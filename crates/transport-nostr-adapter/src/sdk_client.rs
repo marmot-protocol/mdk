@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::{
     MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointReceipt,
+    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportPublishFailure,
+    collapse_publish_failure_summaries,
 };
 use nostr_sdk::prelude::{
     Alphabet, Client, Event, EventBuilder, Filter, Kind, PublicKey, RelayMessage,
@@ -460,10 +461,12 @@ impl NostrSdkRelayClient {
             Ok(Err(_)) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
                 reason: "connect relay failed".to_owned(),
+                rejection_category: None,
             }),
             Err(_) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
                 reason: "connect relay timed out".to_owned(),
+                rejection_category: None,
             }),
         }
     }
@@ -474,7 +477,11 @@ impl NostrSdkRelayClient {
         event: Event,
     ) -> Result<TransportEndpointReceipt, TransportEndpointFailure> {
         let transport_endpoint = TransportEndpoint(endpoint.to_string());
-        let mut last_error = "send event failed".to_owned();
+        let mut last_failure = TransportEndpointFailure {
+            endpoint: transport_endpoint.clone(),
+            reason: "send event failed".to_owned(),
+            rejection_category: None,
+        };
         for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
             match timeout(
                 SDK_RELAY_PUBLISH_WAIT,
@@ -494,25 +501,28 @@ impl NostrSdkRelayClient {
                     });
                 }
                 Ok(Ok(output)) => {
-                    // The relay's rejection text is remote-controlled and can
-                    // embed the relay URL, event ids, or arbitrary content, so
-                    // it must not reach the display-bearing publish error
-                    // (`finish_publish_outcome` joins these reasons into
-                    // `TransportAdapterError::Publish`). Map to a stable
-                    // reason instead of echoing it.
-                    last_error = if output.failed.contains_key(&endpoint) {
-                        "relay rejected event".to_owned()
+                    if output.failed.contains_key(&endpoint) {
+                        let remote = output
+                            .failed
+                            .get(&endpoint)
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        last_failure =
+                            relay_rejection_endpoint_failure(transport_endpoint.clone(), remote);
                     } else {
-                        "relay did not acknowledge event".to_owned()
-                    };
+                        last_failure.reason = "relay did not acknowledge event".to_owned();
+                        last_failure.rejection_category = None;
+                    }
                 }
                 Ok(Err(_)) => {
                     // No sdk error Display here either — it can carry the
                     // relay URL.
-                    last_error = "send event failed".to_owned();
+                    last_failure.reason = "send event failed".to_owned();
+                    last_failure.rejection_category = None;
                 }
                 Err(_) => {
-                    last_error = "send event timed out".to_owned();
+                    last_failure.reason = "send event timed out".to_owned();
+                    last_failure.rejection_category = None;
                 }
             }
             if attempt < SDK_RELAY_PUBLISH_ATTEMPTS {
@@ -520,10 +530,7 @@ impl NostrSdkRelayClient {
             }
         }
 
-        Err(TransportEndpointFailure {
-            endpoint: transport_endpoint,
-            reason: last_error,
-        })
+        Err(last_failure)
     }
 
     async fn publish_prepared_event(
@@ -773,6 +780,7 @@ impl NostrSdkRelayClient {
             Err(_) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
                 reason: "add publish relay failed".to_owned(),
+                rejection_category: None,
             }),
         }
     }
@@ -848,11 +856,7 @@ impl NostrSdkRelayClient {
                 required_acks
             )
         } else if accepted.is_empty() && !failed.is_empty() {
-            failed
-                .iter()
-                .map(|failure| failure.reason.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
+            collapse_publish_failure_summaries(failed.iter().map(|failure| failure.reason.as_str()))
         } else {
             format!(
                 "insufficient publish acknowledgements: accepted {} of required {}",
@@ -860,7 +864,13 @@ impl NostrSdkRelayClient {
                 required_acks
             )
         };
-        Err(TransportAdapterError::Publish(reason))
+        if failed.is_empty() {
+            Err(TransportAdapterError::Publish(reason))
+        } else {
+            Err(TransportAdapterError::PublishEndpoints(
+                TransportPublishFailure::with_endpoint_failures(reason, failed),
+            ))
+        }
     }
 }
 
@@ -1164,6 +1174,42 @@ fn relay_endpoint_publish_accepted(success: bool, failure_reason: Option<&str>) 
     success || failure_reason.is_some_and(relay_duplicate_acknowledgement)
 }
 
+fn map_relay_rejection_category(
+    prefix: nostr::message::MachineReadablePrefix,
+) -> TransportEndpointRejectionCategory {
+    use nostr::message::MachineReadablePrefix as Prefix;
+    match prefix {
+        Prefix::Duplicate => TransportEndpointRejectionCategory::Duplicate,
+        Prefix::Pow => TransportEndpointRejectionCategory::Pow,
+        Prefix::Blocked => TransportEndpointRejectionCategory::Blocked,
+        Prefix::RateLimited => TransportEndpointRejectionCategory::RateLimited,
+        Prefix::Invalid => TransportEndpointRejectionCategory::Invalid,
+        Prefix::Error => TransportEndpointRejectionCategory::Error,
+        Prefix::Unsupported => TransportEndpointRejectionCategory::Unsupported,
+        Prefix::AuthRequired => TransportEndpointRejectionCategory::AuthRequired,
+        Prefix::Restricted => TransportEndpointRejectionCategory::Restricted,
+    }
+}
+
+fn relay_rejection_endpoint_failure(
+    endpoint: TransportEndpoint,
+    relay_message: &str,
+) -> TransportEndpointFailure {
+    if let Some(prefix) = nostr::message::MachineReadablePrefix::parse(relay_message) {
+        let category = map_relay_rejection_category(prefix);
+        return TransportEndpointFailure {
+            endpoint,
+            reason: format!("relay rejected event ({})", category.as_str()),
+            rejection_category: Some(category),
+        };
+    }
+    TransportEndpointFailure {
+        endpoint,
+        reason: "relay rejected event".to_owned(),
+        rejection_category: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1190,6 +1236,102 @@ mod tests {
             .sign_with_keys(&ephemeral)
             .expect("sign ephemeral 445");
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
+    }
+
+    #[test]
+    fn relay_rejection_endpoint_failure_maps_machine_readable_prefix() {
+        for (message, category, summary) in [
+            (
+                "auth-required: account secret at https://evil.example/auth",
+                TransportEndpointRejectionCategory::AuthRequired,
+                "relay rejected event (auth-required)",
+            ),
+            (
+                "restricted: kind 5 disabled at https://evil.example/policy",
+                TransportEndpointRejectionCategory::Restricted,
+                "relay rejected event (restricted)",
+            ),
+            (
+                "invalid: leaked event payload",
+                TransportEndpointRejectionCategory::Invalid,
+                "relay rejected event (invalid)",
+            ),
+            (
+                "unsupported: kind 5",
+                TransportEndpointRejectionCategory::Unsupported,
+                "relay rejected event (unsupported)",
+            ),
+        ] {
+            let failure = relay_rejection_endpoint_failure(
+                TransportEndpoint("wss://relay.example".into()),
+                message,
+            );
+            assert_eq!(failure.rejection_category, Some(category));
+            assert_eq!(failure.reason, summary);
+            assert!(!failure.reason.contains("evil.example"));
+            assert!(!failure.reason.contains("leaked event payload"));
+        }
+    }
+
+    #[test]
+    fn finish_publish_outcome_collapses_duplicate_relay_rejection_summaries() {
+        let message_id = cgka_traits::MessageId::new(vec![0xD6; 32]);
+        let err = NostrSdkRelayClient::finish_publish_outcome(
+            message_id,
+            Vec::new(),
+            vec![
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://first.example".into()),
+                    reason: "relay rejected event (blocked)".to_owned(),
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://second.example".into()),
+                    reason: "relay rejected event (blocked)".to_owned(),
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+            ],
+            1,
+            false,
+        )
+        .unwrap_err();
+
+        let rendered = err.to_string();
+        assert_eq!(rendered, "publish failed: relay rejected event (blocked)");
+        assert!(!rendered.contains("first.example"));
+        assert!(!rendered.contains("injected"));
+        if let TransportAdapterError::PublishEndpoints(failure) = err {
+            assert_eq!(failure.endpoint_failures.len(), 2);
+            assert_eq!(
+                failure.endpoint_failures[0].rejection_category,
+                Some(TransportEndpointRejectionCategory::Blocked)
+            );
+        } else {
+            panic!("expected publish failure");
+        }
+    }
+
+    #[test]
+    fn finish_publish_outcome_success_retains_rejected_endpoint_diagnostics() {
+        let message_id = cgka_traits::MessageId::new(vec![0xD7; 32]);
+        let accepted = vec![TransportEndpointReceipt {
+            endpoint: TransportEndpoint("wss://good.example".into()),
+            accepted_at: None,
+        }];
+        let failed = vec![TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://bad.example".into()),
+            reason: "relay rejected event (auth-required)".to_owned(),
+            rejection_category: Some(TransportEndpointRejectionCategory::AuthRequired),
+        }];
+        let outcome = NostrSdkRelayClient::finish_publish_outcome(
+            message_id,
+            accepted,
+            failed.clone(),
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.failed, failed);
     }
 
     #[test]
@@ -1233,6 +1375,7 @@ mod tests {
             vec![TransportEndpointFailure {
                 endpoint: endpoint.clone(),
                 reason: "connect relay failed".to_owned(),
+                rejection_category: None,
             }],
             1,
             false,
@@ -2038,6 +2181,67 @@ mod tests {
         // The privacy invariant forbids relay URLs in error Display: the bad
         // endpoint itself must not be echoed back.
         assert!(!rendered.contains("not a relay url"), "{rendered}");
+    }
+
+    #[derive(Debug)]
+    struct RejectAllWrites;
+
+    impl nostr_relay_builder::prelude::WritePolicy for RejectAllWrites {
+        fn admit_event<'a>(
+            &'a self,
+            _event: &'a nostr::Event,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
+        {
+            Box::pin(async move {
+                nostr_relay_builder::prelude::PolicyResult::Reject(
+                    "injected write rejection".into(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_event_reports_per_relay_rejection_categories_with_collapsed_display() {
+        use crate::KIND_MARMOT_KEY_PACKAGE;
+        use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+        let relay_a = LocalRelay::new(RelayBuilder::default().write_policy(RejectAllWrites));
+        relay_a.run().await.unwrap();
+        let relay_b = LocalRelay::new(RelayBuilder::default().write_policy(RejectAllWrites));
+        relay_b.run().await.unwrap();
+        let endpoint_a = TransportEndpoint(relay_a.url().await.to_string());
+        let endpoint_b = TransportEndpoint(relay_b.url().await.to_string());
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys.clone()).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let deletion = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            5,
+            vec![
+                vec!["e".into(), "11".repeat(32)],
+                vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+            ],
+            String::new(),
+        );
+
+        let err = sdk
+            .publish_event(&[endpoint_a, endpoint_b], &deletion, 1)
+            .await
+            .expect_err("both relays reject writes");
+
+        let rendered = err.to_string();
+        assert_eq!(rendered, "publish failed: relay rejected event (blocked)");
+        assert!(!rendered.contains("injected write rejection"));
+        if let TransportAdapterError::PublishEndpoints(failure) = err {
+            assert_eq!(failure.endpoint_failures.len(), 2);
+            assert!(failure.endpoint_failures.iter().all(|endpoint_failure| {
+                endpoint_failure.rejection_category
+                    == Some(TransportEndpointRejectionCategory::Blocked)
+            }));
+        } else {
+            panic!("expected structured publish failure");
+        }
     }
 
     async fn silent_relay_url() -> String {

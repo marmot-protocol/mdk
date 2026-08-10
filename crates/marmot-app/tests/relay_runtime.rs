@@ -7482,6 +7482,70 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
 }
 
 #[tokio::test]
+async fn app_runtime_delete_key_package_event_nip09_succeeds_and_clears_matching_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let packages = runtime
+        .account_key_packages(&created.account.account_id_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let relay_package = packages
+        .iter()
+        .find(|package| package.relay)
+        .expect("setup should publish a relay key package");
+    let event_id = relay_package.key_package_event_id.clone();
+    let record_path = dir
+        .path()
+        .join("key-packages")
+        .join(format!("{}.json", created.account.label));
+    std::fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &record_path,
+        serde_json::json!({
+            "account_label": created.account.label,
+            "account_id_hex": created.account.account_id_hex,
+            "key_package_id": "integration-slot",
+            "key_package_ref_hex": "aa".repeat(32),
+            "key_package_event_id": event_id,
+            "published_at": 1,
+            "key_package_hex": "00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(
+        record_path.exists(),
+        "local publication metadata should exist before deletion"
+    );
+
+    let deleted = runtime
+        .delete_key_package(
+            &created.account.account_id_hex,
+            &event_id,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+    assert!(deleted >= 1);
+    assert!(
+        !record_path.exists(),
+        "successful deletion must remove matching local publication metadata"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_wipe_reports_deletion_failure_and_still_removes_local_account() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = deletion_rejecting_app(&dir).await;

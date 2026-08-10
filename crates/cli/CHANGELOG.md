@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
+  categories (for example `blocked` or `auth-required`) instead of repeating a
+  generic `relay rejected event` summary, while successful deletions still
+  clear only matching local KeyPackage publication metadata after at least one
+  relay acknowledgement.
+
 ## [0.9.11] - 2026-08-09
 
 ### Added

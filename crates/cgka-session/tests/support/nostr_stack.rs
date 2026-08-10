@@ -128,6 +128,7 @@ impl NostrRelayClient for FakeRelayClient {
                 .map(|endpoint| TransportEndpointFailure {
                     endpoint,
                     reason: "not accepted by in-memory relay".into(),
+                    rejection_category: None,
                 })
                 .collect(),
         })

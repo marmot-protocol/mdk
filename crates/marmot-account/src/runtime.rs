@@ -3253,6 +3253,7 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
                 failed.push(TransportEndpointFailure {
                     endpoint: endpoint.clone(),
                     reason: "publish attempt failed".into(),
+                    rejection_category: None,
                 });
             }
             cgka_traits::FanoutTargetStatus::NotAttempted

@@ -11,7 +11,7 @@ use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
-use cgka_traits::{GroupId, SecretBytes, TransportEndpoint};
+use cgka_traits::{GroupId, SecretBytes, TransportAdapterError, TransportEndpoint};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
     NostrAccountImport,
@@ -716,6 +716,9 @@ pub struct SignOutOutcome {
 fn wipe_failure_reason(err: &AppError) -> String {
     let category = match err {
         AppError::RuntimeStopping => "runtime is shutting down",
+        AppError::Transport(TransportAdapterError::PublishEndpoints(failure)) => {
+            return failure.summary.clone();
+        }
         AppError::Transport(_) | AppError::TransportClosed => "transport error",
         AppError::Publish(_) => "relay publish failed",
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
@@ -2369,10 +2372,25 @@ impl MarmotAppRuntime {
                     event_id_hex: result.event_id_hex,
                     reason: "relay publish failed".to_owned(),
                 }),
-                Err(error) => failures.push(RelayFailure {
-                    event_id_hex: result.event_id_hex,
-                    reason: wipe_failure_reason(&error),
-                }),
+                Err(error) => {
+                    let endpoint_failures = match &error {
+                        AppError::Transport(error) => error.publish_endpoint_failures(),
+                        _ => &[],
+                    };
+                    if endpoint_failures.is_empty() {
+                        failures.push(RelayFailure {
+                            event_id_hex: result.event_id_hex,
+                            reason: wipe_failure_reason(&error),
+                        });
+                    } else {
+                        for endpoint_failure in endpoint_failures {
+                            failures.push(RelayFailure {
+                                event_id_hex: result.event_id_hex.clone(),
+                                reason: endpoint_failure.reason.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
         (deleted, failures)
