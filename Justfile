@@ -177,6 +177,9 @@ openclaw-dev-teardown args="":
 openclaw-dev-test:
     cd integrations/openclaw/marmot && pnpm install && pnpm typecheck && pnpm test
 
+openclaw-host-compat-test:
+    integrations/openclaw/marmot/test/openclaw-host-compat.sh
+
 openclaw-dev-script-test:
     integrations/openclaw/marmot/test/dev-scripts.sh
 

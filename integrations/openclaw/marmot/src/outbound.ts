@@ -28,6 +28,7 @@ import { readLocalFileFromRoots } from "openclaw/plugin-sdk/infra-runtime";
 import { getDefaultLocalRoots, LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 
 import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
+import { markMarmotOutboundSent } from "./runtime-state.js";
 
 /** Marmot send target resolved from OpenClaw config + the inbound chat id. */
 export interface ResolvedMarmotTarget {
@@ -347,7 +348,9 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
           marmotAccountIdHex,
           groupIdHex: ctx.to,
         });
-        return { receipt: receiptFromMessageIds(response.message_ids_hex, now()) };
+        const receipt = receiptFromMessageIds(response.message_ids_hex, now());
+        markMarmotOutboundSent(ctx.accountId, receipt.sentAt);
+        return { receipt };
       },
       media: async (ctx: ChannelMessageSendMediaContext) => {
         const resolved = await resolveOutboundMediaUpload(ctx, writeTempMedia);
@@ -369,7 +372,9 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
             marmotAccountIdHex,
             groupIdHex: ctx.to,
           });
-          return { receipt: receiptFromMessageIds(response.message_ids_hex, now(), "media") };
+          const receipt = receiptFromMessageIds(response.message_ids_hex, now(), "media");
+          markMarmotOutboundSent(ctx.accountId, receipt.sentAt);
+          return { receipt };
         } finally {
           // Remove the staged copy even if the connector send threw. The
           // original source remains untouched.

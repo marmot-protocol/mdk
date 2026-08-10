@@ -63,6 +63,25 @@ export function markMarmotInboundReceived(accountId?: string | null): void {
   };
 }
 
+/** Record a durable outbound receipt for channel status/probe reporting. */
+export function markMarmotOutboundSent(
+  accountId?: string | null,
+  sentAt: number = Date.now(),
+): void {
+  const nextAccountId = accountIdOrDefault(accountId);
+  // This compatibility slot describes one active inbound account. An outbound
+  // send for another configured account must not replace that live status with
+  // a synthetic stopped snapshot; the host-owned per-account runtime remains
+  // authoritative for the other account.
+  if (inboundRuntime.accountId !== nextAccountId) {
+    return;
+  }
+  inboundRuntime = {
+    ...inboundRuntime,
+    lastOutboundAt: sentAt,
+  };
+}
+
 export function markMarmotInboundReconnect(accountId?: string | null): void {
   inboundRuntime = {
     ...inboundRuntime,

@@ -1,6 +1,29 @@
-import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+// The dedicated keyed-async-queue subpath lost its declarations in
+// 2026.7.2-beta. The core barrel exports the same runtime value and declarations
+// on both stable and beta.
+import { KeyedAsyncQueue } from "openclaw/plugin-sdk/core";
 
 export const DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32;
+
+// Copied from the OpenClaw host assertion. This classification is best-effort:
+// an upstream wording change safely degrades to the generic `error` bucket.
+const OPENCLAW_DISPATCH_LIFECYCLE_ERROR =
+  "runChannelInboundEvent prepared turns must declare runDispatchLifecycle when creating runDispatch";
+
+/**
+ * Reduce an arbitrary dispatch failure to a fixed, privacy-safe class. Never
+ * include Error.message: upstream failures can embed prompts, paths, ids, or
+ * other conversation-specific data.
+ */
+export function classifyInboundDispatchFailure(error: unknown): string {
+  if (error instanceof Error && error.message === OPENCLAW_DISPATCH_LIFECYCLE_ERROR) {
+    return "openclaw_dispatch_lifecycle_contract";
+  }
+  if (error instanceof Error) {
+    return "error";
+  }
+  return "non_error";
+}
 
 /**
  * Per-key FIFO dispatch with a bounded queue depth. When a key is at capacity,
@@ -39,6 +62,10 @@ export class BoundedKeyedAsyncQueue {
           }
         }
       })
-      .catch(() => this.onShed?.("marmot: inbound dispatch task failed"));
+      .catch((error: unknown) =>
+        this.onShed?.(
+          `marmot: inbound dispatch task failed (class=${classifyInboundDispatchFailure(error)})`,
+        ),
+      );
   }
 }

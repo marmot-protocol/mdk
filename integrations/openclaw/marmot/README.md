@@ -109,6 +109,7 @@ Invite the printed agent account from the phone app.
 
 ```sh
 just openclaw-dev-test                 # pnpm install + typecheck + vitest
+just openclaw-host-compat-test         # build + focused runtime tests on supported beta
 just openclaw-dev-script-test          # generated helper/env/installer contract test
 just openclaw-dev-setup --print-env    # build + isolated dev root + helper scripts
 just openclaw-dev-e2e-connector        # real wn-agent + debug control deterministic E2E

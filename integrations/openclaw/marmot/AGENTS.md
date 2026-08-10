@@ -60,6 +60,10 @@ cd integrations/openclaw/marmot && pnpm install && pnpm typecheck && pnpm test
 integrations/openclaw/marmot/test/dev-scripts.sh
 # or from the repo root:
 just openclaw-dev-test
+just openclaw-host-compat-test
 just openclaw-dev-script-test
 just openclaw-dev-e2e-connector
 ```
+
+After changing OpenClaw plugin dependencies, regenerate the committed beta lock
+with `integrations/openclaw/marmot/test/openclaw-host-compat.sh --update-lock`.

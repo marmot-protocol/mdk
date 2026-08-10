@@ -12,8 +12,8 @@
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
 
-import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
 import { resolveSingleAccount } from "./account.js";
+import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
@@ -36,6 +36,35 @@ import {
   markMarmotInboundStopped,
 } from "./runtime-state.js";
 import { syncAllowlist } from "./security.js";
+
+/**
+ * OpenClaw stable awaits an onFlush Promise directly. 2026.7.2-beta instead
+ * supplies a createFlush factory and expects admission + completion promises.
+ * Keep the adapter structural so the packaged stable build can run on either
+ * host without importing a beta-only type or branching on a version string.
+ */
+interface CompatibleInboundDebounceFlush {
+  admission: Promise<void>;
+  completion: Promise<void>;
+}
+
+type CompatibleInboundDebounceFlushFactory = (params: {
+  dispatch: (lifecycle: unknown) => Promise<void>;
+}) => CompatibleInboundDebounceFlush;
+
+type CompatibleInboundDebouncerFactory = <T>(params: {
+  debounceMs: number;
+  buildKey: (item: T) => string | null | undefined;
+  onFlush: (
+    items: T[],
+    createFlush?: CompatibleInboundDebounceFlushFactory,
+  ) => Promise<void> | CompatibleInboundDebounceFlush;
+}) => {
+  enqueue: (item: T) => Promise<void>;
+};
+
+const createCompatibleInboundDebouncer =
+  createInboundDebouncer as unknown as CompatibleInboundDebouncerFactory;
 
 /** Minimal logger surface (subset of OpenClaw's PluginLogger). */
 interface InboundLogger {
@@ -328,14 +357,24 @@ export function startMarmotInbound(
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =
       resolved.debounceMs > 0
-        ? createInboundDebouncer<MarmotInboundMessage>({
+        ? createCompatibleInboundDebouncer<MarmotInboundMessage>({
             debounceMs: resolved.debounceMs,
             buildKey: (message) =>
               `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`,
-            onFlush: async (items) => {
-              if (items.length > 0) {
-                runQueued(coalesceInboundMessages(items));
-              }
+            onFlush: (items, createFlush) => {
+              const dispatchFlush = async (): Promise<void> => {
+                if (items.length > 0) {
+                  runQueued(coalesceInboundMessages(items));
+                }
+              };
+              // Beta completion deliberately means "admitted to Marmot's
+              // bounded per-group queue", not "the agent turn settled". The
+              // outer queue owns turn serialization and failure logging, which
+              // matches stable's fire-and-forget seam, so the factory-provided
+              // lifecycle argument is intentionally ignored.
+              return createFlush
+                ? createFlush({ dispatch: async (_lifecycle) => dispatchFlush() })
+                : dispatchFlush();
             },
           })
         : null;

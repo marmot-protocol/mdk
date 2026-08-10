@@ -11,7 +11,10 @@ import {
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
 
-import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import {
+  buildChannelInboundEventContext,
+  runChannelInboundEvent,
+} from "openclaw/plugin-sdk/channel-inbound";
 import { deliverInboundReplyWithMessageSendContext } from "openclaw/plugin-sdk/channel-outbound";
 
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
@@ -50,9 +53,11 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 const buildCtxMock = vi.mocked(buildChannelInboundEventContext);
+const runInboundEventMock = vi.mocked(runChannelInboundEvent);
 const durableDeliveryMock = vi.mocked(deliverInboundReplyWithMessageSendContext);
 
 beforeEach(() => {
+  runInboundEventMock.mockClear();
   durableDeliveryMock.mockClear();
 });
 
@@ -168,6 +173,19 @@ describe("createMarmotInboundDispatcher", () => {
       },
     ]);
     expect(captured).toHaveLength(1);
+    const inboundEvent = runInboundEventMock.mock.calls[0]?.[0] as unknown as {
+      adapter: {
+        resolveTurn: () => {
+          runDispatchLifecycle?: {
+            turnAdoptionLifecycle?: unknown;
+            onDispatchSkipped?: (reason: string) => Promise<void>;
+          };
+        };
+      };
+    };
+    const lifecycle = inboundEvent.adapter.resolveTurn().runDispatchLifecycle;
+    expect(lifecycle).toMatchObject({ turnAdoptionLifecycle: undefined });
+    await expect(lifecycle?.onDispatchSkipped?.("observeOnly")).resolves.toBeUndefined();
     expect((captured[0] as { ctx: { accountId: string } }).ctx.accountId).toBe("default");
     expect(
       (captured[0] as { replyOptions: { disableBlockStreaming?: boolean } }).replyOptions

@@ -260,6 +260,26 @@ jobs:
       - name: Run real Hermes persisted-config probe
         run: ./scripts/hermes_marmot_verify_persisted_config.sh --root "$HERMES_MARMOT_DEV_ROOT"
 
+  openclaw-host-compat:
+    name: OpenClaw beta host compatibility
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Test supported OpenClaw beta host
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.13.1 --activate
+          integrations/openclaw/marmot/test/openclaw-host-compat.sh
+
   openclaw-plugin:
     name: Package OpenClaw plugin
     runs-on: ubuntu-latest

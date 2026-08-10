@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   deriveDurableFinalDeliveryRequirements,
   type ChannelMessageSendMediaContext,
@@ -18,8 +18,18 @@ import {
   receiptFromMessageIds,
   SentMessageTargetCache,
 } from "../src/outbound.js";
+import {
+  markMarmotInboundReady,
+  markMarmotInboundStarting,
+  marmotInboundRuntimeSnapshot,
+  resetMarmotInboundRuntimeForTests,
+} from "../src/runtime-state.js";
 
 const HEX32 = (b: string) => b.repeat(32);
+
+afterEach(() => {
+  resetMarmotInboundRuntimeForTests();
+});
 
 interface SendFinalCall {
   accountIdHex: string;
@@ -110,6 +120,7 @@ describe("createMarmotMessageAdapter", () => {
     expect(result.receipt.platformMessageIds).toEqual([HEX32("ab")]);
     expect(result.receipt.parts[0]).toMatchObject({ kind: "text", index: 0 });
     expect(result.receipt.sentAt).toBe(1234);
+    expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
   });
 
   it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
@@ -133,6 +144,32 @@ describe("createMarmotMessageAdapter", () => {
     });
     expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
+  });
+
+  it("does not evict another account's active inbound status after a send", async () => {
+    markMarmotInboundStarting("work");
+    markMarmotInboundReady("work");
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(emptyClientCalls()),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+      nowMs: () => 2468,
+    });
+
+    await adapter.send!.text!({
+      cfg: {},
+      accountId: "personal",
+      to: HEX32("cc"),
+      text: "cross-account send",
+    } as unknown as ChannelMessageSendTextContext);
+
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      accountId: "work",
+      running: true,
+      connected: true,
+    });
+    expect(marmotInboundRuntimeSnapshot("personal").lastOutboundAt).toBeUndefined();
   });
 
   it("routes a media send with a local path to send_media with the caption", async () => {
@@ -171,6 +208,7 @@ describe("createMarmotMessageAdapter", () => {
       expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
       expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
       expect(result.receipt.sentAt).toBe(5678);
+      expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(5678);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

@@ -11,5 +11,8 @@ export default defineChannelPluginEntry({
   name: "Marmot",
   description: "End-to-end encrypted Marmot groups through the local wn-agent connector.",
   plugin: createMarmotChannelPlugin(),
-  registerFull: registerMarmotHistoryTool,
+  // 2026.7.2-beta's channel-core and core barrels currently name structurally
+  // equivalent OpenClawPluginApi types from different generated declaration
+  // bundles. Keep the runtime handoff explicit until those barrels converge.
+  registerFull: (api) => registerMarmotHistoryTool(api as never),
 });

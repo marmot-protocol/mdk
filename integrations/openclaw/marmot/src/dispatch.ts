@@ -561,6 +561,15 @@ export function createMarmotInboundDispatcher(
           storePath,
           ctxPayload,
           recordInboundSession: deps.runtimeChannel.session.recordInboundSession as never,
+          // OpenClaw 2026.7.2-beta requires prepared dispatch runners to
+          // declare who owns their adoption lifecycle. Marmot does not create
+          // a durable adoption resource outside runDispatch, so a skipped turn
+          // has nothing to release. Stable 2026.7.1 ignores this additive
+          // property, letting one packaged adapter run on both SDK contracts.
+          runDispatchLifecycle: {
+            turnAdoptionLifecycle: undefined,
+            onDispatchSkipped: async () => undefined,
+          },
           runDispatch: () =>
             deps.runtimeChannel.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: ctxPayload,

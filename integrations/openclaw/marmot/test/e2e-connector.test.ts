@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -104,7 +105,13 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
   it(
     "keeps sequential and restarted inbound replies on the source Marmot group",
     async () => {
-      const tempRoot = await mkdtemp("/tmp/omce-");
+      // wn-agent requires every ancestor of its exclusive home to be owned and
+      // non-writable by other users, and Unix sockets have a short path limit.
+      // A direct /tmp child fails the first invariant while a deep worktree path
+      // can fail the second, so use the user's short, owned cache root.
+      const cacheRoot = process.env.XDG_CACHE_HOME?.trim() || join(homedir(), ".cache");
+      await mkdir(cacheRoot, { recursive: true, mode: 0o700 });
+      const tempRoot = await mkdtemp(join(cacheRoot, "openclaw-e2e-"));
       const marmotHome = join(tempRoot, "marmot-home");
       const socketPath = join(tempRoot, "a.sock");
       const proc = spawn(
