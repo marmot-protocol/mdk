@@ -3,8 +3,8 @@
 
 use cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1;
 use cgka_conformance_simulator::{
-    ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec,
-    ScenarioStep, ScenarioTopologyV2,
+    QuiescencePolicy, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
+    ScenarioSpec, ScenarioStep, ScenarioTopologyV2,
 };
 use convergence_campaign_runner::{
     ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1, DistributedFaultV1,
@@ -89,7 +89,13 @@ fn smoke_scenario() -> ScenarioSpec {
             ScenarioStep::Tick {
                 clients: clients.clone(),
             },
-            in_group(ScenarioStep::ObserveExact { clients }),
+            // The marmot_app_process adapter deliberately omits
+            // ExactConformanceObservation. AwaitQuiescence is its supported
+            // exactness gate: it fails unless every node reports one shared
+            // state_commitment_sha256 and an observably quiescent projection.
+            ScenarioStep::AwaitQuiescence {
+                policy: QuiescencePolicy::default(),
+            },
         ],
     }
 }
