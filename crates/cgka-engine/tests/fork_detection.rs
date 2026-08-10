@@ -6,6 +6,14 @@
 //! - Compare deterministic transport ordering keys
 //! - Roll back to the pre-commit snapshot if the inbound commit wins
 //! - Apply the winning commit and return to Stable
+//!
+//! The tail of this file covers the seam where none of that is possible: an
+//! in-horizon rival whose fork-source anchor snapshot is gone. Ingest reaches
+//! that state through OpenMLS's `WrongEpoch` framing check, upstream of every
+//! signature and membership-tag check, so the rival's claimed source epoch is
+//! unauthenticated. Ingest therefore retains and schedules but decides nothing
+//! terminal; the durable halt comes from the convergence coordinator's own
+//! `MissingRetainedAnchor` verdict.
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
@@ -2463,7 +2471,7 @@ async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork
 }
 
 #[tokio::test]
-async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
+async fn restarted_committer_without_source_anchor_halts_through_convergence() {
     // Control on the same deterministic fixture: no restart, pairwise route.
     let (control, mut control_local) = router_flip_fixture("control").await;
     assert!(control.sibling_wins);
@@ -2483,38 +2491,28 @@ async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
     // fails, and `has_retained_anchor_snapshot` refuses convergence admission.
     // Within the rewind horizon that absence is abnormal by construction —
     // every canonical advance retains a source-epoch anchor and pruning runs
-    // only beyond the horizon — so the only honest outcome is a durable,
-    // observable halt: silently keeping our own (possibly losing) branch would
-    // be permanent divergence invisible to both the app and forensics.
-    let (f, local) = router_flip_fixture("silent").await;
-    assert!(f.sibling_wins);
+    // only beyond the horizon — so a durable, observable halt is the honest
+    // outcome: silently keeping our own (possibly losing) branch would be
+    // permanent divergence invisible to both the app and forensics.
+    //
+    // Ingest does not write that halt. It cannot honestly: it reaches this
+    // decision through OpenMLS's `WrongEpoch` framing check, upstream of every
+    // signature and membership-tag check, so the rival's claimed epoch is
+    // unauthenticated (see `unauthenticated_past_epoch_rival_never_halts_the_
+    // group_at_ingest`). What ingest owes is retention and a scheduled pass;
+    // the halt belongs to the convergence coordinator, which owns the
+    // `MissingRetainedAnchor` verdict. This pins the whole route end to end, so
+    // the original silent-drop defect stays closed.
+    let f = anchor_less_forked_device("silent").await;
     let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
-    drop(local);
-    f.local_storage
-        .release_group_snapshot(&f.group_id, "openmls-retained-anchor-1")
-        .expect("release the source-epoch anchor");
-    let audit_dir = tempfile::TempDir::new().unwrap();
-    let audit_path = audit_dir.path().join("audit.jsonl");
-    let recorder =
-        marmot_forensics::JsonlRecorder::open(&audit_path, "restarted-committer".to_string())
-            .unwrap();
-    let mut local = {
-        let mut engine = EngineBuilder::new(f.local_storage.clone())
-            .legacy_compatibility_profile()
-            .identity(pad32(&f.local_seed))
-            .account_identity_proof_signer(proof_signer(&f.local_seed))
-            .feature_registry(selfremove_registry())
-            .peeler(Box::new(MockPeeler))
-            .recorder(Box::new(recorder))
-            .build()
-            .unwrap();
-        engine.hydrate_stable_groups_from_storage().unwrap();
-        engine
-    };
+    let (mut local, _audit_dir, audit_path) =
+        restarted_device_with_recorder(&f, "restarted-committer");
+    let _ = local.drain_pending_convergence_groups();
 
     let outcome = local.ingest(f.competing.clone()).await.unwrap();
 
-    // The rival's arrival is loud: retained for repair, never a silent Stale.
+    // The rival's arrival is loud: retained for adjudication, never a silent
+    // Stale, and never a terminal verdict derived from its own claim.
     assert_eq!(
         outcome,
         IngestOutcome::Buffered {
@@ -2523,17 +2521,37 @@ async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
         },
         "the unadjudicated rival must be retained, not silently classified stale"
     );
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Created,
+        "the rival stays in the pass-opening state convergence needs"
+    );
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "ingest must not derive a terminal state from an unauthenticated claim"
+    );
+
+    // Retention only pays off if something opens the pass, and applications
+    // open passes off `drain_pending_convergence_groups`.
+    let scheduled = local.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&f.group_id),
+        "ingest must hand the group holding the retained rival to the drain; got {scheduled:?}"
+    );
+    for group_id in &scheduled {
+        let _ = local.converge_stored_openmls_messages_at(group_id, 0);
+        let _ = local.converge_stored_openmls_messages_at(group_id, 60_000);
+    }
+
     assert!(
         f.local_storage
             .get_group(&f.group_id)
             .unwrap()
             .unrecoverable,
         "missing in-horizon fork-recovery material must durably halt the group"
-    );
-    assert_eq!(
-        f.local_storage.get_message(&competing_id).unwrap().state,
-        MessageState::ConvergenceDeferred,
-        "the winning sibling stays parked for reconsideration after repair"
     );
     assert!(
         local.drain_events().iter().any(|event| matches!(
@@ -2568,4 +2586,236 @@ async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
         )),
         "the durable halt must leave an audit row naming the missing material"
     );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            marmot_forensics::AuditEventKind::Rejection { reason, .. }
+                if reason == "fork_rival_missing_retained_anchor"
+        )),
+        "the ingest seam must record why it could not adjudicate the rival"
+    );
+}
+
+/// The `restarted_committer_without_source_anchor_halts_through_convergence`
+/// precondition, without the engine: the epoch-1 fork fixture with its
+/// source-epoch anchor released. The caller reopens the device (which is what
+/// clears `committed_from`) once it has finished reading storage directly.
+async fn anchor_less_forked_device(tag: &str) -> RouterFlipFixture {
+    let (f, local) = router_flip_fixture(tag).await;
+    assert!(f.sibling_wins);
+    drop(local);
+    f.local_storage
+        .release_group_snapshot(&f.group_id, "openmls-retained-anchor-1")
+        .expect("release the source-epoch anchor");
+    f
+}
+
+/// Reopen the device with a forensic recorder installed. Returns the engine and
+/// the audit path the recorder flushes to on drop.
+fn restarted_device_with_recorder(
+    f: &RouterFlipFixture,
+    tag: &str,
+) -> (
+    Engine<SqliteAccountStorage>,
+    tempfile::TempDir,
+    std::path::PathBuf,
+) {
+    let audit_dir = tempfile::TempDir::new().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, tag.to_string()).unwrap();
+    let mut engine = EngineBuilder::new(f.local_storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(&f.local_seed))
+        .account_identity_proof_signer(proof_signer(&f.local_seed))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+    engine.hydrate_stable_groups_from_storage().unwrap();
+    (engine, audit_dir, audit_path)
+}
+
+/// The MLS epoch a set of raw commit bytes claims, read the way ingest reads it.
+fn claimed_mls_epoch(mls_bytes: &[u8]) -> EpochId {
+    use openmls::framing::{MlsMessageBodyIn, MlsMessageIn, ProtocolMessage};
+    use tls_codec::Deserialize as _;
+    let msg_in =
+        MlsMessageIn::tls_deserialize_exact(mls_bytes).expect("forged bytes still TLS-parse");
+    let proto: ProtocolMessage = match msg_in.extract() {
+        MlsMessageBodyIn::PublicMessage(p) => p.into(),
+        MlsMessageBodyIn::PrivateMessage(p) => p.into(),
+        other => panic!("expected a framed MLS message, got {other:?}"),
+    };
+    EpochId(proto.epoch().as_u64())
+}
+
+/// Wrap forged MLS bytes as an inbound transport message for `group_id`. The id
+/// is content-derived so a forgery never dedups against the genuine rival.
+fn forged_rival_envelope(
+    mls_bytes: Vec<u8>,
+    group_id: &cgka_traits::types::GroupId,
+) -> TransportMessage {
+    TransportMessage {
+        id: MessageId::new(Sha256::digest(&mls_bytes).to_vec()),
+        payload: mls_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("forged-past-epoch-rival".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+/// Assert the anchor-less device's INGEST seam derives no durable terminal
+/// state from `forged`, whose claimed past epoch is the only attacker-controlled
+/// fact behind the halt this seam used to write.
+///
+/// Scoped to the ingest seam on purpose. The convergence coordinator's own
+/// `MissingRetainedAnchor` halt reads a `source_epoch` that
+/// `openmls_projection::project_mls_message` re-derives from the same
+/// unauthenticated wire bytes for every retained commit row, so it still halts
+/// this group on a later pass. That is a distinct, already-merged seam; this
+/// test does not claim to cover it and must not be widened to, or it would
+/// assert behavior no change at this seam can deliver.
+async fn assert_forged_rival_never_halts_at_ingest(
+    case: &str,
+    f: &RouterFlipFixture,
+    mut local: Engine<SqliteAccountStorage>,
+    audit_path: &std::path::Path,
+    forged: TransportMessage,
+) {
+    // Hydration may schedule groups of its own; drain first so the assertion
+    // below observes only what ingest scheduled.
+    let _ = local.drain_pending_convergence_groups();
+    let outcome = local.ingest(forged).await;
+    assert!(
+        outcome.is_ok(),
+        "{case}: an unauthenticated rival must not abort the transport drain, got {outcome:?}"
+    );
+
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "{case}: unauthenticated bytes must never write the durable terminal marker"
+    );
+    assert!(
+        local.drain_events().iter().all(|event| !matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id } if group_id == &f.group_id
+        )),
+        "{case}: unauthenticated bytes must never announce a terminal group state"
+    );
+    // The group must stay usable: a fire-and-forget forgery cannot cost the
+    // device its ability to ingest, which is what the durable halt takes away.
+    assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
+    assert_eq!(settled_branch(&local, f), Branch::Own);
+
+    // The rival is retained rather than dropped, so the seam still owes the
+    // group a pass; applications open one off `drain_pending_convergence_groups`.
+    let scheduled = local.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&f.group_id),
+        "{case}: a retained, unapplied rival must schedule its group; got {scheduled:?}"
+    );
+
+    // Drop the engine so the JsonlRecorder flushes on Drop, then pin the
+    // forensic trail.
+    drop(local);
+    let events: Vec<marmot_forensics::AuditEvent> = std::fs::read_to_string(audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().all(|event| !matches!(
+            &event.kind,
+            marmot_forensics::AuditEventKind::EpochStateChanged { new_state, .. }
+                if new_state == "unrecoverable"
+        )),
+        "{case}: unauthenticated bytes must never record a terminal state change"
+    );
+}
+
+/// A rival commit reaches the missing-anchor fail-closed halt through OpenMLS's
+/// `WrongEpoch` framing check, which runs BEFORE membership-tag and signature
+/// verification (`validate_framing` is the first statement of `decrypt_message`).
+/// Nothing cryptographic has therefore run when the halt fires, and nothing
+/// could: the membership MAC needs the claimed epoch's membership key and the
+/// signature covers that epoch's group context — both live in the anchor
+/// snapshot that is missing by precondition.
+///
+/// So the claimed epoch is raw attacker input, and any member (or a removed
+/// member whose epoch snapshot is still retained) can fire one parseable
+/// datagram to durably freeze the group on every device whose anchor for that
+/// in-horizon epoch is absent. Freezing on unauthenticated input is the bug:
+/// a genuine anchor gap is a LOCAL fact and does not need the rival's word for
+/// it. This pins that the rival's word alone never buys a terminal state at
+/// this seam — see `assert_forged_rival_never_halts_at_ingest` for why the
+/// scope stops there.
+#[tokio::test]
+async fn unauthenticated_past_epoch_rival_never_halts_the_group_at_ingest() {
+    // Case A — signature-invalid, epoch untouched. Flipping the last byte lands
+    // inside the trailing `FramedContentAuthData` / membership-tag region: the
+    // message still TLS-parses and still claims in-horizon epoch 1, but it is
+    // no longer authentic under any key.
+    let f = anchor_less_forked_device("forged-authtag").await;
+    let (local, _audit_dir, audit_path) = restarted_device_with_recorder(&f, "forged-authtag");
+    let mut forged_bytes = f.competing.payload.clone();
+    let last = forged_bytes.len() - 1;
+    forged_bytes[last] ^= 0x01;
+    assert_ne!(forged_bytes, f.competing.payload);
+    assert_eq!(
+        claimed_mls_epoch(&forged_bytes),
+        EpochId(1),
+        "the forgery must keep claiming the in-horizon source epoch"
+    );
+    let forged = forged_rival_envelope(forged_bytes, &f.group_id);
+    assert_forged_rival_never_halts_at_ingest(
+        "case A (auth-tag flip)",
+        &f,
+        local,
+        &audit_path,
+        forged,
+    )
+    .await;
+
+    // Case B — epoch surgery. A commit genuinely authored at the current epoch 2
+    // has its epoch field rewritten to the in-horizon past epoch 1. This is the
+    // pure form of the defect: every other byte is a member's real commit, and
+    // the single field that decides whether the group freezes is the one nothing
+    // authenticates.
+    let f = anchor_less_forked_device("forged-epoch").await;
+    let local_id = MemberId::new(pad32(&f.local_seed));
+    let mut forged_bytes = raw_self_update_commit(&f.local_storage, &local_id, &f.group_id).payload;
+    // `MlsMessageOut` is version(u16) ++ wire_format(u16) ++ body; a
+    // `PublicMessage` body opens with `FramedContent`, whose `group_id` VLBytes
+    // (1-byte length for the 16-byte OpenMLS group id) precedes the fixed-width
+    // `u64` epoch. Assert the field before rewriting it so a layout change fails
+    // loudly here instead of silently testing nothing.
+    const EPOCH_OFFSET: usize = 2 + 2 + 1 + 16;
+    assert_eq!(
+        &forged_bytes[EPOCH_OFFSET..EPOCH_OFFSET + 8],
+        &2u64.to_be_bytes(),
+        "expected the epoch field at the computed FramedContent offset"
+    );
+    forged_bytes[EPOCH_OFFSET..EPOCH_OFFSET + 8].copy_from_slice(&1u64.to_be_bytes());
+    assert_eq!(
+        claimed_mls_epoch(&forged_bytes),
+        EpochId(1),
+        "the rewritten commit must claim the in-horizon past epoch"
+    );
+    let (local, _audit_dir, audit_path) = restarted_device_with_recorder(&f, "forged-epoch");
+    let forged = forged_rival_envelope(forged_bytes, &f.group_id);
+    assert_forged_rival_never_halts_at_ingest(
+        "case B (epoch surgery)",
+        &f,
+        local,
+        &audit_path,
+        forged,
+    )
+    .await;
 }

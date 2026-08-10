@@ -1003,19 +1003,14 @@ impl<S: StorageProvider> Engine<S> {
                     // An in-horizon rival commit refused convergence admission
                     // only because its fork-source anchor is gone SHOULD have
                     // been adjudicated by distributed convergence. Falling
-                    // through to the stale fallback would silently keep our
-                    // own (possibly losing) branch — permanent divergence
-                    // invisible to the app and to forensics. Fail closed
-                    // loudly instead, mirroring the materialization-time
-                    // missing-recovery-material precedent.
+                    // through to the stale fallback would retire the retained
+                    // row and leave our own (possibly losing) branch with
+                    // nothing recorded. Keep it loud and retained instead —
+                    // but derive no durable terminal state from it, because
+                    // `msg_epoch` is unauthenticated here by construction.
                     if pending_recovery.is_none() && convergence_refused_for_missing_anchor {
-                        return self.fail_closed_missing_fork_recovery_anchor(
-                            group_id,
-                            &msg.id,
-                            &openmls_msg,
-                            msg_epoch,
-                            current,
-                        );
+                        return self
+                            .unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current);
                     }
 
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
@@ -2294,105 +2289,74 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Fail-closed loud handling for an in-horizon rival commit whose
+    /// Loud, non-terminal handling for an in-horizon rival commit whose
     /// fork-source anchor snapshot is gone (pre-mechanism database, storage
     /// loss). The rival SHOULD have been adjudicated by distributed
-    /// convergence; without the anchor this device cannot adjudicate it, and
-    /// silently keeping its own (possibly losing) branch would be permanent
-    /// divergence invisible to the app and to forensics. Mirrors the
-    /// materialization-time missing-recovery-material halt in
-    /// `distributed_convergence` (`MissingRetainedAnchor` /
-    /// `MissingOwnCommitCheckpoint`): park the rival reconsiderable, write
-    /// the durable `unrecoverable` marker, audit the state change, and emit
-    /// `GroupUnrecoverable` so the app can surface repair. Canonical state is
-    /// left untouched.
+    /// convergence; without the anchor this device cannot adjudicate it
+    /// pairwise, and silently dropping it would leave the device on its own —
+    /// possibly losing — branch with nothing recorded anywhere. So: keep the
+    /// retained content row, record the refusal in the audit log, and schedule
+    /// the group so convergence gives the rival a verdict from canonical state.
+    /// Canonical state is left untouched here.
     ///
-    /// The marker and the park are ONE durable unit, and within it the marker
-    /// comes first. Parking demotes a row that arrived `Created` to
-    /// `ConvergenceDeferred`, which convergence admits to a pass but cannot use
-    /// to *open* one (`convergence_input::can_start_pass`). A park that
-    /// outlives a failed marker therefore halts nothing while removing the only
-    /// input that could re-derive the halt: the group stays `Stable` on a
-    /// possibly-losing branch, redelivery dedups against the parked row, and
-    /// stale-deferred retirement eventually terminalizes it — permanent
-    /// divergence manufactured by the halt's own error path. The convergence
-    /// coordinator's halt needs no transaction only because it persists no
-    /// disposition before its marker, so every input keeps the state that
-    /// re-derives the identical halt on the next run.
-    fn fail_closed_missing_fork_recovery_anchor(
+    /// # This seam derives NO durable terminal state, deliberately
+    ///
+    /// It used to. Reaching here means OpenMLS rejected the message with
+    /// `WrongEpoch`, and `validate_framing` — which raises that error — is the
+    /// FIRST statement of `decrypt_message`, strictly upstream of membership-tag
+    /// and signature verification. Nothing cryptographic has run, and nothing
+    /// could: the membership MAC needs the claimed epoch's membership key and
+    /// the signature covers that epoch's serialized group context, and both live
+    /// in the very anchor snapshot that is missing by precondition. `msg_epoch`
+    /// is therefore raw attacker input that no check downstream can ever
+    /// corroborate.
+    ///
+    /// A durable `unrecoverable` marker derived from it handed any group member
+    /// — or a removed member whose epoch snapshot is still retained, via the
+    /// snapshot-fallback peel — a fire-and-forget freeze: one parseable datagram
+    /// naming any in-horizon epoch for which the victim holds no anchor, and the
+    /// group is permanently un-ingestable, across restarts, exitable only by a
+    /// replacement Welcome or disband. Nothing about the victim's storage had to
+    /// be known; a device with a legitimate gap (`join_epoch == 0` legacy
+    /// records defeat the pre-membership carve-out) is exactly the target.
+    ///
+    /// Parking the rival `ConvergenceDeferred` keyed by `msg_epoch` was the same
+    /// defect one level down. That key is the row's `source_epoch`, and
+    /// `openmls_projection::historical_replay_start_epoch` takes the `min` over
+    /// unresolved rows to pick where a pass rewinds to — so the claimed epoch
+    /// would steer the convergence coordinator into its own
+    /// `MissingRetainedAnchor` halt on every later pass. The row this seam
+    /// leaves alone is the one ingest already persisted `Created` at
+    /// `current_epoch`: still retained, still pass-opening, but never a
+    /// historical rewind target chosen by an unauthenticated claim.
+    ///
+    /// # The local half is not lost
+    ///
+    /// "Our anchor set has a gap inside the rewind horizon" is a LOCAL fact with
+    /// zero attacker input, and it is the only half that could justify a hard
+    /// stop. Evaluating it belongs on a seam that reads no inbound bytes —
+    /// session open, i.e. the per-group full hydration behind
+    /// `Engine::ensure_hydrated`, alongside `sync_unrecoverable_halt_from_storage`.
+    /// Whether a gap there SHOULD hard-stop a group is a product decision and is
+    /// deliberately not made here.
+    fn unadjudicable_fork_rival_without_anchor(
         &mut self,
         group_id: GroupId,
         msg_id: &MessageId,
-        openmls_msg: &TransportMessage,
-        msg_epoch: EpochId,
         current: EpochId,
     ) -> Result<IngestOutcome, EngineError> {
-        // Schedule before the write, because both of its exits owe the group a
-        // pass. On commit, `Buffered` promises the parked rival a later replay;
-        // the post-repair convergence drain seeds it (see
-        // `IngestOutcome::Buffered` docs). On rollback the rival keeps the
-        // pass-opening `Created` row persisted outside this transaction, and the
-        // schedule is the only thing that tells the app to open the pass that
-        // re-derives this halt. The insert is idempotent and in-memory, so
-        // hoisting it costs the success path nothing.
+        // `Buffered` promises a later replay of the retained row, and
+        // applications open passes off `drain_pending_convergence_groups`, so
+        // the seam owes the group a schedule. The insert is idempotent and
+        // in-memory.
         self.schedule_pending_convergence_group(&group_id);
-        self.storage
-            .with_transaction(|storage| -> Result<(), EngineError> {
-                // Durable marker first: a crash after the commit still halts
-                // the group on the next session open via
-                // `sync_unrecoverable_halt_from_storage` (mdk#971).
-                let mut group = storage.get_group(&group_id)?;
-                if !group.unrecoverable {
-                    group.unrecoverable = true;
-                    storage.put_group(&group)?;
-                }
-                // Park the rival keyed by its source epoch, as replay requires,
-                // so a verified repair path can still reconsider it. This
-                // writes through `self.storage` rather than the passed handle
-                // because the helper needs engine state (the convergence clock,
-                // the audit sink); the `StorageProvider::with_transaction`
-                // contract makes those writes join this unit regardless.
-                self.persist_openmls_wire_message(
-                    openmls_msg,
-                    &group_id,
-                    msg_epoch,
-                    MessageState::ConvergenceDeferred,
-                )
-            })?;
         self.audit_group(
             &group_id,
-            crate::audit_helpers::message_state_changed_event(
-                hex::encode(msg_id.as_slice()),
-                MessageState::ConvergenceDeferred,
-                "fork_rival_missing_retained_anchor",
-            ),
+            marmot_forensics::AuditEventKind::Rejection {
+                msg_id: hex::encode(msg_id.as_slice()),
+                reason: "fork_rival_missing_retained_anchor".to_string(),
+            },
         );
-        // Durable state has committed. From here on the steps are in-memory
-        // transitions and queue pushes, infallible w.r.t. the backend.
-        let previous_state = self
-            .epoch_manager
-            .state(&group_id)
-            .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
-        self.epoch_manager.mark_unrecoverable(&group_id);
-        let epoch = self.epoch_manager.epoch(&group_id).unwrap_or(current);
-        // Same reason tag as the convergence coordinator's halt for this
-        // material (`canonicalization_error_tag(MissingRetainedAnchor)`); the
-        // ingest-time site is distinguished by the parked-rival row above and
-        // by the absence of a convergence-run context.
-        self.audit_group(
-            &group_id,
-            crate::audit_helpers::epoch_state_changed_event(
-                previous_state.as_deref(),
-                "unrecoverable",
-                epoch,
-                "missing_retained_anchor",
-                None,
-                None,
-            ),
-        );
-        self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
-            group_id: group_id.clone(),
-        });
         Ok(IngestOutcome::Buffered {
             group_id,
             epoch: current,
