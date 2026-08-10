@@ -32,14 +32,14 @@ fn generator_versions_track_the_renamed_output_contract() {
     assert!(
         generate_adversarial_reliability_family(7, 12)
             .iter()
-            .all(|case| case.generator_version == "2")
+            .all(|case| case.generator_version == "3")
     );
     for case in [
         generate_adversarial_reliability_offline_regression(7),
         generate_adversarial_reliability_sustained_regression(7),
         generate_adversarial_reliability_self_update_regression(7),
     ] {
-        assert_eq!(case.generator_version, "2-regression");
+        assert_eq!(case.generator_version, "3-regression");
     }
 }
 

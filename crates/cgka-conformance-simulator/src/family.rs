@@ -143,14 +143,17 @@ pub fn generate_convergence_e2e_delivery_family(
     let mut out = Vec::with_capacity(cases);
     for case_index in 0..cases {
         let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_C0A7 ^ ((case_index as u64) << 32));
+        let (scenario, mut expected_outcomes) =
+            convergence_e2e_delivery_case(&mut rng, case_index as u64);
+        push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
         out.push(GeneratedScenarioCase {
             family_name: "convergence-e2e-delivery/v1".into(),
-            generator_version: "1".into(),
+            generator_version: "2".into(),
             seed,
             case_index: case_index as u64,
             subject: GeneratedSubjectKind::Engine,
-            scenario: convergence_e2e_delivery_case(&mut rng, case_index as u64),
-            expected_outcomes: vec![],
+            scenario,
+            expected_outcomes,
         });
     }
     out
@@ -235,10 +238,11 @@ pub fn generate_adversarial_reliability_case(seed: u64, case_index: u64) -> Gene
     let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
     let (family_name, subject, mut scenario, mut expected_outcomes) =
         adversarial_reliability_case(&mut rng, case_index);
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "2".into(),
+        generator_version: "3".into(),
         seed,
         case_index,
         subject,
@@ -255,10 +259,11 @@ pub fn generate_adversarial_reliability_sustained_regression(seed: u64) -> Gener
     let (family_name, subject, mut scenario, mut expected_outcomes) =
         adversarial_reliability_sustained_mixed_traffic_with_rounds(&mut rng, case_index, 1);
     scenario.name = "adversarial-reliability/sustained-mixed-traffic/regression".into();
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "2-regression".into(),
+        generator_version: "3-regression".into(),
         seed,
         case_index,
         subject,
@@ -301,10 +306,11 @@ fn adversarial_reliability_regression_case(
     let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
     let (family_name, subject, mut scenario, mut expected_outcomes) = build(&mut rng, case_index);
     scenario.name = format!("{family_name}/regression");
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "2-regression".into(),
+        generator_version: "3-regression".into(),
         seed,
         case_index,
         subject,
@@ -1983,7 +1989,9 @@ fn adversarial_reliability_offline_retained_flood_with_rounds(
             client: "bob".into(),
         },
     ];
+    let mut bob_payloads = Vec::with_capacity(rounds + 1);
     for round in 0..rounds {
+        bob_payloads.push(format!("offline-flood-{case_index}-{round}"));
         steps.push(ScenarioStep::SendAppMessage {
             sender: "alice".into(),
             payload: format!("offline-flood-{case_index}-{round}"),
@@ -2027,7 +2035,15 @@ fn adversarial_reliability_offline_retained_flood_with_rounds(
         },
         tick(["bob"]),
     ]);
-    let expected = vec![clients_converged(["alice", "bob", "carol"], None, Some(3))];
+    bob_payloads.push(format!("membership-window-{case_index}"));
+    // Bob's full-history catch-up transcript is the arm's delivery claim: every
+    // flood payload plus the membership-window payload, in publication order,
+    // at the deterministic post-remove epoch.
+    let final_epoch = 3 + u64::try_from(rounds).expect("rounds fit u64");
+    let expected = vec![
+        clients_converged(["alice", "bob", "carol"], None, Some(3)),
+        client_state("bob", final_epoch, 3, bob_payloads),
+    ];
     (
         "adversarial-reliability/offline-retained-history-flood/v1".into(),
         GeneratedSubjectKind::RetainedRelay,
@@ -2078,11 +2094,15 @@ fn adversarial_reliability_sustained_mixed_traffic_with_rounds(
         clients.clone(),
         labels(["bob", "carol", "david"]),
     );
+    let mut carol_payloads = Vec::with_capacity(rounds * 3);
     for round in 0..rounds {
         let mut senders = labels(["alice", "bob", "carol", "david"]);
         let sender_count = senders.len();
         senders.rotate_left(rng.gen_range(0..sender_count));
         for sender in &senders {
+            if sender != "carol" {
+                carol_payloads.push(format!("mixed-{case_index}-{round}-{sender}"));
+            }
             steps.push(ScenarioStep::SendAppMessage {
                 sender: sender.clone(),
                 payload: format!("mixed-{case_index}-{round}-{sender}"),
@@ -2112,6 +2132,10 @@ fn adversarial_reliability_sustained_mixed_traffic_with_rounds(
         ScenarioStep::DeliverAll,
         tick(["bob", "carol", "david"]),
     ]);
+    // Carol never commits, so her transcript is the arm's delivery claim:
+    // every other sender's payload in send order, at the deterministic
+    // post-leave epoch.
+    let final_epoch = 2 + u64::try_from(rounds).expect("rounds fit u64");
     (
         "adversarial-reliability/sustained-mixed-traffic/v1".into(),
         GeneratedSubjectKind::Engine,
@@ -2122,7 +2146,10 @@ fn adversarial_reliability_sustained_mixed_traffic_with_rounds(
             topology: Default::default(),
             steps,
         },
-        vec![clients_converged(["alice", "bob", "carol"], None, Some(3))],
+        vec![
+            clients_converged(["alice", "bob", "carol"], None, Some(3)),
+            client_state("carol", final_epoch, 3, carol_payloads),
+        ],
     )
 }
 
@@ -2473,7 +2500,13 @@ fn adversarial_reliability_multi_group_noisy_neighbor(
             topology: Default::default(),
             steps,
         },
-        vec![clients_converged(["alice", "bob"], Some(1), Some(2))],
+        vec![
+            clients_converged(["alice", "bob"], Some(1), Some(2)),
+            // Bob sits only in the quiet group, so his transcript is the
+            // noisy-neighbor isolation claim: exactly the quiet-group payload
+            // and none of the noise.
+            client_state("bob", 1, 2, vec![format!("quiet-progress-{case_index}")]),
+        ],
     )
 }
 
@@ -2527,7 +2560,20 @@ fn adversarial_reliability_multi_device_account(
             topology,
             steps,
         },
-        vec![clients_converged_vec(clients, Some(1), Some(3))],
+        vec![
+            clients_converged_vec(clients, Some(1), Some(3)),
+            // Bob is the cross-account observer: both same-account device
+            // payloads must reach him in send order.
+            client_state(
+                "bob",
+                1,
+                3,
+                vec![
+                    format!("phone-{case_index}"),
+                    format!("laptop-{case_index}"),
+                ],
+            ),
+        ],
     )
 }
 
@@ -2602,7 +2648,21 @@ fn adversarial_reliability_app_witness_value(
         "adversarial-reliability/app-witness-value/v1".into(),
         GeneratedSubjectKind::Engine,
         scenario,
-        vec![clients_converged(["alice", "bob", "carol"], None, None)],
+        vec![
+            clients_converged(["alice", "bob", "carol"], None, None),
+            // Bob's branch carries two app witnesses against alice's one, so
+            // witness-decided selection deterministically keeps eve's and
+            // frank's payloads and never emits david's on carol.
+            client_state(
+                "carol",
+                2,
+                5,
+                vec![
+                    format!("eve-witness-{case_index}"),
+                    format!("frank-witness-{case_index}"),
+                ],
+            ),
+        ],
     )
 }
 
@@ -2707,7 +2767,12 @@ fn adversarial_reliability_clock_cursor_attack(
             topology: adversarial_reliability_single_relay_topology(&clients),
             steps,
         },
-        vec![clients_converged(["alice", "bob"], Some(1), Some(2))],
+        vec![
+            clients_converged(["alice", "bob"], Some(1), Some(2)),
+            // Reverse-ordered, duplicated relay history plus the year-long
+            // clock jump must still deliver the payload exactly once.
+            client_state("bob", 1, 2, vec![format!("before-clock-jump-{case_index}")]),
+        ],
     )
 }
 
@@ -2986,6 +3051,32 @@ fn confirmed(step_index: usize, client: &str, pending: &str) -> TraceExpectation
     }
 }
 
+/// Pin every scripted accepted labelled acknowledgement as a confirmed
+/// pending-resolution expectation. Scripted acknowledgements are pure
+/// functions of the case, so these expectations are delivery-schedule
+/// invariant, and they give the strict oracle its `CreateGroup` /
+/// `PublishConfirm` stimulus coverage without hand-maintained step indices.
+fn push_labelled_confirmation_expectations(
+    scenario: &ScenarioSpec,
+    expected: &mut Vec<TraceExpectation>,
+) {
+    for (step_index, step) in scenario.steps.iter().enumerate() {
+        let ScenarioStep::AcknowledgeOutbound {
+            client,
+            publication: Some(publication),
+            outcome: SubjectOutboundOutcome::Accepted,
+            ..
+        } = step
+        else {
+            continue;
+        };
+        let expectation = confirmed(step_index, client, publication);
+        if !expected.contains(&expectation) {
+            expected.push(expectation);
+        }
+    }
+}
+
 fn rolled_back(step_index: usize, client: &str, pending: &str) -> TraceExpectation {
     TraceExpectation::PendingResolution {
         step_index,
@@ -3048,7 +3139,10 @@ fn recovery_summary(
     }
 }
 
-fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {
+fn convergence_e2e_delivery_case(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = vec![
         "alice".to_string(),
         "bob".to_string(),
@@ -3141,13 +3235,62 @@ fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioS
         clients: vec!["carol".into(), "frank".into()],
     });
 
-    ScenarioSpec {
-        name: format!("convergence-e2e-delivery/v1/case-{case_index}"),
-        spec_version: "2".into(),
-        topology: Default::default(),
-        clients,
-        steps,
+    // Settle the founders on the canonical branch, then actively prove
+    // post-selection application delivery in every direction and exact
+    // canonical agreement. The mid-schedule observation above stays
+    // branch-dependent, and so does the selected branch itself: app-witness
+    // scoring can hand the win to either committer depending on the delivery
+    // schedule, and the losing branch's commits deliberately remain
+    // reconsiderable deferred candidates on non-committing clients. That makes
+    // final epoch/member-count and no-pending-work schedule-DEPENDENT, so this
+    // family pins agreement, exact equivalence, and active bidirectional
+    // decryptability instead of the standard strict reliability tail.
+    let founders = vec![
+        "alice".to_string(),
+        "bob".to_string(),
+        "carol".to_string(),
+        "frank".to_string(),
+    ];
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(ScenarioStep::Tick {
+        clients: founders.clone(),
+    });
+    for founder in &founders {
+        steps.push(accept_all_outbound(founder));
     }
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(ScenarioStep::Tick {
+        clients: founders.clone(),
+    });
+    steps.push(ScenarioStep::ProbeBidirectionalDecryptability {
+        clients: founders.clone(),
+    });
+    steps.push(ScenarioStep::ObserveExact {
+        clients: founders.clone(),
+    });
+
+    let expected = vec![
+        TraceExpectation::ClientsConverged {
+            clients: founders.clone(),
+            epoch: None,
+            member_count: None,
+        },
+        TraceExpectation::ClientsExactlyEquivalent {
+            clients: founders.clone(),
+        },
+        TraceExpectation::ClientsBidirectionallyDecryptable { clients: founders },
+    ];
+
+    (
+        ScenarioSpec {
+            name: format!("convergence-e2e-delivery/v1/case-{case_index}"),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients,
+            steps,
+        },
+        expected,
+    )
 }
 
 fn convergence_e2e_prefix_steps(case_index: u64) -> Vec<ScenarioStep> {

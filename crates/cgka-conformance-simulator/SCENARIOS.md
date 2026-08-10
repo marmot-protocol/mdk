@@ -499,10 +499,17 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `convergence-e2e-delivery/v1`
 
-- Generator: `generate_convergence_e2e_delivery_family`
-- Setup: the real-peeler invite-fork scenario runs with generated delivery mutations.
+- Generator: `generate_convergence_e2e_delivery_family` (generator version `2`).
+- Setup: the real-peeler invite-fork scenario runs with generated delivery mutations, then a settle tail delivers and
+  ticks the founders, accepts outstanding outbound work, runs an active bidirectional decryptability probe, and
+  observes the founders exactly.
 - Pressure: duplicate, delay, release, and reorder before observer clients tick.
-- Expected: observers converge on one selected branch and emit only the selected branch payload.
+- Expected: the mid-schedule observation stays branch-dependent, and so does the selected branch itself — app-witness
+  scoring can hand the win to either committer depending on the delivery schedule, and the losing branch's commits
+  deliberately remain reconsiderable deferred candidates on non-committing clients. The generated expectations
+  therefore pin the schedule-invariant claims: every scripted accepted acknowledgement confirms, the founders converge
+  and are exactly equivalent, and post-selection application traffic decrypts in every founder direction. Final
+  epoch/member-count and a whole-roster no-pending-work claim are deliberately not asserted.
 
 ### `admin-churn/v1`
 
@@ -644,7 +651,7 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### Adversarial Reliability Catalog
 
-`adversarial-reliability/v1` rotates through twelve deterministic workload shapes: retained-history offline floods;
+`adversarial-reliability/v1` (generator version `3`) rotates through twelve deterministic workload shapes: retained-history offline floods;
 sustained app/proposal/commit traffic; self-update versus admin progress; a named unrecoverable losing-branch invite;
 unequal relay reconciliation; restart boundaries plus the engine's real SIGKILL durable-phase matrix; multi-group noisy
 neighbors; replay-budget exhaustion; shared-account multi-device witnesses; full-engine app-witness A/B selection;
