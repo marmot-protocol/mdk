@@ -350,6 +350,18 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   terminal disposition). Fork-recovery paths fail closed with typed errors (`EngineError::ForkedEpoch` / `Backend`) —
   never `unreachable!`/`panic!` — on attacker-influenced input. When you add a guard to one seam, add it to the shared
   helper (or all seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
+- **Never derive durable terminal group state from unauthenticated inbound bytes.** "Fail closed" means refuse the
+  input, not punish the group. The `WrongEpoch` arm in `message_processor/ingest.rs` is the sharp case: OpenMLS raises
+  it from `validate_framing`, the FIRST statement of `decrypt_message`, strictly upstream of membership-tag and
+  signature verification — so the message's claimed epoch is raw attacker input there, and for a *past* epoch it is
+  unverifiable in principle (the membership key and the serialized group context that would authenticate it live in the
+  epoch snapshot this arm has already found missing). A durable `unrecoverable` marker written from that claim let any
+  member freeze a group with one fire-and-forget datagram. Retention, an audit row, and a scheduled convergence pass are
+  the correct response; the terminal verdict belongs to a seam that has authenticated material, which for missing
+  recovery material is the convergence coordinator's `MissingRetainedAnchor` halt. The same rule applies to durable
+  *inputs*: a stored row keyed by an unverified claimed epoch steers a later pass just as effectively as a flag. If a
+  hard stop is ever wanted for a genuine local anchor gap, evaluate that gap on a seam that reads no inbound bytes —
+  session open / per-group full hydration — not here.
 - **Commit-derived group records and capability caches are atomic with the MLS apply.** Every durable projection of
   an accepted commit must share the transaction that mutates OpenMLS state, and every projection read/write error
   must propagate. This includes the Marmot group record, capabilities extracted from added KeyPackages, and the
