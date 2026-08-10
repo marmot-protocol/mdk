@@ -29,6 +29,11 @@ SENDER_ACCOUNT_ID_HEX = "44" * 32
 INBOUND_TEXT = "ping from marmot"
 DETERMINISTIC_RESPONSE = f"marmot-e2e-ok: {INBOUND_TEXT}"
 PROTOCOL = "marmot.agent-control.v2"
+TOOL_RUNTIME_KWARGS = {
+    "task_id": "task-runtime-kwargs-regression",
+    "session_id": "session-runtime-kwargs-regression",
+    "future_runtime_kwarg": "probe",
+}
 
 
 async def read_json_line(reader: asyncio.StreamReader) -> dict[str, Any]:
@@ -177,12 +182,33 @@ def assert_plugin_discovery_registers_marmot_platform() -> None:
         raise AssertionError("Hermes plugin discovery did not register Marmot platform")
 
 
+def assert_registered_marmot_tools_accept_runtime_kwargs() -> None:
+    from tools.registry import registry
+
+    cases = (
+        ("marmot_history", {"group_id_hex": GROUP_ID_HEX}),
+        ("delete_marmot_message", {"message_id": MESSAGE_ID_HEX}),
+    )
+    for name, args in cases:
+        if registry.get_entry(name) is None:
+            raise AssertionError(f"Hermes plugin discovery did not register {name}")
+        raw = registry.dispatch(name, args, **TOOL_RUNTIME_KWARGS)
+        if not isinstance(raw, str):
+            raise AssertionError(f"{name} returned a non-string result: {type(raw).__name__}")
+        payload = json.loads(raw)
+        if "unexpected keyword argument" in raw:
+            raise AssertionError(f"{name} rejected Hermes runtime kwargs: {raw}")
+        if payload.get("ok") is not False or "error" not in payload:
+            raise AssertionError(f"{name} did not fail closed without a live gateway: {raw}")
+
+
 async def run() -> None:
     plugin_path = Path(os.environ.get("HERMES_HOME", "")) / "plugins" / "marmot" / "adapter.py"
     if not plugin_path.exists():
         raise SystemExit(f"plugin adapter not found: {plugin_path}")
 
     assert_plugin_discovery_registers_marmot_platform()
+    assert_registered_marmot_tools_accept_runtime_kwargs()
     module = load_marmot_adapter_module(plugin_path)
 
     from gateway.config import PlatformConfig

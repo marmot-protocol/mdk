@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Hermes Marmot `marmot_history` and `delete_marmot_message` tools now accept
+  Hermes ToolRegistry runtime keyword arguments (`task_id`, `session_id`, and
+  future dispatch metadata) instead of failing with `TypeError` during gateway
+  tool calls.
+
 ## [0.9.11] - 2026-08-09
 
 ### Added
