@@ -149,7 +149,7 @@
         "active all-pairs application decryptability",
         "durable accepted and invalidated commit dispositions"
       ],
-      "next": "Run the same logical topology through retained-history, app-runtime, process, container, and VM adapters with restart and delivery permutations."
+      "next": "Run the same logical topology through app-runtime, process, container, and VM adapters with restart and delivery permutations."
     },
     {
       "id": "convergence-committer-selected/v1",

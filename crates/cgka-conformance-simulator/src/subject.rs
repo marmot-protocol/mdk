@@ -876,13 +876,17 @@ impl EngineHarnessSubject {
             .ok_or_else(|| SubjectError::new("unknown_client", format!("unknown client {label}")))
     }
 
+    /// Selects the recipient ledger entry authenticated as the expected probe
+    /// sender, then normalizes that verified account identity to the scenario
+    /// client label used by decryptability edges. Exact observations retain the
+    /// ledger's source identity instead.
     fn attributed_probe_ledger(
         &self,
-        expected_client: &str,
+        expected_sender: &str,
         logical_id: &Option<String>,
         entries: &[ScenarioInputLedgerEntry],
     ) -> Option<ScenarioInputLedgerEntry> {
-        let authenticated_identity = self.authenticated_identity_by_client.get(expected_client)?;
+        let authenticated_identity = self.authenticated_identity_by_client.get(expected_sender)?;
         let mut entry = entries
             .iter()
             .find(|entry| {
@@ -890,7 +894,7 @@ impl EngineHarnessSubject {
                     && entry.sender == authenticated_identity.as_str()
             })?
             .clone();
-        entry.sender = expected_client.to_owned();
+        entry.sender = expected_sender.to_owned();
         Some(entry)
     }
 
@@ -2145,6 +2149,48 @@ mod tests {
         QuiescenceStatus, drive_subject_to_quiescence,
     };
 
+    fn account_topology(
+        labels: &[String],
+        account_for: impl Fn(&str) -> String,
+    ) -> crate::ScenarioTopologyV2 {
+        let accounts_by_client = labels
+            .iter()
+            .map(|client| (client.clone(), account_for(client)))
+            .collect::<BTreeMap<_, _>>();
+        crate::ScenarioTopologyV2 {
+            accounts: accounts_by_client
+                .values()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|id| crate::ScenarioAccountV2 {
+                    id,
+                    roles: vec!["member".into()],
+                })
+                .collect(),
+            devices: labels
+                .iter()
+                .map(|client| crate::ScenarioDeviceV2 {
+                    id: format!("device:{client}"),
+                    account: accounts_by_client[client].clone(),
+                    process: format!("process:{client}"),
+                    client: client.clone(),
+                })
+                .collect(),
+            processes: labels
+                .iter()
+                .map(|client| crate::ScenarioProcessV2 {
+                    id: format!("process:{client}"),
+                    binary_version: "mdk-test".into(),
+                    policy_version: "marmot-convergence-v1".into(),
+                    relays: vec![],
+                })
+                .collect(),
+            groups: vec![],
+            relays: vec![],
+        }
+    }
+
     #[test]
     fn sqlite_database_accounting_uses_real_sidecar_names() {
         assert_eq!(
@@ -2233,32 +2279,7 @@ mod tests {
     #[test]
     fn explicit_topology_shares_account_identity_across_devices() {
         let labels = vec!["alice-phone".to_owned(), "alice-laptop".to_owned()];
-        let topology = crate::ScenarioTopologyV2 {
-            accounts: vec![crate::ScenarioAccountV2 {
-                id: "account:alice".into(),
-                roles: vec!["member".into()],
-            }],
-            devices: labels
-                .iter()
-                .map(|client| crate::ScenarioDeviceV2 {
-                    id: format!("device:{client}"),
-                    account: "account:alice".into(),
-                    process: format!("process:{client}"),
-                    client: client.clone(),
-                })
-                .collect(),
-            processes: labels
-                .iter()
-                .map(|client| crate::ScenarioProcessV2 {
-                    id: format!("process:{client}"),
-                    binary_version: "mdk-test".into(),
-                    policy_version: "marmot-convergence-v1".into(),
-                    relays: vec![],
-                })
-                .collect(),
-            groups: vec![],
-            relays: vec![],
-        };
+        let topology = account_topology(&labels, |_| "account:alice".into());
         let subject = EngineHarnessSubject::new_with_topology(
             &labels,
             &topology,
@@ -2280,35 +2301,7 @@ mod tests {
     #[test]
     fn decryptability_probe_rejects_matching_logical_id_from_wrong_account() {
         let labels = vec!["alice".to_owned(), "bob".to_owned()];
-        let topology = crate::ScenarioTopologyV2 {
-            accounts: labels
-                .iter()
-                .map(|client| crate::ScenarioAccountV2 {
-                    id: format!("account:{client}"),
-                    roles: vec!["member".into()],
-                })
-                .collect(),
-            devices: labels
-                .iter()
-                .map(|client| crate::ScenarioDeviceV2 {
-                    id: format!("device:{client}"),
-                    account: format!("account:{client}"),
-                    process: format!("process:{client}"),
-                    client: client.clone(),
-                })
-                .collect(),
-            processes: labels
-                .iter()
-                .map(|client| crate::ScenarioProcessV2 {
-                    id: format!("process:{client}"),
-                    binary_version: "mdk-test".into(),
-                    policy_version: "marmot-convergence-v1".into(),
-                    relays: vec![],
-                })
-                .collect(),
-            groups: vec![],
-            relays: vec![],
-        };
+        let topology = account_topology(&labels, |client| format!("account:{client}"));
         let subject = EngineHarnessSubject::new_with_topology(
             &labels,
             &topology,
