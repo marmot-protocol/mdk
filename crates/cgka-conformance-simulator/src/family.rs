@@ -118,65 +118,72 @@ impl GeneratedScenarioCase {
 }
 
 pub fn generate_send_leave_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {
-    let mut out = Vec::with_capacity(cases);
-    for case_index in 0..cases {
-        let mut rng = StdRng::seed_from_u64(seed ^ ((case_index as u64) << 32));
-        let (mut scenario, mut expected_outcomes) = send_leave_case(&mut rng, case_index as u64);
-        add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
-        out.push(GeneratedScenarioCase {
-            family_name: "send-leave/v1".into(),
-            generator_version: "2".into(),
-            seed,
-            case_index: case_index as u64,
-            subject: GeneratedSubjectKind::Engine,
-            scenario,
-            expected_outcomes,
-        });
+    (0..cases)
+        .map(|case_index| generate_send_leave_case(seed, case_index as u64))
+        .collect()
+}
+
+/// Generate one send/leave case without regenerating earlier case indices.
+pub fn generate_send_leave_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ (case_index << 32));
+    let (mut scenario, mut expected_outcomes) = send_leave_case(&mut rng, case_index);
+    add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name: "send-leave/v1".into(),
+        generator_version: "2".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::Engine,
+        scenario,
+        expected_outcomes,
     }
-    out
 }
 
 pub fn generate_convergence_e2e_delivery_family(
     seed: u64,
     cases: usize,
 ) -> Vec<GeneratedScenarioCase> {
-    let mut out = Vec::with_capacity(cases);
-    for case_index in 0..cases {
-        let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_C0A7 ^ ((case_index as u64) << 32));
-        let (scenario, mut expected_outcomes) =
-            convergence_e2e_delivery_case(&mut rng, case_index as u64);
-        push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
-        out.push(GeneratedScenarioCase {
-            family_name: "convergence-e2e-delivery/v1".into(),
-            generator_version: "2".into(),
-            seed,
-            case_index: case_index as u64,
-            subject: GeneratedSubjectKind::Engine,
-            scenario,
-            expected_outcomes,
-        });
+    (0..cases)
+        .map(|case_index| generate_convergence_e2e_delivery_case(seed, case_index as u64))
+        .collect()
+}
+
+/// Generate one convergence-delivery case without regenerating earlier case indices.
+pub fn generate_convergence_e2e_delivery_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_C0A7 ^ (case_index << 32));
+    let (scenario, mut expected_outcomes) = convergence_e2e_delivery_case(&mut rng, case_index);
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name: "convergence-e2e-delivery/v1".into(),
+        generator_version: "2".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::Engine,
+        scenario,
+        expected_outcomes,
     }
-    out
 }
 
 pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {
-    let mut out = Vec::with_capacity(cases);
-    for case_index in 0..cases {
-        let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_1CE5 ^ ((case_index as u64) << 32));
-        let (mut scenario, mut expected_outcomes) =
-            convergence_chaos_case(&mut rng, case_index as u64);
-        add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
-        out.push(GeneratedScenarioCase {
-            family_name: "convergence-chaos/v1".into(),
-            generator_version: "6".into(),
-            seed,
-            case_index: case_index as u64,
-            subject: GeneratedSubjectKind::Engine,
-            scenario,
-            expected_outcomes,
-        });
+    (0..cases)
+        .map(|case_index| generate_convergence_chaos_case(seed, case_index as u64))
+        .collect()
+}
+
+/// Generate one convergence-chaos case without regenerating earlier case indices.
+pub fn generate_convergence_chaos_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_1CE5 ^ (case_index << 32));
+    let (mut scenario, mut expected_outcomes) = convergence_chaos_case(&mut rng, case_index);
+    add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name: "convergence-chaos/v1".into(),
+        generator_version: "6".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::Engine,
+        scenario,
+        expected_outcomes,
     }
-    out
 }
 
 /// Generate the admin-churn catalog ported from the external multi-VM harness
@@ -185,39 +192,42 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
 /// admin-policy commits, restart during a commit burst, and a latecomer added
 /// under commit pressure with a pre-join mailbox-isolation check.
 pub fn generate_admin_churn_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {
-    let mut out = Vec::with_capacity(cases);
-    for case_index in 0..cases {
-        let mut rng = StdRng::seed_from_u64(seed ^ 0xAD41_C4B2 ^ ((case_index as u64) << 32));
-        let (mut scenario, mut expected_outcomes) = admin_churn_case(&mut rng, case_index as u64);
-        if case_index % 4 == 3 {
-            // The latecomer arm scopes the pending-work oracle away from the
-            // joiner: a welcome-joined member currently retains its own join
-            // commit as a permanently deferred transport input, so the strict
-            // whole-roster oracle would flag every latecomer scenario.
-            add_scoped_reliability_oracle(
-                &mut scenario,
-                &mut expected_outcomes,
-                admin_churn_core_labels(),
-            );
-            // The joiner is not exempt from pending-work coverage: it must
-            // retain exactly its own deferred join commit and nothing else.
-            expected_outcomes.push(TraceExpectation::NoPendingWorkExceptRetainedJoinCommit {
-                client: "dave".into(),
-            });
-        } else {
-            add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
-        }
-        out.push(GeneratedScenarioCase {
-            family_name: "admin-churn/v1".into(),
-            generator_version: "1".into(),
-            seed,
-            case_index: case_index as u64,
-            subject: GeneratedSubjectKind::Engine,
-            scenario,
-            expected_outcomes,
+    (0..cases)
+        .map(|case_index| generate_admin_churn_case(seed, case_index as u64))
+        .collect()
+}
+
+/// Generate one admin-churn case without regenerating earlier case indices.
+pub fn generate_admin_churn_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xAD41_C4B2 ^ (case_index << 32));
+    let (mut scenario, mut expected_outcomes) = admin_churn_case(&mut rng, case_index);
+    if case_index % 4 == 3 {
+        // The latecomer arm scopes the pending-work oracle away from the
+        // joiner: a welcome-joined member currently retains its own join
+        // commit as a permanently deferred transport input, so the strict
+        // whole-roster oracle would flag every latecomer scenario.
+        add_scoped_reliability_oracle(
+            &mut scenario,
+            &mut expected_outcomes,
+            admin_churn_core_labels(),
+        );
+        // The joiner is not exempt from pending-work coverage: it must retain
+        // exactly its own deferred join commit and nothing else.
+        expected_outcomes.push(TraceExpectation::NoPendingWorkExceptRetainedJoinCommit {
+            client: "dave".into(),
         });
+    } else {
+        add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     }
-    out
+    GeneratedScenarioCase {
+        family_name: "admin-churn/v1".into(),
+        generator_version: "1".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::Engine,
+        scenario,
+        expected_outcomes,
+    }
 }
 
 /// Generate the adversarial reliability catalog. Case indices rotate through
