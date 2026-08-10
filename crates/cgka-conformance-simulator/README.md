@@ -474,6 +474,22 @@ the selected envelope bytes and the selected canonical Scenario IR inside it. An
 adapter to report and failure-capsule filenames so A/B runs cannot overwrite one another. Override runs do not mint a
 promotable vector candidate; only the generator-recorded subject may supply that adapter-neutral fixture.
 
+The fixed `cross-route-retained-history-recovery/v1` input uses the same envelope to pin the retained-relay adapter and
+the semantic oracle for the four-party cross-route regression. Run its strict encrypted-SQLite replay with:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --generated-input \
+  crates/cgka-conformance-simulator/vectors/generated-inputs/cross-route-retained-history-recovery.generated-input.json \
+  --out target/cross-route-retained-history --storage file --strict-oracle
+```
+
+That command enforces the saved input's portable state, recovery, profile, pending-work, and decryptability outcomes.
+The focused `cross_route_recovery_uses_retained_history_after_restart` Rust regression additionally owns the stable
+accepted/invalidated/accepted commit-disposition subset and exact retained-sync injection observations. Those checks
+remain harness-local because there is no portable relay-sync expectation and a complete ledger expectation would also
+pin unrelated probe ids and counters.
+
 The process adapter accepts the same saved input in place of a raw Scenario IR file:
 
 ```sh

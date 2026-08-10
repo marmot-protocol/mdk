@@ -256,8 +256,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "cutoff_boundary_admission and output_invalidation",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "convergence-committer-selected/v1, convergence-witness-selected/v1, and cross-route-own-commit-recovery/v1",
-            "The fixed vectors cover observer ingest and engine-level committer/observer equivalence, but not every external adapter.",
+            "convergence-committer-selected/v1, convergence-witness-selected/v1, cross-route-own-commit-recovery/v1, and cross-route-retained-history-recovery/v1",
+            "The fixed regressions cover observer ingest plus engine and retained-history committer/observer equivalence; app-runtime and distributed adapters remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -273,8 +273,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "The sibling-model mutant proves the witness distinguishes two abstract rules, not that production takes the adopted transition.",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1, pairwise_incumbent_defers_to_deeper_convergence_branch, and pairwise_candidate_win_leaves_old_incumbent_reconsiderable",
-            "The four-party engine scenario covers pairwise displacement followed by deeper-branch reconsideration; retained-history and external-adapter permutations remain open.",
+            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, pairwise_incumbent_defers_to_deeper_convergence_branch, and pairwise_candidate_win_leaves_old_incumbent_reconsiderable",
+            "The four-party engine and retained-history scenarios cover pairwise displacement followed by deeper-branch reconsideration; app-runtime, distributed, and durable-transition permutations remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -289,8 +289,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "selector_comparison_order and frozen_member_persistence",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1, stored convergence restart properties, and convergence-chaos/v1",
-            "The engine route now participates in a four-party committer-versus-observer comparison; external-adapter equivalence remains open.",
+            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, stored convergence restart properties, and convergence-chaos/v1",
+            "The engine and retained-history routes participate in a four-party committer-versus-observer comparison; app-runtime and distributed equivalence remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -305,8 +305,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "retained_history_expiration_boundary and frozen_member_persistence",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1, openmls_replay_probe, and replay-budget repair tests",
-            "Commit-addressed own-branch materialization now agrees with live pairwise routing in one engine topology; retained-history and external-adapter equivalence remain open.",
+            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, openmls_replay_probe, and replay-budget repair tests",
+            "Commit-addressed own-branch materialization agrees with live pairwise routing through engine and retained-history delivery; app-runtime and distributed equivalence remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -321,8 +321,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "retained_history_expiration_boundary and witness_sender_epoch_deduplication",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "retained-relay history equality and chat-journey/v1 offline profile",
-            "History recovery is exercised without the complete #1236 cross-route topology.",
+            "cross-route-retained-history-recovery/v1, retained-relay history equality, and chat-journey/v1 offline profile",
+            "The complete four-party topology now settles from retained history; multi-relay ordering, retention-boundary, and external-adapter permutations remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -334,8 +334,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "frozen_member_persistence and scheduler_deadline_rearm",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1, durable-phase kill matrix, and stored convergence restart properties",
-            "Encrypted-SQLite restart after pairwise displacement is covered, but every route transition and external adapter has not yet been crossed.",
+            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, durable-phase kill matrix, and stored convergence restart properties",
+            "Encrypted-SQLite restart after pairwise displacement is covered for engine and retained-history delivery, but every durable transition and external adapter has not yet been crossed.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -347,7 +347,7 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         ),
         mutation_sentinel: AssuranceOwnerV1::covered("output_invalidation"),
         campaign: AssuranceOwnerV1::partial(
-            "scenario-input ledgers and bidirectional decryptability probes, including cross-route-own-commit-recovery/v1",
+            "scenario-input ledgers and bidirectional decryptability probes, including both cross-route recovery regressions",
             "Selected and losing commits plus post-settlement probe traffic are accounted for; sender-visible application invalidation during branch replacement remains open.",
         ),
     },

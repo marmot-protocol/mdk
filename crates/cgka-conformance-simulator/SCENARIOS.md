@@ -112,8 +112,25 @@ These are the scenarios another implementation should be able to load from JSON 
   recovery rather than in-memory or epoch-addressed rollback.
 - Expected: all four clients select Zeta's depth-two branch at epoch 3, expose exact canonical cryptographic equality,
   retain accepted dispositions for the selected root and child plus an invalidated disposition for Alpha's root, have
-  no pending work, and decrypt active application probes in all twelve directions. Retained-history, app-runtime,
-  process, container, and VM permutations remain separate Milestone 6 evidence.
+  no pending work, and decrypt active application probes in all twelve directions. App-runtime, process, container,
+  and VM permutations remain separate Milestone 6 evidence.
+
+### `cross-route-retained-history-recovery/v1`
+
+- File: `vectors/generated-inputs/cross-route-retained-history-recovery.generated-input.json`
+- Subject: the saved input pins `retained_relay`; replay cannot silently substitute the fast in-process packet bus.
+- Setup: the same four participants and competing source-epoch profile commits as
+  `cross-route-own-commit-recovery/v1`, with an explicit one-relay deployment topology.
+- Pressure: relay visibility and incremental cursors give Yankee only Zeta's root, then give Zeta Alpha's competing
+  root while hiding Yankee's deeper child. Zeta restarts after pairwise displacement. The hidden events are then made
+  visible and every participant performs a full-history query, which is required because the earlier incremental
+  queries advanced beyond the temporarily hidden events.
+- Expected: the retained-history path reaches the same epoch-3 Zeta branch with exact canonical cryptographic equality,
+  accepted/invalidated/accepted commit dispositions, no pending work, and active decryptability in all twelve
+  directions. The regression also requires all four final full-history queries to inject retained objects, so a passing
+  result cannot be explained by the packet bus healing the delivery schedule. The saved input's portable outcomes own
+  the state, profile, recovery, pending-work, and decryptability contract; the focused Rust regression owns the
+  retained-injection observations and stable commit-disposition subset.
 
 ### `convergence-committer-selected/v1`
 

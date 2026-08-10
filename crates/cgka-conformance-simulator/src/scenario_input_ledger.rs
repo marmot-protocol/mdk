@@ -66,7 +66,12 @@ pub struct ScenarioInputLedgerEntry {
     /// Stable synthetic action id, never a transport or randomized MLS id.
     pub scenario_id: String,
     pub kind: ScenarioInputKind,
-    /// Stable scenario label when known, otherwise the sender identity hex.
+    /// Authenticated sender identity as observed by the ledger source.
+    ///
+    /// This is normally the scenario label, but explicit account topologies use
+    /// the account id and unknown identities fall back to hex. Decryptability
+    /// probe copies normalize a verified account id to the expected scenario
+    /// client label; exact-observation copies preserve this source identity.
     pub sender: String,
     /// Deterministic inner application-event id used only to correlate delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]

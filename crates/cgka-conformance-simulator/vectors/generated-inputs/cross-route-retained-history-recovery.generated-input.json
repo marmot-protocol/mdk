@@ -1,0 +1,292 @@
+{
+  "schema_version": "1",
+  "case": {
+    "family_name": "cross-route-retained-history-recovery/v1",
+    "generator_version": "fixed-regression/v1",
+    "seed": 0,
+    "case_index": 0,
+    "subject": "retained_relay",
+    "scenario": {
+      "name": "cross-route-retained-history-recovery/v1",
+      "spec_version": "2",
+      "clients": [
+        "zeta",
+        "alpha",
+        "yankee",
+        "observer"
+      ],
+      "topology": {
+        "accounts": [
+          { "id": "account:zeta" },
+          { "id": "account:alpha" },
+          { "id": "account:yankee" },
+          { "id": "account:observer" }
+        ],
+        "devices": [
+          {
+            "id": "device:zeta",
+            "account": "account:zeta",
+            "process": "process:zeta",
+            "client": "zeta"
+          },
+          {
+            "id": "device:alpha",
+            "account": "account:alpha",
+            "process": "process:alpha",
+            "client": "alpha"
+          },
+          {
+            "id": "device:yankee",
+            "account": "account:yankee",
+            "process": "process:yankee",
+            "client": "yankee"
+          },
+          {
+            "id": "device:observer",
+            "account": "account:observer",
+            "process": "process:observer",
+            "client": "observer"
+          }
+        ],
+        "processes": [
+          {
+            "id": "process:zeta",
+            "binary_version": "current",
+            "policy_version": "current",
+            "relays": ["relay:cross-route"]
+          },
+          {
+            "id": "process:alpha",
+            "binary_version": "current",
+            "policy_version": "current",
+            "relays": ["relay:cross-route"]
+          },
+          {
+            "id": "process:yankee",
+            "binary_version": "current",
+            "policy_version": "current",
+            "relays": ["relay:cross-route"]
+          },
+          {
+            "id": "process:observer",
+            "binary_version": "current",
+            "policy_version": "current",
+            "relays": ["relay:cross-route"]
+          }
+        ],
+        "relays": [
+          {
+            "id": "relay:cross-route",
+            "implementation_version": "retained-memory/v1",
+            "policy_version": "retain-all/v1"
+          }
+        ]
+      },
+      "steps": [
+        {
+          "type": "create_group",
+          "creator": "zeta",
+          "name": "cross-route",
+          "invitees": ["alpha", "yankee", "observer"],
+          "required_features": [],
+          "initial_admins": ["alpha", "yankee"],
+          "pending": "create"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "zeta",
+          "publication": "create",
+          "outcome": "accepted"
+        },
+        { "type": "deliver_all" },
+        {
+          "type": "tick",
+          "clients": ["alpha", "yankee", "observer"]
+        },
+        {
+          "type": "clear_events",
+          "clients": ["zeta", "alpha", "yankee", "observer"]
+        },
+        {
+          "type": "update_group_data",
+          "client": "zeta",
+          "name": "zeta-root",
+          "pending": "zeta-root"
+        },
+        {
+          "type": "update_group_data",
+          "client": "alpha",
+          "name": "alpha-root",
+          "pending": "alpha-root"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "zeta",
+          "publication": "zeta-root",
+          "outcome": "accepted"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alpha",
+          "publication": "alpha-root",
+          "outcome": "accepted"
+        },
+        {
+          "type": "set_relay_event_visibility",
+          "relay": "relay:cross-route",
+          "selector": {
+            "publication": "alpha-root",
+            "class": "commit"
+          },
+          "clients": ["yankee"],
+          "visible": false
+        },
+        {
+          "type": "sync_relay_history",
+          "clients": ["yankee"],
+          "sync": { "mode": "incremental" }
+        },
+        { "type": "tick", "clients": ["yankee"] },
+        {
+          "type": "update_group_data",
+          "client": "yankee",
+          "name": "zeta-branch-depth-two",
+          "pending": "zeta-child"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "yankee",
+          "publication": "zeta-child",
+          "outcome": "accepted"
+        },
+        {
+          "type": "set_relay_event_visibility",
+          "relay": "relay:cross-route",
+          "selector": {
+            "publication": "zeta-child",
+            "class": "commit"
+          },
+          "clients": ["zeta"],
+          "visible": false
+        },
+        {
+          "type": "sync_relay_history",
+          "clients": ["zeta"],
+          "sync": { "mode": "incremental" }
+        },
+        { "type": "tick", "clients": ["zeta"] },
+        { "type": "restart_client", "client": "zeta" },
+        {
+          "type": "set_relay_event_visibility",
+          "relay": "relay:cross-route",
+          "selector": {
+            "publication": "zeta-child",
+            "class": "commit"
+          },
+          "clients": ["zeta"],
+          "visible": true
+        },
+        {
+          "type": "set_relay_event_visibility",
+          "relay": "relay:cross-route",
+          "selector": {
+            "publication": "alpha-root",
+            "class": "commit"
+          },
+          "clients": ["yankee"],
+          "visible": true
+        },
+        {
+          "type": "sync_relay_history",
+          "clients": ["zeta", "alpha", "yankee", "observer"],
+          "sync": { "mode": "full_history" }
+        },
+        {
+          "type": "tick",
+          "clients": ["zeta", "alpha", "yankee", "observer"]
+        },
+        { "type": "await_quiescence" },
+        {
+          "type": "probe_bidirectional_decryptability",
+          "clients": ["zeta", "alpha", "yankee", "observer"]
+        },
+        {
+          "type": "observe_exact",
+          "clients": ["zeta", "alpha", "yankee", "observer"]
+        }
+      ]
+    },
+    "expected_outcomes": [
+      {
+        "type": "pending_resolution",
+        "step_index": 1,
+        "client": "zeta",
+        "pending": "create",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 7,
+        "client": "zeta",
+        "pending": "zeta-root",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 8,
+        "client": "alpha",
+        "pending": "alpha-root",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 13,
+        "client": "yankee",
+        "pending": "zeta-child",
+        "resolution": "confirmed"
+      },
+      { "type": "client_state", "client": "zeta", "epoch": 3, "member_count": 4 },
+      { "type": "client_state", "client": "alpha", "epoch": 3, "member_count": 4 },
+      { "type": "client_state", "client": "yankee", "epoch": 3, "member_count": 4 },
+      { "type": "client_state", "client": "observer", "epoch": 3, "member_count": 4 },
+      {
+        "type": "client_epoch_changes",
+        "client": "zeta",
+        "changes": [{ "from": 2, "to": 3 }]
+      },
+      {
+        "type": "client_recoveries",
+        "client": "alpha",
+        "count": 1,
+        "source_epoch": 1,
+        "recovered_epoch": 2,
+        "winner_differs_from_invalidated": true
+      },
+      {
+        "type": "recovery_summary",
+        "count": 1,
+        "source_epoch": 1,
+        "recovered_epoch": 2,
+        "winner_differs_from_invalidated": true
+      },
+      {
+        "type": "clients_exactly_equivalent",
+        "clients": ["zeta", "alpha", "yankee", "observer"]
+      },
+      {
+        "type": "group_profile",
+        "client": "zeta",
+        "name": "zeta-branch-depth-two",
+        "description": ""
+      },
+      {
+        "type": "clients_bidirectionally_decryptable",
+        "clients": ["zeta", "alpha", "yankee", "observer"]
+      },
+      {
+        "type": "no_pending_work",
+        "clients": ["zeta", "alpha", "yankee", "observer"]
+      }
+    ]
+  }
+}
