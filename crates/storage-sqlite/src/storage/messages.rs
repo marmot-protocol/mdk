@@ -61,19 +61,19 @@ impl MessageStorage for SqliteAccountStorage {
     }
 
     fn delete_message(&self, id: &MessageId) -> StorageResult<()> {
-        let delete = || {
-            self.lock()?
-                .execute(
-                    "DELETE FROM cgka_messages WHERE id = ?1",
-                    params![id.as_slice()],
-                )
-                .storage()?;
-            Ok(())
-        };
         if self.connection.is_current_thread_transaction_owner() {
-            delete()
+            let conn = self.lock()?;
+            delete_message_on_connection(&conn, id)
         } else {
-            retry_on_busy(delete)
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .storage()?;
+                delete_message_on_connection(&tx, id)?;
+                tx.commit().storage()?;
+                Ok(())
+            })
         }
     }
 
@@ -335,6 +335,22 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
+/// Delete a protocol message and its not-yet-acknowledged application event on
+/// the same connection/transaction so neither row can outlive the other.
+fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
+    conn.execute(
+        "DELETE FROM pending_application_events WHERE message_id = ?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    conn.execute(
+        "DELETE FROM cgka_messages WHERE id = ?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::SqliteAccountStorage;
@@ -415,12 +431,16 @@ mod tests {
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let message = sample_message(mid(1), gid(1), 0);
         store.put_message(&message).unwrap();
+        store
+            .put_pending_application_event(&application_event(message.id.clone()))
+            .unwrap();
 
         store.delete_message(&message.id).unwrap();
         assert!(matches!(
             store.get_message(&message.id),
             Err(StorageError::NotFound)
         ));
+        assert!(store.list_pending_application_events().unwrap().is_empty());
 
         store.put_message(&message).unwrap();
         assert_eq!(store.get_message(&message.id).unwrap(), message);
