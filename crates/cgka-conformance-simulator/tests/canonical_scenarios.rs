@@ -22,7 +22,7 @@ use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::MessageState;
@@ -2867,8 +2867,11 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         );
     }
 
-    let deferred_trace = ScenarioTrace {
-        name: "convergence-e2e/deferred-losing-transport".into(),
+    // The losing branch leaves nothing behind. Its transport object is peeled
+    // under its own branch state, adjudicated, and resolved, so both observers
+    // end the schedule fully quiescent.
+    let settled_trace = ScenarioTrace {
+        name: "convergence-e2e/settled-losing-transport".into(),
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
@@ -2878,19 +2881,19 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
             observe_client_exact("frank", &mut frank),
         ],
     };
-    for observation in &deferred_trace.observations {
+    for observation in &settled_trace.observations {
         let pending = observation
             .pending_work
             .as_ref()
             .expect("exact pending snapshot");
-        assert!(
-            pending.engine.stored_transport_deferred_messages > 0,
-            "{} should expose the retained unpeeled transport object: {pending:#?}",
+        assert_eq!(
+            pending.engine.stored_transport_deferred_messages, 0,
+            "{} should retain no unpeeled transport object: {pending:#?}",
             observation.client
         );
-        assert!(
-            pending.scenario_inputs_pending > 0,
-            "{} should expose the unresolved scenario input: {pending:#?}",
+        assert_eq!(
+            pending.scenario_inputs_pending, 0,
+            "{} should leave no unresolved scenario input: {pending:#?}",
             observation.client
         );
     }
@@ -2899,17 +2902,11 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         &[TraceExpectation::NoPendingWork {
             clients: vec!["carol".into(), "frank".into()],
         }],
-        &deferred_trace,
-    );
-    assert_eq!(
-        failures.len(),
-        2,
-        "each observer should fail quiescence while transport work remains: {failures:#?}"
+        &settled_trace,
     );
     assert!(
-        failures
-            .iter()
-            .all(|failure| failure.kind == "pending_work_remaining")
+        failures.is_empty(),
+        "both observers should reach quiescence: {failures:#?}"
     );
 }
 
@@ -2924,7 +2921,18 @@ async fn scenario_report_records_convergence_e2e_group_events() {
     assert!(report.invariant_failures.is_empty());
     assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
     assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
-    assert!(report.app_invalidation_observations.is_empty());
+    // Each observer retracts bob's losing-branch payload exactly once; the
+    // report must attribute both retractions.
+    assert_eq!(
+        report
+            .app_invalidation_observations
+            .iter()
+            .map(|invalidation| (invalidation.client.as_str(), invalidation.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("carol", "losing_branch"), ("frank", "losing_branch")],
+        "{:#?}",
+        report.app_invalidation_observations
+    );
     assert!(
         report
             .step_log
@@ -3102,20 +3110,48 @@ fn assert_tick_reached_convergence(
     );
 }
 
+/// Pins this client's application timeline across branch selection: exactly the
+/// selected branch's payload reaches the application, it is never taken back,
+/// and the rival branch's payload is retracted explicitly.
+///
+/// Branch-relative peel makes the rival branch's traffic decryptable under that
+/// branch's own state, so the losing payload is now decrypted and adjudicated
+/// instead of sitting undecryptable. That turns "no invalidation ever" into a
+/// live obligation: convergence owes the application a `LosingBranch`
+/// retraction for it.
 fn assert_canonical_application_event(
     client: &str,
     events: Vec<GroupEvent>,
     expected_payload: &[u8],
     losing_payload: &[u8],
 ) {
-    let received_payloads: Vec<Vec<u8>> = events
+    let delivered: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => {
-                Some(cgka_conformance_simulator::client::decode_harness_app_payload(payload))
-            }
+            GroupEvent::MessageReceived {
+                message_id,
+                payload,
+                ..
+            } => Some((
+                message_id,
+                cgka_conformance_simulator::client::decode_harness_app_payload(payload),
+            )),
             _ => None,
         })
+        .collect();
+    let retractions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::AppMessageInvalidated {
+                message_id, reason, ..
+            } => Some((message_id, *reason)),
+            _ => None,
+        })
+        .collect();
+
+    let received_payloads: Vec<Vec<u8>> = delivered
+        .iter()
+        .map(|(_, payload)| payload.clone())
         .collect();
     assert_eq!(
         received_payloads,
@@ -3128,11 +3164,28 @@ fn assert_canonical_application_event(
             .any(|payload| payload == losing_payload),
         "{client} should not receive losing branch payload: {events:?}"
     );
+    // A payload the application was shown and then lost is a failure here,
+    // retracted or not: on this schedule the selected branch is the only one
+    // that ever reaches delivery, so its delivery must stand. A schedule that
+    // legitimately delivers the rival branch first trips this by design.
+    for (message_id, _) in &delivered {
+        assert!(
+            !retractions
+                .iter()
+                .any(|(retracted, _)| retracted == message_id),
+            "{client} retracted a payload it had already delivered: {events:?}"
+        );
+    }
+    assert_eq!(
+        retractions.len(),
+        1,
+        "{client} should retract the losing branch payload exactly once: {events:?}"
+    );
     assert!(
-        !events
+        retractions
             .iter()
-            .any(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. })),
-        "{client} invalidations: {events:?}"
+            .all(|(_, reason)| matches!(reason, AppMessageInvalidationReason::LosingBranch)),
+        "{client} should retract only for losing-branch selection: {events:?}"
     );
     assert!(
         events.iter().any(|event| {
@@ -3149,12 +3202,15 @@ fn assert_canonical_application_event(
     );
 }
 
+/// Pins the settled branch every legacy observation in the convergence-E2E
+/// shape must report: alice's branch carries two invites to bob's one, so
+/// depth decides it for every observer that has been handed both.
 fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
     // The settle tail observes the founders with `observe_client_exact` after
     // canonical branch selection; those snapshots must agree with each other,
     // and the family's own `clients_exactly_equivalent` expectation carries
-    // the exact claim. The branch-shape match below applies to the
-    // mid-schedule legacy observations only.
+    // the exact claim. The branch-shape checks below apply to the legacy
+    // observations only.
     let settled = trace
         .observations
         .iter()
@@ -3170,32 +3226,53 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
         if observation.canonical_state.is_some() {
             continue;
         }
-        match observation.received_payloads.as_slice() {
-            [payload] if payload == "alice canonical payload" => {
-                assert_eq!(observation.epoch, 3);
-                assert_eq!(observation.member_count, 6);
-                assert_eq!(observation.added_members, vec!["david", "grace"]);
-                assert_eq!(
-                    observation.epoch_changes,
-                    vec![
-                        EpochChangeObservation { from: 1, to: 2 },
-                        EpochChangeObservation { from: 2, to: 3 },
-                    ]
-                );
-            }
-            [payload] if payload == "bob losing payload" => {
-                assert_eq!(observation.epoch, 2);
-                assert_eq!(observation.member_count, 5);
-                assert_eq!(observation.added_members, vec!["eve"]);
-                assert_eq!(
-                    observation.epoch_changes,
-                    vec![EpochChangeObservation { from: 1, to: 2 }]
-                );
-            }
-            _ => panic!("unexpected convergence trace observation: {observation:?}"),
+        // Every observer here has been handed both branches and ticked, so it
+        // has settled on the deeper one: alice's two invites, epoch 3, and her
+        // payload as the only application output.
+        assert_eq!(
+            observation.received_payloads,
+            vec!["alice canonical payload"],
+            "{observation:?}"
+        );
+        assert_eq!(observation.epoch, 3, "{observation:?}");
+        assert_eq!(observation.member_count, 6, "{observation:?}");
+        assert_eq!(
+            observation.epoch_changes,
+            vec![
+                EpochChangeObservation { from: 1, to: 2 },
+                EpochChangeObservation { from: 2, to: 3 },
+            ],
+            "{observation:?}"
+        );
+        // Whether the rival branch was adopted first is a delivery-order
+        // detail, so the membership claim is the net diff: anything withdrawn
+        // must be something this client had adopted, and what survives is
+        // exactly the selected branch's addition.
+        for removed in &observation.removed_members {
+            assert!(
+                observation.added_members.contains(removed),
+                "{observation:?}"
+            );
         }
-        assert!(observation.removed_members.is_empty());
-        assert!(observation.app_invalidations.is_empty());
+        let net_added: Vec<&str> = observation
+            .added_members
+            .iter()
+            .filter(|member| !observation.removed_members.contains(member))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(net_added, vec!["david", "grace"], "{observation:?}");
+        // Bob's payload decrypts under his own branch state, so it must be
+        // retracted rather than silently dropped.
+        let invalidation_reasons: Vec<&str> = observation
+            .app_invalidations
+            .iter()
+            .map(|invalidation| invalidation.reason.as_str())
+            .collect();
+        assert_eq!(
+            invalidation_reasons,
+            vec!["losing_branch"],
+            "{observation:?}"
+        );
     }
 }
 
