@@ -514,12 +514,95 @@ pub struct TransportEndpointReceipt {
     pub accepted_at: Option<Timestamp>,
 }
 
+/// Privacy-safe endpoint publish-rejection category.
+///
+/// Transport adapters may map wire-level rejection signals into this enum
+/// (for example authentication-required, policy-blocked, or invalid-payload).
+/// Only the category is retained; arbitrary remote suffix text is discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportEndpointRejectionCategory {
+    Duplicate,
+    Pow,
+    Blocked,
+    RateLimited,
+    Invalid,
+    Error,
+    Unsupported,
+    AuthRequired,
+    Restricted,
+}
+
+impl TransportEndpointRejectionCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::Pow => "pow",
+            Self::Blocked => "blocked",
+            Self::RateLimited => "rate-limited",
+            Self::Invalid => "invalid",
+            Self::Error => "error",
+            Self::Unsupported => "unsupported",
+            Self::AuthRequired => "auth-required",
+            Self::Restricted => "restricted",
+        }
+    }
+}
+
 /// Endpoint-level publish failure. The overall publish may still succeed if
 /// enough other endpoints acknowledge the message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportEndpointFailure {
     pub endpoint: TransportEndpoint,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_category: Option<TransportEndpointRejectionCategory>,
+}
+
+/// Publish failure surfaced by transport adapters.
+///
+/// `summary` is safe for `Display`/logging. Per-endpoint diagnostics live in
+/// `endpoint_failures` and may include endpoint identifiers only for structured
+/// telemetry boundaries that do not log them verbatim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportPublishFailure {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_failures: Vec<TransportEndpointFailure>,
+}
+
+impl TransportPublishFailure {
+    pub fn with_endpoint_failures(
+        summary: impl Into<String>,
+        endpoint_failures: Vec<TransportEndpointFailure>,
+    ) -> Self {
+        Self {
+            summary: summary.into(),
+            endpoint_failures,
+        }
+    }
+}
+
+impl std::fmt::Display for TransportPublishFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.summary)
+    }
+}
+
+/// Collapse identical publish failure summaries for user-facing `Display`.
+///
+/// Preserves first-seen order while dropping duplicates so multiple endpoints
+/// rejecting with the same sanitized category do not repeat in UI text.
+pub fn collapse_publish_failure_summaries<'a>(
+    reasons: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut unique = Vec::new();
+    for reason in reasons {
+        if !unique.contains(&reason) {
+            unique.push(reason);
+        }
+    }
+    unique.join("; ")
 }
 
 /// Aggregate publish result from a transport adapter.
@@ -635,11 +718,26 @@ pub enum TransportAdapterError {
     #[error("publish failed: {0}")]
     Publish(String),
 
+    /// Publish reached endpoints but every required acknowledgement failed.
+    /// `summary` is safe for `Display`/logging; per-endpoint diagnostics are
+    /// structured separately and may carry endpoint labels for non-log surfaces.
+    #[error("publish failed: {0}")]
+    PublishEndpoints(TransportPublishFailure),
+
     #[error("transport backend failure: {0}")]
     Backend(String),
 
     #[error("other transport adapter error: {0}")]
     Other(String),
+}
+
+impl TransportAdapterError {
+    pub fn publish_endpoint_failures(&self) -> &[TransportEndpointFailure] {
+        match self {
+            Self::PublishEndpoints(failure) => failure.endpoint_failures.as_slice(),
+            _ => &[],
+        }
+    }
 }
 
 /// Account-aware network adapter that moves wrapped transport messages.
@@ -819,6 +917,7 @@ mod tests {
                 .map(|i| TransportEndpointFailure {
                     endpoint: TransportEndpoint(format!("wss://failed-{i}.example")),
                     reason: "unreachable".into(),
+                    rejection_category: None,
                 })
                 .collect(),
             required_acks,
@@ -843,5 +942,29 @@ mod tests {
         assert!(report(1, 0, 1).met_required_acks());
         assert!(!report(1, 1, 2).met_required_acks());
         assert!(report(2, 0, 2).met_required_acks());
+    }
+
+    #[test]
+    fn collapse_publish_failure_summaries_dedupes_while_preserving_order() {
+        let collapsed = collapse_publish_failure_summaries([
+            "relay rejected event (blocked)",
+            "connect relay failed",
+            "relay rejected event (blocked)",
+        ]);
+        assert_eq!(
+            collapsed,
+            "relay rejected event (blocked); connect relay failed"
+        );
+    }
+
+    #[test]
+    fn endpoint_failure_deserializes_legacy_records_without_rejection_category() {
+        let failure: TransportEndpointFailure = serde_json::from_value(serde_json::json!({
+            "endpoint": "wss://relay.example",
+            "reason": "connect relay failed"
+        }))
+        .unwrap();
+
+        assert_eq!(failure.rejection_category, None);
     }
 }

@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
+  categories (for example `blocked` or `auth-required`) instead of repeating a
+  generic `relay rejected event` summary, while successful deletions still
+  clear only matching local KeyPackage publication metadata after at least one
+  relay acknowledgement.
 - Hermes Marmot `marmot_history` and `delete_marmot_message` tools now accept
   Hermes ToolRegistry runtime keyword arguments (`task_id`, `session_id`, and
   future dispatch metadata) instead of failing with `TypeError` during gateway
