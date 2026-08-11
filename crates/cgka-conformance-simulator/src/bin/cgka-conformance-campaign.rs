@@ -1,9 +1,6 @@
 use cgka_conformance_simulator::{
     GeneratedScenarioCase, GeneratedScenarioInputV1, HarnessStorageMode, ReportArgs, ReportInput,
-    ScenarioReport, generate_admin_churn_case, generate_adversarial_reliability_case,
-    generate_convergence_chaos_case, generate_convergence_e2e_delivery_case,
-    generate_send_leave_case, generate_stateful_chat_journey_case, resolve_scenario_input_bytes,
-    run_report,
+    ScenarioReport, generate_family_case, resolve_scenario_input_bytes, run_report,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -69,6 +66,17 @@ struct CaseArtifactPaths {
     sensitive_replay_capsule: PathBuf,
 }
 
+struct PlannedCase {
+    case: GeneratedScenarioCase,
+    paths: CaseArtifactPaths,
+    generated_input_bytes: Vec<u8>,
+}
+
+struct CaseArtifactInspection {
+    integrity_errors: Vec<String>,
+    database_bytes: Option<u64>,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -85,6 +93,8 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
     if args.worker {
         return run_worker(&args).await;
     }
+    let executable = std::env::current_exe()?;
+    let (summary_path, planned_cases) = preflight_campaign(&args)?;
     #[cfg(unix)]
     let _output_dir_guard = fs_private::prepare_directory_path(
         &args.out,
@@ -93,27 +103,14 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
     )?;
     #[cfg(not(unix))]
     fs_private::create_dir_all_private(&args.out)?;
-    let summary_path = args.out.join("process-campaign.v1.json");
-    ensure_path_absent(&summary_path)?;
-
-    let executable = std::env::current_exe()?;
     let mut observations = Vec::with_capacity(args.cases);
-    for case_index in 0..args.cases {
-        let case = generate_case(&args.family, args.seed, case_index)?;
-        let paths = case_artifact_paths(&args.out, &case);
-        for path in [
-            &paths.generated_input,
-            &paths.report,
-            &paths.fixture_candidate,
-            &paths.failure_capsule,
-            &paths.sensitive_replay_capsule,
-        ] {
-            ensure_path_absent(path)?;
-        }
-        fs_private::write_private(
-            &paths.generated_input,
-            &serde_json::to_vec_pretty(&GeneratedScenarioInputV1::new(case.clone()))?,
-        )?;
+    for (case_index, planned) in planned_cases.into_iter().enumerate() {
+        let PlannedCase {
+            case,
+            paths,
+            generated_input_bytes,
+        } = planned;
+        fs_private::write_private(&paths.generated_input, &generated_input_bytes)?;
         let mut command = Command::new(&executable);
         command
             .arg("--worker")
@@ -129,8 +126,7 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
         let started = Instant::now();
         let child = command.spawn()?;
         let usage = wait_with_usage(child, args.case_timeout)?;
-        let artifact_integrity_errors = inspect_case_artifacts(&case, &paths, &usage);
-        let database_bytes = read_database_bytes(&paths.report);
+        let inspection = inspect_case_artifacts(&case, &paths, &usage);
         observations.push(ProcessCaseMeasurementV1 {
             case_index,
             generated_input: paths.generated_input,
@@ -154,11 +150,11 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
             user_cpu_us: usage.user_cpu_us,
             system_cpu_us: usage.system_cpu_us,
             peak_rss_bytes: usage.peak_rss_bytes,
-            database_bytes,
+            database_bytes: inspection.database_bytes,
             filesystem_block_write_lower_bound_bytes: usage
                 .filesystem_block_write_lower_bound_bytes,
             unavailable_process_fields: usage.unavailable_process_fields,
-            artifact_integrity_errors,
+            artifact_integrity_errors: inspection.integrity_errors,
         });
     }
     let failed = observations.iter().any(|case| {
@@ -198,6 +194,7 @@ async fn run_worker(args: &Args) -> Result<ExitCode, Box<dyn Error>> {
         capture_sensitive_replay: args.capture_sensitive_replay,
     })
     .await?;
+    println!("{}", summary.to_human_text());
     let failed = summary.failed() > 0;
     Ok(if failed {
         ExitCode::FAILURE
@@ -206,19 +203,11 @@ async fn run_worker(args: &Args) -> Result<ExitCode, Box<dyn Error>> {
     })
 }
 
-fn read_database_bytes(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice::<ScenarioReport>(&bytes)
-        .ok()?
-        .campaign_measurements
-        .database_bytes
-}
-
 fn inspect_case_artifacts(
     case: &GeneratedScenarioCase,
     paths: &CaseArtifactPaths,
     usage: &ChildUsage,
-) -> Vec<String> {
+) -> CaseArtifactInspection {
     let mut errors = Vec::new();
     let input_bytes = match std::fs::read(&paths.generated_input) {
         Ok(bytes) => bytes,
@@ -244,42 +233,58 @@ fn inspect_case_artifacts(
         }
     };
 
+    let normally_exited = !usage.timed_out && usage.signal.is_none();
+    let report = match std::fs::read(&paths.report) {
+        Ok(bytes) => match serde_json::from_slice::<ScenarioReport>(&bytes) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                if normally_exited {
+                    errors.push(format!("report_invalid:{error}"));
+                }
+                None
+            }
+        },
+        Err(error) => {
+            if normally_exited {
+                errors.push(format!("report_unreadable:{error}"));
+            }
+            None
+        }
+    };
+    let database_bytes = report
+        .as_ref()
+        .and_then(|report| report.campaign_measurements.database_bytes);
+
     // A timeout or signal may interrupt the worker before it can publish a
     // report. A normally exiting worker, including a strict-oracle failure,
     // must leave a parseable report and fixture candidate.
-    if !usage.timed_out && usage.signal.is_none() {
-        match std::fs::read(&paths.report) {
-            Ok(bytes) => match serde_json::from_slice::<ScenarioReport>(&bytes) {
-                Ok(report) => {
-                    let generated = report.metadata.generated.as_ref();
-                    if generated.map(|value| {
-                        (
-                            value.family_name.as_str(),
-                            value.generator_version.as_str(),
-                            value.seed,
-                            value.case_index,
-                        )
-                    }) != Some((
-                        case.family_name.as_str(),
-                        case.generator_version.as_str(),
-                        case.seed,
-                        case.case_index,
-                    )) {
-                        errors.push("report_generated_metadata_mismatch".into());
-                    }
-                    if report
-                        .metadata
-                        .input_provenance
-                        .as_ref()
-                        .map(|value| value.source_sha256.as_str())
-                        != expected_source_sha256.as_deref()
-                    {
-                        errors.push("report_input_digest_mismatch".into());
-                    }
-                }
-                Err(error) => errors.push(format!("report_invalid:{error}")),
-            },
-            Err(error) => errors.push(format!("report_unreadable:{error}")),
+    if normally_exited {
+        if let Some(report) = report.as_ref() {
+            let generated = report.metadata.generated.as_ref();
+            if generated.map(|value| {
+                (
+                    value.family_name.as_str(),
+                    value.generator_version.as_str(),
+                    value.seed,
+                    value.case_index,
+                )
+            }) != Some((
+                case.family_name.as_str(),
+                case.generator_version.as_str(),
+                case.seed,
+                case.case_index,
+            )) {
+                errors.push("report_generated_metadata_mismatch".into());
+            }
+            if report
+                .metadata
+                .input_provenance
+                .as_ref()
+                .map(|value| value.source_sha256.as_str())
+                != expected_source_sha256.as_deref()
+            {
+                errors.push("report_input_digest_mismatch".into());
+            }
         }
         if !paths.fixture_candidate.is_file() {
             errors.push("fixture_candidate_missing".into());
@@ -289,7 +294,10 @@ fn inspect_case_artifacts(
             errors.push("failure_capsule_missing".into());
         }
     }
-    errors
+    CaseArtifactInspection {
+        integrity_errors: errors,
+        database_bytes,
+    }
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>> {
@@ -354,22 +362,31 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     })
 }
 
-fn generate_case(
-    family: &str,
-    seed: u64,
-    case_index: usize,
-) -> Result<GeneratedScenarioCase, Box<dyn Error>> {
-    let case_index = u64::try_from(case_index)?;
-    let case = match family {
-        "send-leave/v1" => generate_send_leave_case(seed, case_index),
-        "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_case(seed, case_index),
-        "convergence-chaos/v1" => generate_convergence_chaos_case(seed, case_index),
-        "admin-churn/v1" => generate_admin_churn_case(seed, case_index),
-        "adversarial-reliability/v1" => generate_adversarial_reliability_case(seed, case_index),
-        "chat-journey/v1" => generate_stateful_chat_journey_case(seed, case_index),
-        other => return Err(format!("unsupported family {other}").into()),
-    };
-    Ok(case)
+fn preflight_campaign(args: &Args) -> Result<(PathBuf, Vec<PlannedCase>), Box<dyn Error>> {
+    let summary_path = args.out.join("process-campaign.v1.json");
+    ensure_path_absent(&summary_path)?;
+    let mut planned_cases = Vec::with_capacity(args.cases);
+    for case_index in 0..args.cases {
+        let case = generate_family_case(&args.family, args.seed, u64::try_from(case_index)?)?;
+        let paths = case_artifact_paths(&args.out, &case);
+        for path in [
+            &paths.generated_input,
+            &paths.report,
+            &paths.fixture_candidate,
+            &paths.failure_capsule,
+            &paths.sensitive_replay_capsule,
+        ] {
+            ensure_path_absent(path)?;
+        }
+        let generated_input_bytes =
+            serde_json::to_vec_pretty(&GeneratedScenarioInputV1::new(case.clone()))?;
+        planned_cases.push(PlannedCase {
+            case,
+            paths,
+            generated_input_bytes,
+        });
+    }
+    Ok((summary_path, planned_cases))
 }
 
 fn case_artifact_paths(out: &Path, case: &GeneratedScenarioCase) -> CaseArtifactPaths {
@@ -604,7 +621,7 @@ mod tests {
             "adversarial-reliability/v1",
             "chat-journey/v1",
         ] {
-            let case = generate_case(family, 42, 3).expect("family case generates");
+            let case = generate_family_case(family, 42, 3).expect("family case generates");
             assert_eq!(case.seed, 42);
             assert_eq!(case.case_index, 3);
             let legacy_prefix_case = match family {
@@ -645,7 +662,7 @@ mod tests {
 
     #[test]
     fn case_artifacts_use_the_report_cli_stem() {
-        let case = generate_case("convergence-chaos/v1", 42, 3).expect("case generates");
+        let case = generate_family_case("convergence-chaos/v1", 42, 3).expect("case generates");
         let paths = case_artifact_paths(Path::new("out"), &case);
         let stem = "convergence-chaos-v1-seed-42-case-3";
         assert_eq!(
@@ -657,6 +674,31 @@ mod tests {
             paths.fixture_candidate,
             Path::new("out").join(format!("{stem}-fixture.v1.json"))
         );
+    }
+
+    #[test]
+    fn preflight_rejects_an_unknown_family_without_creating_output() {
+        let temp = tempfile::tempdir().expect("temporary campaign root");
+        let out = temp.path().join("not-created");
+        let args = parse_args(
+            [
+                "--family",
+                "unknown/v1",
+                "--cases",
+                "1",
+                "--out",
+                out.to_str().expect("UTF-8 test path"),
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("arguments parse");
+        let error = preflight_campaign(&args)
+            .err()
+            .expect("unknown family must fail")
+            .to_string();
+        assert!(error.contains("unsupported family unknown/v1"));
+        assert!(!out.exists());
     }
 
     #[cfg(unix)]

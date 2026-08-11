@@ -18,6 +18,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::fmt;
 
 pub const GENERATED_SCENARIO_INPUT_SCHEMA_VERSION: &str = "1";
 
@@ -115,6 +116,44 @@ impl GeneratedScenarioCase {
             expected_outcomes: self.expected_outcomes.clone(),
         }
     }
+}
+
+/// Error returned when a generated-family name is not registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedGeneratedFamily {
+    family: String,
+}
+
+impl fmt::Display for UnsupportedGeneratedFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unsupported family {}", self.family)
+    }
+}
+
+impl std::error::Error for UnsupportedGeneratedFamily {}
+
+/// Generate one indexed case from any registered scenario family.
+pub fn generate_family_case(
+    family: &str,
+    seed: u64,
+    case_index: u64,
+) -> Result<GeneratedScenarioCase, UnsupportedGeneratedFamily> {
+    let case = match family {
+        "send-leave/v1" => generate_send_leave_case(seed, case_index),
+        "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_case(seed, case_index),
+        "convergence-chaos/v1" => generate_convergence_chaos_case(seed, case_index),
+        "admin-churn/v1" => generate_admin_churn_case(seed, case_index),
+        "adversarial-reliability/v1" => generate_adversarial_reliability_case(seed, case_index),
+        "chat-journey/v1" => {
+            crate::stateful_generator::generate_stateful_chat_journey_case(seed, case_index)
+        }
+        other => {
+            return Err(UnsupportedGeneratedFamily {
+                family: other.to_owned(),
+            });
+        }
+    };
+    Ok(case)
 }
 
 pub fn generate_send_leave_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {

@@ -163,10 +163,13 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
   --family convergence-chaos/v1 --seed 42 --cases 22 --case-timeout-secs 300 \
   --out target/cgka-convergence-chaos-process-campaign --storage file
+```
 
-# Use a new output directory for each run. The runner refuses to overwrite a
-# prior summary, generated input, report, fixture, or failure capsule.
+Use a new output directory for each ad-hoc run. The runner refuses to overwrite a prior summary, generated input,
+report, fixture, or failure capsule. The committed `adversarial-reliability-ci` and `convergence-weekly-lane` gates
+remove their fixed output directories before invoking the runner, so those recipes remain rerunnable.
 
+```sh
 # Test-only one-variable policy curves around fixed retained inputs/horizons.
 cargo test -p cgka-conformance-simulator --features test-policy-overrides \
   --test policy_sweeps
