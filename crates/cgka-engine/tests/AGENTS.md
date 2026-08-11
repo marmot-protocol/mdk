@@ -27,6 +27,13 @@ cargo insta review
 `MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted file-backed
 backend on the same rail.
 
+**Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
+production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
+carries no epoch hint, so a device that never entered that epoch state reads opaque bytes. Tests whose subject is
+*what a device can see* must opt into `support::epoch_sealed_peeler::EpochSealedPeeler`, which models that sealing
+(`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
+epoch-scoped readability; `MockPeeler` stays right for everything else.
+
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation; `Box<dyn CgkaEngine>` witness
 
@@ -96,6 +103,11 @@ backend on the same rail.
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
+
+- **File:** `epoch_sealed_transport.rs`
+  - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
+    model's own semantics plus the fork shapes that only appear when post-fork traffic on an unadopted branch is
+    unreadable
 
 - **File:** `audit_log.rs`
   - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and no-op default behavior
