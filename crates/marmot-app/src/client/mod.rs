@@ -118,6 +118,10 @@ pub struct AppClient {
     /// (see `Self::drain_epoch_stall_escalations`).
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Batch-start local-deletion frontiers crossed by authenticated fresh
+    /// activity. They remain pending until the crossing projection and marker
+    /// clears commit in the same account-state transaction.
+    pub(crate) pending_local_group_deletion_frontier_clears: HashMap<String, u64>,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -2127,7 +2131,9 @@ impl AppClient {
             // the primary error.
             self.observe_send_applied_effects_best_effort(&effects)
                 .await;
-            if let Err(_save_err) = self.app.save_state(&self.state) {
+            if let Err(_save_err) =
+                self.save_state_with_pending_local_group_deletion_frontier_clears()
+            {
                 tracing::warn!(
                     target: "marmot_app::messages",
                     method = "send_app_event_with_local_projection",
@@ -2178,7 +2184,7 @@ impl AppClient {
         // Best-effort: a projection failure must not fail a completed publish.
         self.observe_send_applied_effects_best_effort(&effects)
             .await;
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,

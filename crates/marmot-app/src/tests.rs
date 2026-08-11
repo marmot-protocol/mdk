@@ -5836,7 +5836,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
         routes,
         HashSet::from([
             (
-                hex::decode(old_route.nostr_group_id_hex).unwrap(),
+                hex::decode(&old_route.nostr_group_id_hex).unwrap(),
                 vec![TransportEndpoint("wss://old.example".to_owned())],
             ),
             (
@@ -5852,41 +5852,173 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
     );
 
     let sender = app.account_home().account("alice").unwrap().account_id_hex;
+    let fresh_payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Chat {
+                content: "fresh activity".to_owned(),
+            },
+            &sender,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let fresh = reopened
         .runtime
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: crate::messages::encode_inner_event(
-                &build_inner_event(
-                    &AppMessageIntent::Chat {
-                        content: "fresh activity".to_owned(),
-                    },
-                    &sender,
-                    unix_now_seconds(),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            payload: fresh_payload.clone(),
         })
         .await
         .unwrap();
     assert!(fresh.failures.is_empty());
-    assert!(
-        app.account_storage("alice")
-            .unwrap()
-            .clear_local_group_deletion_frontier_if_message_is_newer(
-                &group_id_hex,
-                &fresh.reports[0].message_id,
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: fresh.reports[0].message_id.clone(),
+            sender: MemberId::new(hex::decode(&sender).unwrap()),
+            epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
+            payload: fresh_payload,
+            retention: None,
+        }],
+        ..Default::default()
+    };
+    let summary = reopened
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    assert_eq!(summary.messages[0].plaintext, "fresh activity");
+
+    let resurrected = app.group("alice", &group_id_hex).unwrap().unwrap();
+    assert_eq!(
+        resurrected
+            .prior_nostr_routes
+            .iter()
+            .map(|route| (route.nostr_group_id_hex.clone(), route.relays.clone()))
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            (
+                old_route.nostr_group_id_hex,
+                vec!["wss://old.example".to_owned()],
+            ),
+            (
+                hex::encode([0x22; 32]),
+                vec!["wss://current.example".to_owned()],
+            ),
+        ]),
+        "resurrection must adopt the exact retained route history before clearing the marker",
+    );
+    let resurrected_routes = reopened
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group_id)
+        .map(|route| (route.transport_group_id, route.endpoints))
+        .collect::<HashSet<_>>();
+    assert_eq!(resurrected_routes, routes);
+}
+
+#[tokio::test]
+async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
+    for fresh_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("batch frontier", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+        let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
+
+        let historical_payload = crate::messages::encode_inner_event(
+            &build_inner_event(
+                &AppMessageIntent::Chat {
+                    content: "historical".to_owned(),
+                },
+                &sender_hex,
+                unix_now_seconds(),
             )
             .unwrap(),
-        "fresh activity after restart must cross the local-deletion frontier",
-    );
-    reopened.refresh_group(&group_id);
-    app.save_state(&reopened.state).unwrap();
-    assert!(
-        app.group("alice", &group_id_hex).unwrap().is_some(),
-        "new authenticated activity must still be able to resurrect the projection",
-    );
+        )
+        .unwrap();
+        let historical = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: historical_payload.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(historical.failures.is_empty());
+        assert!(client.delete_group_local(&group_id).await.unwrap());
+
+        let fresh_payload = crate::messages::encode_inner_event(
+            &build_inner_event(
+                &AppMessageIntent::Chat {
+                    content: "fresh".to_owned(),
+                },
+                &sender_hex,
+                unix_now_seconds(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let fresh = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: fresh_payload.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(fresh.failures.is_empty());
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        let historical_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: historical.reports[0].message_id.clone(),
+            sender: sender.clone(),
+            epoch,
+            payload: historical_payload,
+            retention: None,
+        };
+        let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: fresh.reports[0].message_id.clone(),
+            sender,
+            epoch,
+            payload: fresh_payload,
+            retention: None,
+        };
+        let effects = marmot_account::AccountDeviceEffects {
+            events: if fresh_first {
+                vec![fresh_event, historical_event]
+            } else {
+                vec![historical_event, fresh_event]
+            },
+            ..Default::default()
+        };
+
+        let summary = client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.messages.len(), 1, "fresh_first={fresh_first}");
+        assert_eq!(summary.messages[0].plaintext, "fresh");
+        assert!(app.group("alice", &group_id_hex).unwrap().is_some());
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .local_group_deletion_frontier(&group_id_hex)
+                .unwrap(),
+            None,
+        );
+    }
 }
 
 #[test]

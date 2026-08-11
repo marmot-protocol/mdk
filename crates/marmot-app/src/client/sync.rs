@@ -208,7 +208,7 @@ impl AppClient {
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
         if self.refresh_group_routes()? {
-            self.app.save_state(&self.state)?;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         let rebuild_since_secs = self
             .relay_plane
@@ -281,14 +281,28 @@ impl AppClient {
         // (see `schema_valid_message_ids`).
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
-        self.clear_local_group_deletion_frontiers_for_new_activity(
-            effects,
-            &source_message_id_hex,
-            source_received_at,
-        )?;
+        let local_group_deletion_frontiers =
+            self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
         for event in &effects.events {
-            if let Some(changed) = self.suppress_local_deleted_group_event(event)? {
+            let batch_start_frontier = event_group_id(event)
+                .and_then(|group_id| {
+                    local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
+                })
+                .copied();
+            let crosses_frontier = match batch_start_frontier {
+                Some(frontier) => self.local_deleted_group_event_crosses_frontier(
+                    event,
+                    frontier,
+                    &source_message_id_hex,
+                    source_received_at,
+                )?,
+                None => false,
+            };
+            if !crosses_frontier
+                && let Some(changed) =
+                    self.suppress_local_deleted_group_event(event, batch_start_frontier)?
+            {
                 routes_dirty |= changed;
                 continue;
             }
@@ -322,6 +336,12 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
+            if crosses_frontier {
+                self.prepare_local_group_deletion_frontier_clear(
+                    event,
+                    batch_start_frontier.expect("crossing event has a frontier"),
+                )?;
+            }
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
@@ -334,7 +354,7 @@ impl AppClient {
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -505,7 +525,7 @@ impl AppClient {
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -572,7 +592,7 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         Ok(summary)
     }
 
@@ -610,7 +630,7 @@ impl AppClient {
             // that window would otherwise tear the durable membership change
             // from its app-state row, and the consumed welcome is never
             // re-emitted to repair it.
-            self.app.save_state(&self.state)?;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
 
         // Publishing here is incidental work triggered by the inbound
@@ -805,7 +825,7 @@ impl AppClient {
     /// operation and therefore does not mutate the detector's debounce state.
     pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, AppError> {
         if self.refresh_group_routes()? {
-            self.app.save_state(&self.state)?;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         // Caller-directed repair is a fresh transport preparation, not an
         // assumption that startup ordering already installed the signer and
@@ -868,7 +888,7 @@ impl AppClient {
             self.sync_runtime_groups().await?;
         }
         self.prune_plaintext_retention_for_group(group_id)?;
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if publish_new_message_notification {
             self.publish_notification_trigger_best_effort(
                 group_id,
@@ -880,73 +900,122 @@ impl AppClient {
         Ok(summary)
     }
 
-    /// Clear durable local-delete markers only for a fresh authenticated rejoin
-    /// or a causally newer, fully valid inbound chat message. This runs for both
-    /// direct transport ingest and session-drained buffered effects so those
-    /// seams cannot diverge.
-    fn clear_local_group_deletion_frontiers_for_new_activity(
+    /// Snapshot each affected group's durable local-delete frontier before any
+    /// event in the effects batch mutates projection state. Every event is then
+    /// classified against this same authority, independent of batch order.
+    fn local_group_deletion_frontiers_at_batch_start(
         &self,
         effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<HashMap<String, u64>, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let mut frontiers = HashMap::new();
+        let mut seen_group_ids = HashSet::new();
+        for event in &effects.events {
+            let Some(group_id) = event_group_id(event) else {
+                continue;
+            };
+            let group_id_hex = hex::encode(group_id.as_slice());
+            if !seen_group_ids.insert(group_id_hex.clone()) {
+                continue;
+            }
+            if let Some(frontier) = storage.local_group_deletion_frontier(&group_id_hex)? {
+                frontiers.insert(group_id_hex, frontier);
+            }
+        }
+        Ok(frontiers)
+    }
+
+    fn local_deleted_group_event_crosses_frontier(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+        frontier: u64,
         source_message_id_hex: &str,
         source_received_at: u64,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
+        let Some(group_id) = event_group_id(event) else {
+            return Ok(false);
+        };
+        if self
+            .runtime
+            .group_record(group_id)
+            .is_ok_and(|group| group.removed || group.disbanded.is_some())
+        {
+            return Ok(false);
+        }
+        if matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }) {
+            return Ok(true);
+        }
+        let cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id,
+            message_id,
+            sender,
+            epoch,
+            payload,
+            retention,
+        } = event
+        else {
+            return Ok(false);
+        };
         // One delivery can release buffered effects for several groups, so its
         // outer timestamp is not valid provenance for every event in the batch.
         // The authenticated engine message id resolves to a durable local ingress
         // order. Strict app decoding then prevents malformed or sender-mismatched
         // payloads from resurrecting a deliberately hidden group.
-        let storage = self.app.account_storage(&self.state.label)?;
-        for event in &effects.events {
-            if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } = event {
-                // A newly authenticated Welcome supersedes any deletion marker
-                // retained from an earlier removed copy of the same MLS group.
-                storage.clear_local_group_deletion_frontier(&hex::encode(group_id.as_slice()))?;
-                continue;
-            }
-            let cgka_traits::engine::GroupEvent::MessageReceived {
-                group_id,
-                message_id,
-                sender,
-                epoch,
-                payload,
-                retention,
-            } = event
-            else {
-                continue;
-            };
-            let group_id_hex = hex::encode(group_id.as_slice());
-            if storage
-                .local_group_deletion_frontier(&group_id_hex)?
-                .is_none()
-            {
-                continue;
-            }
-            let sender_hex = hex::encode(sender.as_slice());
-            let Some(message) = decode_received_event(
-                payload,
-                &sender_hex,
-                None,
-                group_id,
-                epoch.0,
-                *retention,
-                source_message_id_hex,
-                source_received_at,
-                None,
-                self.app.allow_loopback_blob_endpoints(),
-            ) else {
-                continue;
-            };
-            if message.kind != MARMOT_APP_EVENT_KIND_CHAT {
-                continue;
-            }
-            storage.clear_local_group_deletion_frontier_if_message_is_newer(
-                &group_id_hex,
-                message_id,
-            )?;
+        let sender_hex = hex::encode(sender.as_slice());
+        let Some(message) = decode_received_event(
+            payload,
+            &sender_hex,
+            None,
+            group_id,
+            epoch.0,
+            *retention,
+            source_message_id_hex,
+            source_received_at,
+            None,
+            self.app.allow_loopback_blob_endpoints(),
+        ) else {
+            return Ok(false);
+        };
+        if message.kind != MARMOT_APP_EVENT_KIND_CHAT {
+            return Ok(false);
         }
+        let group_id_hex = hex::encode(group_id.as_slice());
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .local_group_deletion_message_is_newer_than(&group_id_hex, message_id, frontier)?)
+    }
+
+    fn prepare_local_group_deletion_frontier_clear(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+        frontier: u64,
+    ) -> Result<(), AppError> {
+        let Some(group_id) = event_group_id(event) else {
+            return Ok(());
+        };
+        if !self.adopt_local_deleted_group_prior_routes(group_id)? {
+            return Ok(());
+        }
+        self.pending_local_group_deletion_frontier_clears
+            .entry(hex::encode(group_id.as_slice()))
+            .or_insert(frontier);
         Ok(())
     }
 
+    pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(
+        &mut self,
+    ) -> Result<(), AppError> {
+        let frontiers_to_clear = self
+            .pending_local_group_deletion_frontier_clears
+            .iter()
+            .map(|(group_id_hex, frontier)| (group_id_hex.clone(), *frontier))
+            .collect::<Vec<_>>();
+        self.app
+            .save_state_clearing_local_group_deletion_frontiers(&self.state, &frontiers_to_clear)?;
+        self.pending_local_group_deletion_frontier_clears.clear();
+        Ok(())
+    }
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -969,13 +1038,27 @@ impl AppClient {
         // ONE pass after the loop. The previous per-message `retain` was O(n) per
         // gossip event → O(n²) over a batch a relay could flood with kind-448s.
         let mut gossip_message_ids: HashSet<String> = HashSet::new();
-        self.clear_local_group_deletion_frontiers_for_new_activity(
-            effects,
-            source_message_id_hex,
-            source_received_at,
-        )?;
+        let local_group_deletion_frontiers =
+            self.local_group_deletion_frontiers_at_batch_start(effects)?;
         for event in &effects.events {
-            if let Some(changed) = self.suppress_local_deleted_group_event(event)? {
+            let batch_start_frontier = event_group_id(event)
+                .and_then(|group_id| {
+                    local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
+                })
+                .copied();
+            let crosses_frontier = match batch_start_frontier {
+                Some(frontier) => self.local_deleted_group_event_crosses_frontier(
+                    event,
+                    frontier,
+                    source_message_id_hex,
+                    source_received_at,
+                )?,
+                None => false,
+            };
+            if !crosses_frontier
+                && let Some(changed) =
+                    self.suppress_local_deleted_group_event(event, batch_start_frontier)?
+            {
                 routes_dirty |= changed;
                 continue;
             }
@@ -1197,6 +1280,12 @@ impl AppClient {
                     &self.state.label,
                     &group_id_hex,
                     SelfMembership::Member,
+                )?;
+            }
+            if crosses_frontier {
+                self.prepare_local_group_deletion_frontier_clear(
+                    event,
+                    batch_start_frontier.expect("crossing event has a frontier"),
                 )?;
             }
         }

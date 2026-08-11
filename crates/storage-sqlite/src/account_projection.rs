@@ -566,10 +566,40 @@ impl SqliteAccountStorage {
         max_seen_events: usize,
         max_future_skew_secs: u64,
     ) -> StorageResult<()> {
+        self.save_account_projection_state_clearing_local_group_deletion_frontiers(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            &[],
+        )
+    }
+
+    /// Persist the account snapshot while atomically clearing only the
+    /// local-deletion markers whose insertion-order frontier still matches the
+    /// caller's batch-start observation. A concurrent repeated delete advances
+    /// the frontier and therefore keeps both its marker and projection filter.
+    pub fn save_account_projection_state_clearing_local_group_deletion_frontiers(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+    ) -> StorageResult<()> {
         let now = unix_now_seconds();
         let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            for (group_id_hex, expected_frontier) in frontiers_to_clear {
+                conn.execute(
+                    "DELETE FROM local_group_deletion_frontiers
+                     WHERE group_id_hex = ?1 AND message_insert_order = ?2",
+                    params![
+                        group_id_hex,
+                        i64::try_from(*expected_frontier).unwrap_or(i64::MAX)
+                    ],
+                )
+                .storage()?;
+            }
             let stored_cursor = conn
                 .query_row(
                     "SELECT last_transport_timestamp FROM account_state WHERE label = ?1",
@@ -1049,6 +1079,33 @@ impl SqliteAccountStorage {
                     retained.push(route.clone());
                 }
             }
+            let group_id = hex::decode(group_id_hex).map_err(|error| {
+                StorageError::Serialization(format!("invalid local group id: {error}"))
+            })?;
+            let active_route_ids = {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT transport_group_id
+                         FROM cgka_transport_group_routes
+                         WHERE group_id = ?1",
+                    )
+                    .storage()?;
+                statement
+                    .query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))
+                    .storage()?
+                    .collect::<Result<std::collections::HashSet<_>, _>>()
+                    .storage()?
+            };
+            // Hydrated live groups always have an engine-owned route index. An
+            // empty set can still occur while upgrading a legacy database before
+            // hydration backfills migration 0043, so retain its exact history
+            // until the engine supplies an authoritative overlap window.
+            if !active_route_ids.is_empty() {
+                retained.retain(|route| {
+                    hex::decode(&route.nostr_group_id_hex)
+                        .is_ok_and(|route_id| active_route_ids.contains(&route_id))
+                });
+            }
             retained.sort_by(|left, right| {
                 left.last_epoch
                     .cmp(&right.last_epoch)
@@ -1096,6 +1153,36 @@ impl SqliteAccountStorage {
             )
             .storage()?
             > 0)
+    }
+
+    /// Return whether `message_id` belongs to `group_id_hex` and was durably
+    /// inserted after the supplied batch-start local-deletion frontier. This
+    /// intentionally does not clear the marker: the caller persists the
+    /// crossing projection and clears the expected frontier in one transaction.
+    pub fn local_group_deletion_message_is_newer_than(
+        &self,
+        group_id_hex: &str,
+        message_id: &MessageId,
+        frontier: u64,
+    ) -> StorageResult<bool> {
+        let group_id = hex::decode(group_id_hex).map_err(|error| {
+            StorageError::Serialization(format!("invalid local group id: {error}"))
+        })?;
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM cgka_messages
+                    WHERE id = ?1 AND group_id = ?2 AND insert_order > ?3
+                 )",
+                params![
+                    message_id.as_slice(),
+                    group_id,
+                    i64::try_from(frontier).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()
     }
 
     /// Remove a local-delete marker once the protocol group reaches a terminal

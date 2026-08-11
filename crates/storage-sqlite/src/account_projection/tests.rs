@@ -2216,6 +2216,136 @@ fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
 }
 
 #[test]
+fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut deleted_group = group("aa", "alpha");
+    deleted_group.prior_nostr_routes = vec![
+        StoredNostrRoute {
+            nostr_group_id_hex: "11".repeat(32),
+            relays: vec!["wss://retired.example".to_owned()],
+            last_epoch: 1,
+        },
+        StoredNostrRoute {
+            nostr_group_id_hex: "22".repeat(32),
+            relays: vec!["wss://retained.example".to_owned()],
+            last_epoch: 2,
+        },
+    ];
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![deleted_group],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    {
+        let conn = store.lock().unwrap();
+        for (route, epoch) in [([0x22_u8; 32], 2_i64), ([0x33_u8; 32], 3_i64)] {
+            conn.execute(
+                "INSERT INTO cgka_transport_group_routes (
+                    transport_group_id, group_id, source_epoch
+                 ) VALUES (?1, ?2, ?3)",
+                rusqlite::params![route.as_slice(), &[0xaa_u8], epoch],
+            )
+            .unwrap();
+        }
+    }
+    store.delete_local_group_data("aa").unwrap();
+
+    store
+        .retain_local_group_deletion_nostr_routes(
+            "aa",
+            &[StoredNostrRoute {
+                nostr_group_id_hex: "33".repeat(32),
+                relays: vec!["wss://current.example".to_owned()],
+                last_epoch: 3,
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.local_group_deletion_prior_nostr_routes("aa").unwrap(),
+        vec![
+            StoredNostrRoute {
+                nostr_group_id_hex: "22".repeat(32),
+                relays: vec!["wss://retained.example".to_owned()],
+                last_epoch: 2,
+            },
+            StoredNostrRoute {
+                nostr_group_id_hex: "33".repeat(32),
+                relays: vec!["wss://current.example".to_owned()],
+                last_epoch: 3,
+            },
+        ],
+        "durable exact-route history must advance with the engine-owned overlap window",
+    );
+}
+
+#[test]
+fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    store.delete_local_group_data("aa").unwrap();
+    let frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_resurrection_projection
+             BEFORE INSERT ON account_groups
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected projection failure');
+             END;",
+        )
+        .unwrap();
+
+    let result = store.save_account_projection_state_clearing_local_group_deletion_frontiers(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "resurrected")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+        &[("aa".to_owned(), frontier)],
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(frontier),
+        "the marker clear must roll back when the crossing projection fails to persist",
+    );
+    assert!(
+        store
+            .load_account_projection_state("alice", 16)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "a failed save must not expose a partially resurrected group",
+    );
+}
+
+#[test]
 fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);

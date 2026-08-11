@@ -136,21 +136,23 @@ impl AppClient {
             .local_group_deletion_frontier(&group_id_hex)?
             .is_some())
     }
-
     /// Suppress projection updates for an intentionally hidden live group while
-    /// keeping its durable transport routes active. A terminal disband removes
-    /// both the routes and the now-redundant app-only deletion marker.
+    /// keeping its durable transport routes active. `batch_start_frontier`
+    /// remains authoritative for the whole effects batch, even if an earlier
+    /// fresh event has already rebuilt the in-memory group. A terminal disband
+    /// removes both the routes and the now-redundant app-only deletion marker.
     pub(crate) fn suppress_local_deleted_group_event(
         &mut self,
         event: &cgka_traits::engine::GroupEvent,
+        batch_start_frontier: Option<u64>,
     ) -> Result<Option<bool>, AppError> {
         let Some(group_id) = event_group_id(event) else {
             return Ok(None);
         };
-        if self.state_group_record(group_id).is_some() {
+        if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {
             return Ok(None);
         }
-        if !self.has_local_group_deletion_frontier(group_id)? {
+        if batch_start_frontier.is_none() && !self.has_local_group_deletion_frontier(group_id)? {
             return Ok(None);
         }
         let terminal = matches!(
@@ -169,6 +171,11 @@ impl AppClient {
                 group_id,
                 Vec::<TransportGroupSubscription>::new(),
             )));
+        }
+        if self.state_group_record(group_id).is_some() {
+            // rebuilt the in-memory group. Historical events are still judged
+            // against the batch-start frontier and stay suppressed.
+            return Ok(Some(false));
         }
         Ok(Some(self.ensure_local_deleted_group_route(group_id)?))
     }
@@ -364,6 +371,36 @@ impl AppClient {
     ) -> Result<bool, AppError> {
         let subscriptions = self.local_deleted_group_subscriptions(group_id)?;
         Ok(self.routing.replace_group_routes(group_id, subscriptions))
+    }
+
+    /// Move exact route history out of the deletion marker and into the
+    /// recreated app group before the marker is cleared transactionally.
+    pub(crate) fn adopt_local_deleted_group_prior_routes(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let routes = self
+            .app
+            .account_storage(&self.state.label)?
+            .local_group_deletion_prior_nostr_routes(&group_id_hex)?
+            .into_iter()
+            .map(|route| AppPriorNostrRoute {
+                nostr_group_id_hex: route.nostr_group_id_hex,
+                relays: route.relays,
+                last_epoch: route.last_epoch,
+            })
+            .collect::<Vec<_>>();
+        let Some(group) = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+        else {
+            return Ok(false);
+        };
+        group.adopt_prior_nostr_routes(routes);
+        Ok(true)
     }
 
     /// Add intentionally hidden live-group routes to a freshly rebuilt routing
