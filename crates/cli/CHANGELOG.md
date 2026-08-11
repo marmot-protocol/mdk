@@ -11,6 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- OpenCode harness idle-timeout regression test now keeps the mock child alive
+  past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.

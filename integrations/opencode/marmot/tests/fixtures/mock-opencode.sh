@@ -9,7 +9,9 @@ case "$scenario" in
         ;;
     idle)
         printf '%s\n' '{"type":"step_start","sessionID":"ses_idle"}'
-        exec sleep 2
+        # Stay alive longer than the harness idle timeout so the test observes
+        # BackendIdle instead of racing normal exit at the same deadline.
+        exec sleep 3
         ;;
     streaming)
         for i in 1 2 3 4 5; do
