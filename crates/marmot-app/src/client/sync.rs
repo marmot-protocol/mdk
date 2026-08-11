@@ -1060,7 +1060,7 @@ impl AppClient {
             if let Err(err) = ingest_result {
                 tracing::warn!(
                     target: "marmot_app::notifications",
-                    method = "ingest_delivery",
+                    method = "project_received_message",
                     error_kind = err.privacy_safe_kind(),
                     "ignoring malformed push token gossip",
                 );
@@ -1099,7 +1099,7 @@ impl AppClient {
         {
             tracing::warn!(
                 target: "marmot_app::media",
-                method = "ingest_delivery",
+                method = "project_received_message",
                 error_code = "encrypted_media_secret_cache_skipped",
                 "failed to cache encrypted media source epoch secret",
             );

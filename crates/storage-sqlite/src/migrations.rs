@@ -589,6 +589,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained_routes, "[]");
+        let pending_application_event_columns = connection
+            .prepare("PRAGMA table_info(pending_application_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            pending_application_event_columns,
+            vec!["message_id", "group_id", "message_insert_order", "record"],
+            "serialized application events follow the storage record-blob convention",
+        );
     }
 
     #[test]

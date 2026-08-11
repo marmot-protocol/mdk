@@ -1796,7 +1796,7 @@ impl<S: StorageProvider> Engine<S> {
                 // MessageReceived from any seam.
                 tracing::warn!(
                     target: "cgka_engine::distributed_convergence",
-                    method = "emit_application_replay_events",
+                    method = "application_replay_events",
                     "skipping replayed application message with unattributable sender"
                 );
                 continue;
