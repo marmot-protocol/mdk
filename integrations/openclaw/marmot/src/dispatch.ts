@@ -538,7 +538,10 @@ export function createMarmotInboundDispatcher(
       suppressSelfQuoteBody: false,
     });
 
-    const storePath = deps.runtimeChannel.session.resolveStorePath();
+    const sessionStore = (deps.cfg as { session?: { store?: string } }).session?.store;
+    const storePath = deps.runtimeChannel.session.resolveStorePath(sessionStore, {
+      agentId: route.agentId,
+    });
     const turnCfg = buildMarmotTurnConfig(deps.cfg);
     const deliverInboundReply =
       deps.deliverInboundReply ?? deliverInboundReplyWithMessageSendContext;

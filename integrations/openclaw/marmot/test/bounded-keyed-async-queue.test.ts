@@ -70,4 +70,13 @@ describe("BoundedKeyedAsyncQueue", () => {
       "error",
     );
   });
+
+  it("classifies beta's agent-scoped session-store requirement without exposing text", () => {
+    const error = new Error("potentially sensitive upstream detail");
+    error.name = "SessionStoreAgentIdRequiredError";
+
+    expect(classifyInboundDispatchFailure(error)).toBe(
+      "openclaw_session_store_agent_id_required",
+    );
+  });
 });

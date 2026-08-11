@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentControlEvent, MarmotAgentControlClient } from "../src/client.js";
+import { createMarmotChannelPlugin } from "../src/channel.js";
 import {
   createMarmotInboundDispatcher,
   type MarmotDispatchClient,
@@ -39,6 +40,15 @@ describe("installed OpenClaw inbound host contract", () => {
       await deliver({ text: "host-compatible reply" }, { kind: "final" });
       return { counts: {} };
     });
+    const resolveStorePath = vi.fn((_store?: string, options?: unknown) => {
+      const agentId = (options as { agentId?: string } | undefined)?.agentId;
+      if (!agentId) {
+        const error = new Error("Session store path requires an explicit agent id.");
+        error.name = "SessionStoreAgentIdRequiredError";
+        throw error;
+      }
+      return "/tmp/openclaw-marmot-host-contract";
+    });
     const runtimeChannel: OpenClawChannelRuntime = {
       routing: {
         resolveAgentRoute: () => ({
@@ -48,7 +58,7 @@ describe("installed OpenClaw inbound host contract", () => {
         }),
       },
       session: {
-        resolveStorePath: () => "/tmp/openclaw-marmot-host-contract",
+        resolveStorePath,
         recordInboundSession: vi.fn(async () => undefined),
       },
       reply: { dispatchReplyWithBufferedBlockDispatcher: runDispatch },
@@ -85,6 +95,14 @@ describe("installed OpenClaw inbound host contract", () => {
 
     expect(runDispatch).toHaveBeenCalledOnce();
     expect(deliverInboundReply).toHaveBeenCalledOnce();
+    expect(resolveStorePath).toHaveBeenCalledWith(undefined, { agentId: "agent" });
+  });
+
+  it("leaves generic sends to beta's durable core while owning delete", () => {
+    const actions = createMarmotChannelPlugin().actions;
+
+    expect(actions?.supportsAction?.({ action: "send" })).toBe(false);
+    expect(actions?.supportsAction?.({ action: "delete" })).toBe(true);
   });
 
   const betaContract = process.env.OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR === "1" ? it : it.skip;
