@@ -11,6 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Engine fork-detection integration tests now exercise the pinned v1
+  five-commit rewind horizon in normal builds instead of overriding
+  `max_rewind_commits` to one.
 - Runtime catch-up, key-package maintenance, and every other incremental sync
   seam now execute an armed epoch-gap full-history replay immediately instead of
   waiting for unrelated later relay traffic. Explicit full-history repair also
