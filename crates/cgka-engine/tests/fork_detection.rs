@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, CanonicalizationState, ConvergenceStatus,
 };
-use cgka_engine::convergence::ConvergencePolicy;
+use cgka_engine::convergence::V1_MAX_REWIND_COMMITS;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{
     OpenMlsProjectionError, apply_openmls_canonicalization_result,
@@ -991,21 +991,10 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
     };
     bob.join_welcome(bob_welcome).await.unwrap();
 
-    let policy = CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    };
-    alice
-        .set_group_convergence_policy(&group_id, policy)
-        .unwrap();
-
     // Bob produces a same-source-epoch commit from epoch 1, then Alice advances
-    // two epochs without seeing it. Once Alice is at epoch 3 and the policy
-    // keeps only one rewind commit, source epoch 1 is outside the recovery
-    // horizon and must be classified as a stale commit, not a recoverable fork.
+    // past the pinned v1 rewind horizon without seeing it. Once Alice is beyond
+    // epoch 1 + V1_MAX_REWIND_COMMITS, source epoch 1 is outside recovery and
+    // must be classified as a stale commit, not a recoverable fork.
     let dave_kp = dave.fresh_key_package().await.unwrap();
     let late_invite = bob
         .send(SendIntent::Invite {
@@ -1022,7 +1011,8 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
         other => panic!("expected Bob invite GroupEvolution, got {other:?}"),
     };
 
-    for i in 0..2 {
+    let advance_epochs = V1_MAX_REWIND_COMMITS + 1;
+    for i in 0..advance_epochs {
         let update = alice
             .send(SendIntent::UpdateGroupData {
                 group_id: group_id.clone(),
@@ -1037,7 +1027,8 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
         };
         alice.confirm_published(pending).await.unwrap();
     }
-    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(3));
+    let terminal_epoch = EpochId(1 + advance_epochs);
+    assert_eq!(alice.epoch(&group_id).unwrap(), terminal_epoch);
 
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
@@ -1051,10 +1042,10 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
         outcome,
         IngestOutcome::Stale {
             reason: StaleReason::AlreadyAtEpoch {
-                current: EpochId(3),
+                current,
                 msg_epoch: EpochId(1),
             }
-        }
+        } if current == terminal_epoch
     ));
     let events = alice.drain_events();
     assert!(
