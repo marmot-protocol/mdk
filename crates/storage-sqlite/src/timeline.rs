@@ -7,7 +7,7 @@ use crate::{
         replace_encrypted_media_secret_references_tx,
         retire_unreferenced_encrypted_media_secret_epochs_tx,
     },
-    optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
+    i64_to_u64, optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_event::{
     AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
@@ -21,19 +21,63 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The ONE display order for the materialized message-timeline / chat-list
-/// surface: `(timeline_at, message_id_hex)` (#736 boundary contract 1). This is
-/// the cross-client user-visible order (`timeline_at == recorded_at` at
-/// projection). It is a SEPARATE surface from the raw-event replay cursor
-/// (`AppEventReplayCursor`, which additionally tie-breaks on the LOCAL
-/// `insert_order` and is used only for lag-recovery watermark/suppression). Keep
-/// the two distinct: the replay cursor MUST NOT be applied to timeline
-/// pagination. Timeline record queries alias the materialized table as
-/// `timeline` and reference these constants; a few other lookups and the
-/// keyset-pagination predicates express the SAME order inline.
-pub(crate) const TIMELINE_ORDER_BY_ASC: &str =
+/// Canonical per-group display order for the materialized timeline. Authenticated
+/// source epochs establish the durable boundaries: a kind-1210 row establishing
+/// epoch N sorts before application rows authenticated in N, and every row in N
+/// sorts before the state row for N+1. The local observation timestamp remains a
+/// display/retention value, not the group-history authority.
+///
+/// The leading class keeps pre-source-epoch legacy rows ahead of canonical
+/// history and optimistic local rows (no source id and no epoch yet) at the head.
+/// Global, cross-group queries retain wall-clock order because epochs are local
+/// to a group and therefore cannot be compared across groups.
+pub(crate) const TIMELINE_GROUP_ORDER_BY_ASC: &str = "ORDER BY CASE
+        WHEN timeline.source_epoch IS NOT NULL THEN 1
+        WHEN timeline.source_message_id_hex IS NULL THEN 2
+        ELSE 0
+     END ASC,
+     CASE
+        WHEN timeline.source_epoch IS NOT NULL THEN timeline.source_epoch
+        ELSE timeline.timeline_at
+     END ASC,
+     CASE
+        WHEN timeline.kind = 1210
+         AND timeline.source_message_id_hex IS NULL
+         AND timeline.source_epoch IS NOT NULL THEN 0
+        ELSE 1
+     END ASC,
+     CASE
+        WHEN timeline.kind = 1210
+         AND timeline.source_message_id_hex IS NULL
+         AND timeline.source_epoch IS NOT NULL THEN 0
+        ELSE timeline.timeline_at
+     END ASC,
+     timeline.message_id_hex ASC";
+pub(crate) const TIMELINE_GROUP_ORDER_BY_DESC: &str = "ORDER BY CASE
+        WHEN timeline.source_epoch IS NOT NULL THEN 1
+        WHEN timeline.source_message_id_hex IS NULL THEN 2
+        ELSE 0
+     END DESC,
+     CASE
+        WHEN timeline.source_epoch IS NOT NULL THEN timeline.source_epoch
+        ELSE timeline.timeline_at
+     END DESC,
+     CASE
+        WHEN timeline.kind = 1210
+         AND timeline.source_message_id_hex IS NULL
+         AND timeline.source_epoch IS NOT NULL THEN 0
+        ELSE 1
+     END DESC,
+     CASE
+        WHEN timeline.kind = 1210
+         AND timeline.source_message_id_hex IS NULL
+         AND timeline.source_epoch IS NOT NULL THEN 0
+        ELSE timeline.timeline_at
+     END DESC,
+     timeline.message_id_hex DESC";
+pub(crate) const TIMELINE_WALL_ORDER_BY_ASC: &str =
     "ORDER BY timeline.timeline_at ASC, timeline.message_id_hex ASC";
-pub(crate) const TIMELINE_ORDER_BY_DESC: &str =
+pub(crate) const TIMELINE_WALL_ORDER_BY_DESC: &str =
     "ORDER BY timeline.timeline_at DESC, timeline.message_id_hex DESC";
 
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
@@ -128,6 +172,20 @@ pub struct TimelineMessageRecord {
     /// tombstone instead of silently disappearing. Carries the engine invalidation
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+}
+
+impl TimelineMessageRecord {
+    /// Stable per-group order derived only from accepted history plus the
+    /// authenticated inner event time. Local receive time never participates.
+    pub fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
+        canonical_timeline_order_key(
+            self.source_message_id_hex.as_deref(),
+            self.source_epoch,
+            self.kind,
+            self.timeline_at,
+            &self.message_id_hex,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,11 +372,14 @@ enum CursorDirection {
     After,
 }
 
+type OwnedTimelineOrderKey = (u8, u64, u8, u64, String);
+
 #[derive(Clone, Debug)]
 struct ValidatedPagination {
     direction: CursorDirection,
     cursor_at: Option<u64>,
     cursor_message_id_hex: Option<String>,
+    cursor_order: Option<OwnedTimelineOrderKey>,
     /// Inclusive upper bound for a `Before` cursor (see
     /// [`TimelinePagination::before_inclusive`]); ignored for other directions.
     inclusive: bool,
@@ -795,9 +856,38 @@ impl SqliteAccountStorage {
     }
 
     pub fn message_timeline(&self, query: TimelineMessageQuery) -> StorageResult<TimelinePage> {
-        let pagination = validate_pagination(&query.pagination)?;
-        let (sql, params) = timeline_query_sql(&query, &pagination)?;
+        self.message_timeline_ordered(query, true)
+    }
+
+    /// Query by the legacy wall-clock tuple regardless of group source epochs.
+    /// Retention uses this because expiry cutoffs are timestamps, not display
+    /// cursors; ordinary group timelines should use [`Self::message_timeline`].
+    pub fn message_timeline_by_wall_clock(
+        &self,
+        query: TimelineMessageQuery,
+    ) -> StorageResult<TimelinePage> {
+        self.message_timeline_ordered(query, false)
+    }
+
+    fn message_timeline_ordered(
+        &self,
+        query: TimelineMessageQuery,
+        canonical_group_order: bool,
+    ) -> StorageResult<TimelinePage> {
+        let canonical_group_order = canonical_group_order && query.group_id_hex.is_some();
+        let mut pagination = validate_pagination(&query.pagination)?;
         let conn = self.lock()?;
+        if canonical_group_order
+            && let (Some(group_id_hex), Some(cursor_at), Some(cursor_message_id_hex)) = (
+                query.group_id_hex.as_deref(),
+                pagination.cursor_at,
+                pagination.cursor_message_id_hex.as_deref(),
+            )
+        {
+            pagination.cursor_order =
+                timeline_order_cursor_tx(&conn, group_id_hex, cursor_at, cursor_message_id_hex)?;
+        }
+        let (sql, params) = timeline_query_sql(&query, &pagination, canonical_group_order)?;
         let rows = {
             let _span = tracing::debug_span!(
                 target: "storage_sqlite::timeline",
@@ -1128,7 +1218,16 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                    invalidation_status IS NULL
                    OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
                )
-             ORDER BY timeline_at DESC, message_id_hex DESC
+             ORDER BY CASE
+                        WHEN source_epoch IS NOT NULL THEN 1
+                        WHEN source_message_id_hex IS NULL THEN 2
+                        ELSE 0
+                      END DESC,
+                      CASE
+                        WHEN source_epoch IS NOT NULL THEN source_epoch
+                        ELSE timeline_at
+                      END DESC,
+                      timeline_at DESC, message_id_hex DESC
              LIMIT 1",
             params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
             |row| {
@@ -2340,11 +2439,49 @@ fn timeline_records_by_ids_tx(
             .storage()?;
         messages.extend(chunk_messages);
     }
-    messages.sort_by(|left, right| {
-        (left.timeline_at, &left.message_id_hex).cmp(&(right.timeline_at, &right.message_id_hex))
-    });
+    messages.sort_by(|left, right| left.canonical_order_key().cmp(&right.canonical_order_key()));
     attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
+}
+
+fn timeline_order_cursor_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    timeline_at: u64,
+    message_id_hex: &str,
+) -> StorageResult<Option<OwnedTimelineOrderKey>> {
+    let row = tx
+        .query_row(
+            "SELECT source_message_id_hex, source_epoch, kind, timeline_at, message_id_hex
+             FROM message_timeline
+             WHERE group_id_hex = ?1 AND timeline_at = ?2 AND message_id_hex = ?3",
+            params![group_id_hex, u64_to_i64(timeline_at)?, message_id_hex],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .storage()?;
+    let Some((source_message_id_hex, source_epoch, kind, timeline_at, message_id_hex)) = row else {
+        return Ok(None);
+    };
+    let source_epoch = source_epoch.map(i64_to_u64).transpose()?;
+    let kind = i64_to_u64(kind)?;
+    let timeline_at = i64_to_u64(timeline_at)?;
+    let (class, primary, phase, at, _) = canonical_timeline_order_key(
+        source_message_id_hex.as_deref(),
+        source_epoch,
+        kind,
+        timeline_at,
+        &message_id_hex,
+    );
+    Ok(Some((class, primary, phase, at, message_id_hex)))
 }
 
 fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<ValidatedPagination> {
@@ -2383,14 +2520,32 @@ fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<Validat
         direction,
         cursor_at,
         cursor_message_id_hex,
+        cursor_order: None,
         inclusive: pagination.before_inclusive,
         limit,
     })
 }
 
+fn canonical_cursor_params(
+    class: u8,
+    primary: u64,
+    phase: u8,
+    timeline_at: u64,
+    message_id_hex: &str,
+) -> StorageResult<Vec<rusqlite::types::Value>> {
+    Ok(vec![
+        rusqlite::types::Value::Integer(i64::from(class)),
+        rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+        rusqlite::types::Value::Integer(i64::from(phase)),
+        rusqlite::types::Value::Integer(u64_to_i64(timeline_at)?),
+        rusqlite::types::Value::Text(message_id_hex.to_owned()),
+    ])
+}
+
 fn timeline_query_sql(
     query: &TimelineMessageQuery,
     pagination: &ValidatedPagination,
+    canonical_group_order: bool,
 ) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
     let mut clauses = Vec::new();
     let mut params = Vec::new();
@@ -2410,10 +2565,67 @@ fn timeline_query_sql(
             escape_like_literal(search)
         )));
     }
-    match pagination.direction {
-        CursorDirection::Before => {
-            // An inclusive cursor returns the row equal to the bound too, so the
-            // tie-break comparison flips from `<` to `<=`.
+    match (pagination.direction, pagination.cursor_order.as_ref()) {
+        (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
+            let comparison = if pagination.inclusive { "<=" } else { "<" };
+            clauses.push(format!(
+                "(CASE
+                    WHEN timeline.source_epoch IS NOT NULL THEN 1
+                    WHEN timeline.source_message_id_hex IS NULL THEN 2
+                    ELSE 0
+                  END,
+                  CASE
+                    WHEN timeline.source_epoch IS NOT NULL THEN timeline.source_epoch
+                    ELSE timeline.timeline_at
+                  END,
+                  CASE
+                    WHEN timeline.kind = 1210
+                     AND timeline.source_message_id_hex IS NULL
+                     AND timeline.source_epoch IS NOT NULL THEN 0
+                    ELSE 1
+                  END,
+                  CASE
+                    WHEN timeline.kind = 1210
+                     AND timeline.source_message_id_hex IS NULL
+                     AND timeline.source_epoch IS NOT NULL THEN 0
+                    ELSE timeline.timeline_at
+                  END,
+                  timeline.message_id_hex) {comparison} (?, ?, ?, ?, ?)"
+            ));
+            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+        }
+        (CursorDirection::After, Some((class, primary, phase, at, id))) => {
+            clauses.push(
+                "(CASE
+                    WHEN timeline.source_epoch IS NOT NULL THEN 1
+                    WHEN timeline.source_message_id_hex IS NULL THEN 2
+                    ELSE 0
+                  END,
+                  CASE
+                    WHEN timeline.source_epoch IS NOT NULL THEN timeline.source_epoch
+                    ELSE timeline.timeline_at
+                  END,
+                  CASE
+                    WHEN timeline.kind = 1210
+                     AND timeline.source_message_id_hex IS NULL
+                     AND timeline.source_epoch IS NOT NULL THEN 0
+                    ELSE 1
+                  END,
+                  CASE
+                    WHEN timeline.kind = 1210
+                     AND timeline.source_message_id_hex IS NULL
+                     AND timeline.source_epoch IS NOT NULL THEN 0
+                    ELSE timeline.timeline_at
+                  END,
+                  timeline.message_id_hex) > (?, ?, ?, ?, ?)"
+                    .to_owned(),
+            );
+            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+        }
+        (CursorDirection::Before, None) => {
+            // Unknown/synthetic cursors keep the timestamp API's legacy wall-clock
+            // semantics. Row cursors returned by a group query take the canonical
+            // branch above.
             let id_comparison = if pagination.inclusive { "<=" } else { "<" };
             clauses.push(format!(
                 "(timeline.timeline_at < ? OR (timeline.timeline_at = ? AND timeline.message_id_hex {id_comparison} ?))"
@@ -2425,7 +2637,7 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        CursorDirection::After => {
+        (CursorDirection::After, None) => {
             clauses.push(
                 "(timeline.timeline_at > ? OR (timeline.timeline_at = ? AND timeline.message_id_hex > ?))"
                     .to_owned(),
@@ -2437,7 +2649,7 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        CursorDirection::None => {}
+        (CursorDirection::None, _) => {}
     }
     params.push(rusqlite::types::Value::Integer(
         i64::try_from(pagination.limit + 1).unwrap_or(i64::MAX),
@@ -2447,9 +2659,11 @@ fn timeline_query_sql(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    let order_sql = match pagination.direction {
-        CursorDirection::After => TIMELINE_ORDER_BY_ASC,
-        CursorDirection::None | CursorDirection::Before => TIMELINE_ORDER_BY_DESC,
+    let order_sql = match (canonical_group_order, pagination.direction) {
+        (true, CursorDirection::After) => TIMELINE_GROUP_ORDER_BY_ASC,
+        (true, CursorDirection::None | CursorDirection::Before) => TIMELINE_GROUP_ORDER_BY_DESC,
+        (false, CursorDirection::After) => TIMELINE_WALL_ORDER_BY_ASC,
+        (false, CursorDirection::None | CursorDirection::Before) => TIMELINE_WALL_ORDER_BY_DESC,
     };
     Ok((
         format!(
@@ -2481,6 +2695,30 @@ fn escape_like_literal(value: &str) -> String {
         escaped.push(ch);
     }
     escaped
+}
+
+pub(crate) fn canonical_timeline_order_key<'a>(
+    source_message_id_hex: Option<&str>,
+    source_epoch: Option<u64>,
+    kind: u64,
+    timeline_at: u64,
+    message_id_hex: &'a str,
+) -> (u8, u64, u8, u64, &'a str) {
+    let (class, primary) = match source_epoch {
+        Some(epoch) => (1, epoch),
+        None if source_message_id_hex.is_none() => (2, timeline_at),
+        None => (0, timeline_at),
+    };
+    let phase = if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+        && source_message_id_hex.is_none()
+        && source_epoch.is_some()
+    {
+        0
+    } else {
+        1
+    };
+    let intra_epoch_at = if phase == 0 { 0 } else { timeline_at };
+    (class, primary, phase, intra_epoch_at, message_id_hex)
 }
 
 fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {

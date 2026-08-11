@@ -1924,6 +1924,17 @@ impl MarmotApp {
         Ok(self.account_storage(label)?.message_timeline(query)?)
     }
 
+    pub(crate) fn timeline_messages_by_wall_clock_with_query(
+        &self,
+        label: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .message_timeline_by_wall_clock(query)?)
+    }
+
     pub fn timeline_message(
         &self,
         label: &str,

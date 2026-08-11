@@ -205,7 +205,7 @@ impl AppClient {
         );
 
         loop {
-            let page = self.app.timeline_messages_with_query(
+            let page = self.app.timeline_messages_by_wall_clock_with_query(
                 &self.state.label,
                 TimelineMessageQuery {
                     group_id_hex: Some(input.group_id_hex.clone()),

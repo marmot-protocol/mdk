@@ -138,9 +138,9 @@ impl TimelineWindow {
         query.pagination = match self.page.messages.last() {
             // Detached: re-fetch the loaded range ending exactly at the newest
             // message using an *inclusive* upper-bound cursor. The store applies
-            // the descending `LIMIT` against `<= (timeline_at, message_id_hex)`,
-            // so newer same-second rows are excluded at the SQL level and can't
-            // starve the window — no post-fetch trimming required.
+            // the descending `LIMIT` against the row-resolved canonical key, so
+            // newer rows are excluded at the SQL level and can't starve the
+            // window — no post-fetch trimming required.
             Some(newest) if !self.anchored_to_head() => TimelinePagination {
                 before: Some(newest.timeline_at),
                 before_message_id: Some(newest.message_id_hex.clone()),
@@ -206,7 +206,14 @@ impl TimelineWindowHandle {
         let older = blocking_app_task(move || query_fn(query)).await?;
         let mut window = self.lock();
         let limit = window.window_limit;
-        merge_timeline_window(&mut window.page, older, TimelineWindowEdge::Older, limit);
+        let canonical_group_order = window.base_query.group_id_hex.is_some();
+        merge_timeline_window_with_order(
+            &mut window.page,
+            older,
+            TimelineWindowEdge::Older,
+            limit,
+            canonical_group_order,
+        );
         window.bump_generation();
         Ok(window.page.clone())
     }
@@ -236,7 +243,14 @@ impl TimelineWindowHandle {
         let newer = blocking_app_task(move || query_fn(query)).await?;
         let mut window = self.lock();
         let limit = window.window_limit;
-        merge_timeline_window(&mut window.page, newer, TimelineWindowEdge::Newer, limit);
+        let canonical_group_order = window.base_query.group_id_hex.is_some();
+        merge_timeline_window_with_order(
+            &mut window.page,
+            newer,
+            TimelineWindowEdge::Newer,
+            limit,
+            canonical_group_order,
+        );
         window.bump_generation();
         Ok(window.page.clone())
     }
@@ -346,30 +360,45 @@ impl RuntimeTimelineMessagesSubscription {
     }
 }
 
-/// Sort a timeline by the canonical `(timeline_at, message_id_hex)` ascending
-/// order the store and clients agree on.
-fn sort_timeline_records(messages: &mut [TimelineMessageRecord]) {
-    messages.sort_by(|left, right| {
-        left.timeline_at
-            .cmp(&right.timeline_at)
-            .then_with(|| left.message_id_hex.cmp(&right.message_id_hex))
-    });
+/// Sort a group timeline by the accepted-history order the store and clients
+/// agree on.
+fn sort_timeline_records(messages: &mut [TimelineMessageRecord], canonical_group_order: bool) {
+    if canonical_group_order {
+        messages
+            .sort_by(|left, right| left.canonical_order_key().cmp(&right.canonical_order_key()));
+    } else {
+        messages.sort_by(|left, right| {
+            (left.timeline_at, &left.message_id_hex)
+                .cmp(&(right.timeline_at, &right.message_id_hex))
+        });
+    }
 }
 
 /// Merge a freshly-queried page into `window` on the given edge, then enforce
 /// the cap from the opposite edge. The single piece of windowing logic shared
 /// by both pagination directions.
+#[cfg(test)]
 pub(crate) fn merge_timeline_window(
     window: &mut TimelinePage,
     incoming: TimelinePage,
     edge: TimelineWindowEdge,
     limit: usize,
 ) {
+    merge_timeline_window_with_order(window, incoming, edge, limit, true);
+}
+
+fn merge_timeline_window_with_order(
+    window: &mut TimelinePage,
+    incoming: TimelinePage,
+    edge: TimelineWindowEdge,
+    limit: usize,
+    canonical_group_order: bool,
+) {
     let mut messages = std::mem::take(&mut window.messages);
     for message in incoming.messages {
         upsert_window_message(&mut messages, message);
     }
-    sort_timeline_records(&mut messages);
+    sort_timeline_records(&mut messages, canonical_group_order);
     match edge {
         TimelineWindowEdge::Older => {
             // The older side now reflects whatever the store reported. The
@@ -405,21 +434,16 @@ pub(crate) fn apply_projection_to_window(
     limit: usize,
 ) {
     let anchored = !window.has_more_after;
-    // Canonical upper bound of the window is the pair `(timeline_at,
-    // message_id_hex)`, not just the timestamp. A detached window must suppress
-    // anything sorting strictly after this — including same-second messages with
-    // a larger id, which `timeline_at`-only comparison would have admitted.
-    let newest_key = window
-        .messages
-        .last()
-        .map(|message| (message.timeline_at, message.message_id_hex.clone()));
+    // A detached window must suppress anything sorting strictly after its
+    // canonical accepted-history upper bound.
+    let newest_message = window.messages.last().cloned();
     if update.timeline_changes.is_empty() {
         for message in &update.timeline_messages {
             insert_live_message(
                 &mut window.messages,
                 message.clone(),
                 anchored,
-                newest_key.as_ref(),
+                newest_message.as_ref(),
             );
         }
     } else {
@@ -430,7 +454,7 @@ pub(crate) fn apply_projection_to_window(
                         &mut window.messages,
                         (**message).clone(),
                         anchored,
-                        newest_key.as_ref(),
+                        newest_message.as_ref(),
                     );
                 }
                 TimelineMessageChange::Remove { message_id_hex, .. } => {
@@ -441,7 +465,7 @@ pub(crate) fn apply_projection_to_window(
             }
         }
     }
-    sort_timeline_records(&mut window.messages);
+    sort_timeline_records(&mut window.messages, true);
     // Live growth only ever adds at or below the head, so trim the oldest rows
     // on overflow; the head boundary (`has_more_after`) is preserved.
     if window.messages.len() > limit {
@@ -454,15 +478,15 @@ pub(crate) fn apply_projection_to_window(
 /// Apply one live upsert. Existing messages are replaced in place (edits,
 /// reactions, delivery-state changes). A brand-new message is appended only when
 /// the window is anchored to the head, or when it sorts at or below the detached
-/// window's newest message in canonical `(timeline_at, message_id_hex)` order.
-/// `newest_key` is `None` only for an empty window, where a detached window has
+/// window's newest message in canonical accepted-history order.
+/// `newest_message` is `None` only for an empty window, where a detached window has
 /// nothing in range and therefore suppresses (an anchored empty window still
 /// appends, as the head).
 fn insert_live_message(
     messages: &mut Vec<TimelineMessageRecord>,
     message: TimelineMessageRecord,
     anchored: bool,
-    newest_key: Option<&(u64, String)>,
+    newest_message: Option<&TimelineMessageRecord>,
 ) {
     if let Some(existing) = messages
         .iter_mut()
@@ -471,9 +495,8 @@ fn insert_live_message(
         *existing = message;
         return;
     }
-    let within_window = newest_key.is_some_and(|(at, id)| {
-        (message.timeline_at, message.message_id_hex.as_str()) <= (*at, id.as_str())
-    });
+    let within_window = newest_message
+        .is_some_and(|newest| message.canonical_order_key() <= newest.canonical_order_key());
     if anchored || within_window {
         messages.push(message);
     }

@@ -499,6 +499,37 @@ fn timeline_subscription_take_snapshot_retains_window_for_pagination() {
 }
 
 #[test]
+fn merge_timeline_window_orders_epoch_boundaries_canonically() {
+    let mut system_seven = timeline_test_record("system-7", 900);
+    system_seven.source_epoch = Some(7);
+    system_seven.kind = 1210;
+    let mut message_seven = timeline_test_record("message-7", 200);
+    message_seven.source_epoch = Some(7);
+    let mut system_eight = timeline_test_record("system-8", 901);
+    system_eight.source_epoch = Some(8);
+    system_eight.kind = 1210;
+    let mut message_eight = timeline_test_record("message-8", 150);
+    message_eight.source_epoch = Some(8);
+    let mut window = TimelinePage {
+        messages: vec![message_eight, system_seven],
+        has_more_before: false,
+        has_more_after: false,
+    };
+    let incoming = TimelinePage {
+        messages: vec![system_eight, message_seven],
+        has_more_before: false,
+        has_more_after: false,
+    };
+
+    merge_timeline_window(&mut window, incoming, TimelineWindowEdge::Newer, 300);
+
+    assert_eq!(
+        timeline_ids(&window),
+        ["system-7", "message-7", "system-8", "message-8"]
+    );
+}
+
+#[test]
 fn merge_timeline_window_prepends_older_and_keeps_head_flag() {
     let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
     let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);

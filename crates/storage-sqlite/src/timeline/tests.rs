@@ -677,6 +677,152 @@ fn timeline_orders_tied_timestamps_by_message_id() {
 }
 
 #[test]
+fn group_timeline_order_is_stable_across_delayed_system_projection() {
+    fn history(system_observed_at: [u64; 3]) -> SqliteAccountStorage {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut system_seven = group_system("system-7a", "member_added", system_observed_at[0]);
+        system_seven.source_epoch = Some(7);
+        store.record_app_event(&system_seven).unwrap();
+        let mut system_seven_second =
+            group_system("system-7b", "group_name_changed", system_observed_at[1]);
+        system_seven_second.source_epoch = Some(7);
+        store.record_app_event(&system_seven_second).unwrap();
+
+        let mut message_seven = chat("message-7", "alice", 200, "epoch seven");
+        message_seven.source_epoch = Some(7);
+        store.record_app_event(&message_seven).unwrap();
+
+        let mut system_eight = group_system("system-8", "member_removed", system_observed_at[2]);
+        system_eight.source_epoch = Some(8);
+        store.record_app_event(&system_eight).unwrap();
+
+        // The authenticated app timestamp may move backwards across senders or
+        // devices. Epoch boundaries, not wall-clock coincidence, establish the
+        // durable relative order.
+        let mut message_eight = chat("message-8", "bob", 150, "epoch eight");
+        message_eight.source_epoch = Some(8);
+        store.record_app_event(&message_eight).unwrap();
+        store
+    }
+
+    let online = history([100, 101, 300]);
+    // Catch-up observes the same epoch-seven system rows in the opposite local
+    // timestamp order. Their deterministic ids still decide their order.
+    let delayed = history([901, 900, 902]);
+    let ids = |store: &SqliteAccountStorage| {
+        list(store)
+            .into_iter()
+            .map(|message| message.message_id_hex)
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        "system-7a",
+        "system-7b",
+        "message-7",
+        "system-8",
+        "message-8",
+    ];
+
+    assert_eq!(ids(&online), expected);
+    assert_eq!(ids(&delayed), expected);
+}
+
+#[test]
+fn authenticated_kind_1210_message_does_not_establish_an_epoch_boundary() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut chat = chat("chat", "alice", 100, "before explicit system message");
+    chat.source_epoch = Some(7);
+    store.record_app_event(&chat).unwrap();
+    let mut explicit_system = group_system("explicit-system", "custom", 200);
+    explicit_system.source_message_id_hex = Some("source-explicit-system".to_owned());
+    explicit_system.source_epoch = Some(7);
+    explicit_system.direction = "received".to_owned();
+    store.record_app_event(&explicit_system).unwrap();
+
+    assert_eq!(
+        list(&store)
+            .into_iter()
+            .map(|message| message.message_id_hex)
+            .collect::<Vec<_>>(),
+        ["chat", "explicit-system"]
+    );
+}
+
+#[test]
+fn group_timeline_pagination_uses_canonical_epoch_cursor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut system_seven = group_system("system-7", "member_added", 100);
+    system_seven.source_epoch = Some(7);
+    store.record_app_event(&system_seven).unwrap();
+    let mut message_seven = chat("message-7", "alice", 200, "epoch seven");
+    message_seven.source_epoch = Some(7);
+    store.record_app_event(&message_seven).unwrap();
+    let mut system_eight = group_system("system-8", "member_removed", 300);
+    system_eight.source_epoch = Some(8);
+    store.record_app_event(&system_eight).unwrap();
+    let mut message_eight = chat("message-8", "bob", 150, "epoch eight");
+    message_eight.source_epoch = Some(8);
+    store.record_app_event(&message_eight).unwrap();
+
+    let page = |pagination| {
+        store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some("11".repeat(32)),
+                pagination,
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap()
+    };
+    let older = page(TimelinePagination {
+        before: Some(300),
+        before_message_id: Some("system-8".to_owned()),
+        limit: Some(2),
+        ..TimelinePagination::default()
+    });
+    let newer = page(TimelinePagination {
+        after: Some(200),
+        after_message_id: Some("message-7".to_owned()),
+        limit: Some(2),
+        ..TimelinePagination::default()
+    });
+
+    assert_eq!(ids(&older), ["system-7", "message-7"]);
+    assert_eq!(ids(&newer), ["system-8", "message-8"]);
+}
+
+#[test]
+fn wall_clock_timeline_query_preserves_retention_scan_order() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut system_seven = group_system("system-7", "member_added", 100);
+    system_seven.source_epoch = Some(7);
+    store.record_app_event(&system_seven).unwrap();
+    let mut message_seven = chat("message-7", "alice", 200, "epoch seven");
+    message_seven.source_epoch = Some(7);
+    store.record_app_event(&message_seven).unwrap();
+    let mut system_eight = group_system("system-8", "member_removed", 300);
+    system_eight.source_epoch = Some(8);
+    store.record_app_event(&system_eight).unwrap();
+    let mut message_eight = chat("message-8", "bob", 150, "epoch eight");
+    message_eight.source_epoch = Some(8);
+    store.record_app_event(&message_eight).unwrap();
+
+    let page = store
+        .message_timeline_by_wall_clock(TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            pagination: TimelinePagination {
+                before: Some(300),
+                before_message_id: Some("system-8".to_owned()),
+                limit: Some(2),
+                ..TimelinePagination::default()
+            },
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+
+    assert_eq!(ids(&page), ["message-8", "message-7"]);
+}
+
+#[test]
 fn orphan_reaction_applies_when_target_arrives() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
@@ -738,9 +884,9 @@ fn reply_preview_carries_parent_source_epoch_and_media() {
         "filename diagram.png".to_owned(),
     ]];
     store.record_app_event(&parent).unwrap();
-    store
-        .record_app_event(&reply("reply", "bob", "parent", 2, "answer"))
-        .unwrap();
+    let mut child = reply("reply", "bob", "parent", 2, "answer");
+    child.source_epoch = Some(5);
+    store.record_app_event(&child).unwrap();
 
     let page = store
         .message_timeline(TimelineMessageQuery {

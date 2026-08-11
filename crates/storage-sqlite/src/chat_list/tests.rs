@@ -935,6 +935,77 @@ fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
 }
 
 #[test]
+fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let mut epoch_seven = chat("message-7", REMOTE, 200, "epoch seven");
+    epoch_seven.source_epoch = Some(7);
+    store.record_app_event(&epoch_seven).unwrap();
+    let mut epoch_eight = chat("message-8", REMOTE, 150, "epoch eight");
+    epoch_eight.source_epoch = Some(8);
+    store.record_app_event(&epoch_eight).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.last_message.unwrap().message_id_hex, "message-8");
+
+    let row = store
+        .mark_timeline_message_read(LOCAL, GROUP, "message-7", &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(
+        row.first_unread_message_id_hex.as_deref(),
+        Some("message-8")
+    );
+
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "message-8", &no_mentions)
+        .unwrap();
+    let row = store
+        .mark_timeline_message_read(LOCAL, GROUP, "message-7", &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        row.last_read_message_id_hex.as_deref(),
+        Some("message-8"),
+        "a later wall timestamp from an older epoch must not move the marker backward"
+    );
+    assert_eq!(row.unread_count, 0);
+}
+
+#[test]
+fn secure_prune_keeps_chat_preview_on_canonical_latest_epoch() {
+    let store = setup_store();
+    let mut pruned = chat("pruned", REMOTE, 10, "old");
+    pruned.source_epoch = Some(6);
+    store.record_app_event(&pruned).unwrap();
+    let mut epoch_seven = chat("message-7", REMOTE, 200, "epoch seven");
+    epoch_seven.source_epoch = Some(7);
+    store.record_app_event(&epoch_seven).unwrap();
+    let mut epoch_eight = chat("message-8", REMOTE, 150, "epoch eight");
+    epoch_eight.source_epoch = Some(8);
+    store.record_app_event(&epoch_eight).unwrap();
+
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(before.last_message.unwrap().message_id_hex, "message-8");
+
+    store
+        .secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
+        .unwrap();
+
+    let after = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(after.last_message.unwrap().message_id_hex, "message-8");
+}
+
+#[test]
 fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
     let store = setup_store();
     store

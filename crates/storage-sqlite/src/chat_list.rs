@@ -251,6 +251,26 @@ struct ConversationReadState {
     manually_marked_unread: bool,
 }
 
+#[derive(Clone, Debug)]
+struct TimelineReadMarker {
+    message_id_hex: String,
+    source_message_id_hex: Option<String>,
+    source_epoch: Option<u64>,
+    timeline_at: u64,
+}
+
+impl TimelineReadMarker {
+    fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
+        crate::timeline::canonical_timeline_order_key(
+            self.source_message_id_hex.as_deref(),
+            self.source_epoch,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            self.timeline_at,
+            &self.message_id_hex,
+        )
+    }
+}
+
 impl SqliteAccountStorage {
     pub fn chat_list_rows(&self, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
         let conn = self.lock()?;
@@ -553,15 +573,31 @@ impl SqliteAccountStorage {
             if let Some(target) =
                 timeline_message_for_read_marker_tx(&conn, group_id_hex, message_id_hex)?
             {
-                let should_advance = read_state_tx(&conn, group_id_hex)?
-                    .and_then(|state| {
-                        state
-                            .last_read_timeline_at
-                            .zip(state.last_read_message_id_hex)
-                    })
-                    .is_none_or(|(at, id)| {
-                        timeline_tuple_after(target.timeline_at, &target.message_id_hex, at, &id)
-                    });
+                let should_advance = match read_state_tx(&conn, group_id_hex)? {
+                    None => true,
+                    Some(state) => match state
+                        .last_read_timeline_at
+                        .zip(state.last_read_message_id_hex)
+                    {
+                        None => true,
+                        Some((at, id)) => {
+                            match timeline_message_for_read_marker_tx(&conn, group_id_hex, &id)? {
+                                Some(current) => {
+                                    target.canonical_order_key() > current.canonical_order_key()
+                                }
+                                // A retained read marker can outlive its pruned
+                                // timeline row. Its epoch is then unknowable, so
+                                // preserve the legacy wall-clock fallback.
+                                None => timeline_tuple_after(
+                                    target.timeline_at,
+                                    &target.message_id_hex,
+                                    at,
+                                    &id,
+                                ),
+                            }
+                        }
+                    },
+                };
 
                 if should_advance {
                     conn.execute(
@@ -828,7 +864,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
                    OR row.last_message_sender IS NOT (
@@ -843,7 +888,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
                    OR row.last_message_preview IS NOT (
@@ -858,7 +912,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
                    OR row.last_message_kind IS NOT (
@@ -873,7 +936,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
                    OR row.last_message_timeline_at IS NOT (
@@ -888,7 +960,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
                    OR row.last_message_deleted IS NOT COALESCE((
@@ -903,7 +984,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      ), 0)
                    OR row.last_message_media_json IS NOT (
@@ -918,7 +1008,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
                    OR row.last_message_delivery_state IS NOT COALESCE((
@@ -938,7 +1037,16 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      ), 'not_applicable')
                    OR row.activity_sort_at IS NOT MAX(
@@ -955,7 +1063,16 @@ fn chat_list_projection_complete_tx(
                                       AND mt.invalidation_status = 'local_publish_failed'
                                   )
                               )
-                            ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                            ORDER BY CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN 1
+                            WHEN mt.source_message_id_hex IS NULL THEN 2
+                            ELSE 0
+                          END DESC,
+                          CASE
+                            WHEN mt.source_epoch IS NOT NULL THEN mt.source_epoch
+                            ELSE mt.timeline_at
+                          END DESC,
+                          mt.timeline_at DESC, mt.message_id_hex DESC
                             LIMIT 1
                         ), 0),
                         COALESCE((
@@ -1201,28 +1318,51 @@ fn unread_summary_tx(
             first_message_id: None,
         });
     };
-    let (where_sql, marker_at, marker_id) =
-        if let Some(last_read_at) = read_state.last_read_timeline_at {
+    let (where_sql, marker_params) = if let Some(last_read_at) = read_state.last_read_timeline_at {
+        let marker_id = read_state.last_read_message_id_hex.as_deref().unwrap_or("");
+        if let Some(marker) = timeline_message_for_read_marker_tx(tx, group_id_hex, marker_id)? {
+            let (class, primary, _phase, at, id) = marker.canonical_order_key();
             (
-                "(timeline_at > ?4 OR (timeline_at = ?4 AND message_id_hex > ?5))",
-                last_read_at,
-                read_state.last_read_message_id_hex.as_deref().unwrap_or(""),
+                "(CASE
+                    WHEN source_epoch IS NOT NULL THEN 1
+                    WHEN source_message_id_hex IS NULL THEN 2
+                    ELSE 0
+                  END,
+                  CASE
+                    WHEN source_epoch IS NOT NULL THEN source_epoch
+                    ELSE timeline_at
+                  END,
+                  timeline_at,
+                  message_id_hex) > (?4, ?5, ?6, ?7)",
+                vec![
+                    rusqlite::types::Value::Integer(i64::from(class)),
+                    rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+                    rusqlite::types::Value::Integer(u64_to_i64(at)?),
+                    rusqlite::types::Value::Text(id.to_owned()),
+                ],
             )
         } else {
             (
-                "timeline_at > ?4 AND (?5 = ?5)",
-                read_state.initialized_at,
-                "",
+                "(timeline_at > ?4 OR (timeline_at = ?4 AND message_id_hex > ?5))",
+                vec![
+                    rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
+                    rusqlite::types::Value::Text(marker_id.to_owned()),
+                ],
             )
-        };
-    // #704: derive count + first-unread id + mention_count from ONE ordered scan
-    // over the unread window, instead of a separate COUNT(*), a LIMIT 1, and a
-    // full mention scan over the identical predicate. Ordered by the
-    // materialized-timeline key `(timeline_at, message_id_hex)` so the first row
-    // is the first-unread message. Mention classification is injected (the
-    // storage layer never parses nostr/NIP-21); a tag blob that fails to decode
-    // is treated as no tags (no mention) so one malformed row never errors the
-    // whole projection.
+        }
+    } else {
+        (
+            "timeline_at > ?4 AND (?5 = ?5)",
+            vec![
+                rusqlite::types::Value::Integer(u64_to_i64(read_state.initialized_at)?),
+                rusqlite::types::Value::Text(String::new()),
+            ],
+        )
+    };
+    // Derive count + first-unread id + mention_count from one ordered scan over
+    // the unread window. For a retained marker row the predicate and ordering use
+    // the same canonical accepted-history key as timeline pagination. A marker
+    // whose row was pruned falls back to its retained wall-clock tuple.
     let scan_sql = format!(
         "SELECT message_id_hex, plaintext, tags_json
          FROM message_timeline
@@ -1232,17 +1372,26 @@ fn unread_summary_tx(
            AND invalidation_status IS NULL
            AND sender != ?3
            AND {where_sql}
-         ORDER BY timeline_at ASC, message_id_hex ASC"
+         ORDER BY CASE
+                    WHEN source_epoch IS NOT NULL THEN 1
+                    WHEN source_message_id_hex IS NULL THEN 2
+                    ELSE 0
+                  END ASC,
+                  CASE
+                    WHEN source_epoch IS NOT NULL THEN source_epoch
+                    ELSE timeline_at
+                  END ASC,
+                  timeline_at ASC, message_id_hex ASC"
     );
+    let mut query_params = vec![
+        rusqlite::types::Value::Text(group_id_hex.to_owned()),
+        rusqlite::types::Value::Integer(u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?),
+        rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
+    ];
+    query_params.extend(marker_params);
     let mut scan_stmt = tx.prepare(&scan_sql).storage()?;
     let mut scan_rows = scan_stmt
-        .query(params![
-            group_id_hex,
-            u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
-            local_account_id_hex,
-            u64_to_i64(marker_at)?,
-            marker_id,
-        ])
+        .query(rusqlite::params_from_iter(query_params))
         .storage()?;
     let mut count: u64 = 0;
     let mut mention_count: u64 = 0;
@@ -1383,7 +1532,16 @@ fn latest_kind9_message_tx(
                invalidation_status IS NULL
                OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
            )
-         ORDER BY timeline_at DESC, message_id_hex DESC
+         ORDER BY CASE
+                    WHEN source_epoch IS NOT NULL THEN 1
+                    WHEN source_message_id_hex IS NULL THEN 2
+                    ELSE 0
+                  END DESC,
+                  CASE
+                    WHEN source_epoch IS NOT NULL THEN source_epoch
+                    ELSE timeline_at
+                  END DESC,
+                  timeline_at DESC, message_id_hex DESC
          LIMIT 1",
         params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
         chat_list_message_from_row,
@@ -1396,10 +1554,9 @@ fn timeline_message_for_read_marker_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<Option<ChatListMessagePreview>> {
+) -> StorageResult<Option<TimelineReadMarker>> {
     tx.query_row(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                media_json, direction, source_message_id_hex, invalidation_status
+        "SELECT message_id_hex, source_message_id_hex, source_epoch, timeline_at
          FROM message_timeline
          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind = ?3",
         params![
@@ -1407,7 +1564,16 @@ fn timeline_message_for_read_marker_tx(
             message_id_hex,
             u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?
         ],
-        chat_list_message_from_row,
+        |row| {
+            Ok(TimelineReadMarker {
+                message_id_hex: row.get(0)?,
+                source_message_id_hex: row.get(1)?,
+                source_epoch: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|value| value.try_into().ok()),
+                timeline_at: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
+            })
+        },
     )
     .optional()
     .storage()

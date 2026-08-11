@@ -86,6 +86,8 @@ mod migration_0042_group_state_checkpoints;
 mod migration_0043_transport_group_routes;
 #[path = "migrations/0044_local_group_deletion_frontiers.rs"]
 mod migration_0044_local_group_deletion_frontiers;
+#[path = "migrations/0045_timeline_canonical_order.rs"]
+mod migration_0045_timeline_canonical_order;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -317,6 +319,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 44,
         name: "0044_local_group_deletion_frontiers",
         apply: migration_0044_local_group_deletion_frontiers::apply,
+    },
+    Migration {
+        version: 45,
+        name: "0045_timeline_canonical_order",
+        apply: migration_0045_timeline_canonical_order::apply,
     },
 ];
 
