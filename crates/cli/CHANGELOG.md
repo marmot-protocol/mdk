@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Hermes Marmot `marmot_history` and `delete_marmot_message` tools now accept
+  Hermes ToolRegistry runtime keyword arguments (`task_id`, `session_id`, and
+  future dispatch metadata) instead of failing with `TypeError` during gateway
+  tool calls.
 - Leave-proposal persistence now commits the signed proposal, durable leave
   request, and content-dedup marker atomically, so a storage failure cannot
   strand a same-epoch leave retry without a publishable proposal.
