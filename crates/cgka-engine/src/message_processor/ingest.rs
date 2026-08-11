@@ -11,8 +11,8 @@ use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
 use crate::identity::member_id_of_sender;
 use crate::openmls_projection::{
-    OpenMlsContentKind, process_commit_with_app_data_updates, project_mls_message,
-    retained_anchor_epoch_from_snapshot_name,
+    CandidateBranchPeelContext, OpenMlsContentKind, process_commit_with_app_data_updates,
+    project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -40,9 +40,52 @@ use tls_codec::{Deserialize as _, Serialize as _};
 struct PastPeelRecovery {
     peeled: cgka_traits::ingest::PeeledMessage,
     source_epoch: EpochId,
-    message_retention_seconds: Option<u64>,
-    snapshot_name: String,
+    source: PeelRecoverySource,
     attempt_count: u64,
+}
+
+/// Which non-live context read a message the live peel could not.
+enum PeelRecoverySource {
+    /// A retained snapshot of an epoch on this device's own canonical lineage,
+    /// carrying the retention policy in force in that state.
+    RetainedAnchor {
+        snapshot_name: String,
+        message_retention_seconds: Option<u64>,
+    },
+    /// A candidate branch state materialized by the convergence sweep — a
+    /// lineage this device has NOT adopted.
+    ///
+    /// Deliberately carries no retention policy. A message readable only under
+    /// an unadopted branch never reaches the live apply, which is the sole
+    /// consumer of one; holding a field here would invite a future caller to
+    /// read a retention policy out of a lineage this device has not accepted.
+    CandidateBranch { branch_id: String },
+}
+
+impl PeelRecoverySource {
+    /// Stable low-cardinality label for the forensic audit trail.
+    fn label(&self) -> String {
+        match self {
+            Self::RetainedAnchor { snapshot_name, .. } => snapshot_name.clone(),
+            Self::CandidateBranch { branch_id } => format!("candidate-branch-{branch_id}"),
+        }
+    }
+
+    fn is_candidate_branch(&self) -> bool {
+        matches!(self, Self::CandidateBranch { .. })
+    }
+
+    /// The `(source epoch, retention)` pair the live apply may consume — `None`
+    /// for a context the live apply is not reachable from.
+    fn live_apply_retention(&self, source_epoch: EpochId) -> Option<(EpochId, Option<u64>)> {
+        match self {
+            Self::RetainedAnchor {
+                message_retention_seconds,
+                ..
+            } => Some((source_epoch, *message_retention_seconds)),
+            Self::CandidateBranch { .. } => None,
+        }
+    }
 }
 
 struct RetainedSelfRemoveProposal {
@@ -154,6 +197,25 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.ingest_group_message_with_branch_contexts(msg, transport_group_id, &[])
+            .await
+    }
+
+    /// [`Self::ingest_group_message`] with extra candidate-branch peel contexts
+    /// offered to the peel-recovery fallback.
+    ///
+    /// Only the deferred-peel sweep passes a non-empty set (see
+    /// [`Engine::retry_deferred_peels`]). A message that only a candidate
+    /// branch's state could read belongs to a lineage this device has not
+    /// adopted, so it is routed to the convergence seam rather than the direct
+    /// apply — see the provenance guard below. Every other step, from dedup to
+    /// terminal classification, is shared with the ordinary path.
+    pub(crate) async fn ingest_group_message_with_branch_contexts(
+        &mut self,
+        msg: &TransportMessage,
+        transport_group_id: Vec<u8>,
+        branch_contexts: &[CandidateBranchPeelContext],
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
@@ -343,11 +405,19 @@ impl<S: StorageProvider> Engine<S> {
             );
         }
         let mut recovered_source_retention = None;
+        // Set when the message was readable ONLY under a candidate branch's
+        // state, i.e. it belongs to a lineage this device has not adopted.
+        let mut recovered_from_candidate_branch = false;
         let peeled = match peel_result {
             Ok(p) => p,
             Err(PeelerError::DecryptFailed) => {
                 let recovered = match self
-                    .try_peel_group_message_from_available_snapshots(msg, &group_id, current_epoch)
+                    .try_peel_group_message_from_recovery_contexts(
+                        msg,
+                        &group_id,
+                        current_epoch,
+                        branch_contexts,
+                    )
                     .await
                 {
                     Ok(recovered) => recovered,
@@ -387,7 +457,8 @@ impl<S: StorageProvider> Engine<S> {
                 };
                 if let Some(recovery) = recovered {
                     recovered_source_retention =
-                        Some((recovery.source_epoch, recovery.message_retention_seconds));
+                        recovery.source.live_apply_retention(recovery.source_epoch);
+                    recovered_from_candidate_branch = recovery.source.is_candidate_branch();
                     self.audit_group(
                         &group_id,
                         marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -395,7 +466,7 @@ impl<S: StorageProvider> Engine<S> {
                             artifact_kind: None,
                             outcome: marmot_forensics::PeelerOutcomeKind::Success,
                             fallback_snapshot_used: true,
-                            fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
+                            fallback_snapshot_name: Some(recovery.source.label()),
                             fallback_snapshot_source_epoch: Some(recovery.source_epoch.0),
                             fallback_attempt_count: Some(recovery.attempt_count),
                             error_kind: None,
@@ -466,7 +537,12 @@ impl<S: StorageProvider> Engine<S> {
                 context_epoch,
             }) => {
                 let recovered = match self
-                    .try_peel_group_message_from_available_snapshots(msg, &group_id, current_epoch)
+                    .try_peel_group_message_from_recovery_contexts(
+                        msg,
+                        &group_id,
+                        current_epoch,
+                        branch_contexts,
+                    )
                     .await
                 {
                     Ok(recovered) => recovered,
@@ -506,7 +582,8 @@ impl<S: StorageProvider> Engine<S> {
                 };
                 if let Some(recovery) = recovered {
                     recovered_source_retention =
-                        Some((recovery.source_epoch, recovery.message_retention_seconds));
+                        recovery.source.live_apply_retention(recovery.source_epoch);
+                    recovered_from_candidate_branch = recovery.source.is_candidate_branch();
                     self.audit_group(
                         &group_id,
                         marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -514,7 +591,7 @@ impl<S: StorageProvider> Engine<S> {
                             artifact_kind: None,
                             outcome: marmot_forensics::PeelerOutcomeKind::Success,
                             fallback_snapshot_used: true,
-                            fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
+                            fallback_snapshot_name: Some(recovery.source.label()),
                             fallback_snapshot_source_epoch: Some(recovery.source_epoch.0),
                             fallback_attempt_count: Some(recovery.attempt_count),
                             error_kind: None,
@@ -734,6 +811,24 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // A message this device could read only under a CANDIDATE BRANCH's
+        // state belongs to a lineage it has not adopted. Canonical OpenMLS
+        // processing cannot accept it — at the same epoch number the rival
+        // branch holds different epoch secrets, so `process_message` fails to
+        // decrypt — and this seam must derive nothing from it either way. It
+        // enters convergence as input for the pass that adjudicates that
+        // branch, which is the only seam that authenticates it.
+        if recovered_from_candidate_branch {
+            return self.buffer_openmls_message_into_convergence(
+                group_id,
+                &openmls_msg,
+                msg,
+                &raw_msg_id,
+                current_epoch,
+                "recovered_under_candidate_branch",
+            );
+        }
+
         // Set when convergence admission is refused ONLY because the
         // fork-source anchor snapshot is gone. Within the rewind horizon
         // that absence is abnormal by construction — every canonical
@@ -774,49 +869,24 @@ impl<S: StorageProvider> Engine<S> {
             false
         };
         if commit_should_enter_convergence {
-            let now = self.convergence_now();
-            self.buffer_openmls_convergence_message_with_time(&group_id, openmls_msg.clone(), now)
-                .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
-            // The content-derived row is now the durable convergence witness;
-            // a raw wrapper that arrived through the retry lifecycle has done
-            // its job and must leave it instead of being re-peeled on every
-            // later publish-cycle replay (mdk#339). No-op on the direct path.
-            if raw_msg_id != msg.id {
-                self.mark_raw_transport_message_processed_if_awaiting_retry(
-                    &raw_msg_id,
-                    "buffered_into_convergence",
-                )?;
-            }
-            let result = self
-                .converge_stored_openmls_messages_with_time(&group_id, now)
-                .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
-            return Ok(convergence_ingest_outcome(
-                &result,
-                msg,
+            return self.buffer_openmls_message_into_convergence(
                 group_id,
+                &openmls_msg,
+                msg,
+                &raw_msg_id,
                 current_epoch,
-            ));
+                "buffered_into_convergence",
+            );
         }
         if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
-            let now = self.convergence_now();
-            self.buffer_openmls_convergence_message_with_time(&group_id, openmls_msg.clone(), now)
-                .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
-            // Same wrapper retirement as the commit branch above.
-            if raw_msg_id != msg.id {
-                self.mark_raw_transport_message_processed_if_awaiting_retry(
-                    &raw_msg_id,
-                    "buffered_into_convergence",
-                )?;
-            }
-            let result = self
-                .converge_stored_openmls_messages_with_time(&group_id, now)
-                .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
-            return Ok(convergence_ingest_outcome(
-                &result,
-                msg,
+            return self.buffer_openmls_message_into_convergence(
                 group_id,
+                &openmls_msg,
+                msg,
+                &raw_msg_id,
                 current_epoch,
-            ));
+                "buffered_into_convergence",
+            );
         }
 
         self.persist_openmls_wire_message(
@@ -2229,6 +2299,77 @@ impl<S: StorageProvider> Engine<S> {
         Ok(matched.unwrap_or(resolved))
     }
 
+    /// Hand an authenticated-later message to the convergence seam and report
+    /// that pass's verdict for it.
+    ///
+    /// The content-derived row is now the durable convergence witness, so a raw
+    /// transport wrapper that arrived through the deferred-peel retry lifecycle
+    /// leaves that lifecycle here instead of being re-peeled on every later
+    /// replay (mdk#339). No-op on the direct path, where no wrapper exists.
+    fn buffer_openmls_message_into_convergence(
+        &mut self,
+        group_id: GroupId,
+        openmls_msg: &TransportMessage,
+        msg: &TransportMessage,
+        raw_msg_id: &MessageId,
+        current_epoch: EpochId,
+        wrapper_retirement_reason: &str,
+    ) -> Result<IngestOutcome, EngineError> {
+        let now = self.convergence_now();
+        self.buffer_openmls_convergence_message_with_time(&group_id, openmls_msg.clone(), now)
+            .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
+        if raw_msg_id != &msg.id {
+            self.mark_raw_transport_message_processed_if_awaiting_retry(
+                raw_msg_id,
+                wrapper_retirement_reason,
+            )?;
+        }
+        let result = self
+            .converge_stored_openmls_messages_with_time(&group_id, now)
+            .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
+        Ok(convergence_ingest_outcome(
+            &result,
+            msg,
+            group_id,
+            current_epoch,
+        ))
+    }
+
+    /// Re-attempt a failed peel against every context this device can offer:
+    /// the candidate branch states the caller supplies, then the retained
+    /// past-epoch anchors.
+    ///
+    /// Branch contexts come first because they need no storage access at all —
+    /// they are owned values whose exporter secret was derived while the
+    /// candidate state was materialized — whereas each anchor attempt rolls the
+    /// group back and forward again.
+    async fn try_peel_group_message_from_recovery_contexts(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        current_epoch: EpochId,
+        branch_contexts: &[CandidateBranchPeelContext],
+    ) -> Result<Option<PastPeelRecovery>, EngineError> {
+        for (index, branch) in branch_contexts.iter().enumerate() {
+            match self.peeler.peel_group_message(msg, &branch.context).await {
+                Ok(peeled) => {
+                    return Ok(Some(PastPeelRecovery {
+                        peeled,
+                        source_epoch: EpochId(branch.tip_epoch),
+                        source: PeelRecoverySource::CandidateBranch {
+                            branch_id: branch.branch_id.clone(),
+                        },
+                        attempt_count: index as u64 + 1,
+                    }));
+                }
+                Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
+                Err(err) => return Err(EngineError::Peeler(err)),
+            }
+        }
+        self.try_peel_group_message_from_available_snapshots(msg, group_id, current_epoch)
+            .await
+    }
+
     async fn try_peel_group_message_from_available_snapshots(
         &self,
         msg: &TransportMessage,
@@ -2287,8 +2428,10 @@ impl<S: StorageProvider> Engine<S> {
                     return Ok(Some(PastPeelRecovery {
                         peeled,
                         source_epoch,
-                        message_retention_seconds,
-                        snapshot_name,
+                        source: PeelRecoverySource::RetainedAnchor {
+                            snapshot_name,
+                            message_retention_seconds,
+                        },
                         attempt_count,
                     }));
                 }

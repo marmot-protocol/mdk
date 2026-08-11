@@ -1473,16 +1473,14 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
-        // A retained-anchor convergence probe durably rewinds the group while
-        // it explores historical candidates. Process termination cannot run
-        // the in-process rollback guard, so restore its pre-probe live snapshot
+        // A convergence rewind probe — the pass's, or the deferred-peel sweep's
+        // candidate-branch enumeration — durably rewinds the group while it
+        // explores historical candidates. Process termination cannot run the
+        // in-process rollback guard, so restore its pre-probe live snapshot
         // before loading any MLS or Marmot state — including the group record
         // read below, whose epoch seeds the epoch manager.
-        crate::openmls_projection::recover_interrupted_retained_anchor_probe(
-            &self.storage,
-            group_id,
-        )
-        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_rewind_probe(&self.storage, group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 

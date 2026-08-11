@@ -1658,6 +1658,90 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
     );
 }
 
+// The deferred-peel sweep rewinds the live group exactly as the pass does, to
+// enumerate the candidate branches whose state reads a rival branch's traffic.
+// A crash mid-rewind must be recovered on the same rail.
+#[tokio::test]
+async fn hydration_recovers_interrupted_candidate_branch_probe() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    let mut historical_group = live_group.clone();
+    historical_group.name = "historical anchor".into();
+    historical_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&historical_group)
+        .expect("plant historical group record");
+    storage
+        .create_group_snapshot(&group_id, "test-historical-anchor")
+        .expect("capture historical anchor");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_snapshot(&group_id, "openmls-branch-probe-test-crash")
+        .expect("capture pre-probe live state");
+    storage
+        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate committed probe rewind");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate recovers orphaned probe");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-probe live state"
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-branch-probe-")),
+        "recovered probe snapshot must be released"
+    );
+}
+
+// Two interrupted rewind probes mean two candidate live states and no way to
+// tell which is newer, so hydration must refuse the group rather than guess.
+// The two rewinds must therefore be distinguishable on disk: were they to share
+// a snapshot name, `create_group_snapshot`'s INSERT OR REPLACE would collapse
+// them into one row and silently disarm this check.
+#[tokio::test]
+async fn hydration_fails_closed_on_two_interrupted_rewind_probes_of_different_kinds() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    drop(initial);
+
+    for name in [
+        "openmls-retained-probe-test-crash",
+        "openmls-branch-probe-test-crash",
+    ] {
+        storage
+            .create_group_snapshot(&group_id, name)
+            .expect("capture pre-probe live state");
+    }
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("per-group failure is quarantined");
+
+    assert!(
+        matches!(
+            reopened.quarantined_groups().as_slice(),
+            [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
+        ),
+        "an ambiguous pair of interrupted probes must quarantine the group"
+    );
+}
+
 // mdk#968: the apply snapshot is released transactionally with a completed
 // branch apply. If one survives a crash, hydration must restore the captured
 // pre-apply live state rather than accepting a partially rewound projection.

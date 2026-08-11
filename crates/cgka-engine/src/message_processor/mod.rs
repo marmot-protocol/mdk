@@ -31,6 +31,7 @@ use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
@@ -42,6 +43,14 @@ pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 /// message would need to trail the group by this many context changes before
 /// its retained row is resource-refused and released. The same transport id
 /// remains eligible if the transport delivers it again afterwards.
+///
+/// The fingerprint now also moves on every newly stored commit, so a busy group
+/// spends this budget faster than one whose live epoch alone advances. It stays
+/// comfortable: a row would have to sit unreadable across 32 distinct commit
+/// contexts, and long before that it has fallen outside `max_rewind_commits`
+/// (pinned at 5 in v1), where it is terminal on horizon grounds regardless.
+/// Spending an attempt per commit is also the intended behavior, not a cost —
+/// each new commit is a genuinely new chance for the row to become readable.
 pub const MAX_DEFERRED_PEEL_ATTEMPTS: u32 = 32;
 
 /// Maximum local residence for an opaque transport object. This is deliberately
@@ -102,6 +111,19 @@ pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 /// across passes instead of holding a convergence drain hostage, so current
 /// events are never blocked behind irrelevant history.
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
+
+/// Upper bound on candidate branch states materialized as peel contexts in one
+/// deferred-peel sweep (`Engine::candidate_branch_peel_contexts`).
+///
+/// Each context costs one bounded replay of its branch, and each is then
+/// offered to at most [`MAX_DEFERRED_ROWS_PER_SWEEP`] retained rows, so one
+/// sweep's worst case is `8 × 64` symmetric AEAD attempts on top of 8 replays —
+/// negligible next to the convergence pass itself, and reached only when a
+/// contested graph and a deferred backlog coincide. Eight comfortably exceeds
+/// the branch count any real fork produces: v1 `max_rewind_commits` is 5, and a
+/// graph wide enough to need more than eight branches is already failing the
+/// pass's own `ReplayBudget`.
+pub(crate) const MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS: usize = 8;
 
 /// Per-group deferred-peel retry lifecycle state (mdk#339). Held on the
 /// engine in `Engine::deferred_peel`; in-memory by design (see the field doc).
@@ -1122,6 +1144,20 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(due.len());
         }
 
+        // The full row list is in hand: refresh the flood-cap count, then stop
+        // before the context work when there is nothing to sweep. Describing
+        // this group's peel context reads storage, so an empty backlog must not
+        // pay for it on every drain.
+        let total = deferred.len();
+        {
+            let state = self.deferred_peel.entry(group_id.clone()).or_default();
+            state.deferred_rows = total;
+            state.counted = true;
+        }
+        if total == 0 {
+            return Ok(0);
+        }
+
         let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
         if self
             .deferred_peel
@@ -1141,14 +1177,9 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let sweep_started = std::time::Instant::now();
-        let total = deferred.len();
-
-        let (_sweep_index, start, retry_budget) = {
+        let (start, retry_budget) = {
             let budget = self.deferred_peel_retry_budget;
             let state = self.deferred_peel.entry(group_id.clone()).or_default();
-            // The full row list is in hand: refresh the flood-cap count.
-            state.deferred_rows = total;
-            state.counted = true;
             state.sweep_count += 1;
             if state.cursor >= total {
                 state.cursor = 0;
@@ -1156,11 +1187,22 @@ impl<S: StorageProvider> Engine<S> {
             if state.cursor == 0 {
                 state.cycle_progressed = false;
             }
-            (state.sweep_count, state.cursor, budget)
+            (state.cursor, budget)
         };
-        if total == 0 {
-            return Ok(0);
-        }
+
+        // Candidate branch states are part of this group's peel context, not a
+        // separate mechanism: post-fork traffic is sealed under the SENDER's
+        // branch state, so a rival branch's later commits and app messages are
+        // opaque to every device that adopted a different branch. Materializing
+        // each candidate branch produces the context that reads its traffic, so
+        // depth and app witnesses can be counted over evidence this device has
+        // not adopted instead of each committer scoring only its own branch.
+        //
+        // Empty for an uncontested graph, so a group without competing commits
+        // pays only the seeding scan. Nothing read here is trusted: the bytes
+        // re-enter through ordinary ingest and only the next pass's OpenMLS
+        // replay authenticates them. A peel that fails is silence.
+        let branch_contexts = self.candidate_branch_peel_contexts(group_id)?;
 
         let end = (start + MAX_DEFERRED_ROWS_PER_SWEEP).min(total);
         let mut progressed = 0usize;
@@ -1192,91 +1234,11 @@ impl<S: StorageProvider> Engine<S> {
             // may conservatively consume an attempt, but cannot reset it.
             self.storage.put_message(&record)?;
 
-            let stored_payload = StoredMessagePayload::decode(&record.payload)
-                .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-            let Some(msg) = stored_payload.as_raw_transport().cloned() else {
-                continue;
-            };
-            match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec())
-                .await
+            if self
+                .reingest_deferred_peel_row(group_id, &record, &branch_contexts)
+                .await?
             {
-                Ok(IngestOutcome::TransportDeferred { .. }) => {}
-                Ok(IngestOutcome::ResourceRefused {
-                    resource: InboundResourceLimit::TransportDeferredCapacity,
-                    ..
-                }) => {}
-                Ok(IngestOutcome::LocalState {
-                    state: LocalIngestState::Quarantined,
-                }) => {
-                    // Defense-in-depth: the gate above should keep this loop
-                    // from running for a quarantined group at all, but if a
-                    // row still classifies Quarantined it must keep its
-                    // PeelDeferred state — the catch-all arm below would
-                    // retire the replay buffer.
-                }
-                Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
-                    // The peeled content now has its own content-derived record;
-                    // retire the raw transport wrapper so it does not keep
-                    // re-entering this retry loop as a stale duplicate — but ONLY
-                    // while it is still awaiting retry. `record` is the pre-ingest
-                    // sweep snapshot; `ingest_group_message` may have committed a
-                    // terminal state to this same row during the call (or
-                    // fork-recovery rollback may have deleted it). That
-                    // ingest-committed verdict is authoritative, so re-read the
-                    // row and retire only a state ingest left awaiting retry
-                    // (seam parity with `replay_buffered_messages`, 5ae9a440).
-                    if self.raw_transport_row_awaiting_retry(&record.id)? {
-                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
-                    }
-                    // Release the flood-cap slot whenever the row leaves the
-                    // retry lifecycle, whether this arm retired it or ingest
-                    // already terminalized it.
-                    self.note_peel_deferred_row_retired(group_id);
-                    progressed += 1;
-                }
-                Ok(
-                    IngestOutcome::Stale { .. }
-                    | IngestOutcome::Ignored { .. }
-                    | IngestOutcome::LocalState { .. }
-                    | IngestOutcome::ResourceRefused { .. }
-                    | IngestOutcome::Rejected { .. },
-                ) => {
-                    // Terminal stale classifications are still successful
-                    // reclassifications of this raw deferred row. Retire it only
-                    // while it is still awaiting retry: the reachable case is
-                    // `SelfEvicted`, where re-ingesting the deferred row against a
-                    // now-inactive group makes ingest persist it `Failed`
-                    // (ingest.rs). Relabeling that evicted-on row `Processed`
-                    // would sweep it back into canonicalization, so re-read the
-                    // row and never clobber ingest's terminal verdict (seam parity
-                    // with `replay_buffered_messages`, 5ae9a440).
-                    if self.raw_transport_row_awaiting_retry(&record.id)? {
-                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
-                    }
-                    // The cap-slot release stays outside the guard: the row has
-                    // left the retry lifecycle regardless of who terminalized it.
-                    self.note_peel_deferred_row_retired(group_id);
-                    progressed += 1;
-                }
-                Err(EngineError::ForkedEpoch {
-                    group_id: forked_group_id,
-                    last_stable,
-                    conflicting_epoch,
-                }) => {
-                    self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
-                    self.note_peel_deferred_row_retired(group_id);
-                    return Err(EngineError::ForkedEpoch {
-                        group_id: forked_group_id,
-                        last_stable,
-                        conflicting_epoch,
-                    });
-                }
-                Err(e) => {
-                    self.update_stored_message_state(&record.id, MessageState::Retryable)?;
-                    self.note_peel_deferred_row_retired(group_id);
-                    return Err(e);
-                }
+                progressed += 1;
             }
         }
 
@@ -1299,11 +1261,141 @@ impl<S: StorageProvider> Engine<S> {
             backlog = total as u64,
             progressed = progressed as u64,
             terminal = terminal as u64,
+            branch_contexts = branch_contexts.len() as u64,
             queue_depth = queue_depth as u64,
             sweep_duration_ms = sweep_started.elapsed().as_millis() as u64,
             "deferred-peel retry sweep"
         );
         Ok(progressed)
+    }
+
+    /// Materialize the candidate branches of this group's convergence graph and
+    /// capture each tip's peel context.
+    fn candidate_branch_peel_contexts(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::openmls_projection::CandidateBranchPeelContext>, EngineError> {
+        let group = self.storage.get_group(group_id)?;
+        let policy = self
+            .convergence_policy_for_group_ungated(group_id)
+            .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+        let max_rewind_commits = policy.convergence.max_rewind_commits;
+        crate::openmls_projection::candidate_branch_peel_contexts(
+            &self.storage,
+            group_id,
+            group.epoch.0.saturating_sub(max_rewind_commits),
+            max_rewind_commits,
+            crate::openmls_projection::ReplayProfilePolicy {
+                reject_legacy_group_additions: self.new_protocol_profile
+                    == cgka_traits::group::ProtocolProfile::Current,
+            },
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+        )
+        .map_err(|e| EngineError::Backend(format!("candidate branch peel contexts: {e}")))
+    }
+
+    /// Re-ingest one retained raw-transport row and settle its retry lifecycle
+    /// from whatever ingest decided. Returns whether the row made progress —
+    /// i.e. left the retry lifecycle.
+    ///
+    /// Split out from the sweep loop so the retire/keep rules read as one
+    /// rulebook rather than as control flow; the caller owns retry-budget
+    /// accounting.
+    async fn reingest_deferred_peel_row(
+        &mut self,
+        group_id: &GroupId,
+        record: &MessageRecord,
+        branch_contexts: &[crate::openmls_projection::CandidateBranchPeelContext],
+    ) -> Result<bool, EngineError> {
+        let stored_payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let Some(msg) = stored_payload.as_raw_transport().cloned() else {
+            return Ok(false);
+        };
+        match self
+            .ingest_group_message_with_branch_contexts(
+                &msg,
+                group_id.as_slice().to_vec(),
+                branch_contexts,
+            )
+            .await
+        {
+            Ok(IngestOutcome::TransportDeferred { .. }) => Ok(false),
+            Ok(IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }) => Ok(false),
+            Ok(IngestOutcome::LocalState {
+                state: LocalIngestState::Quarantined,
+            }) => {
+                // Defense-in-depth: the gates above should keep this from
+                // running for a quarantined group at all, but if a row still
+                // classifies Quarantined it must keep its PeelDeferred state —
+                // the catch-all arm below would retire the replay buffer.
+                Ok(false)
+            }
+            Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
+                // The peeled content now has its own content-derived record;
+                // retire the raw transport wrapper so it does not keep
+                // re-entering this retry loop as a stale duplicate — but ONLY
+                // while it is still awaiting retry. `record` is the pre-ingest
+                // sweep snapshot; ingest may have committed a terminal state to
+                // this same row during the call (or a convergence rollback may
+                // have deleted it). That ingest-committed verdict is
+                // authoritative, so re-read the row and retire only a state
+                // ingest left awaiting retry (seam parity with
+                // `replay_buffered_messages`, 5ae9a440).
+                if self.raw_transport_row_awaiting_retry(&record.id)? {
+                    self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                }
+                // Release the flood-cap slot whenever the row leaves the retry
+                // lifecycle, whether this arm retired it or ingest already
+                // terminalized it.
+                self.note_peel_deferred_row_retired(group_id);
+                Ok(true)
+            }
+            Ok(
+                IngestOutcome::Stale { .. }
+                | IngestOutcome::Ignored { .. }
+                | IngestOutcome::LocalState { .. }
+                | IngestOutcome::ResourceRefused { .. }
+                | IngestOutcome::Rejected { .. },
+            ) => {
+                // Terminal stale classifications are still successful
+                // reclassifications of this raw deferred row. Retire it only
+                // while it is still awaiting retry: the reachable case is
+                // `SelfEvicted`, where re-ingesting the deferred row against a
+                // now-inactive group makes ingest persist it `Failed`
+                // (ingest.rs). Relabeling that evicted-on row `Processed` would
+                // sweep it back into canonicalization, so re-read the row and
+                // never clobber ingest's terminal verdict.
+                if self.raw_transport_row_awaiting_retry(&record.id)? {
+                    self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                }
+                // The cap-slot release stays outside the guard: the row has left
+                // the retry lifecycle regardless of who terminalized it.
+                self.note_peel_deferred_row_retired(group_id);
+                Ok(true)
+            }
+            Err(EngineError::ForkedEpoch {
+                group_id: forked_group_id,
+                last_stable,
+                conflicting_epoch,
+            }) => {
+                self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
+                self.note_peel_deferred_row_retired(group_id);
+                Err(EngineError::ForkedEpoch {
+                    group_id: forked_group_id,
+                    last_stable,
+                    conflicting_epoch,
+                })
+            }
+            Err(e) => {
+                self.update_stored_message_state(&record.id, MessageState::Retryable)?;
+                self.note_peel_deferred_row_retired(group_id);
+                Err(e)
+            }
+        }
     }
 
     /// Return the remaining time until the earliest durable deferred-peel
@@ -1352,8 +1444,10 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Fingerprint of everything that can change a deferred peel's outcome:
-    /// the group's live epoch and the retained peel-snapshot set. While this
-    /// is unchanged, re-peeling a deferred row is guaranteed wasted work.
+    /// the group's live epoch, the retained peel-snapshot set, and the stored
+    /// commit graph the sweep's candidate branch contexts are derived from.
+    /// While all three are unchanged, re-peeling a deferred row is guaranteed
+    /// wasted work.
     fn deferred_peel_context_fingerprint(
         &self,
         group_id: &GroupId,
@@ -1372,9 +1466,46 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update((name.len() as u64).to_be_bytes());
             hasher.update(name.as_bytes());
         }
+        // The stored commit graph is part of the peel context too: candidate
+        // branch states are derived from it, so a newly retained rival commit
+        // adds a readable context even though the live epoch and the retained
+        // anchor set are both unchanged. Without this term the gate would stay
+        // armed exactly where it must not — on a device holding its own branch
+        // while a rival branch's traffic sits unreadable.
+        for digest in self.stored_convergence_commit_digests(group_id)? {
+            hasher.update(digest);
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(&hasher.finalize());
         Ok(out)
+    }
+
+    /// Content digests of the stored commits that can contribute to this
+    /// group's convergence graph, in a stable order.
+    fn stored_convergence_commit_digests(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<BTreeSet<[u8; 32]>, EngineError> {
+        let mut digests = BTreeSet::new();
+        for record in self.storage.list_messages(group_id, EpochId(0))? {
+            // Share the graph's own membership predicate rather than restating
+            // it: this set must describe exactly the commits a pass would build
+            // candidate branches from, and a private copy of that match drifts
+            // without any test noticing.
+            if !crate::openmls_projection::record_state_can_contribute_to_openmls_graph(
+                record.state,
+            ) {
+                continue;
+            }
+            let Some((_message, projection)) = decode_openmls_wire_projection(&record.payload)
+            else {
+                continue;
+            };
+            if projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit {
+                digests.insert(projection.message_digest);
+            }
+        }
+        Ok(digests)
     }
 
     /// Check capacity for one new `PeelDeferred` row, lazily counting the

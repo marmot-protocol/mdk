@@ -29,7 +29,9 @@ capability negotiation, and MIP-03 admin policy — everything that OpenMLS does
   - **Open...:** the convergence admission gate (`commit_should_enter_convergence`) in
     `src/message_processor/ingest.rs` + `src/distributed_convergence.rs` — same-epoch rivals are adjudicated by
     distributed convergence for every member; the `WrongEpoch` branch retains and schedules an in-horizon rival whose
-    source anchor is gone, and the coordinator's `MissingRetainedAnchor` verdict owns the durable halt
+    source anchor is gone, and the coordinator's `MissingRetainedAnchor` verdict owns the durable halt. Post-fork
+    traffic on an unadopted branch is unreadable until `openmls_projection::candidate_branch_peel_contexts` gives
+    `Engine::retry_deferred_peels` that branch's own state — see "Branch-relative peel" below
 
 - **You want to...:** Figure out SelfRemove auto-commit eligibility
   - **Open...:** `src/auto_committer.rs`
@@ -151,7 +153,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** engine-side diagnostic telemetry for post-settle convergence reorgs
 
 - **Module:** `openmls_projection.rs`
-  - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay
+  - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay and
+    `candidate_branch_peel_contexts` (candidate branch tips captured as owned peel contexts)
 
 - **Module:** `update_group_data.rs`
   - **Owns:** `SendIntent::UpdateGroupData` — stages an `AppDataUpdate` commit for `marmot.group.profile.v1`
@@ -334,6 +337,34 @@ send/apply-time `fork-` snapshots, `GroupEvent::ForkRecovered`) is deleted. The 
 (source epoch, `privileged` before `ordinary`, authenticated committer identity, digest fallback) lives on inside
 branch selection, where valid branch depth outranks it. Tests: `tests/fork_detection.rs`, the route-equivalence
 family in the conformance simulator.
+
+**Branch-relative peel — the unified route's visibility half.** Branch selection ranks on valid commit depth and app
+witnesses counted over *stored* inputs, and a group message is sealed under the **sender's** current-epoch exporter
+secret with no epoch hint on the wire. So once two members commit from the same epoch, each branch's later traffic is
+opaque to every device that adopted the other branch: it sits retained as `PeelDeferred`, contributes neither depth nor
+witnesses, every committer over-scores its own branch, and the fork never heals. Candidate branch states are therefore
+part of a group's *peel context*, not a separate mechanism.
+`openmls_projection::candidate_branch_peel_contexts` materializes each candidate branch under a
+`SnapshotRollbackGuard` and captures its tip's owned `GroupContextSnapshot`; the exporter secret is derived while the
+branch state exists, so the transient state is rolled back before any (async) peel runs against it.
+`Engine::retry_deferred_peels` then offers those contexts to every retained row through the ordinary ingest seam.
+
+Gating, so the uncontested path pays no replay: the sweep returns before any context work on an empty backlog; context
+collection stops at the cheap "two commits share a source epoch" check before any replay; at most
+`MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS` branches are materialized, one bounded replay each under a fresh budget of the
+pass's shape; and failure to enumerate branches (missing anchor, missing own-commit checkpoint, exhausted budget)
+yields no contexts rather than an error — the pass, not this helper, owns every verdict. Because candidate branch
+states are part of the peel context, `deferred_peel_context_fingerprint` folds in the stored commit graph: a newly
+retained rival commit adds a readable context even when the live epoch and retained-anchor set are unchanged, and
+without that term the sweep gate would stay armed exactly where it must not.
+
+**Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
+not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical
+OpenMLS cannot accept it anyway (same epoch number, different epoch secrets), and this seam must derive nothing from
+it. The peeled bytes are evidence of nothing on their own: the next pass's OpenMLS replay is what authenticates them,
+and a failed peel is silence, never a verdict. Tests: `tests/epoch_sealed_transport.rs` (Tier 2 opts into production
+epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-e2e-delivery/v1` and
+`adversarial-reliability/app-witness-value/v1` families in the conformance simulator.
 
 ## Conventions in this crate
 

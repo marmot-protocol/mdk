@@ -24,6 +24,7 @@ E7|crates/cgka-engine/src/message_processor/mod.rs|SELF_REMOVE_AUTO_COMMIT_JITTE
 E7|crates/cgka-engine/src/message_processor/mod.rs|SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS
 E8|crates/cgka-engine/src/message_processor/mod.rs|MAX_DEFERRED_PEEL_RESIDENCE_MS
 E9|crates/cgka-engine/src/message_processor/mod.rs|MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP
+E10|crates/cgka-engine/src/message_processor/mod.rs|MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS
 A1|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS
 A2|crates/marmot-app/src/runtime/account_worker.rs|MIN_CONVERGENCE_SETTLEMENT_DELAY
 A3|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_RETRY_BASE_DELAY
