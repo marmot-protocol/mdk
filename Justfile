@@ -329,10 +329,15 @@ convergence-failure-corpus:
     cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
     cargo nextest run -p cgka-conformance-simulator --test semantic_reduction --locked
 
-# Run the small post-fix regression matrix against a clean source revision and
-# retain its exact test selectors, private logs, source identity, and digests.
-focused-convergence-regressions out:
-    cargo run -p convergence-campaign-runner --bin cgka-regression-campaign --locked -- run --out "{{out}}"
+# Run each post-fix regression through an independent exact selector. Nextest
+# exits nonzero when a selector matches no tests, so renames and deletions fail
+# closed instead of silently reporting a zero-test success.
+focused-convergence-regressions:
+    cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=restarted_committer_without_source_anchor_halts_through_convergence)'
+    cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=verified_welcome_repair_survives_the_next_convergence_drain)'
+    cargo nextest run -p cgka-engine --test auto_commit_atomicity --locked -E 'test(=leave_persistence_failure_rolls_back_every_transactional_write)'
+    cargo nextest run -p marmot-app --lib --locked -E 'test(=tests::explicit_catch_up_arms_and_replays_without_later_traffic)'
+    cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork)'
 
 # Capability-level entry points used by the scheduled workflows. PR checks
 # remain split into separately named steps for useful failure attribution.

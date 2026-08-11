@@ -60,33 +60,3 @@ in the corpus. Promotion cannot be asserted through the diagnosis command.
 The operator contract, backend boundary, artifact posture, and real-container
 verification commands live in
 [`docs/marmot-architecture/distributed-convergence-campaigns.md`](../../docs/marmot-architecture/distributed-convergence-campaigns.md).
-
-## Focused local regression evidence
-
-`cgka-regression-campaign` composes the narrow engine and app regressions for
-recent convergence fixes without weakening or duplicating their internal fault
-injection as Scenario IR. The v1 catalog covers:
-
-- missing retained-anchor fail-closed behavior;
-- authenticated Welcome repair surviving the next convergence drain;
-- atomic self-removal persistence across every injected write failure and a
-  restart/retry;
-- armed full-history replay immediately after catch-up; and
-- the production-pinned rewind-horizon boundary in a normal build.
-
-Run it from a clean revision and choose a new output directory:
-
-```sh
-just focused-convergence-regressions target/focused-convergence-$(git rev-parse --short HEAD)
-cargo run -p convergence-campaign-runner --bin cgka-regression-campaign --locked -- \
-  check target/focused-convergence-$(git rev-parse --short HEAD)/campaign-report.v1.json
-```
-
-The runner refuses a dirty source tree and an existing output directory. Before
-the first test it writes an owner-only `campaign-input.v1.json` containing the
-source revision, `Cargo.lock` digest, exact package/target/test selectors, and
-timeout. It then writes owner-only stdout/stderr per case and a
-`campaign-report.v1.json` binding every artifact by byte count and SHA-256.
-These are focused regression artifacts, not a release evidence bundle and not
-evidence that the four-party cross-route vector ran through distributed
-adapters.
