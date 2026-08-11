@@ -140,9 +140,8 @@ pub struct AppClient {
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
     pub(crate) epoch_stall: EpochStallDetector,
-    /// Set when [`epoch_stall`] arms a backfill during ingest; drained after the
-    /// sync by running the full-history transport replay.
-    pub(crate) epoch_backfill_pending: bool,
+    /// Armed epoch-gap recovery intent awaiting its account-wide replay.
+    pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
     /// Temporary full-history subscriptions installed only while a post-join
     /// maintenance obligation is waiting for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:

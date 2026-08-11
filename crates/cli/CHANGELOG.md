@@ -54,6 +54,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   seam now execute an armed epoch-gap full-history replay immediately instead of
   waiting for unrelated later relay traffic. Explicit full-history repair also
   consumes a pending replay without issuing the same account-wide query twice.
+- Epoch-gap backfill forensic audit rows now continue past `armed` with typed
+  `started`, `completed`/`failed`, and optional `deferred` lifecycle evidence
+  correlated by `operation_id`, including replay seam, delivery count, transport
+  activation outcome, and per-group local epoch before/after observation.
 - KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
   categories (for example `blocked` or `auth-required`) instead of repeating a
   generic `relay rejected event` summary, while successful deletions still

@@ -1428,7 +1428,7 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
-            epoch_backfill_pending: false,
+            pending_epoch_backfill: None,
             post_join_maintenance_subscriptions: HashMap::new(),
         };
         if !defer_group_hydration {

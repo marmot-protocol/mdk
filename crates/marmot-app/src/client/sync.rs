@@ -20,10 +20,31 @@ use crate::{
     SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary,
     TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event, unix_now_seconds,
 };
+use marmot_forensics::{
+    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillDeferredReason,
+    EpochBackfillExecutionSeam, EpochStallBackfillTrigger,
+};
 
 use super::AppClient;
-use super::epoch_stall::BackfillDecision;
+use super::audit::EpochBackfillTerminalAudit;
+use super::epoch_stall::{BackfillDecision, PendingEpochBackfill, PendingEpochBackfillGroup};
 use crate::config::CursorPersistence;
+
+/// In-flight epoch-gap replay bookkeeping shared by begin/finish helpers.
+pub(crate) struct EpochBackfillExecution {
+    pub(crate) pending: PendingEpochBackfill,
+    pub(crate) epochs_before: HashMap<cgka_traits::GroupId, u64>,
+    pub(crate) retry_ordinal: u64,
+    pub(crate) started: Instant,
+}
+
+struct EpochBackfillReplayOutcome {
+    duration_ms: u64,
+    activation_outcome: EpochBackfillActivationOutcome,
+    error_kind: Option<String>,
+    deliveries: u64,
+    succeeded: bool,
+}
 
 /// What the convergence scheduler should do next for a group, derived from
 /// the engine's durable pass state. Expected collection time is not an error;
@@ -136,7 +157,12 @@ impl AppClient {
             let decision = self
                 .epoch_stall
                 .observe_resource_refusal(group_id.clone(), record.epoch);
-            self.apply_backfill_decision(group_id, record.epoch.0, decision);
+            self.apply_backfill_decision(
+                group_id,
+                record.epoch.0,
+                decision,
+                EpochStallBackfillTrigger::ResourceRefusal,
+            );
         }
     }
 
@@ -219,7 +245,8 @@ impl AppClient {
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.
         self.record_subscription_rebuild(rebuild_since_secs).await;
-        let mut summary = self.sync_sdk_relay().await?;
+        let mut deliveries = 0;
+        let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
         // `open()` hydration (mdk#426). If no relay delivery arrived
@@ -484,7 +511,7 @@ impl AppClient {
                 && summary.events.is_empty()
                 && summary.epoch_stall_escalations.is_empty()
                 && self.pending_convergence_groups.is_empty()
-                && !self.epoch_backfill_pending
+                && !self.has_pending_epoch_backfill()
             {
                 continue;
             }
@@ -550,7 +577,7 @@ impl AppClient {
         Ok(summary)
     }
 
-    async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
+    async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, AppError> {
         let display_names = self.app.display_names_by_id()?;
         let local_account_id_hex = self
             .app
@@ -571,7 +598,7 @@ impl AppClient {
         // compare the persisted floor against the ingested `created_at`s.
         let drain_started = std::time::Instant::now();
         let cursor_before_secs = self.state.last_transport_timestamp;
-        let mut deliveries: u64 = 0;
+        *deliveries = 0;
         let mut routes_dirty = false;
 
         loop {
@@ -599,7 +626,7 @@ impl AppClient {
             routes_dirty |= self
                 .ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
-            deliveries = deliveries.saturating_add(1);
+            *deliveries = deliveries.saturating_add(1);
         }
 
         let routes_changed = self.refresh_group_routes()?;
@@ -608,7 +635,7 @@ impl AppClient {
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            deliveries,
+            *deliveries,
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
@@ -716,7 +743,18 @@ impl AppClient {
                 BackfillDecision::Skip
             }
         };
-        self.apply_backfill_decision(&group_id, record.epoch.0, decision);
+        self.apply_backfill_decision(
+            &group_id,
+            record.epoch.0,
+            decision,
+            match outcome {
+                IngestOutcome::TransportDeferred { .. } => {
+                    EpochStallBackfillTrigger::UndecryptableThreshold
+                }
+                IngestOutcome::ResourceRefused { .. } => EpochStallBackfillTrigger::ResourceRefusal,
+                _ => EpochStallBackfillTrigger::UndecryptableThreshold,
+            },
+        );
     }
 
     /// Apply an epoch-stall backfill decision: arm the replay, and record an
@@ -736,14 +774,40 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         stalled_epoch: u64,
         decision: BackfillDecision,
+        trigger: EpochStallBackfillTrigger,
     ) {
         if decision.arms_backfill() {
+            let (attempt_id, record_arm) = {
+                let pending = self
+                    .pending_epoch_backfill
+                    .get_or_insert_with(PendingEpochBackfill::new);
+                let record_arm = match pending.groups.get_mut(group_id) {
+                    None => {
+                        pending.groups.insert(
+                            group_id.clone(),
+                            PendingEpochBackfillGroup { stalled_epoch },
+                        );
+                        true
+                    }
+                    Some(existing) if existing.stalled_epoch != stalled_epoch => {
+                        existing.stalled_epoch = stalled_epoch;
+                        true
+                    }
+                    Some(_) => false,
+                };
+                (pending.attempt_id.clone(), record_arm)
+            };
+            let context = AuditEventContext {
+                operation_id: Some(attempt_id),
+                ..AuditEventContext::default()
+            };
             // Record the arm decision before the replay side effect runs (the
             // worker seam calls run_pending_epoch_backfill after this returns).
             // Best-effort, fire-and-forget: recording can never block or fail
             // the backfill.
-            self.record_epoch_stall_backfill_armed(group_id, stalled_epoch);
-            self.epoch_backfill_pending = true;
+            if record_arm {
+                self.record_epoch_stall_backfill_armed(group_id, stalled_epoch, trigger, &context);
+            }
         }
         if let BackfillDecision::ArmAndEscalate { arms } = decision {
             // The replay is armed above regardless: escalating reports that
@@ -810,32 +874,216 @@ impl AppClient {
     /// the account worker to schedule a forensic audit-tracker upload for the
     /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
     pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
-        self.epoch_backfill_pending
+        self.pending_epoch_backfill.is_some()
     }
 
-    /// Consume a pending epoch-gap replay after an unfloored transport
-    /// activation has succeeded. Shared by the automatic replay path and the
-    /// explicit full-history repair path, which already performed the same
-    /// account-wide replay and must not issue it twice.
-    pub(crate) fn finish_pending_epoch_backfill_after_replay(&mut self) {
-        if !self.epoch_backfill_pending {
-            return;
+    fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
+        self.runtime
+            .group_record(group_id)
+            .ok()
+            .map(|record| record.epoch.0)
+    }
+
+    fn capture_pending_group_epochs(
+        &self,
+        pending: &PendingEpochBackfill,
+    ) -> HashMap<cgka_traits::GroupId, u64> {
+        pending
+            .groups
+            .keys()
+            .filter_map(|group_id| {
+                self.local_epoch_for_group(group_id)
+                    .map(|epoch| (group_id.clone(), epoch))
+            })
+            .collect()
+    }
+
+    fn epoch_backfill_audit_context(pending: &PendingEpochBackfill) -> AuditEventContext {
+        AuditEventContext {
+            operation_id: Some(pending.attempt_id.clone()),
+            ..AuditEventContext::default()
         }
-        self.epoch_stall.mark_replayed();
-        self.epoch_backfill_pending = false;
+    }
+
+    pub(crate) fn begin_epoch_backfill_execution(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Option<EpochBackfillExecution> {
+        let mut pending = self.pending_epoch_backfill.take()?;
+        let retry_ordinal = u64::from(pending.execution_attempts);
+        let epochs_before = self.capture_pending_group_epochs(&pending);
+        let context = Self::epoch_backfill_audit_context(&pending);
+        if epochs_before.len() != pending.groups.len() {
+            self.record_epoch_stall_backfill_deferred(
+                EpochBackfillDeferredReason::GroupEpochUnavailable,
+                retry_ordinal,
+                &context,
+            );
+            self.pending_epoch_backfill = Some(pending);
+            return None;
+        }
+        pending.execution_attempts = pending.execution_attempts.saturating_add(1);
+        self.record_epoch_stall_backfill_started(seam, retry_ordinal, &context);
+        Some(EpochBackfillExecution {
+            pending,
+            epochs_before,
+            retry_ordinal,
+            started: Instant::now(),
+        })
+    }
+
+    fn finish_epoch_backfill_execution(
+        &mut self,
+        execution: EpochBackfillExecution,
+        activation_outcome: EpochBackfillActivationOutcome,
+        error_kind: Option<String>,
+        deliveries: u64,
+        succeeded: bool,
+    ) {
+        let duration_ms = execution.started.elapsed().as_millis() as u64;
+        let epochs_after = self.capture_pending_group_epochs(&execution.pending);
+        let observed_all_groups = epochs_after.len() == execution.pending.groups.len();
+        let succeeded = succeeded && observed_all_groups;
+        let error_kind = if !observed_all_groups && error_kind.is_none() {
+            Some("group_epoch_unavailable".to_string())
+        } else {
+            error_kind
+        };
+        self.record_epoch_backfill_terminal_rows(
+            &execution.pending,
+            execution.retry_ordinal,
+            &execution.epochs_before,
+            &epochs_after,
+            EpochBackfillReplayOutcome {
+                duration_ms,
+                activation_outcome,
+                error_kind,
+                deliveries,
+                succeeded,
+            },
+        );
+        if succeeded {
+            self.epoch_stall.mark_replayed();
+        } else {
+            self.pending_epoch_backfill = Some(execution.pending);
+        }
+    }
+
+    fn record_epoch_backfill_terminal_rows(
+        &self,
+        pending: &PendingEpochBackfill,
+        retry_ordinal: u64,
+        epochs_before: &HashMap<cgka_traits::GroupId, u64>,
+        epochs_after: &HashMap<cgka_traits::GroupId, u64>,
+        outcome: EpochBackfillReplayOutcome,
+    ) {
+        let context = Self::epoch_backfill_audit_context(pending);
+        for group_id in pending.groups.keys() {
+            let local_epoch_before = epochs_before
+                .get(group_id)
+                .copied()
+                .unwrap_or(pending.groups[group_id].stalled_epoch);
+            let local_epoch_after = epochs_after
+                .get(group_id)
+                .copied()
+                .unwrap_or(local_epoch_before);
+            let group_advanced = local_epoch_after > local_epoch_before;
+            self.record_epoch_stall_backfill_terminal(
+                group_id,
+                outcome.succeeded,
+                EpochBackfillTerminalAudit {
+                    retry_ordinal,
+                    duration_ms: outcome.duration_ms,
+                    activation_outcome: outcome.activation_outcome,
+                    error_kind: outcome.error_kind.clone(),
+                    deliveries: outcome.deliveries,
+                    local_epoch_before,
+                    local_epoch_after,
+                    group_advanced,
+                },
+                &context,
+            );
+        }
     }
 
     /// Recover any group that stalled below its live epoch during ingest by
     /// replaying the account's full transport history (`since = None`). One replay
     /// re-fetches every group, so the detector collapses simultaneously-stuck
     /// groups into a single replay. A no-op when nothing stalled.
-    pub(crate) async fn run_pending_epoch_backfill(&mut self) -> Result<(), AppError> {
-        if !self.epoch_backfill_pending {
-            return Ok(());
+    pub(crate) async fn run_pending_epoch_backfill(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Result<Option<SyncSummary>, AppError> {
+        let Some(execution) = self.begin_epoch_backfill_execution(seam) else {
+            return Ok(None);
+        };
+
+        match self.runtime.activate_transport(None).await {
+            Ok(()) => {
+                if let Err(err) = self.sync_runtime_groups().await {
+                    let terminal_error = err.privacy_safe_kind().to_string();
+                    self.finish_epoch_backfill_execution(
+                        execution,
+                        EpochBackfillActivationOutcome::Succeeded,
+                        Some(terminal_error),
+                        0,
+                        false,
+                    );
+                    return Err(err);
+                }
+                self.record_subscription_rebuild(None).await;
+                let mut deliveries = 0;
+                let mut summary = match self.sync_sdk_relay(&mut deliveries).await {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        let terminal_error = err.privacy_safe_kind().to_string();
+                        self.finish_epoch_backfill_execution(
+                            execution,
+                            EpochBackfillActivationOutcome::Succeeded,
+                            Some(terminal_error),
+                            deliveries,
+                            false,
+                        );
+                        return Err(err);
+                    }
+                };
+                let drained = match self.drain_pending_session_events().await {
+                    Ok(drained) => drained,
+                    Err(err) => {
+                        let terminal_error = err.privacy_safe_kind().to_string();
+                        self.finish_epoch_backfill_execution(
+                            execution,
+                            EpochBackfillActivationOutcome::Succeeded,
+                            Some(terminal_error),
+                            deliveries,
+                            false,
+                        );
+                        return Err(err);
+                    }
+                };
+                summary.merge(drained);
+                self.finish_epoch_backfill_execution(
+                    execution,
+                    EpochBackfillActivationOutcome::Succeeded,
+                    None,
+                    deliveries,
+                    true,
+                );
+                Ok(Some(summary))
+            }
+            Err(err) => {
+                let app_err: AppError = err.into();
+                let terminal_error = app_err.privacy_safe_kind().to_string();
+                self.finish_epoch_backfill_execution(
+                    execution,
+                    EpochBackfillActivationOutcome::Failed,
+                    Some(terminal_error),
+                    0,
+                    false,
+                );
+                Err(app_err)
+            }
         }
-        self.runtime.activate_transport(None).await?;
-        self.finish_pending_epoch_backfill_after_replay();
-        Ok(())
     }
 
     /// Explicit account-wide repair for a host that has independent evidence
@@ -853,10 +1101,17 @@ impl AppClient {
         self.relay_plane
             .set_transport_signer(self.transport_signer.clone())
             .await;
+        if self.has_pending_epoch_backfill() {
+            return self
+                .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
+                .await?
+                .ok_or_else(|| AppError::UnknownGroup(String::new()));
+        }
         self.runtime.activate_transport(None).await?;
         self.sync_runtime_groups().await?;
         self.record_subscription_rebuild(None).await;
-        let mut summary = self.sync_sdk_relay().await?;
+        let mut deliveries = 0;
+        let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
         summary.merge(self.drain_pending_session_events().await?);
         Ok(summary)
     }

@@ -401,6 +401,7 @@ fn epoch_stall_backfill_armed_roundtrips_and_carries_its_fields() {
     let kind = AuditEventKind::EpochStallBackfillArmed {
         stalled_epoch: 19,
         threshold: 8,
+        trigger: Some(EpochStallBackfillTrigger::ResourceRefusal),
     };
     let event = AuditEvent {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
@@ -419,8 +420,27 @@ fn epoch_stall_backfill_armed_roundtrips_and_carries_its_fields() {
     assert_eq!(value["kind"]["type"], "epoch_stall_backfill_armed");
     assert_eq!(value["kind"]["stalled_epoch"], 19);
     assert_eq!(value["kind"]["threshold"], 8);
+    assert_eq!(value["kind"]["trigger"], "resource_refusal");
     let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.kind, kind);
+}
+
+#[test]
+fn epoch_stall_backfill_armed_accepts_pre_trigger_v2_rows() {
+    let parsed: AuditEventKind = serde_json::from_value(serde_json::json!({
+        "type": "epoch_stall_backfill_armed",
+        "stalled_epoch": 19,
+        "threshold": 8
+    }))
+    .unwrap();
+    assert_eq!(
+        parsed,
+        AuditEventKind::EpochStallBackfillArmed {
+            stalled_epoch: 19,
+            threshold: 8,
+            trigger: None,
+        }
+    );
 }
 
 #[test]
@@ -865,6 +885,35 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::EpochStallBackfillArmed {
             stalled_epoch: 19,
             threshold: 8,
+            trigger: Some(EpochStallBackfillTrigger::UndecryptableThreshold),
+        },
+        AuditEventKind::EpochStallBackfillStarted {
+            seam: EpochBackfillExecutionSeam::ExplicitCatchUp,
+            replay_scope: EpochBackfillReplayScope::AccountFullHistory,
+            retry_ordinal: 0,
+        },
+        AuditEventKind::EpochStallBackfillCompleted {
+            retry_ordinal: 0,
+            duration_ms: 120,
+            activation_outcome: EpochBackfillActivationOutcome::Succeeded,
+            deliveries: 4,
+            local_epoch_before: 19,
+            local_epoch_after: 20,
+            group_advanced: true,
+        },
+        AuditEventKind::EpochStallBackfillFailed {
+            retry_ordinal: 0,
+            duration_ms: 50,
+            activation_outcome: EpochBackfillActivationOutcome::Failed,
+            error_kind: Some("account_transport".into()),
+            deliveries: 0,
+            local_epoch_before: 19,
+            local_epoch_after: 19,
+            group_advanced: false,
+        },
+        AuditEventKind::EpochStallBackfillDeferred {
+            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
+            retry_ordinal: 1,
         },
         AuditEventKind::EpochStallBackfillEscalated {
             stalled_epoch: 12,

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, SecretBytes};
+use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -672,6 +673,7 @@ async fn run_app_runtime_account_worker(
                 &account_id_hex,
                 &account_label,
                 &shared,
+                EpochBackfillExecutionSeam::Startup,
             )
             .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -823,6 +825,7 @@ async fn run_app_runtime_account_worker(
                                         &account_id_hex,
                                         &account_label,
                                         &shared,
+                                        EpochBackfillExecutionSeam::Maintenance,
                                     )
                                     .await;
                                     if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -942,6 +945,7 @@ async fn run_app_runtime_account_worker(
                             &account_id_hex,
                             &account_label,
                             &shared,
+                            EpochBackfillExecutionSeam::Receive,
                         )
                         .await;
                         if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -1154,6 +1158,7 @@ async fn run_app_runtime_account_worker(
                     &account_id_hex,
                     &account_label,
                     &shared,
+                    EpochBackfillExecutionSeam::Maintenance,
                 )
                 .await;
                 if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
@@ -1325,6 +1330,7 @@ async fn handle_account_worker_catch_up(
                 context.account_id_hex,
                 context.account_label,
                 context.shared,
+                EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
             .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -1614,6 +1620,7 @@ async fn handle_account_worker_command(
                         account_id_hex,
                         account_label,
                         shared,
+                        EpochBackfillExecutionSeam::ExplicitCatchUp,
                     )
                     .await;
                     if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -1650,10 +1657,6 @@ async fn handle_account_worker_command(
             let result = match client.repair_full_history().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
-                    if client.has_pending_epoch_backfill() {
-                        client.finish_pending_epoch_backfill_after_replay();
-                        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
-                    }
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("repair_full_history");
                     }
@@ -2918,13 +2921,26 @@ async fn run_pending_epoch_backfill_reporting_arm(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
+    seam: EpochBackfillExecutionSeam,
 ) -> Result<(), String> {
     let backfill_armed = client.has_pending_epoch_backfill();
-    let result = client.run_pending_epoch_backfill().await.map_err(|err| {
-        let message = account_error_message("epoch-gap backfill failed", &err);
-        publish_app_runtime_account_error(events, account_id_hex, account_label, message.clone());
-        message
-    });
+    let result = match client.run_pending_epoch_backfill(seam).await {
+        Ok(Some(summary)) => {
+            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => {
+            let message = account_error_message("epoch-gap backfill failed", &error);
+            publish_app_runtime_account_error(
+                events,
+                account_id_hex,
+                account_label,
+                message.clone(),
+            );
+            Err(message)
+        }
+    };
     if backfill_armed {
         shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
     }
@@ -3120,6 +3136,8 @@ mod tests {
 
     use crate::client::epoch_stall::BackfillDecision;
     use crate::tests::ScriptedPushRelayClient;
+    use crate::{AuditLogSettings, MarmotApp};
+    use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
 
     fn test_group_id(byte: u8) -> GroupId {
         GroupId::new(vec![byte])
@@ -3140,6 +3158,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_epoch_backfill_success_records_correlated_lifecycle_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("successful epoch backfill audit", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+
+        let (events, _subscriber) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+            EpochBackfillExecutionSeam::ExplicitCatchUp,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<serde_json::Value> = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let attempt_id = rows
+            .iter()
+            .find(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
+            .and_then(|row| row["context"]["operation_id"].as_str())
+            .expect("armed row must carry operation_id");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+                .count(),
+            1
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+                .count()
+                == 0
+        );
+        assert!(rows.iter().all(|row| {
+            !matches!(
+                row["kind"]["type"].as_str(),
+                Some(
+                    "epoch_stall_backfill_started"
+                        | "epoch_stall_backfill_completed"
+                        | "epoch_stall_backfill_failed"
+                )
+            ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
+        }));
+    }
+
+    #[tokio::test]
     async fn pending_epoch_backfill_failure_is_reported_retained_and_coalesced() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -3148,8 +3253,23 @@ mod tests {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
         let mut client = app.client("alice").await.unwrap();
-        client.apply_backfill_decision(&test_group_id(7), 3, BackfillDecision::Arm);
+        let group_id = client
+            .create_group("failed epoch backfill audit", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
 
         let (events, mut subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
@@ -3160,12 +3280,31 @@ mod tests {
             "account-id",
             "alice",
             &shared,
+            EpochBackfillExecutionSeam::ExplicitCatchUp,
         )
         .await
         .expect_err("failed replay activation must be returned");
 
         assert_eq!(error, "epoch-gap backfill failed: account_transport");
         assert!(client.has_pending_epoch_backfill());
+        let failed_rows: Vec<serde_json::Value> = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+            .collect();
+        assert_eq!(failed_rows.len(), 1);
+        assert_eq!(
+            failed_rows[0]["kind"]["activation_outcome"].as_str(),
+            Some("failed")
+        );
         assert!(matches!(
             subscriber.try_recv().unwrap(),
             MarmotAppEvent::AccountError(RuntimeAccountError { message, .. })
@@ -3178,6 +3317,7 @@ mod tests {
             "account-id",
             "alice",
             &shared,
+            EpochBackfillExecutionSeam::ExplicitCatchUp,
         )
         .await
         .unwrap();
@@ -3190,6 +3330,7 @@ mod tests {
             "account-id",
             "alice",
             &shared,
+            EpochBackfillExecutionSeam::ExplicitCatchUp,
         )
         .await
         .unwrap();
@@ -3206,7 +3347,17 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
-        client.apply_backfill_decision(&test_group_id(8), 3, BackfillDecision::Arm);
+        let group_id = client
+            .create_group("explicit catch-up epoch backfill", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
 
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
@@ -3246,7 +3397,18 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
-        client.apply_backfill_decision(&test_group_id(9), 3, BackfillDecision::Arm);
+        let group_id = client
+            .create_group("full-history epoch backfill", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let subscriptions_before_repair = relay.subscription_count();
 
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
@@ -3268,7 +3430,7 @@ mod tests {
         );
         assert_eq!(
             relay.subscription_count(),
-            2,
+            subscriptions_before_repair + 2,
             "the explicit unfloored repair already fulfills the pending replay",
         );
     }

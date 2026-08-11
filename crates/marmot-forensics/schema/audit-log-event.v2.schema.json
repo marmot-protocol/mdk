@@ -703,6 +703,21 @@
         "other"
       ]
     },
+    "epochStallBackfillTrigger": {
+      "enum": ["undecryptable_threshold", "resource_refusal"]
+    },
+    "epochBackfillExecutionSeam": {
+      "enum": ["startup", "receive", "explicit_catch_up", "maintenance"]
+    },
+    "epochBackfillReplayScope": {
+      "enum": ["account_full_history"]
+    },
+    "epochBackfillActivationOutcome": {
+      "enum": ["succeeded", "failed"]
+    },
+    "epochBackfillDeferredReason": {
+      "enum": ["group_epoch_unavailable"]
+    },
     "jsonScalar": {
       "type": ["string", "number", "integer", "boolean", "null"]
     },
@@ -1660,6 +1675,127 @@
               "$ref": "#/$defs/u64"
             },
             "threshold": {
+              "$ref": "#/$defs/u64"
+            },
+            "trigger": {
+              "$ref": "#/$defs/epochStallBackfillTrigger"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "seam", "replay_scope", "retry_ordinal"],
+          "properties": {
+            "type": {
+              "const": "epoch_stall_backfill_started"
+            },
+            "seam": {
+              "$ref": "#/$defs/epochBackfillExecutionSeam"
+            },
+            "replay_scope": {
+              "$ref": "#/$defs/epochBackfillReplayScope"
+            },
+            "retry_ordinal": {
+              "$ref": "#/$defs/u64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "retry_ordinal",
+            "duration_ms",
+            "activation_outcome",
+            "deliveries",
+            "local_epoch_before",
+            "local_epoch_after",
+            "group_advanced"
+          ],
+          "properties": {
+            "type": {
+              "const": "epoch_stall_backfill_completed"
+            },
+            "retry_ordinal": {
+              "$ref": "#/$defs/u64"
+            },
+            "duration_ms": {
+              "$ref": "#/$defs/u64"
+            },
+            "activation_outcome": {
+              "$ref": "#/$defs/epochBackfillActivationOutcome"
+            },
+            "deliveries": {
+              "$ref": "#/$defs/u64"
+            },
+            "local_epoch_before": {
+              "$ref": "#/$defs/u64"
+            },
+            "local_epoch_after": {
+              "$ref": "#/$defs/u64"
+            },
+            "group_advanced": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "retry_ordinal",
+            "duration_ms",
+            "activation_outcome",
+            "deliveries",
+            "local_epoch_before",
+            "local_epoch_after",
+            "group_advanced"
+          ],
+          "properties": {
+            "type": {
+              "const": "epoch_stall_backfill_failed"
+            },
+            "retry_ordinal": {
+              "$ref": "#/$defs/u64"
+            },
+            "duration_ms": {
+              "$ref": "#/$defs/u64"
+            },
+            "activation_outcome": {
+              "$ref": "#/$defs/epochBackfillActivationOutcome"
+            },
+            "error_kind": {
+              "type": "string"
+            },
+            "deliveries": {
+              "$ref": "#/$defs/u64"
+            },
+            "local_epoch_before": {
+              "$ref": "#/$defs/u64"
+            },
+            "local_epoch_after": {
+              "$ref": "#/$defs/u64"
+            },
+            "group_advanced": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "reason", "retry_ordinal"],
+          "properties": {
+            "type": {
+              "const": "epoch_stall_backfill_deferred"
+            },
+            "reason": {
+              "$ref": "#/$defs/epochBackfillDeferredReason"
+            },
+            "retry_ordinal": {
               "$ref": "#/$defs/u64"
             }
           }

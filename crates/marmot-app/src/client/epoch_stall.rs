@@ -40,6 +40,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cgka_traits::{EpochId, GroupId};
+use rand::RngCore;
 
 /// Distinct undecryptable messages a group may accumulate at one stalled epoch
 /// before the runtime reads it as stuck and triggers an epoch-gap backfill.
@@ -304,6 +305,49 @@ impl Default for EpochStallDetector {
             EPOCH_STALL_ESCALATION_ARM_THRESHOLD,
         )
     }
+}
+
+/// One armed group participating in a coalesced account-wide epoch-gap replay.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingEpochBackfillGroup {
+    pub(crate) stalled_epoch: u64,
+}
+
+/// Pending epoch-gap recovery intent: one opaque attempt id correlates every
+/// lifecycle row for the current arm, and additional groups coalesce into the
+/// same account-wide replay without minting a second attempt.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingEpochBackfill {
+    pub(crate) attempt_id: String,
+    pub(crate) groups: HashMap<GroupId, PendingEpochBackfillGroup>,
+    /// How many execution tries have started for this pending intent.
+    pub(crate) execution_attempts: u32,
+}
+
+impl PendingEpochBackfill {
+    pub(crate) fn new() -> Self {
+        Self {
+            attempt_id: new_recovery_attempt_id(),
+            groups: HashMap::new(),
+            execution_attempts: 0,
+        }
+    }
+}
+
+fn new_recovery_attempt_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let encoded = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &encoded[0..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+        &encoded[20..32]
+    )
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
-use crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD;
+use crate::client::epoch_stall::{BackfillDecision, EPOCH_STALL_BACKFILL_THRESHOLD};
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
@@ -399,6 +399,11 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -512,7 +517,202 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             unfloored_before + 1,
             "consumed evidence must not trigger a second full-history replay",
         );
+        let final_local_epoch = runtime
+            .group_mls_state("alice", &group_id)
+            .await
+            .expect("final local MLS epoch")
+            .epoch;
+
+        let audit_rows = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let armed_rows: Vec<_> = audit_rows
+            .iter()
+            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
+            .collect();
+        let started_rows: Vec<_> = audit_rows
+            .iter()
+            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+            .collect();
+        let completed_rows: Vec<_> = audit_rows
+            .iter()
+            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+            .collect();
+        assert_eq!(
+            armed_rows.len(),
+            1,
+            "explicit catch-up must arm exactly once: {audit_rows:?}"
+        );
+        assert_eq!(
+            started_rows.len(),
+            1,
+            "explicit catch-up must start exactly one replay attempt: {audit_rows:?}"
+        );
+        assert_eq!(
+            completed_rows.len(),
+            1,
+            "explicit catch-up must complete exactly one replay attempt: {audit_rows:?}"
+        );
+        let attempt_id = armed_rows[0]["context"]["operation_id"]
+            .as_str()
+            .expect("armed row must carry operation_id");
+        assert_eq!(
+            started_rows[0]["context"]["operation_id"].as_str(),
+            Some(attempt_id)
+        );
+        assert_eq!(
+            completed_rows[0]["context"]["operation_id"].as_str(),
+            Some(attempt_id)
+        );
+        assert_eq!(
+            started_rows[0]["kind"]["seam"].as_str(),
+            Some("explicit_catch_up")
+        );
+        assert_eq!(
+            completed_rows[0]["kind"]["activation_outcome"].as_str(),
+            Some("succeeded")
+        );
+        assert_eq!(completed_rows[0]["kind"]["retry_ordinal"], 0);
+        assert!(
+            completed_rows[0]["kind"]["deliveries"]
+                .as_u64()
+                .is_some_and(|deliveries| deliveries >= 1),
+            "the terminal row must count the below-floor delivery"
+        );
+        let audited_epoch_before = completed_rows[0]["kind"]["local_epoch_before"]
+            .as_u64()
+            .expect("completed row local epoch before");
+        assert_eq!(
+            completed_rows[0]["kind"]["local_epoch_after"].as_u64(),
+            Some(final_local_epoch),
+            "the terminal row must report the observed final local epoch"
+        );
+        assert_eq!(
+            completed_rows[0]["kind"]["group_advanced"].as_bool(),
+            Some(final_local_epoch > audited_epoch_before),
+            "activation success and group epoch recovery must remain distinct"
+        );
+
         runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
+    run_composed_app_runtime_test("failed-epoch-backfill-retry", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("failed epoch backfill retry", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+
+        relay.fail_next_subscribe();
+        client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect_err("injected activation failure must surface");
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "failed activation must retain pending recovery"
+        );
+
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("retained recovery must retry")
+            .expect("retry must execute the pending replay");
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "successful retry must consume pending recovery"
+        );
+        drop(client);
+
+        let audit_rows = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rows_of_kind = |kind: &str| {
+            audit_rows
+                .iter()
+                .filter(|row| row["kind"]["type"] == kind)
+                .collect::<Vec<_>>()
+        };
+        let armed = rows_of_kind("epoch_stall_backfill_armed");
+        let started = rows_of_kind("epoch_stall_backfill_started");
+        let failed = rows_of_kind("epoch_stall_backfill_failed");
+        let completed = rows_of_kind("epoch_stall_backfill_completed");
+        assert_eq!(armed.len(), 1, "one recovery intent must arm once");
+        assert_eq!(started.len(), 2, "failure plus retry must start twice");
+        assert_eq!(
+            failed.len(),
+            1,
+            "first attempt must have one failed terminal"
+        );
+        assert_eq!(completed.len(), 1, "retry must have one completed terminal");
+        let attempt_id = armed[0]["context"]["operation_id"]
+            .as_str()
+            .expect("armed operation id");
+        for row in started.iter().chain(failed.iter()).chain(completed.iter()) {
+            assert_eq!(
+                row["context"]["operation_id"].as_str(),
+                Some(attempt_id),
+                "all lifecycle rows must correlate to one opaque attempt"
+            );
+        }
+        assert_eq!(started[0]["kind"]["retry_ordinal"], 0);
+        assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
+        assert_eq!(started[1]["kind"]["retry_ordinal"], 1);
+        assert_eq!(completed[0]["kind"]["retry_ordinal"], 1);
+        assert_eq!(
+            failed[0]["kind"]["activation_outcome"].as_str(),
+            Some("failed")
+        );
+        assert_eq!(failed[0]["kind"]["deliveries"], 0);
+        assert_eq!(failed[0]["kind"]["group_advanced"], false);
     });
 }
 
@@ -6258,6 +6458,7 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
         &group_id,
         7,
         crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 3 },
+        marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
     );
     // ...and a later fallible step in that same pass errors, so the summary the
     // pass was building never reaches a caller.
@@ -6408,6 +6609,7 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
         &group_id,
         9,
         crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 4 },
+        marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
     );
 
     let mut delivery = relay_delivery("escalation-seam", "55".repeat(32));
