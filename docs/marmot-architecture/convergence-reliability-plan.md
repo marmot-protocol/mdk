@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-09
+updated: 2026-08-10
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -81,8 +81,12 @@ The baseline is now a functioning reliability lab, but it does not yet justify t
   repair seam exist, while systematic container/VM evidence for those paths remains open;
 - the engine and process adapters have distinct complete quiescence contracts, but every new adapter and scenario still
   has to prove that its observable contract detects all unfinished work it can own;
+- every built-in generated family now carries strict-oracle coverage, and the reviewed seeds `1`, `42`, and `1337`
+  pass without weak-oracle warnings, including all twelve adversarial workload arms; this establishes that those runs
+  ask and observe meaningful questions, not that the engine is universally correct or the current constants are
+  optimal;
 - small and sustained generated storms exist, but the reviewed run volume, constant-boundary coverage, and accumulated
-  evidence are not yet sufficient to claim that the current constants are optimal;
+  evidence are not yet sufficient to characterize the current constants across realistic operating envelopes;
 - scenario seeds do not reproduce randomized MLS bytes;
 - the independent selector/canonicalization model covers bounded authenticated input, dependency, witness, selection,
   and disposition behavior, while production persistence remains exercised by engine and retained-relay subjects;
@@ -1195,14 +1199,26 @@ residual gap.
 2. [x] Finish scenario-catalog consolidation. #1292 and #1294 imported the portable scenario catalog, and
    [MDK #1295](https://github.com/marmot-protocol/mdk/pull/1295) added the simulator-only seeded admin-churn family
    without introducing a second scenario language.
-3. [ ] Complete the #1285 cross-route regression across every capable adapter. The engine checkpoint is now permanent
+3. [x] Close the known strict-oracle coverage gaps in every built-in generated family. [MDK #1349](https://github.com/marmot-protocol/mdk/pull/1349)
+   gave `convergence-e2e-delivery/v1` an exact/decryptable settle tail, added deterministic delivery and accepted-publish
+   expectations across `adversarial-reliability/v1`, and taught the oracle to recognize a passing exact-equivalence
+   expectation over a subset even when other observed clients intentionally diverge. The reviewed all-family seeds
+   `1`, `42`, and `1337` are strict-green; this removes known oracle false positives but is not an engine-correctness
+   claim.
+4. [ ] Generalize the isolated child-process campaign runner from the adversarial catalog to every built-in generated
+   family, persist the exact generated input before each worker starts, run the worker through the strict report path,
+   and retain its report, fixture candidate, and failure capsule. Then execute a reviewed file-backed seed/case matrix
+   and classify every failure as a product defect, protocol ambiguity, environment failure, or expected resource
+   refusal. Verification must include one smoke case from every family, exact saved-input replay, deadline kill/reap,
+   nonzero exit propagation, and artifact-path integrity. This is the current in-progress slice.
+5. [ ] Complete the #1285 cross-route regression across every capable adapter. The engine checkpoint is now permanent
    as `cross-route-own-commit-recovery/v1` and pins exact cryptographic, decryptability, commit-disposition, pending-work,
    and projection agreement after restart. `cross-route-retained-history-recovery/v1` now establishes the same contract
    through retained relay histories; app-runtime, process, container, and VM evidence remains.
    The decision-route inventory is machine checked; keep the remaining assurance artifacts independent of the
    production behavior under review in #1329/#1293.
-4. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
-5. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
+6. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
+7. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
 
 The local smoke path is a usability and integration checkpoint, not an assurance exit gate. A visually successful run
@@ -1346,6 +1362,7 @@ incorrect result.
 | 2026-08-09 | Campaign follow-up: strict clock oracle and fixture fidelity | Accepted exact no-pending evidence as temporal closure after an explicit virtual-time advance, while retaining fixed-point quiescence as the stronger option; kept semantic minimizers diagnostic and made fixture candidates preserve the original executed scenario so broad failure identity cannot silently replace a five-of-six delivery failure with a zero-delivery case | Oracle coverage unit tests; fixture-candidate fidelity unit test; strict seed-2001 convergence-chaos replay |
 | 2026-08-09 | 6.1 four-party engine cross-route checkpoint | Promoted the #1285 topology into a portable vector with two simultaneous source-epoch committers, pairwise committer displacement, observer-side stored convergence, ordering-key-versus-depth disagreement, branch growth by a third member, encrypted-SQLite restart of the displaced own-commit author, exact cryptographic equality, durable selected/invalidated commit dispositions, no pending work, and active application decryptability in all twelve directions; retained external-adapter and transition-permutation work explicitly open | `cross-route-own-commit-recovery/v1`; strict file-backed report; focused canonical-scenario regression; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md) |
 | 2026-08-10 | 6.1 retained-history cross-route checkpoint | Replayed the four-party #1285 topology through explicit retained relay history rather than semantic packet-bus withholding: participant-specific visibility advances incremental cursors past hidden roots/children, restart reopens encrypted SQLite after pairwise displacement, and full-history queries restore the complete set before exact settlement. Also normalized active-probe evidence from authenticated account identities to stable scenario labels after logical-id correlation. App-runtime and distributed permutations remain open. | `cross-route-retained-history-recovery/v1`; strict file-backed regression; retained-object injection assertions; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md) |
+| 2026-08-10 | Strict generated-family oracle closure | Closed the known strict-oracle false positives across every built-in generated family without changing production convergence behavior: subset exact-equivalence now counts as observed evidence when its executable expectation passes, convergence delivery has an exact/decryptable settle tail, and adversarial arms pin accepted publication plus deterministic delivery claims. Generator versions changed where scenario meaning changed. | [MDK #1349](https://github.com/marmot-protocol/mdk/pull/1349); all 28 vectors; all six families at seeds `1`, `42`, and `1337`; full simulator suite; `test-policy-overrides` campaign gate; `just fast-ci` |
 
 ## Capability Naming Cleanup
 
