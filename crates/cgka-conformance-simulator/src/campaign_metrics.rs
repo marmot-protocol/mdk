@@ -13,7 +13,6 @@ pub struct CampaignMeasurementsV1 {
     pub blocked_send_duration_us: u64,
     pub pass_count: usize,
     pub reorg_count: Option<usize>,
-    pub recovery_observation_count: usize,
     pub reorg_rewind_depth: Option<CampaignHistogramV1>,
     pub reorg_lateness_ms: Option<CampaignHistogramV1>,
     pub unresolved_outcomes: usize,
@@ -153,7 +152,6 @@ impl CampaignMeasurementsV1 {
             pass_count,
             reorg_count: engine_metrics
                 .and_then(|metrics| usize::try_from(metrics.post_settle_reorgs).ok()),
-            recovery_observation_count: report.recovery_observations.len(),
             reorg_rewind_depth: engine_metrics
                 .map(|metrics| CampaignHistogramV1::from(&metrics.reorg_rewind_depth)),
             reorg_lateness_ms: engine_metrics

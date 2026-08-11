@@ -292,7 +292,6 @@ impl ReferenceModelSubject {
             removed_members: window.removed_members,
             epoch_changes: window.epoch_changes,
             app_invalidations: Vec::new(),
-            recoveries: Vec::new(),
             convergence_decisions: Vec::new(),
         })
     }

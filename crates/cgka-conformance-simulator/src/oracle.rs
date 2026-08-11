@@ -69,7 +69,6 @@ pub enum OracleBehavior {
     MemberAdded,
     MemberRemoved,
     EpochChanged,
-    ForkRecovered,
     ConvergenceDecisionObserved,
     AppInvalidated,
     LargeGroupObserved,
@@ -96,7 +95,6 @@ pub struct BehaviorEvidenceSummary {
     pub member_removals: usize,
     pub epoch_changes: usize,
     pub app_invalidations: usize,
-    pub recoveries: usize,
     pub convergence_decisions: usize,
     pub scenario_input_entries: usize,
     pub scenario_inputs_deduplicated: usize,
@@ -502,9 +500,6 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     if evidence.app_invalidations > 0 {
         behaviors.insert(OracleBehavior::AppInvalidated);
     }
-    if evidence.recoveries > 0 {
-        behaviors.insert(OracleBehavior::ForkRecovered);
-    }
     if evidence.convergence_decisions > 0 {
         behaviors.insert(OracleBehavior::ConvergenceDecisionObserved);
     }
@@ -584,7 +579,6 @@ pub fn behavior_evidence(trace: &ScenarioTrace) -> BehaviorEvidenceSummary {
         evidence.member_removals += observation.removed_members.len();
         evidence.epoch_changes += observation.epoch_changes.len();
         evidence.app_invalidations += observation.app_invalidations.len();
-        evidence.recoveries += observation.recoveries.len();
         evidence.convergence_decisions += observation.convergence_decisions.len();
         evidence.scenario_input_entries += observation.scenario_input_ledger.len();
         evidence.scenario_inputs_deduplicated += observation
@@ -696,9 +690,6 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
         TraceExpectation::ClientEpochChanges { .. } => {
             behaviors.insert(OracleBehavior::EpochChanged);
         }
-        TraceExpectation::ClientRecoveries { .. } | TraceExpectation::RecoverySummary { .. } => {
-            behaviors.insert(OracleBehavior::ForkRecovered);
-        }
         TraceExpectation::ConvergenceDecision { .. } => {
             behaviors.insert(OracleBehavior::ConvergenceDecisionObserved);
         }
@@ -761,7 +752,6 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
         ScenarioStimulus::GroupDataUpdate => vec![
             OracleBehavior::PendingConfirmed,
             OracleBehavior::PendingRolledBack,
-            OracleBehavior::ForkRecovered,
             OracleBehavior::EpochChanged,
             OracleBehavior::ClientConvergence,
         ],
@@ -803,7 +793,6 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::ClientState,
             OracleBehavior::DeliveredPayload,
             OracleBehavior::AppInvalidated,
-            OracleBehavior::ForkRecovered,
         ],
         ScenarioStimulus::LargeGroup => vec![
             OracleBehavior::LargeGroupObserved,
@@ -812,13 +801,11 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
         ],
         ScenarioStimulus::MessageStorm => vec![OracleBehavior::DeliveredPayload],
         ScenarioStimulus::CommitStorm => vec![
-            OracleBehavior::ForkRecovered,
             OracleBehavior::ClientConvergence,
             OracleBehavior::EpochChanged,
         ],
         ScenarioStimulus::MixedMessageCommitStorm => vec![
             OracleBehavior::DeliveredPayload,
-            OracleBehavior::ForkRecovered,
             OracleBehavior::ClientConvergence,
         ],
         ScenarioStimulus::CandidateGraph => vec![OracleBehavior::SelectorDeterminism],
@@ -871,7 +858,6 @@ mod tests {
             removed_members: Vec::new(),
             epoch_changes: Vec::new(),
             app_invalidations: Vec::new(),
-            recoveries: Vec::new(),
             convergence_decisions: Vec::new(),
         }
     }

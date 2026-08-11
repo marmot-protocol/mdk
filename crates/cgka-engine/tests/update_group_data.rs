@@ -2286,14 +2286,6 @@ async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_or
     assert_eq!(loser_storage.get_group(&gid).unwrap().name, winner_name);
     assert_eq!(winner_storage.get_group(&gid).unwrap().name, winner_name);
 
-    // This is the convergence path: no ForkRecovered fires.
-    assert!(
-        !loser_after
-            .iter()
-            .any(|event| matches!(event, cgka_traits::engine::GroupEvent::ForkRecovered { .. })),
-        "stored convergence must not emit ForkRecovered, got {loser_after:?}"
-    );
-
     // The correctness core: the withdrawal names the stamped origin of the
     // loser's OWN confirmed commit (its wrap-time transport id, preserved by
     // the stored wire record) — not the content dedup id — so the

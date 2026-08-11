@@ -255,20 +255,14 @@
         "changes": [{ "from": 2, "to": 3 }]
       },
       {
-        "type": "client_recoveries",
+        "type": "client_epoch_changes",
         "client": "alpha",
-        "count": 1,
-        "source_epoch": 1,
-        "recovered_epoch": 2,
-        "winner_differs_from_invalidated": true
+        "changes": [{ "from": 1, "to": 2 }, { "from": 2, "to": 3 }]
       },
-      {
-        "type": "recovery_summary",
-        "count": 1,
-        "source_epoch": 1,
-        "recovered_epoch": 2,
-        "winner_differs_from_invalidated": true
-      },
+      { "type": "convergence_decision", "client": "zeta", "selected_tip_epoch": 3 },
+      { "type": "convergence_decision", "client": "alpha", "selected_tip_epoch": 3 },
+      { "type": "convergence_decision", "client": "yankee", "selected_tip_epoch": 3 },
+      { "type": "convergence_decision", "client": "observer", "selected_tip_epoch": 3 },
       {
         "type": "clients_exactly_equivalent",
         "clients": ["zeta", "alpha", "yankee", "observer"]
@@ -276,6 +270,24 @@
       {
         "type": "group_profile",
         "client": "zeta",
+        "name": "zeta-branch-depth-two",
+        "description": ""
+      },
+      {
+        "type": "group_profile",
+        "client": "alpha",
+        "name": "zeta-branch-depth-two",
+        "description": ""
+      },
+      {
+        "type": "group_profile",
+        "client": "yankee",
+        "name": "zeta-branch-depth-two",
+        "description": ""
+      },
+      {
+        "type": "group_profile",
+        "client": "observer",
         "name": "zeta-branch-depth-two",
         "description": ""
       },

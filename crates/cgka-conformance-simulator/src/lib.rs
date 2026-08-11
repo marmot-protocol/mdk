@@ -183,8 +183,7 @@ pub use topology::{
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,
     ConvergenceDecisionObservation, EpochChangeObservation, ExpectationFailure,
-    ForkRecoveryObservation, PendingResolutionObservation, RecoveryOrderingKeyObservation,
-    ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioTrace, TraceExpectation,
-    VectorFixture, VectorMismatch, compare_trace_expectations, observe_client,
-    observe_client_exact,
+    PendingResolutionObservation, ScenarioAdminPolicyObservation, ScenarioErrorObservation,
+    ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch, compare_trace_expectations,
+    observe_client, observe_client_exact,
 };

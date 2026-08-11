@@ -77,12 +77,18 @@
       },
       {
         "type": "withhold_message",
-        "selector": { "publication": "alice-update", "class": "commit" },
+        "selector": {
+          "publication": "alice-update",
+          "class": "commit"
+        },
         "label": "alice-branch-commit"
       },
       {
         "type": "withhold_message",
-        "selector": { "publication": "bob-update", "class": "commit" },
+        "selector": {
+          "publication": "bob-update",
+          "class": "commit"
+        },
         "label": "bob-branch-commit"
       },
       {
@@ -216,11 +222,8 @@
       ]
     },
     {
-      "type": "recovery_summary",
-      "count": 1,
-      "source_epoch": 1,
-      "recovered_epoch": 2,
-      "winner_differs_from_invalidated": true
+      "type": "convergence_decision",
+      "selected_tip_epoch": 2
     }
   ]
 }

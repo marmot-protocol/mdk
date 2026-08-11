@@ -22,7 +22,6 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
-        | GroupEvent::ForkRecovered { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupStateInvalidated { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }
@@ -142,11 +141,6 @@ pub enum GroupEventKindFfi {
     EpochChanged {
         from: u64,
         to: u64,
-    },
-    ForkRecovered {
-        source_epoch: u64,
-        recovered_epoch: u64,
-        invalidated_commit_id_hex: String,
     },
     CommitRolledBack {
         invalidated_commit_id_hex: String,
@@ -276,16 +270,6 @@ impl From<GroupEvent> for GroupEventKindFfi {
             GroupEvent::EpochChanged { from, to, .. } => Self::EpochChanged {
                 from: from.0,
                 to: to.0,
-            },
-            GroupEvent::ForkRecovered {
-                source_epoch,
-                recovered_epoch,
-                invalidated_commit_id,
-                ..
-            } => Self::ForkRecovered {
-                source_epoch: source_epoch.0,
-                recovered_epoch: recovered_epoch.0,
-                invalidated_commit_id_hex: hex::encode(invalidated_commit_id.as_slice()),
             },
             GroupEvent::CommitRolledBack {
                 invalidated_commit_id,

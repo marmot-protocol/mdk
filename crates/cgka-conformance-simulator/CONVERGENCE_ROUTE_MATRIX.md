@@ -14,8 +14,7 @@ below is deliberately not treated as passing evidence.
 | Route id | Production owner | Independent model | Mutation sentinel | Current campaign evidence | Current limitation |
 | --- | --- | --- | --- | --- | --- |
 | `ordinary_ingest` | `message_processor/ingest.rs` | partial: `reference_convergence::evaluate` | covered: cutoff admission and output invalidation | observer vectors, both strict cross-route regressions, the shared engine/app/process restart journey, and the app-runtime cross-route characterization | Corrected reversible relay input can still leave a two-branch public/probe split; process/distributed execution and exact app-runtime state remain open. |
-| `pairwise_fork_recovery` | `message_processor/ingest.rs`, `fork_recovery.rs` | partial: bounded abstract route lifecycle | partial: sibling-model pairwise-loser terminalization | both strict cross-route regressions, app-runtime cross-route characterization, and pairwise reconsideration tests | The production-shaped app route does not reliably select the strict reference's winning branch; process/distributed and durable-transition permutations remain open. |
-| `stored_convergence` | `distributed_convergence.rs` | partial: selector plus lifecycle models | covered: comparator and frozen membership | both strict cross-route regressions, app-runtime cross-route characterization, restart properties, and convergence chaos | Route choice is not represented in the models, and app-runtime/process/distributed equivalence remains open. |
+| `stored_convergence` | `distributed_convergence.rs` | partial: selector plus lifecycle models | covered: comparator and frozen membership | both strict cross-route regressions, app-runtime cross-route characterization, restart properties, convergence chaos, and the two reconsideration regressions inherited from the retired pairwise route | Route choice is not represented in the models, and app-runtime/process/distributed equivalence remains open. |
 | `candidate_materialization` | `openmls_projection.rs` | partial: dependency/disposition model | covered: retention and frozen membership | engine and retained-history cross-route recovery plus OpenMLS replay | Exact cryptographic and durable-disposition evidence remains limited to engine-capable subjects; app-runtime/process/distributed equivalence remains open. |
 | `retained_history_replay` | `message_processor/ingest.rs`, `openmls_projection.rs` | partial: unequal-history lifecycle | covered: retention and witness deduplication | `cross-route-retained-history-recovery/v1`, `cross-route-app-runtime-recovery/v1`, retained-relay equality, offline journeys, and shared app/process offline full-history recovery | Reversible relay-wide app-runtime history removes the tombstone artifact but does not reliably produce public or active-chat equivalence; process, multi-relay, retention-boundary, and distributed evidence remain open. |
 | `crash_restart_recovery` | `engine.rs`, `distributed_convergence.rs` | covered: crash/restart lifecycle | covered: frozen membership and scheduler re-arm | both strict cross-route encrypted-SQLite regressions, the app-runtime cross-route restart, durable-phase kill properties, and the shared engine/app/process restart journey | The adversarial app-runtime topology covers one post-displacement restart; every durable transition plus process/distributed adapters remain open. |
@@ -45,6 +44,28 @@ reversible query-visibility layer removed that artifact, repeated executions
 still produced both complete equivalence and a two-branch protocol/probe split.
 The corrected-input characterization accepts only reviewed terminal surfaces;
 it is counterexample evidence, not passing assurance evidence.
+
+## Retired routes
+
+A deleted route is removed from the table and from `DecisionRouteId` rather
+than re-pointed at a surviving seam. Re-pointing would give one seam two route
+claims and count its evidence twice, which is exactly the inflation the source
+audit exists to prevent. The audit failing on a vanished marker is the intended
+trigger for that review, not an obstacle to it.
+
+Retired by MDK #1293 (option C route unification): `pairwise_fork_recovery`,
+whose owners were `message_processor/ingest.rs` and `fork_recovery.rs`. The
+pairwise same-epoch route was deleted — `fork_recovery.rs` is gone and ingest no
+longer calls `.resolve_fork_candidate(` — and same-epoch rivals are now
+adjudicated by distributed convergence, which is already registered as
+`stored_convergence`. The route's two cited properties survived the unification
+as renamed engine regressions,
+`incumbent_committer_defers_to_deeper_convergence_branch` and
+`rival_win_leaves_displaced_own_commit_reconsiderable`, and are now cited as
+campaign evidence for `stored_convergence`; its reconsiderable-loser rule is
+folded into that route's adopted rule. The abstract route-lifecycle mutant it
+sponsored survives route-agnostically as `provisional_winner_terminalization`
+in the mutation catalog.
 
 ## Active production work
 

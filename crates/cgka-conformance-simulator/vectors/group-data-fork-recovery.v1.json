@@ -123,11 +123,8 @@
       "received_payloads": []
     },
     {
-      "type": "recovery_summary",
-      "count": 1,
-      "source_epoch": 1,
-      "recovered_epoch": 2,
-      "winner_differs_from_invalidated": true
+      "type": "convergence_decision",
+      "selected_tip_epoch": 2
     }
   ]
 }
