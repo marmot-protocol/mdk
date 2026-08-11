@@ -78,6 +78,8 @@ Run it from a clean revision and choose a new output directory:
 
 ```sh
 just focused-convergence-regressions target/focused-convergence-$(git rev-parse --short HEAD)
+cargo run -p convergence-campaign-runner --bin cgka-regression-campaign --locked -- \
+  check target/focused-convergence-$(git rev-parse --short HEAD)/campaign-report.v1.json
 ```
 
 The runner refuses a dirty source tree and an existing output directory. Before

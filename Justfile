@@ -332,7 +332,7 @@ convergence-failure-corpus:
 # Run the small post-fix regression matrix against a clean source revision and
 # retain its exact test selectors, private logs, source identity, and digests.
 focused-convergence-regressions out:
-    cargo run -p convergence-campaign-runner --bin cgka-regression-campaign --locked -- --out "{{out}}"
+    cargo run -p convergence-campaign-runner --bin cgka-regression-campaign --locked -- run --out "{{out}}"
 
 # Capability-level entry points used by the scheduled workflows. PR checks
 # remain split into separately named steps for useful failure attribution.

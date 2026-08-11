@@ -1237,12 +1237,16 @@ residual gap.
    adapters that cannot expose it. The actual four-party adversarial vector and its durable-transition permutations
    remain open. The decision-route inventory is machine checked; keep the remaining assurance artifacts independent
    of #1293.
-6. [ ] Run a focused current-`master` delta campaign for the production convergence changes that landed after the
+6. [x] Run a focused current-`master` delta campaign for the production convergence changes that landed after the
    reviewed 1,170-case snapshot. Preserve exact inputs, source revision, strict reports, and artifact digests while
    covering #1329 missing-anchor halt and authenticated Welcome repair, #1360 atomic self-removal persistence across
    injected write failures and restart, and #1365 armed full-history backfill after catch-up. Include #1377's pinned
    rewind-horizon regression as the normal-build policy-boundary sentinel. This is a small targeted matrix, not a
-   requirement to repeat the entire historical campaign.
+   requirement to repeat the entire historical campaign. `focused-convergence-regressions/v1` now composes the five
+   exact named engine/app tests without duplicating their internal fault injection as Scenario IR. Its clean-revision
+   run passed 5/5 at `5eeb3d159294bcbf66d8f5bdc35a1e3e5f2f491d`; the privately written input manifest has SHA-256
+   `6c30c6e77af0a8e0c7ee3113525b22993c3f20c86ba953bb3e89bf29cdd6ff42` and the report has SHA-256
+   `195f3d26e5f8c1fa74a62470a4a9f0a338eddbacd5f33bed61a0137e1bd96e5a`.
 7. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
 8. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
@@ -1256,9 +1260,10 @@ its slowest-case rollup considered only the soak subset; future evidence generat
 included campaign. The case artifacts and directories were owner-only, while the three top-level hand-authored summary
 files were mode `0644`; future bundles should create aggregate manifests through the same private-file boundary.
 
-Because #1329, #1360, and #1365 changed production behavior after that campaign snapshot, execution-order item 6 is
-required before those paths can be included in a current-`master` assurance bundle. A full 1,170-case rerun remains
-useful release evidence, but it is not a substitute for the focused boundary, crash/restart, and recovery assertions.
+Because #1329, #1360, and #1365 changed production behavior after the historical campaign snapshot, the focused item 6
+result is the current regression evidence for those paths. It pins their boundary, crash/restart, and recovery
+assertions without carrying the historical 1,170-case result forward to newer code. A full matrix rerun remains useful
+release evidence and must still identify its own exact source snapshot.
 
 ### Milestone 6 Exit Gate
 
@@ -1403,6 +1408,7 @@ incorrect result.
 | 2026-08-11 | Post-campaign convergence deltas | Merged fail-closed missing-anchor handling and Welcome-repair retirement, atomic self-removal persistence, and armed backfill after catch-up. These changes postdate the reviewed all-family matrix and therefore require focused current-`master` delta evidence rather than being covered by the older green result. | [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329); [MDK #1360](https://github.com/marmot-protocol/mdk/pull/1360); [MDK #1365](https://github.com/marmot-protocol/mdk/pull/1365) |
 | 2026-08-11 | 6.1 cross-adapter public projection checkpoint | Made accepted publication checkpoints portable across the `CgkaEngine` harness's staged transport and the app runtime's already-published command surface, then ran a three-participant profile/message/restart IR unchanged through the `CgkaEngine` harness, full app-runtime adapter, and isolated app processes. The production-shaped adapters cross the `CgkaEngine`, `TransportPeeler`, and `TransportAdapter` seams. A companion app/process permutation takes one member offline across the commit and message, restarts another member, performs full-history repair, and requires equivalent duplicate-free public projections. Exact MLS state, active decryptability, the four-party adversarial topology, containers, and VMs remain open. | [MDK #1372](https://github.com/marmot-protocol/mdk/pull/1372); `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`; `app_runtime_and_process_adapters_recover_the_same_offline_projection`; simulator-only adapter seam and focused process/app tests |
 | 2026-08-11 | Failure-input and pinned-policy boundary hardening | Rejected manifest-less or corrupt NDJSON stream remnants instead of silently classifying them as empty healthy incident exports, and restored normal-build coverage proving that a commit beyond the pinned five-commit rewind horizon is terminal stale without weakening the production policy guard. These strengthen failure-corpus admission and the P1 boundary sentinel; they do not replace incident-corpus lane execution or a delayed-history campaign. | [MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140); [MDK #1377](https://github.com/marmot-protocol/mdk/pull/1377); incident-replay regressions; `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork` |
+| 2026-08-11 | Focused post-campaign production-delta evidence | Added a clean-source local regression campaign that writes its exact test-selector input before execution, owns and reaps the full case process group, preserves partial timeout output, refuses overwrite, and binds private per-case logs by byte count and SHA-256. The first run passed the missing-anchor halt, verified Welcome repair, three-write atomic self-removal rollback/restart, armed post-catch-up backfill, and pinned rewind-horizon cases with no timeout, signal, or launch failure. This is targeted current-source regression evidence, not a rerun of the historical generated matrix or distributed cross-route evidence. | `focused-convergence-regressions/v1`; source `5eeb3d159294bcbf66d8f5bdc35a1e3e5f2f491d`; 5/5 passed; input `6c30c6e77af0a8e0c7ee3113525b22993c3f20c86ba953bb3e89bf29cdd6ff42`; report `195f3d26e5f8c1fa74a62470a4a9f0a338eddbacd5f33bed61a0137e1bd96e5a` |
 
 ## Capability Naming Cleanup
 
