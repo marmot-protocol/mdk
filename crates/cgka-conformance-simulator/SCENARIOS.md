@@ -226,8 +226,19 @@ These are the scenarios another implementation should be able to load from JSON 
   the full transcript minus the departed members' silence and converge at epoch 3 with two members. `no_pending_work`
   covers Alice and Bob only: like the latecomer vector's pre-join input, Dave and Carol legitimately retain their
   undecryptable post-departure inputs as deferred transport work. The original harness scenario's re-add leg (removed
-  member rejoins via a fresh KeyPackage) is deliberately absent: welcome-after-eviction currently fails in the engine
-  harness with `GroupStateError(UseAfterEviction)` and is tracked as a coverage gap.
+  member rejoins via a fresh KeyPackage) lives in `readd-after-eviction/v1`.
+
+### `readd-after-eviction/v1`
+
+- File: `vectors/readd-after-eviction.v1.json`
+- Setup: Alice creates a group with Bob and Carol, removes Carol, then re-invites her with a fresh KeyPackage. Carol
+  sends the first post-rejoin application message.
+- Pressure: the rejoin Welcome lands on stale evicted local state, and the re-add commit reaches Carol as an
+  old-epoch group message whose only retained peel snapshots are from her evicted era.
+- Expected: the Welcome supersedes the stale live OpenMLS state, evicted-era retained snapshots are skipped as peel
+  sources instead of failing ingest with `UseAfterEviction`, and all three clients converge at epoch 3 with Carol's
+  post-rejoin payload delivered. The Rust regression for this shape is
+  `removed_member_rejoins_via_fresh_welcome` in `tests/canonical_scenarios.rs`.
 
 ### `incremental-growth/v1`
 

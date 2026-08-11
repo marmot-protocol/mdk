@@ -2624,7 +2624,13 @@ impl<S: StorageProvider> Engine<S> {
                 SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
             let (ctx, message_retention_seconds) =
                 match self.context_from_group_snapshot(group_id, &snapshot_name) {
-                    Ok(context) => context,
+                    Ok(Some(context)) => context,
+                    Ok(None) => {
+                        // Evicted-era snapshot: no exporter secret exists for
+                        // it. Restore live state and try the next snapshot.
+                        guard.commit()?;
+                        continue;
+                    }
                     Err(err) => {
                         // Drop on `guard` rolls back to live + releases.
                         guard.commit()?;
@@ -2747,15 +2753,20 @@ impl<S: StorageProvider> Engine<S> {
         Ok(snapshots)
     }
 
+    /// `Ok(None)` means the retained snapshot cannot serve as a peel source:
+    /// its own leaf is evicted, so OpenMLS refuses every exporter derivation
+    /// (`UseAfterEviction`). A re-added member keeps such snapshots from its
+    /// pre-removal era; they must be skipped like an undecryptable snapshot,
+    /// not surfaced as an ingest failure.
     fn context_from_group_snapshot(
         &self,
         group_id: &GroupId,
         snapshot_name: &str,
     ) -> Result<
-        (
+        Option<(
             cgka_traits::group_context::GroupContextSnapshot,
             Option<u64>,
-        ),
+        )>,
         EngineError,
     > {
         self.storage
@@ -2768,12 +2779,15 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        if !mls_group.is_active() {
+            return Ok(None);
+        }
         let message_retention_seconds =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?;
-        Ok((
+        Ok(Some((
             group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?,
             message_retention_seconds,
-        ))
+        )))
     }
 }
 
