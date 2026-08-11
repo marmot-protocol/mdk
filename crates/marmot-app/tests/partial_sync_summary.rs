@@ -235,6 +235,8 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
         .unwrap();
     let expected_groups = [first_group_id, second_group_id];
 
+    // Both welcomes are already stored in MockRelay before this sync starts,
+    // so the N+1 fault must observe them in the same drain.
     let app_bob_failing = open_store(&bob_dir, &relay_url, Some(1));
     let mut bob_failing = app_bob_failing.client("bob").await.unwrap();
     let failure = bob_failing

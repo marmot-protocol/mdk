@@ -552,9 +552,12 @@ impl AppClient {
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up delivery boundary below.
+        if routes_dirty {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        let routes_changed = self.refresh_group_routes()?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.drain_epoch_stall_escalations(&mut summary);
-        let routes_changed = self.refresh_group_routes()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }

@@ -1,6 +1,6 @@
 //! `sync` command namespace handler and output helpers.
 
-use marmot_app::{MarmotApp, SyncFailure, SyncSummary};
+use marmot_app::{MarmotApp, ReceivedMessage, SyncFailure, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
@@ -82,12 +82,17 @@ fn sync_json(
         "joined_groups": summary.joined_groups.into_iter().map(|group_id| {
             hex::encode(group_id.as_slice())
         }).collect::<Vec<_>>(),
-        "messages": summary.messages.into_iter().map(|message| {
-            let agent_text_stream = agent_text_stream_payload_value(
-                message.kind,
-                &message.tags,
-                &message.plaintext,
-            );
+        "messages": sync_messages_json(app, summary.messages),
+        "events": summary.events.len(),
+    }))
+}
+
+fn sync_messages_json(app: &MarmotApp, messages: Vec<ReceivedMessage>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .map(|message| {
+            let agent_text_stream =
+                agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
             let from_display_name = message
                 .sender_display_name
                 .clone()
@@ -106,9 +111,8 @@ fn sync_json(
                 value["agent_text_stream"] = agent_text_stream;
             }
             value
-        }).collect::<Vec<_>>(),
-        "events": summary.events.len(),
-    }))
+        })
+        .collect()
 }
 
 fn partial_sync_plain(summary: &SyncSummary) -> String {
@@ -158,31 +162,7 @@ fn partial_sync_json_value(
         "joined_groups": summary.joined_groups.into_iter().map(|group_id| {
             hex::encode(group_id.as_slice())
         }).collect::<Vec<_>>(),
-        "messages": summary.messages.into_iter().map(|message| {
-            let agent_text_stream = agent_text_stream_payload_value(
-                message.kind,
-                &message.tags,
-                &message.plaintext,
-            );
-            let from_display_name = message
-                .sender_display_name
-                .clone()
-                .or_else(|| display_name_for_sender(app, &message.sender));
-            let mut value = json!({
-                "message_id": message.message_id_hex,
-                "direction": "received",
-                "from": message.sender,
-                "from_display_name": from_display_name,
-                "group_id": hex::encode(message.group_id.as_slice()),
-                "plaintext": message.plaintext,
-                "kind": message.kind,
-                "tags": message.tags,
-            });
-            if let Some(agent_text_stream) = agent_text_stream {
-                value["agent_text_stream"] = agent_text_stream;
-            }
-            value
-        }).collect::<Vec<_>>(),
+        "messages": sync_messages_json(app, summary.messages),
         "events": summary.events.len(),
         "projection_updates": summary.projection_updates.len(),
         "epoch_stall_escalations": summary.epoch_stall_escalations.len(),
