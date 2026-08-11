@@ -1,9 +1,10 @@
 //! `incident-replay` CLI: classify a Goggles export — either an
 //! `agent-state.json` document or a streamed NDJSON group export — and, for a
 //! fork-recovery or convergence incident, synthesize and verify a conformance
-//! vector. The format is recognised from the content: a stream leads with its
-//! `manifest` line (the `goggles-group-export/v1` contract), anything else is
-//! parsed as `agent-state.json`.
+//! vector. The format is recognised from the content: any first line carrying
+//! the stream's `t` discriminator is parsed under the fail-closed
+//! `goggles-group-export/v1` contract; anything else is parsed as
+//! `agent-state.json`.
 //!
 //! Reading, format detection, and printing live here; everything about *which*
 //! route an export takes is [`incident_replay::route`].

@@ -22,8 +22,9 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     `complete: true`, per-section counts matching what arrived, and no in-band
     `error` line — the server's only failure surface once the HTTP status is
     committed), which replaces the `has_more` truncation signal of the document
-    shape. `is_stream` detects the format from the contract's manifest-first
-    rule, so the CLI needs no format flag.
+    shape. `is_stream` detects any first-line `t` discriminator and routes it
+    through that fail-closed contract, so a malformed or manifest-less stream
+    cannot fall back to the document parser and the CLI needs no format flag.
 - **Module:** `src/classify.rs`
   - **Role:** The `classify` gate → `Verdict`: `Healthy | ForkRecovery |
     ConvergenceSelected | Quarantine { reason }`. Everything downstream is gated

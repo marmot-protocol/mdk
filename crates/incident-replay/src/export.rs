@@ -432,6 +432,10 @@ impl EventKind {
 
 /// Parse a Goggles `agent-state.json` export.
 pub fn parse(json: &str) -> Result<AgentStateExport, ParseError> {
+    let probe = serde_json::from_str::<BTreeMap<String, serde::de::IgnoredAny>>(json);
+    if probe.is_ok_and(|object| object.contains_key("t")) {
+        return Err(ParseError::StreamDiscriminator);
+    }
     Ok(serde_json::from_str(json)?)
 }
 
@@ -440,4 +444,6 @@ pub fn parse(json: &str) -> Result<AgentStateExport, ParseError> {
 pub enum ParseError {
     #[error("agent-state export does not match the expected schema: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("input carries the streamed NDJSON `t` discriminator, not an agent-state document")]
+    StreamDiscriminator,
 }
