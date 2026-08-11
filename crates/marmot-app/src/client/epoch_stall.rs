@@ -40,6 +40,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cgka_traits::{EpochId, GroupId};
+use marmot_forensics::EpochBackfillDeferredReason;
 use rand::RngCore;
 
 /// Distinct undecryptable messages a group may accumulate at one stalled epoch
@@ -313,6 +314,18 @@ pub(crate) struct PendingEpochBackfillGroup {
     pub(crate) stalled_epoch: u64,
 }
 
+/// In-memory deferral seam identity for epoch-gap replay audit debouncing.
+///
+/// Never emitted on the forensic wire; bounded by the pending group's armed set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EpochBackfillDeferredSnapshot {
+    pub(crate) reason: EpochBackfillDeferredReason,
+    pub(crate) retry_ordinal: u64,
+    /// Armed group identity paired with the latest observed local epoch, if any.
+    /// Sorted by opaque group-id bytes for stable comparison.
+    pub(crate) group_epochs: Vec<(GroupId, Option<u64>)>,
+}
+
 /// Pending epoch-gap recovery intent: one opaque attempt id correlates every
 /// lifecycle row for the current arm, and additional groups coalesce into the
 /// same account-wide replay without minting a second attempt.
@@ -322,6 +335,8 @@ pub(crate) struct PendingEpochBackfill {
     pub(crate) groups: HashMap<GroupId, PendingEpochBackfillGroup>,
     /// How many execution tries have started for this pending intent.
     pub(crate) execution_attempts: u32,
+    /// Last deferred audit evidence keyed by the exact deferral seam snapshot.
+    pub(crate) last_deferred_audit: Option<EpochBackfillDeferredSnapshot>,
 }
 
 impl PendingEpochBackfill {
@@ -330,6 +345,7 @@ impl PendingEpochBackfill {
             attempt_id: new_recovery_attempt_id(),
             groups: HashMap::new(),
             execution_attempts: 0,
+            last_deferred_audit: None,
         }
     }
 }
@@ -489,6 +505,26 @@ mod tests {
         assert_eq!(
             detector.observe_undecryptable(b, "b5".into(), EpochId(7)),
             BackfillDecision::ArmAndEscalate { arms: 2 }
+        );
+    }
+
+    #[test]
+    fn deferred_snapshot_distinguishes_observed_epoch_at_same_cardinality() {
+        let g = group(0x01);
+        let phantom = group(0xde);
+        let unchanged = EpochBackfillDeferredSnapshot {
+            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
+            retry_ordinal: 0,
+            group_epochs: vec![(g.clone(), Some(5)), (phantom.clone(), None)],
+        };
+        let epoch_advanced = EpochBackfillDeferredSnapshot {
+            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
+            retry_ordinal: 0,
+            group_epochs: vec![(g, Some(6)), (phantom, None)],
+        };
+        assert_ne!(
+            unchanged, epoch_advanced,
+            "observed local epoch transitions must change the deferral snapshot"
         );
     }
 

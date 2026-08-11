@@ -142,6 +142,10 @@ pub struct AppClient {
     pub(crate) epoch_stall: EpochStallDetector,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
+    /// when a replay failure must not overwrite a newer arm minted in flight.
+    pub(crate) queued_epoch_backfills:
+        std::collections::VecDeque<epoch_stall::PendingEpochBackfill>,
     /// Temporary full-history subscriptions installed only while a post-join
     /// maintenance obligation is waiting for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:

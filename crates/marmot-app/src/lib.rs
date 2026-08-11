@@ -1429,6 +1429,7 @@ impl MarmotApp {
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
             pending_epoch_backfill: None,
+            queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
         };
         if !defer_group_hydration {

@@ -716,6 +716,469 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
     });
 }
 
+#[test]
+fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
+    run_composed_app_runtime_test("in-flight-backfill-arm", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut client = app.client("alice").await.unwrap();
+        let group_a = client
+            .create_group("in-flight backfill group a", &[])
+            .await
+            .unwrap();
+        let group_b = client
+            .create_group("in-flight backfill group b", &[])
+            .await
+            .unwrap();
+        let stalled_epoch_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_a,
+            stalled_epoch_a,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let operation_a = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("group a must arm one recovery intent")
+            .attempt_id
+            .clone();
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the first operation must begin execution");
+        assert_eq!(execution.pending.attempt_id, operation_a);
+
+        let stalled_epoch_b = client.group_mls_state(&group_b).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_b,
+            stalled_epoch_b,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let operation_b = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("group b must arm a second recovery intent during replay")
+            .attempt_id
+            .clone();
+        assert_ne!(operation_a, operation_b);
+
+        client.test_finish_epoch_backfill_execution(execution, false);
+
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "both recovery intents must remain retryable after the in-flight failure"
+        );
+        assert_eq!(
+            client
+                .pending_epoch_backfill
+                .as_ref()
+                .map(|pending| pending.attempt_id.as_str()),
+            Some(operation_b.as_str()),
+            "the newer in-flight arm must stay scheduled ahead of the failed operation"
+        );
+        assert!(
+            client
+                .queued_epoch_backfills
+                .iter()
+                .any(|pending| pending.attempt_id == operation_a),
+            "the failed operation must be queued instead of orphaned"
+        );
+
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("operation b must retry")
+            .expect("operation b must execute");
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("operation a must retry")
+            .expect("operation a must execute");
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "both operations must be consumed after successful retries"
+        );
+
+        let audit_rows = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rows_for_operation = |operation_id: &str, kind: &str| {
+            audit_rows
+                .iter()
+                .filter(|row| {
+                    row["kind"]["type"] == kind
+                        && row["context"]["operation_id"].as_str() == Some(operation_id)
+                })
+                .count()
+        };
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_armed"),
+            1
+        );
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_started"),
+            2
+        );
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_failed"),
+            1
+        );
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_completed"),
+            1
+        );
+        assert_eq!(
+            rows_for_operation(&operation_b, "epoch_stall_backfill_armed"),
+            1
+        );
+        assert_eq!(
+            rows_for_operation(&operation_b, "epoch_stall_backfill_started"),
+            1
+        );
+        assert_eq!(
+            rows_for_operation(&operation_b, "epoch_stall_backfill_completed"),
+            1
+        );
+        assert_eq!(
+            rows_for_operation(&operation_b, "epoch_stall_backfill_failed"),
+            0
+        );
+    });
+}
+
+#[test]
+fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
+    run_composed_app_runtime_test("epoch-backfill-deferral", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("epoch backfill deferral", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let phantom_group = cgka_traits::GroupId::new(vec![0xde]);
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("backfill must be armed")
+            .groups
+            .insert(
+                phantom_group.clone(),
+                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
+            );
+
+        for _ in 0..3 {
+            assert!(
+                client
+                    .begin_epoch_backfill_execution(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                    )
+                    .is_none(),
+                "unavailable group epochs must keep deferring execution"
+            );
+        }
+
+        let deferred_rows = || {
+            app.audit_log_files()
+                .unwrap()
+                .into_iter()
+                .flat_map(|file| {
+                    std::fs::read_to_string(file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_deferred")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            deferred_rows().len(),
+            1,
+            "identical deferral seams must not multiply deferred evidence"
+        );
+
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("pending recovery must remain armed")
+            .groups
+            .remove(&phantom_group);
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("pending recovery must remain armed")
+            .groups
+            .insert(
+                cgka_traits::GroupId::new(vec![0xad]),
+                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 2 },
+            );
+        assert!(
+            client
+                .begin_epoch_backfill_execution(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .is_none(),
+            "a changed armed-group identity at the same cardinality must still defer"
+        );
+        assert_eq!(
+            deferred_rows().len(),
+            2,
+            "a meaningful identity transition must emit deferred evidence again"
+        );
+        for _ in 0..3 {
+            assert!(
+                client
+                    .begin_epoch_backfill_execution(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                    )
+                    .is_none(),
+                "repeated identical deferral seams must stay debounced"
+            );
+        }
+        assert_eq!(
+            deferred_rows().len(),
+            2,
+            "repeated identical deferral seams must not multiply deferred evidence"
+        );
+
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("pending recovery must remain armed")
+            .groups
+            .retain(|group_id, _| *group_id.as_slice() != [0xad]);
+        assert!(
+            client
+                .begin_epoch_backfill_execution(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .is_some(),
+            "once every armed group is observable the replay must start"
+        );
+        assert_eq!(
+            deferred_rows().len(),
+            2,
+            "starting execution must not add another deferred row"
+        );
+    });
+}
+
+#[test]
+fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
+    run_composed_app_runtime_test("epoch-backfill-fair-defer", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut client = app.client("alice").await.unwrap();
+        let group_a = client
+            .create_group("queued older backfill group a", &[])
+            .await
+            .unwrap();
+        let group_b = client
+            .create_group("queued older backfill group b", &[])
+            .await
+            .unwrap();
+        let stalled_epoch_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_a,
+            stalled_epoch_a,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let operation_a = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("group a must arm one recovery intent")
+            .attempt_id
+            .clone();
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the first operation must begin execution");
+        assert_eq!(execution.pending.attempt_id, operation_a);
+
+        let stalled_epoch_b = client.group_mls_state(&group_b).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_b,
+            stalled_epoch_b,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let operation_b = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("group b must arm a second recovery intent during replay")
+            .attempt_id
+            .clone();
+        assert_ne!(operation_a, operation_b);
+
+        client.test_finish_epoch_backfill_execution(execution, false);
+        assert_eq!(
+            client
+                .pending_epoch_backfill
+                .as_ref()
+                .map(|pending| pending.attempt_id.as_str()),
+            Some(operation_b.as_str()),
+            "the newer in-flight arm must stay scheduled ahead of the failed operation"
+        );
+        assert!(
+            client
+                .queued_epoch_backfills
+                .iter()
+                .any(|pending| pending.attempt_id == operation_a),
+            "the failed operation must be queued behind the newer arm"
+        );
+
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("newer operation must remain primary")
+            .groups
+            .insert(
+                cgka_traits::GroupId::new(vec![0xde]),
+                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
+            );
+
+        assert!(
+            client
+                .begin_epoch_backfill_execution(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .is_none(),
+            "the unavailable newer operation must defer without starving queued work"
+        );
+        assert_eq!(
+            client
+                .pending_epoch_backfill
+                .as_ref()
+                .map(|pending| pending.attempt_id.as_str()),
+            Some(operation_a.as_str()),
+            "fair deferral must rotate the queued older operation to the front"
+        );
+        assert!(
+            client
+                .queued_epoch_backfills
+                .iter()
+                .any(|pending| pending.attempt_id == operation_b),
+            "the deferred newer operation must rotate behind the queued older work"
+        );
+
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the queued older operation must retry")
+            .expect("the queued older operation must execute");
+        assert!(
+            client
+                .queued_epoch_backfills
+                .iter()
+                .any(|pending| pending.attempt_id == operation_b),
+            "the deferred newer operation must remain retryable after the older operation runs"
+        );
+
+        let audit_rows = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rows_for_operation = |operation_id: &str, kind: &str| {
+            audit_rows
+                .iter()
+                .filter(|row| {
+                    row["kind"]["type"] == kind
+                        && row["context"]["operation_id"].as_str() == Some(operation_id)
+                })
+                .count()
+        };
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_started"),
+            2,
+            "the queued older operation must reach started evidence after fair deferral"
+        );
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_failed"),
+            1,
+            "the older operation must retain its earlier failed terminal"
+        );
+        assert_eq!(
+            rows_for_operation(&operation_a, "epoch_stall_backfill_completed"),
+            1,
+            "the queued older operation must reach completed terminal evidence"
+        );
+        assert_eq!(
+            rows_for_operation(&operation_b, "epoch_stall_backfill_deferred"),
+            1,
+            "the unavailable newer operation must emit one debounced deferred row"
+        );
+        assert_eq!(
+            rows_for_operation(&operation_b, "epoch_stall_backfill_started"),
+            0,
+            "the newer operation must not start while its group epochs stay unavailable"
+        );
+    });
+}
+
 /// Run app-runtime integration chains on a stack large enough for debug
 /// OpenMLS group creation. Libtest's default 2 MiB stack is too small once a
 /// test composes the account worker with maintenance and push lifecycle work.

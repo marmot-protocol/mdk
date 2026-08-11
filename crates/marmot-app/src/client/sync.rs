@@ -27,7 +27,10 @@ use marmot_forensics::{
 
 use super::AppClient;
 use super::audit::EpochBackfillTerminalAudit;
-use super::epoch_stall::{BackfillDecision, PendingEpochBackfill, PendingEpochBackfillGroup};
+use super::epoch_stall::{
+    BackfillDecision, EpochBackfillDeferredSnapshot, PendingEpochBackfill,
+    PendingEpochBackfillGroup,
+};
 use crate::config::CursorPersistence;
 
 /// In-flight epoch-gap replay bookkeeping shared by begin/finish helpers.
@@ -874,7 +877,73 @@ impl AppClient {
     /// the account worker to schedule a forensic audit-tracker upload for the
     /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
     pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
-        self.pending_epoch_backfill.is_some()
+        self.pending_epoch_backfill.is_some() || !self.queued_epoch_backfills.is_empty()
+    }
+
+    fn take_next_pending_epoch_backfill(&mut self) -> Option<PendingEpochBackfill> {
+        self.pending_epoch_backfill
+            .take()
+            .or_else(|| self.queued_epoch_backfills.pop_front())
+    }
+
+    fn requeue_failed_epoch_backfill_intent(&mut self, failed: PendingEpochBackfill) {
+        match self.pending_epoch_backfill.take() {
+            None => self.pending_epoch_backfill = Some(failed),
+            Some(current) if current.attempt_id == failed.attempt_id => {
+                self.pending_epoch_backfill = Some(failed);
+            }
+            Some(current) => {
+                self.pending_epoch_backfill = Some(current);
+                self.queued_epoch_backfills.push_back(failed);
+            }
+        }
+    }
+
+    fn restore_deferred_epoch_backfill(&mut self, deferred: PendingEpochBackfill) {
+        if let Some(next) = self.queued_epoch_backfills.pop_front() {
+            self.queued_epoch_backfills.push_back(deferred);
+            self.pending_epoch_backfill = Some(next);
+        } else {
+            self.pending_epoch_backfill = Some(deferred);
+        }
+    }
+
+    fn epoch_backfill_deferred_snapshot(
+        reason: EpochBackfillDeferredReason,
+        retry_ordinal: u64,
+        pending: &PendingEpochBackfill,
+        observed_epochs: &HashMap<cgka_traits::GroupId, u64>,
+    ) -> EpochBackfillDeferredSnapshot {
+        let mut group_epochs = pending
+            .groups
+            .keys()
+            .map(|group_id| (group_id.clone(), observed_epochs.get(group_id).copied()))
+            .collect::<Vec<_>>();
+        group_epochs.sort_by(|(left, _), (right, _)| left.as_slice().cmp(right.as_slice()));
+        EpochBackfillDeferredSnapshot {
+            reason,
+            retry_ordinal,
+            group_epochs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_finish_epoch_backfill_execution(
+        &mut self,
+        execution: EpochBackfillExecution,
+        succeeded: bool,
+    ) {
+        self.finish_epoch_backfill_execution(
+            execution,
+            EpochBackfillActivationOutcome::Succeeded,
+            if succeeded {
+                None
+            } else {
+                Some("account_transport".to_string())
+            },
+            0,
+            succeeded,
+        );
     }
 
     fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
@@ -909,19 +978,29 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Option<EpochBackfillExecution> {
-        let mut pending = self.pending_epoch_backfill.take()?;
+        let mut pending = self.take_next_pending_epoch_backfill()?;
         let retry_ordinal = u64::from(pending.execution_attempts);
         let epochs_before = self.capture_pending_group_epochs(&pending);
         let context = Self::epoch_backfill_audit_context(&pending);
         if epochs_before.len() != pending.groups.len() {
-            self.record_epoch_stall_backfill_deferred(
+            let defer_state = Self::epoch_backfill_deferred_snapshot(
                 EpochBackfillDeferredReason::GroupEpochUnavailable,
                 retry_ordinal,
-                &context,
+                &pending,
+                &epochs_before,
             );
-            self.pending_epoch_backfill = Some(pending);
+            if pending.last_deferred_audit != Some(defer_state.clone()) {
+                self.record_epoch_stall_backfill_deferred(
+                    EpochBackfillDeferredReason::GroupEpochUnavailable,
+                    retry_ordinal,
+                    &context,
+                );
+                pending.last_deferred_audit = Some(defer_state);
+            }
+            self.restore_deferred_epoch_backfill(pending);
             return None;
         }
+        pending.last_deferred_audit = None;
         pending.execution_attempts = pending.execution_attempts.saturating_add(1);
         self.record_epoch_stall_backfill_started(seam, retry_ordinal, &context);
         Some(EpochBackfillExecution {
@@ -965,7 +1044,7 @@ impl AppClient {
         if succeeded {
             self.epoch_stall.mark_replayed();
         } else {
-            self.pending_epoch_backfill = Some(execution.pending);
+            self.requeue_failed_epoch_backfill_intent(execution.pending);
         }
     }
 
