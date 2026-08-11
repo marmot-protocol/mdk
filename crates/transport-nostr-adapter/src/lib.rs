@@ -25,7 +25,7 @@ use cgka_traits::{
 };
 use nostr::RelayUrl;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
 use transport_nostr_peeler::{
     KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrPeelerError, NostrTransportEvent,
@@ -745,7 +745,7 @@ impl TransportAdapter for NostrTransportAdapter {
         // Serialize against other subscription-lifecycle operations so the
         // drain's live-route filter and its relay unsubscribes cannot race a
         // concurrent re-add of the same deterministic subscription id.
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let subscription_guard = self.subscription_lock.clone().lock_owned().await;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
@@ -776,21 +776,50 @@ impl TransportAdapter for NostrTransportAdapter {
             )
         };
 
-        // Additions stay fail-fast: on error the adapter state is untouched, a
-        // retry re-diffs against the old group set, and re-subscribing the same
-        // deterministic subscription id is idempotent.
-        self.subscribe_all("sync_account_groups", &to_add).await?;
+        // Stage new route coverage and a telemetry overlay BEFORE the relay REQs
+        // go out. Existing routes and committed telemetry remain live until the
+        // whole batch succeeds, while synchronous callbacks update the overlay.
+        let now_ms = self.now_ms();
+        {
+            let mut state = self.state.write().await;
+            state.stage_subscription_starts(&to_add, now_ms);
+            state.stage_group_routes(&to_add);
+        }
+        // Keep the lifecycle lock in a detached cleanup guard. If this future
+        // is cancelled at any later await, dropping the sender wakes the guard,
+        // which rolls back staged state before another lifecycle call can run.
+        let (staging_complete, staging_abandoned) = oneshot::channel();
+        let cleanup_state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let _subscription_guard = subscription_guard;
+            if staging_abandoned.await.is_err() {
+                let mut state = cleanup_state.write().await;
+                state.rollback_staged_subscription_starts();
+                state.rebuild_transport_group_index();
+            }
+        });
+
+        if let Err(error) = self.subscribe_all("sync_account_groups", &to_add).await {
+            // The authoritative routes and committed telemetry were never
+            // replaced. Discard only this batch's staged callbacks and rebuild
+            // the derived route index to remove its temporary coverage.
+            let mut state = self.state.write().await;
+            state.rollback_staged_subscription_starts();
+            state.rebuild_transport_group_index();
+            drop(state);
+            let _ = staging_complete.send(());
+            return Err(error);
+        }
 
         // Commit routing intent BEFORE relay teardown: a failed unsubscribe
         // must never leave the routing index serving the old group set.
         // Removals are queued and drained below (plus any left over from
         // earlier syncs); failures there are absorbed and retried, never
         // surfaced as an error.
-        let now_ms = self.now_ms();
         let drainable = {
             let mut state = self.state.write().await;
+            state.commit_staged_subscription_starts();
             state.forget_subscription_starts(&to_remove);
-            state.record_subscription_starts(&to_add, now_ms);
             state.sync_groups(sync, to_add.len());
             state.queue_pending_unsubscribes(to_remove);
             state.take_drainable_unsubscribes()
@@ -825,6 +854,8 @@ impl TransportAdapter for NostrTransportAdapter {
                 "deferred relay unsubscribes; will retry on next group sync"
             );
         }
+        drop(state);
+        let _ = staging_complete.send(());
         Ok(())
     }
 
@@ -1047,8 +1078,9 @@ struct AdapterState {
     /// `transport_group_id` to its candidate routes, so an inbound group event is
     /// resolved in O(matching groups) instead of scanning O(accounts × groups)
     /// every event (attacker-floodable). Rebuilt wholesale from `accounts` (the
-    /// authoritative signed-routing state) at every mutation
-    /// (activate/sync_groups/deactivate), so it can never drift.
+    /// authoritative signed-routing state) at every committed mutation. Group
+    /// sync may append only missing pre-REQ routes while a subscribe batch is in
+    /// flight; both success and failure rebuild the index before returning.
     by_transport_group: HashMap<Vec<u8>, Vec<GroupRouteEntry>>,
     /// Relay unsubscribes that failed and await retry. Routing state
     /// (`accounts`/`by_transport_group`) already reflects the removal; these
@@ -1080,6 +1112,50 @@ impl AdapterState {
             }
         }
         self.by_transport_group = index;
+    }
+
+    /// Add the endpoint coverage needed by new group REQs without replacing
+    /// any live route. Existing coverage is skipped (including canonical URL
+    /// matches), preventing duplicate account deliveries during the staging
+    /// window. A later index rebuild commits or discards these entries.
+    fn stage_group_routes(&mut self, subscriptions: &[NostrSubscription]) {
+        for subscription in subscriptions {
+            let NostrSubscription::Group {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+                ..
+            } = subscription
+            else {
+                continue;
+            };
+            let entries = self
+                .by_transport_group
+                .entry(transport_group_id.clone())
+                .or_default();
+            let staged_endpoints = endpoints
+                .iter()
+                .filter(|endpoint| {
+                    let parsed_endpoint = RelayUrl::parse(endpoint.as_str()).ok();
+                    !entries.iter().any(|entry| {
+                        &entry.account_id == account_id
+                            && &entry.group_id == group_id
+                            && entry.endpoints.iter().any(|candidate| {
+                                candidate.matches(endpoint, parsed_endpoint.as_ref())
+                            })
+                    })
+                })
+                .map(CanonicalEndpoint::new)
+                .collect::<Vec<_>>();
+            if !staged_endpoints.is_empty() {
+                entries.push(GroupRouteEntry {
+                    account_id: account_id.clone(),
+                    group_id: group_id.clone(),
+                    endpoints: staged_endpoints,
+                });
+            }
+        }
     }
 
     fn activate(&mut self, activation: TransportAccountActivation, replaced: usize) {
@@ -1198,6 +1274,27 @@ impl AdapterState {
             self.sync
                 .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
         }
+    }
+
+    fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
+        self.sync.begin_staged_subscription_starts();
+        for subscription in subscriptions {
+            let relays: Vec<RelayIndex> = subscription
+                .endpoints()
+                .iter()
+                .map(|endpoint| self.relay_index.index_for(endpoint))
+                .collect();
+            self.sync
+                .stage_subscription_start(&subscription.subscription_id(), &relays, now_ms);
+        }
+    }
+
+    fn commit_staged_subscription_starts(&mut self) {
+        self.sync.commit_staged_subscription_starts();
+    }
+
+    fn rollback_staged_subscription_starts(&mut self) {
+        self.sync.rollback_staged_subscription_starts();
     }
 
     /// Evict sync-telemetry progress for subscriptions being removed, so the
