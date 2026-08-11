@@ -4,10 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind,
-    ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec,
-    ScenarioStep, ScenarioTopologyV2, TraceExpectation, compile_scenario,
-    resolve_scenario_input_bytes, run_scenario_report, run_scenario_report_with_subject,
+    AppRuntimeHarness, AppRuntimeObservationV1, GeneratedScenarioCase, GeneratedScenarioInputV1,
+    GeneratedSubjectKind, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
+    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, TraceExpectation, compile_scenario,
+    node_protocol::NodeObservationV1, resolve_scenario_input_bytes, run_scenario_report,
+    run_scenario_report_with_subject,
 };
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
@@ -149,45 +150,174 @@ fn controlled_relay_topology() -> ScenarioTopologyV2 {
     }
 }
 
-fn cross_adapter_scenario() -> ScenarioSpec {
-    ScenarioSpec {
-        name: "cross-adapter-public-state".into(),
-        spec_version: "3".into(),
-        clients: vec!["alice".into()],
-        topology: Default::default(),
-        steps: vec![
-            in_group(
-                "main",
-                ScenarioStep::CreateGroup {
-                    creator: "alice".into(),
-                    name: "initial".into(),
-                    invitees: Vec::new(),
-                    required_features: Vec::new(),
-                    initial_admins: Some(vec!["alice".into()]),
-                    pending: "create".into(),
-                },
-            ),
-            in_group(
-                "main",
-                ScenarioStep::UpdateGroupProfile {
-                    client: "alice".into(),
-                    name: Some("equivalent result".into()),
-                    description: Some("equivalent description".into()),
-                    pending: "rename".into(),
-                },
-            ),
-            ScenarioStep::DeliverAll,
-            ScenarioStep::Tick {
-                clients: vec!["alice".into()],
+#[derive(Clone, Copy)]
+enum CrossAdapterRecovery {
+    Restart,
+    OfflineFullHistory,
+}
+
+fn build_cross_adapter_scenario(recovery: CrossAdapterRecovery) -> ScenarioSpec {
+    let include_offline_recovery = matches!(recovery, CrossAdapterRecovery::OfflineFullHistory);
+    let clients = vec!["alice".into(), "bob".into(), "carol".into()];
+    let mut steps = vec![
+        in_group(
+            "main",
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "initial".into(),
+                invitees: vec!["bob".into(), "carol".into()],
+                required_features: Vec::new(),
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
             },
-            in_group(
-                "main",
-                ScenarioStep::Observe {
-                    clients: vec!["alice".into()],
-                },
-            ),
-        ],
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "alice".into(),
+            publication: Some("create".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec!["bob".into(), "carol".into()],
+        },
+        in_group(
+            "main",
+            ScenarioStep::ClearEvents {
+                clients: clients.clone(),
+            },
+        ),
+    ];
+    if include_offline_recovery {
+        steps.push(ScenarioStep::SetClientOffline {
+            client: "bob".into(),
+        });
     }
+    steps.extend([
+        in_group(
+            "main",
+            ScenarioStep::UpdateGroupProfile {
+                client: "alice".into(),
+                name: Some("equivalent result".into()),
+                description: Some("equivalent description".into()),
+                pending: "rename".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "alice".into(),
+            publication: Some("rename".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        in_group(
+            "main",
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "sent before restart".into(),
+            },
+        ),
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec!["alice".into(), "carol".into()],
+        },
+        ScenarioStep::RestartClient {
+            client: "carol".into(),
+        },
+    ]);
+    if include_offline_recovery {
+        steps.extend([
+            ScenarioStep::ReconnectClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::SyncRelayHistory {
+                clients: clients.clone(),
+                sync: cgka_conformance_simulator::ScenarioRelaySyncModeV2::FullHistory,
+            },
+        ]);
+    }
+    steps.extend([
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "sent after restart".into(),
+            },
+        ),
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::Observe {
+                clients: clients.clone(),
+            },
+        ),
+    ]);
+    ScenarioSpec {
+        name: if include_offline_recovery {
+            "app-process-offline-restart-recovery".into()
+        } else {
+            "cross-adapter-restart-recovery".into()
+        },
+        spec_version: "3".into(),
+        clients,
+        topology: Default::default(),
+        steps,
+    }
+}
+
+fn cross_adapter_restart_scenario() -> ScenarioSpec {
+    build_cross_adapter_scenario(CrossAdapterRecovery::Restart)
+}
+
+fn cross_adapter_offline_scenario() -> ScenarioSpec {
+    build_cross_adapter_scenario(CrossAdapterRecovery::OfflineFullHistory)
+}
+
+async fn run_app_and_process_adapters(
+    spec: &ScenarioSpec,
+) -> (
+    BTreeMap<String, AppRuntimeObservationV1>,
+    BTreeMap<String, NodeObservationV1>,
+) {
+    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
+    let app_report = run_scenario_report_with_subject(spec, None, Vec::new(), &mut app)
+        .await
+        .unwrap();
+    assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
+    let app_observations = app
+        .observations(&spec.clients)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|observation| (observation.participant.clone(), observation))
+        .collect::<BTreeMap<_, _>>();
+
+    let process_artifacts = tempfile::tempdir().unwrap();
+    let mut process = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        spec,
+        process_artifacts.path(),
+    )
+    .await
+    .unwrap();
+    let process_report = process.run().await.unwrap();
+    assert!(process_report.completed, "{process_report:#?}");
+    let process_observations = process_report
+        .observations
+        .iter()
+        .rev()
+        .take(spec.clients.len())
+        .map(|observation| (observation.participant.clone(), observation.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    process.shutdown().await;
+    app.shutdown().await;
+    (app_observations, process_observations)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,67 +372,165 @@ async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state() {
-    let spec = cross_adapter_scenario();
+    let spec = cross_adapter_restart_scenario();
     let engine_report = run_scenario_report(&spec, None).await.unwrap();
     let engine = engine_report
         .observed_trace
         .as_ref()
         .unwrap()
         .observations
-        .last()
-        .unwrap();
+        .iter()
+        .map(|observation| (observation.client.as_str(), observation))
+        .collect::<BTreeMap<_, _>>();
 
-    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
-    let app_report = run_scenario_report_with_subject(&spec, None, Vec::new(), &mut app)
-        .await
-        .unwrap();
-    assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
-    let app_observation = app.observations(&spec.clients).await.unwrap().remove(0);
+    let (app_observations, process_observations) = run_app_and_process_adapters(&spec).await;
 
-    let process_artifacts = tempfile::tempdir().unwrap();
-    let mut process = ProcessOrchestrator::launch(
-        env!("CARGO_BIN_EXE_cgka-conformance-node"),
-        &spec,
-        process_artifacts.path(),
-    )
-    .await
-    .unwrap();
-    let process_report = process.run().await.unwrap();
-    assert!(process_report.completed, "{process_report:#?}");
-    let process_observation = process_report.observations.last().unwrap();
+    for client in &spec.clients {
+        let engine = engine[client.as_str()];
+        let app = &app_observations[client];
+        let process = &process_observations[client];
 
-    assert_eq!(engine.epoch, app_observation.protocol.epoch);
-    assert_eq!(engine.epoch, process_observation.protocol.epoch);
-    assert_eq!(engine.member_count, app_observation.protocol.member_count);
-    assert_eq!(
-        engine.member_count,
-        process_observation.protocol.member_count
-    );
-    assert_eq!(engine.group_name, app_observation.protocol.group_name);
-    assert_eq!(engine.group_name, process_observation.protocol.group_name);
-    assert_eq!(
-        engine.group_description,
-        app_observation.protocol.group_description
-    );
-    assert_eq!(
-        engine.group_description,
-        process_observation.protocol.group_description
-    );
-    assert_eq!(engine.group_description, "equivalent description");
-    assert_eq!(
-        app_observation.protocol.state_commitment_sha256,
-        process_observation.protocol.state_commitment_sha256
-    );
-    assert_eq!(app_observation.protocol.member_identities, ["alice"]);
-    assert_eq!(app_observation.protocol.admin_identities, ["alice"]);
+        assert_eq!(engine.epoch, app.protocol.epoch, "{client} app epoch");
+        assert_eq!(
+            engine.epoch, process.protocol.epoch,
+            "{client} process epoch"
+        );
+        assert_eq!(
+            engine.member_count, app.protocol.member_count,
+            "{client} app roster"
+        );
+        assert_eq!(
+            engine.member_count, process.protocol.member_count,
+            "{client} process roster"
+        );
+        assert_eq!(
+            engine.group_name, app.protocol.group_name,
+            "{client} app name"
+        );
+        assert_eq!(
+            engine.group_name, process.protocol.group_name,
+            "{client} process name"
+        );
+        assert_eq!(
+            engine.group_description, app.protocol.group_description,
+            "{client} app description"
+        );
+        assert_eq!(
+            engine.group_description, process.protocol.group_description,
+            "{client} process description"
+        );
+        assert_eq!(engine.group_description, "equivalent description");
+        let app_payloads = app
+            .application
+            .visible_plaintexts
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let process_payloads = process
+            .application
+            .visible_plaintexts
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            app_payloads, process_payloads,
+            "{client} app/process projection"
+        );
+        assert_eq!(app.application.visible_plaintexts.len(), app_payloads.len());
+        assert_eq!(
+            process.application.visible_plaintexts.len(),
+            process_payloads.len()
+        );
+        if client == "alice" {
+            // The engine harness observes inbound delivery only, while the app
+            // projection also includes the sender's locally authored rows.
+            assert!(engine.received_payloads.is_empty());
+        } else if client == "carol" {
+            // Restart clears the engine harness's in-memory event window; the
+            // app/process projection correctly retains already-projected rows.
+            assert_eq!(engine.received_payloads, ["sent after restart"]);
+        } else {
+            let engine_payloads = engine
+                .received_payloads
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                engine_payloads, app_payloads,
+                "{client} inbound application projection"
+            );
+            assert_eq!(engine.received_payloads.len(), engine_payloads.len());
+        }
+        assert_eq!(
+            app.protocol.state_commitment_sha256, process.protocol.state_commitment_sha256,
+            "{client} public commitment"
+        );
+        assert_eq!(app.protocol.member_identities, ["alice", "bob", "carol"]);
+        assert_eq!(app.protocol.admin_identities, ["alice"]);
+        assert!(app.application.invalidated_message_ids.is_empty());
+        assert!(process.application.invalidated_message_ids.is_empty());
+    }
+}
 
-    process.shutdown().await;
-    app.shutdown().await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_runtime_and_process_adapters_recover_the_same_offline_projection() {
+    let spec = cross_adapter_offline_scenario();
+    let (app_observations, process_observations) = run_app_and_process_adapters(&spec).await;
+
+    let expected_payloads = BTreeSet::from(["sent after restart", "sent before restart"]);
+    let bob = &app_observations["bob"];
+    assert!(bob.local.online, "bob must be reconnected at the end");
+    assert!(
+        bob.local.reopen_count > 0,
+        "bob's offline runtime must have reopened"
+    );
+    assert!(
+        bob.local.catch_up_attempts > 0,
+        "bob must have executed retained-history catch-up"
+    );
+    for client in &spec.clients {
+        let app = &app_observations[client];
+        let process = &process_observations[client];
+        assert_eq!(
+            app.protocol, process.protocol,
+            "{client} protocol projection"
+        );
+        let app_payloads = app
+            .application
+            .visible_plaintexts
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let process_payloads = process
+            .application
+            .visible_plaintexts
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(app_payloads, expected_payloads, "{client} app message set");
+        assert_eq!(
+            process_payloads, expected_payloads,
+            "{client} process message set"
+        );
+        assert_eq!(app.application.visible_plaintexts.len(), app_payloads.len());
+        assert_eq!(
+            process.application.visible_plaintexts.len(),
+            process_payloads.len()
+        );
+        assert!(app.application.invalidated_message_ids.is_empty());
+        assert!(process.application.invalidated_message_ids.is_empty());
+        assert!(!app.application.pending_confirmation);
+        assert!(!process.application.pending_confirmation);
+        assert_eq!(
+            app.application.stored_member_count,
+            process.application.stored_member_count
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
-    let spec = cross_adapter_scenario();
+    let spec = cross_adapter_restart_scenario();
     let input = GeneratedScenarioInputV1::new(GeneratedScenarioCase {
         family_name: "selectable-process/v1".into(),
         generator_version: "4".into(),
@@ -538,7 +766,7 @@ fn process_cli_writes_a_private_versioned_report() {
     let report_path = root.path().join("report.json");
     fs_private::write_private(
         &scenario_path,
-        &serde_json::to_vec_pretty(&cross_adapter_scenario()).unwrap(),
+        &serde_json::to_vec_pretty(&cross_adapter_restart_scenario()).unwrap(),
     )
     .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-process"))

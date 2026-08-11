@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use cgka_conformance_simulator::{
     AppRuntimeHarness, ConvergenceSubject, GeneratedScenarioCase, GeneratedSubjectKind,
-    HarnessStorageMode, ScenarioSpec, ScenarioStep, TraceExpectation,
+    HarnessStorageMode, ScenarioOutboundSelection, ScenarioSpec, ScenarioStep, ScenarioStepStatus,
+    SubjectFailureCategory, SubjectOutboundOutcome, TraceExpectation,
     run_generated_case_report_with_capture_on_subject, run_scenario_report_with_subject,
 };
 
@@ -56,6 +57,38 @@ fn two_client_scenario() -> ScenarioSpec {
                     clients: clients.clone(),
                 },
             ),
+        ],
+    }
+}
+
+fn publication_acknowledgement_scenario(
+    name: &str,
+    publication: Option<&str>,
+    outcome: SubjectOutboundOutcome,
+) -> ScenarioSpec {
+    ScenarioSpec {
+        name: name.into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            in_group(
+                "main",
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "publication contract".into(),
+                    invitees: Vec::new(),
+                    required_features: Vec::new(),
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                },
+            ),
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: publication.map(str::to_owned),
+                selection: ScenarioOutboundSelection::All,
+                outcome,
+            },
         ],
     }
 }
@@ -144,6 +177,46 @@ async fn app_runtime_adapter_is_selectable_for_a_saved_generated_case() {
         "marmot_app_runtime"
     );
     assert!(report.expectation_failures.is_empty(), "{report:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_runtime_publication_acknowledgements_fail_closed_without_mid_run_capability_errors() {
+    for (name, publication, outcome, expected_failure) in [
+        (
+            "accepted-publication-cannot-roll-back",
+            Some("create"),
+            SubjectOutboundOutcome::ReachedNoEndpoint,
+            Some("publication_rollback_rejected"),
+        ),
+        (
+            "unknown-publication-is-refused",
+            Some("missing"),
+            SubjectOutboundOutcome::Accepted,
+            Some("publication_not_found"),
+        ),
+        (
+            "unlabelled-publication-drain-is-idempotent",
+            None,
+            SubjectOutboundOutcome::Accepted,
+            None,
+        ),
+    ] {
+        let spec = publication_acknowledgement_scenario(name, publication, outcome);
+        let mut subject = AppRuntimeHarness::new(&spec.clients).await.unwrap();
+        let report = run_scenario_report_with_subject(&spec, None, Vec::new(), &mut subject)
+            .await
+            .unwrap();
+        match expected_failure {
+            Some(expected_kind) => assert!(matches!(
+                &report.step_log[1].status,
+                ScenarioStepStatus::Failed { kind, category, .. }
+                    if kind == expected_kind
+                        && *category == SubjectFailureCategory::ExpectedRefusal
+            )),
+            None => assert!(report.step_log[1].status.is_completed()),
+        }
+        subject.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -361,6 +361,15 @@ pub trait ConvergenceSubject: Send {
         Err(SubjectError::unsupported(SubjectCapability::VirtualTime))
     }
 
+    /// Return whether an adapter already published and accepted a named
+    /// scenario action through its production-shaped command surface. Engine
+    /// subjects return `false` and expose transport-ready artifacts for an
+    /// explicit acknowledgement; auto-publishing app adapters override this
+    /// so the same canonical IR can retain its publication checkpoint.
+    fn scenario_publication_already_accepted(&self, _client: &str, _publication: &str) -> bool {
+        false
+    }
+
     fn poll_outbound(
         &mut self,
         _client: &str,

@@ -20,8 +20,8 @@ use crate::node_protocol::{
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
     ScenarioInputProvenanceV1, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
-    SubjectCapability, SubjectDescriptor, SubjectFailureCategory, TraceExpectation,
-    canonical_scenario_ir_sha256, compile_scenario, preflight_compiled_scenario,
+    SubjectCapability, SubjectDescriptor, SubjectFailureCategory, SubjectOutboundOutcome,
+    TraceExpectation, canonical_scenario_ir_sha256, compile_scenario, preflight_compiled_scenario,
 };
 
 pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "1";
@@ -190,6 +190,7 @@ pub struct ProcessOrchestrator {
     input_provenance: Option<ScenarioInputProvenanceV1>,
     executed_scenario_ir_sha256: String,
     expected_outcomes: Vec<TraceExpectation>,
+    accepted_publications: BTreeMap<String, BTreeSet<String>>,
 }
 
 struct NodeProcess {
@@ -330,6 +331,7 @@ impl ProcessOrchestrator {
             input_provenance: None,
             executed_scenario_ir_sha256,
             expected_outcomes: Vec::new(),
+            accepted_publications: BTreeMap::new(),
         };
         for client in &clients {
             orchestrator.launch_participant(client, "launch").await?;
@@ -454,6 +456,13 @@ impl ProcessOrchestrator {
         }
     }
 
+    fn record_accepted_publication(&mut self, client: &str, publication: &str) {
+        self.accepted_publications
+            .entry(client.to_owned())
+            .or_default()
+            .insert(publication.to_owned());
+    }
+
     async fn execute_action(
         &mut self,
         action: &crate::CompiledScenarioActionV2,
@@ -471,6 +480,7 @@ impl ProcessOrchestrator {
                 name,
                 invitees,
                 initial_admins,
+                pending,
                 ..
             } => {
                 let members = self.account_ids(invitees).map_err(orchestrator_failure)?;
@@ -516,10 +526,13 @@ impl ProcessOrchestrator {
                     )
                     .await?;
                 }
+                self.record_accepted_publication(creator, pending);
                 Ok((vec![creator.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::InviteMembers {
-                inviter, invitees, ..
+                inviter,
+                invitees,
+                pending,
             } => {
                 self.select_group(inviter, &group).await?;
                 let member_accounts = self.account_ids(invitees).map_err(orchestrator_failure)?;
@@ -531,10 +544,13 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_accepted_publication(inviter, pending);
                 Ok((vec![inviter.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::RemoveMembers {
-                remover, members, ..
+                remover,
+                members,
+                pending,
             } => {
                 self.select_group(remover, &group).await?;
                 let member_accounts = self.account_ids(members).map_err(orchestrator_failure)?;
@@ -546,9 +562,10 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_accepted_publication(remover, pending);
                 Ok((vec![remover.clone()], ProcessActionStatusV1::Completed))
             }
-            ScenarioStep::SelfUpdate { client, .. } => {
+            ScenarioStep::SelfUpdate { client, pending } => {
                 self.select_group(client, &group).await?;
                 self.expect_ack(
                     client,
@@ -557,9 +574,14 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
-            ScenarioStep::UpdateGroupData { client, name, .. } => {
+            ScenarioStep::UpdateGroupData {
+                client,
+                name,
+                pending,
+            } => {
                 self.select_group(client, &group).await?;
                 self.expect_ack(
                     client,
@@ -569,13 +591,14 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::UpdateGroupProfile {
                 client,
                 name,
                 description,
-                ..
+                pending,
             } => {
                 self.select_group(client, &group).await?;
                 self.expect_ack(
@@ -587,9 +610,14 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
-            ScenarioStep::UpdateAdminPolicy { client, admins, .. } => {
+            ScenarioStep::UpdateAdminPolicy {
+                client,
+                admins,
+                pending,
+            } => {
                 self.select_group(client, &group).await?;
                 let admin_accounts = self.account_ids(admins).map_err(orchestrator_failure)?;
                 self.expect_ack(
@@ -600,6 +628,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
@@ -671,10 +700,24 @@ impl ProcessOrchestrator {
                 report.observations.extend(observations);
                 Ok((labels, ProcessActionStatusV1::Completed))
             }
-            ScenarioStep::AcknowledgeOutbound { client, .. } => Ok((
-                vec![client.clone()],
-                ProcessActionStatusV1::AlreadyPublished,
-            )),
+            ScenarioStep::AcknowledgeOutbound {
+                client,
+                publication,
+                outcome,
+                ..
+            } => {
+                validate_auto_published_acknowledgement(
+                    &self.accepted_publications,
+                    client,
+                    publication.as_deref(),
+                    *outcome,
+                )
+                .map_err(|error| (Some(client.clone()), error))?;
+                Ok((
+                    vec![client.clone()],
+                    ProcessActionStatusV1::AlreadyPublished,
+                ))
+            }
             ScenarioStep::Barrier { name } => {
                 hook.before_barrier(name)
                     .await
@@ -1374,6 +1417,38 @@ fn action_participant(step: &ScenarioStep) -> Option<String> {
     }
 }
 
+fn validate_auto_published_acknowledgement(
+    accepted_publications: &BTreeMap<String, BTreeSet<String>>,
+    client: &str,
+    publication: Option<&str>,
+    outcome: SubjectOutboundOutcome,
+) -> Result<(), NodeErrorV1> {
+    let Some(publication) = publication else {
+        return Ok(());
+    };
+    let known = accepted_publications
+        .get(client)
+        .is_some_and(|publications| publications.contains(publication));
+    if !known {
+        return Err(NodeErrorV1 {
+            code: "publication_not_found".into(),
+            category: SubjectFailureCategory::ExpectedRefusal,
+            retryable: false,
+            message: "the process adapter has no accepted publication with that label".into(),
+        });
+    }
+    if outcome != SubjectOutboundOutcome::Accepted {
+        return Err(NodeErrorV1 {
+            code: "publication_rollback_rejected".into(),
+            category: SubjectFailureCategory::ExpectedRefusal,
+            retryable: false,
+            message: "a process publication already accepted by transport cannot be rolled back"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 fn process_action_error(error: (Option<String>, NodeErrorV1)) -> ProcessOrchestratorError {
     ProcessOrchestratorError::new(error.1.code, error.1.message)
 }
@@ -1496,6 +1571,46 @@ mod tests {
         let error = render_node_arg("{shell}", "p", "r", host, child).unwrap_err();
         assert_eq!(error.code, "unknown_node_command_placeholder");
     }
+
+    #[test]
+    fn process_auto_published_acknowledgements_validate_labels_and_outcomes() {
+        let accepted = BTreeMap::from([("alice".into(), BTreeSet::from(["create".into()]))]);
+        validate_auto_published_acknowledgement(
+            &accepted,
+            "alice",
+            Some("create"),
+            SubjectOutboundOutcome::Accepted,
+        )
+        .unwrap();
+        validate_auto_published_acknowledgement(
+            &accepted,
+            "alice",
+            None,
+            SubjectOutboundOutcome::Accepted,
+        )
+        .unwrap();
+
+        let unknown = validate_auto_published_acknowledgement(
+            &accepted,
+            "alice",
+            Some("missing"),
+            SubjectOutboundOutcome::Accepted,
+        )
+        .unwrap_err();
+        assert_eq!(unknown.code, "publication_not_found");
+        assert_eq!(unknown.category, SubjectFailureCategory::ExpectedRefusal);
+
+        let rollback = validate_auto_published_acknowledgement(
+            &accepted,
+            "alice",
+            Some("create"),
+            SubjectOutboundOutcome::ReachedNoEndpoint,
+        )
+        .unwrap_err();
+        assert_eq!(rollback.code, "publication_rollback_rejected");
+        assert_eq!(rollback.category, SubjectFailureCategory::ExpectedRefusal);
+    }
+
     #[test]
     fn observation_schema_is_rejected_before_typed_observation_decoding() {
         let line = format!(

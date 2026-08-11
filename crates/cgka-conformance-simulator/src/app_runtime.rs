@@ -25,8 +25,8 @@ use crate::{
     ClientEventCounts, ClientObservation, ConvergenceSubject, ForkRecoveryObservation,
     ScenarioAdminPolicyObservation, ScenarioInputLedgerEntry, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
-    SubjectInviteMembers, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundOutcome, SubjectRemoveMembers,
+    SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
 };
 
 pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "1";
@@ -119,6 +119,7 @@ pub struct AppRuntimeHarness {
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
+    accepted_publications: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl AppRuntimeHarness {
@@ -173,6 +174,7 @@ impl AppRuntimeHarness {
             participants,
             scenario_groups: BTreeMap::new(),
             active_scenario_group: None,
+            accepted_publications: BTreeMap::new(),
         })
     }
 
@@ -345,6 +347,13 @@ impl AppRuntimeHarness {
             .iter()
             .map(|label| Ok(self.participant(label)?.account_id.clone()))
             .collect()
+    }
+
+    fn record_accepted_publication(&mut self, client: &str, publication: &str) {
+        self.accepted_publications
+            .entry(client.to_owned())
+            .or_default()
+            .insert(publication.to_owned());
     }
 
     async fn refresh_cached_members(&mut self, clients: &[String]) -> Result<(), SubjectError> {
@@ -585,6 +594,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::EventObservation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,
+                SubjectCapability::OutboundPublication,
                 SubjectCapability::ParticipantConnectivity,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
@@ -638,6 +648,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         self.scenario_groups.insert(group_label, group_id.clone());
         self.apply_admin_set(action.creator, &group_id, action.initial_admins)
             .await?;
+        self.record_accepted_publication(action.creator, action.pending);
         Ok(())
     }
 
@@ -653,6 +664,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .invite_members(&participant.account_id, &group_id, &invitees)
             .await
             .map_err(app_error)?;
+        self.record_accepted_publication(action.inviter, action.pending);
         Ok(())
     }
 
@@ -672,6 +684,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
+        self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
 
@@ -687,6 +700,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .remove_members(&participant.account_id, &group_id, &members)
             .await
             .map_err(app_error)?;
+        self.record_accepted_publication(action.remover, action.pending);
         Ok(())
     }
 
@@ -698,6 +712,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .schedule_manual_self_update(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
+        self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
 
@@ -707,7 +722,49 @@ impl ConvergenceSubject for AppRuntimeHarness {
     ) -> Result<(), SubjectError> {
         let group_id = self.active_group()?;
         self.apply_admin_set(action.client, &group_id, action.admins)
-            .await
+            .await?;
+        if let Some(pending) = action.pending {
+            self.record_accepted_publication(action.client, pending);
+        }
+        Ok(())
+    }
+
+    fn scenario_publication_already_accepted(&self, client: &str, publication: &str) -> bool {
+        self.accepted_publications
+            .get(client)
+            .is_some_and(|publications| publications.contains(publication))
+    }
+
+    fn poll_outbound(
+        &mut self,
+        _client: &str,
+    ) -> Result<Vec<SubjectOutboundArtifact>, SubjectError> {
+        // App commands publish before returning, so this adapter never has an
+        // unresolved transport-ready artifact for the scenario runner.
+        Ok(Vec::new())
+    }
+
+    async fn acknowledge_outbound(
+        &mut self,
+        client: &str,
+        publication: &str,
+        outcome: SubjectOutboundOutcome,
+    ) -> Result<(), SubjectError> {
+        if !self.scenario_publication_already_accepted(client, publication) {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "publication_not_found",
+                "the app runtime has no accepted publication with that label",
+            ));
+        }
+        if outcome != SubjectOutboundOutcome::Accepted {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "publication_rollback_rejected",
+                "an app-runtime publication already accepted by transport cannot be rolled back",
+            ));
+        }
+        Ok(())
     }
 
     async fn send_application(
