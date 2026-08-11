@@ -2262,22 +2262,27 @@ mod tests {
             .await
             .unwrap();
 
-        loop {
-            match timeout(Duration::from_secs(5), notifications.recv())
-                .await
-                .expect("the relay EOSE must arrive")
-                .expect("notification channel remains open")
-            {
-                RelayPoolNotification::Event { .. } => {
-                    panic!("failed signature verification must not emit a trusted event")
+        const RELAY_EOSE_TIMEOUT: Duration = Duration::from_secs(30);
+        timeout(RELAY_EOSE_TIMEOUT, async {
+            loop {
+                match notifications
+                    .recv()
+                    .await
+                    .expect("notification channel remains open")
+                {
+                    RelayPoolNotification::Event { .. } => {
+                        panic!("failed signature verification must not emit a trusted event")
+                    }
+                    RelayPoolNotification::Message {
+                        message: RelayMessage::EndOfStoredEvents(_),
+                        ..
+                    } => break,
+                    _ => {}
                 }
-                RelayPoolNotification::Message {
-                    message: RelayMessage::EndOfStoredEvents(_),
-                    ..
-                } => break,
-                _ => {}
             }
-        }
+        })
+        .await
+        .expect("the relay EOSE must arrive within the CI-safe timeout");
         assert_eq!(
             client.database().check_id(&event.id).await.unwrap(),
             DatabaseEventStatus::NotExistent,

@@ -305,8 +305,9 @@ The workflow lives at:
 .github/workflows/bindings.yaml
 ```
 
-It runs only when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
-`marmotkit-v0.9.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
+It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
+`marmotkit-v0.9.0`, builds both binding bundles, and creates the matching immutable GitHub Release. It can also be
+dispatched with a full commit SHA reachable from `master` to create an immutable iOS-only TestFlight snapshot.
 
 Create the tag:
 
@@ -320,10 +321,20 @@ For releases that should include the matching MDK source and WN Agent tracks, pr
 
 The release job creates these assets:
 
+- `MarmotKitFFI-<version>.xcframework.zip`
+- `MarmotKitFFI-<version>.xcframework.zip.sha256`
+- `MarmotKitFFI-<version>.xcframework.zip.swiftpm-checksum`
+- `MarmotKit-<version>.swift`
+- `marmotkit-ios-<version>.manifest.json`
+- `marmotkit-ios-<version>.checksums.txt`
 - `marmotkit-ios-<version>.zip`
 - `marmotkit-ios-<version>.zip.sha256`
 - `marmotkit-android-<version>.zip`
 - `marmotkit-android-<version>.zip.sha256`
+
+Snapshot assets use `snapshot-<full-sha>` in place of `<version>` and are published under the exact
+`marmotkit-snapshot-<full-sha>` release tag. The binary-only ZIP contains `MarmotKit.xcframework` at its archive root
+for SwiftPM. See `crates/marmot-uniffi/DISTRIBUTION.md` for URL and consumer examples.
 
 The iOS zip contains:
 
@@ -337,8 +348,10 @@ The Android zip contains:
 - `jniLibs/<abi>/libmarmot_uniffi.so` for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`
 - `manifest.json`
 
-Each manifest records the release tag, source commit, workspace version, `Cargo.lock` hash, Rust toolchain versions,
-and package contents. App repos should pin a tag and verify the `.sha256` file before vendoring the bundle.
+Each manifest records the release identifier, exact source commit, workflow builder commit, workspace version, `Cargo.lock` hash, Rust
+toolchain versions, enabled features, targets, deployment target, effective release profile, and artifact hashes. App
+repos must pin an exact tag, update generated Swift and binary references together, and verify the ordinary SHA-256
+and SwiftPM checksum. Existing release assets and snapshot tags are never overwritten.
 
 ## App Repo Consumption
 
@@ -412,15 +425,17 @@ git push origin wn-agent-v0.9.0
 
 If a release has already been consumed, create a new patch version instead.
 
-If the workflow succeeds but an uploaded asset is wrong, rerun the workflow from the same tag only when the source commit
-is correct and the failure was packaging-only. The release job uploads assets with `--clobber`, so a rerun can replace
-assets on the same GitHub Release.
+The MarmotKit release job uploads and verifies assets while the release is still a draft, then publishes it. A failed
+pre-publication run may be retried: the workflow deletes only its incomplete draft and starts again. If remote URL,
+size, digest, SwiftPM checksum, or consumer validation fails after publication, do not replace the immutable assets.
+Publish a new formal patch version or snapshot source SHA instead. Deleting an immutable release does not make its tag
+name reusable.
 
 ## Current Limits
 
 - The workspace is not published to crates.io.
 - The whole-workspace release is tag- and source-archive-based.
-- MarmotKit releases are zipped generated files, not SwiftPM or Maven packages.
+- MarmotKit does not publish a Swift package manifest or Maven package. Its binary-target ZIP is SwiftPM-compatible.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
 - The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the
   MarmotKit binding release.

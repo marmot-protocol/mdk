@@ -353,9 +353,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let failure = run(
             Invocation {
-                // The mock is a spawned shell process. Leave enough startup
-                // budget for this test to remain reliable under the full
-                // workspace nextest load.
+                // The mock child sleeps longer than this idle budget after the
+                // session line so CI load cannot race idle timeout with normal exit.
                 idle_timeout: Duration::from_secs(2),
                 ..mock_invocation(&dir, "idle")
             },

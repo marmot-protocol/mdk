@@ -2422,6 +2422,42 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
 }
 
 #[tokio::test]
+async fn refused_leave_releases_named_scenario_input_reservation() {
+    // A refused leave must release the id reserved by
+    // name_next_scenario_input; otherwise the next named action panics on the
+    // unconsumed-id assertion or inherits the failed leave's id.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("leave-refusal", vec![bob_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    // Alice is the sole admin, so the engine refuses her SelfRemove.
+    alice.name_next_scenario_input("refused-leave");
+    alice
+        .leave()
+        .await
+        .expect_err("sole admin self-remove must be refused");
+
+    // Naming the next action must not trip the unconsumed-id assertion, and
+    // the app send consumes the fresh reservation (proven by naming again).
+    alice.name_next_scenario_input("post-refusal-app");
+    alice.send_app(b"still alive".to_vec()).await;
+    alice.name_next_scenario_input("post-refusal-consumed");
+    alice.send_app(b"second".to_vec()).await;
+}
+
+#[tokio::test]
 async fn add_then_self_remove_via_harness() {
     // Alice creates with Bob and Carol; Bob, a non-admin, leaves; remaining
     // members may both publish SelfRemove-only commits, and convergence handles
@@ -2448,7 +2484,7 @@ async fn add_then_self_remove_via_harness() {
     carol.tick().await;
 
     // Bob (non-admin) leaves.
-    bob.leave().await;
+    bob.leave().await.expect("leave");
     bus.deliver_all();
     let alice_proposal_outcomes = alice.tick().await; // ingests proposal + auto-commits
     let carol_proposal_outcomes = carol.tick().await; // same: no deterministic election

@@ -1400,7 +1400,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
     async fn leave(&mut self, action_id: &str, client: &str) -> Result<(), SubjectError> {
         let client = self.client_mut(client)?;
         client.name_next_scenario_input(action_id);
-        client.leave().await;
+        client.leave().await.map_err(subject_engine_error)?;
         Ok(())
     }
 

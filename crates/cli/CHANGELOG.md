@@ -16,6 +16,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   until a causally newer chat message arrives, while a durable engine-to-app
   delivery outbox makes that first crossing chat recoverable after a crash and
   does not affect other locally deleted groups.
+- OpenCode harness idle-timeout regression test now keeps the mock child alive
+  past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.
@@ -35,6 +37,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Leave-proposal persistence now commits the signed proposal, durable leave
   request, and content-dedup marker atomically, so a storage failure cannot
   strand a same-epoch leave retry without a publishable proposal.
+- The Nostr SDK failed-signature regression test now observes EOSE under one
+  bounded CI-safe window, avoiding sharded CI flakes without weakening
+  failed-event non-emission and non-caching assertions.
 
 ## [0.9.11] - 2026-08-09
 

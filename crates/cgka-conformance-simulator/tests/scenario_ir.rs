@@ -283,6 +283,46 @@ async fn typoed_group_label_fails_closed_at_execution() {
 }
 
 #[tokio::test]
+async fn refused_admin_leave_fails_the_step_without_unwinding() {
+    // A sole admin may not self-remove (MIP-03 admin policy), so the engine
+    // refuses this leave. The refusal must surface as a failed scenario step
+    // in the report, not unwind the harness.
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/refused-admin-leave".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::InGroup {
+                group: "red".into(),
+                action: Box::new(ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "red".into(),
+                    invitees: vec![],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "red-create".into(),
+                }),
+            },
+            ScenarioStep::InGroup {
+                group: "red".into(),
+                action: Box::new(ScenarioStep::Leave {
+                    client: "alice".into(),
+                }),
+            },
+        ],
+    };
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("engine refusals are reported structurally");
+    assert!(report.step_log.iter().any(|step| matches!(
+        &step.status,
+        cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. }
+            if kind == "admin_policy"
+    )));
+}
+
+#[tokio::test]
 async fn wrapped_action_id_is_used_by_fault_selectors_and_the_runtime_ledger() {
     let in_group = |action| ScenarioStep::InGroup {
         group: "red".into(),

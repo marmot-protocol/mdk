@@ -323,7 +323,7 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
     bob.tick().await;
     carol.tick().await;
 
-    let proposal_msg = bob.leave_capture().await;
+    let proposal_msg = bob.leave_capture().await.expect("leave proposal");
     let proposal_msg = openmls_projection_message(&carol, &proposal_msg).await;
     assert_projected_kind(&proposal_msg, OpenMlsContentKind::Proposal, 1);
 
@@ -532,7 +532,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
     bob.tick().await;
     carol.tick().await;
 
-    let proposal_msg = bob.leave_capture().await;
+    let proposal_msg = bob.leave_capture().await.expect("leave proposal");
     let proposal_msg = openmls_projection_message(&carol, &proposal_msg).await;
     bus.deliver_all();
     let alice_outcomes = alice.tick().await;
