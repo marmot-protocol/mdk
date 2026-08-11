@@ -957,7 +957,7 @@ impl<S: StorageProvider> Engine<S> {
         // live-state clearing, that store, every Marmot post-check, the
         // discoverable group record, capability cache, and both durable
         // Welcome dispositions in one transaction.
-        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable) =
+        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) =
             self.storage.with_transaction(|storage| {
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                 // Match in the same order OpenMLS uses: the first Welcome
@@ -1004,6 +1004,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(EngineError::InvalidWelcome);
                 }
 
+                let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
                 let (local_state_is_stale, repaired_unrecoverable) =
                     match storage.get_group(&group_id) {
                         Ok(group) => {
@@ -1143,6 +1144,19 @@ impl<S: StorageProvider> Engine<S> {
                     // MLS copy. Frozen-pass membership belongs to the discarded
                     // copy and must not re-halt the repaired group.
                     storage.delete_convergence_pass(&group_id)?;
+                    // The pass is only half of that residue. Unresolved commits
+                    // retained below the replacement epoch were retained
+                    // against the discarded copy too, and an anchor-less one
+                    // steers every later pass's rewind target into
+                    // `MissingRetainedAnchor` — re-halting the group this
+                    // Welcome just repaired. The epoch bound is the new copy's
+                    // own authenticated epoch, never an inbound claim.
+                    superseded =
+                        crate::openmls_projection::retire_commits_superseded_by_replacement_welcome(
+                            storage,
+                            &group_id,
+                            mls_group.epoch().as_u64(),
+                        )?;
                 }
                 crate::capability_manager::cache_self_capabilities(
                     storage,
@@ -1196,6 +1210,7 @@ impl<S: StorageProvider> Engine<S> {
                     mls_group,
                     welcome_sender_id,
                     repaired_unrecoverable,
+                    superseded,
                 ))
             })?;
 
@@ -1206,6 +1221,20 @@ impl<S: StorageProvider> Engine<S> {
         {
             let joined_epoch = EpochId(mls_group.epoch().as_u64());
             self.index_transport_group_route(transport_group_id, &group_id, joined_epoch);
+        }
+
+        // The retirements are durable now. Record each one so a forensic reader
+        // can tell a commit the repair superseded from one that merely aged out
+        // below the retained anchor.
+        for (message_id, _source_epoch) in &superseded {
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::message_state_changed_event(
+                    hex::encode(message_id.as_slice()),
+                    MessageState::EpochInvalidated,
+                    "superseded_by_replacement_welcome",
+                ),
+            );
         }
 
         // 7. State machine: Stable at the post-welcome epoch.
