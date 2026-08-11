@@ -611,6 +611,87 @@ mod tests {
     }
 
     #[test]
+    fn canonical_timeline_order_migration_backfills_read_anchor_and_virtual_keys() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..44]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+                 VALUES ('aa', 'relay', 1)",
+                [],
+            )
+            .unwrap();
+        for (id, source_id, epoch, timeline_at, invalidation) in [
+            ("marker", Some("source-marker"), Some(8_i64), 150_i64, None),
+            ("pending", None, None, 999, None),
+            ("failed", None, None, 1_000, Some("local_publish_failed")),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message_timeline (
+                         group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
+                         direction, sender, plaintext, kind, tags_json, timeline_at,
+                         received_at, reactions_json, invalidation_status
+                     ) VALUES ('aa', ?1, ?2, ?3, 'received', 'sender', '', 9, '[]', ?4,
+                         ?4, '[]', ?5)",
+                    params![id, source_id, epoch, timeline_at, invalidation],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO conversation_read_state (
+                     group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                     initialized_at, updated_at
+                 ) VALUES ('aa', 'marker', 150, 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let read_anchor: (i64, i64) = connection
+            .query_row(
+                "SELECT last_read_order_class, last_read_order_primary
+                 FROM conversation_read_state WHERE group_id_hex = 'aa'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(read_anchor, (1, 8));
+        let keys = connection
+            .prepare(
+                "SELECT message_id_hex, timeline_order_class, timeline_order_primary,
+                        timeline_order_phase, timeline_order_at
+                 FROM message_timeline ORDER BY message_id_hex",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                ("failed".to_owned(), 0, 1_000, 1, 1_000),
+                ("marker".to_owned(), 1, 8, 1, 150),
+                ("pending".to_owned(), 2, 999, 1, 999),
+            ]
+        );
+    }
+
+    #[test]
     fn media_secret_reference_migration_backfills_known_rows_conservatively() {
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
         connection

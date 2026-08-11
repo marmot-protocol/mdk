@@ -354,12 +354,16 @@ fn timeline_ids(page: &TimelinePage) -> Vec<String> {
 /// pagination/refresh call issued.
 #[derive(Clone, Default)]
 struct ScriptedTimelineStore {
-    responses: Arc<StdMutex<std::collections::VecDeque<TimelinePage>>>,
+    responses: Arc<StdMutex<std::collections::VecDeque<Result<TimelinePage, AppError>>>>,
     queries: Arc<StdMutex<Vec<TimelineMessageQuery>>>,
 }
 
 impl ScriptedTimelineStore {
     fn new(responses: Vec<TimelinePage>) -> Self {
+        Self::new_results(responses.into_iter().map(Ok).collect())
+    }
+
+    fn new_results(responses: Vec<Result<TimelinePage, AppError>>) -> Self {
         Self {
             responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
             queries: Arc::new(StdMutex::new(Vec::new())),
@@ -371,12 +375,11 @@ impl ScriptedTimelineStore {
         let queries = self.queries.clone();
         Arc::new(move |query: TimelineMessageQuery| {
             queries.lock().expect("queries lock").push(query);
-            let page = responses
+            responses
                 .lock()
                 .expect("responses lock")
                 .pop_front()
-                .expect("scripted timeline store exhausted");
-            Ok(page)
+                .expect("scripted timeline store exhausted")
         })
     }
 
@@ -925,6 +928,38 @@ async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
 }
 
 #[tokio::test]
+async fn pagination_refreshes_head_when_canonical_cursor_was_pruned() {
+    let store = ScriptedTimelineStore::new_results(vec![
+        Err(AppError::Storage(
+            cgka_traits::storage::StorageError::TimelineCursorExpired,
+        )),
+        Ok(timeline_test_page(&[("x", 40), ("y", 50)], true, false)),
+    ]);
+    let handle = timeline_window_handle(
+        &store,
+        timeline_test_page(&[("a", 10), ("b", 20)], true, true),
+        300,
+    );
+
+    let page = handle
+        .paginate_backwards(2)
+        .await
+        .expect("expired cursor refreshes the window");
+
+    assert_eq!(timeline_ids(&page), vec!["x", "y"]);
+    let queries = store.recorded_queries();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].pagination.before, Some(10));
+    assert_eq!(
+        queries[0].pagination.before_message_id.as_deref(),
+        Some("a")
+    );
+    assert_eq!(queries[1].pagination.before, None);
+    assert_eq!(queries[1].pagination.after, None);
+    assert_eq!(queries[1].pagination.limit, Some(2));
+}
+
+#[tokio::test]
 async fn refresh_install_is_dropped_when_window_paginated_during_query() {
     // Deterministic model of the P1(b) race: a refresh captures the window
     // generation before its store read; a pagination completes during that
@@ -943,7 +978,7 @@ async fn refresh_install_is_dropped_when_window_paginated_during_query() {
 
     // recv() captures the refresh request (a generation snapshot) before
     // awaiting the store.
-    let (_query_fn, _query, generation) = handle.refresh_request();
+    let (_query_fn, _query, _head_query, generation) = handle.refresh_request();
 
     // A concurrent pagination lands while the refresh query is "in flight".
     let paginated = handle.paginate_backwards(2).await.expect("paginate");

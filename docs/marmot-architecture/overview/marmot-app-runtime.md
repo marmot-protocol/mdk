@@ -110,8 +110,9 @@ add the incremental, bounded, non-blocking, single-source properties around it s
      break remaining ties. Group pagination resolves a retained cursor by `(group_id_hex, message_id_hex)` to recover
      that canonical key; if the row was pruned, the caller must refresh instead of applying a wall-clock predicate to
      canonical order. `TIMELINE_WALL_ORDER_BY_ASC/_DESC` = `(timeline_at, message_id_hex)` remains the order for
-     cross-group queries and retention scans, where epochs are not comparable. The replay cursor MUST NOT be applied
-     to either timeline order.
+     cross-group queries and retention scans. Cross-group queries use wall-clock order because epochs are not
+     comparable; retention scans use it for time-based expiry. The replay cursor MUST NOT be applied to either
+     timeline order.
 2. **Runtime recovery** (`marmot-app` runtime). The lag-recovery watermark capture and `recovery_row_is_pre_subscription`
    suppression are the SAME `AppEventReplayCursor` the recovery query orders by, so the suppression boundary can never
    drift from the query order. Lag replay reads a bounded window (broadcast-depth/watermark-keyed), never the full

@@ -979,6 +979,130 @@ fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
 }
 
 #[test]
+fn read_marker_follows_pending_send_into_authenticated_history() {
+    let store = setup_store();
+    let mut pending = chat("pending", LOCAL, 500, "optimistic send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    pending.source_message_id_hex = Some("source-pending".to_owned());
+    pending.source_epoch = Some(7);
+    store.record_app_event(&pending).unwrap();
+
+    let mut incoming = chat("incoming", REMOTE, 100, "newer authenticated message");
+    incoming.source_epoch = Some(8);
+    store.record_app_event(&incoming).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("pending"));
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("incoming"));
+}
+
+#[test]
+fn failed_pending_read_marker_does_not_hide_authenticated_history() {
+    let store = setup_store();
+    let mut pending = chat("pending", LOCAL, 500, "optimistic send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    store
+        .invalidate_app_event_by_message_id(GROUP, "pending", "local_publish_failed")
+        .unwrap();
+    let mut incoming = chat("incoming", REMOTE, 100, "authenticated message");
+    incoming.source_epoch = Some(8);
+    store.record_app_event(&incoming).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("pending"));
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("incoming"));
+}
+
+#[test]
+fn pruned_read_marker_keeps_canonical_epoch_anchor() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let mut marker = chat("marker", REMOTE, 150, "newer epoch");
+    marker.source_epoch = Some(8);
+    store.record_app_event(&marker).unwrap();
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "marker", &no_mentions)
+        .unwrap();
+
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "DELETE FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![GROUP, "marker"],
+        )
+        .unwrap();
+    }
+
+    let mut late_older = chat("late-older", REMOTE, 900, "older epoch");
+    late_older.source_epoch = Some(7);
+    store.record_app_event(&late_older).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("marker"));
+
+    let row = store
+        .mark_timeline_message_read(LOCAL, GROUP, "late-older", &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("marker"));
+    assert_eq!(row.last_read_timeline_at, Some(150));
+}
+
+#[test]
+fn failed_local_send_does_not_replace_delivered_chat_preview() {
+    let store = setup_store();
+    let mut failed = chat("failed", LOCAL, 300, "did not reach the group");
+    failed.source_message_id_hex = None;
+    store.record_app_event(&failed).unwrap();
+    store
+        .invalidate_app_event_by_message_id(GROUP, "failed", "local_publish_failed")
+        .unwrap();
+
+    let mut delivered = chat("delivered", REMOTE, 150, "accepted history");
+    delivered.source_epoch = Some(8);
+    store.record_app_event(&delivered).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        row.last_message
+            .as_ref()
+            .map(|message| message.message_id_hex.as_str()),
+        Some("delivered")
+    );
+}
+
+#[test]
 fn secure_prune_keeps_chat_preview_on_canonical_latest_epoch() {
     let store = setup_store();
     let mut pruned = chat("pruned", REMOTE, 10, "old");

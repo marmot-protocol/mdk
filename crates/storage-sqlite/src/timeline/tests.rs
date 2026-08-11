@@ -726,6 +726,91 @@ fn group_timeline_order_is_stable_across_delayed_system_projection() {
 }
 
 #[test]
+fn virtual_order_columns_match_the_rust_canonical_key() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut legacy = chat("legacy", "alice", 400, "legacy");
+    legacy.source_epoch = None;
+    store.record_app_event(&legacy).unwrap();
+
+    let mut pending = chat("pending", "local", 500, "pending");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    pending.direction = "sent".to_owned();
+    store.record_app_event(&pending).unwrap();
+
+    let mut system = group_system("system", "member_added", 900);
+    system.source_epoch = Some(7);
+    store.record_app_event(&system).unwrap();
+
+    let mut authenticated = chat("authenticated", "bob", 300, "authenticated");
+    authenticated.source_epoch = Some(7);
+    store.record_app_event(&authenticated).unwrap();
+
+    let expected = [&legacy, &pending, &system, &authenticated]
+        .into_iter()
+        .map(|event| {
+            let key = canonical_timeline_order_key(
+                event.source_message_id_hex.as_deref(),
+                event.source_epoch,
+                None,
+                event.kind,
+                event.recorded_at,
+                &event.message_id_hex,
+            );
+            (
+                event.message_id_hex.clone(),
+                i64::from(key.0),
+                i64::try_from(key.1).unwrap(),
+                i64::from(key.2),
+                i64::try_from(key.3).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let conn = store.lock().unwrap();
+    let actual = conn
+        .prepare(
+            "SELECT message_id_hex, timeline_order_class, timeline_order_primary,
+                    timeline_order_phase, timeline_order_at
+             FROM message_timeline
+             ORDER BY message_id_hex",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut expected = expected;
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(actual, expected);
+
+    conn.execute(
+        "UPDATE message_timeline
+         SET invalidation_status = 'local_publish_failed'
+         WHERE message_id_hex = 'pending'",
+        [],
+    )
+    .unwrap();
+    let failed_class: i64 = conn
+        .query_row(
+            "SELECT timeline_order_class FROM message_timeline
+             WHERE message_id_hex = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_class, 0);
+}
+
+#[test]
 fn authenticated_kind_1210_message_does_not_establish_an_epoch_boundary() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let mut chat = chat("chat", "alice", 100, "before explicit system message");
@@ -844,11 +929,7 @@ fn group_timeline_pagination_rejects_missing_canonical_cursor() {
         ..TimelineMessageQuery::default()
     });
 
-    assert!(matches!(
-        result,
-        Err(StorageError::Backend(message))
-            if message == "group timeline cursor no longer exists; refresh the timeline"
-    ));
+    assert!(matches!(result, Err(StorageError::TimelineCursorExpired)));
 }
 
 #[test]

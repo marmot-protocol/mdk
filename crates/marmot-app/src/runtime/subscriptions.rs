@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
-use cgka_traits::{GroupId, MessageId};
+use cgka_traits::{GroupId, MessageId, storage::StorageError};
 use serde::{Deserialize, Serialize};
 use storage_sqlite::AppEventReplayCursor;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -126,6 +126,15 @@ impl TimelineWindow {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    fn head_refresh_query(&self) -> TimelineMessageQuery {
+        let mut query = self.base_query.clone();
+        query.pagination = TimelinePagination {
+            limit: Some(self.page.messages.len().max(1)),
+            ..TimelinePagination::default()
+        };
+        query
+    }
+
     /// Cursor query that re-materializes the current window from the store.
     /// Anchored windows refresh the head; detached (scrolled-back) windows
     /// refresh the loaded range ending at the current newest message so the
@@ -133,13 +142,14 @@ impl TimelineWindow {
     /// Because the window is capped at the store's single-query limit, one query
     /// always reconstitutes it.
     pub(crate) fn refresh_query(&self) -> TimelineMessageQuery {
-        let mut query = self.base_query.clone();
+        let mut query = self.head_refresh_query();
         let limit = self.page.messages.len().max(1);
         query.pagination = match self.page.messages.last() {
             // Detached: re-fetch the loaded range ending exactly at the newest
-            // message using an *inclusive* upper-bound cursor. The store applies
-            // the descending `LIMIT` against the row-resolved canonical key, so
-            // newer rows are excluded at the SQL level and can't starve the
+            // message using an *inclusive* upper-bound cursor. Group queries
+            // apply the descending `LIMIT` against the row-resolved canonical
+            // key; global queries use the wall-clock timestamp/message-id key.
+            // Either order excludes newer rows in SQL so they cannot starve the
             // window — no post-fetch trimming required.
             Some(newest) if !self.anchored_to_head() => TimelinePagination {
                 before: Some(newest.timeline_at),
@@ -149,12 +159,25 @@ impl TimelineWindow {
                 ..TimelinePagination::default()
             },
             // Anchored or empty: refresh the head.
-            _ => TimelinePagination {
-                limit: Some(limit),
-                ..TimelinePagination::default()
-            },
+            _ => query.pagination,
         };
         query
+    }
+}
+
+async fn query_timeline_page_with_cursor_refresh(
+    query_fn: Arc<TimelineQueryFn>,
+    query: TimelineMessageQuery,
+    head_query: TimelineMessageQuery,
+) -> Result<(TimelinePage, bool), AppError> {
+    let first_query_fn = query_fn.clone();
+    match blocking_app_task(move || first_query_fn(query)).await {
+        Ok(page) => Ok((page, false)),
+        Err(AppError::Storage(StorageError::TimelineCursorExpired)) => {
+            let page = blocking_app_task(move || query_fn(head_query)).await?;
+            Ok((page, true))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -186,7 +209,7 @@ impl TimelineWindowHandle {
     /// return the updated window. A no-op (returns the current window) when no
     /// older messages exist. The store read runs off the caller thread.
     pub async fn paginate_backwards(&self, count: usize) -> Result<TimelinePage, AppError> {
-        let (query_fn, query) = {
+        let (query_fn, query, head_query, generation) = {
             let window = self.lock();
             if !window.page.has_more_before {
                 return Ok(window.page.clone());
@@ -201,9 +224,18 @@ impl TimelineWindowHandle {
                 limit: Some(count),
                 ..TimelinePagination::default()
             };
-            (window.query.clone(), query)
+            (
+                window.query.clone(),
+                query,
+                window.head_refresh_query(),
+                window.generation,
+            )
         };
-        let older = blocking_app_task(move || query_fn(query)).await?;
+        let (older, refreshed) =
+            query_timeline_page_with_cursor_refresh(query_fn, query, head_query).await?;
+        if refreshed {
+            return Ok(self.install_refresh(older, generation));
+        }
         let mut window = self.lock();
         let limit = window.window_limit;
         let canonical_group_order = window.base_query.group_id_hex.is_some();
@@ -223,7 +255,7 @@ impl TimelineWindowHandle {
     /// window already includes the head. Reaching the head re-anchors the
     /// window (`has_more_after` becomes false).
     pub async fn paginate_forwards(&self, count: usize) -> Result<TimelinePage, AppError> {
-        let (query_fn, query) = {
+        let (query_fn, query, head_query, generation) = {
             let window = self.lock();
             if !window.page.has_more_after {
                 return Ok(window.page.clone());
@@ -238,9 +270,18 @@ impl TimelineWindowHandle {
                 limit: Some(count),
                 ..TimelinePagination::default()
             };
-            (window.query.clone(), query)
+            (
+                window.query.clone(),
+                query,
+                window.head_refresh_query(),
+                window.generation,
+            )
         };
-        let newer = blocking_app_task(move || query_fn(query)).await?;
+        let (newer, refreshed) =
+            query_timeline_page_with_cursor_refresh(query_fn, query, head_query).await?;
+        if refreshed {
+            return Ok(self.install_refresh(newer, generation));
+        }
         let mut window = self.lock();
         let limit = window.window_limit;
         let canonical_group_order = window.base_query.group_id_hex.is_some();
@@ -266,11 +307,19 @@ impl TimelineWindowHandle {
 
     /// Read the store handle, the refresh cursor, and the window generation the
     /// refresh is based on (so a stale install can be detected).
-    pub(crate) fn refresh_request(&self) -> (Arc<TimelineQueryFn>, TimelineMessageQuery, u64) {
+    pub(crate) fn refresh_request(
+        &self,
+    ) -> (
+        Arc<TimelineQueryFn>,
+        TimelineMessageQuery,
+        TimelineMessageQuery,
+        u64,
+    ) {
         let window = self.lock();
         (
             window.query.clone(),
             window.refresh_query(),
+            window.head_refresh_query(),
             window.generation,
         )
     }
@@ -343,9 +392,10 @@ impl RuntimeTimelineMessagesSubscription {
                     return Some(RuntimeTimelineMessageUpdate::Projection(*update));
                 }
                 TimelineSubscriptionSignal::Refresh => {
-                    let (query_fn, query, generation) = self.window.refresh_request();
-                    match blocking_app_task(move || query_fn(query)).await {
-                        Ok(page) => {
+                    let (query_fn, query, head_query, generation) = self.window.refresh_request();
+                    match query_timeline_page_with_cursor_refresh(query_fn, query, head_query).await
+                    {
+                        Ok((page, _)) => {
                             let page = self.window.install_refresh(page, generation);
                             return Some(RuntimeTimelineMessageUpdate::Page { page });
                         }
