@@ -9,6 +9,9 @@ package that shared surface:
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
   `jniLibs` shared libraries.
 
+See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable SwiftPM binary artifacts, exact release and snapshot URLs,
+checksums, provenance, and the generated Swift synchronization rule.
+
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
 
