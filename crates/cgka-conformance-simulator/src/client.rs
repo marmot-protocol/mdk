@@ -503,6 +503,21 @@ fn key_package_with_harness_source(key_package: KeyPackage) -> KeyPackage {
     .with_protocol_profile(protocol_profile)
 }
 
+/// Stable variant name for unexpected-result errors. Debug-formatting a
+/// [`SendResult`] would embed transport payload bytes in the error string.
+fn send_result_kind(res: &SendResult) -> &'static str {
+    match res {
+        SendResult::NoChange { .. } => "NoChange",
+        SendResult::DisbandRequested { .. } => "DisbandRequested",
+        SendResult::ApplicationMessage { .. } => "ApplicationMessage",
+        SendResult::Queued { .. } => "Queued",
+        SendResult::Proposal { .. } => "Proposal",
+        SendResult::GroupEvolution { .. } => "GroupEvolution",
+        SendResult::GroupCreated { .. } => "GroupCreated",
+        SendResult::FoundingGroupCreated { .. } => "FoundingGroupCreated",
+    }
+}
+
 #[derive(Clone)]
 struct NostrAccountIdentityProofSigner {
     keys: nostr::Keys,
@@ -1366,11 +1381,24 @@ impl HarnessClient {
     }
 
     /// Send a SelfRemove proposal and return the wrapped transport message.
+    ///
+    /// A refused leave releases any id reserved via
+    /// [`Self::name_next_scenario_input`]; only a sent proposal consumes it,
+    /// so the next named action neither trips the unconsumed-id assertion nor
+    /// inherits the failed leave's id.
     pub async fn leave_capture(&mut self) -> Result<TransportMessage, EngineError> {
+        let result = self.leave_capture_inner().await;
+        if result.is_err() {
+            self.next_scenario_input_id = None;
+        }
+        result
+    }
+
+    async fn leave_capture_inner(&mut self) -> Result<TransportMessage, EngineError> {
         let gid = self
             .default_group
             .clone()
-            .ok_or_else(|| EngineError::Other("leave without a default group".into()))?;
+            .ok_or_else(|| EngineError::Other("must create or join a group first".into()))?;
         let res = self
             .engine_mut()
             .send(SendIntent::Leave {
@@ -1391,7 +1419,8 @@ impl HarnessClient {
             Ok(routed)
         } else {
             Err(EngineError::Other(format!(
-                "expected Proposal, got {res:?}"
+                "expected Proposal, got {}",
+                send_result_kind(&res)
             )))
         }
     }
