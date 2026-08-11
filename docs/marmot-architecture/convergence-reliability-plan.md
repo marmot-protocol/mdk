@@ -996,14 +996,19 @@ through app-runtime, process, retained-history, or distributed execution. Milest
 equivalence and cryptographic interoperability as first-class campaign properties rather than assuming that either the
 engine repair or scaling the existing corpus is sufficient.
 
+Status update (2026-08, option C route unification): the pairwise fork-recovery route has since been deleted — every
+member adjudicates a same-epoch rival through distributed convergence, so the specific committer-versus-observer
+asymmetry above no longer exists structurally. The 6.1 items below remain the assurance program for the routes that
+still exist (ordinary ingest, stored convergence, retained-history replay, crash/restart recovery).
+
 ### 6.1 Decision-route assurance closure
 
 - [x] Inventory every production path that selects, rejects, defers, invalidates, replays, or applies a competing
   commit, and map each site to the adopted canonical rule, reference-model transition, mutation sentinel, and campaign
   family that exercises it.
 - [ ] Define and test route equivalence: for the same authenticated dependency-closed input set, the final canonical
-  result does not depend on whether input first passes through pairwise fork recovery, ordinary ingest, stored
-  convergence, retained-history replay, or crash/restart recovery.
+  result does not depend on whether input first passes through ordinary ingest, stored convergence,
+  retained-history replay, or crash/restart recovery.
 - [ ] Promote the same-source-epoch cross-route topology exposed during #1236 and repaired at engine level by #1285
   into a permanent synthetic regression family with at least four participants, simultaneous same-source-epoch
   committers, committer-versus-observer routing, ordering-key-versus-depth disagreement, branch growth, application

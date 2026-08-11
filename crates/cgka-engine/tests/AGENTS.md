@@ -46,7 +46,8 @@ backend on the same rail.
   - **Owns:** Phase 4.6/4.7 + 5.4 — `feature_status`, capability cache, capability matrix
 
 - **File:** `fork_detection.rs`
-  - **Owns:** Phase 4.5 — deterministic same-epoch fork recovery plus the unrecoverable `ForkedEpoch` boundary
+  - **Owns:** same-epoch fork resolution through the unified distributed-convergence route (committer, observer,
+    and restarted-committer shapes) plus the missing-anchor fail-closed halt
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, and retained-anchor behavior
@@ -109,7 +110,7 @@ cargo test -p cgka-engine
 
 - **File:** `canonical_scenarios.rs`
   - **Owns:** Scripted + portable harness scenarios: 3-client happy path, welcome-before-commit, SelfRemove convergence,
-    deliberate fork with recovery observation, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family
+    deliberate fork with convergence resolution, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family
     reports
 
 - **File:** `proptest_invariants.rs`
@@ -185,6 +186,6 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
 Testing engine behavior requires an `Engine<S>` instance which requires a storage backend, so engine-behavior assertions
 go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless the test explicitly needs
 encrypted file-backed persistence. The exceptions are `src/identity.rs`, `src/engine_metrics.rs`, `src/epoch_manager.rs`,
-`src/fork_recovery.rs`, `src/app_components.rs`, `src/canonicalization.rs`, and `src/group_state_changes.rs`, which carry
+`src/app_components.rs`, `src/canonicalization.rs`, and `src/group_state_changes.rs`, which carry
 small in-crate `#[cfg(test)]` modules for pure-data logic (state transitions, diff helpers, policy ordering) that needs
 no `Engine` instance.
