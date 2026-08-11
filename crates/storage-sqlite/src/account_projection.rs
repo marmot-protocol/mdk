@@ -5,6 +5,7 @@ use crate::{
     tags_from_json, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::types::MessageId;
 use rusqlite::{
     Connection, OptionalExtension, TransactionBehavior, params, params_from_iter,
     types::{Type, Value},
@@ -549,8 +550,9 @@ impl SqliteAccountStorage {
     ///   sighting is old. It only narrows cross-restart redelivery;
     ///   engine-level dedup stays the authoritative duplicate guard.
     /// - Group and component rows are snapshot-replaced (last writer wins),
-    ///   except a group row remains while it owns an unsent draft so pruning
-    ///   re-derivable metadata cannot cascade-delete user-authored content.
+    ///   except that a durable local-deletion frontier wins over stale snapshot
+    ///   writers, and a group row remains while it owns an unsent draft so
+    ///   pruning re-derivable metadata cannot cascade-delete user-authored content.
     ///   Consequently, a stale draft-owning group remains visible in the
     ///   projection/chat list until its draft is removed and a later save can
     ///   prune the group. Full multi-writer reconciliation is an explicit
@@ -620,9 +622,20 @@ impl SqliteAccountStorage {
             )
             .storage()?;
 
+            let locally_deleted_group_ids = {
+                let mut statement = conn
+                    .prepare("SELECT group_id_hex FROM local_group_deletion_frontiers")
+                    .storage()?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .storage()?
+                    .collect::<Result<std::collections::HashSet<_>, _>>()
+                    .storage()?
+            };
             let retained_group_ids = state
                 .groups
                 .iter()
+                .filter(|group| !locally_deleted_group_ids.contains(&group.group_id_hex))
                 .map(|group| group.group_id_hex.as_str())
                 .collect::<std::collections::HashSet<_>>();
             // Draft text and attachment plaintext are user-authored durable data,
@@ -646,7 +659,11 @@ impl SqliteAccountStorage {
                 &retained_group_ids,
             )?;
 
-            for group in &state.groups {
+            for group in state
+                .groups
+                .iter()
+                .filter(|group| !locally_deleted_group_ids.contains(&group.group_id_hex))
+            {
                 let group_was_new = !conn
                     .query_row(
                         "SELECT EXISTS(
@@ -770,16 +787,17 @@ impl SqliteAccountStorage {
     /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
     /// because protocol/MLS state is intentionally retained; without it that
     /// state could immediately rederive wiped key bytes. `seen_events` and
-    /// protocol/MLS tables are left intact for active groups so old relay
-    /// deliveries stay suppressed while a future fresh group message can
-    /// re-create the app projection. A terminal group is different: its live
-    /// MLS state is already erased, so this transaction also removes the full
-    /// `cgka_groups` row and retains only `cgka_disband_tombstones` as the
-    /// permanent anti-resurrection guard. The logical wipe and a durable WAL
-    /// checkpoint intent commit together under `secure_delete = ON`. If
-    /// `wal_checkpoint(TRUNCATE)` is blocked by a reader, the committed result
-    /// is returned with `erasure_pending`; a retry recovers the accumulated
-    /// result from the intent and attempts truncation again.
+    /// protocol/MLS tables are left intact for active groups. A durable local
+    /// deletion frontier distinguishes the intentionally absent projection from
+    /// a torn write, suppressing historical relay replay while allowing a
+    /// causally newer chat message to re-create it. A terminal group is
+    /// different: its live MLS state is already erased, so this transaction also
+    /// removes the full `cgka_groups` row and retains only
+    /// `cgka_disband_tombstones` as the permanent anti-resurrection guard. The
+    /// logical wipe and a durable WAL checkpoint intent commit together under
+    /// `secure_delete = ON`. If `wal_checkpoint(TRUNCATE)` is blocked by a reader,
+    /// the committed result is returned with `erasure_pending`; a retry recovers
+    /// the accumulated result from the intent and attempts truncation again.
     pub fn delete_local_group_data(
         &self,
         group_id_hex: &str,
@@ -826,17 +844,41 @@ impl SqliteAccountStorage {
                         .storage()?,
                     );
                 }
-                let terminal = tx
+                let (terminal, active, message_insert_order) = tx
                     .query_row(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?1
-                         )",
+                        "SELECT
+                            EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?1),
+                            EXISTS(SELECT 1 FROM cgka_groups WHERE id = ?1),
+                            COALESCE(
+                                (SELECT MAX(insert_order) FROM cgka_messages WHERE group_id = ?1),
+                                0
+                            )",
                         params![&group_id],
-                        |row| row.get::<_, i64>(0),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)? != 0,
+                                row.get::<_, i64>(1)? != 0,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
                     )
-                    .storage()?
-                    != 0;
+                    .storage()?;
+                if active && !terminal {
+                    tx.execute(
+                        "INSERT INTO local_group_deletion_frontiers (
+                            group_id_hex, message_insert_order
+                         ) VALUES (?1, ?2)
+                         ON CONFLICT(group_id_hex) DO NOTHING",
+                        params![hex::encode(&group_id), message_insert_order],
+                    )
+                    .storage()?;
+                }
                 if terminal {
+                    tx.execute(
+                        "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
+                        params![hex::encode(&group_id)],
+                    )
+                    .storage()?;
                     deleted = deleted.saturating_add(
                         tx.execute("DELETE FROM cgka_groups WHERE id = ?1", params![&group_id])
                             .storage()?,
@@ -852,11 +894,29 @@ impl SqliteAccountStorage {
             combine_secure_delete_operation_and_restore(delete_result, restore)
         })?;
 
-        let finish = finish_secure_delete_checkpoint_intent::<DeleteLocalGroupDataResult>(
+        let finish = match finish_secure_delete_checkpoint_intent::<DeleteLocalGroupDataResult>(
             self,
             SECURE_DELETE_LOCAL_GROUP_OPERATION,
             group_id_hex,
-        )?;
+        ) {
+            Ok(finish) => finish,
+            Err(_) => {
+                // The logical deletion and its checkpoint intent committed before
+                // this best-effort finish step. Report that committed outcome and
+                // leave the durable intent for a later retry instead of inviting
+                // the caller to restore projection state that was already erased.
+                tracing::warn!(
+                    target: "storage_sqlite::account_projection",
+                    method = "delete_local_group_data",
+                    "secure-delete checkpoint cleanup remains pending after committed local deletion"
+                );
+                return Ok(DeleteLocalGroupDataResult {
+                    deleted_rows: newly_deleted,
+                    completed_pending_checkpoint: false,
+                    erasure_pending: true,
+                });
+            }
+        };
         match finish.result {
             Some(mut result) => {
                 result.completed_pending_checkpoint =
@@ -874,6 +934,70 @@ impl SqliteAccountStorage {
                 erasure_pending: false,
             }),
         }
+    }
+
+    /// Return the durable message-ingress frontier recorded by a deliberate
+    /// local group deletion. Its presence distinguishes an intentionally absent
+    /// app projection from a torn projection write while the MLS group remains
+    /// live, without trusting a remote sender's timestamp.
+    pub fn local_group_deletion_frontier(&self, group_id_hex: &str) -> StorageResult<Option<u64>> {
+        self.lock()?
+            .query_row(
+                "SELECT message_insert_order
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StorageError::Serialization("negative local group deletion frontier".to_owned())
+                })
+            })
+            .transpose()
+    }
+
+    /// Clear a local-delete marker only when `message_id` belongs to this group
+    /// and was durably inserted after the deletion frontier. Exact or rewrapped
+    /// historical replay resolves to an older existing row and stays suppressed.
+    pub fn clear_local_group_deletion_frontier_if_message_is_newer(
+        &self,
+        group_id_hex: &str,
+        message_id: &MessageId,
+    ) -> StorageResult<bool> {
+        let group_id = hex::decode(group_id_hex).map_err(|error| {
+            StorageError::Serialization(format!("invalid local group id: {error}"))
+        })?;
+        Ok(self
+            .lock()?
+            .execute(
+                "DELETE FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = ?1
+                   AND message_insert_order < (
+                       SELECT insert_order
+                       FROM cgka_messages
+                       WHERE id = ?2 AND group_id = ?3
+                   )",
+                params![group_id_hex, message_id.as_slice(), group_id],
+            )
+            .storage()?
+            > 0)
+    }
+
+    /// Remove a local-delete marker once the protocol group reaches a terminal
+    /// state. Terminal engine state is the anti-resurrection authority, so the
+    /// app-only marker no longer serves a purpose.
+    pub fn clear_local_group_deletion_frontier(&self, group_id_hex: &str) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute(
+                "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
+                params![group_id_hex],
+            )
+            .storage()?
+            > 0)
     }
 
     /// Record the local account's own membership in `group_id_hex` so the
@@ -2356,9 +2480,25 @@ fn combine_secure_delete_operation_and_restore<T>(
     operation: StorageResult<T>,
     restore: StorageResult<()>,
 ) -> StorageResult<T> {
-    match (operation, restore) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) | (Err(error), Err(_)) => Err(error),
+    match operation {
+        Ok(value) => {
+            if restore.is_err() {
+                // The transaction has already committed. Leaving secure_delete
+                // enabled on this connection is fail-safe; surfacing an error
+                // here would falsely tell callers that the deletion did not
+                // happen and could make them restore stale projection state.
+                tracing::warn!(
+                    target: "storage_sqlite::account_projection",
+                    method = "combine_secure_delete_operation_and_restore",
+                    "secure-delete pragma restoration failed after committed operation"
+                );
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = restore;
+            Err(error)
+        }
     }
 }
 

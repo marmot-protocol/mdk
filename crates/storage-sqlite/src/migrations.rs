@@ -84,6 +84,8 @@ mod migration_0041_secure_delete_checkpoint_intents;
 mod migration_0042_group_state_checkpoints;
 #[path = "migrations/0043_transport_group_routes.rs"]
 mod migration_0043_transport_group_routes;
+#[path = "migrations/0044_local_group_deletion_frontiers.rs"]
+mod migration_0044_local_group_deletion_frontiers;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -311,6 +313,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0043_transport_group_routes",
         apply: migration_0043_transport_group_routes::apply,
     },
+    Migration {
+        version: 44,
+        name: "0044_local_group_deletion_frontiers",
+        apply: migration_0044_local_group_deletion_frontiers::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -537,6 +544,41 @@ mod tests {
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn local_group_deletion_frontier_migration_preserves_absent_live_groups() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..43]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, ?2)",
+                params![&[0xaa_u8], &[0_u8]],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 0, 0, ?3)",
+                params![&[1_u8], &[0xaa_u8], &[0_u8]],
+            )
+            .unwrap();
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let frontier: i64 = connection
+            .query_row(
+                "SELECT message_insert_order
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frontier, 1);
     }
 
     #[test]

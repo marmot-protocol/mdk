@@ -253,6 +253,14 @@ fn app_payload_for(sender: &AccountDeviceSession, payload: impl AsRef<[u8]>) -> 
     .expect("test app event encodes")
 }
 
+fn only_received_message_id(events: &[GroupEvent]) -> MessageId {
+    let [GroupEvent::MessageReceived { message_id, .. }] = events else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
+    message_id.clone()
+}
+
 #[tokio::test]
 async fn session_reopens_encrypted_sqlite_group_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -362,10 +370,12 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
         other => panic!("expected invitee application publish work, got {other:?}"),
     };
     let received = alice.ingest(message).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id.clone(),
+            message_id,
             epoch: EpochId(1),
             sender: bob.self_id(),
             payload: app_payload_for(&bob, b"invitee first message"),
@@ -435,8 +445,8 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
-
     let received = bob.ingest(app_msg).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
     assert_eq!(
         received.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
@@ -445,6 +455,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id,
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello through session"),
@@ -498,8 +509,8 @@ async fn reopened_creator_can_send_valid_group_messages() {
         PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
-
     let received = bob.ingest(app_msg).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
     assert_eq!(
         received.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
@@ -508,6 +519,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id,
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello after restart"),

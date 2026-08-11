@@ -5,6 +5,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
     QUOTE_REF_TAG, STREAM_TAG,
 };
+use cgka_traits::types::MessageId;
 
 /// Test twin of the app layer's transport-cursor future-skew policy (five
 /// minutes). The storage layer treats it as an injected bound, so any value
@@ -13,6 +14,17 @@ const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
+}
+
+#[test]
+fn secure_delete_restore_failure_preserves_committed_outcome() {
+    let result = combine_secure_delete_operation_and_restore::<usize>(
+        Ok(7),
+        Err(StorageError::Backend("injected restore failure".to_owned())),
+    )
+    .unwrap();
+
+    assert_eq!(result, 7);
 }
 
 #[test]
@@ -2217,6 +2229,16 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
     insert_read_and_chat_rows(&store, "aa");
     insert_protocol_group_marker(&store, &[0xaa]);
+    let historical_message_id = MessageId::new(vec![1]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![historical_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
     let registration = AccountPushRegistration {
         account_label: "alice".to_owned(),
         account_id_hex: "11".repeat(32),
@@ -2236,6 +2258,56 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
 
     assert!(store.delete_local_group_data("aa").unwrap().did_delete());
+    let deletion_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    assert!(
+        !store
+            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &historical_message_id,)
+            .unwrap(),
+        "historical replay already inside the deletion frontier must stay suppressed"
+    );
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(deletion_frontier)
+    );
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    let after_stale_save = store.load_account_projection_state("alice", 16).unwrap();
+    assert!(
+        after_stale_save
+            .groups
+            .iter()
+            .all(|group| group.group_id_hex != "aa"),
+        "a stale concurrent snapshot must not recreate a locally deleted projection"
+    );
+    assert!(
+        after_stale_save
+            .groups
+            .iter()
+            .any(|group| group.group_id_hex == "bb"),
+        "unrelated groups must survive stale snapshot suppression"
+    );
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(deletion_frontier)
+    );
+    let newer_message_id = MessageId::new(vec![2]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![newer_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    assert!(
+        store
+            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &newer_message_id,)
+            .unwrap(),
+        "causally newer group activity must clear the deletion frontier"
+    );
+    assert_eq!(store.local_group_deletion_frontier("aa").unwrap(), None);
     store
         .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
         .unwrap();

@@ -9,7 +9,10 @@ use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::app_telemetry::AppPerformanceOperation;
-use crate::groups::{EventGroupProjection, event_group_id, fail_if_publish_failed, observe_event};
+use crate::groups::{
+    EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
+    observe_event,
+};
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
@@ -278,8 +281,17 @@ impl AppClient {
         // (see `schema_valid_message_ids`).
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
+        self.clear_local_group_deletion_frontiers_for_new_activity(
+            effects,
+            &source_message_id_hex,
+            source_received_at,
+        )?;
         let mut routes_dirty = false;
         for event in &effects.events {
+            if let Some(changed) = self.suppress_local_deleted_group_event(event)? {
+                routes_dirty |= changed;
+                continue;
+            }
             let before = self.state.groups.len();
             let previous_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -314,6 +326,7 @@ impl AppClient {
                 routes_dirty = true;
             }
         }
+        self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
@@ -867,6 +880,73 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Clear durable local-delete markers only for a fresh authenticated rejoin
+    /// or a causally newer, fully valid inbound chat message. This runs for both
+    /// direct transport ingest and session-drained buffered effects so those
+    /// seams cannot diverge.
+    fn clear_local_group_deletion_frontiers_for_new_activity(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_message_id_hex: &str,
+        source_received_at: u64,
+    ) -> Result<(), AppError> {
+        // One delivery can release buffered effects for several groups, so its
+        // outer timestamp is not valid provenance for every event in the batch.
+        // The authenticated engine message id resolves to a durable local ingress
+        // order. Strict app decoding then prevents malformed or sender-mismatched
+        // payloads from resurrecting a deliberately hidden group.
+        let storage = self.app.account_storage(&self.state.label)?;
+        for event in &effects.events {
+            if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } = event {
+                // A newly authenticated Welcome supersedes any deletion marker
+                // retained from an earlier removed copy of the same MLS group.
+                storage.clear_local_group_deletion_frontier(&hex::encode(group_id.as_slice()))?;
+                continue;
+            }
+            let cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id,
+                message_id,
+                sender,
+                epoch,
+                payload,
+                retention,
+            } = event
+            else {
+                continue;
+            };
+            let group_id_hex = hex::encode(group_id.as_slice());
+            if storage
+                .local_group_deletion_frontier(&group_id_hex)?
+                .is_none()
+            {
+                continue;
+            }
+            let sender_hex = hex::encode(sender.as_slice());
+            let Some(message) = decode_received_event(
+                payload,
+                &sender_hex,
+                None,
+                group_id,
+                epoch.0,
+                *retention,
+                source_message_id_hex,
+                source_received_at,
+                None,
+                self.app.allow_loopback_blob_endpoints(),
+            ) else {
+                continue;
+            };
+            if message.kind != MARMOT_APP_EVENT_KIND_CHAT {
+                continue;
+            }
+            storage.clear_local_group_deletion_frontier_if_message_is_newer(
+                &group_id_hex,
+                message_id,
+            )?;
+        }
+        Ok(())
+    }
+
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -889,7 +969,16 @@ impl AppClient {
         // ONE pass after the loop. The previous per-message `retain` was O(n) per
         // gossip event → O(n²) over a batch a relay could flood with kind-448s.
         let mut gossip_message_ids: HashSet<String> = HashSet::new();
+        self.clear_local_group_deletion_frontiers_for_new_activity(
+            effects,
+            source_message_id_hex,
+            source_received_at,
+        )?;
         for event in &effects.events {
+            if let Some(changed) = self.suppress_local_deleted_group_event(event)? {
+                routes_dirty |= changed;
+                continue;
+            }
             let before = self.state.groups.len();
             let previous_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1111,6 +1200,7 @@ impl AppClient {
                 )?;
             }
         }
+        self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // #760: strip all collected push-gossip messages in one pass.
         if !gossip_message_ids.is_empty() {
             summary

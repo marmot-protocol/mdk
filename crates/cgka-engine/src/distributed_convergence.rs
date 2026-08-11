@@ -1479,7 +1479,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         };
-        self.emit_application_replay_events(group_id, &observations);
+        self.emit_application_replay_events(group_id, &observations)?;
         self.emit_invalidated_app_events(group_id, &result)?;
         self.emit_rejected_proposal_convergence_audits(group_id, &result);
         self.emit_rolled_back_commits(group_id, &result)?;
@@ -1770,9 +1770,10 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         observations: &[OpenMlsReplayObservation],
-    ) {
+    ) -> Result<(), OpenMlsProjectionError> {
         for observation in observations {
             let OpenMlsReplayObservation::ApplicationProcessed {
+                message_id,
                 source_epoch,
                 sender,
                 payload,
@@ -1796,12 +1797,14 @@ impl<S: StorageProvider> Engine<S> {
             }
             self.events_buf.push_back(GroupEvent::MessageReceived {
                 group_id: group_id.clone(),
+                message_id: message_id_from_hex(message_id)?,
                 epoch: cgka_traits::EpochId(*source_epoch),
                 sender: MemberId::new(sender.clone()),
                 payload: payload.clone(),
                 retention: Some(*retention),
             });
         }
+        Ok(())
     }
 
     fn emit_invalidated_app_events(

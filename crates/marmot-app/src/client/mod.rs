@@ -1477,8 +1477,10 @@ impl AppClient {
     /// an MLS leave and does not delete the stored MLS/OpenMLS group state; a
     /// future fresh group delivery can recreate the chat-list projection.
     ///
-    /// The live transport route is removed and synced before the DB wipe so the
-    /// account stops actively subscribing to the group before local rows vanish.
+    /// The live transport route is removed and synced before the DB wipe so no
+    /// delivery races the deletion transaction, then the current route is
+    /// restored without restoring the projection. The durable deletion frontier
+    /// filters historical replay until a strictly newer app message arrives.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
@@ -1511,20 +1513,47 @@ impl AppClient {
             }
         }
 
-        match self
+        let result = match self
             .app
             .delete_group_local_data(&self.state.label, &group_id_hex)
         {
-            Ok(deleted) => Ok(deleted || was_live),
+            Ok(result) => result,
             Err(error) => {
                 if was_live {
                     self.state.groups = original_groups;
                     self.refresh_routing()?;
                     self.sync_runtime_groups().await?;
                 }
-                Err(error)
+                return Err(error);
+            }
+        };
+        if was_live {
+            // The wipe has committed. Route restoration is a best-effort
+            // post-success step: a transient adapter failure must not report
+            // the durable delete as failed. Startup reconciliation retries it.
+            match self.ensure_local_deleted_group_route(group_id) {
+                Ok(true) => {
+                    if let Err(error) = self.sync_runtime_groups().await {
+                        tracing::warn!(
+                            target: "marmot_app::client",
+                            method = "delete_group_local",
+                            error_kind = error.privacy_safe_kind(),
+                            "local-delete route restoration remains pending",
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "delete_group_local",
+                        error_kind = error.privacy_safe_kind(),
+                        "local-delete route restoration remains pending",
+                    );
+                }
             }
         }
+        Ok(was_live || result)
     }
 
     async fn leave_group_with_audit_context(
@@ -3109,6 +3138,7 @@ impl AppClient {
 
     fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
+        self.preserve_local_deleted_group_routes(&routing)?;
         self.routing.replace(routing.snapshot());
         Ok(())
     }

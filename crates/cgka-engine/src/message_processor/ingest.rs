@@ -1162,6 +1162,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                     self.events_buf.push_back(GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
+                        message_id: msg.id.clone(),
                         sender,
                         epoch: msg_epoch,
                         payload,

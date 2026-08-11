@@ -1,4 +1,3 @@
-use cgka_traits::GroupId;
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -9,13 +8,16 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::storage::GroupStorage;
+use cgka_traits::{GroupId, TransportGroupSubscription};
 
-use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group};
+use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group, event_group_id};
 use crate::{
     AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageInput,
     AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupProfileComponent,
-    AppGroupRecord, AppMessageProjection, SecureDeleteExpiredResult, unix_now_seconds,
+    AppGroupRecord, AppMessageProjection, AppTransportRouting, SecureDeleteExpiredResult,
+    unix_now_seconds,
 };
 
 use super::AppClient;
@@ -122,7 +124,91 @@ impl AppClient {
             .cloned()
     }
 
+    pub(crate) fn has_local_group_deletion_frontier(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .local_group_deletion_frontier(&group_id_hex)?
+            .is_some())
+    }
+
+    /// Suppress projection updates for an intentionally hidden live group while
+    /// keeping its durable transport routes active. A terminal disband removes
+    /// both the routes and the now-redundant app-only deletion marker.
+    pub(crate) fn suppress_local_deleted_group_event(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+    ) -> Result<Option<bool>, AppError> {
+        let Some(group_id) = event_group_id(event) else {
+            return Ok(None);
+        };
+        if self.state_group_record(group_id).is_some() {
+            return Ok(None);
+        }
+        if !self.has_local_group_deletion_frontier(group_id)? {
+            return Ok(None);
+        }
+        let terminal = matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                ..
+            }
+        ) || self
+            .runtime
+            .group_record(group_id)
+            .ok()
+            .is_some_and(|group| group.removed || group.disbanded.is_some());
+        if terminal {
+            return Ok(Some(self.routing.replace_group_routes(
+                group_id,
+                Vec::<TransportGroupSubscription>::new(),
+            )));
+        }
+        Ok(Some(self.ensure_local_deleted_group_route(group_id)?))
+    }
+
+    /// Terminal events in one engine-effects batch all stay suppressed by the
+    /// marker. Remove it only after that batch drains so a trailing epoch/state
+    /// event cannot rebuild the projection or reinstall a terminal route.
+    pub(crate) fn clear_terminal_local_group_deletion_frontiers(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        for event in &effects.events {
+            let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if self.state_group_record(group_id).is_none() {
+                storage.clear_local_group_deletion_frontier(&hex::encode(group_id.as_slice()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn refresh_group(&mut self, group_id: &GroupId) {
+        if self.state_group_record(group_id).is_none() {
+            match self.has_local_group_deletion_frontier(group_id) {
+                Ok(true) => {
+                    let _ = self.ensure_local_deleted_group_route(group_id);
+                    return;
+                }
+                // Refresh is best-effort. Fail closed instead of letting a
+                // storage read failure resurrect a deliberately deleted group.
+                Err(_) => return,
+                Ok(false) => {}
+            }
+        }
         let group_metadata = self.runtime.group_record(group_id).ok();
         let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
             return;
@@ -178,6 +264,76 @@ impl AppClient {
         Ok(())
     }
 
+    /// Build the current and retained-prior subscriptions for an intentionally
+    /// hidden live group. The engine's protocol-owned route index is the durable
+    /// authority for the routing-v1 overlap window.
+    fn local_deleted_group_subscriptions(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
+        if self
+            .runtime
+            .group_record(group_id)
+            .map_err(AppError::from)
+            .is_ok_and(|group| group.removed || group.disbanded.is_some())
+        {
+            return Ok(Vec::new());
+        }
+        let current = self
+            .nostr_routing_for_group(group_id)?
+            .subscription(group_id)?;
+        let mut subscriptions = self
+            .app
+            .account_storage(&self.state.label)?
+            .list_transport_group_routes()?
+            .into_iter()
+            .filter(|route| route.group_id == *group_id)
+            .map(|route| TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: route.transport_group_id,
+                endpoints: current.endpoints.clone(),
+            })
+            .collect::<Vec<_>>();
+        if !subscriptions
+            .iter()
+            .any(|subscription| subscription.transport_group_id == current.transport_group_id)
+        {
+            subscriptions.push(current);
+        }
+        Ok(subscriptions)
+    }
+
+    /// Keep every still-valid transport route active while the app projection
+    /// is intentionally deleted. This is the path by which a fresh chat message
+    /// can cross the deletion frontier and restore the conversation.
+    pub(crate) fn ensure_local_deleted_group_route(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let subscriptions = self.local_deleted_group_subscriptions(group_id)?;
+        Ok(self.routing.replace_group_routes(group_id, subscriptions))
+    }
+
+    /// Add intentionally hidden live-group routes to a freshly rebuilt routing
+    /// snapshot before it atomically replaces the active snapshot.
+    pub(crate) fn preserve_local_deleted_group_routes(
+        &self,
+        routing: &AppTransportRouting,
+    ) -> Result<(), AppError> {
+        for group_id in self.runtime.live_group_ids()? {
+            if self.state_group_record(&group_id).is_some()
+                || !self.has_local_group_deletion_frontier(&group_id)?
+            {
+                continue;
+            }
+            routing.replace_group_routes(
+                &group_id,
+                self.local_deleted_group_subscriptions(&group_id)?,
+            );
+        }
+        Ok(())
+    }
+
     /// Repair an engine/projection tear left by a previously confirmed group
     /// mutation whose trailing app-state write failed, and hydrate the durable
     /// roster-count projection introduced for chat-list classification.
@@ -195,6 +351,15 @@ impl AppClient {
         for group_id in live_group_ids {
             let group_id_hex = hex::encode(group_id.as_slice());
             if !projected.contains(group_id_hex.as_str()) {
+                if self
+                    .app
+                    .account_storage(&self.state.label)?
+                    .local_group_deletion_frontier(&group_id_hex)?
+                    .is_some()
+                {
+                    self.ensure_local_deleted_group_route(&group_id)?;
+                    continue;
+                }
                 self.add_group(&group_id)?;
                 changed = true;
                 continue;

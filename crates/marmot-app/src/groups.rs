@@ -1953,6 +1953,7 @@ pub(crate) fn observe_event(
             epoch,
             payload,
             retention,
+            ..
         } => {
             if let Some(projection) = group_projection {
                 add_group(

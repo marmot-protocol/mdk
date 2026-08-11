@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Local-only group deletion now survives account restart and historical relay
+  replay. A per-group deletion frontier suppresses projection reconciliation
+  until a causally newer chat message arrives, without affecting other
+  locally deleted groups.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.
