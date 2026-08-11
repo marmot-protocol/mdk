@@ -226,7 +226,10 @@ impl AppClient {
         // above, `sync_sdk_relay` never drained the engine, so these would stay
         // buffered and invisible to runtime subscribers until some later
         // unrelated send/ingest. Fold any pending events into this summary.
-        let drained = self.drain_pending_session_events().await?;
+        let drained = match self.drain_pending_session_events().await {
+            Ok(drained) => drained,
+            Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+        };
         summary.merge(drained);
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
@@ -437,11 +440,23 @@ impl AppClient {
         }
     }
 
-    /// Drain the buffered summary of send-applied group events. Called by the
-    /// account worker after each command so the events broadcast on the same
-    /// seam that published the command's response.
+    /// Drain durable effects retained outside their originating operation.
+    /// Called by the account worker after commands and before reporting a sync
+    /// error so the corresponding live events are never stranded.
     pub(crate) fn take_pending_applied_sync_summary(&mut self) -> SyncSummary {
         std::mem::take(&mut self.pending_applied_sync_summary)
+    }
+
+    /// Keep effects that completed before a later sync failure available to the
+    /// account worker. The worker broadcasts this buffer before reporting the
+    /// error, so durable partial progress is never hidden from live subscribers.
+    fn preserve_applied_summary_on_error(
+        &mut self,
+        summary: SyncSummary,
+        error: AppError,
+    ) -> Result<SyncSummary, AppError> {
+        self.pending_applied_sync_summary.merge(summary);
+        Err(error)
     }
 
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
@@ -585,7 +600,9 @@ impl AppClient {
             let delivery = match timeout(wait, self.adapter.receive()).await {
                 Ok(Ok(Some(delivery))) => delivery,
                 Ok(Ok(None)) => break,
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(error)) => {
+                    return self.preserve_applied_summary_on_error(summary, error.into());
+                }
                 Err(_) => break,
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
@@ -596,15 +613,50 @@ impl AppClient {
                 continue;
             }
             remember_seen_event(&mut seen, &mut self.state, event_id);
-            routes_dirty |= self
-                .ingest_delivery(delivery, &display_names, &mut summary)
-                .await?;
+            let mut delivery_summary = SyncSummary::default();
+            let delivery_routes_dirty = match self
+                .ingest_delivery(delivery, &display_names, &mut delivery_summary)
+                .await
+            {
+                Ok(routes_dirty) => routes_dirty,
+                Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+            };
+            routes_dirty |= delivery_routes_dirty;
             deliveries = deliveries.saturating_add(1);
+            summary.merge(delivery_summary);
+            // A later delivery may fail after these effects are already durable.
+            // Persist the matching seen-id/cursor state at the same per-delivery
+            // boundary used by the live tail instead of deferring every advance
+            // to the end of the drain. Membership-changing ingest already saves
+            // before its route-refresh await.
+            if !delivery_routes_dirty
+                && let Err(error) =
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()
+            {
+                return self.preserve_applied_summary_on_error(summary, error);
+            }
+            if cfg!(feature = "test-policy-overrides")
+                && self
+                    .app
+                    .config
+                    .dev_fail_sync_after_messages
+                    .is_some_and(|limit| summary.messages.len() as u64 >= limit)
+            {
+                return self.preserve_applied_summary_on_error(
+                    summary,
+                    AppError::BlockingTask("injected catch-up drain failure".to_owned()),
+                );
+            }
         }
 
-        let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
+        let routes_changed = match self.refresh_group_routes() {
+            Ok(routes_changed) => routes_changed,
+            Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+        };
+        if (routes_dirty || routes_changed)
+            && let Err(error) = self.sync_runtime_groups().await
+        {
+            return self.preserve_applied_summary_on_error(summary, error);
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -612,7 +664,9 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
+            return self.preserve_applied_summary_on_error(summary, error);
+        }
         Ok(summary)
     }
 
@@ -857,7 +911,11 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         self.record_subscription_rebuild(None).await;
         let mut summary = self.sync_sdk_relay().await?;
-        summary.merge(self.drain_pending_session_events().await?);
+        let drained = match self.drain_pending_session_events().await {
+            Ok(drained) => drained,
+            Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+        };
+        summary.merge(drained);
         Ok(summary)
     }
 

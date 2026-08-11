@@ -99,13 +99,12 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
-    /// Sync summary for group events the engine applied as a side effect of an
-    /// outbound send: a send that lands while inbound convergence input is
-    /// retained folds those commits before publishing, so its effects can carry
-    /// peer `GroupStateChanged` / `EpochChanged` events. The runtime account
-    /// worker drains this after each command and broadcasts it like an inbound
-    /// sync summary so live chat-list/group-state subscriptions observe the
-    /// applied commits.
+    /// Sync summary for durable effects that must be broadcast outside the
+    /// operation that applied them. This includes group events folded as a side
+    /// effect of an outbound send and completed catch-up deliveries retained when
+    /// a later delivery fails the batch. The runtime account worker drains this
+    /// before reporting the operation error and after each command, so live
+    /// subscribers observe every applied commit.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.

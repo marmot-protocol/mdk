@@ -680,6 +680,12 @@ async fn run_app_runtime_account_worker(
             backfill_result
         }
         Err(err) => {
+            publish_client_pending_applied_summary(
+                &mut client,
+                &events,
+                &account_id_hex,
+                &account_label,
+            );
             // A failed initial catch-up surfaces as an account error but must not
             // fail worker readiness — readiness was already signalled above.
             let message = account_error_message("runtime startup receive failed", &err);
@@ -1129,6 +1135,12 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                         Ok(Err(err)) => {
+                            publish_client_pending_applied_summary(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
                             publish_app_runtime_account_error(
                                 &events,
                                 &account_id_hex,
@@ -1333,6 +1345,12 @@ async fn handle_account_worker_catch_up(
             backfill_result
         }
         Err(err) => {
+            publish_client_pending_applied_summary(
+                client,
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+            );
             let message = account_error_message("runtime catch-up failed", &err);
             publish_app_runtime_account_error(
                 context.events,
@@ -1622,6 +1640,12 @@ async fn handle_account_worker_command(
                     backfill_result
                 }
                 Err(err) => {
+                    publish_client_pending_applied_summary(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
                     let message = account_error_message("runtime catch-up failed", &err);
                     publish_app_runtime_account_error(
                         events,
@@ -1660,6 +1684,12 @@ async fn handle_account_worker_command(
                     Ok(())
                 }
                 Err(err) => {
+                    publish_client_pending_applied_summary(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
                     let message = account_error_message("full-history repair failed", &err);
                     publish_app_runtime_account_error(
                         events,
@@ -3008,12 +3038,11 @@ fn publish_client_pending_projection_updates(
     }
 }
 
-/// Broadcast group events a send applied as a side effect (retained inbound
-/// convergence commits folded before publishing). Called from every worker seam
-/// that can run a send — the command chokepoint, the receive arm's post-join
-/// push retry, the maintenance tick, and startup — so the applied events reach
-/// chat-list/group-state subscribers instead of buffering indefinitely. A no-op
-/// when the buffered summary is empty.
+/// Broadcast durable effects retained outside their originating operation. This
+/// covers retained inbound convergence commits folded by a send and completed
+/// catch-up deliveries preserved across a later batch error. Called before the
+/// corresponding error is reported and from every worker seam that can buffer
+/// applied effects. A no-op when the summary is empty.
 fn publish_client_pending_applied_summary(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,

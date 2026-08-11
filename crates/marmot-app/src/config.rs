@@ -97,6 +97,10 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this exercises the account
     /// worker's degraded catch-up path without corrupting a real database.
     pub dev_force_group_read_snapshot_failure: bool,
+    /// Dev/test-only fault injected after this many projected messages in a
+    /// catch-up drain. Honored only with `test-policy-overrides`; this exercises
+    /// truthful partial-progress reporting after a later batch failure.
+    pub dev_fail_sync_after_messages: Option<u64>,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -150,6 +154,7 @@ impl Default for MarmotAppConfig {
             dev_scheduled_convergence_delay_ms: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
+            dev_fail_sync_after_messages: None,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -241,6 +246,13 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
         self.dev_force_group_read_snapshot_failure = enabled;
+        self
+    }
+
+    /// Fail a catch-up drain after `messages` projected messages in
+    /// test-policy builds. Normal builds ignore this field.
+    pub fn with_dev_fail_sync_after_messages(mut self, messages: u64) -> Self {
+        self.dev_fail_sync_after_messages = Some(messages);
         self
     }
 }
