@@ -32,7 +32,7 @@ use crate::{
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, ReceivedMessage, RetentionSweepReport, SecureDeleteExpiredResult,
-    SendSummary, SyncSummary,
+    SendSummary, SyncFailure, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -575,7 +575,7 @@ async fn run_app_runtime_account_worker(
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
-            Ok::<_, AppError>(summary)
+            Ok::<_, SyncFailure>(summary)
         });
         loop {
             tokio::select! {
@@ -679,16 +679,18 @@ async fn run_app_runtime_account_worker(
             }
             backfill_result
         }
-        Err(err) => {
-            publish_client_pending_applied_summary(
-                &mut client,
+        Err(failure) => {
+            publish_sync_summary_with_audit(
                 &events,
                 &account_id_hex,
                 &account_label,
+                &failure.partial_summary,
+                &shared,
+                "startup_sync",
             );
             // A failed initial catch-up surfaces as an account error but must not
             // fail worker readiness — readiness was already signalled above.
-            let message = account_error_message("runtime startup receive failed", &err);
+            let message = account_error_message("runtime startup receive failed", &failure.source);
             publish_app_runtime_account_error(
                 &events,
                 &account_id_hex,
@@ -1134,12 +1136,14 @@ async fn run_app_runtime_account_worker(
                                 &mut client,
                             );
                         }
-                        Ok(Err(err)) => {
-                            publish_client_pending_applied_summary(
-                                &mut client,
+                        Ok(Err(failure)) => {
+                            publish_sync_summary_with_audit(
                                 &events,
                                 &account_id_hex,
                                 &account_label,
+                                &failure.partial_summary,
+                                &shared,
+                                "key_package_maintenance_catch_up",
                             );
                             publish_app_runtime_account_error(
                                 &events,
@@ -1147,7 +1151,7 @@ async fn run_app_runtime_account_worker(
                                 &account_label,
                                 account_error_message(
                                     "key package maintenance catch-up failed",
-                                    &err,
+                                    &failure.source,
                                 ),
                             );
                         }
@@ -1344,14 +1348,16 @@ async fn handle_account_worker_catch_up(
             }
             backfill_result
         }
-        Err(err) => {
-            publish_client_pending_applied_summary(
-                client,
+        Err(failure) => {
+            publish_sync_summary_with_audit(
                 context.events,
                 context.account_id_hex,
                 context.account_label,
+                &failure.partial_summary,
+                context.shared,
+                "catch_up",
             );
-            let message = account_error_message("runtime catch-up failed", &err);
+            let message = account_error_message("runtime catch-up failed", &failure.source);
             publish_app_runtime_account_error(
                 context.events,
                 context.account_id_hex,
@@ -1639,14 +1645,16 @@ async fn handle_account_worker_command(
                     }
                     backfill_result
                 }
-                Err(err) => {
-                    publish_client_pending_applied_summary(
-                        client,
+                Err(failure) => {
+                    publish_sync_summary_with_audit(
                         events,
                         account_id_hex,
                         account_label,
+                        &failure.partial_summary,
+                        shared,
+                        "catch_up",
                     );
-                    let message = account_error_message("runtime catch-up failed", &err);
+                    let message = account_error_message("runtime catch-up failed", &failure.source);
                     publish_app_runtime_account_error(
                         events,
                         account_id_hex,
@@ -1683,14 +1691,17 @@ async fn handle_account_worker_command(
                     }
                     Ok(())
                 }
-                Err(err) => {
-                    publish_client_pending_applied_summary(
-                        client,
+                Err(failure) => {
+                    publish_sync_summary_with_audit(
                         events,
                         account_id_hex,
                         account_label,
+                        &failure.partial_summary,
+                        shared,
+                        "repair_full_history",
                     );
-                    let message = account_error_message("full-history repair failed", &err);
+                    let message =
+                        account_error_message("full-history repair failed", &failure.source);
                     publish_app_runtime_account_error(
                         events,
                         account_id_hex,
@@ -2931,6 +2942,20 @@ fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
         || !summary.epoch_stall_escalations.is_empty()
 }
 
+fn publish_sync_summary_with_audit(
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    summary: &SyncSummary,
+    shared: &RuntimeSharedServices,
+    audit_trigger: &'static str,
+) {
+    publish_app_runtime_summary(events, account_id_hex, account_label, summary);
+    if sync_summary_triggers_audit_tracker_update(summary) {
+        shared.schedule_audit_log_tracker_update(audit_trigger);
+    }
+}
+
 /// Run any pending epoch-gap backfill and push its arm evidence to the audit
 /// tracker. The arm state is captured *before* the replay drains it, and the
 /// tracker is scheduled unconditionally on the replay outcome: the
@@ -3038,11 +3063,12 @@ fn publish_client_pending_projection_updates(
     }
 }
 
-/// Broadcast durable effects retained outside their originating operation. This
-/// covers retained inbound convergence commits folded by a send and completed
-/// catch-up deliveries preserved across a later batch error. Called before the
-/// corresponding error is reported and from every worker seam that can buffer
-/// applied effects. A no-op when the summary is empty.
+/// Broadcast group events a send applied as a side effect (retained inbound
+/// convergence commits folded before publishing). Called from every worker seam
+/// that can run a send — the command chokepoint, the receive arm's post-join
+/// push retry, the maintenance tick, and startup — so the applied events reach
+/// chat-list/group-state subscribers instead of buffering indefinitely. A no-op
+/// when the buffered summary is empty.
 fn publish_client_pending_applied_summary(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,

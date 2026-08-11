@@ -10,11 +10,22 @@ use serde_json::{Value, json};
 use crate::relay_lists_json;
 
 #[derive(Debug, thiserror::Error)]
+#[error("sync failed; completed prefix:\n{partial_plain}\nerror: {source}")]
+pub(crate) struct SyncCommandError {
+    #[source]
+    pub(crate) source: AppError,
+    pub(crate) partial_plain: String,
+    pub(crate) partial_json: Value,
+}
+
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum WnError {
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
     #[error(transparent)]
     App(#[from] AppError),
+    #[error(transparent)]
+    Sync(Box<SyncCommandError>),
     #[error(transparent)]
     QuicStream(#[from] transport_quic_stream::QuicTextStreamError),
     #[error(transparent)]
@@ -212,6 +223,16 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
         }),
         WnError::AccountHome(err) => account_home_error_json(err),
         WnError::App(err) => app_error_json(err),
+        WnError::Sync(sync) => {
+            // Preserve the source AppError's established top-level code and
+            // repair metadata for existing CLI consumers. Partial progress is
+            // additive; it must not force scripts to unwrap a new `cause` layer.
+            let mut value = app_error_json(&sync.source);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("partial".to_owned(), sync.partial_json.clone());
+            }
+            value
+        }
         WnError::QuicStream(err) => json!({
             "code": "quic_stream",
             "message": err.to_string(),

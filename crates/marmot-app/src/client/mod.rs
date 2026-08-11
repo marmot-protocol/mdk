@@ -99,12 +99,13 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
-    /// Sync summary for durable effects that must be broadcast outside the
-    /// operation that applied them. This includes group events folded as a side
-    /// effect of an outbound send and completed catch-up deliveries retained when
-    /// a later delivery fails the batch. The runtime account worker drains this
-    /// before reporting the operation error and after each command, so live
-    /// subscribers observe every applied commit.
+    /// Sync summary for group events the engine applied as a side effect of an
+    /// outbound send: a send that lands while inbound convergence input is
+    /// retained folds those commits before publishing, so its effects can carry
+    /// peer `GroupStateChanged` / `EpochChanged` events. The runtime account
+    /// worker drains this after each command and broadcasts it like an inbound
+    /// sync summary so live chat-list/group-state subscriptions observe the
+    /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
@@ -112,9 +113,8 @@ pub struct AppClient {
     /// The detector latches `escalated` one-shot per unrecovered run, so an
     /// escalation dropped by a later `?` on the recording pass is never raised
     /// again — the run keeps arming in silence. Escalations therefore land here
-    /// rather than on whatever `SyncSummary` the recording pass happened to be
-    /// building, and move onto a summary only at a seam that is returning `Ok`
-    /// (see `Self::drain_epoch_stall_escalations`).
+    /// and move onto a delivery-local summary only after that delivery crosses
+    /// its persistence boundary (see `Self::drain_epoch_stall_escalations`).
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Batch-start local-deletion frontiers crossed by authenticated fresh

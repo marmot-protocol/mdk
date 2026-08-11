@@ -17,7 +17,7 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AppError, AppGroupAdminPolicyComponent, AppMessageProjection, AppPerformanceTelemetry,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
     TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event, unix_now_seconds,
 };
 
@@ -189,32 +189,37 @@ impl AppClient {
         registration
     }
 
-    pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+    /// Transport-first startup sync. All authenticated, newly-applied effects
+    /// are projected into app state; no historical replay cursor is maintained.
+    pub async fn sync(&mut self) -> Result<SyncSummary, SyncFailure> {
         self.sync_inner(None).await
     }
 
     pub(crate) async fn sync_with_startup_stage_telemetry(
         &mut self,
         telemetry: &AppPerformanceTelemetry,
-    ) -> Result<SyncSummary, AppError> {
+    ) -> Result<SyncSummary, SyncFailure> {
         self.sync_inner(Some(telemetry)).await
     }
 
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<SyncSummary, AppError> {
+    ) -> Result<SyncSummary, SyncFailure> {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
-        if self.refresh_group_routes()? {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()
+                .map_err(SyncFailure::from)?;
         }
         let rebuild_since_secs = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp)
             .map(|timestamp| timestamp.0);
-        self.prepare_transport_with_telemetry(telemetry).await?;
+        self.prepare_transport_with_telemetry(telemetry)
+            .await
+            .map_err(SyncFailure::from)?;
         // Both the inbox/group activation and the group-subscription refresh
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.
@@ -228,7 +233,7 @@ impl AppClient {
         // unrelated send/ingest. Fold any pending events into this summary.
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
-            Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+            Err(error) => return Err(SyncFailure::new(summary, error)),
         };
         summary.merge(drained);
         self.drain_epoch_stall_escalations(&mut summary);
@@ -440,23 +445,11 @@ impl AppClient {
         }
     }
 
-    /// Drain durable effects retained outside their originating operation.
-    /// Called by the account worker after commands and before reporting a sync
-    /// error so the corresponding live events are never stranded.
+    /// Drain the buffered summary of send-applied group events. Called by the
+    /// account worker after each command so the events broadcast on the same
+    /// seam that published the command's response.
     pub(crate) fn take_pending_applied_sync_summary(&mut self) -> SyncSummary {
         std::mem::take(&mut self.pending_applied_sync_summary)
-    }
-
-    /// Keep effects that completed before a later sync failure available to the
-    /// account worker. The worker broadcasts this buffer before reporting the
-    /// error, so durable partial progress is never hidden from live subscribers.
-    fn preserve_applied_summary_on_error(
-        &mut self,
-        summary: SyncSummary,
-        error: AppError,
-    ) -> Result<SyncSummary, AppError> {
-        self.pending_applied_sync_summary.merge(summary);
-        Err(error)
     }
 
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
@@ -554,23 +547,27 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let routes_dirty = self
-            .ingest_delivery(delivery, &display_names, &mut summary)
+            .ingest_delivery(delivery, &display_names, &mut summary, None)
             .await?;
+        // A membership-changing ingest is already durable. Persist its app
+        // projection before route reconciliation or subscription refresh can
+        // fail, matching the catch-up delivery boundary below.
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.drain_epoch_stall_escalations(&mut summary);
         let routes_changed = self.refresh_group_routes()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
-    async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
-        let display_names = self.app.display_names_by_id()?;
+    async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, SyncFailure> {
+        let display_names = self.app.display_names_by_id().map_err(SyncFailure::from)?;
         let local_account_id_hex = self
             .app
             .account_home()
-            .account(&self.state.label)?
+            .account(&self.state.label)
+            .map_err(|source| SyncFailure::from(AppError::from(source)))?
             .account_id_hex;
         let mut summary = SyncSummary::default();
         let mut seen = self
@@ -587,7 +584,6 @@ impl AppClient {
         let drain_started = std::time::Instant::now();
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut deliveries: u64 = 0;
-        let mut routes_dirty = false;
 
         loop {
             let wait = if first_wait {
@@ -596,12 +592,11 @@ impl AppClient {
                 SDK_DRAIN_WAIT
             };
             first_wait = false;
-
             let delivery = match timeout(wait, self.adapter.receive()).await {
                 Ok(Ok(Some(delivery))) => delivery,
                 Ok(Ok(None)) => break,
                 Ok(Err(error)) => {
-                    return self.preserve_applied_summary_on_error(summary, error.into());
+                    return Err(SyncFailure::new(summary, error.into()));
                 }
                 Err(_) => break,
             };
@@ -612,51 +607,65 @@ impl AppClient {
             if seen.contains(&event_id) {
                 continue;
             }
-            remember_seen_event(&mut seen, &mut self.state, event_id);
+            let cursor_before_delivery = self.state.last_transport_timestamp;
             let mut delivery_summary = SyncSummary::default();
             let delivery_routes_dirty = match self
-                .ingest_delivery(delivery, &display_names, &mut delivery_summary)
+                .ingest_delivery(
+                    delivery,
+                    &display_names,
+                    &mut delivery_summary,
+                    Some(deliveries),
+                )
                 .await
             {
                 Ok(routes_dirty) => routes_dirty,
-                Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+                Err(error) => return Err(SyncFailure::new(summary, error)),
             };
-            routes_dirty |= delivery_routes_dirty;
-            deliveries = deliveries.saturating_add(1);
-            summary.merge(delivery_summary);
+            let mut state_before_boundary = self.state.clone();
+            state_before_boundary.last_transport_timestamp = cursor_before_delivery;
+            remember_seen_event(&mut seen, &mut self.state, event_id);
             // A later delivery may fail after these effects are already durable.
             // Persist the matching seen-id/cursor state at the same per-delivery
-            // boundary used by the live tail instead of deferring every advance
-            // to the end of the drain. Membership-changing ingest already saves
-            // before its route-refresh await.
-            if !delivery_routes_dirty
-                && let Err(error) =
-                    self.save_state_with_pending_local_group_deletion_frontier_clears()
-            {
-                return self.preserve_applied_summary_on_error(summary, error);
-            }
-            if cfg!(feature = "test-policy-overrides")
+            // boundary so a restart cannot replay work already reported in the
+            // partial summary or advance the relay floor past uncommitted state.
+            let boundary_failure = if cfg!(feature = "test-policy-overrides")
                 && self
                     .app
                     .config
-                    .dev_fail_sync_after_messages
-                    .is_some_and(|limit| summary.messages.len() as u64 >= limit)
+                    .dev_fail_sync_before_boundary_save
+                    .is_some_and(|limit| deliveries >= limit)
             {
-                return self.preserve_applied_summary_on_error(
-                    summary,
-                    AppError::BlockingTask("injected catch-up drain failure".to_owned()),
-                );
+                Err(AppError::BlockingTask(
+                    "injected catch-up boundary save failure".to_owned(),
+                ))
+            } else {
+                self.save_state_with_pending_local_group_deletion_frontier_clears()
+            };
+            if let Err(error) = boundary_failure {
+                // The SQLite boundary is atomic. Restore the in-memory seen id
+                // and transport cursor while retaining the state projections
+                // produced by the already-durable engine effects.
+                self.state = state_before_boundary;
+                return Err(SyncFailure::new(summary, error));
+            }
+            // Escalations are accumulated as a side channel while observing
+            // this delivery. Move them into the delivery-local summary only
+            // after its persistence boundary succeeds, so N's escalation is
+            // returned when N+1 fails and an incomplete N is never reported.
+            self.drain_epoch_stall_escalations(&mut delivery_summary);
+            deliveries = deliveries.saturating_add(1);
+            summary.merge(delivery_summary);
+            if delivery_routes_dirty && let Err(error) = self.sync_runtime_groups().await {
+                return Err(SyncFailure::new(summary, error));
             }
         }
 
         let routes_changed = match self.refresh_group_routes() {
             Ok(routes_changed) => routes_changed,
-            Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+            Err(error) => return Err(SyncFailure::new(summary, error)),
         };
-        if (routes_dirty || routes_changed)
-            && let Err(error) = self.sync_runtime_groups().await
-        {
-            return self.preserve_applied_summary_on_error(summary, error);
+        if routes_changed && let Err(error) = self.sync_runtime_groups().await {
+            return Err(SyncFailure::new(summary, error));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -665,7 +674,7 @@ impl AppClient {
             self.state.last_transport_timestamp,
         );
         if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
-            return self.preserve_applied_summary_on_error(summary, error);
+            return Err(SyncFailure::new(summary, error));
         }
         Ok(summary)
     }
@@ -675,7 +684,20 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
+        sync_deliveries_before_delivery: Option<u64>,
     ) -> Result<bool, AppError> {
+        if cfg!(feature = "test-policy-overrides")
+            && sync_deliveries_before_delivery.is_some_and(|deliveries| {
+                self.app
+                    .config
+                    .dev_fail_sync_before_delivery
+                    .is_some_and(|limit| deliveries >= limit)
+            })
+        {
+            return Err(AppError::BlockingTask(
+                "injected catch-up delivery failure".to_owned(),
+            ));
+        }
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
@@ -697,16 +719,6 @@ impl AppClient {
                 Some(outer_transport_at),
             )
             .await?;
-        if routes_dirty {
-            // The engine join/leave is already durable; persist the matching
-            // app-state projection (a fresh join's pending invite row) before
-            // the callers' route-refresh network awaits. A process exit in
-            // that window would otherwise tear the durable membership change
-            // from its app-state row, and the consumed welcome is never
-            // re-emitted to repair it.
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        }
-
         // Publishing here is incidental work triggered by the inbound
         // delivery. A hard publish failure may roll that pending commit back,
         // but it must not discard the already-authenticated inbound message or
@@ -897,9 +909,10 @@ impl AppClient {
     /// participant that has no new traffic capable of arming epoch-stall
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
-    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, AppError> {
-        if self.refresh_group_routes()? {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
+        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()
+                .map_err(SyncFailure::from)?;
         }
         // Caller-directed repair is a fresh transport preparation, not an
         // assumption that startup ordering already installed the signer and
@@ -907,13 +920,18 @@ impl AppClient {
         self.relay_plane
             .set_transport_signer(self.transport_signer.clone())
             .await;
-        self.runtime.activate_transport(None).await?;
-        self.sync_runtime_groups().await?;
+        self.runtime
+            .activate_transport(None)
+            .await
+            .map_err(|source| SyncFailure::from(AppError::from(source)))?;
+        self.sync_runtime_groups()
+            .await
+            .map_err(SyncFailure::from)?;
         self.record_subscription_rebuild(None).await;
         let mut summary = self.sync_sdk_relay().await?;
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
-            Err(error) => return self.preserve_applied_summary_on_error(summary, error),
+            Err(error) => return Err(SyncFailure::new(summary, error)),
         };
         summary.merge(drained);
         Ok(summary)

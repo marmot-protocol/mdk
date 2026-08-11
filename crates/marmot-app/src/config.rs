@@ -97,10 +97,16 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this exercises the account
     /// worker's degraded catch-up path without corrupting a real database.
     pub dev_force_group_read_snapshot_failure: bool,
-    /// Dev/test-only fault injected after this many projected messages in a
-    /// catch-up drain. Honored only with `test-policy-overrides`; this exercises
-    /// truthful partial-progress reporting after a later batch failure.
-    pub dev_fail_sync_after_messages: Option<u64>,
+    /// Dev/test-only fault injected before the next delivery after this many
+    /// completed catch-up deliveries. Honored only with
+    /// `test-policy-overrides`; this exercises truthful partial-progress
+    /// reporting when delivery N+1 fails before ingest.
+    pub dev_fail_sync_before_delivery: Option<u64>,
+    /// Dev/test-only fault injected before persisting the current delivery's
+    /// completion boundary, after this many earlier deliveries completed.
+    /// Honored only with `test-policy-overrides`; this verifies that an
+    /// incompletely persisted delivery is excluded from the completed prefix.
+    pub dev_fail_sync_before_boundary_save: Option<u64>,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -154,7 +160,8 @@ impl Default for MarmotAppConfig {
             dev_scheduled_convergence_delay_ms: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
-            dev_fail_sync_after_messages: None,
+            dev_fail_sync_before_delivery: None,
+            dev_fail_sync_before_boundary_save: None,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -249,10 +256,18 @@ impl MarmotAppConfig {
         self
     }
 
-    /// Fail a catch-up drain after `messages` projected messages in
+    /// Fail before the next catch-up delivery after `deliveries` completed in
     /// test-policy builds. Normal builds ignore this field.
-    pub fn with_dev_fail_sync_after_messages(mut self, messages: u64) -> Self {
-        self.dev_fail_sync_after_messages = Some(messages);
+    pub fn with_dev_fail_sync_before_delivery(mut self, deliveries: u64) -> Self {
+        self.dev_fail_sync_before_delivery = Some(deliveries);
+        self
+    }
+
+    /// Fail before saving the current delivery's completion boundary after
+    /// `completed_deliveries` earlier deliveries in test-policy builds. Normal
+    /// builds ignore this field.
+    pub fn with_dev_fail_sync_before_boundary_save(mut self, completed_deliveries: u64) -> Self {
+        self.dev_fail_sync_before_boundary_save = Some(completed_deliveries);
         self
     }
 }

@@ -79,10 +79,18 @@ async fn mock_relay() -> (MockRelay, String) {
 }
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
+    open_store_with_config(dir, relay_url, MarmotAppConfig::default())
+}
+
+fn open_store_with_config(
+    dir: &tempfile::TempDir,
+    relay_url: &str,
+    config: MarmotAppConfig,
+) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        config.with_allow_loopback_relay_endpoints(true),
     )
 }
 
@@ -198,13 +206,21 @@ async fn stalled_bob_in_a_live_group(
     dir_bob: &tempfile::TempDir,
     dir_alice: &tempfile::TempDir,
 ) -> StalledGroup {
+    stalled_bob_in_a_live_group_with_config(dir_bob, dir_alice, MarmotAppConfig::default()).await
+}
+
+async fn stalled_bob_in_a_live_group_with_config(
+    dir_bob: &tempfile::TempDir,
+    dir_alice: &tempfile::TempDir,
+    bob_config: MarmotAppConfig,
+) -> StalledGroup {
     let (relay, url) = mock_relay().await;
 
     // --- bob: the stalled account whose arm decision we pin (own store) ---
     let home_bob = AccountHome::open(dir_bob.path());
     home_bob.create_account("bob").unwrap();
     let bob_id = home_bob.account("bob").unwrap().account_id_hex;
-    let app_bob = open_store(dir_bob, &url);
+    let app_bob = open_store_with_config(dir_bob, &url, bob_config);
     // Enable forensic audit recording before any client opens; the setting
     // persists in the store so every client this account builds records.
     app_bob
@@ -595,6 +611,56 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
         Some(hex::encode(live.group_id.as_slice()).as_str()),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
     );
+}
+
+/// A later delivery failure must not strand an escalation produced by the
+/// completed delivery immediately before it. The escalation belongs to N's
+/// persisted boundary and therefore travels in the error's completed prefix
+/// when N+1 fails before ingest.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn escalation_from_completed_delivery_survives_later_sync_failure() {
+    let dir_bob = tempfile::tempdir().unwrap();
+    let dir_alice = tempfile::tempdir().unwrap();
+    let config =
+        MarmotAppConfig::default().with_dev_fail_sync_before_delivery(BACKFILL_THRESHOLD as u64);
+    let mut live = stalled_bob_in_a_live_group_with_config(&dir_bob, &dir_alice, config).await;
+
+    // Two prior arms establish one unrecovered run. Each burst has exactly the
+    // configured number of deliveries, so no N+1 exists to trigger the fault.
+    for run in 0..(ESCALATION_ARM_THRESHOLD - 1) {
+        assert!(live.stall_bob_for_one_run(run).await.is_empty());
+        live.advance_bobs_epoch(&format!("advanced-{run}")).await;
+    }
+
+    let stalled_epoch = live.bobs_epoch();
+    let created_at = test_unix_now_seconds();
+    for probe in 0..=BACKFILL_THRESHOLD {
+        publish_garbage_group_message_at(
+            &live.relay_url,
+            &live.nostr_group_id_hex,
+            created_at,
+            &format!("failing-run-probe-{probe}"),
+        )
+        .await;
+    }
+
+    let failure = live
+        .bob
+        .sync()
+        .await
+        .expect_err("delivery after the threshold-crossing escalation must fail");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected catch-up delivery failure")
+    );
+    assert_eq!(failure.partial_summary.epoch_stall_escalations.len(), 1);
+    let escalation = &failure.partial_summary.epoch_stall_escalations[0];
+    assert_eq!(escalation.group_id, live.group_id);
+    assert_eq!(escalation.stalled_epoch, stalled_epoch);
+    assert_eq!(escalation.arms, ESCALATION_ARM_THRESHOLD as u32);
 }
 
 /// An epoch bob passes through cleanly — he keeps up with alice's commits
