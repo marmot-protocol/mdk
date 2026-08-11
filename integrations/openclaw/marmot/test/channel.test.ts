@@ -119,6 +119,20 @@ describe("resolveMarmotChannelAccount", () => {
 });
 
 describe("createMarmotDeleteActionAdapter", () => {
+  it("owns only delete so core durable sends can fall through", () => {
+    const adapter = createMarmotDeleteActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: { deleteMessage: async () => undefined },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    expect(adapter.supportsAction?.({ action: "delete" })).toBe(true);
+    expect(adapter.supportsAction?.({ action: "send" })).toBe(false);
+    expect(adapter.supportsAction?.({ action: "react" })).toBe(false);
+  });
+
   it("declares the delete action through describeMessageTool", () => {
     const adapter = createMarmotDeleteActionAdapter({
       deleteByMessageId: async () => false,

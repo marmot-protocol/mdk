@@ -393,6 +393,74 @@ impl NostrRelayClient for FlakyUnsubscribeRelayClient {
     }
 }
 
+/// Like [`FakeRelayClient`], but `unsubscribe` blocks on the call numbered by
+/// `block_on_call` (0 disables blocking). `unsubscribe_entered` increments when
+/// each `unsubscribe` call begins.
+#[derive(Default)]
+struct BlockingUnsubscribeRelayClient {
+    subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
+    unsubscribed: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
+    unsubscribed_accounts: Mutex<Vec<MemberId>>,
+    /// 1-based call index to block on; 0 means never block.
+    block_on_call: AtomicUsize,
+    unsubscribe_entered: AtomicUsize,
+    unsubscribe_release: Notify,
+}
+
+impl BlockingUnsubscribeRelayClient {
+    fn release_blocked_unsubscribe(&self) {
+        self.block_on_call.store(0, Ordering::SeqCst);
+        self.unsubscribe_release.notify_one();
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for BlockingUnsubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let call = self.unsubscribe_entered.fetch_add(1, Ordering::SeqCst) + 1;
+        loop {
+            let released = self.unsubscribe_release.notified();
+            if self.block_on_call.load(Ordering::SeqCst) != call {
+                break;
+            }
+            released.await;
+        }
+        self.unsubscribed.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.unsubscribed_accounts
+            .lock()
+            .unwrap()
+            .push(account_id.clone());
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
 /// Records the maximum number of `unsubscribe` calls observed in flight at
 /// once. Each `unsubscribe` yields several times so that, absent serialization,
 /// a concurrent lifecycle op's `unsubscribe` would be seen overlapping.
@@ -1820,6 +1888,172 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
     let metrics = adapter.metrics().await;
     assert_eq!(metrics.subscriptions_removed, 1);
     assert_eq!(metrics.unsubscribe_retries_pending, 0);
+}
+
+// Regression for mdk#1389: cancelling `sync_account_groups` during the
+// post-commit unsubscribe drain must retain confirmed progress and requeue only
+// unresolved relay teardowns.
+#[tokio::test]
+async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
+    let relay = Arc::new(BlockingUnsubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let old_group_a = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+    let old_group_b = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xB3; 32]),
+        transport_group_id: vec![0xC4; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+    let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let new_group = TransportGroupSubscription {
+        group_id: new_group_id.clone(),
+        transport_group_id: new_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+    let expected_unsubscribes = [
+        NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: old_group_a.group_id.clone(),
+            transport_group_id: old_group_a.transport_group_id.clone(),
+            endpoints: old_group_a.endpoints.clone(),
+            since: None,
+        },
+        NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: old_group_b.group_id.clone(),
+            transport_group_id: old_group_b.transport_group_id.clone(),
+            endpoints: old_group_b.endpoints.clone(),
+            since: None,
+        },
+    ];
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group_a.clone(), old_group_b.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    relay.block_on_call.store(2, Ordering::SeqCst);
+    let adapter_for_sync = adapter.clone();
+    let sync_account_id = account_id.clone();
+    let sync_group = new_group.clone();
+    let sync_task = tokio::spawn(async move {
+        adapter_for_sync
+            .sync_account_groups(TransportGroupSync {
+                account_id: sync_account_id,
+                group_subscriptions: vec![sync_group],
+                since: None,
+            })
+            .await
+    });
+
+    tokio::time::timeout(concurrent_subscribe_timeout(), async {
+        while relay.unsubscribe_entered.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sync must enter the second relay unsubscribe");
+    sync_task.abort();
+    let join_err = sync_task
+        .await
+        .expect_err("aborted sync must not complete successfully");
+    assert!(
+        join_err.is_cancelled(),
+        "aborted sync must be cancelled, got {join_err:?}"
+    );
+
+    let old_a_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("old-group-a-sub".into()),
+            event: group_event("24", &old_group_a.transport_group_id),
+        })
+        .await
+        .expect("old group-a relay event handled");
+    let old_b_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("old-group-b-sub".into()),
+            event: group_event("26", &old_group_b.transport_group_id),
+        })
+        .await
+        .expect("old group-b relay event handled");
+    let new_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some("new-group-sub".into()),
+            event: group_event("25", &new_transport_group_id),
+        })
+        .await
+        .expect("new relay event handled");
+    assert_eq!(old_a_delivered, 0, "removed route A must not deliver");
+    assert_eq!(old_b_delivered, 0, "removed route B must not deliver");
+    assert_eq!(new_delivered, 1);
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.group_id_hint, Some(new_group_id));
+
+    let metrics = adapter.metrics().await;
+    assert_eq!(
+        metrics.subscriptions_removed, 1,
+        "first unsubscribe must be confirmed before cancellation"
+    );
+    assert_eq!(
+        metrics.unsubscribe_retries_pending, 1,
+        "cancelled drain must retain only the unresolved relay unsubscribe"
+    );
+
+    relay.release_blocked_unsubscribe();
+    tokio::time::timeout(
+        concurrent_subscribe_timeout(),
+        adapter.sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![new_group.clone()],
+            since: None,
+        }),
+    )
+    .await
+    .expect("retry sync must complete before timeout")
+    .expect("retry sync succeeds");
+
+    {
+        let unsubscribed = relay.unsubscribed.lock().unwrap();
+        assert_eq!(
+            unsubscribed.as_slice(),
+            &expected_unsubscribes,
+            "both old subscription teardowns are recorded exactly once in vector order"
+        );
+    }
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.subscriptions_removed, 2);
+    assert_eq!(metrics.unsubscribe_retries_pending, 0);
+
+    tokio::time::timeout(
+        concurrent_subscribe_timeout(),
+        adapter.sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![new_group],
+            since: None,
+        }),
+    )
+    .await
+    .expect("follow-up sync must complete before timeout")
+    .expect("follow-up sync must not deadlock the lifecycle mutex");
+    assert_eq!(
+        adapter.metrics().await.subscriptions_removed,
+        2,
+        "follow-up sync must not double-count removals"
+    );
 }
 
 #[tokio::test]
