@@ -557,10 +557,10 @@ impl AppClient {
         }
         let routes_changed = self.refresh_group_routes()?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.drain_epoch_stall_escalations(&mut summary);
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
@@ -658,6 +658,9 @@ impl AppClient {
             self.drain_epoch_stall_escalations(&mut delivery_summary);
             deliveries = deliveries.saturating_add(1);
             summary.merge(delivery_summary);
+            // Refresh subscriptions at the same durable per-delivery boundary.
+            // If N+1 fails, groups joined by the reported N-prefix must already
+            // be live instead of waiting for another sync/startup recovery pass.
             if delivery_routes_dirty && let Err(error) = self.sync_runtime_groups().await {
                 return Err(SyncFailure::new(summary, error));
             }
