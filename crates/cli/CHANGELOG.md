@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Leave-proposal persistence now commits the signed proposal, durable leave
+  request, and content-dedup marker atomically, so a storage failure cannot
+  strand a same-epoch leave retry without a publishable proposal.
+
 ## [0.9.11] - 2026-08-09
 
 ### Added

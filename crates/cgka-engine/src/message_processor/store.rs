@@ -257,6 +257,7 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
         request: &LeaveRequest,
     ) -> Result<(), EngineError> {
+        let content_id = content_dedup_id(mls_bytes);
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
@@ -280,13 +281,18 @@ impl<S: StorageProvider> Engine<S> {
         self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
             storage.put_leave_request(request)?;
-            Ok::<_, EngineError>(())
+            self.persist_sent_openmls_content_marker(
+                &openmls_msg,
+                content_id.clone(),
+                group_id,
+                epoch,
+            )
         })?;
 
+        // Do not seed any hot-process sent/leave state until all durable rows
+        // commit together.
         self.sent_message_ids.insert(msg.id.clone());
-        let content_id = content_dedup_id(mls_bytes);
-        self.sent_message_ids.insert(content_id.clone());
-        self.persist_sent_openmls_content_marker(&openmls_msg, content_id, group_id, epoch)?;
+        self.sent_message_ids.insert(content_id);
         self.leaving_groups.insert(request.group_id.clone());
         self.leave_requests
             .insert(request.group_id.clone(), request.clone());
