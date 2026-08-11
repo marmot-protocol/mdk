@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Runtime catch-up, key-package maintenance, and every other incremental sync
+  seam now execute an armed epoch-gap full-history replay immediately instead of
+  waiting for unrelated later relay traffic. Explicit full-history repair also
+  consumes a pending replay without issuing the same account-wide query twice.
 - KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
   categories (for example `blocked` or `auth-required`) instead of repeating a
   generic `relay rejected event` summary, while successful deletions still

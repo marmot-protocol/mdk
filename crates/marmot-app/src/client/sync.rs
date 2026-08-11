@@ -760,6 +760,18 @@ impl AppClient {
         self.epoch_backfill_pending
     }
 
+    /// Consume a pending epoch-gap replay after an unfloored transport
+    /// activation has succeeded. Shared by the automatic replay path and the
+    /// explicit full-history repair path, which already performed the same
+    /// account-wide replay and must not issue it twice.
+    pub(crate) fn finish_pending_epoch_backfill_after_replay(&mut self) {
+        if !self.epoch_backfill_pending {
+            return;
+        }
+        self.epoch_stall.mark_replayed();
+        self.epoch_backfill_pending = false;
+    }
+
     /// Recover any group that stalled below its live epoch during ingest by
     /// replaying the account's full transport history (`since = None`). One replay
     /// re-fetches every group, so the detector collapses simultaneously-stuck
@@ -769,8 +781,7 @@ impl AppClient {
             return Ok(());
         }
         self.runtime.activate_transport(None).await?;
-        self.epoch_stall.mark_replayed();
-        self.epoch_backfill_pending = false;
+        self.finish_pending_epoch_backfill_after_replay();
         Ok(())
     }
 

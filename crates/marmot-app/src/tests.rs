@@ -13,14 +13,21 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use marmot_account::AccountHomeError;
+use nostr::base64::Engine as _;
+use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use nostr_sdk::prelude::{
+    Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind, Timestamp as NostrTimestamp,
+};
 use storage_sqlite::StoredRelayTelemetrySettings;
 use transport_nostr_adapter::{
-    NostrEventPublishRequest, NostrPublishOutcome, NostrRelayClient, NostrSubscription,
+    NostrEventPublishRequest, NostrPublishOutcome, NostrRelayClient, NostrRelayEvent,
+    NostrSubscription,
 };
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
+use crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD;
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
@@ -36,11 +43,13 @@ use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
 #[derive(Default)]
-struct ScriptedPushRelayClient {
+pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
+    block_subscribe_count: std::sync::atomic::AtomicUsize,
+    blocked_subscribe_count: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
@@ -87,6 +96,11 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn block_next_subscribes(&self, count: usize) {
+        self.block_subscribe_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn block_and_fail_next_subscribe(&self) {
         self.fail_blocked_subscribe
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -96,13 +110,41 @@ impl ScriptedPushRelayClient {
     /// Fail the next `subscribe` immediately instead of parking it first, for
     /// tests that need a transport activation to error inside a straight-line
     /// call (no second task to release the block).
-    fn fail_next_subscribe(&self) {
+    pub(crate) fn fail_next_subscribe(&self) {
         self.fail_next_subscribe
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub(crate) fn subscription_count(&self) -> usize {
+        self.subscriptions.lock().unwrap().len()
+    }
+
+    fn unfloored_account_subscription_count(&self) -> usize {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::AccountInbox { since: None, .. }
+                )
+            })
+            .count()
+    }
+
     async fn wait_for_blocked_subscribe(&self) {
         self.subscribe_started.notified().await;
+    }
+
+    async fn wait_for_blocked_subscribes(&self, count: usize) {
+        while self
+            .blocked_subscribe_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < count
+        {
+            self.subscribe_started.notified().await;
+        }
     }
 
     fn release_subscribe(&self) {
@@ -179,8 +221,18 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         let blocked = block_for_account
             || self
                 .block_next_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            || self
+                .block_subscribe_count
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
         if blocked {
+            self.blocked_subscribe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.subscribe_started.notify_one();
             self.subscribe_release.notified().await;
             if self
@@ -279,6 +331,166 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         }
         outcomes
     }
+}
+
+const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
+
+fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> NostrTransportEvent {
+    let mut envelope = vec![0_u8; 12];
+    envelope.extend_from_slice(format!("explicit-catch-up-probe:{marker}").as_bytes());
+    assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
+    let event = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
+        .tags([Tag::custom(
+            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+            [nostr_group_id_hex.to_owned()],
+        )])
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .sign_with_keys(&Keys::generate())
+        .expect("sign epoch-gap probe");
+    NostrTransportEvent::from_nostr_event(&event).expect("convert epoch-gap probe")
+}
+
+async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
+    let delivered = app
+        .relay_plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+            subscription_id: Some("explicit-catch-up-test".to_owned()),
+            event,
+        })
+        .await
+        .expect("route epoch-gap probe");
+    assert_eq!(
+        delivered, 1,
+        "the active group route must receive the probe"
+    );
+}
+
+#[test]
+fn explicit_catch_up_arms_and_replays_without_later_traffic() {
+    run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+
+        let cursor = crate::unix_now_seconds();
+        let group_id = {
+            let mut client = app.client("alice").await.unwrap();
+            let group_id = client
+                .create_group("explicit catch-up epoch-gap replay", &[])
+                .await
+                .unwrap();
+            client.state.last_transport_timestamp = Some(cursor);
+            app.save_state(&client.state).unwrap();
+            group_id
+        };
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.start().await.unwrap();
+        // This command is deferred behind startup catch-up, so its response is
+        // also the steady-state barrier this regression needs.
+        runtime.pause_maintenance("alice").await.unwrap();
+        let unfloored_before = relay.unfloored_account_subscription_count();
+
+        // Hold the ordinary, floored activation inside explicit CatchUp. The
+        // worker is now committed to the command path and cannot consume these
+        // queued deliveries through its live receive arm instead.
+        relay.block_next_subscribes(2);
+        let catch_up_runtime = runtime.clone();
+        let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
+        tokio::time::timeout(
+            EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
+            relay.wait_for_blocked_subscribes(2),
+        )
+        .await
+        .expect("explicit catch-up must park its complete floored activation");
+
+        let above_floor = cursor;
+        for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
+            inject_epoch_gap_probe(
+                &app,
+                epoch_gap_probe(
+                    &group.nostr_routing.nostr_group_id_hex,
+                    above_floor,
+                    &format!("arm-{arm}"),
+                ),
+            )
+            .await;
+        }
+
+        // The next two blocked subscribes are the complete unfloored replay.
+        // Without the post-CatchUp replay seam the catch-up task returns after
+        // the first release and this wait times out: the regression's RED signal.
+        relay.block_next_subscribes(2);
+        relay.release_subscribe();
+        tokio::time::timeout(
+            EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
+            relay.wait_for_blocked_subscribes(4),
+        )
+        .await
+        .expect("armed explicit catch-up must park one complete unfloored replay");
+
+        // Model the relay's stored-event response to that unfloored REQ. The
+        // target is older than the persisted cursor's 120-second floor and is
+        // offered only after replay starts; no later live delivery is published.
+        let below_floor_target = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            cursor.saturating_sub(600),
+            "below-floor-target",
+        );
+        let below_floor_target_id = below_floor_target.id.clone();
+        inject_epoch_gap_probe(&app, below_floor_target).await;
+        relay.release_subscribe();
+
+        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, catch_up)
+            .await
+            .expect("explicit catch-up must finish after replay activation")
+            .expect("catch-up task must not panic")
+            .expect("explicit catch-up must report replay success");
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            unfloored_before + 1,
+            "the arming catch-up must issue exactly one account-wide replay",
+        );
+
+        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
+            loop {
+                if app
+                    .load_state("alice")
+                    .unwrap()
+                    .seen_events
+                    .iter()
+                    .any(|event_id| event_id == &below_floor_target_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the below-floor target must be ingested without later traffic");
+
+        runtime.catch_up_accounts().await.unwrap();
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            unfloored_before + 1,
+            "consumed evidence must not trigger a second full-history replay",
+        );
+        runtime.shutdown().await;
+    });
 }
 
 /// Run app-runtime integration chains on a stack large enough for debug

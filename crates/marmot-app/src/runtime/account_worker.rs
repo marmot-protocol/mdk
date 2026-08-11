@@ -666,7 +666,7 @@ async fn run_app_runtime_account_worker(
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-            run_pending_epoch_backfill_reporting_arm(
+            let backfill_result = run_pending_epoch_backfill_reporting_arm(
                 &mut client,
                 &events,
                 &account_id_hex,
@@ -677,7 +677,7 @@ async fn run_app_runtime_account_worker(
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
-            Ok(())
+            backfill_result
         }
         Err(err) => {
             // A failed initial catch-up surfaces as an account error but must not
@@ -817,7 +817,7 @@ async fn run_app_runtime_account_worker(
                                         &mut scheduled_convergence,
                                         &mut client,
                                     );
-                                    run_pending_epoch_backfill_reporting_arm(
+                                    let _ = run_pending_epoch_backfill_reporting_arm(
                                         &mut client,
                                         &events,
                                         &account_id_hex,
@@ -936,7 +936,7 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                             &mut client,
                         );
-                        run_pending_epoch_backfill_reporting_arm(
+                        let _ = run_pending_epoch_backfill_reporting_arm(
                             &mut client,
                             &events,
                             &account_id_hex,
@@ -1148,6 +1148,14 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                 }
+                let _ = run_pending_epoch_backfill_reporting_arm(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                )
+                .await;
                 if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
                     publish_app_runtime_account_error(
                         &events,
@@ -1311,15 +1319,18 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
                 &summary,
             );
-            if client.has_pending_epoch_backfill() {
-                context
-                    .shared
-                    .schedule_audit_log_tracker_update("epoch_backfill_armed");
-            }
+            let backfill_result = run_pending_epoch_backfill_reporting_arm(
+                client,
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                context.shared,
+            )
+            .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 context.shared.schedule_audit_log_tracker_update("catch_up");
             }
-            Ok(())
+            backfill_result
         }
         Err(err) => {
             let message = account_error_message("runtime catch-up failed", &err);
@@ -1597,18 +1608,18 @@ async fn handle_account_worker_command(
             let result = match client.sync().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
-                    // Catch-up arms without running the backfill (the next
-                    // receive pass runs it), but the arm row is already durable
-                    // and the arming traffic never trips the summary gate below
-                    // — push it to the tracker from the seam that observed the
-                    // arm rather than a hoped-for later delivery.
-                    if client.has_pending_epoch_backfill() {
-                        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
-                    }
+                    let backfill_result = run_pending_epoch_backfill_reporting_arm(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        shared,
+                    )
+                    .await;
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
-                    Ok(())
+                    backfill_result
                 }
                 Err(err) => {
                     let message = account_error_message("runtime catch-up failed", &err);
@@ -1640,6 +1651,7 @@ async fn handle_account_worker_command(
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
                     if client.has_pending_epoch_backfill() {
+                        client.finish_pending_epoch_backfill_after_replay();
                         shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
                     }
                     if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -2894,29 +2906,29 @@ fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
 /// tracker is scheduled unconditionally on the replay outcome: the
 /// `epoch_stall_backfill_armed` row is already durable, a failing replay is the
 /// highest-value upload, and the arming pass returns an empty summary that
-/// never trips the visible-activity gate. Shared by the startup and receive
-/// seams so the capture-before-run ordering cannot drift between them; the
-/// catch-up seam schedules the upload without running the backfill and stays
-/// separate.
+/// never trips the visible-activity gate. Shared by every incremental sync and
+/// ingest seam so the capture-before-run ordering cannot drift. A replay
+/// activation failure is both published and returned: explicit catch-up fails
+/// its response while background seams retain their existing event-only
+/// reporting behavior. Explicit full-history repair already performed the
+/// unfloored replay and consumes the same intent without calling this helper.
 async fn run_pending_epoch_backfill_reporting_arm(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-) {
+) -> Result<(), String> {
     let backfill_armed = client.has_pending_epoch_backfill();
-    if let Err(err) = client.run_pending_epoch_backfill().await {
-        publish_app_runtime_account_error(
-            events,
-            account_id_hex,
-            account_label,
-            account_error_message("epoch-gap backfill failed", &err),
-        );
-    }
+    let result = client.run_pending_epoch_backfill().await.map_err(|err| {
+        let message = account_error_message("epoch-gap backfill failed", &err);
+        publish_app_runtime_account_error(events, account_id_hex, account_label, message.clone());
+        message
+    });
     if backfill_armed {
         shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
     }
+    result
 }
 
 fn publish_app_runtime_summary(
@@ -3102,6 +3114,12 @@ fn publish_app_runtime_account_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use marmot_account::AccountHome;
+
+    use crate::client::epoch_stall::BackfillDecision;
+    use crate::tests::ScriptedPushRelayClient;
 
     fn test_group_id(byte: u8) -> GroupId {
         GroupId::new(vec![byte])
@@ -3119,6 +3137,140 @@ mod tests {
         let message = account_error_message("runtime receive failed", &err);
         assert_eq!(message, "runtime receive failed: transport");
         assert!(!message.contains("private-relay.example"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn pending_epoch_backfill_failure_is_reported_retained_and_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.apply_backfill_decision(&test_group_id(7), 3, BackfillDecision::Arm);
+
+        let (events, mut subscriber) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        relay.fail_next_subscribe();
+        let error = run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+        )
+        .await
+        .expect_err("failed replay activation must be returned");
+
+        assert_eq!(error, "epoch-gap backfill failed: account_transport");
+        assert!(client.has_pending_epoch_backfill());
+        assert!(matches!(
+            subscriber.try_recv().unwrap(),
+            MarmotAppEvent::AccountError(RuntimeAccountError { message, .. })
+                if message == "epoch-gap backfill failed: account_transport"
+        ));
+
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+        )
+        .await
+        .unwrap();
+        assert!(!client.has_pending_epoch_backfill());
+        let subscriptions_after_replay = relay.subscription_count();
+
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+        )
+        .await
+        .unwrap();
+        assert_eq!(relay.subscription_count(), subscriptions_after_replay);
+    }
+
+    #[tokio::test]
+    async fn explicit_catch_up_runs_prearmed_backfill_before_success_response() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.apply_backfill_decision(&test_group_id(8), 3, BackfillDecision::Arm);
+
+        let (events, _subscriber) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let mut pending = VecDeque::new();
+        let context = AccountWorkerCatchUpContext {
+            app: &app,
+            events: &events,
+            shared: &shared,
+            account_id_hex: "account-id",
+            account_label: "alice",
+        };
+        let (respond, response) = oneshot::channel();
+
+        handle_account_worker_catch_up(&mut client, respond, &mut commands, &mut pending, context)
+            .await;
+
+        response.await.unwrap().unwrap();
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "catch-up must consume the replay intent before sending success",
+        );
+        assert!(
+            relay.subscription_count() >= 2,
+            "catch-up must perform its floored sync and the pending unfloored replay",
+        );
+        drop(command_tx);
+    }
+
+    #[tokio::test]
+    async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.apply_backfill_decision(&test_group_id(9), 3, BackfillDecision::Arm);
+
+        let (events, _subscriber) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        let (respond, response) = oneshot::channel();
+        handle_account_worker_command(
+            &mut client,
+            AccountWorkerCommand::RepairFullHistory { respond },
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+        )
+        .await;
+
+        response.await.unwrap().unwrap();
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "every successful sync seam must consume an armed replay intent",
+        );
+        assert_eq!(
+            relay.subscription_count(),
+            2,
+            "the explicit unfloored repair already fulfills the pending replay",
+        );
     }
 
     #[test]
