@@ -4,10 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind,
-    ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec,
-    ScenarioStep, ScenarioTopologyV2, TraceExpectation, compile_scenario,
-    resolve_scenario_input_bytes, run_scenario_report, run_scenario_report_with_subject,
+    AppRuntimeHarness, AppRuntimeObservationV1, GeneratedScenarioCase, GeneratedScenarioInputV1,
+    GeneratedSubjectKind, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
+    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, TraceExpectation, compile_scenario,
+    node_protocol::NodeObservationV1, resolve_scenario_input_bytes, run_scenario_report,
+    run_scenario_report_with_subject,
 };
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
@@ -149,7 +150,14 @@ fn controlled_relay_topology() -> ScenarioTopologyV2 {
     }
 }
 
-fn cross_adapter_scenario(include_offline_recovery: bool) -> ScenarioSpec {
+#[derive(Clone, Copy)]
+enum CrossAdapterRecovery {
+    Restart,
+    OfflineFullHistory,
+}
+
+fn build_cross_adapter_scenario(recovery: CrossAdapterRecovery) -> ScenarioSpec {
+    let include_offline_recovery = matches!(recovery, CrossAdapterRecovery::OfflineFullHistory);
     let clients = vec!["alice".into(), "bob".into(), "carol".into()];
     let mut steps = vec![
         in_group(
@@ -262,6 +270,56 @@ fn cross_adapter_scenario(include_offline_recovery: bool) -> ScenarioSpec {
     }
 }
 
+fn cross_adapter_restart_scenario() -> ScenarioSpec {
+    build_cross_adapter_scenario(CrossAdapterRecovery::Restart)
+}
+
+fn cross_adapter_offline_scenario() -> ScenarioSpec {
+    build_cross_adapter_scenario(CrossAdapterRecovery::OfflineFullHistory)
+}
+
+async fn run_app_and_process_adapters(
+    spec: &ScenarioSpec,
+) -> (
+    BTreeMap<String, AppRuntimeObservationV1>,
+    BTreeMap<String, NodeObservationV1>,
+) {
+    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
+    let app_report = run_scenario_report_with_subject(spec, None, Vec::new(), &mut app)
+        .await
+        .unwrap();
+    assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
+    let app_observations = app
+        .observations(&spec.clients)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|observation| (observation.participant.clone(), observation))
+        .collect::<BTreeMap<_, _>>();
+
+    let process_artifacts = tempfile::tempdir().unwrap();
+    let mut process = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        spec,
+        process_artifacts.path(),
+    )
+    .await
+    .unwrap();
+    let process_report = process.run().await.unwrap();
+    assert!(process_report.completed, "{process_report:#?}");
+    let process_observations = process_report
+        .observations
+        .iter()
+        .rev()
+        .take(spec.clients.len())
+        .map(|observation| (observation.participant.clone(), observation.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    process.shutdown().await;
+    app.shutdown().await;
+    (app_observations, process_observations)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
     let spec = process_scenario("app-process-canonical-schedule", false);
@@ -314,7 +372,7 @@ async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state() {
-    let spec = cross_adapter_scenario(false);
+    let spec = cross_adapter_restart_scenario();
     let engine_report = run_scenario_report(&spec, None).await.unwrap();
     let engine = engine_report
         .observed_trace
@@ -325,41 +383,12 @@ async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state()
         .map(|observation| (observation.client.as_str(), observation))
         .collect::<BTreeMap<_, _>>();
 
-    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
-    let app_report = run_scenario_report_with_subject(&spec, None, Vec::new(), &mut app)
-        .await
-        .unwrap();
-    assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
-    let app_observations = app
-        .observations(&spec.clients)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|observation| (observation.participant.clone(), observation))
-        .collect::<BTreeMap<_, _>>();
-
-    let process_artifacts = tempfile::tempdir().unwrap();
-    let mut process = ProcessOrchestrator::launch(
-        env!("CARGO_BIN_EXE_cgka-conformance-node"),
-        &spec,
-        process_artifacts.path(),
-    )
-    .await
-    .unwrap();
-    let process_report = process.run().await.unwrap();
-    assert!(process_report.completed, "{process_report:#?}");
-    let process_observations = process_report
-        .observations
-        .iter()
-        .rev()
-        .take(spec.clients.len())
-        .map(|observation| (observation.participant.clone(), observation))
-        .collect::<BTreeMap<_, _>>();
+    let (app_observations, process_observations) = run_app_and_process_adapters(&spec).await;
 
     for client in &spec.clients {
         let engine = engine[client.as_str()];
         let app = &app_observations[client];
-        let process = process_observations[client];
+        let process = &process_observations[client];
 
         assert_eq!(engine.epoch, app.protocol.epoch, "{client} app epoch");
         assert_eq!(
@@ -441,49 +470,27 @@ async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state()
         assert!(app.application.invalidated_message_ids.is_empty());
         assert!(process.application.invalidated_message_ids.is_empty());
     }
-
-    process.shutdown().await;
-    app.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn app_runtime_and_process_adapters_recover_the_same_offline_projection() {
-    let spec = cross_adapter_scenario(true);
-    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
-    let app_report = run_scenario_report_with_subject(&spec, None, Vec::new(), &mut app)
-        .await
-        .unwrap();
-    assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
-    let app_observations = app
-        .observations(&spec.clients)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|observation| (observation.participant.clone(), observation))
-        .collect::<BTreeMap<_, _>>();
-
-    let process_artifacts = tempfile::tempdir().unwrap();
-    let mut process = ProcessOrchestrator::launch(
-        env!("CARGO_BIN_EXE_cgka-conformance-node"),
-        &spec,
-        process_artifacts.path(),
-    )
-    .await
-    .unwrap();
-    let process_report = process.run().await.unwrap();
-    assert!(process_report.completed, "{process_report:#?}");
-    let process_observations = process_report
-        .observations
-        .iter()
-        .rev()
-        .take(spec.clients.len())
-        .map(|observation| (observation.participant.clone(), observation))
-        .collect::<BTreeMap<_, _>>();
+    let spec = cross_adapter_offline_scenario();
+    let (app_observations, process_observations) = run_app_and_process_adapters(&spec).await;
 
     let expected_payloads = BTreeSet::from(["sent after restart", "sent before restart"]);
+    let bob = &app_observations["bob"];
+    assert!(bob.local.online, "bob must be reconnected at the end");
+    assert!(
+        bob.local.reopen_count > 0,
+        "bob's offline runtime must have reopened"
+    );
+    assert!(
+        bob.local.catch_up_attempts > 0,
+        "bob must have executed retained-history catch-up"
+    );
     for client in &spec.clients {
         let app = &app_observations[client];
-        let process = process_observations[client];
+        let process = &process_observations[client];
         assert_eq!(
             app.protocol, process.protocol,
             "{client} protocol projection"
@@ -519,14 +526,11 @@ async fn app_runtime_and_process_adapters_recover_the_same_offline_projection() 
             process.application.stored_member_count
         );
     }
-
-    process.shutdown().await;
-    app.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
-    let spec = cross_adapter_scenario(false);
+    let spec = cross_adapter_restart_scenario();
     let input = GeneratedScenarioInputV1::new(GeneratedScenarioCase {
         family_name: "selectable-process/v1".into(),
         generator_version: "4".into(),
@@ -762,7 +766,7 @@ fn process_cli_writes_a_private_versioned_report() {
     let report_path = root.path().join("report.json");
     fs_private::write_private(
         &scenario_path,
-        &serde_json::to_vec_pretty(&cross_adapter_scenario(false)).unwrap(),
+        &serde_json::to_vec_pretty(&cross_adapter_restart_scenario()).unwrap(),
     )
     .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-process"))

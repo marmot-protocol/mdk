@@ -906,18 +906,20 @@ async fn execute_scenario_step(
         } => {
             let client_label = client.clone();
             let already_accepted = if let Some(publication) = publication {
-                subject
-                    .scenario_publication_already_accepted(client, publication)
-                    .map_err(|error| subject_step_error(step_index, error))?
+                subject.scenario_publication_already_accepted(client, publication)
             } else {
                 false
             };
             if already_accepted {
                 if *outcome != SubjectOutboundOutcome::Accepted {
-                    return Err(err(
+                    return Err(subject_step_error(
                         step_index,
-                        format!(
-                            "publication {publication:?} for client {client} was already accepted and cannot be rolled back"
+                        SubjectError::classified(
+                            SubjectFailureCategory::ExpectedRefusal,
+                            "publication_rollback_rejected",
+                            format!(
+                                "publication {publication:?} for client {client} was already accepted and cannot be rolled back"
+                            ),
                         ),
                     ));
                 }
@@ -933,10 +935,14 @@ async fn execute_scenario_step(
                     })
                     .collect::<Vec<_>>();
                 if artifacts.is_empty() && publication.is_some() {
-                    return Err(err(
+                    return Err(subject_step_error(
                         step_index,
-                        format!(
-                            "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
+                        SubjectError::classified(
+                            SubjectFailureCategory::ExpectedRefusal,
+                            "publication_not_found",
+                            format!(
+                                "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
+                            ),
                         ),
                     ));
                 }

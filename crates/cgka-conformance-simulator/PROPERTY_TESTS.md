@@ -130,8 +130,10 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   state commitment.
 - Boundary: the engine harness exposes inbound delivery events, not the app's durable local-sender projection, and its
   event window is intentionally cleared by restart. The test compares those narrower engine observations only where
-  their semantics overlap. It does not claim exact MLS-state or active-decryptability evidence from app/process
-  adapters.
+  their semantics overlap. On app/process adapters, a labelled accepted acknowledgement attests that the mutation's
+  production command returned after publishing; the resulting `PendingResolution { resolution: "confirmed" }` is not
+  independent transport-delivery evidence on those subjects. It does not claim exact MLS-state or
+  active-decryptability evidence from app/process adapters.
 - Why: fixture portability and capability preflight alone do not prove that production-shaped adapters execute the
   same scenario meaning.
 
@@ -141,7 +143,8 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   two subjects that declare participant-connectivity and retained-history capabilities.
 - Checks: Bob misses a profile commit and application message while offline, Carol durably restarts, Bob reconnects,
   every participant performs a full-history repair, and both adapters reach the same public protocol commitment,
-  roster, profile, administration, and duplicate-free application-message set.
+  roster, profile, administration, and duplicate-free application-message set. Bob's app-local online, reopen, and
+  catch-up diagnostics pin the offline/recovery precondition rather than inferring it only from the final projection.
 - Boundary: this is public projection evidence. Adapter-local message ids, runtime event counts, database paths, and
   other execution-specific observations are deliberately not compared.
 

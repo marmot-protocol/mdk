@@ -366,12 +366,8 @@ pub trait ConvergenceSubject: Send {
     /// subjects return `false` and expose transport-ready artifacts for an
     /// explicit acknowledgement; auto-publishing app adapters override this
     /// so the same canonical IR can retain its publication checkpoint.
-    fn scenario_publication_already_accepted(
-        &self,
-        _client: &str,
-        _publication: &str,
-    ) -> Result<bool, SubjectError> {
-        Ok(false)
+    fn scenario_publication_already_accepted(&self, _client: &str, _publication: &str) -> bool {
+        false
     }
 
     fn poll_outbound(

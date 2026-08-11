@@ -1214,16 +1214,17 @@ residual gap.
    six generated families with zero failures, timeouts, signals, integrity errors, missing artifacts, or failure
    capsules. It tested commit `7b0480604a84b8f5728289c18018dd71d8d33e77` on base
    `5e90b22e`, so it is retained evidence for that snapshot rather than evidence for later production changes.
-5. [ ] Complete the #1285 cross-route regression across every capable adapter. The engine checkpoint is now permanent
+5. [ ] Complete the #1285 cross-route regression across every capable adapter. The `CgkaEngine` checkpoint is now permanent
    as `cross-route-own-commit-recovery/v1` and pins exact cryptographic, decryptability, commit-disposition, pending-work,
    and projection agreement after restart. `cross-route-retained-history-recovery/v1` now establishes the same contract
-   through retained relay histories; app-runtime, process, container, and VM evidence remains.
-   The first implementation slice runs one capability-overlap restart journey unchanged through engine, app-runtime,
-   and separate-process adapters, plus a companion offline/full-history journey through the app-runtime and process
-   adapters that implement participant connectivity. It compares their public protocol and application projections
-   without weakening the four-party vector or claiming exact cryptographic/disposition evidence from adapters that
-   cannot expose it. The decision-route inventory is machine checked; keep the remaining assurance artifacts
-   independent of #1293.
+   through retained relay histories; full app-runtime, process, container, and VM evidence remains.
+   The first implementation slice runs one capability-overlap restart journey unchanged through the `CgkaEngine`
+   harness and the full app-runtime/separate-process adapters, crossing the production-shaped `CgkaEngine`,
+   `TransportPeeler`, and `TransportAdapter` seams in the latter two. A companion offline/full-history journey runs
+   through the app-runtime and process adapters that implement participant connectivity. It compares their public
+   protocol and application projections without weakening the four-party vector or claiming exact
+   cryptographic/disposition evidence from adapters that cannot expose it. The decision-route inventory is machine
+   checked; keep the remaining assurance artifacts independent of #1293.
 6. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
 7. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
@@ -1382,7 +1383,7 @@ incorrect result.
 | 2026-08-10 | Strict generated-family oracle closure | Closed the known strict-oracle false positives across every built-in generated family without changing production convergence behavior: subset exact-equivalence now counts as observed evidence when its executable expectation passes, convergence delivery has an exact/decryptable settle tail, and adversarial arms pin accepted publication plus deterministic delivery claims. Generator versions changed where scenario meaning changed. | [MDK #1349](https://github.com/marmot-protocol/mdk/pull/1349); all 28 vectors; all six families at seeds `1`, `42`, and `1337`; full simulator suite; `test-policy-overrides` campaign gate; `just fast-ci` |
 | 2026-08-11 | All-family isolated campaign evidence | Generalized the isolated worker runner to all six generated families, then reviewed 60 file-backed campaigns and 1,170 cases with exact inputs, reports, fixture candidates, process accounting, deadlines, and failure-capsule paths preserved per case. No case failed, timed out, signaled, lost artifact integrity, or emitted a failure capsule. Recorded the exact tested snapshot and corrected the aggregate slowest-case bookkeeping limitation rather than carrying the result forward to newer production code. | [MDK #1357](https://github.com/marmot-protocol/mdk/pull/1357); tested commit `7b0480604a84b8f5728289c18018dd71d8d33e77` on base `5e90b22e`; 1,170/1,170 cases passed |
 | 2026-08-11 | Post-campaign convergence deltas | Merged fail-closed missing-anchor handling and Welcome-repair retirement, atomic self-removal persistence, and armed backfill after catch-up. These changes postdate the reviewed all-family matrix and therefore require focused current-`master` delta evidence rather than being covered by the older green result. | [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329); [MDK #1360](https://github.com/marmot-protocol/mdk/pull/1360); [MDK #1365](https://github.com/marmot-protocol/mdk/pull/1365) |
-| 2026-08-11 | 6.1 cross-adapter public projection checkpoint | Made accepted publication checkpoints portable across the engine's staged transport and the app runtime's already-published command surface, then ran a three-participant profile/message/restart IR unchanged through engine, app-runtime, and isolated app processes. A companion app/process permutation takes one member offline across the commit and message, restarts another member, performs full-history repair, and requires equivalent duplicate-free public projections. Exact MLS state, active decryptability, the four-party adversarial topology, containers, and VMs remain open. | `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`; `app_runtime_and_process_adapters_recover_the_same_offline_projection`; simulator-only adapter seam and focused process/app tests |
+| 2026-08-11 | 6.1 cross-adapter public projection checkpoint | Made accepted publication checkpoints portable across the `CgkaEngine` harness's staged transport and the app runtime's already-published command surface, then ran a three-participant profile/message/restart IR unchanged through the `CgkaEngine` harness, full app-runtime adapter, and isolated app processes. The production-shaped adapters cross the `CgkaEngine`, `TransportPeeler`, and `TransportAdapter` seams. A companion app/process permutation takes one member offline across the commit and message, restarts another member, performs full-history repair, and requires equivalent duplicate-free public projections. Exact MLS state, active decryptability, the four-party adversarial topology, containers, and VMs remain open. | `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`; `app_runtime_and_process_adapters_recover_the_same_offline_projection`; simulator-only adapter seam and focused process/app tests |
 
 ## Capability Naming Cleanup
 
