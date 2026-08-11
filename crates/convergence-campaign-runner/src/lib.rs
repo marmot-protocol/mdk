@@ -10,6 +10,7 @@ pub mod failure_corpus;
 pub mod lane;
 pub mod manifest;
 pub mod plan;
+pub mod regression_campaign;
 pub mod runner;
 
 pub use evidence::*;
@@ -17,6 +18,7 @@ pub use failure_corpus::*;
 pub use lane::*;
 pub use manifest::*;
 pub use plan::*;
+pub use regression_campaign::*;
 pub use runner::*;
 
 /// Runner-owned DNS alias attached only to the campaign relay container.

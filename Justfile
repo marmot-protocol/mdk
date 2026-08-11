@@ -329,6 +329,11 @@ convergence-failure-corpus:
     cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
     cargo nextest run -p cgka-conformance-simulator --test semantic_reduction --locked
 
+# Run the small post-fix regression matrix against a clean source revision and
+# retain its exact test selectors, private logs, source identity, and digests.
+focused-convergence-regressions out:
+    cargo run -p convergence-campaign-runner --bin cgka-regression-campaign --locked -- --out "{{out}}"
+
 # Capability-level entry points used by the scheduled workflows. PR checks
 # remain split into separately named steps for useful failure attribution.
 convergence-nightly-lane: convergence-lane-policy convergence-failure-corpus simulator-full adversarial-reliability-ci convergence-verification-ci
