@@ -2029,6 +2029,7 @@ impl HarnessClient {
 impl HarnessClient {
     pub(crate) fn capture_engine_events(&mut self) {
         let events = self.engine_mut().drain_events();
+        let mut delivered_application_events = Vec::new();
         for event in events {
             if let GroupEvent::GroupJoined { group_id, .. } = &event
                 && self.default_group.is_none()
@@ -2051,10 +2052,15 @@ impl HarnessClient {
                             .record_resource_refused(&scenario_input);
                     }
                 }
-                GroupEvent::MessageReceived { payload, .. } => {
+                GroupEvent::MessageReceived {
+                    message_id,
+                    payload,
+                    ..
+                } => {
                     let (logical_id, _) = logical_message_fields(payload);
                     self.scenario_input_tracker
                         .record_delivered_logical(&logical_id);
+                    delivered_application_events.push(message_id.clone());
                 }
                 GroupEvent::AppMessageInvalidated {
                     message_id, reason, ..
@@ -2109,6 +2115,9 @@ impl HarnessClient {
             }
             self.pending_events.push(event);
         }
+        self.storage()
+            .delete_pending_application_events(&delivered_application_events)
+            .expect("captured application events are durably acknowledged");
     }
 }
 

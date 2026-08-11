@@ -3,6 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cgka_conformance_simulator::{ClientBuilder, HarnessStorageMode, TransportBus};
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{GroupStorage, StorageProvider};
 use storage_sqlite::{
     SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
@@ -68,6 +69,42 @@ async fn encrypted_file_restart_closes_reopens_and_hydrates_group_state() {
         .expect("read synchronous mode");
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(synchronous, 2, "production default must be FULL");
+}
+
+#[tokio::test]
+async fn captured_application_event_is_not_replayed_after_restart() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice-outbox")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob-outbox")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("outbox-ack", vec![bob_key_package], Vec::new())
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    bob.drain_events();
+
+    alice.send_app(b"fresh chat".to_vec()).await;
+    bus.deliver_all();
+    bob.tick().await;
+    let delivered = bob.drain_events();
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+            .count(),
+        1,
+    );
+
+    bob.restart();
+    assert!(
+        bob.drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. })),
+        "captured application delivery must be acknowledged before restart",
+    );
 }
 
 #[tokio::test]
