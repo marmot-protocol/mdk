@@ -57,8 +57,8 @@ the property-test registry. This file is the agent-facing model.
 
 - **Module:** `src/family.rs`
   - **Role:** Deterministic generated scenario families. `generate_send_leave_family`,
-    `generate_convergence_e2e_delivery_family`, `generate_convergence_chaos_family`, and
-    `generate_admin_churn_family` record family name, generator
+    `generate_convergence_e2e_delivery_family`, `generate_convergence_chaos_family`,
+    `generate_admin_churn_family`, and `generate_bounded_convergence_pressure_family` record family name, generator
     version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report`
     adds generated metadata to report artifacts. Reliability families append a final global drain, exact canonical
     observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
@@ -241,6 +241,12 @@ instead of only writing an observation dump. Generator version `6` draws the del
 shapes (arms 2, 6, 7, 8, 9) from the seed, so distinct seeds exercise distinct adversarial orderings; the
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed, so coverage grows with the seed
 without re-pinning vectors.
+
+The `bounded-convergence-pressure/v1` generated family is the finite-pressure acceptance campaign for the unified
+fork-resolution route: a same-epoch commit race, application sends issued inside the quiescence window, a committer
+restart taken mid-resolution, and a bounded self-update/profile/admin tail. It activates controlled virtual time before
+the race, so every later settle must be `AwaitQuiescence`; the driver's watchdog budget is the bounded-time assertion.
+The campaign is finite by construction and claims nothing about progress under unbounded self-updates.
 
 ## How to add a new scripted scenario
 

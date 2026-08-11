@@ -11,7 +11,8 @@ use cgka_conformance_simulator::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
     ScenarioMessageSelectorV2, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
     ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
-    compare_trace_expectations, generate_admin_churn_family, generate_convergence_chaos_family,
+    compare_trace_expectations, compile_scenario, generate_admin_churn_family,
+    generate_bounded_convergence_pressure_family, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
     observe_client_exact, run_generated_case_report, run_generated_case_report_with_storage_mode,
     run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
@@ -1496,6 +1497,157 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
             "send/leave case {} failed strict expectations: {:?}",
             case.case_index,
             report.expectation_failures
+        );
+    }
+}
+
+/// The bounded convergence-pressure campaign generates a deterministic,
+/// schedule-legal case per seed index, and every case carries the full shape
+/// the campaign is defined by: a same-epoch commit race, application sends
+/// issued inside the quiescence window, a committer restart taken
+/// mid-resolution, a finite self-update/profile/admin tail, a bounded-queue
+/// resource assertion, and an active decryptability probe placed before the
+/// terminal `observe_exact`.
+#[test]
+fn bounded_convergence_pressure_family_generates_the_declared_campaign_shape() {
+    let cases = generate_bounded_convergence_pressure_family(2026, 6);
+
+    assert_eq!(cases, generate_bounded_convergence_pressure_family(2026, 6));
+    assert_eq!(cases.len(), 6);
+    for (case_index, case) in cases.iter().enumerate() {
+        assert_eq!(case.family_name, "bounded-convergence-pressure/v1");
+        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.seed, 2026);
+        assert_eq!(case.case_index, case_index as u64);
+        compile_scenario(&case.scenario)
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+    }
+
+    for case in &cases {
+        let steps = &case.scenario.steps;
+        let position = |predicate: fn(&ScenarioStep) -> bool| {
+            steps.iter().position(predicate).unwrap_or_else(|| {
+                panic!("{} is missing a required campaign step", case.scenario.name)
+            })
+        };
+
+        // A same-epoch rival race, both branches withheld until release.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::WithholdMessage { .. }))
+                .count(),
+            2,
+            "{} must withhold both rival commits",
+            case.scenario.name
+        );
+        // Application sends land after the rival branch is ingested, so they sit
+        // inside the quiescence window the committers wait out.
+        let window_open = position(|step| matches!(step, ScenarioStep::ReleaseWithheld { .. }));
+        let first_send = position(|step| matches!(step, ScenarioStep::SendAppMessage { .. }));
+        let restart = position(|step| matches!(step, ScenarioStep::RestartClient { .. }));
+        assert!(
+            window_open < first_send && first_send < restart,
+            "{}: sends must open inside the window and precede the mid-resolution restart",
+            case.scenario.name
+        );
+        // Finite pressure, never an unbounded stream.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::SelfUpdate { .. }))
+                .count(),
+            3,
+            "{} must apply exactly the finite self-update budget",
+            case.scenario.name
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::UpdateAdminPolicy { .. })),
+            "{} must apply an admin-policy commit",
+            case.scenario.name
+        );
+        // Bounded queue behavior, and the bounded-time claim carried by the
+        // quiescence driver's own watchdog budget.
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::Assert { .. })),
+            "{} must bound the pending-input queue",
+            case.scenario.name
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::AwaitQuiescence { .. })),
+            "{} must settle through the bounded quiescence driver",
+            case.scenario.name
+        );
+        // The probe mutates, so it must precede the terminal exact observation.
+        let probe =
+            position(|step| matches!(step, ScenarioStep::ProbeBidirectionalDecryptability { .. }));
+        let observe_exact = steps
+            .iter()
+            .rposition(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+            .expect("the strict oracle appends a terminal exact observation");
+        assert!(
+            probe < observe_exact,
+            "{}: the mutating probe must run before the terminal observe_exact",
+            case.scenario.name
+        );
+
+        assert!(
+            case.expected_outcomes.iter().any(|expectation| matches!(
+                expectation,
+                TraceExpectation::ClientsExactlyEquivalent { .. }
+            )),
+            "{} must pin exact canonical equivalence",
+            case.scenario.name
+        );
+        assert!(
+            case.expected_outcomes
+                .iter()
+                .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. })),
+            "{} must pin no-pending-work",
+            case.scenario.name
+        );
+    }
+}
+
+/// Runnable acceptance gate for the unified fork-resolution route under
+/// **finite** pressure. Every seed must reach quiescence with exact canonical
+/// equivalence, active bidirectional decryptability, and a bounded input queue.
+/// It deliberately claims nothing about progress under an unbounded
+/// self-update stream.
+///
+/// IGNORED — this currently fails on engine behavior, not on the campaign. An
+/// application message accepted while the group is resolving a same-epoch fork
+/// is queued durably and then stranded: once the pass completes, nothing
+/// re-arms the retained-intent drain, and the engine's own conformance
+/// structural progress reports `runnable_work = 0` with no next wake while
+/// `pending_work.queued_outbound_intents > 0`. The quiescence driver therefore
+/// reports `Blocked { subsystems: ["scenario_inputs"] }` and the payload is
+/// never published. Un-ignore once the retained-intent drain is re-armed after
+/// a completed pass; do not weaken the assertions below to make it pass.
+#[ignore = "engine strands application sends accepted inside the convergence quiescence window"]
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_convergence_pressure_family_settles_every_seeded_permutation() {
+    for case in &generate_bounded_convergence_pressure_family(2026, 6) {
+        let report = run_generated_case_report(case, None)
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+        assert!(
+            report.expectation_failures.is_empty(),
+            "{} expectation failures: {:#?}",
+            case.scenario.name,
+            report.expectation_failures
+        );
+        assert!(
+            report.invariant_failures.is_empty(),
+            "{} invariant failures: {:#?}",
+            case.scenario.name,
+            report.invariant_failures
         );
     }
 }

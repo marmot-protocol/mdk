@@ -707,7 +707,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... [--adapter engine|retained-relay|app-runtime] | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|admin-churn/v1|adversarial-reliability/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... [--adapter engine|retained-relay|app-runtime] | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|admin-churn/v1|adversarial-reliability/v1|bounded-convergence-pressure/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
 }
 
 #[cfg(test)]

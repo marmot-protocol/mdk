@@ -144,6 +144,9 @@ pub fn generate_family_case(
         "convergence-chaos/v1" => generate_convergence_chaos_case(seed, case_index),
         "admin-churn/v1" => generate_admin_churn_case(seed, case_index),
         "adversarial-reliability/v1" => generate_adversarial_reliability_case(seed, case_index),
+        "bounded-convergence-pressure/v1" => {
+            generate_bounded_convergence_pressure_case(seed, case_index)
+        }
         "chat-journey/v1" => {
             crate::stateful_generator::generate_stateful_chat_journey_case(seed, case_index)
         }
@@ -260,6 +263,47 @@ pub fn generate_admin_churn_case(seed: u64, case_index: u64) -> GeneratedScenari
     }
     GeneratedScenarioCase {
         family_name: "admin-churn/v1".into(),
+        generator_version: "1".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::Engine,
+        scenario,
+        expected_outcomes,
+    }
+}
+
+/// Generate the bounded convergence-pressure campaign.
+///
+/// Every case races two same-epoch profile commits, then applies **finite**
+/// pressure while that fork is unresolved: a bounded self-update stream,
+/// profile and admin-policy commits, application sends issued inside the
+/// quiescence window, and a restart of one committer mid-resolution. Seeds
+/// permute the sibling release order, the restarted committer, and the
+/// window-send order.
+///
+/// The campaign is deliberately finite. It claims eventual quiescence, exact
+/// convergence, and bounded queue/time behavior **for bounded input only**; it
+/// makes no progress claim under an unbounded self-update stream.
+pub fn generate_bounded_convergence_pressure_family(
+    seed: u64,
+    cases: usize,
+) -> Vec<GeneratedScenarioCase> {
+    (0..cases)
+        .map(|case_index| generate_bounded_convergence_pressure_case(seed, case_index as u64))
+        .collect()
+}
+
+/// Generate one bounded-pressure case without regenerating any prior index.
+pub fn generate_bounded_convergence_pressure_case(
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x424f_554e_4445_4421 ^ case_index.rotate_left(29));
+    let (mut scenario, mut expected_outcomes) =
+        bounded_convergence_pressure_case(&mut rng, case_index);
+    add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name: "bounded-convergence-pressure/v1".into(),
         generator_version: "1".into(),
         seed,
         case_index,
@@ -1486,6 +1530,233 @@ fn convergence_chaos_restart_delivery_faults(
         client_state("alice", 1, 3, vec![payload]),
     ];
     (scenario, expected)
+}
+
+/// Finite self-updates applied in the bounded pressure phase. The campaign
+/// deliberately stays finite: no progress claim is made, or intended, for an
+/// unbounded self-update stream.
+const BOUNDED_PRESSURE_SELF_UPDATES: usize = 3;
+
+/// Upper bound on scenario inputs pending anywhere in the subject while the
+/// fork is unresolved. Every input this campaign creates is one of the finitely
+/// many commits or application sends the generator emits, so a queue that grows
+/// past this bound means retained intent is accumulating rather than draining.
+const BOUNDED_PRESSURE_MAX_PENDING_INPUTS: usize = 24;
+
+/// Build one bounded convergence-pressure case.
+///
+/// The shape is: a same-epoch profile-commit race, application sends issued
+/// after every member has ingested the rival branch (so they land inside the
+/// quiescence window the committers wait out), a committer restart taken
+/// mid-resolution, and then a finite tail of self-update, profile, and
+/// admin-policy commits. Settling always goes through `AwaitQuiescence` once
+/// virtual time is active, so the bounded-time claim is the driver's own
+/// watchdog budget rather than an invented metric.
+fn bounded_convergence_pressure_case(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let clients = labels(["alice", "bob", "carol", "dave"]);
+
+    // Seed-derived permutations. The behavior under test is schedule-invariant,
+    // so distinct seeds widen ordering coverage without re-pinning outcomes.
+    let release_alice_first = rng.gen_bool(0.5);
+    let restart_committer = if rng.gen_bool(0.5) { "alice" } else { "bob" };
+    let mut window_senders = clients.clone();
+    let window_rotation = rng.gen_range(0..clients.len());
+    window_senders.rotate_left(window_rotation);
+    let self_updates_first = rng.gen_bool(0.5);
+    let self_update_client = if rng.gen_bool(0.5) { "carol" } else { "dave" };
+
+    let mut steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: "alice".into(),
+            name: format!("bounded-pressure-{case_index}"),
+            invitees: labels(["bob", "carol", "dave"]),
+            required_features: vec![],
+            initial_admins: Some(labels(["alice", "bob"])),
+            pending: "create".into(),
+        },
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob", "carol", "dave"]),
+        clear_vec(clients.clone()),
+        // Activate controlled virtual time before the fork. From here on the
+        // quiescence window is a real deadline instead of a far-future tick
+        // shortcut, so every settle below must be `AwaitQuiescence`; bare ticks
+        // remain only where the scenario deliberately wakes participants
+        // *without* settling them.
+        ScenarioStep::AdvanceTime { delta_ms: 1 },
+        // Same-epoch rival commits from the two admins.
+        ScenarioStep::UpdateGroupData {
+            client: "alice".into(),
+            name: format!("alice branch {case_index}"),
+            pending: "alice-fork".into(),
+        },
+        ScenarioStep::UpdateGroupData {
+            client: "bob".into(),
+            name: format!("bob branch {case_index}"),
+            pending: "bob-fork".into(),
+        },
+        confirmed_step("alice", "alice-fork"),
+        confirmed_step("bob", "bob-fork"),
+        ScenarioStep::WithholdMessage {
+            selector: publication_selector("alice-fork", ScenarioTransportClass::Commit),
+            label: "alice-fork-commit".into(),
+        },
+        ScenarioStep::WithholdMessage {
+            selector: publication_selector("bob-fork", ScenarioTransportClass::Commit),
+            label: "bob-fork-commit".into(),
+        },
+    ];
+
+    let release_order = if release_alice_first {
+        ["alice-fork-commit", "bob-fork-commit"]
+    } else {
+        ["bob-fork-commit", "alice-fork-commit"]
+    };
+    for label in release_order {
+        steps.push(ScenarioStep::ReleaseWithheld {
+            label: label.into(),
+        });
+    }
+    steps.push(ScenarioStep::DeliverAll);
+    // Wake every member on the rival branch without settling: this is what opens
+    // the quiescence window that the sends below must survive.
+    steps.push(tick_vec(clients.clone()));
+
+    // Application traffic issued while fork resolution is pending.
+    let mut window_payloads = Vec::new();
+    for sender in &window_senders {
+        let payload = format!("window:{sender}:{case_index}");
+        steps.push(ScenarioStep::SendAppMessage {
+            sender: sender.clone(),
+            payload: payload.clone(),
+        });
+        window_payloads.push((sender.clone(), payload));
+    }
+    // Restart one committer mid-resolution: it must re-derive the fork from
+    // durable storage rather than from live in-memory candidate state.
+    steps.push(ScenarioStep::RestartClient {
+        client: restart_committer.into(),
+    });
+    let post_restart_sender = clients
+        .iter()
+        .find(|client| client.as_str() != restart_committer)
+        .expect("a non-restarted client exists")
+        .clone();
+    let post_restart_payload = format!("post-restart:{post_restart_sender}:{case_index}");
+    steps.push(ScenarioStep::SendAppMessage {
+        sender: post_restart_sender.clone(),
+        payload: post_restart_payload.clone(),
+    });
+    window_payloads.push((post_restart_sender, post_restart_payload));
+
+    steps.push(ScenarioStep::Assert {
+        assertion: crate::ScenarioAssertionV2::Resource {
+            metric: crate::ScenarioResourceMetric::ScenarioInputsPending,
+            comparison: crate::ScenarioComparison::LessThanOrEqual,
+            value: BOUNDED_PRESSURE_MAX_PENDING_INPUTS,
+        },
+    });
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(clients.clone()));
+    steps.push(ScenarioStep::AwaitQuiescence {
+        policy: crate::QuiescencePolicy::default(),
+    });
+
+    // Finite pressure tail: bounded self-updates plus one profile and one
+    // admin-policy commit, ordered by seed.
+    let mut self_update_steps = Vec::new();
+    for round in 0..BOUNDED_PRESSURE_SELF_UPDATES {
+        let pending = format!("self-update-{round}");
+        self_update_steps.push(ScenarioStep::SelfUpdate {
+            client: self_update_client.into(),
+            pending: pending.clone(),
+        });
+        self_update_steps.push(confirmed_step(self_update_client, &pending));
+        self_update_steps.push(ScenarioStep::AwaitQuiescence {
+            policy: crate::QuiescencePolicy::default(),
+        });
+    }
+    let pressure_profile_name = format!("bounded-pressure settled {case_index}");
+    let pressure_admins = labels(["alice", "bob", "carol"]);
+    let commit_steps = vec![
+        ScenarioStep::UpdateGroupData {
+            client: "alice".into(),
+            name: pressure_profile_name.clone(),
+            pending: "pressure-profile".into(),
+        },
+        confirmed_step("alice", "pressure-profile"),
+        ScenarioStep::AwaitQuiescence {
+            policy: crate::QuiescencePolicy::default(),
+        },
+        ScenarioStep::UpdateAdminPolicy {
+            client: "alice".into(),
+            admins: pressure_admins.clone(),
+            pending: "pressure-admin".into(),
+        },
+        confirmed_step("alice", "pressure-admin"),
+        ScenarioStep::AwaitQuiescence {
+            policy: crate::QuiescencePolicy::default(),
+        },
+    ];
+    if self_updates_first {
+        steps.extend(self_update_steps);
+        steps.extend(commit_steps);
+    } else {
+        steps.extend(commit_steps);
+        steps.extend(self_update_steps);
+    }
+
+    steps.push(ScenarioStep::Assert {
+        assertion: crate::ScenarioAssertionV2::Resource {
+            metric: crate::ScenarioResourceMetric::ScenarioInputsPending,
+            comparison: crate::ScenarioComparison::LessThanOrEqual,
+            value: BOUNDED_PRESSURE_MAX_PENDING_INPUTS,
+        },
+    });
+    steps.push(ScenarioStep::ObserveAdminPolicy {
+        clients: clients.clone(),
+    });
+    // The decryptability probe is a mutating probe, so it must run before the
+    // terminal `observe_exact` the strict oracle appends; a later observation is
+    // what the per-client convergence-decision pins read.
+    steps.push(ScenarioStep::ProbeBidirectionalDecryptability {
+        clients: clients.clone(),
+    });
+    steps.push(ScenarioStep::AwaitQuiescence {
+        policy: crate::QuiescencePolicy::default(),
+    });
+
+    let mut expected = vec![
+        clients_converged_vec(clients.clone(), None, Some(4)),
+        TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: clients.clone(),
+        },
+    ];
+    for client in &clients {
+        expected.push(TraceExpectation::AdminPolicy {
+            client: client.clone(),
+            admins: pressure_admins.clone(),
+        });
+        expected.push(TraceExpectation::GroupProfile {
+            client: client.clone(),
+            name: pressure_profile_name.clone(),
+            description: String::new(),
+        });
+    }
+
+    (
+        ScenarioSpec {
+            name: format!("bounded-convergence-pressure/v1/case-{case_index}"),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients,
+            steps,
+        },
+        expected,
+    )
 }
 
 /// Select one of the twelve adversarial workload shapes by stable case index.
