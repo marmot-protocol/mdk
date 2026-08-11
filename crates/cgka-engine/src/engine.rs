@@ -17,8 +17,8 @@ use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent,
-    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
+    GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::{PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -109,30 +109,6 @@ pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn newest_fork_snapshot(
-    names: impl IntoIterator<Item = String>,
-    prefix: &str,
-) -> Result<Option<String>, ()> {
-    let mut newest: Option<(u64, String)> = None;
-    for name in names {
-        let Some(suffix) = name.strip_prefix(prefix) else {
-            continue;
-        };
-        let (counter, digest) = suffix.split_once('-').ok_or(())?;
-        if digest.is_empty() {
-            return Err(());
-        }
-        let counter = counter.parse::<u64>().map_err(|_| ())?;
-        if newest
-            .as_ref()
-            .is_none_or(|(newest_counter, _)| counter > *newest_counter)
-        {
-            newest = Some((counter, name));
-        }
-    }
-    Ok(newest.map(|(_, name)| name))
-}
-
 /// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
 /// A group-state change effected by a locally staged commit, buffered until
 /// publish confirmation merges that commit. `actor` attributes the change: for
@@ -171,8 +147,11 @@ pub struct Engine<S: StorageProvider> {
     /// allocation, and fork-detection marker flows through this struct.
     pub(crate) epoch_manager: crate::epoch_manager::EpochManager,
 
-    /// Snapshot + ordering metadata for same-epoch competing commits.
-    pub(crate) fork_recovery: crate::fork_recovery::ForkRecoveryManager,
+    /// Storage-layer identity of the origin commit behind each in-flight
+    /// pending publish, so `do_confirm_published` can mark the sent commit
+    /// row `Processed` (and key its own-commit checkpoint) and
+    /// `do_publish_failed` can drop the entry again.
+    pub(crate) pending_origin_commits: HashMap<PendingStateRef, MessageId>,
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
@@ -564,7 +543,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             wall_clock: self.wall_clock,
             maintenance_random: self.maintenance_random,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
-            fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
+            pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
@@ -1645,41 +1624,19 @@ impl<S: StorageProvider> Engine<S> {
                 .pending_ref()
                 .expect("pending fanout state retains its pending ref");
             let prior_epoch = EpochId(mls_group.epoch().as_u64());
+            // Validate the fanout's origin-commit row still resolves to a
+            // stored OpenMLS wire message before restoring the pending
+            // lifecycle around it.
             let stored = self
                 .storage
                 .get_message(fanout.message_id())
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
             let payload = StoredMessagePayload::decode(&stored.payload)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            let commit_bytes = payload
-                .as_openmls_wire()
-                .map(|message| message.payload.as_slice())
-                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            let priority = crate::app_components::commit_ordering_priority_for_staged(
-                mls_group
-                    .pending_commit()
-                    .expect("pending commit presence checked above"),
-            );
-            let snapshot_prefix = format!("fork-{}-", prior_epoch.0);
-            let snapshots = self
-                .storage
-                .list_group_snapshots(group_id)
-                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            let snapshot_name = newest_fork_snapshot(snapshots, &snapshot_prefix)
-                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
-                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            Some((
-                pending_ref,
-                prior_epoch,
-                fanout.message_id().clone(),
-                CommitOrderingKey::from_commit_bytes(
-                    prior_epoch,
-                    priority,
-                    self.identity.self_id().clone(),
-                    commit_bytes,
-                ),
-                snapshot_name,
-            ))
+            if payload.as_openmls_wire().is_none() {
+                return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+            }
+            Some((pending_ref, prior_epoch, fanout.message_id().clone()))
         } else {
             None
         };
@@ -1807,9 +1764,7 @@ impl<S: StorageProvider> Engine<S> {
             self.epoch_manager
                 .restore_unrecoverable(group_id.clone(), group.epoch);
             ("unrecoverable", "hydrate_unrecoverable_group")
-        } else if let Some((pending_ref, prior_epoch, message_id, ordering_key, snapshot_name)) =
-            pending_recovery
-        {
+        } else if let Some((pending_ref, prior_epoch, message_id)) = pending_recovery {
             self.epoch_manager
                 .restore_pending(
                     group_id.clone(),
@@ -1820,14 +1775,7 @@ impl<S: StorageProvider> Engine<S> {
                     crate::epoch_manager::PendingKind::GroupEvolution,
                 )
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            self.fork_recovery.record_pending(
-                pending_ref,
-                group_id.clone(),
-                prior_epoch,
-                message_id,
-                ordering_key,
-                snapshot_name,
-            );
+            self.track_pending_origin_commit(pending_ref, message_id);
             ("pending_publish", "hydrate_stable_group")
         } else if restored_durable_evolution {
             ("pending_publish", "hydrate_stable_group")
@@ -1946,17 +1894,12 @@ impl<S: StorageProvider> Engine<S> {
         let Some(exact_message) = payload.as_exact_transport().cloned() else {
             return recovery_failed();
         };
-        let Some(openmls_message) = payload.as_openmls_wire() else {
+        if payload.as_openmls_wire().is_none() {
             return recovery_failed();
-        };
-        let Some(staged_commit) = mls_group.pending_commit() else {
+        }
+        if mls_group.pending_commit().is_none() {
             return recovery_failed();
-        };
-        let commit_priority =
-            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
-        let Some(snapshot) = evolution.recovery_snapshot.clone() else {
-            return recovery_failed();
-        };
+        }
 
         self.epoch_manager
             .set_stable(group_id.clone(), source_epoch);
@@ -1985,19 +1928,7 @@ impl<S: StorageProvider> Engine<S> {
             let _ = maintenance.put_group_evolution(&evolution);
             return recovery_failed();
         }
-        self.track_pending_commit_for_recovery(
-            pending,
-            group_id.clone(),
-            source_epoch,
-            message_id,
-            cgka_traits::engine::CommitOrderingKey::from_commit_bytes(
-                source_epoch,
-                commit_priority,
-                self.identity.self_id().clone(),
-                &openmls_message.payload,
-            ),
-            snapshot,
-        );
+        self.track_pending_origin_commit(pending, message_id);
         self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
             msg: exact_message,
             pending,
@@ -2666,26 +2597,34 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Emit a `SnapshotCreated` audit event. Call this immediately after
-    /// `self.fork_recovery.create_snapshot(&self.storage, ...)` succeeds.
-    /// Kept separate from the `create_snapshot` call so callers preserve
-    /// disjoint-field borrow patterns when a `provider` is alive.
-    pub(crate) fn audit_snapshot_created(
-        &self,
-        group_id: &GroupId,
-        snapshot_name: &str,
-        source_epoch: EpochId,
-        reason: &str,
+    /// Record the origin-commit storage id of a freshly staged pending
+    /// publish. `do_confirm_published` reads it to mark the sent commit row
+    /// `Processed` and key its own-commit checkpoint; `do_publish_failed`
+    /// drops it again.
+    pub(crate) fn track_pending_origin_commit(
+        &mut self,
+        pending: PendingStateRef,
+        origin_commit_id: MessageId,
     ) {
-        self.audit_group(
-            group_id,
-            AuditEventKind::SnapshotCreated {
-                snapshot_name: snapshot_name.to_string(),
-                source_epoch: source_epoch.0,
-                reason: reason.to_string(),
-                state_digest: None,
-            },
-        );
+        self.pending_origin_commits
+            .insert(pending, origin_commit_id);
+    }
+
+    /// Read the origin-commit storage id for a pending entry **without**
+    /// consuming it. `do_confirm_published` needs this id inside its durable
+    /// transaction, but the entry must survive until the transaction has
+    /// committed so a rolled-back, retried confirm sees the same state.
+    pub(crate) fn peek_pending_origin_commit(&self, pending: PendingStateRef) -> Option<MessageId> {
+        self.pending_origin_commits.get(&pending).cloned()
+    }
+
+    /// Consume the pending entry after its publish lifecycle resolved
+    /// (confirmed or failed).
+    pub(crate) fn take_pending_origin_commit(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Option<MessageId> {
+        self.pending_origin_commits.remove(&pending)
     }
 
     /// Return the Marmot group metadata mirrored from signed MLS group state.
@@ -3222,31 +3161,5 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     async fn delete_key_package(&mut self, key_package: &KeyPackage) -> Result<(), EngineError> {
         self.do_delete_key_package(key_package)
-    }
-}
-
-#[cfg(test)]
-mod frozen_fanout_recovery_tests {
-    use super::newest_fork_snapshot;
-
-    #[test]
-    fn recovery_snapshot_selection_compares_numeric_counters() {
-        let names = vec![
-            "fork-7-9-old".to_string(),
-            "fork-7-10-new".to_string(),
-            "fork-6-99-other-epoch".to_string(),
-        ];
-        assert_eq!(
-            newest_fork_snapshot(names, "fork-7-").unwrap().as_deref(),
-            Some("fork-7-10-new")
-        );
-    }
-
-    #[test]
-    fn recovery_snapshot_selection_rejects_malformed_matching_names() {
-        assert!(
-            newest_fork_snapshot(vec!["fork-7-not-a-counter-digest".to_string()], "fork-7-")
-                .is_err()
-        );
     }
 }

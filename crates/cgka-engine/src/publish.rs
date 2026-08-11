@@ -89,7 +89,7 @@ impl<S: StorageProvider> Engine<S> {
         // engine's ambient context has cleared by now (this is a later
         // publish-confirm call), so re-attach it explicitly.
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
-        let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
+        let origin_commit_id = self.peek_pending_origin_commit(pending);
         let queued_intent = self.queued_intent_by_pending.get(&pending).cloned();
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -291,9 +291,9 @@ impl<S: StorageProvider> Engine<S> {
         // rows the upcoming `GroupStateChanged` events synthesize, so they can be
         // invalidated by origin commit if this commit later loses a fork. The
         // `Processed` state write already landed in the durable transaction
-        // above; here we only move the recovery record pending → incumbent
-        // (in-memory) and emit the audit line.
-        let origin_commit_id = self.promote_pending_commit_for_recovery(pending);
+        // above; here we only consume the in-memory pending entry and emit the
+        // audit line.
+        let origin_commit_id = self.take_pending_origin_commit(pending);
         if let Some(message_id) = origin_commit_id.as_ref() {
             self.audit_with_context(
                 Some(&group_id),
@@ -303,17 +303,6 @@ impl<S: StorageProvider> Engine<S> {
                     MessageState::Processed,
                     "publish_confirmed",
                 ),
-            );
-        }
-        // Best-effort post-commit cleanup: pruning stale fork-recovery snapshots
-        // is re-runnable on the next confirm/advance, so a transient lock here
-        // must not fail (and thereby orphan) an already-durable confirm.
-        if let Err(e) = self.prune_fork_recovery_for_group(&group_id) {
-            tracing::warn!(
-                target: "cgka_engine::publish",
-                method = "do_confirm_published",
-                transient = e.is_transient(),
-                "deferred fork-recovery prune after confirm; will retry on next pass"
             );
         }
         self.schedule_drain_for_retained_outbound_intents(&group_id);
@@ -370,7 +359,7 @@ impl<S: StorageProvider> Engine<S> {
         mut fanout: Option<&mut OutboundFanout>,
     ) -> Result<(), EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
+        let origin_commit_id = self.peek_pending_origin_commit(pending);
 
         let group_id = self
             .epoch_manager
@@ -503,7 +492,7 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(&queued_group_id);
         }
         self.schedule_drain_for_retained_outbound_intents(&group_id);
-        self.forget_pending_commit_for_recovery(pending)?;
+        self.take_pending_origin_commit(pending);
         self.restore_self_remove_auto_commit_schedules_for_group(
             &group_id,
             prior_epoch,
