@@ -148,6 +148,25 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
 - Boundary: this is public projection evidence. Adapter-local message ids, runtime event counts, database paths, and
   other execution-specific observations are deliberately not compared.
 
+### `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`
+
+- Runs: the four-participant cross-route topology through both the strict retained-engine subject and the full
+  `MarmotAppRuntime` adapter. The app harness's real in-memory Nostr relay associates retained events with stable
+  Scenario IR action ids, removes a selected event only while every named recipient is offline, and reinserts it
+  before full-history repair. This avoids treating process timing or a live relay race as controlled delivery.
+- Checks: the retained-engine reference reaches exact canonical equality, durable accepted/invalidated/accepted commit
+  dispositions, no pending work, and all twelve active decryptability edges. The app run pins the intended split at
+  the intermediate checkpoint, compares final public protocol state and active probes with that reference, and keeps
+  the observed falsification explicit.
+- Known falsification: repeated executions have produced two non-equivalent terminal surfaces after the controlled
+  input schedule: either Zeta remains one epoch behind, or public protocol state agrees while Alpha's post-settlement
+  application probe remains neither visible nor invalidated at Zeta after two pre-probe and two post-probe
+  full-history repair/tick passes. The characterization requires at least one equivalence failure, rejects unexpected
+  or duplicate payloads, and fails deliberately if the complete equivalence oracle begins passing so the claim and
+  test must be reviewed together. It is not passing route-equivalence evidence.
+- Boundary: process, container, and VM adapters do not yet expose equivalent controlled retained-event staging. They
+  must not claim this topology from targeted catch-up alone because a live relay can deliver the competing root first.
+
 ## Shared Generators
 
 ### `intent_seq(3, range)`

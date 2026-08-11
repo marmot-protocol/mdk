@@ -15,7 +15,10 @@ use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime,
 };
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::LocalRelay;
+use nostr_relay_builder::prelude::{
+    Event, Filter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -114,17 +117,25 @@ impl Participant {
 
 /// In-process application harness backed by one real local Nostr relay.
 pub struct AppRuntimeHarness {
-    _relay: MockRelay,
+    _relay: LocalRelay,
+    relay_database: MemoryDatabase,
     relay_url: String,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
+    relay_action_events: BTreeMap<String, Vec<Event>>,
+    hidden_relay_events: BTreeMap<String, Event>,
 }
 
 impl AppRuntimeHarness {
     pub async fn new(clients: &[String]) -> Result<Self, SubjectError> {
-        let relay = MockRelay::run().await.map_err(environment_error)?;
+        let relay_database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(75_000),
+        });
+        let relay = LocalRelay::new(RelayBuilder::default().database(relay_database.clone()));
+        relay.run().await.map_err(environment_error)?;
         let relay_url = relay.url().await.to_string();
         let endpoint = TransportEndpoint::from(relay_url.clone());
         let mut participants = BTreeMap::new();
@@ -175,7 +186,132 @@ impl AppRuntimeHarness {
             scenario_groups: BTreeMap::new(),
             active_scenario_group: None,
             accepted_publications: BTreeMap::new(),
+            relay_action_events: BTreeMap::new(),
+            hidden_relay_events: BTreeMap::new(),
+            relay_database,
         })
+    }
+
+    async fn relay_events(&self) -> Result<Vec<Event>, SubjectError> {
+        let mut events = self
+            .relay_database
+            .query(Filter::new())
+            .await
+            .map_err(environment_error)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.id);
+        Ok(events)
+    }
+
+    async fn record_relay_action_events(
+        &mut self,
+        action_id: &str,
+        before: BTreeSet<String>,
+    ) -> Result<(), SubjectError> {
+        let events = self
+            .relay_events()
+            .await?
+            .into_iter()
+            .filter(|event| !before.contains(&event.id.to_hex()))
+            .collect::<Vec<_>>();
+        if !events.is_empty() {
+            self.relay_action_events
+                .entry(action_id.to_owned())
+                .or_default()
+                .extend(events);
+        }
+        Ok(())
+    }
+
+    async fn relay_event_ids(&self) -> Result<BTreeSet<String>, SubjectError> {
+        Ok(self
+            .relay_events()
+            .await?
+            .into_iter()
+            .map(|event| event.id.to_hex())
+            .collect())
+    }
+
+    async fn set_shared_relay_event_visibility(
+        &mut self,
+        relay: &str,
+        selector: &crate::ScenarioMessageSelectorV2,
+        clients: &[String],
+        visible: bool,
+    ) -> Result<(), SubjectError> {
+        if relay != "relay:shared" {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "unknown_relay",
+                "the app-runtime adapter owns only relay:shared",
+            ));
+        }
+        if selector.publication.is_some() || selector.sender.is_some() || selector.class.is_some() {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "unsupported_relay_selector",
+                "the app-runtime relay gate requires an action_id-only selector",
+            ));
+        }
+        let action_id = selector.action_id.as_deref().ok_or_else(|| {
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "missing_relay_action_id",
+                "the app-runtime relay gate requires an action id",
+            )
+        })?;
+        let event = self
+            .relay_action_events
+            .get(action_id)
+            .and_then(|events| events.get(selector.occurrence))
+            .cloned()
+            .ok_or_else(|| {
+                SubjectError::classified(
+                    SubjectFailureCategory::ExpectedRefusal,
+                    "relay_event_not_found",
+                    "no retained relay event matched the scenario action",
+                )
+            })?;
+        let event_id = event.id.to_hex();
+        if visible {
+            let event = self.hidden_relay_events.remove(&event_id).ok_or_else(|| {
+                SubjectError::classified(
+                    SubjectFailureCategory::ExpectedRefusal,
+                    "relay_event_not_hidden",
+                    "the selected relay event is not currently hidden",
+                )
+            })?;
+            self.relay_database
+                .save_event(&event)
+                .await
+                .map_err(environment_error)?;
+            return Ok(());
+        }
+        if self.hidden_relay_events.contains_key(&event_id) {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_event_already_hidden",
+                "the selected relay event is already hidden",
+            ));
+        }
+        if clients.iter().any(|client| {
+            self.participants
+                .get(client)
+                .is_none_or(|participant| participant.online)
+        }) {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_visibility_requires_offline_clients",
+                "shared-relay events can be hidden only while every named client is offline",
+            ));
+        }
+        self.relay_database
+            .delete(Filter::new().id(event.id))
+            .await
+            .map_err(environment_error)?;
+        self.hidden_relay_events.insert(event_id, event);
+        Ok(())
     }
 
     pub fn participant_roots(&self) -> BTreeMap<String, PathBuf> {
@@ -598,6 +734,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::ParticipantConnectivity,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
+                SubjectCapability::RetainedRelayControl,
             ]),
         }
     }
@@ -672,6 +809,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectUpdateGroupData<'_>,
     ) -> Result<(), SubjectError> {
+        let before = self.relay_event_ids().await?;
         let group_id = self.active_group()?;
         let participant = self.participant(action.client)?;
         participant
@@ -684,6 +822,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action.action_id, before)
+            .await?;
         self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
@@ -883,6 +1023,16 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 block_on_subject(self.catch_up(clients))
             }
         }
+    }
+
+    fn set_relay_event_visibility(
+        &mut self,
+        relay: &str,
+        selector: &crate::ScenarioMessageSelectorV2,
+        clients: &[String],
+        visible: bool,
+    ) -> Result<(), SubjectError> {
+        block_on_subject(self.set_shared_relay_event_visibility(relay, selector, clients, visible))
     }
 }
 

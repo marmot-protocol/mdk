@@ -132,6 +132,22 @@ These are the scenarios another implementation should be able to load from JSON 
   the state, profile, recovery, pending-work, and decryptability contract; the focused Rust regression owns the
   retained-injection observations and stable commit-disposition subset.
 
+### `cross-route-app-runtime-recovery/v1`
+
+- File: constructed by `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; promotion to a
+  portable saved input waits until the falsified oracle has a reviewed resolution.
+- Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
+  `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
+  Nostr relay.
+- Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
+  The harness removes Zeta's root from shared history before Alpha reconnects and authors its competing root, removes
+  Alpha's root before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both roots, and performs
+  repeated full-history repair.
+- Current result: exact retained-engine settlement passes. Across repeated app-runtime executions, either Zeta remains
+  one epoch behind or public protocol state agrees while Alpha's later application probe remains absent and
+  non-invalidated at Zeta after repeated repair. This is a retained counterexample and keeps route equivalence, active
+  decryptability, and complete application disposition open outside the engine/retained reference.
+
 ### `convergence-committer-selected/v1`
 
 - File: `vectors/convergence-committer-selected.v1.json`

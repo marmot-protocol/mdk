@@ -1022,7 +1022,11 @@ engine repair or scaling the existing corpus is sufficient.
   - [ ] Expand the core vector into app-runtime, process, container, and VM executions, with delivery permutations and
     restarts around each durable transition rather than the single post-displacement restart. The #1372 journeys are
     capability-overlap evidence, not execution of the four-party adversarial vector or a substitute for its exact
-    cryptographic, disposition, pending-work, and active-decryptability assertions.
+    cryptographic, disposition, pending-work, and active-decryptability assertions. The first controlled app-runtime
+    execution now exists as `cross-route-app-runtime-recovery/v1`, but it is counterexample evidence: repeated runs
+    either leave Zeta one epoch behind or lose Alpha's non-invalidated post-settlement probe at Zeta. Keep this item
+    open until that falsification is resolved and the process/container/VM adapters gain equivalent retained-event
+    staging.
 - [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
   disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
   comparison remains part of the open route-equivalence work above.
@@ -1235,9 +1239,14 @@ residual gap.
    and process adapters that implement participant connectivity. It compares their public protocol and application
    projections without weakening the four-party vector or claiming exact cryptographic/disposition evidence from
    adapters that cannot expose it. The actual four-party adversarial vector and its durable-transition permutations
-   remain open. The decision-route inventory is machine checked; keep the remaining assurance artifacts independent
-   of #1293.
-6. [ ] Land and execute a focused current-`master` regression gate for the production convergence changes that landed
+   remain open. The next app-runtime slice now uses action-addressed shared-relay event staging, rather than timing a
+   live relay, to reproduce the actual four-party branch split. Its strict retained-engine reference passes, and the
+   app runtime either leaves Zeta one epoch behind or reaches the same public protocol state while Alpha's
+   post-settlement application probe remains absent and non-invalidated at Zeta after repeated full-history repair.
+   That counterexample reopens route equivalence, active decryptability, and complete application disposition;
+   process/container/VM execution still needs equivalent controlled retained-event staging. The decision-route
+   inventory is machine checked; keep the remaining assurance artifacts independent of #1293.
+6. [x] Land and execute a focused current-`master` regression gate for the production convergence changes that landed
    after the reviewed 1,170-case snapshot. Cover #1329 missing-anchor halt and authenticated Welcome repair, #1360
    atomic self-removal persistence across injected write failures and restart, #1365 armed full-history backfill after
    catch-up, and #1377's pinned rewind-horizon policy boundary. `just focused-convergence-regressions` runs each exact
@@ -1245,6 +1254,7 @@ residual gap.
    tests to run. The simulator CI job owns a separately named step for this gate. Close this item after that step passes
    on the squash-merge commit; the retained CI run and commit are the durable evidence, not machine-local timings,
    paths, logs, or digests. This is a small targeted matrix, not a requirement to repeat the entire historical campaign.
+   [MDK #1383](https://github.com/marmot-protocol/mdk/pull/1383) merged the gate at `fc3cae3e`.
 7. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
 8. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
@@ -1407,6 +1417,7 @@ incorrect result.
 | 2026-08-11 | 6.1 cross-adapter public projection checkpoint | Made accepted publication checkpoints portable across the `CgkaEngine` harness's staged transport and the app runtime's already-published command surface, then ran a three-participant profile/message/restart IR unchanged through the `CgkaEngine` harness, full app-runtime adapter, and isolated app processes. The production-shaped adapters cross the `CgkaEngine`, `TransportPeeler`, and `TransportAdapter` seams. A companion app/process permutation takes one member offline across the commit and message, restarts another member, performs full-history repair, and requires equivalent duplicate-free public projections. Exact MLS state, active decryptability, the four-party adversarial topology, containers, and VMs remain open. | [MDK #1372](https://github.com/marmot-protocol/mdk/pull/1372); `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`; `app_runtime_and_process_adapters_recover_the_same_offline_projection`; simulator-only adapter seam and focused process/app tests |
 | 2026-08-11 | Failure-input and pinned-policy boundary hardening | Rejected manifest-less or corrupt NDJSON stream remnants instead of silently classifying them as empty healthy incident exports, and restored normal-build coverage proving that a commit beyond the pinned five-commit rewind horizon is terminal stale without weakening the production policy guard. These strengthen failure-corpus admission and the P1 boundary sentinel; they do not replace incident-corpus lane execution or a delayed-history campaign. | [MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140); [MDK #1377](https://github.com/marmot-protocol/mdk/pull/1377); incident-replay regressions; `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork` |
 | 2026-08-11 | Focused post-campaign production-delta gate | Added a fail-closed named CI gate for the missing-anchor halt, verified Welcome repair, three-write atomic self-removal rollback/restart, armed post-catch-up backfill, and pinned rewind-horizon regressions. Every exact Nextest selector runs independently, so moving or removing one test cannot silently become a zero-test success. The squash-merge commit's successful named CI step will be the durable current-`master` evidence. This is targeted regression coverage, not a rerun of the historical generated matrix or distributed cross-route evidence. | `just focused-convergence-regressions`; `Run focused convergence regressions` CI step; five exact named engine/app tests |
+| 2026-08-11 | 6.1 app-runtime cross-route falsification | Added action-addressed event staging to the app-runtime harness's real retained Nostr relay so offline recipients cannot race the intended four-party branch topology. The strict retained-engine reference still reaches exact state, durable commit dispositions, no pending work, and twelve active decryptability edges; repeated app-runtime executions either leave Zeta one epoch behind or reach the same public protocol state while Alpha's post-settlement probe remains absent and non-invalidated at Zeta after repeated full-history repair. This is a retained counterexample, not passing route-equivalence evidence; no production convergence behavior changed. | `cross-route-app-runtime-recovery/v1`; `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; route-assurance claims reopened |
 
 ## Capability Naming Cleanup
 
