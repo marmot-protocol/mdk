@@ -841,7 +841,10 @@ impl AppGroupRecord {
 }
 
 impl AppPriorNostrRoute {
-    fn subscription(&self, group_id: &GroupId) -> Result<TransportGroupSubscription, AppError> {
+    pub(crate) fn subscription(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<TransportGroupSubscription, AppError> {
         let transport_group_id = hex::decode(&self.nostr_group_id_hex)?;
         if transport_group_id.len() != 32 {
             return Err(AppError::InvalidNostrRouting(

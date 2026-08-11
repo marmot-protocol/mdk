@@ -44,10 +44,10 @@ use crate::{
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
     AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
-    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
-    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
-    remember_seen_event, unix_now_seconds,
+    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -1492,6 +1492,7 @@ impl AppClient {
             .await?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let original_groups = self.state.groups.clone();
+        let original_routing = self.routing.snapshot();
         let was_live = original_groups
             .iter()
             .any(|group| group.group_id_hex == group_id_hex);
@@ -1501,14 +1502,21 @@ impl AppClient {
                 .groups
                 .retain(|group| group.group_id_hex != group_id_hex);
             if let Err(error) = self.refresh_routing() {
-                self.state.groups = original_groups;
-                self.refresh_routing()?;
+                self.restore_local_group_after_failed_delete(
+                    original_groups,
+                    original_routing.clone(),
+                    false,
+                )
+                .await;
                 return Err(error);
             }
             if let Err(error) = self.sync_runtime_groups().await {
-                self.state.groups = original_groups;
-                self.refresh_routing()?;
-                self.sync_runtime_groups().await?;
+                self.restore_local_group_after_failed_delete(
+                    original_groups,
+                    original_routing.clone(),
+                    true,
+                )
+                .await;
                 return Err(error);
             }
         }
@@ -1520,9 +1528,12 @@ impl AppClient {
             Ok(result) => result,
             Err(error) => {
                 if was_live {
-                    self.state.groups = original_groups;
-                    self.refresh_routing()?;
-                    self.sync_runtime_groups().await?;
+                    self.restore_local_group_after_failed_delete(
+                        original_groups,
+                        original_routing,
+                        true,
+                    )
+                    .await;
                 }
                 return Err(error);
             }
@@ -1554,6 +1565,24 @@ impl AppClient {
             }
         }
         Ok(was_live || result)
+    }
+
+    async fn restore_local_group_after_failed_delete(
+        &mut self,
+        original_groups: Vec<AppGroupRecord>,
+        original_routing: AppRoutingState,
+        sync_transport: bool,
+    ) {
+        self.state.groups = original_groups;
+        self.routing.replace(original_routing);
+        if sync_transport && let Err(error) = self.sync_runtime_groups().await {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "restore_local_group_after_failed_delete",
+                error_kind = error.privacy_safe_kind(),
+                "failed local-delete transport compensation remains pending",
+            );
+        }
     }
 
     async fn leave_group_with_audit_context(

@@ -10,14 +10,15 @@ use cgka_traits::app_event::{
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::GroupStorage;
 use cgka_traits::{GroupId, TransportGroupSubscription};
+use storage_sqlite::StoredNostrRoute;
 
 use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group, event_group_id};
 use crate::{
     AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageInput,
     AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupProfileComponent,
-    AppGroupRecord, AppMessageProjection, AppTransportRouting, SecureDeleteExpiredResult,
-    unix_now_seconds,
+    AppGroupRecord, AppMessageProjection, AppPriorNostrRoute, AppTransportRouting,
+    SecureDeleteExpiredResult, unix_now_seconds,
 };
 
 use super::AppClient;
@@ -265,8 +266,8 @@ impl AppClient {
     }
 
     /// Build the current and retained-prior subscriptions for an intentionally
-    /// hidden live group. The engine's protocol-owned route index is the durable
-    /// authority for the routing-v1 overlap window.
+    /// hidden live group. The deletion frontier keeps each authenticated prior
+    /// route paired with the relay set that carried it.
     fn local_deleted_group_subscriptions(
         &self,
         group_id: &GroupId,
@@ -279,26 +280,77 @@ impl AppClient {
         {
             return Ok(Vec::new());
         }
-        let current = self
-            .nostr_routing_for_group(group_id)?
-            .subscription(group_id)?;
-        let mut subscriptions = self
-            .app
-            .account_storage(&self.state.label)?
+        let routing = self.nostr_routing_for_group(group_id)?;
+        let current = routing.subscription(group_id)?;
+        let storage = self.app.account_storage(&self.state.label)?;
+        if storage
+            .retain_local_group_deletion_nostr_routes(
+                &hex::encode(group_id.as_slice()),
+                &[StoredNostrRoute {
+                    nostr_group_id_hex: routing.nostr_group_id_hex,
+                    relays: routing.relays,
+                    last_epoch: self
+                        .runtime
+                        .group_record(group_id)
+                        .map(|group| group.epoch.0)
+                        .unwrap_or_default(),
+                }],
+            )
+            .is_err()
+        {
+            tracing::warn!(
+                target: "marmot_app::client::projection",
+                method = "local_deleted_group_subscriptions",
+                "could not retain the current route for a locally deleted group",
+            );
+        }
+        let indexed_routes = storage
             .list_transport_group_routes()?
             .into_iter()
             .filter(|route| route.group_id == *group_id)
-            .map(|route| TransportGroupSubscription {
-                group_id: group_id.clone(),
-                transport_group_id: route.transport_group_id,
-                endpoints: current.endpoints.clone(),
-            })
             .collect::<Vec<_>>();
-        if !subscriptions
-            .iter()
-            .any(|subscription| subscription.transport_group_id == current.transport_group_id)
+        let mut subscriptions = Vec::new();
+        for route in
+            storage.local_group_deletion_prior_nostr_routes(&hex::encode(group_id.as_slice()))?
         {
-            subscriptions.push(current);
+            let route = AppPriorNostrRoute {
+                nostr_group_id_hex: route.nostr_group_id_hex,
+                relays: route.relays,
+                last_epoch: route.last_epoch,
+            };
+            match route.subscription(group_id) {
+                Ok(subscription)
+                    if indexed_routes.iter().any(|route| {
+                        route.transport_group_id == subscription.transport_group_id
+                    }) =>
+                {
+                    subscriptions.push(subscription);
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    target: "marmot_app::client::projection",
+                    method = "local_deleted_group_subscriptions",
+                    error_kind = "invalid_prior_nostr_route",
+                    "skipping invalid prior Nostr route",
+                ),
+            }
+        }
+        subscriptions.push(current.clone());
+
+        // Legacy deletion markers have no exact prior-route payload. Keep the
+        // old route-id coverage in that case by pairing only still-unrepresented
+        // ids with the authenticated current component's relay set.
+        for route in indexed_routes {
+            if !subscriptions
+                .iter()
+                .any(|subscription| subscription.transport_group_id == route.transport_group_id)
+            {
+                subscriptions.push(TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: route.transport_group_id,
+                    endpoints: current.endpoints.clone(),
+                });
+            }
         }
         Ok(subscriptions)
     }

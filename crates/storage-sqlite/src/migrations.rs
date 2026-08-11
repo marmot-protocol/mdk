@@ -579,6 +579,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frontier, 1);
+        let retained_routes: String = connection
+            .query_row(
+                "SELECT prior_nostr_routes_json
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_routes, "[]");
     }
 
     #[test]

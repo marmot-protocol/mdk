@@ -52,6 +52,7 @@ pub(crate) struct ScriptedPushRelayClient {
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
+    block_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     block_publish_count: std::sync::atomic::AtomicUsize,
     blocked_publish_count: std::sync::atomic::AtomicUsize,
@@ -63,6 +64,8 @@ pub(crate) struct ScriptedPushRelayClient {
     publish_release: tokio::sync::Notify,
     subscribe_started: tokio::sync::Notify,
     subscribe_release: tokio::sync::Notify,
+    unsubscribe_started: tokio::sync::Notify,
+    unsubscribe_release: tokio::sync::Notify,
 }
 
 impl ScriptedPushRelayClient {
@@ -149,6 +152,19 @@ impl ScriptedPushRelayClient {
 
     fn release_subscribe(&self) {
         self.subscribe_release.notify_waiters();
+    }
+
+    fn block_next_unsubscribe(&self) {
+        self.block_next_unsubscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_unsubscribe(&self) {
+        self.unsubscribe_started.notified().await;
+    }
+
+    fn release_unsubscribe(&self) {
+        self.unsubscribe_release.notify_waiters();
     }
 
     fn zero_ack_next_publish(&self) {
@@ -252,6 +268,13 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         _subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self
+            .block_next_unsubscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.unsubscribe_started.notify_one();
+            self.unsubscribe_release.notified().await;
+        }
         Ok(())
     }
 
@@ -5698,6 +5721,171 @@ fn reopening_account_restores_current_and_prior_group_routes() {
             .map(|route| route.transport_group_id.clone())
             .collect::<HashSet<_>>(),
         HashSet::from([vec![0x11; 32], vec![0x22; 32]])
+    );
+}
+
+#[tokio::test]
+async fn local_delete_compensation_preserves_primary_error_and_attempts_route_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("compensation", &[]).await.unwrap();
+    let routes_before = client.routing.snapshot().group_routes;
+
+    relay.block_next_unsubscribe();
+    let delete = tokio::spawn(async move {
+        let result = client.delete_group_local(&group_id).await;
+        (result, client.routing.snapshot().group_routes)
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_unsubscribe(),
+    )
+    .await
+    .unwrap();
+    app.close_storage().unwrap();
+    relay.fail_next_subscribe();
+    relay.release_unsubscribe();
+
+    let (result, routes_after) = delete.await.unwrap();
+    let error = format!("{:?}", result.unwrap_err());
+    assert!(
+        error.contains("Closed"),
+        "the original storage-delete failure must win over compensation failures: {error}"
+    );
+    assert_eq!(routes_after, routes_before);
+    assert!(
+        !relay
+            .fail_next_subscribe
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "runtime route restoration must still be attempted after storage compensation fails"
+    );
+}
+
+#[tokio::test]
+async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrection() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://old.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("rotated local delete", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let old_route = app
+        .group("alice", &group_id_hex)
+        .unwrap()
+        .unwrap()
+        .nostr_routing;
+
+    let current_route =
+        NostrRoutingV1::new([0x22; 32], vec!["wss://current.example".to_owned()]).unwrap();
+    let effects = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(&current_route).unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(!effects.reports.is_empty());
+    client.refresh_group(&group_id);
+    client.refresh_group_routes().unwrap();
+    app.save_state(&client.state).unwrap();
+
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+    let hidden_route =
+        NostrRoutingV1::new([0x33; 32], vec!["wss://hidden.example".to_owned()]).unwrap();
+    client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(&hidden_route).unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    client.refresh_group(&group_id);
+    client.refresh_group_routes().unwrap();
+    drop(client);
+
+    let mut reopened = app.client("alice").await.unwrap();
+    let routes = reopened
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group_id)
+        .map(|route| (route.transport_group_id, route.endpoints))
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        routes,
+        HashSet::from([
+            (
+                hex::decode(old_route.nostr_group_id_hex).unwrap(),
+                vec![TransportEndpoint("wss://old.example".to_owned())],
+            ),
+            (
+                vec![0x22; 32],
+                vec![TransportEndpoint("wss://current.example".to_owned())],
+            ),
+            (
+                vec![0x33; 32],
+                vec![TransportEndpoint("wss://hidden.example".to_owned())],
+            ),
+        ]),
+        "a hidden group must keep each retained route paired with its authenticated relay set",
+    );
+
+    let sender = app.account_home().account("alice").unwrap().account_id_hex;
+    let fresh = reopened
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: crate::messages::encode_inner_event(
+                &build_inner_event(
+                    &AppMessageIntent::Chat {
+                        content: "fresh activity".to_owned(),
+                    },
+                    &sender,
+                    unix_now_seconds(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(fresh.failures.is_empty());
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .clear_local_group_deletion_frontier_if_message_is_newer(
+                &group_id_hex,
+                &fresh.reports[0].message_id,
+            )
+            .unwrap(),
+        "fresh activity after restart must cross the local-deletion frontier",
+    );
+    reopened.refresh_group(&group_id);
+    app.save_state(&reopened.state).unwrap();
+    assert!(
+        app.group("alice", &group_id_hex).unwrap().is_some(),
+        "new authenticated activity must still be able to resurrect the projection",
     );
 }
 

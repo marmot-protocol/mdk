@@ -11,7 +11,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         r#"
 CREATE TABLE local_group_deletion_frontiers (
     group_id_hex TEXT PRIMARY KEY NOT NULL,
-    message_insert_order INTEGER NOT NULL CHECK(message_insert_order >= 0)
+    message_insert_order INTEGER NOT NULL CHECK(message_insert_order >= 0),
+    prior_nostr_routes_json TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Conservatively preserve already-absent live groups during upgrade. Before

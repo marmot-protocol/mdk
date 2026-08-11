@@ -821,6 +821,17 @@ impl SqliteAccountStorage {
                     .storage()?;
                 let mut deleted =
                     retire_all_encrypted_media_secrets_for_group_tx(&tx, group_id_hex)?;
+                let prior_nostr_routes_json = tx
+                    .query_row(
+                        "SELECT prior_nostr_routes_json
+                         FROM account_groups
+                         WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .storage()?
+                    .unwrap_or_else(|| "[]".to_owned());
                 for table in [
                     "app_events",
                     "message_timeline",
@@ -866,10 +877,23 @@ impl SqliteAccountStorage {
                 if active && !terminal {
                     tx.execute(
                         "INSERT INTO local_group_deletion_frontiers (
-                            group_id_hex, message_insert_order
-                         ) VALUES (?1, ?2)
-                         ON CONFLICT(group_id_hex) DO NOTHING",
-                        params![hex::encode(&group_id), message_insert_order],
+                            group_id_hex, message_insert_order, prior_nostr_routes_json
+                         ) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(group_id_hex) DO UPDATE SET
+                            message_insert_order = MAX(
+                                local_group_deletion_frontiers.message_insert_order,
+                                excluded.message_insert_order
+                            ),
+                            prior_nostr_routes_json = CASE
+                                WHEN excluded.prior_nostr_routes_json = '[]'
+                                    THEN local_group_deletion_frontiers.prior_nostr_routes_json
+                                ELSE excluded.prior_nostr_routes_json
+                            END",
+                        params![
+                            hex::encode(&group_id),
+                            message_insert_order,
+                            prior_nostr_routes_json
+                        ],
                     )
                     .storage()?;
                 }
@@ -957,6 +981,94 @@ impl SqliteAccountStorage {
                 })
             })
             .transpose()
+    }
+
+    /// Return the exact Nostr route/relay pairs retained by a deliberate local
+    /// deletion. The current signed routing component remains engine-owned; this
+    /// durable history preserves routes observed before and while the group was
+    /// hidden.
+    pub fn local_group_deletion_prior_nostr_routes(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Vec<StoredNostrRoute>> {
+        let routes_json = self
+            .lock()?
+            .query_row(
+                "SELECT prior_nostr_routes_json
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .storage()?;
+        routes_json
+            .map(|routes| {
+                serde_json::from_str(&routes)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))
+            })
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// Retain exact routing coordinates observed while a locally deleted MLS
+    /// group remains live. A hidden group may rotate more than once before the
+    /// app restarts, so every route that was current must remain reconstructible
+    /// without borrowing relay endpoints from a later route id.
+    pub fn retain_local_group_deletion_nostr_routes(
+        &self,
+        group_id_hex: &str,
+        routes: &[StoredNostrRoute],
+    ) -> StorageResult<()> {
+        if routes.is_empty() {
+            return Ok(());
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let Some(routes_json) = conn
+                .query_row(
+                    "SELECT prior_nostr_routes_json
+                     FROM local_group_deletion_frontiers
+                     WHERE group_id_hex = ?1",
+                    params![group_id_hex],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .storage()?
+            else {
+                return Ok(());
+            };
+            let mut retained = serde_json::from_str::<Vec<StoredNostrRoute>>(&routes_json)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            for route in routes {
+                if let Some(existing) = retained.iter_mut().find(|existing| {
+                    existing.nostr_group_id_hex == route.nostr_group_id_hex
+                        && existing.relays == route.relays
+                }) {
+                    existing.last_epoch = existing.last_epoch.max(route.last_epoch);
+                } else {
+                    retained.push(route.clone());
+                }
+            }
+            retained.sort_by(|left, right| {
+                left.last_epoch
+                    .cmp(&right.last_epoch)
+                    .then_with(|| left.nostr_group_id_hex.cmp(&right.nostr_group_id_hex))
+                    .then_with(|| left.relays.cmp(&right.relays))
+            });
+            let retained_json = serde_json::to_string(&retained)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            if retained_json == routes_json {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE local_group_deletion_frontiers
+                 SET prior_nostr_routes_json = ?2
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex, retained_json],
+            )
+            .storage()?;
+            Ok(())
+        })
     }
 
     /// Clear a local-delete marker only when `message_id` belongs to this group
