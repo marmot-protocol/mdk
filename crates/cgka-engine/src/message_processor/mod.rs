@@ -1203,6 +1203,8 @@ impl<S: StorageProvider> Engine<S> {
         // re-enter through ordinary ingest and only the next pass's OpenMLS
         // replay authenticates them. A peel that fails is silence.
         let branch_contexts = self.candidate_branch_peel_contexts(group_id)?;
+        let sweep =
+            crate::message_processor::ingest::DeferredPeelSweep::over_branches(&branch_contexts);
 
         let end = (start + MAX_DEFERRED_ROWS_PER_SWEEP).min(total);
         let mut progressed = 0usize;
@@ -1235,11 +1237,23 @@ impl<S: StorageProvider> Engine<S> {
             self.storage.put_message(&record)?;
 
             if self
-                .reingest_deferred_peel_row(group_id, &record, &branch_contexts)
+                .reingest_deferred_peel_row(group_id, &record, sweep)
                 .await?
             {
                 progressed += 1;
             }
+        }
+
+        // One drain over the whole batch. A contested sweep buffered every row
+        // it recovered without draining, because those rows are one evidence
+        // set and a pass must not freeze on a prefix of it: adjudicating half a
+        // fork settles a verdict the other half would have changed, and the
+        // losers of that verdict are terminalized before the evidence that
+        // would have saved them is even admitted. Uncontested sweeps drained
+        // per row on the way in and have nothing left to do here.
+        if sweep.is_contested() {
+            self.converge_stored_openmls_messages_with_time(group_id, now)
+                .map_err(|e| EngineError::Backend(format!("converge swept batch: {e}")))?;
         }
 
         let queue_depth = {
@@ -1305,7 +1319,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         record: &MessageRecord,
-        branch_contexts: &[crate::openmls_projection::CandidateBranchPeelContext],
+        sweep: crate::message_processor::ingest::DeferredPeelSweep<'_>,
     ) -> Result<bool, EngineError> {
         let stored_payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -1313,11 +1327,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         };
         match self
-            .ingest_group_message_with_branch_contexts(
-                &msg,
-                group_id.as_slice().to_vec(),
-                branch_contexts,
-            )
+            .ingest_group_message_from_sweep(&msg, group_id.as_slice().to_vec(), sweep)
             .await
         {
             Ok(IngestOutcome::TransportDeferred { .. }) => Ok(false),

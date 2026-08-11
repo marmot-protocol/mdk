@@ -37,6 +37,75 @@ use openmls::prelude::{
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
 
+/// What a deferred-peel sweep offers the ingest seam for one retained row.
+///
+/// The candidate branch states this sweep materialized are offered to a row the
+/// live context cannot read. Their presence is also what makes the graph
+/// *contested*: `candidate_branch_peel_contexts` returns nothing unless two
+/// branches actually compete, so a non-empty set means this sweep is feeding a
+/// pass that has a fork to adjudicate.
+#[derive(Clone, Copy)]
+pub(crate) struct DeferredPeelSweep<'a> {
+    branch_contexts: &'a [CandidateBranchPeelContext],
+}
+
+impl<'a> DeferredPeelSweep<'a> {
+    /// Ordinary live ingest: no sweep, no candidate branches, no contest.
+    pub(crate) const LIVE: Self = Self {
+        branch_contexts: &[],
+    };
+
+    pub(crate) fn over_branches(branch_contexts: &'a [CandidateBranchPeelContext]) -> Self {
+        Self { branch_contexts }
+    }
+
+    fn branch_contexts(&self) -> &'a [CandidateBranchPeelContext] {
+        self.branch_contexts
+    }
+
+    /// Whether this sweep is feeding a pass that has competing branches to
+    /// adjudicate.
+    pub(crate) fn is_contested(&self) -> bool {
+        !self.branch_contexts.is_empty()
+    }
+
+    /// When a contested sweep buffers evidence, the drain waits for the whole
+    /// batch. See [`ConvergenceDrain::DeferredToCaller`].
+    fn drain_policy(&self) -> ConvergenceDrain {
+        if self.is_contested() {
+            ConvergenceDrain::DeferredToCaller
+        } else {
+            ConvergenceDrain::Now
+        }
+    }
+}
+
+/// What the ingest seam wants done when it hands a message to convergence.
+struct ConvergenceHandoff<'a> {
+    /// Stable low-cardinality label recorded when a raw transport wrapper
+    /// leaves the deferred-peel retry lifecycle.
+    wrapper_retirement_reason: &'a str,
+    drain: ConvergenceDrain,
+}
+
+/// Whether buffering a message into convergence also drains the group.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConvergenceDrain {
+    /// Drain immediately. One inbound message arrived and its caller wants the
+    /// verdict that message produces.
+    Now,
+    /// Leave the drain to the caller, which runs exactly one over the whole
+    /// batch it is buffering.
+    ///
+    /// A deferred-peel sweep recovers many rows at once and they are a single
+    /// evidence set — often the two halves of one fork, since a sweep becomes
+    /// productive precisely when a rival branch first becomes readable.
+    /// Draining per row lets a pass freeze on a PREFIX of that set and settle a
+    /// verdict the remaining rows would have changed, then terminalize the
+    /// losers of a decision made on incomplete evidence.
+    DeferredToCaller,
+}
+
 struct PastPeelRecovery {
     peeled: cgka_traits::ingest::PeeledMessage,
     source_epoch: EpochId,
@@ -198,24 +267,23 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
-        self.ingest_group_message_with_branch_contexts(msg, transport_group_id, &[])
+        self.ingest_group_message_from_sweep(msg, transport_group_id, DeferredPeelSweep::LIVE)
             .await
     }
 
-    /// [`Self::ingest_group_message`] with extra candidate-branch peel contexts
-    /// offered to the peel-recovery fallback.
+    /// [`Self::ingest_group_message`] on behalf of a deferred-peel sweep.
     ///
-    /// Only the deferred-peel sweep passes a non-empty set (see
-    /// [`Engine::retry_deferred_peels`]). A message that only a candidate
-    /// branch's state could read belongs to a lineage this device has not
-    /// adopted, so it is routed to the convergence seam rather than the direct
-    /// apply — see the provenance guard below. Every other step, from dedup to
-    /// terminal classification, is shared with the ordinary path.
-    pub(crate) async fn ingest_group_message_with_branch_contexts(
+    /// The sweep supplies the candidate branch states it materialized, which
+    /// the peel-recovery fallback offers to a row the live context cannot read;
+    /// a non-empty set also marks the graph contested, which changes how a
+    /// recovered application message is routed (see the evidence guard below).
+    /// Every other step, from dedup to terminal classification, is shared with
+    /// the ordinary path.
+    pub(crate) async fn ingest_group_message_from_sweep(
         &mut self,
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
-        branch_contexts: &[CandidateBranchPeelContext],
+        sweep: DeferredPeelSweep<'_>,
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
@@ -416,7 +484,7 @@ impl<S: StorageProvider> Engine<S> {
                         msg,
                         &group_id,
                         current_epoch,
-                        branch_contexts,
+                        sweep.branch_contexts(),
                     )
                     .await
                 {
@@ -541,7 +609,7 @@ impl<S: StorageProvider> Engine<S> {
                         msg,
                         &group_id,
                         current_epoch,
-                        branch_contexts,
+                        sweep.branch_contexts(),
                     )
                     .await
                 {
@@ -818,14 +886,33 @@ impl<S: StorageProvider> Engine<S> {
         // decrypt — and this seam must derive nothing from it either way. It
         // enters convergence as input for the pass that adjudicates that
         // branch, which is the only seam that authenticates it.
-        if recovered_from_candidate_branch {
+        //
+        // While a sweep is working a CONTESTED graph, an application message
+        // takes that same seam whichever context read it. Branch selection
+        // weighs app witnesses, and a witness weighs nothing unless the pass
+        // sees it. Routing only the rival branch's witnesses into the pass
+        // while applying this device's own directly hands the pass a biased
+        // sample: the branch this device occupies collects no witnesses and
+        // selection is driven off it by construction — the split-brain,
+        // inverted. Commits need no such rule; `commit_should_enter_convergence`
+        // below decides on epoch, which is already provenance-blind.
+        let evidence_for_a_contested_pass =
+            msg_content_type == ContentType::Application && sweep.is_contested();
+        if recovered_from_candidate_branch || evidence_for_a_contested_pass {
             return self.buffer_openmls_message_into_convergence(
                 group_id,
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
                 current_epoch,
-                "recovered_under_candidate_branch",
+                ConvergenceHandoff {
+                    wrapper_retirement_reason: if recovered_from_candidate_branch {
+                        "recovered_under_candidate_branch"
+                    } else {
+                        "app_evidence_for_contested_pass"
+                    },
+                    drain: sweep.drain_policy(),
+                },
             );
         }
 
@@ -875,7 +962,10 @@ impl<S: StorageProvider> Engine<S> {
                 msg,
                 &raw_msg_id,
                 current_epoch,
-                "buffered_into_convergence",
+                ConvergenceHandoff {
+                    wrapper_retirement_reason: "buffered_into_convergence",
+                    drain: sweep.drain_policy(),
+                },
             );
         }
         if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
@@ -885,7 +975,10 @@ impl<S: StorageProvider> Engine<S> {
                 msg,
                 &raw_msg_id,
                 current_epoch,
-                "buffered_into_convergence",
+                ConvergenceHandoff {
+                    wrapper_retirement_reason: "buffered_into_convergence",
+                    drain: sweep.drain_policy(),
+                },
             );
         }
 
@@ -2313,8 +2406,12 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         raw_msg_id: &MessageId,
         current_epoch: EpochId,
-        wrapper_retirement_reason: &str,
+        handoff: ConvergenceHandoff<'_>,
     ) -> Result<IngestOutcome, EngineError> {
+        let ConvergenceHandoff {
+            wrapper_retirement_reason,
+            drain,
+        } = handoff;
         let now = self.convergence_now();
         self.buffer_openmls_convergence_message_with_time(&group_id, openmls_msg.clone(), now)
             .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
@@ -2323,6 +2420,15 @@ impl<S: StorageProvider> Engine<S> {
                 raw_msg_id,
                 wrapper_retirement_reason,
             )?;
+        }
+        if drain == ConvergenceDrain::DeferredToCaller {
+            // Durably buffered and awaiting the caller's single drain. There is
+            // no verdict to report yet — by design: the point of deferring is
+            // that no verdict be reached until the whole batch is in.
+            return Ok(IngestOutcome::Buffered {
+                group_id,
+                epoch: current_epoch,
+            });
         }
         let result = self
             .converge_stored_openmls_messages_with_time(&group_id, now)
