@@ -182,7 +182,7 @@ fn single_relay_topology(clients: &[String]) -> ScenarioTopologyV2 {
         groups: Vec::new(),
         relays: vec![ScenarioRelayV2 {
             id: "relay:shared".into(),
-            implementation_version: "mock-relay-v1".into(),
+            implementation_version: "retained-memory/v1".into(),
             policy_version: "retain-all-v1".into(),
         }],
     }
@@ -1006,6 +1006,9 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
         .iter()
         .map(|observation| (observation.client.as_str(), observation))
         .collect::<BTreeMap<_, _>>();
+    // Alpha and Observer have not ticked since the pre-split checkpoint, so
+    // these two values pin cached schedule state. Zeta and Yankee's refreshed
+    // epoch-4 observations are the independent evidence of the routed split.
     assert_eq!(app_routed["zeta"].epoch, 4);
     assert_eq!(app_routed["alpha"].epoch, 3);
     assert_eq!(app_routed["yankee"].epoch, 4);
@@ -1016,7 +1019,9 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
         .collect::<BTreeSet<_>>();
     expected_payloads.insert("zeta-branch-witness".into());
     let mut protocol_equivalent = true;
-    let mut all_active_probes_visible = true;
+    let mut protocol_equivalent_by_client = BTreeMap::new();
+    let mut protocol_non_epoch_equivalent_by_client = BTreeMap::new();
+    let mut app_payloads_by_client = BTreeMap::new();
     for client in &clients {
         let retained = retained_observations[client];
         let app = &app_observations[client];
@@ -1031,10 +1036,14 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
             2,
             "{client} retained route depth"
         );
-        protocol_equivalent &= app.protocol.epoch == retained.epoch
-            && app.protocol.member_count == retained.member_count
+        let non_epoch_equivalent = app.protocol.member_count == retained.member_count
             && app.protocol.group_name == retained.group_name
             && app.protocol.group_description == retained.group_description;
+        let client_protocol_equivalent =
+            app.protocol.epoch == retained.epoch && non_epoch_equivalent;
+        protocol_equivalent &= client_protocol_equivalent;
+        protocol_equivalent_by_client.insert(client.clone(), client_protocol_equivalent);
+        protocol_non_epoch_equivalent_by_client.insert(client.clone(), non_epoch_equivalent);
         assert_eq!(app.protocol.member_count, 4, "{client} roster size");
         assert_eq!(app.protocol.admin_identities, ["alpha", "yankee", "zeta"]);
         let app_payloads = app
@@ -1048,13 +1057,68 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
             "{client} projected an unexpected application payload"
         );
         assert_eq!(app.application.visible_plaintexts.len(), app_payloads.len());
-        all_active_probes_visible &= app_payloads == expected_payloads;
+        app_payloads_by_client.insert(client.clone(), app_payloads);
         assert!(app.application.invalidated_message_ids.is_empty());
         assert!(!app.application.pending_confirmation);
     }
+
+    let zeta_one_epoch_behind = clients.iter().all(|client| {
+        if client == "zeta" {
+            let app = &app_observations[client];
+            let retained = retained_observations[client];
+            app.protocol.epoch.checked_add(1) == Some(retained.epoch)
+                && protocol_non_epoch_equivalent_by_client[client]
+        } else {
+            protocol_equivalent_by_client[client]
+        }
+    }) && app_payloads_by_client
+        .values()
+        .all(|payloads| payloads == &expected_payloads);
+
+    let mut zeta_missing_alpha_probe = expected_payloads.clone();
+    assert!(zeta_missing_alpha_probe.remove("probe-from-alpha"));
+    let missing_probe_after_agreement = protocol_equivalent
+        && clients.iter().all(|client| {
+            let expected = if client == "zeta" {
+                &zeta_missing_alpha_probe
+            } else {
+                &expected_payloads
+            };
+            &app_payloads_by_client[client] == expected
+        });
+
+    let payload_set = |payloads: &[&str]| {
+        payloads
+            .iter()
+            .map(|payload| (*payload).to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let split_protocol_and_probe_surface = {
+        let alpha = &app_observations["alpha"];
+        let observer = &app_observations["observer"];
+        alpha.protocol.epoch == app_baseline["alpha"].epoch + 1
+            && alpha.protocol.group_name == "alpha-root"
+            && alpha.protocol.group_description.is_empty()
+            && observer.protocol.epoch == app_baseline["observer"].epoch
+            && observer.protocol.group_name == "cross-route"
+            && observer.protocol.group_description.is_empty()
+            && protocol_equivalent_by_client["yankee"]
+            && protocol_equivalent_by_client["zeta"]
+            && app_payloads_by_client["alpha"]
+                == payload_set(&["probe-from-alpha", "probe-from-observer"])
+            && app_payloads_by_client["observer"] == payload_set(&["probe-from-observer"])
+            && app_payloads_by_client["yankee"]
+                == payload_set(&[
+                    "probe-from-observer",
+                    "probe-from-yankee",
+                    "probe-from-zeta",
+                    "zeta-branch-witness",
+                ])
+            && app_payloads_by_client["zeta"] == app_payloads_by_client["yankee"]
+    };
     assert!(
-        !protocol_equivalent || !all_active_probes_visible,
-        "the known app-runtime route-equivalence falsification unexpectedly disappeared; review and replace this characterization with a passing equivalence oracle"
+        zeta_one_epoch_behind || missing_probe_after_agreement || split_protocol_and_probe_surface,
+        "app-runtime route result was neither documented counterexample shape; protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; observations={app_observations:#?}"
     );
 }
 

@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use cgka_conformance_simulator::{
     AppRuntimeHarness, ConvergenceSubject, GeneratedScenarioCase, GeneratedSubjectKind,
-    HarnessStorageMode, ScenarioOutboundSelection, ScenarioSpec, ScenarioStep, ScenarioStepStatus,
-    SubjectFailureCategory, SubjectOutboundOutcome, TraceExpectation,
-    run_generated_case_report_with_capture_on_subject, run_scenario_report_with_subject,
+    HarnessStorageMode, ScenarioMessageSelectorV2, ScenarioOutboundSelection, ScenarioSpec,
+    ScenarioStep, ScenarioStepStatus, SubjectFailureCategory, SubjectOutboundOutcome,
+    TraceExpectation, run_generated_case_report_with_capture_on_subject,
+    run_scenario_report_with_subject,
 };
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
@@ -258,6 +259,60 @@ async fn observations_keep_pending_invites_until_an_explicit_tick() {
             .application
             .pending_confirmation
     );
+    subject.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_relay_control_resolves_immediate_app_publication_action_ids() {
+    let clients = vec!["alice".to_owned(), "bob".to_owned()];
+    let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+    subject.select_scenario_group("main", true).unwrap();
+    subject
+        .create_group(cgka_conformance_simulator::SubjectCreateGroup {
+            action_id: "create",
+            creator: "alice",
+            name: "relay action ids",
+            invitees: &["bob".into()],
+            required_features: &[],
+            initial_admins: &["alice".into()],
+            pending: "create",
+        })
+        .await
+        .unwrap();
+    subject.tick(&clients).await.unwrap();
+    subject
+        .update_group_data(cgka_conformance_simulator::SubjectUpdateGroupData {
+            action_id: "rename",
+            client: "alice",
+            name: Some("renamed"),
+            description: None,
+            pending: "rename",
+        })
+        .await
+        .unwrap();
+    subject
+        .send_application(cgka_conformance_simulator::SubjectSendApplication {
+            action_id: "send",
+            sender: "alice",
+            payload: "action-addressed application",
+        })
+        .await
+        .unwrap();
+
+    subject.set_online("alice", false).await.unwrap();
+    subject.set_online("bob", false).await.unwrap();
+    for action_id in ["create", "rename", "send"] {
+        let selector = ScenarioMessageSelectorV2 {
+            action_id: Some(action_id.into()),
+            ..ScenarioMessageSelectorV2::default()
+        };
+        subject
+            .set_relay_event_visibility("relay:shared", &selector, &clients, false)
+            .unwrap_or_else(|error| panic!("{action_id}: {error}"));
+        subject
+            .set_relay_event_visibility("relay:shared", &selector, &clients, true)
+            .unwrap();
+    }
     subject.shutdown().await;
 }
 

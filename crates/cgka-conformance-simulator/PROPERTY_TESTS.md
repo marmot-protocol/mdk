@@ -152,18 +152,24 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
 
 - Runs: the four-participant cross-route topology through both the strict retained-engine subject and the full
   `MarmotAppRuntime` adapter. The app harness's real in-memory Nostr relay associates retained events with stable
-  Scenario IR action ids, removes a selected event only while every named recipient is offline, and reinserts it
-  before full-history repair. This avoids treating process timing or a live relay race as controlled delivery.
+  Scenario IR action ids. After verifying every named recipient is offline, it removes a selected event from the
+  single shared relay database, making that event unavailable to every participant that has not already fetched it,
+  and reinserts it before full-history repair. This is deliberately relay-wide rather than the strict retained-relay
+  subject's per-recipient visibility model, and avoids treating process timing or a live relay race as controlled
+  delivery. Action selectors cover group-message events and action-local Welcome gift wraps admitted before a
+  successful serialized app command returns; publications deferred beyond that command boundary (for example, a
+  scheduled self-update) are not action-addressable on this adapter.
 - Checks: the retained-engine reference reaches exact canonical equality, durable accepted/invalidated/accepted commit
   dispositions, no pending work, and all twelve active decryptability edges. The app run pins the intended split at
   the intermediate checkpoint, compares final public protocol state and active probes with that reference, and keeps
   the observed falsification explicit.
-- Known falsification: repeated executions have produced two non-equivalent terminal surfaces after the controlled
-  input schedule: either Zeta remains one epoch behind, or public protocol state agrees while Alpha's post-settlement
-  application probe remains neither visible nor invalidated at Zeta after two pre-probe and two post-probe
-  full-history repair/tick passes. The characterization requires at least one equivalence failure, rejects unexpected
-  or duplicate payloads, and fails deliberately if the complete equivalence oracle begins passing so the claim and
-  test must be reviewed together. It is not passing route-equivalence evidence.
+- Known falsification: repeated executions have produced three exactly characterized non-equivalent terminal surfaces
+  after the controlled input schedule: Zeta remains one epoch behind with the complete probe set; public protocol state
+  agrees while only Alpha's post-settlement application probe remains neither visible nor invalidated at Zeta; or
+  Alpha remains on its competing root, Observer remains at the baseline, and only Yankee/Zeta reach the retained
+  reference branch, with the probe sets split along those same branch boundaries. The characterization rejects any
+  fourth divergence shape, unexpected or duplicate payloads, and complete equivalence so every changed outcome forces
+  review of the counterexample and claim together. It is not passing route-equivalence evidence.
 - Boundary: process, container, and VM adapters do not yet expose equivalent controlled retained-event staging. They
   must not claim this topology from targeted catch-up alone because a live relay can deliver the competing root first.
 
