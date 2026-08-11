@@ -409,6 +409,20 @@ impl MessageStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
     }
+    fn put_pending_application_event(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+    ) -> StorageResult<()> {
+        self.inner.put_pending_application_event(event)
+    }
+    fn list_pending_application_events(
+        &self,
+    ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
+        self.inner.list_pending_application_events()
+    }
+    fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
+        self.inner.delete_pending_application_events(ids)
+    }
     fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.put_ingress_dedup_marker(id)
     }

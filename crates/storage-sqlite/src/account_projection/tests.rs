@@ -5,7 +5,9 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
     QUOTE_REF_TAG, STREAM_TAG,
 };
-use cgka_traits::types::MessageId;
+use cgka_traits::engine::GroupEvent;
+use cgka_traits::storage::MessageStorage;
+use cgka_traits::types::{EpochId, MemberId, MessageId};
 
 /// Test twin of the app layer's transport-cursor future-skew policy (five
 /// minutes). The storage layer treats it as an injected bound, so any value
@@ -2305,6 +2307,25 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
     insert_protocol_group_marker(&store, &[0xaa]);
     store.delete_local_group_data("aa").unwrap();
     let frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    let fresh_message_id = MessageId::new(vec![9]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 4, ?3)",
+            rusqlite::params![fresh_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    let pending_event = GroupEvent::MessageReceived {
+        group_id: cgka_traits::GroupId::new(vec![0xaa]),
+        message_id: fresh_message_id.clone(),
+        sender: MemberId::new(vec![7; 32]),
+        epoch: EpochId(0),
+        payload: b"fresh chat".to_vec(),
+        retention: None,
+    };
+    store.put_pending_application_event(&pending_event).unwrap();
     store
         .lock()
         .unwrap()
@@ -2317,7 +2338,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         )
         .unwrap();
 
-    let result = store.save_account_projection_state_clearing_local_group_deletion_frontiers(
+    let result = store.save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &StoredAccountState {
             label: "alice".to_owned(),
             seen_events: Vec::new(),
@@ -2327,6 +2348,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         16,
         MAX_FUTURE_SKEW_SECS,
         &[("aa".to_owned(), frontier)],
+        std::slice::from_ref(&fresh_message_id),
     );
 
     assert!(result.is_err());
@@ -2342,6 +2364,11 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
             .groups
             .is_empty(),
         "a failed save must not expose a partially resurrected group",
+    );
+    assert_eq!(
+        store.list_pending_application_events().unwrap(),
+        vec![pending_event],
+        "the durable delivery acknowledgement must roll back with the failed projection",
     );
 }
 

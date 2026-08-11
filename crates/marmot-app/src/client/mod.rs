@@ -21,7 +21,7 @@ use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
-use cgka_traits::{GroupId, SecretBytes};
+use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::StreamExt;
 use marmot_forensics::AuditEventContext;
 
@@ -122,6 +122,10 @@ pub struct AppClient {
     /// activity. They remain pending until the crossing projection and marker
     /// clears commit in the same account-state transaction.
     pub(crate) pending_local_group_deletion_frontier_clears: HashMap<String, u64>,
+    /// Authenticated application deliveries observed by this client but not yet
+    /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
+    /// committed with the account projection and any frontier clear.
+    pub(crate) pending_application_event_acks: HashSet<MessageId>,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable

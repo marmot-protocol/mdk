@@ -1388,7 +1388,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             Vec::new()
         };
-        let observations = self.storage.with_transaction(|storage| {
+        let (observations, application_events) = self.storage.with_transaction(|storage| {
             let observations = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,
                 group_id,
@@ -1397,7 +1397,13 @@ impl<S: StorageProvider> Engine<S> {
                 replay_profile_policy,
             )?;
             storage.put_convergence_pass(&completed_pass)?;
-            Ok::<_, OpenMlsProjectionError>(observations)
+            let application_events = Self::application_replay_events(group_id, &observations)?;
+            for event in &application_events {
+                storage
+                    .put_pending_application_event(event)
+                    .map_err(storage_projection_error)?;
+            }
+            Ok::<_, OpenMlsProjectionError>((observations, application_events))
         })?;
         for (disposition, previous_state, epoch) in disposition_transitions {
             if previous_state == disposition.state {
@@ -1479,7 +1485,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         };
-        self.emit_application_replay_events(group_id, &observations)?;
+        self.events_buf.extend(application_events);
         self.emit_invalidated_app_events(group_id, &result)?;
         self.emit_rejected_proposal_convergence_audits(group_id, &result);
         self.emit_rolled_back_commits(group_id, &result)?;
@@ -1766,11 +1772,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    fn emit_application_replay_events(
-        &mut self,
+    fn application_replay_events(
         group_id: &GroupId,
         observations: &[OpenMlsReplayObservation],
-    ) -> Result<(), OpenMlsProjectionError> {
+    ) -> Result<Vec<GroupEvent>, OpenMlsProjectionError> {
+        let mut events = Vec::new();
         for observation in observations {
             let OpenMlsReplayObservation::ApplicationProcessed {
                 message_id,
@@ -1795,7 +1801,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
                 continue;
             }
-            self.events_buf.push_back(GroupEvent::MessageReceived {
+            events.push(GroupEvent::MessageReceived {
                 group_id: group_id.clone(),
                 message_id: message_id_from_hex(message_id)?,
                 epoch: cgka_traits::EpochId(*source_epoch),
@@ -1804,7 +1810,7 @@ impl<S: StorageProvider> Engine<S> {
                 retention: Some(*retention),
             });
         }
-        Ok(())
+        Ok(events)
     }
 
     fn emit_invalidated_app_events(

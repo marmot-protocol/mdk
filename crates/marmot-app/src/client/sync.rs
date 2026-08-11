@@ -284,6 +284,7 @@ impl AppClient {
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
+        let mut gossip_message_ids = HashSet::new();
         for event in &effects.events {
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
@@ -304,6 +305,7 @@ impl AppClient {
                     self.suppress_local_deleted_group_event(event, batch_start_frontier)?
             {
                 routes_dirty |= changed;
+                self.prepare_pending_application_event_ack(event);
                 continue;
             }
             let before = self.state.groups.len();
@@ -317,7 +319,7 @@ impl AppClient {
             let group_projection = event_group_id(event).and_then(|group_id| {
                 self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
             });
-            observe_event(
+            if let Some(message) = observe_event(
                 &mut self.state,
                 &display_names,
                 &mut summary,
@@ -327,7 +329,14 @@ impl AppClient {
                 source_received_at,
                 None,
                 self.app.allow_loopback_blob_endpoints(),
-            );
+            ) {
+                if let Some(gossip_message_id) =
+                    self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
+                {
+                    gossip_message_ids.insert(gossip_message_id);
+                }
+                self.prepare_pending_application_event_ack(event);
+            }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
             self.audit_observed_group_event(
@@ -342,9 +351,15 @@ impl AppClient {
                     batch_start_frontier.expect("crossing event has a frontier"),
                 )?;
             }
+            self.prepare_pending_application_event_ack(event);
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
+        }
+        if !gossip_message_ids.is_empty() {
+            summary
+                .messages
+                .retain(|message| !gossip_message_ids.contains(&message.message_id_hex));
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // Reconcile transport routes once after the batch drains instead of per
@@ -1003,6 +1018,99 @@ impl AppClient {
         Ok(())
     }
 
+    fn project_received_message(
+        &mut self,
+        message: crate::ReceivedMessage,
+        group_metadata: Option<&cgka_traits::Group>,
+        summary: &mut SyncSummary,
+    ) -> Result<Option<String>, AppError> {
+        if notifications::is_push_gossip_kind(message.kind) {
+            let ingest_result = group_metadata
+                .map(|group| group.protocol_profile)
+                .ok_or_else(|| {
+                    AppError::InvalidPushGossip("group profile unavailable for push gossip".into())
+                })
+                .and_then(|profile| {
+                    self.runtime
+                        .members(&message.group_id)
+                        .map_err(AppError::from)
+                        .map(|members| {
+                            (
+                                profile,
+                                members
+                                    .into_iter()
+                                    .map(|member| hex::encode(member.id.as_slice()))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                })
+                .and_then(|(profile, active_member_ids)| {
+                    self.app.ingest_push_gossip_message(
+                        &self.state.label,
+                        &message,
+                        &active_member_ids,
+                        profile,
+                    )
+                });
+            if let Err(err) = ingest_result {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "ingest_delivery",
+                    error_kind = err.privacy_safe_kind(),
+                    "ignoring malformed push token gossip",
+                );
+            }
+            return Ok(Some(message.message_id_hex));
+        }
+        let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
+            && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
+        self.app.remember_directory_message_sender(&message)?;
+        let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
+            && self.delete_moderation_grant(&message.group_id, &message.sender);
+        let message_projection = AppMessageProjection {
+            message_id_hex: message.message_id_hex.clone(),
+            source_message_id_hex: Some(message.source_message_id_hex.clone()),
+            direction: "received".to_owned(),
+            group_id_hex: hex::encode(message.group_id.as_slice()),
+            sender: message.sender.clone(),
+            plaintext: message.plaintext.clone(),
+            kind: message.kind,
+            tags: message.tags.clone(),
+            source_epoch: Some(message.source_epoch),
+            retention: message.retention,
+            recorded_at: Some(message.recorded_at),
+            origin_commit_id: None,
+            moderation_grant,
+        };
+        let projection_update = self.app.record_account_app_event_at(
+            &self.state.label,
+            &message_projection,
+            message.received_at,
+        )?;
+        if retains_encrypted_media
+            && self
+                .remember_current_encrypted_media_secret(&message.group_id)
+                .is_err()
+        {
+            tracing::warn!(
+                target: "marmot_app::media",
+                method = "ingest_delivery",
+                error_code = "encrypted_media_secret_cache_skipped",
+                "failed to cache encrypted media source epoch secret",
+            );
+        }
+        summary.projection_updates.push(projection_update);
+        self.prune_plaintext_retention_for_group(&message.group_id)?;
+        Ok(None)
+    }
+
+    fn prepare_pending_application_event_ack(&mut self, event: &cgka_traits::engine::GroupEvent) {
+        if let cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } = event {
+            self.pending_application_event_acks
+                .insert(message_id.clone());
+        }
+    }
+
     pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(
         &mut self,
     ) -> Result<(), AppError> {
@@ -1011,9 +1119,19 @@ impl AppClient {
             .iter()
             .map(|(group_id_hex, frontier)| (group_id_hex.clone(), *frontier))
             .collect::<Vec<_>>();
+        let application_event_ids_to_ack = self
+            .pending_application_event_acks
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         self.app
-            .save_state_clearing_local_group_deletion_frontiers(&self.state, &frontiers_to_clear)?;
+            .save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                &self.state,
+                &frontiers_to_clear,
+                &application_event_ids_to_ack,
+            )?;
         self.pending_local_group_deletion_frontier_clears.clear();
+        self.pending_application_event_acks.clear();
         Ok(())
     }
     async fn observe_account_device_effects(
@@ -1060,6 +1178,7 @@ impl AppClient {
                     self.suppress_local_deleted_group_event(event, batch_start_frontier)?
             {
                 routes_dirty |= changed;
+                self.prepare_pending_application_event_ack(event);
                 continue;
             }
             let before = self.state.groups.len();
@@ -1097,103 +1216,12 @@ impl AppClient {
                 outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
             ) {
-                if notifications::is_push_gossip_kind(message.kind) {
-                    // Bind inbound gossip to the carrying group's authenticated MLS
-                    // member set; owner signatures are then verified per record so
-                    // a kind 448 may apply other members' records (offline-member
-                    // bootstrap) without trusting the relaying sender.
-                    let ingest_result = group_metadata
-                        .as_ref()
-                        .map(|group| group.protocol_profile)
-                        .ok_or_else(|| {
-                            AppError::InvalidPushGossip(
-                                "group profile unavailable for push gossip".into(),
-                            )
-                        })
-                        .and_then(|profile| {
-                            self.runtime
-                                .members(&message.group_id)
-                                .map_err(AppError::from)
-                                .map(|members| {
-                                    (
-                                        profile,
-                                        members
-                                            .into_iter()
-                                            .map(|member| hex::encode(member.id.as_slice()))
-                                            .collect::<Vec<_>>(),
-                                    )
-                                })
-                        })
-                        .and_then(|(profile, active_member_ids)| {
-                            self.app.ingest_push_gossip_message(
-                                &self.state.label,
-                                &message,
-                                &active_member_ids,
-                                profile,
-                            )
-                        });
-                    if let Err(err) = ingest_result {
-                        tracing::warn!(
-                            target: "marmot_app::notifications",
-                            method = "ingest_delivery",
-                            error_kind = err.privacy_safe_kind(),
-                            "ignoring malformed push token gossip",
-                        );
-                    }
-                    gossip_message_ids.insert(message.message_id_hex.clone());
-                    continue;
-                }
-                let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                    && media_imeta_tags_are_valid(
-                        &message.tags,
-                        self.app.allow_loopback_blob_endpoints(),
-                    );
-                self.app.remember_directory_message_sender(&message)?;
-                // Evaluated against the signed MLS group state while the
-                // delete's epoch context is live, then persisted with the
-                // event so later admin-set changes cannot flip the verdict.
-                let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
-                    && self.delete_moderation_grant(&message.group_id, &message.sender);
-                let message_projection = AppMessageProjection {
-                    message_id_hex: message.message_id_hex.clone(),
-                    source_message_id_hex: Some(message.source_message_id_hex.clone()),
-                    direction: "received".to_owned(),
-                    group_id_hex: hex::encode(message.group_id.as_slice()),
-                    sender: message.sender.clone(),
-                    plaintext: message.plaintext.clone(),
-                    kind: message.kind,
-                    tags: message.tags.clone(),
-                    source_epoch: Some(message.source_epoch),
-                    retention: message.retention,
-                    recorded_at: Some(message.recorded_at),
-                    // Received app messages are not synthesized system rows.
-                    origin_commit_id: None,
-                    moderation_grant,
-                };
-                let projection_update = self.app.record_account_app_event_at(
-                    &self.state.label,
-                    &message_projection,
-                    message.received_at,
-                )?;
-                // Persist the reference first. A source epoch whose previous
-                // final reference was retired may be re-used by a later message;
-                // the durable reference is what authorizes restoring its secret.
-                // Doing this before the next delivery also preserves the source
-                // epoch when the same sync batch advances the group afterwards.
-                if retains_encrypted_media
-                    && self
-                        .remember_current_encrypted_media_secret(&message.group_id)
-                        .is_err()
+                if let Some(gossip_message_id) =
+                    self.project_received_message(message, group_metadata.as_ref(), summary)?
                 {
-                    tracing::warn!(
-                        target: "marmot_app::media",
-                        method = "ingest_delivery",
-                        error_code = "encrypted_media_secret_cache_skipped",
-                        "failed to cache encrypted media source epoch secret",
-                    );
+                    gossip_message_ids.insert(gossip_message_id);
                 }
-                summary.projection_updates.push(projection_update);
-                self.prune_plaintext_retention_for_group(&message.group_id)?;
+                self.prepare_pending_application_event_ack(event);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1288,6 +1316,7 @@ impl AppClient {
                     batch_start_frontier.expect("crossing event has a frontier"),
                 )?;
             }
+            self.prepare_pending_application_event_ack(event);
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // #760: strip all collected push-gossip messages in one pass.

@@ -6021,6 +6021,87 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
     }
 }
 
+#[tokio::test]
+async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash() {
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+    let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
+
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+    let fresh_payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Chat {
+                content: "first fresh chat".to_owned(),
+            },
+            &sender_hex,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: fresh_payload.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(fresh.failures.is_empty());
+    let message_id = fresh.reports[0].message_id.clone();
+    let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        group_id: group_id.clone(),
+        message_id: message_id.clone(),
+        sender,
+        epoch: client.runtime.group_record(&group_id).unwrap().epoch,
+        payload: fresh_payload,
+        retention: None,
+    };
+    let storage = app.account_storage("alice").unwrap();
+    storage.put_pending_application_event(&event).unwrap();
+
+    // Simulate termination after the engine transaction committed its durable
+    // delivery but before the app observed or projected it.
+    drop(client);
+    let mut reopened = app.client("alice").await.unwrap();
+    assert!(app.group("alice", &group_id_hex).unwrap().is_none());
+    let recovered = reopened.drain_pending_session_events().await.unwrap();
+
+    assert_eq!(recovered.messages.len(), 1);
+    assert_eq!(recovered.messages[0].plaintext, "first fresh chat");
+    assert!(app.group("alice", &group_id_hex).unwrap().is_some());
+    assert!(
+        app.messages("alice")
+            .unwrap()
+            .iter()
+            .any(|message| message.plaintext == "first fresh chat"),
+        "account-open replay must persist the first crossing chat",
+    );
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .local_group_deletion_frontier(&group_id_hex)
+            .unwrap(),
+        None,
+    );
+}
+
 #[test]
 fn account_routing_skips_malformed_groups_without_discarding_valid_routes() {
     let dir = tempfile::tempdir().unwrap();

@@ -4,6 +4,7 @@ use crate::{
     SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, message_state_to_i64,
     serialize,
 };
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
@@ -124,6 +125,94 @@ impl MessageStorage for SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         records.iter().map(|record| deserialize(record)).collect()
+    }
+
+    fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()> {
+        let GroupEvent::MessageReceived {
+            group_id,
+            message_id,
+            ..
+        } = event
+        else {
+            return Err(StorageError::Backend(
+                "pending application outbox accepts only MessageReceived events".to_owned(),
+            ));
+        };
+        let event_json = serialize(event)?;
+        let write = || {
+            let conn = self.lock()?;
+            let inserted = conn
+                .execute(
+                    "INSERT INTO pending_application_events (
+                        message_id, group_id, message_insert_order, event_json
+                     )
+                     SELECT ?1, ?2, insert_order, ?3
+                     FROM cgka_messages
+                     WHERE id = ?1 AND group_id = ?2
+                     ON CONFLICT(message_id) DO NOTHING",
+                    params![message_id.as_slice(), group_id.as_slice(), &event_json],
+                )
+                .storage()?;
+            if inserted == 0 {
+                let existing = conn
+                    .query_row(
+                        "SELECT event_json FROM pending_application_events WHERE message_id = ?1",
+                        params![message_id.as_slice()],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .storage()?;
+                return match existing {
+                    Some(existing) if existing == event_json => Ok(()),
+                    Some(_) => Err(StorageError::Backend(
+                        "pending application event id reused with different content".to_owned(),
+                    )),
+                    None => Err(StorageError::NotFound),
+                };
+            }
+            Ok(())
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            retry_on_busy(write)
+        }
+    }
+
+    fn list_pending_application_events(&self) -> StorageResult<Vec<GroupEvent>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT event_json
+                 FROM pending_application_events
+                 ORDER BY message_insert_order, message_id",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.iter().map(|event| deserialize(event)).collect()
+    }
+
+    fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
+        let delete = || {
+            let conn = self.lock()?;
+            for id in ids {
+                conn.execute(
+                    "DELETE FROM pending_application_events WHERE message_id = ?1",
+                    params![id.as_slice()],
+                )
+                .storage()?;
+            }
+            Ok(())
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            delete()
+        } else {
+            retry_on_busy(|| self.connection.with_transaction(delete))
+        }
     }
 
     fn create_group_state_checkpoint(
@@ -250,9 +339,21 @@ fn update_message_state_on_connection(
 mod tests {
     use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_message};
+    use cgka_traits::engine::GroupEvent;
     use cgka_traits::message::{DeferredPeelLifecycle, MessageState};
     use cgka_traits::storage::{GroupStorage, MessageStorage, StorageError};
-    use cgka_traits::types::EpochId;
+    use cgka_traits::types::{EpochId, MemberId};
+
+    fn application_event(message_id: cgka_traits::MessageId) -> GroupEvent {
+        GroupEvent::MessageReceived {
+            group_id: gid(1),
+            message_id,
+            sender: MemberId::new(vec![7; 32]),
+            epoch: EpochId(0),
+            payload: b"authenticated chat".to_vec(),
+            retention: None,
+        }
+    }
 
     #[test]
     fn message_state_transitions() {
@@ -413,6 +514,63 @@ mod tests {
             MessageState::Created,
             "message state must roll back with the aborted outer transaction",
         );
+    }
+
+    #[test]
+    fn pending_application_event_commits_and_rolls_back_with_message_state() {
+        use cgka_traits::storage::StorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let committed = sample_message(mid(1), gid(1), 0);
+        let rolled_back = sample_message(mid(2), gid(1), 0);
+        store.put_message(&committed).unwrap();
+        store.put_message(&rolled_back).unwrap();
+
+        store
+            .with_transaction(|storage| {
+                storage.update_message_state(&committed.id, MessageState::Processed)?;
+                storage.put_pending_application_event(&application_event(committed.id.clone()))?;
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![application_event(committed.id.clone())]
+        );
+        let mut conflicting = application_event(committed.id.clone());
+        if let GroupEvent::MessageReceived { payload, .. } = &mut conflicting {
+            *payload = b"conflicting authenticated chat".to_vec();
+        }
+        assert!(matches!(
+            store.put_pending_application_event(&conflicting),
+            Err(StorageError::Backend(_))
+        ));
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![application_event(committed.id.clone())],
+            "a conflicting duplicate must not overwrite durable delivery evidence",
+        );
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.update_message_state(&rolled_back.id, MessageState::Processed)?;
+            storage.put_pending_application_event(&application_event(rolled_back.id.clone()))?;
+            Err(StorageError::Backend("force rollback".to_owned()))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store.get_message(&rolled_back.id).unwrap().state,
+            MessageState::Created
+        );
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![application_event(committed.id.clone())]
+        );
+
+        store
+            .delete_pending_application_events(&[committed.id])
+            .unwrap();
+        assert!(store.list_pending_application_events().unwrap().is_empty());
     }
 
     #[test]

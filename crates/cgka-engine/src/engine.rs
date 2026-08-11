@@ -549,6 +549,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
         )
         .map_err(EngineError::Other)?;
 
+        let pending_application_events = self.storage.list_pending_application_events()?;
+
         Ok(Engine {
             storage: self.storage,
             crypto,
@@ -563,7 +565,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             maintenance_random: self.maintenance_random,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
-            events_buf: VecDeque::new(),
+            events_buf: pending_application_events.into(),
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
             valid_proposal_groups: HashSet::new(),

@@ -585,6 +585,27 @@ impl SqliteAccountStorage {
         max_future_skew_secs: u64,
         frontiers_to_clear: &[(String, u64)],
     ) -> StorageResult<()> {
+        self.save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            frontiers_to_clear,
+            &[],
+        )
+    }
+
+    /// Persist the account projection, clear matched local-delete frontiers,
+    /// and acknowledge authenticated application deliveries in one transaction.
+    /// A crash can therefore leave the outbox pending or the full projection
+    /// committed, but never strand the engine ahead of the app.
+    pub fn save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+    ) -> StorageResult<()> {
         let now = unix_now_seconds();
         let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
         self.connection.with_transaction(|| {
@@ -805,6 +826,13 @@ impl SqliteAccountStorage {
                     upsert_group_component(&conn, &group.group_id_hex, component, now_i64)?;
                 }
             }
+            for message_id in application_event_ids_to_ack {
+                conn.execute(
+                    "DELETE FROM pending_application_events WHERE message_id = ?1",
+                    params![message_id.as_slice()],
+                )
+                .storage()?;
+            }
             Ok(())
         })
     }
@@ -862,6 +890,13 @@ impl SqliteAccountStorage {
                     .optional()
                     .storage()?
                     .unwrap_or_else(|| "[]".to_owned());
+                deleted = deleted.saturating_add(
+                    tx.execute(
+                        "DELETE FROM pending_application_events WHERE group_id = ?1",
+                        params![&group_id],
+                    )
+                    .storage()?,
+                );
                 for table in [
                     "app_events",
                     "message_timeline",
