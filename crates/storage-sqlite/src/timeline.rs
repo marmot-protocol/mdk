@@ -878,14 +878,16 @@ impl SqliteAccountStorage {
         let mut pagination = validate_pagination(&query.pagination)?;
         let conn = self.lock()?;
         if canonical_group_order
-            && let (Some(group_id_hex), Some(cursor_at), Some(cursor_message_id_hex)) = (
+            && let (Some(group_id_hex), Some(cursor_message_id_hex)) = (
                 query.group_id_hex.as_deref(),
-                pagination.cursor_at,
                 pagination.cursor_message_id_hex.as_deref(),
             )
         {
-            pagination.cursor_order =
-                timeline_order_cursor_tx(&conn, group_id_hex, cursor_at, cursor_message_id_hex)?;
+            pagination.cursor_order = Some(timeline_order_cursor_tx(
+                &conn,
+                group_id_hex,
+                cursor_message_id_hex,
+            )?);
         }
         let (sql, params) = timeline_query_sql(&query, &pagination, canonical_group_order)?;
         let rows = {
@@ -2447,15 +2449,14 @@ fn timeline_records_by_ids_tx(
 fn timeline_order_cursor_tx(
     tx: &Connection,
     group_id_hex: &str,
-    timeline_at: u64,
     message_id_hex: &str,
-) -> StorageResult<Option<OwnedTimelineOrderKey>> {
+) -> StorageResult<OwnedTimelineOrderKey> {
     let row = tx
         .query_row(
             "SELECT source_message_id_hex, source_epoch, kind, timeline_at, message_id_hex
              FROM message_timeline
-             WHERE group_id_hex = ?1 AND timeline_at = ?2 AND message_id_hex = ?3",
-            params![group_id_hex, u64_to_i64(timeline_at)?, message_id_hex],
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
@@ -2469,7 +2470,9 @@ fn timeline_order_cursor_tx(
         .optional()
         .storage()?;
     let Some((source_message_id_hex, source_epoch, kind, timeline_at, message_id_hex)) = row else {
-        return Ok(None);
+        return Err(StorageError::Backend(
+            "group timeline cursor no longer exists; refresh the timeline".to_owned(),
+        ));
     };
     let source_epoch = source_epoch.map(i64_to_u64).transpose()?;
     let kind = i64_to_u64(kind)?;
@@ -2481,7 +2484,7 @@ fn timeline_order_cursor_tx(
         timeline_at,
         &message_id_hex,
     );
-    Ok(Some((class, primary, phase, at, message_id_hex)))
+    Ok((class, primary, phase, at, message_id_hex))
 }
 
 fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<ValidatedPagination> {
@@ -2622,10 +2625,9 @@ fn timeline_query_sql(
             );
             params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
         }
-        (CursorDirection::Before, None) => {
-            // Unknown/synthetic cursors keep the timestamp API's legacy wall-clock
-            // semantics. Row cursors returned by a group query take the canonical
-            // branch above.
+        (CursorDirection::Before, None) if !canonical_group_order => {
+            // Wall-clock-only queries retain the timestamp cursor semantics.
+            // Canonical group queries resolve a retained row above instead.
             let id_comparison = if pagination.inclusive { "<=" } else { "<" };
             clauses.push(format!(
                 "(timeline.timeline_at < ? OR (timeline.timeline_at = ? AND timeline.message_id_hex {id_comparison} ?))"
@@ -2637,7 +2639,7 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        (CursorDirection::After, None) => {
+        (CursorDirection::After, None) if !canonical_group_order => {
             clauses.push(
                 "(timeline.timeline_at > ? OR (timeline.timeline_at = ? AND timeline.message_id_hex > ?))"
                     .to_owned(),
@@ -2647,6 +2649,11 @@ fn timeline_query_sql(
             params.push(rusqlite::types::Value::Integer(cursor_at));
             params.push(rusqlite::types::Value::Text(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
+            ));
+        }
+        (CursorDirection::Before | CursorDirection::After, None) => {
+            return Err(StorageError::Backend(
+                "canonical group timeline pagination requires a retained cursor row".to_owned(),
             ));
         }
         (CursorDirection::None, _) => {}

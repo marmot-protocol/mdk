@@ -311,12 +311,10 @@ fn timeline_reads_preserve_every_pinned_retention_state() {
         )
         .unwrap();
 
-    let paginated = store
+    let queried = store
         .message_timeline(TimelineMessageQuery {
             group_id_hex: Some(group_id.clone()),
             pagination: TimelinePagination {
-                after: Some(0),
-                after_message_id: Some(String::new()),
                 limit: Some(10),
                 ..TimelinePagination::default()
             },
@@ -324,7 +322,7 @@ fn timeline_reads_preserve_every_pinned_retention_state() {
         })
         .unwrap()
         .messages;
-    let ids = paginated
+    let ids = queried
         .iter()
         .map(|record| record.message_id_hex.clone())
         .collect::<BTreeSet<_>>();
@@ -347,7 +345,7 @@ fn timeline_reads_preserve_every_pinned_retention_state() {
         ("legacy".to_owned(), (None, None)),
         ("overflow".to_owned(), (Some(1), None)),
     ]);
-    assert_eq!(retention_by_id(&paginated), expected);
+    assert_eq!(retention_by_id(&queried), expected);
     assert_eq!(retention_by_id(&by_id), expected);
 
     store.rebuild_message_timeline_for_group(&group_id).unwrap();
@@ -788,6 +786,69 @@ fn group_timeline_pagination_uses_canonical_epoch_cursor() {
 
     assert_eq!(ids(&older), ["system-7", "message-7"]);
     assert_eq!(ids(&newer), ["system-8", "message-8"]);
+}
+
+#[test]
+fn group_timeline_pagination_resolves_reprojected_system_cursor_by_stable_id() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut system_seven = group_system("system-7", "member_added", 100);
+    system_seven.source_epoch = Some(7);
+    store.record_app_event(&system_seven).unwrap();
+    let mut message_seven = chat("message-7", "alice", 200, "epoch seven");
+    message_seven.source_epoch = Some(7);
+    store.record_app_event(&message_seven).unwrap();
+    let mut system_eight = group_system("system-8", "member_removed", 300);
+    system_eight.source_epoch = Some(8);
+    store.record_app_event(&system_eight).unwrap();
+    let mut message_eight = chat("message-8", "bob", 150, "epoch eight");
+    message_eight.source_epoch = Some(8);
+    store.record_app_event(&message_eight).unwrap();
+
+    // Reprocessing the same deterministic system row updates its local
+    // observation timestamp after a client has already retained the old cursor.
+    system_eight.recorded_at = 900;
+    system_eight.received_at = 900;
+    store.record_app_event(&system_eight).unwrap();
+
+    let older = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            pagination: TimelinePagination {
+                before: Some(300),
+                before_message_id: Some("system-8".to_owned()),
+                limit: Some(2),
+                ..TimelinePagination::default()
+            },
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+
+    assert_eq!(ids(&older), ["system-7", "message-7"]);
+}
+
+#[test]
+fn group_timeline_pagination_rejects_missing_canonical_cursor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut message = chat("message-7", "alice", 200, "epoch seven");
+    message.source_epoch = Some(7);
+    store.record_app_event(&message).unwrap();
+
+    let result = store.message_timeline(TimelineMessageQuery {
+        group_id_hex: Some("11".repeat(32)),
+        pagination: TimelinePagination {
+            before: Some(300),
+            before_message_id: Some("pruned-system-8".to_owned()),
+            limit: Some(2),
+            ..TimelinePagination::default()
+        },
+        ..TimelineMessageQuery::default()
+    });
+
+    assert!(matches!(
+        result,
+        Err(StorageError::Backend(message))
+            if message == "group timeline cursor no longer exists; refresh the timeline"
+    ));
 }
 
 #[test]
