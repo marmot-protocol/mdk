@@ -11,7 +11,7 @@
 
 use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
 use crate::convergence_pass::DurableConvergencePass;
-use crate::engine::SendIntent;
+use crate::engine::{GroupEvent, SendIntent};
 use crate::group::{Group, Member};
 use crate::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
@@ -203,6 +203,20 @@ pub trait MessageStorage {
         group_id: &GroupId,
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>>;
+
+    /// Persist an authenticated application delivery until its app projection
+    /// has committed. Implementations must reject non-`MessageReceived` events.
+    /// The engine calls this on the same transaction rail that marks the source
+    /// message processed, closing the crash gap between protocol ingest and app
+    /// projection.
+    fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()>;
+
+    /// Return pending application deliveries in deterministic ingress order.
+    fn list_pending_application_events(&self) -> StorageResult<Vec<GroupEvent>>;
+
+    /// Acknowledge application deliveries only after their app projection has
+    /// committed. Unknown ids are harmless so replay remains idempotent.
+    fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()>;
 
     /// Persist a terminal duplicate-detection marker for inbound protocol
     /// material that cannot yet be associated with a group (notably malformed

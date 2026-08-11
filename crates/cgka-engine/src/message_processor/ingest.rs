@@ -1160,16 +1160,31 @@ impl<S: StorageProvider> Engine<S> {
                     {
                         self.audit_group(&group_id, decoded);
                     }
-                    self.events_buf.push_back(GroupEvent::MessageReceived {
+                    let event = GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
+                        message_id: msg.id.clone(),
                         sender,
                         epoch: msg_epoch,
                         payload,
                         retention: retention_seconds.map(|seconds| {
                             AppMessageRetentionDecision::new(app_event.created_at, seconds)
                         }),
-                    });
-                    self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    };
+                    let previous = self.storage.get_message(&msg.id).ok();
+                    self.storage.with_transaction(|storage| {
+                        storage.update_message_state(&msg.id, MessageState::Processed)?;
+                        storage.put_pending_application_event(&event)?;
+                        Ok::<_, EngineError>(())
+                    })?;
+                    let transition = crate::audit_helpers::message_state_transition_event(
+                        hex::encode(msg.id.as_slice()),
+                        previous.as_ref().map(|record| record.state),
+                        MessageState::Processed,
+                        previous.as_ref().map(|record| record.epoch),
+                        "state_update",
+                    );
+                    self.audit_group(&group_id, transition);
+                    self.events_buf.push_back(event);
                     // In-memory fast path mirrors the durable record, keyed on
                     // the content-derived id so a re-wrapped duplicate is caught
                     // before the durable lookup.

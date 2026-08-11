@@ -84,6 +84,8 @@ mod migration_0041_secure_delete_checkpoint_intents;
 mod migration_0042_group_state_checkpoints;
 #[path = "migrations/0043_transport_group_routes.rs"]
 mod migration_0043_transport_group_routes;
+#[path = "migrations/0044_local_group_deletion_frontiers.rs"]
+mod migration_0044_local_group_deletion_frontiers;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -311,6 +313,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0043_transport_group_routes",
         apply: migration_0043_transport_group_routes::apply,
     },
+    Migration {
+        version: 44,
+        name: "0044_local_group_deletion_frontiers",
+        apply: migration_0044_local_group_deletion_frontiers::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -537,6 +544,63 @@ mod tests {
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn local_group_deletion_frontier_migration_preserves_absent_live_groups() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..43]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, ?2)",
+                params![&[0xaa_u8], &[0_u8]],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 0, 0, ?3)",
+                params![&[1_u8], &[0xaa_u8], &[0_u8]],
+            )
+            .unwrap();
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let frontier: i64 = connection
+            .query_row(
+                "SELECT message_insert_order
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frontier, 1);
+        let retained_routes: String = connection
+            .query_row(
+                "SELECT prior_nostr_routes_json
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_routes, "[]");
+        let pending_application_event_columns = connection
+            .prepare("PRAGMA table_info(pending_application_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            pending_application_event_columns,
+            vec!["message_id", "group_id", "message_insert_order", "record"],
+            "serialized application events follow the storage record-blob convention",
+        );
     }
 
     #[test]

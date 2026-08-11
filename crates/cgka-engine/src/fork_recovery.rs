@@ -499,6 +499,23 @@ mod tests {
             unused()
         }
 
+        fn put_pending_application_event(
+            &self,
+            _event: &cgka_traits::engine::GroupEvent,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn list_pending_application_events(
+            &self,
+        ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
+            unused()
+        }
+
+        fn delete_pending_application_events(&self, _ids: &[MessageId]) -> StorageResult<()> {
+            unused()
+        }
+
         fn put_ingress_dedup_marker(&self, _id: &MessageId) -> StorageResult<()> {
             unused()
         }

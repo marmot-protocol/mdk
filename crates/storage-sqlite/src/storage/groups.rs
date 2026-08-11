@@ -52,6 +52,11 @@ impl GroupStorage for SqliteAccountStorage {
             return Err(StorageError::NotFound);
         }
         tx.execute(
+            "DELETE FROM pending_application_events WHERE group_id = ?1",
+            params![id.as_slice()],
+        )
+        .storage()?;
+        tx.execute(
             "DELETE FROM openmls_values WHERE provider_version = ?1 AND group_key = ?2",
             params![openmls_traits::storage::CURRENT_VERSION, mls_group_key],
         )
@@ -121,12 +126,13 @@ mod tests {
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
     use cgka_traits::capabilities::GroupCapabilities;
+    use cgka_traits::engine::GroupEvent;
     use cgka_traits::group::ProtocolProfile;
     use cgka_traits::storage::{
         CapabilityStorage, ConvergencePolicyStorage, GroupStorage, MessageStorage,
         OutboundIntentStorage, StorageError, StorageProvider, TransportGroupRoute,
     };
-    use cgka_traits::types::EpochId;
+    use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 
     #[test]
@@ -320,8 +326,17 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 1);
         store.put_group(&group).unwrap();
+        let message = sample_message(mid(1), group.id.clone(), 0);
+        store.put_message(&message).unwrap();
         store
-            .put_message(&sample_message(mid(1), group.id.clone(), 0))
+            .put_pending_application_event(&GroupEvent::MessageReceived {
+                group_id: group.id.clone(),
+                message_id: message.id.clone(),
+                sender: MemberId::new(vec![7; 32]),
+                epoch: EpochId(0),
+                payload: b"authenticated chat".to_vec(),
+                retention: None,
+            })
             .unwrap();
         store
             .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
@@ -370,6 +385,16 @@ mod tests {
             .put_message(&sample_message(mid(1), group.id.clone(), 0))
             .unwrap();
         store
+            .put_pending_application_event(&GroupEvent::MessageReceived {
+                group_id: group.id.clone(),
+                message_id: mid(1),
+                sender: MemberId::new(vec![7; 32]),
+                epoch: EpochId(0),
+                payload: b"authenticated chat".to_vec(),
+                retention: None,
+            })
+            .unwrap();
+        store
             .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
             .unwrap();
         store
@@ -390,6 +415,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(store.list_pending_application_events().unwrap().is_empty());
         assert!(
             store
                 .list_queued_outbound_intents(&group.id)

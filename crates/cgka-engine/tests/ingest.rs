@@ -1815,6 +1815,87 @@ async fn send_app_message_round_trips_to_another_client() {
 }
 
 #[tokio::test]
+async fn pending_application_delivery_replays_after_restart_until_acknowledged() {
+    let mut alice = build_client(b"alice-outbox");
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(bob_storage.clone(), b"bob-outbox");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"survive the projection crash"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let pending_events = bob_storage.list_pending_application_events().unwrap();
+    assert_eq!(pending_events.len(), 1);
+    let pending_message_id = match &pending_events[0] {
+        GroupEvent::MessageReceived { message_id, .. } => message_id.clone(),
+        event => panic!("unexpected pending event: {event:?}"),
+    };
+
+    // Simulate process death after the protocol transition committed but before
+    // the app drained/projected the event.
+    drop(bob);
+    let mut reopened = build_client_with_storage(bob_storage.clone(), b"bob-outbox");
+    let recovered = reopened.drain_events();
+    assert!(recovered.iter().any(
+        |event| matches!(event, GroupEvent::MessageReceived { payload, .. }
+            if app_content(payload) == b"survive the projection crash")
+    ));
+
+    bob_storage
+        .delete_pending_application_events(&[pending_message_id])
+        .unwrap();
+    drop(reopened);
+    let mut acknowledged = build_client_with_storage(bob_storage, b"bob-outbox");
+    assert!(
+        acknowledged
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. })),
+        "acknowledged application events must not replay again",
+    );
+}
+
+#[tokio::test]
 async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");

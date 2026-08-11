@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Local-only group deletion now survives account restart and historical relay
+  replay. A per-group deletion frontier suppresses projection reconciliation
+  until a causally newer chat message arrives, while a durable engine-to-app
+  delivery outbox makes that first crossing chat recoverable after a crash and
+  does not affect other locally deleted groups.
 - OpenCode harness idle-timeout regression test now keeps the mock child alive
   past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
 - Engine fork-detection integration tests now exercise the pinned v1

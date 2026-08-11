@@ -21,7 +21,7 @@ use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
-use cgka_traits::{GroupId, SecretBytes};
+use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::StreamExt;
 use marmot_forensics::AuditEventContext;
 
@@ -44,10 +44,10 @@ use crate::{
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
     AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
-    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
-    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
-    remember_seen_event, unix_now_seconds,
+    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -118,6 +118,19 @@ pub struct AppClient {
     /// (see `Self::drain_epoch_stall_escalations`).
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Batch-start local-deletion frontiers crossed by authenticated fresh
+    /// activity. They remain pending until the crossing projection and marker
+    /// clears commit in the same account-state transaction.
+    pub(crate) pending_local_group_deletion_frontier_clears: HashMap<String, u64>,
+    /// Authenticated application deliveries observed by this client but not yet
+    /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
+    /// committed with the account projection and any frontier clear.
+    pub(crate) pending_application_event_acks: HashSet<MessageId>,
+    /// Unit-test fault injection for the account-open replay path. This keeps
+    /// the live protocol group intact while exercising a missing best-effort
+    /// app projection.
+    #[cfg(test)]
+    pub(crate) force_event_group_projection_unavailable: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -1477,8 +1490,10 @@ impl AppClient {
     /// an MLS leave and does not delete the stored MLS/OpenMLS group state; a
     /// future fresh group delivery can recreate the chat-list projection.
     ///
-    /// The live transport route is removed and synced before the DB wipe so the
-    /// account stops actively subscribing to the group before local rows vanish.
+    /// The live transport route is removed and synced before the DB wipe so no
+    /// delivery races the deletion transaction, then the current route is
+    /// restored without restoring the projection. The durable deletion frontier
+    /// filters historical replay until a strictly newer app message arrives.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
@@ -1490,6 +1505,7 @@ impl AppClient {
             .await?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let original_groups = self.state.groups.clone();
+        let original_routing = self.routing.snapshot();
         let was_live = original_groups
             .iter()
             .any(|group| group.group_id_hex == group_id_hex);
@@ -1499,31 +1515,86 @@ impl AppClient {
                 .groups
                 .retain(|group| group.group_id_hex != group_id_hex);
             if let Err(error) = self.refresh_routing() {
-                self.state.groups = original_groups;
-                self.refresh_routing()?;
+                self.restore_local_group_after_failed_delete(
+                    original_groups,
+                    original_routing.clone(),
+                    false,
+                )
+                .await;
                 return Err(error);
             }
             if let Err(error) = self.sync_runtime_groups().await {
-                self.state.groups = original_groups;
-                self.refresh_routing()?;
-                self.sync_runtime_groups().await?;
+                self.restore_local_group_after_failed_delete(
+                    original_groups,
+                    original_routing.clone(),
+                    true,
+                )
+                .await;
                 return Err(error);
             }
         }
 
-        match self
+        let result = match self
             .app
             .delete_group_local_data(&self.state.label, &group_id_hex)
         {
-            Ok(deleted) => Ok(deleted || was_live),
+            Ok(result) => result,
             Err(error) => {
                 if was_live {
-                    self.state.groups = original_groups;
-                    self.refresh_routing()?;
-                    self.sync_runtime_groups().await?;
+                    self.restore_local_group_after_failed_delete(
+                        original_groups,
+                        original_routing,
+                        true,
+                    )
+                    .await;
                 }
-                Err(error)
+                return Err(error);
             }
+        };
+        if was_live {
+            // The wipe has committed. Route restoration is a best-effort
+            // post-success step: a transient adapter failure must not report
+            // the durable delete as failed. Startup reconciliation retries it.
+            match self.ensure_local_deleted_group_route(group_id) {
+                Ok(true) => {
+                    if let Err(error) = self.sync_runtime_groups().await {
+                        tracing::warn!(
+                            target: "marmot_app::client",
+                            method = "delete_group_local",
+                            error_kind = error.privacy_safe_kind(),
+                            "local-delete route restoration remains pending",
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "delete_group_local",
+                        error_kind = error.privacy_safe_kind(),
+                        "local-delete route restoration remains pending",
+                    );
+                }
+            }
+        }
+        Ok(was_live || result)
+    }
+
+    async fn restore_local_group_after_failed_delete(
+        &mut self,
+        original_groups: Vec<AppGroupRecord>,
+        original_routing: AppRoutingState,
+        sync_transport: bool,
+    ) {
+        self.state.groups = original_groups;
+        self.routing.replace(original_routing);
+        if sync_transport && let Err(error) = self.sync_runtime_groups().await {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "restore_local_group_after_failed_delete",
+                error_kind = error.privacy_safe_kind(),
+                "failed local-delete transport compensation remains pending",
+            );
         }
     }
 
@@ -2069,7 +2140,9 @@ impl AppClient {
             // the primary error.
             self.observe_send_applied_effects_best_effort(&effects)
                 .await;
-            if let Err(_save_err) = self.app.save_state(&self.state) {
+            if let Err(_save_err) =
+                self.save_state_with_pending_local_group_deletion_frontier_clears()
+            {
                 tracing::warn!(
                     target: "marmot_app::messages",
                     method = "send_app_event_with_local_projection",
@@ -2120,7 +2193,7 @@ impl AppClient {
         // Best-effort: a projection failure must not fail a completed publish.
         self.observe_send_applied_effects_best_effort(&effects)
             .await;
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,
@@ -3109,6 +3182,7 @@ impl AppClient {
 
     fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
+        self.preserve_local_deleted_group_routes(&routing)?;
         self.routing.replace(routing.snapshot());
         Ok(())
     }

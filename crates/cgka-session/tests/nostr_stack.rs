@@ -53,10 +53,16 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .await
         .expect("group delivery should reach bob");
     assert_eq!(received.outcome, IngestOutcome::Processed);
+    let [GroupEvent::MessageReceived { message_id, .. }] = received.effects.events.as_slice()
+    else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id: message_id.clone(),
             epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"hello through the nostr stack"),
@@ -160,10 +166,16 @@ async fn group_delivery_requires_synced_group_subscription() {
         .await
         .expect("synced group delivery should reach bob");
     assert_eq!(after_sync.outcome, IngestOutcome::Processed);
+    let [GroupEvent::MessageReceived { message_id, .. }] = after_sync.effects.events.as_slice()
+    else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
     assert_eq!(
         after_sync.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id: message_id.clone(),
             epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"sync gated"),
