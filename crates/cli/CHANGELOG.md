@@ -16,6 +16,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   generic `relay rejected event` summary, while successful deletions still
   clear only matching local KeyPackage publication metadata after at least one
   relay acknowledgement.
+- Hermes Marmot `marmot_history` and `delete_marmot_message` tools now accept
+  Hermes ToolRegistry runtime keyword arguments (`task_id`, `session_id`, and
+  future dispatch metadata) instead of failing with `TypeError` during gateway
+  tool calls.
+- Leave-proposal persistence now commits the signed proposal, durable leave
+  request, and content-dedup marker atomically, so a storage failure cannot
+  strand a same-epoch leave retry without a publishable proposal.
 
 ## [0.9.11] - 2026-08-09
 

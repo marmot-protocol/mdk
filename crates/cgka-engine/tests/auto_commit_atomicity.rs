@@ -1,17 +1,14 @@
-//! Group-record write atomicity under an injected storage fault (mdk#333).
+//! Storage transaction atomicity under injected faults (mdk#333, mdk#1354).
 //!
-//! Every seam that advances durable group state projects the Marmot record as
-//! part of the same logical step. If the record write fails after other durable
-//! state has advanced, the record must not be left torn — an epoch or roster
-//! disagreeing with the MLS group and the epoch state machine strands replay
-//! (which bails on any epoch mismatch), forks the rendered member list from
-//! reality, and survives into the next session because hydration reads the
-//! record.
+//! Group-projection tests prove that every seam advancing durable group state
+//! projects the Marmot record as part of the same logical step. Leave-proposal
+//! tests prove that the sent message, pending leave request, and distinct
+//! content marker commit together. In either case, an injected storage failure
+//! must not leave durable or in-memory state torn across a session restart.
 //!
-//! Each test here arms a one-shot `put_group` failure at exactly one seam's
-//! projection — auto-commit staging, Welcome join, group-profile staging,
-//! inbound commit apply — and asserts nothing is torn and the group stays
-//! usable.
+//! Tests arm one-shot `put_group`, `put_message`, or `put_leave_request`
+//! failures at the relevant write seam and assert that nothing is torn, retries
+//! remain possible, and the group stays usable.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
@@ -152,6 +149,52 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+/// Outbound peeler whose transport id is already the content-derived id.
+/// This exercises the single-row idempotency path in sent-message persistence.
+struct ContentIdPeeler;
+
+#[async_trait]
+impl TransportPeeler for ContentIdPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        use sha2::{Digest, Sha256};
+
+        Ok(TransportMessage {
+            id: MessageId::new(Sha256::digest(&payload.ciphertext).to_vec()),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("leave-content-id".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        })
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 /// Feature registry advertising MIP-03 SelfRemove so the auto-committer fires
 /// on a peer's leave proposal.
 fn selfremove_registry() -> FeatureRegistry {
@@ -212,12 +255,40 @@ impl CapabilityWriteFault {
     }
 }
 
+/// One-shot fault that fails the Nth leave-persistence write after arming.
+/// The counter is shared by proposal rows, leave requests, and content-marker
+/// rows so tests can target every write in their required transaction order.
+#[derive(Clone, Default)]
+struct LeaveWriteFault(Arc<AtomicUsize>);
+
+impl LeaveWriteFault {
+    fn arm_on_write(&self, write: usize) {
+        assert!(write > 0);
+        self.0.store(write, Ordering::SeqCst);
+    }
+
+    fn should_fail(&self) -> bool {
+        matches!(
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                }),
+            Ok(1)
+        )
+    }
+
+    fn remaining(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
 /// selected record/cache writes. Every other call delegates unchanged.
 struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: PutGroupFault,
     capability_fault: CapabilityWriteFault,
+    leave_write_fault: LeaveWriteFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -240,6 +311,11 @@ impl GroupStorage for FaultStorage {
 
 impl MessageStorage for FaultStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
+        if self.leave_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected leave-persistence write failure".into(),
+            ));
+        }
         self.inner.put_message(record)
     }
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
@@ -346,6 +422,11 @@ impl OutboundFanoutStorage for FaultStorage {
 
 impl LeaveRequestStorage for FaultStorage {
     fn put_leave_request(&self, request: &LeaveRequest) -> StorageResult<()> {
+        if self.leave_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected leave-persistence write failure".into(),
+            ));
+        }
         self.inner.put_leave_request(request)
     }
     fn leave_request(&self, group_id: &GroupId) -> StorageResult<Option<LeaveRequest>> {
@@ -553,6 +634,7 @@ fn build_fault_selfremove_client(
         inner,
         fault,
         capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -574,6 +656,7 @@ fn build_capability_fault_client(
         inner,
         fault: PutGroupFault::default(),
         capability_fault,
+        leave_write_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -585,8 +668,34 @@ fn build_capability_fault_client(
     (engine, handle)
 }
 
-fn build_selfremove_client(identity: &[u8]) -> cgka_engine::Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+fn build_leave_write_fault_client(
+    identity: &[u8],
+    leave_write_fault: LeaveWriteFault,
+    peeler: Box<dyn TransportPeeler>,
+) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault,
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(identity))
+    .account_identity_proof_signer(proof_signer(identity))
+    .feature_registry(selfremove_registry())
+    .peeler(peeler)
+    .build()
+    .expect("build fault-injecting engine");
+    (engine, handle)
+}
+
+fn build_selfremove_client_on_storage(
+    identity: &[u8],
+    storage: SqliteAccountStorage,
+) -> cgka_engine::Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
@@ -594,6 +703,143 @@ fn build_selfremove_client(identity: &[u8]) -> cgka_engine::Engine<SqliteAccount
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
+}
+
+fn build_selfremove_client(identity: &[u8]) -> cgka_engine::Engine<SqliteAccountStorage> {
+    build_selfremove_client_on_storage(identity, SqliteAccountStorage::in_memory().unwrap())
+}
+
+async fn setup_leave_fault_case(
+    identity: &[u8],
+    fault: LeaveWriteFault,
+    peeler: Box<dyn TransportPeeler>,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+) {
+    let mut alice = build_selfremove_client(b"alice-leave-write-atomic");
+    let (mut bob, bob_storage) = build_leave_write_fault_client(identity, fault, peeler);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "leave write atomicity".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+    (bob, bob_storage, group_id)
+}
+
+/// The proposal row, durable leave request, and distinct content marker are one
+/// transaction. A fault at any write leaves both durable and hot leave state
+/// untouched, and the same epoch remains retryable after reopening.
+#[tokio::test]
+async fn leave_persistence_failure_rolls_back_every_transactional_write() {
+    for fail_on_write in 1..=3 {
+        let identity = format!("bob-leave-write-{fail_on_write}");
+        let fault = LeaveWriteFault::default();
+        let (mut bob, bob_storage, group_id) =
+            setup_leave_fault_case(identity.as_bytes(), fault.clone(), Box::new(MockPeeler)).await;
+        let epoch = bob.epoch(&group_id).unwrap();
+        let rows_before = bob_storage.list_messages(&group_id, EpochId(0)).unwrap();
+
+        fault.arm_on_write(fail_on_write);
+        let failed = bob
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await;
+        assert!(
+            matches!(failed, Err(EngineError::Storage(StorageError::Busy(_)))),
+            "write {fail_on_write} must surface its storage fault, got {failed:?}"
+        );
+        assert_eq!(
+            bob_storage.list_messages(&group_id, EpochId(0)).unwrap(),
+            rows_before,
+            "write {fail_on_write} must not leave a proposal or content marker"
+        );
+        assert!(
+            bob_storage.leave_request(&group_id).unwrap().is_none(),
+            "write {fail_on_write} must not leave last_proposed_epoch"
+        );
+
+        // The hot leave gate is seeded only after the complete transaction.
+        // Reopening from the same storage must therefore see no leave state and
+        // accept a same-epoch retry.
+        drop(bob);
+        let mut reopened =
+            build_selfremove_client_on_storage(identity.as_bytes(), bob_storage.clone());
+        reopened.hydrate_all_stored_groups().unwrap();
+        assert_eq!(reopened.epoch(&group_id).unwrap(), epoch);
+        let retry = reopened
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await;
+        assert!(
+            matches!(retry, Ok(SendResult::Proposal { .. })),
+            "write {fail_on_write} must leave the same epoch retryable, got {retry:?}"
+        );
+    }
+}
+
+/// When the transport id already equals the content-derived id, persistence
+/// writes one proposal row rather than trying to insert a duplicate marker.
+#[tokio::test]
+async fn leave_persistence_skips_duplicate_content_marker_write() {
+    let fault = LeaveWriteFault::default();
+    let (mut bob, bob_storage, group_id) = setup_leave_fault_case(
+        b"bob-leave-content-id",
+        fault.clone(),
+        Box::new(ContentIdPeeler),
+    )
+    .await;
+    let rows_before = bob_storage.list_messages(&group_id, EpochId(0)).unwrap();
+
+    fault.arm_on_write(3);
+    let proposal = match bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected Proposal, got {other:?}"),
+    };
+    assert_eq!(
+        proposal.id,
+        MessageId::new(<sha2::Sha256 as sha2::Digest>::digest(&proposal.payload).to_vec())
+    );
+    assert_eq!(
+        fault.remaining(),
+        1,
+        "equal transport/content ids must skip the third marker write"
+    );
+    assert_eq!(
+        bob_storage
+            .list_messages(&group_id, EpochId(0))
+            .unwrap()
+            .len(),
+        rows_before.len() + 1,
+        "successful leave should add one canonical proposal row"
+    );
 }
 
 /// A backend failure after OpenMLS consumes the joining KeyPackage must roll

@@ -156,6 +156,20 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
   --seed 7 --cases 12 --case-timeout-secs 300 \
   --out target/cgka-adversarial-reliability-process-campaign --storage file
 
+# Isolate any generated family case-by-case. The parent writes each exact
+# generated input before spawning its deadline-bounded worker; workers write
+# the same reports, fixture candidates, and portable failure capsules as the
+# report CLI.
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
+  --family convergence-chaos/v1 --seed 42 --cases 22 --case-timeout-secs 300 \
+  --out target/cgka-convergence-chaos-process-campaign --storage file
+```
+
+Use a new output directory for each ad-hoc run. The runner refuses to overwrite a prior summary, generated input,
+report, fixture, or failure capsule. The committed `adversarial-reliability-ci` and `convergence-weekly-lane` gates
+remove their fixed output directories before invoking the runner, so those recipes remain rerunnable.
+
+```sh
 # Test-only one-variable policy curves around fixed retained inputs/horizons.
 cargo test -p cgka-conformance-simulator --features test-policy-overrides \
   --test policy_sweeps
@@ -163,6 +177,12 @@ cargo test -p cgka-conformance-simulator --features test-policy-overrides \
 # Independent convergence model, liveness, mutation, and protocol-decision gate.
 just convergence-verification-ci
 ```
+
+The process-campaign summary records the selected family, seed, storage mode, timeout, sensitive-capture setting,
+per-case process measurements, and every generated-input/report/fixture/capsule path. A normally exiting worker must
+leave a parseable report whose generated metadata and source digest match the saved input, plus its fixture candidate;
+otherwise `artifact_integrity_errors` makes the campaign fail. Case indices are generated directly rather than by
+rebuilding and discarding the complete earlier prefix, so increasing `--cases` keeps generation work linear.
 
 Every `ScenarioReport` embeds `campaign_measurements` v1. Its convergence latency is the measured wall time of the
 final successful `await_quiescence` action, or explicitly unavailable when the scenario does not request one;

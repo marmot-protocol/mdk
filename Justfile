@@ -306,6 +306,7 @@ adversarial-reliability-ci:
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked
     cargo test -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked -- --ignored
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
+    rm -rf -- target/cgka-adversarial-reliability-ci
     cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-adversarial-reliability-ci --storage file
 
 # Independent convergence model, lifecycle/fairness, mutation adequacy, and
@@ -335,6 +336,7 @@ convergence-nightly-lane: convergence-lane-policy convergence-failure-corpus sim
     cargo nextest run -p convergence-campaign-runner --locked
 
 convergence-weekly-lane: convergence-nightly-lane
+    rm -rf -- target/cgka-weekly-reliability
     cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 4 --case-timeout-secs 300 --out target/cgka-weekly-reliability --storage file
 
 # A release run must name a reviewed mixed-build manifest rather

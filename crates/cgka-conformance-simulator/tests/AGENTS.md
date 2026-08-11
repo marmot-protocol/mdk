@@ -44,6 +44,10 @@ Map for simulator tests.
   - **Owns:** Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior,
     generated send/leave histories, and delivery-profile convergence.
 
+- **File:** `process_campaign_runner.rs`
+  - **Owns:** Real child-process campaign execution, exact saved-input/report provenance, fixture/capsule artifacts, and
+    refusal to overwrite prior campaign evidence.
+
 - **File:** `report_runner.rs`
   - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
 

@@ -1216,8 +1216,9 @@ mod tests {
     use crate::NostrKeyPackagePublication;
     use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
+    use futures::{SinkExt, StreamExt};
     use nostr_relay_builder::MockRelay;
-    use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
+    use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, Keys, Kind, Tag};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, advance, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
@@ -2174,6 +2175,118 @@ mod tests {
             Some(&1)
         );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
+    async fn sdk_does_not_cache_failed_signature_verification() {
+        let transport_group_id = vec![0xCC; 32];
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "outer encrypted body")
+            .tags([Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [hex::encode(&transport_group_id)],
+            )])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign test event");
+        let mut first_invalid = event.clone();
+        first_invalid.sig = EventBuilder::new(Kind::TextNote, "wrong signature")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign replacement signature")
+            .sig;
+        let mut second_invalid = event.clone();
+        second_invalid.sig = EventBuilder::new(Kind::TextNote, "another wrong signature")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign second replacement signature")
+            .sig;
+        assert!(first_invalid.verify().is_err());
+        assert!(second_invalid.verify().is_err());
+        assert_eq!(first_invalid.id, second_invalid.id);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint_text = format!("ws://{}", listener.local_addr().unwrap());
+        let endpoint = RelayUrl::parse(&endpoint_text).unwrap();
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(message) = socket.next().await {
+                let Ok(tokio_tungstenite::tungstenite::Message::Text(message)) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                let subscription_id = request[1].as_str().unwrap();
+                for invalid in [&first_invalid, &second_invalid] {
+                    socket
+                        .send(
+                            serde_json::json!(["EVENT", subscription_id, invalid])
+                                .to_string()
+                                .into(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                socket
+                    .send(
+                        serde_json::json!(["EOSE", subscription_id])
+                            .to_string()
+                            .into(),
+                    )
+                    .await
+                    .unwrap();
+                return;
+            }
+        });
+
+        let client = Client::builder().build();
+        // Subscribe before the relay connects: unlike `handle_notifications`,
+        // this synchronous receiver is installed before the first event can
+        // arrive and cannot race the test relay's immediate response.
+        let mut notifications = client.notifications();
+
+        client.add_relay(endpoint.clone()).await.unwrap();
+        client.connect().await;
+        let subscription_id = SubscriptionId::new("cache-poisoning-regression");
+        client
+            .subscribe_with_id_to(
+                [endpoint],
+                subscription_id,
+                Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                    SingleLetterTag::lowercase(Alphabet::H),
+                    [hex::encode(&transport_group_id)],
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        loop {
+            match timeout(Duration::from_secs(5), notifications.recv())
+                .await
+                .expect("the relay EOSE must arrive")
+                .expect("notification channel remains open")
+            {
+                RelayPoolNotification::Event { .. } => {
+                    panic!("failed signature verification must not emit a trusted event")
+                }
+                RelayPoolNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(_),
+                    ..
+                } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            client.database().check_id(&event.id).await.unwrap(),
+            DatabaseEventStatus::NotExistent,
+            "events that fail verification must not be stored"
+        );
+
+        client.shutdown().await;
     }
 
     #[test]

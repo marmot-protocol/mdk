@@ -640,6 +640,14 @@ pub trait StorageProvider:
     /// supports it. Backends without transactional support use the closure
     /// directly; SQLite overrides this so multi-write OpenMLS transitions are
     /// committed or rolled back as one unit.
+    ///
+    /// The closure receives this same provider, and every write issued on it
+    /// for the closure's duration joins the one unit — whether through the
+    /// passed handle or through another reference to the same value. Engine
+    /// helpers that write through their own `&S` field rely on this, so an
+    /// implementation must not hand the closure a different connection or a
+    /// distinct `Self`: that would silently split a unit whose atomicity
+    /// callers depend on.
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         Self: Sized,

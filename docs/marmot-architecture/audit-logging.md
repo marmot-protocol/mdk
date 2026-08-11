@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-07-30
+updated: 2026-08-06
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -614,6 +614,18 @@ Metadata notes:
   unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
   `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
   Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
+- `reason = "missing_retained_anchor"` has exactly one emission site: the convergence coordinator's
+  materialization-time halt, paired with a `convergence_run_state` row carrying the same `error_kind`. Direct ingest
+  never emits it. Ingest reaches the same missing-anchor condition through OpenMLS's `WrongEpoch` framing check, which
+  runs upstream of every signature and membership-tag check, so the rival's claimed source epoch is unauthenticated
+  there and no terminal state may be derived from it. Ingest instead records a `rejection` row with
+  `reason = "fork_rival_missing_retained_anchor"`, keeps the rival's retained content row, and schedules the group, so
+  the coordinator issues the halt from its own verdict. The retained row stays pass-opening precisely so that verdict
+  keeps being reachable; the `join_welcome_repair` exit is what clears it, retiring unresolved commits below the
+  replacement Welcome's own epoch with `message_state_changed`
+  `reason = "superseded_by_replacement_welcome"`. Without that retirement a repaired group re-halts on its next drain,
+  so an analyzer seeing `join_welcome_repair` with no following halt should expect those retirement rows in the same
+  join.
 
 ### `group_state_changed`
 
@@ -855,15 +867,19 @@ Emitted when a stored message is inserted or changes `MessageState`.
 | `epoch` | Message epoch when known. |
 | `reason` | Stable call-site reason. |
 
-`new_state` values:
+`new_state` values — the `MessageState` strings, plus one non-state release marker:
 
 - `sent`
 - `created`
 - `processed`
 - `failed`
 - `retryable`
+- `convergence_deferred` — a completed convergence pass gave the input no terminal disposition. It stays graph input
+  for a later pass without reopening convergence itself; evidence that later selects it moves it to `processed`.
 - `peel_deferred`
 - `epoch_invalidated`
+- `released` — not a stored state: the deferred-peel row was deleted under a resource refusal
+  (`resource_refused_retry_budget` below), and same-id redelivery stays eligible.
 
 Current `reason` values found in production call sites:
 
@@ -878,6 +894,7 @@ Current `reason` values found in production call sites:
 | `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
 | `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
+| `superseded_by_replacement_welcome` | A verified replacement Welcome discarded this device's live MLS copy, so an unresolved commit retained below the new copy's epoch can never be applied; state becomes `epoch_invalidated`. |
 
 Metadata notes:
 
@@ -897,9 +914,14 @@ Defined in the schema for structured message/intent rejection:
 
 Current production status:
 
-- No production call site currently emits `AuditEventKind::Rejection`.
-- The variant is covered by serde round-trip tests and should be handled by downstream tooling for forward
-  compatibility.
+- Emitted from the inbound seams (`message_processor/ingest.rs`, `message_processor/mod.rs`) and from
+  `distributed_convergence.rs`. `reason` is a low-cardinality stable string; the set is open, so downstream tooling
+  must tolerate unknown values.
+- `reason = "fork_rival_missing_retained_anchor"` records that direct ingest could not adjudicate an in-horizon rival
+  commit because the fork-source anchor snapshot is gone. It is an observation, not a verdict: the rival's content row
+  stays retained and the group is scheduled for convergence, which owns the `missing_retained_anchor` halt. Ingest
+  reaches this point through OpenMLS's `WrongEpoch` framing check, upstream of signature and membership-tag
+  verification, so the claimed source epoch on the row is unauthenticated and must not be read as an epoch assertion.
 
 ## Stable string catalog
 

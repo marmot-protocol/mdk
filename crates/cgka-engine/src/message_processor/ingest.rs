@@ -767,6 +767,15 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
+            // Set when convergence admission is refused ONLY because the
+            // fork-source anchor snapshot is gone. Within the rewind horizon
+            // that absence is abnormal by construction — every canonical
+            // advance retains a source-epoch anchor and pruning runs only
+            // beyond the horizon — so the WrongEpoch arm below must fail
+            // closed loudly instead of silently classifying the rival stale.
+            // Commits forking from before this device's join epoch are the
+            // one legitimate in-horizon absence and keep the stale fallback.
+            let mut convergence_refused_for_missing_anchor = false;
             let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
                 if msg_epoch >= current_epoch {
                     true
@@ -780,10 +789,17 @@ impl<S: StorageProvider> Engine<S> {
                         .storage
                         .convergence_pass(&group_id)?
                         .is_some_and(|pass| pass.is_active());
+                    let we_committed_from_source =
+                        self.epoch_manager.we_committed_from(&group_id, msg_epoch);
+                    let has_source_anchor =
+                        self.has_retained_anchor_snapshot(&group_id, msg_epoch)?;
+                    convergence_refused_for_missing_anchor = within_rewind_horizon
+                        && !active_pass
+                        && !we_committed_from_source
+                        && !has_source_anchor
+                        && !self.msg_is_pre_membership(&group_id, msg_epoch);
                     within_rewind_horizon
-                        && (active_pass
-                            || (!self.epoch_manager.we_committed_from(&group_id, msg_epoch)
-                                && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?))
+                        && (active_pass || (!we_committed_from_source && has_source_anchor))
                 }
             } else {
                 false
@@ -982,6 +998,19 @@ impl<S: StorageProvider> Engine<S> {
                                 ));
                             }
                         }
+                    }
+
+                    // An in-horizon rival commit refused convergence admission
+                    // only because its fork-source anchor is gone SHOULD have
+                    // been adjudicated by distributed convergence. Falling
+                    // through to the stale fallback would retire the retained
+                    // row and leave our own (possibly losing) branch with
+                    // nothing recorded. Keep it loud and retained instead —
+                    // but derive no durable terminal state from it, because
+                    // `msg_epoch` is unauthenticated here by construction.
+                    if pending_recovery.is_none() && convergence_refused_for_missing_anchor {
+                        return self
+                            .unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current);
                     }
 
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
@@ -2258,6 +2287,94 @@ impl<S: StorageProvider> Engine<S> {
             last_stable: msg_epoch,
             conflicting_epoch: current,
         }
+    }
+
+    /// Loud, non-terminal handling for an in-horizon rival commit whose
+    /// fork-source anchor snapshot is gone (pre-mechanism database, storage
+    /// loss). The rival SHOULD have been adjudicated by distributed
+    /// convergence; without the anchor this device cannot adjudicate it
+    /// pairwise, and silently dropping it would leave the device on its own —
+    /// possibly losing — branch with nothing recorded anywhere. So: keep the
+    /// retained content row, record the refusal in the audit log, and schedule
+    /// the group so convergence gives the rival a verdict from canonical state.
+    /// Canonical state is left untouched here.
+    ///
+    /// # This seam derives NO durable terminal state, deliberately
+    ///
+    /// It used to. Reaching here means OpenMLS rejected the message with
+    /// `WrongEpoch`, and `validate_framing` — which raises that error — is the
+    /// FIRST statement of `decrypt_message`, strictly upstream of membership-tag
+    /// and signature verification. Nothing cryptographic has run, and nothing
+    /// could: the membership MAC needs the claimed epoch's membership key and
+    /// the signature covers that epoch's serialized group context, and both live
+    /// in the very anchor snapshot that is missing by precondition. `msg_epoch`
+    /// is therefore raw attacker input that no check downstream can ever
+    /// corroborate.
+    ///
+    /// A durable `unrecoverable` marker derived from it handed any group member
+    /// — or a removed member whose epoch snapshot is still retained, via the
+    /// snapshot-fallback peel — a fire-and-forget freeze: one parseable datagram
+    /// naming any in-horizon epoch for which the victim holds no anchor, and the
+    /// group is permanently un-ingestable, across restarts, exitable only by a
+    /// replacement Welcome or disband. Nothing about the victim's storage had to
+    /// be known; a device with a legitimate gap (`join_epoch == 0` legacy
+    /// records defeat the pre-membership carve-out) is exactly the target.
+    ///
+    /// Parking the rival `ConvergenceDeferred` keyed by `msg_epoch` was the same
+    /// defect one level down. That key is the row's `source_epoch`, and
+    /// `openmls_projection::historical_replay_start_epoch` takes the `min` over
+    /// unresolved rows to pick where a pass rewinds to — so the claimed epoch
+    /// would steer the convergence coordinator into its own
+    /// `MissingRetainedAnchor` halt on every later pass. The row this seam
+    /// leaves alone is the one ingest already persisted `Created` at
+    /// `current_epoch`: still retained, still pass-opening, but never a
+    /// historical rewind target chosen by an unauthenticated claim.
+    ///
+    /// # Retiring that row is the repair path's job, not this seam's
+    ///
+    /// Leaving it pass-opening is what keeps the coordinator's verdict
+    /// reachable, and the pass seeder re-derives each retained commit's source
+    /// epoch from its own wire bytes regardless of the column this seam wrote —
+    /// so for a genuine anchor gap the row keeps re-deriving the halt until
+    /// something evicts it. That eviction belongs to a seam holding
+    /// authenticated material: `group_lifecycle::do_join_welcome` retires
+    /// unresolved commits below the replacement Welcome's own `MlsGroup::epoch()`
+    /// (`openmls_projection::retire_commits_superseded_by_replacement_welcome`),
+    /// in the same transaction that discards this device's superseded MLS copy.
+    /// Without it a verified repair does not stick: the group exits the halt and
+    /// the next convergence drain walks it straight back in.
+    ///
+    /// # The local half is not lost
+    ///
+    /// "Our anchor set has a gap inside the rewind horizon" is a LOCAL fact with
+    /// zero attacker input, and it is the only half that could justify a hard
+    /// stop. Evaluating it belongs on a seam that reads no inbound bytes —
+    /// session open, i.e. the per-group full hydration behind
+    /// `Engine::ensure_hydrated`, alongside `sync_unrecoverable_halt_from_storage`.
+    /// Whether a gap there SHOULD hard-stop a group is a product decision and is
+    /// deliberately not made here.
+    fn unadjudicable_fork_rival_without_anchor(
+        &mut self,
+        group_id: GroupId,
+        msg_id: &MessageId,
+        current: EpochId,
+    ) -> Result<IngestOutcome, EngineError> {
+        // `Buffered` promises a later replay of the retained row, and
+        // applications open passes off `drain_pending_convergence_groups`, so
+        // the seam owes the group a schedule. The insert is idempotent and
+        // in-memory.
+        self.schedule_pending_convergence_group(&group_id);
+        self.audit_group(
+            &group_id,
+            marmot_forensics::AuditEventKind::Rejection {
+                msg_id: hex::encode(msg_id.as_slice()),
+                reason: "fork_rival_missing_retained_anchor".to_string(),
+            },
+        );
+        Ok(IngestOutcome::Buffered {
+            group_id,
+            epoch: current,
+        })
     }
 
     fn probe_commit_ordering_metadata_for_recovery(

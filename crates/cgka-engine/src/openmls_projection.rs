@@ -664,6 +664,67 @@ pub fn project_mls_message(
     })
 }
 
+/// Retire unresolved commits that a verified replacement Welcome superseded.
+///
+/// A replacement Welcome discards this device's live OpenMLS copy
+/// (`clear_live_openmls_group_on_storage`) and installs a new one whose history
+/// begins at `replacement_epoch`. Every unresolved commit retained below that
+/// epoch was retained against the discarded copy: applying it needs a rewind to
+/// its own source epoch, and the state that rewind would land on no longer
+/// exists locally and was superseded on the fleet's branch by the very commits
+/// that removed and re-added this device. Left unresolved they are not merely
+/// dead — `historical_replay_start_epoch` takes the `min` source epoch over
+/// unresolved rows to pick a pass's rewind target, so an anchor-less one drags
+/// every later pass into `MissingRetainedAnchor` and re-halts the group the
+/// Welcome just repaired.
+///
+/// `replacement_epoch` MUST come from the processed Welcome's own
+/// `MlsGroup::epoch()` — authenticated material this device derived locally —
+/// never from an inbound message's claimed epoch. A row's own claimed source
+/// epoch decides only its own fate here, and only in the safe direction: a
+/// forged high claim leaves the row exactly as unresolved as it already was.
+///
+/// Commits only. Application messages from the prior membership interval stay
+/// untouched: they may still be decryptable from retained epoch secrets, which
+/// is why a replacement Welcome records `join_epoch = 0` rather than applying a
+/// pre-membership lower bound.
+///
+/// Runs on the caller's transactional handle — this is part of the join's
+/// durable unit, not a separate best-effort sweep.
+pub(crate) fn retire_commits_superseded_by_replacement_welcome<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    replacement_epoch: u64,
+) -> Result<Vec<(MessageId, EpochId)>, cgka_traits::error::EngineError> {
+    let mut retired = Vec::new();
+    for record in storage.list_messages(group_id, EpochId(0))? {
+        if !unresolved_commit_state(record.state) {
+            continue;
+        }
+        // Fail open on unreadable rows, exactly as the stale-deferred sweep
+        // does: this maintenance path must not turn unrelated storage damage
+        // into a failed repair.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            continue;
+        };
+        let Some(message) = payload.as_openmls_wire() else {
+            continue;
+        };
+        let Ok(projection) = project_mls_message(&message.payload) else {
+            continue;
+        };
+        let Some(source_epoch) = projection.source_epoch else {
+            continue;
+        };
+        if projection.kind != OpenMlsContentKind::Commit || source_epoch >= replacement_epoch {
+            continue;
+        }
+        storage.update_message_state(&record.id, MessageState::EpochInvalidated)?;
+        retired.push((record.id, EpochId(source_epoch)));
+    }
+    Ok(retired)
+}
+
 /// Retire deferred commits that can no longer enter the retained candidate
 /// graph.
 ///
