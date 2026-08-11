@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Runtime catch-up, key-package maintenance, and every other incremental sync
+  seam now execute an armed epoch-gap full-history replay immediately instead of
+  waiting for unrelated later relay traffic. Explicit full-history repair also
+  consumes a pending replay without issuing the same account-wide query twice.
+
 ## [0.9.11] - 2026-08-09
 
 ### Added

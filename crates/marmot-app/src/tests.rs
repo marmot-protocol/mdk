@@ -36,7 +36,7 @@ use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
 #[derive(Default)]
-struct ScriptedPushRelayClient {
+pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
@@ -96,9 +96,13 @@ impl ScriptedPushRelayClient {
     /// Fail the next `subscribe` immediately instead of parking it first, for
     /// tests that need a transport activation to error inside a straight-line
     /// call (no second task to release the block).
-    fn fail_next_subscribe(&self) {
+    pub(crate) fn fail_next_subscribe(&self) {
         self.fail_next_subscribe
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn subscription_count(&self) -> usize {
+        self.subscriptions.lock().unwrap().len()
     }
 
     async fn wait_for_blocked_subscribe(&self) {
