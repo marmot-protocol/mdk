@@ -279,8 +279,11 @@ retired or re-armed from the same acknowledgement. A state transition with no tr
 no-op publication rather than inventing a synthetic artifact. ScenarioSpec v2 and v3 drive the same contract through
 `acknowledge_outbound`: the runner polls opaque artifacts, optionally selects a stable scenario publication label and
 artifact role, and applies the declared transport outcome. Engine-generated work has no publication label and can be
-acknowledged as the client's current unresolved outbound set. There is no compatibility constructor, silent
-auto-confirmation mode, or second subject publication capability. `ProtocolProfile::Legacy` is separate from that
+acknowledged as the client's current unresolved outbound set. Production-shaped app adapters publish inside their
+command surface rather than exposing transport artifacts; after a successful named mutation they report that its
+publication is already accepted, allowing the same accepted checkpoint to remain in canonical IR. They reject a later
+`reached_no_endpoint` outcome because an accepted publication cannot be rolled back. There is no compatibility
+constructor or silent auto-confirmation mode in the engine subject. `ProtocolProfile::Legacy` is separate from that
 removed lifecycle: it selects the engine's legacy application-profile compatibility through
 `legacy_compatibility_profile()`, but it uses the same explicit outbound contract as `ProtocolProfile::Current`.
 ScenarioSpec v1 is intentionally unsupported after the repository-owned v2 cutover and is rejected before any subject
@@ -410,10 +413,13 @@ omitted values and clear explicitly empty values. At least one field is required
 `group_profile` to assert the requested values directly; `clients_converged` also compares both profile fields.
 
 Staged publications are referenced by string labels chosen inside the scenario. `acknowledge_outbound.publication`
-selects artifacts emitted by that operation; omitting it selects all currently unresolved artifacts for the client.
-The optional `selection` further restricts the set to `all`, `state_confirmation`, `welcome`, `group_message`, or
+selects artifacts emitted by that operation; on an auto-publishing app adapter, the same label identifies the completed
+mutation whose command already returned successfully. Omitting the label selects all currently unresolved artifacts
+for adapters that expose them.
+The optional `selection` further restricts an exposed artifact set to `all`, `state_confirmation`, `welcome`, `group_message`, or
 `regenerated_queued_intent`. `outcome` is either `accepted` or `reached_no_endpoint`. A labelled acknowledgement fails
-when no unresolved artifact matches, while an unlabelled acknowledgement is an idempotent drain and may match nothing.
+when neither an unresolved artifact nor an already-accepted named app mutation matches, while an unlabelled
+acknowledgement is an idempotent drain and may match nothing.
 `group_message` includes both application messages and proposals because both use the group-message transport envelope.
 Proposal artifacts are engine-generated and have no scenario publication label, so scenarios select them with an
 unlabelled `group_message` acknowledgement unless a future proposal action introduces labels. Client labels are stable

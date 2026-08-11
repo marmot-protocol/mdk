@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-10
+updated: 2026-08-11
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -1033,12 +1033,11 @@ The remaining 6.1 work is assurance closure, not another speculative engine rewr
 on `master`; the next test must reproduce the cross-route topology against that design and either confirm equivalent
 results or produce a new minimized counterexample.
 
-Production fork behavior is being considered separately in
-[MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) and its stacked
-[MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293). The route inventory, assurance claims, and campaign
-inputs must remain independently reviewable and runnable against current `master`; they must not encode either open
-PR's proposed result as the oracle. Saved counterexamples from current `master` become before/after evidence if that
-production stack lands.
+[MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) has now merged the fail-closed missing-anchor behavior and
+Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) remains
+open and is not part of the oracle. The route inventory, assurance claims, and campaign inputs remain independently
+reviewable and runnable against current `master`; a production PR may change the implementation under test, but not
+silently redefine the expected result.
 
 ### 6.2 Container and VM execution
 
@@ -1205,24 +1204,42 @@ residual gap.
    expectation over a subset even when other observed clients intentionally diverge. The reviewed all-family seeds
    `1`, `42`, and `1337` are strict-green; this removes known oracle false positives but is not an engine-correctness
    claim.
-4. [ ] Generalize the isolated child-process campaign runner from the adversarial catalog to every built-in generated
+4. [x] Generalize the isolated child-process campaign runner from the adversarial catalog to every built-in generated
    family, persist the exact generated input before each worker starts, run the worker through the strict report path,
    and retain its report, fixture candidate, and failure capsule. Then execute a reviewed file-backed seed/case matrix
    and classify every failure as a product defect, protocol ambiguity, environment failure, or expected resource
    refusal. Verification must include one smoke case from every family, exact saved-input replay, deadline kill/reap,
-   nonzero exit propagation, and artifact-path integrity. This is the current in-progress slice.
+   nonzero exit propagation, and artifact-path integrity. [MDK #1357](https://github.com/marmot-protocol/mdk/pull/1357)
+   completed the runner. The reviewed campaign executed 60 isolated campaigns and 1,170 file-backed cases across all
+   six generated families with zero failures, timeouts, signals, integrity errors, missing artifacts, or failure
+   capsules. It tested commit `7b0480604a84b8f5728289c18018dd71d8d33e77` on base
+   `5e90b22e`, so it is retained evidence for that snapshot rather than evidence for later production changes.
 5. [ ] Complete the #1285 cross-route regression across every capable adapter. The engine checkpoint is now permanent
    as `cross-route-own-commit-recovery/v1` and pins exact cryptographic, decryptability, commit-disposition, pending-work,
    and projection agreement after restart. `cross-route-retained-history-recovery/v1` now establishes the same contract
    through retained relay histories; app-runtime, process, container, and VM evidence remains.
-   The decision-route inventory is machine checked; keep the remaining assurance artifacts independent of the
-   production behavior under review in #1329/#1293.
+   The first implementation slice runs one capability-overlap restart journey unchanged through engine, app-runtime,
+   and separate-process adapters, plus a companion offline/full-history journey through the app-runtime and process
+   adapters that implement participant connectivity. It compares their public protocol and application projections
+   without weakening the four-party vector or claiming exact cryptographic/disposition evidence from adapters that
+   cannot expose it. The decision-route inventory is machine checked; keep the remaining assurance artifacts
+   independent of #1293.
 6. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
 7. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
 
 The local smoke path is a usability and integration checkpoint, not an assurance exit gate. A visually successful run
 does not substitute for the cross-route campaign or the reviewed distributed evidence above.
+
+The reviewed all-family campaign's per-process reports identify the slowest case as `convergence-chaos/v1`, seed `7`,
+case `9`, at 211.849220 seconds under the 300-second limit. The aggregate summary reported 205.307222 seconds because
+its slowest-case rollup considered only the soak subset; future evidence generation must derive this field from every
+included campaign. The case artifacts and directories were owner-only, while the three top-level hand-authored summary
+files were mode `0644`; future bundles should create aggregate manifests through the same private-file boundary.
+
+Because #1329, #1360, and #1365 changed production behavior after that campaign snapshot, a focused current-`master`
+delta matrix must cover missing-anchor repair, atomic self-removal persistence, and armed backfill after catch-up. A
+full 1,170-case rerun is useful release evidence but is not a prerequisite for the cross-adapter slice.
 
 ### Milestone 6 Exit Gate
 
@@ -1363,6 +1380,9 @@ incorrect result.
 | 2026-08-09 | 6.1 four-party engine cross-route checkpoint | Promoted the #1285 topology into a portable vector with two simultaneous source-epoch committers, pairwise committer displacement, observer-side stored convergence, ordering-key-versus-depth disagreement, branch growth by a third member, encrypted-SQLite restart of the displaced own-commit author, exact cryptographic equality, durable selected/invalidated commit dispositions, no pending work, and active application decryptability in all twelve directions; retained external-adapter and transition-permutation work explicitly open | `cross-route-own-commit-recovery/v1`; strict file-backed report; focused canonical-scenario regression; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md) |
 | 2026-08-10 | 6.1 retained-history cross-route checkpoint | Replayed the four-party #1285 topology through explicit retained relay history rather than semantic packet-bus withholding: participant-specific visibility advances incremental cursors past hidden roots/children, restart reopens encrypted SQLite after pairwise displacement, and full-history queries restore the complete set before exact settlement. Also normalized active-probe evidence from authenticated account identities to stable scenario labels after logical-id correlation. App-runtime and distributed permutations remain open. | `cross-route-retained-history-recovery/v1`; strict file-backed regression; retained-object injection assertions; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md) |
 | 2026-08-10 | Strict generated-family oracle closure | Closed the known strict-oracle false positives across every built-in generated family without changing production convergence behavior: subset exact-equivalence now counts as observed evidence when its executable expectation passes, convergence delivery has an exact/decryptable settle tail, and adversarial arms pin accepted publication plus deterministic delivery claims. Generator versions changed where scenario meaning changed. | [MDK #1349](https://github.com/marmot-protocol/mdk/pull/1349); all 28 vectors; all six families at seeds `1`, `42`, and `1337`; full simulator suite; `test-policy-overrides` campaign gate; `just fast-ci` |
+| 2026-08-11 | All-family isolated campaign evidence | Generalized the isolated worker runner to all six generated families, then reviewed 60 file-backed campaigns and 1,170 cases with exact inputs, reports, fixture candidates, process accounting, deadlines, and failure-capsule paths preserved per case. No case failed, timed out, signaled, lost artifact integrity, or emitted a failure capsule. Recorded the exact tested snapshot and corrected the aggregate slowest-case bookkeeping limitation rather than carrying the result forward to newer production code. | [MDK #1357](https://github.com/marmot-protocol/mdk/pull/1357); tested commit `7b0480604a84b8f5728289c18018dd71d8d33e77` on base `5e90b22e`; 1,170/1,170 cases passed |
+| 2026-08-11 | Post-campaign convergence deltas | Merged fail-closed missing-anchor handling and Welcome-repair retirement, atomic self-removal persistence, and armed backfill after catch-up. These changes postdate the reviewed all-family matrix and therefore require focused current-`master` delta evidence rather than being covered by the older green result. | [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329); [MDK #1360](https://github.com/marmot-protocol/mdk/pull/1360); [MDK #1365](https://github.com/marmot-protocol/mdk/pull/1365) |
+| 2026-08-11 | 6.1 cross-adapter public projection checkpoint | Made accepted publication checkpoints portable across the engine's staged transport and the app runtime's already-published command surface, then ran a three-participant profile/message/restart IR unchanged through engine, app-runtime, and isolated app processes. A companion app/process permutation takes one member offline across the commit and message, restarts another member, performs full-history repair, and requires equivalent duplicate-free public projections. Exact MLS state, active decryptability, the four-party adversarial topology, containers, and VMs remain open. | `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`; `app_runtime_and_process_adapters_recover_the_same_offline_projection`; simulator-only adapter seam and focused process/app tests |
 
 ## Capability Naming Cleanup
 

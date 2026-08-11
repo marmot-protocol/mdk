@@ -119,6 +119,7 @@ pub struct AppRuntimeHarness {
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
+    accepted_publications: BTreeSet<(String, String)>,
 }
 
 impl AppRuntimeHarness {
@@ -173,6 +174,7 @@ impl AppRuntimeHarness {
             participants,
             scenario_groups: BTreeMap::new(),
             active_scenario_group: None,
+            accepted_publications: BTreeSet::new(),
         })
     }
 
@@ -585,6 +587,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::EventObservation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,
+                SubjectCapability::OutboundPublication,
                 SubjectCapability::ParticipantConnectivity,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
@@ -638,6 +641,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
         self.scenario_groups.insert(group_label, group_id.clone());
         self.apply_admin_set(action.creator, &group_id, action.initial_admins)
             .await?;
+        self.accepted_publications
+            .insert((action.creator.to_owned(), action.pending.to_owned()));
         Ok(())
     }
 
@@ -653,6 +658,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .invite_members(&participant.account_id, &group_id, &invitees)
             .await
             .map_err(app_error)?;
+        self.accepted_publications
+            .insert((action.inviter.to_owned(), action.pending.to_owned()));
         Ok(())
     }
 
@@ -672,6 +679,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
+        self.accepted_publications
+            .insert((action.client.to_owned(), action.pending.to_owned()));
         Ok(())
     }
 
@@ -687,6 +696,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .remove_members(&participant.account_id, &group_id, &members)
             .await
             .map_err(app_error)?;
+        self.accepted_publications
+            .insert((action.remover.to_owned(), action.pending.to_owned()));
         Ok(())
     }
 
@@ -698,6 +709,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .schedule_manual_self_update(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
+        self.accepted_publications
+            .insert((action.client.to_owned(), action.pending.to_owned()));
         Ok(())
     }
 
@@ -707,7 +720,22 @@ impl ConvergenceSubject for AppRuntimeHarness {
     ) -> Result<(), SubjectError> {
         let group_id = self.active_group()?;
         self.apply_admin_set(action.client, &group_id, action.admins)
-            .await
+            .await?;
+        if let Some(pending) = action.pending {
+            self.accepted_publications
+                .insert((action.client.to_owned(), pending.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn scenario_publication_already_accepted(
+        &self,
+        client: &str,
+        publication: &str,
+    ) -> Result<bool, SubjectError> {
+        Ok(self
+            .accepted_publications
+            .contains(&(client.to_owned(), publication.to_owned())))
     }
 
     async fn send_application(

@@ -118,6 +118,33 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
 - Checks: confirm advances one epoch. Fail restores the prior epoch and a retry can advance normally.
 - Why: pending-publish rollback must leave the group in a reusable stable state.
 
+## Cross-Adapter Contract Tests
+
+### `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`
+
+- Runs: one canonical three-participant IR through the engine harness, the in-process `MarmotAppRuntime` adapter, and
+  three isolated app participant processes.
+- Checks: explicit accepted-publication checkpoints retain the same meaning for the engine's staged transport and the
+  app adapters' already-published commands; all participants agree on epoch, roster, profile, and administrator state
+  after a durable restart; app-runtime and process projections retain the same application-message multiset and public
+  state commitment.
+- Boundary: the engine harness exposes inbound delivery events, not the app's durable local-sender projection, and its
+  event window is intentionally cleared by restart. The test compares those narrower engine observations only where
+  their semantics overlap. It does not claim exact MLS-state or active-decryptability evidence from app/process
+  adapters.
+- Why: fixture portability and capability preflight alone do not prove that production-shaped adapters execute the
+  same scenario meaning.
+
+### `app_runtime_and_process_adapters_recover_the_same_offline_projection`
+
+- Runs: a companion form of the same three-participant IR through the app-runtime and separate-process adapters, the
+  two subjects that declare participant-connectivity and retained-history capabilities.
+- Checks: Bob misses a profile commit and application message while offline, Carol durably restarts, Bob reconnects,
+  every participant performs a full-history repair, and both adapters reach the same public protocol commitment,
+  roster, profile, administration, and duplicate-free application-message set.
+- Boundary: this is public projection evidence. Adapter-local message ids, runtime event counts, database paths, and
+  other execution-specific observations are deliberately not compared.
+
 ## Shared Generators
 
 ### `intent_seq(3, range)`

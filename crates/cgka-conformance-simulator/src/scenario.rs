@@ -905,29 +905,47 @@ async fn execute_scenario_step(
             outcome,
         } => {
             let client_label = client.clone();
-            let artifacts = subject
-                .poll_outbound(client)
-                .map_err(|error| subject_step_error(step_index, error))?
-                .into_iter()
-                .filter(|artifact| {
-                    publication.as_ref().is_none_or(|publication| {
-                        artifact.publication.as_ref() == Some(publication)
-                    }) && selection.matches(artifact)
-                })
-                .collect::<Vec<_>>();
-            if artifacts.is_empty() && publication.is_some() {
-                return Err(err(
-                    step_index,
-                    format!(
-                        "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
-                    ),
-                ));
-            }
-            for artifact in artifacts {
+            let already_accepted = if let Some(publication) = publication {
                 subject
-                    .acknowledge_outbound(client, &artifact.outbound_id, *outcome)
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
+                    .scenario_publication_already_accepted(client, publication)
+                    .map_err(|error| subject_step_error(step_index, error))?
+            } else {
+                false
+            };
+            if already_accepted {
+                if *outcome != SubjectOutboundOutcome::Accepted {
+                    return Err(err(
+                        step_index,
+                        format!(
+                            "publication {publication:?} for client {client} was already accepted and cannot be rolled back"
+                        ),
+                    ));
+                }
+            } else {
+                let artifacts = subject
+                    .poll_outbound(client)
+                    .map_err(|error| subject_step_error(step_index, error))?
+                    .into_iter()
+                    .filter(|artifact| {
+                        publication.as_ref().is_none_or(|publication| {
+                            artifact.publication.as_ref() == Some(publication)
+                        }) && selection.matches(artifact)
+                    })
+                    .collect::<Vec<_>>();
+                if artifacts.is_empty() && publication.is_some() {
+                    return Err(err(
+                        step_index,
+                        format!(
+                            "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
+                        ),
+                    ));
+                }
+                for artifact in artifacts {
+                    subject
+                        .acknowledge_outbound(client, &artifact.outbound_id, *outcome)
+                        .await
+                        .map_err(|error| subject_step_error(step_index, error))?;
+                }
             }
             if let Some(publication) = publication {
                 pending_resolutions.push(PendingResolutionObservation {
