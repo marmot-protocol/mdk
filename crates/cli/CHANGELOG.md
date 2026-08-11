@@ -30,6 +30,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Leave-proposal persistence now commits the signed proposal, durable leave
   request, and content-dedup marker atomically, so a storage failure cannot
   strand a same-epoch leave retry without a publishable proposal.
+- The Nostr SDK failed-signature regression test now observes EOSE under one
+  bounded CI-safe window, avoiding sharded CI flakes without weakening
+  failed-event non-emission and non-caching assertions.
 
 ## [0.9.11] - 2026-08-09
 
