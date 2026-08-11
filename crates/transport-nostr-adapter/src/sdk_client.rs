@@ -2204,6 +2204,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint_text = format!("ws://{}", listener.local_addr().unwrap());
         let endpoint = RelayUrl::parse(&endpoint_text).unwrap();
+        let (relay_done_tx, relay_done_rx) = tokio::sync::oneshot::channel();
         let relay = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -2234,6 +2235,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                let _ = relay_done_rx.await;
                 return;
             }
         });
@@ -2260,10 +2262,6 @@ mod tests {
             .await
             .unwrap();
 
-        timeout(Duration::from_secs(5), relay)
-            .await
-            .unwrap()
-            .unwrap();
         loop {
             match timeout(Duration::from_secs(5), notifications.recv())
                 .await
@@ -2286,6 +2284,11 @@ mod tests {
             "events that fail verification must not be stored"
         );
 
+        let _ = relay_done_tx.send(());
+        timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
         client.shutdown().await;
     }
 
