@@ -500,6 +500,19 @@
         "post-rejoin application traffic"
       ],
       "next": "Keep as the re-add regression fixture; extend leaver-removal-secrecy with its re-add leg separately."
+    },
+    {
+      "id": "late-welcome-backfill/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "late-welcome-backfill.v1.json",
+      "coverage": [
+        "commits delivered before the recipient's delayed Welcome",
+        "unknown-route drop without a durable record",
+        "post-join relay redelivery of the same events",
+        "late joiner catch-up to the group tip"
+      ],
+      "next": "Keep as the late-welcome recovery regression; unknown-route retention stays deliberately absent per the flood posture."
     }
   ]
 }

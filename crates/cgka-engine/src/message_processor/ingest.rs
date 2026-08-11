@@ -270,6 +270,15 @@ impl<S: StorageProvider> Engine<S> {
                         EpochId(0),
                         MessageState::Retryable,
                     )?;
+                    // Unknown-group traffic is deliberately not retained when
+                    // no group row exists (#740: unknown-route floods must
+                    // not consume storage), so this ignore is not terminal
+                    // evidence either. Keep the id out of the in-memory seen
+                    // cache: if this client later joins the group (a Welcome
+                    // that raced behind its commits), relay redelivery of the
+                    // same event must process instead of classifying as a
+                    // duplicate of a message that left no durable record.
+                    self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
                     return Ok(IngestOutcome::Ignored {
                         category: InputRejectionCategory::UnknownGroup,
                     });
