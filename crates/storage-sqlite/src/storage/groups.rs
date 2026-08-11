@@ -385,6 +385,16 @@ mod tests {
             .put_message(&sample_message(mid(1), group.id.clone(), 0))
             .unwrap();
         store
+            .put_pending_application_event(&GroupEvent::MessageReceived {
+                group_id: group.id.clone(),
+                message_id: mid(1),
+                sender: MemberId::new(vec![7; 32]),
+                epoch: EpochId(0),
+                payload: b"authenticated chat".to_vec(),
+                retention: None,
+            })
+            .unwrap();
+        store
             .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
             .unwrap();
         store

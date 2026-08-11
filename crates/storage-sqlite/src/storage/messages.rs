@@ -138,32 +138,32 @@ impl MessageStorage for SqliteAccountStorage {
                 "pending application outbox accepts only MessageReceived events".to_owned(),
             ));
         };
-        let event_json = serialize(event)?;
+        let record = serialize(event)?;
         let write = || {
             let conn = self.lock()?;
             let inserted = conn
                 .execute(
                     "INSERT INTO pending_application_events (
-                        message_id, group_id, message_insert_order, event_json
+                        message_id, group_id, message_insert_order, record
                      )
                      SELECT ?1, ?2, insert_order, ?3
                      FROM cgka_messages
                      WHERE id = ?1 AND group_id = ?2
                      ON CONFLICT(message_id) DO NOTHING",
-                    params![message_id.as_slice(), group_id.as_slice(), &event_json],
+                    params![message_id.as_slice(), group_id.as_slice(), &record],
                 )
                 .storage()?;
             if inserted == 0 {
                 let existing = conn
                     .query_row(
-                        "SELECT event_json FROM pending_application_events WHERE message_id = ?1",
+                        "SELECT record FROM pending_application_events WHERE message_id = ?1",
                         params![message_id.as_slice()],
                         |row| row.get::<_, Vec<u8>>(0),
                     )
                     .optional()
                     .storage()?;
                 return match existing {
-                    Some(existing) if existing == event_json => Ok(()),
+                    Some(existing) if existing == record => Ok(()),
                     Some(_) => Err(StorageError::Backend(
                         "pending application event id reused with different content".to_owned(),
                     )),
@@ -183,7 +183,7 @@ impl MessageStorage for SqliteAccountStorage {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT event_json
+                "SELECT record
                  FROM pending_application_events
                  ORDER BY message_insert_order, message_id",
             )

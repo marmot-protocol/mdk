@@ -329,13 +329,10 @@ impl AppClient {
                 source_received_at,
                 None,
                 self.app.allow_loopback_blob_endpoints(),
-            ) {
-                if let Some(gossip_message_id) =
-                    self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
-                {
-                    gossip_message_ids.insert(gossip_message_id);
-                }
-                self.prepare_pending_application_event_ack(event);
+            ) && let Some(gossip_message_id) =
+                self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
+            {
+                gossip_message_ids.insert(gossip_message_id);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -345,13 +342,17 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
-            if crosses_frontier {
+            let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
                     batch_start_frontier.expect("crossing event has a frontier"),
-                )?;
+                )?
+            } else {
+                true
+            };
+            if can_ack_application_event {
+                self.prepare_pending_application_event_ack(event);
             }
-            self.prepare_pending_application_event_ack(event);
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
@@ -452,6 +453,10 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         group_metadata: Option<&'a cgka_traits::group::Group>,
     ) -> Option<EventGroupProjection<'a>> {
+        #[cfg(test)]
+        if self.force_event_group_projection_unavailable {
+            return None;
+        }
         let nostr_routing = self.nostr_routing_for_group(group_id).ok()?;
         Some(EventGroupProjection {
             nostr_routing,
@@ -1005,17 +1010,17 @@ impl AppClient {
         &mut self,
         event: &cgka_traits::engine::GroupEvent,
         frontier: u64,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let Some(group_id) = event_group_id(event) else {
-            return Ok(());
+            return Ok(false);
         };
         if !self.adopt_local_deleted_group_prior_routes(group_id)? {
-            return Ok(());
+            return Ok(false);
         }
         self.pending_local_group_deletion_frontier_clears
             .entry(hex::encode(group_id.as_slice()))
             .or_insert(frontier);
-        Ok(())
+        Ok(true)
     }
 
     fn project_received_message(
@@ -1215,13 +1220,10 @@ impl AppClient {
                 source_received_at,
                 outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
-            ) {
-                if let Some(gossip_message_id) =
-                    self.project_received_message(message, group_metadata.as_ref(), summary)?
-                {
-                    gossip_message_ids.insert(gossip_message_id);
-                }
-                self.prepare_pending_application_event_ack(event);
+            ) && let Some(gossip_message_id) =
+                self.project_received_message(message, group_metadata.as_ref(), summary)?
+            {
+                gossip_message_ids.insert(gossip_message_id);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1310,13 +1312,17 @@ impl AppClient {
                     SelfMembership::Member,
                 )?;
             }
-            if crosses_frontier {
+            let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
                     batch_start_frontier.expect("crossing event has a frontier"),
-                )?;
+                )?
+            } else {
+                true
+            };
+            if can_ack_application_event {
+                self.prepare_pending_application_event_ack(event);
             }
-            self.prepare_pending_application_event_ack(event);
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // #760: strip all collected push-gossip messages in one pass.

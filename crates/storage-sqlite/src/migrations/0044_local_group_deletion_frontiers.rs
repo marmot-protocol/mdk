@@ -16,14 +16,14 @@ CREATE TABLE local_group_deletion_frontiers (
 );
 
 -- Authenticated application deliveries remain pending until the app projection
--- commits. `event_json` is inside the account's SQLCipher database and is wiped
+-- commits. `record` is inside the account's SQLCipher database and is wiped
 -- by local group deletion; the source message's durable ingress order provides
 -- deterministic replay after a crash.
 CREATE TABLE pending_application_events (
     message_id BLOB PRIMARY KEY NOT NULL,
     group_id BLOB NOT NULL,
     message_insert_order INTEGER NOT NULL CHECK(message_insert_order >= 0),
-    event_json BLOB NOT NULL
+    record BLOB NOT NULL
 );
 CREATE INDEX idx_pending_application_events_group
     ON pending_application_events(group_id, message_insert_order);

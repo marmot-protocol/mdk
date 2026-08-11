@@ -1424,6 +1424,8 @@ impl MarmotApp {
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
+            #[cfg(test)]
+            force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
             epoch_backfill_pending: false,

@@ -126,6 +126,11 @@ pub struct AppClient {
     /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
     /// committed with the account projection and any frontier clear.
     pub(crate) pending_application_event_acks: HashSet<MessageId>,
+    /// Unit-test fault injection for the account-open replay path. This keeps
+    /// the live protocol group intact while exercising a missing best-effort
+    /// app projection.
+    #[cfg(test)]
+    pub(crate) force_event_group_projection_unavailable: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
