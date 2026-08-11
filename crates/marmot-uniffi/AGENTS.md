@@ -41,4 +41,12 @@ OTLP export builds:
 cargo check -p marmot-uniffi --features otlp-export
 ```
 
+Release-artifact checks (after `xcframework.sh`):
+
+```sh
+./crates/marmot-uniffi/validate-ios-artifact.sh crates/marmot-uniffi/output/MarmotKit.xcframework 18.0
+./crates/marmot-uniffi/validate-swift-package.sh \
+  crates/marmot-uniffi/output/MarmotKit.xcframework - crates/marmot-uniffi/output/MarmotKit.swift
+```
+
 See [`README.md`](README.md) for Android NDK prerequisites and initialization requirements.

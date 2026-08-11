@@ -305,8 +305,9 @@ The workflow lives at:
 .github/workflows/bindings.yaml
 ```
 
-It runs only when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
-`marmotkit-v0.9.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
+It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
+`marmotkit-v0.9.0`, builds both binding bundles, and creates the matching immutable GitHub Release. It can also be
+dispatched with a full commit SHA reachable from `master` to create an immutable iOS-only TestFlight snapshot.
 
 Create the tag:
 
@@ -320,10 +321,20 @@ For releases that should include the matching MDK source and WN Agent tracks, pr
 
 The release job creates these assets:
 
+- `MarmotKitFFI-<version>.xcframework.zip`
+- `MarmotKitFFI-<version>.xcframework.zip.sha256`
+- `MarmotKitFFI-<version>.xcframework.zip.swiftpm-checksum`
+- `MarmotKit-<version>.swift`
+- `marmotkit-ios-<version>.manifest.json`
+- `marmotkit-ios-<version>.checksums.txt`
 - `marmotkit-ios-<version>.zip`
 - `marmotkit-ios-<version>.zip.sha256`
 - `marmotkit-android-<version>.zip`
 - `marmotkit-android-<version>.zip.sha256`
+
+Snapshot assets use `snapshot-<full-sha>` in place of `<version>` and are published under the exact
+`marmotkit-snapshot-<full-sha>` release tag. The binary-only ZIP contains `MarmotKit.xcframework` at its archive root
+for SwiftPM. See `crates/marmot-uniffi/DISTRIBUTION.md` for URL and consumer examples.
 
 The iOS zip contains:
 
@@ -337,8 +348,10 @@ The Android zip contains:
 - `jniLibs/<abi>/libmarmot_uniffi.so` for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`
 - `manifest.json`
 
-Each manifest records the release tag, source commit, workspace version, `Cargo.lock` hash, Rust toolchain versions,
-and package contents. App repos should pin a tag and verify the `.sha256` file before vendoring the bundle.
+Each manifest records the release identifier, exact source commit, workspace version, `Cargo.lock` hash, Rust
+toolchain versions, enabled features, targets, deployment target, effective release profile, and artifact hashes. App
+repos must pin an exact tag, update generated Swift and binary references together, and verify the ordinary SHA-256
+and SwiftPM checksum. Existing release assets and snapshot tags are never overwritten.
 
 ## App Repo Consumption
 
