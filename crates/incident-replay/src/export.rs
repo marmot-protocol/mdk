@@ -432,14 +432,11 @@ impl EventKind {
 
 /// Parse a Goggles `agent-state.json` export.
 pub fn parse(json: &str) -> Result<AgentStateExport, ParseError> {
-    let value: serde_json::Value = serde_json::from_str(json)?;
-    if value
-        .as_object()
-        .is_some_and(|object| object.contains_key("t"))
-    {
+    let probe = serde_json::from_str::<BTreeMap<String, serde::de::IgnoredAny>>(json);
+    if probe.is_ok_and(|object| object.contains_key("t")) {
         return Err(ParseError::StreamDiscriminator);
     }
-    Ok(serde_json::from_value(value)?)
+    Ok(serde_json::from_str(json)?)
 }
 
 /// Why an export could not be parsed.

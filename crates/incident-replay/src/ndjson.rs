@@ -43,10 +43,8 @@ pub fn is_stream(input: &str) -> bool {
     let Some(first_line) = input.lines().find(|line| !line.trim().is_empty()) else {
         return false;
     };
-    serde_json::from_str::<serde_json::Value>(first_line)
-        .ok()
-        .and_then(|value| value.as_object().map(|object| object.contains_key("t")))
-        .unwrap_or(false)
+    serde_json::from_str::<BTreeMap<String, serde::de::IgnoredAny>>(first_line)
+        .is_ok_and(|object| object.contains_key("t"))
 }
 
 /// Parse a streamed group export into the same [`AgentStateExport`] the rest of

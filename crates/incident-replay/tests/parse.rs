@@ -8,6 +8,15 @@ fn invalid_json_is_a_parse_error() {
 }
 
 #[test]
+fn invalid_document_errors_keep_the_source_position() {
+    let Err(ParseError::Json(source)) = parse("{\n  \"events\": [\n}") else {
+        panic!("invalid document did not return its JSON error");
+    };
+    assert_eq!(source.line(), 3);
+    assert_eq!(source.column(), 1);
+}
+
+#[test]
 fn unknown_event_kinds_and_absent_projections_are_tolerated() {
     // Real exports carry ~40 event kinds and many fields this adapter ignores;
     // unknown kinds map to a no-op and an absent derived_projections defaults
