@@ -85,6 +85,7 @@ url = "2"
 psl = "2"
 bech32 = "0.11"
 chacha20poly1305 = "0.10"
+bytes = "1"
 scrypt = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"

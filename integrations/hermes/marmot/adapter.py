@@ -64,11 +64,12 @@ STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
 # ten-item ceiling. Keeping one Marmot album within that bound also limits the
 # encrypted blobs an all-or-error upload can orphan before publication fails.
 MAX_OUTBOUND_MEDIA_ATTACHMENTS = 10
-# Marmot receivers cap encrypted Blossom blobs at 64 MiB. ChaCha20-Poly1305 adds
-# a 16-byte tag, so cap plaintext below that wire limit. The aggregate cap keeps
-# the connector's pre-upload in-memory batch bounded as well.
-MAX_OUTBOUND_MEDIA_FILE_BYTES = 64 * 1024 * 1024 - 16
-MAX_OUTBOUND_MEDIA_BATCH_BYTES = 128 * 1024 * 1024
+# MDK bounds encrypted Blossom blobs at 512 MiB. ChaCha20-Poly1305 adds a
+# 16-byte tag, so cap plaintext below that wire limit. Keep the entire batch
+# within the same bound because the connector validates and reads it before
+# beginning the upload.
+MAX_OUTBOUND_MEDIA_FILE_BYTES = 512 * 1024 * 1024 - 16
+MAX_OUTBOUND_MEDIA_BATCH_BYTES = 512 * 1024 * 1024 - 16
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512

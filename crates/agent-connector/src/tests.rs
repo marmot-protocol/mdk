@@ -44,6 +44,18 @@ use crate::{
 };
 use marmot_app::AppMessageRecord;
 
+#[test]
+fn connector_media_limits_follow_the_marmot_app_blob_limit() {
+    assert_eq!(
+        crate::MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES + 16,
+        marmot_app::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
+    );
+    assert_eq!(
+        crate::MAX_MEDIA_UPLOAD_BATCH_BYTES,
+        crate::MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES
+    );
+}
+
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]

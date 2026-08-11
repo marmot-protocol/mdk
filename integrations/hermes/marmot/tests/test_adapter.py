@@ -853,6 +853,17 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(self.adapter._tool_events_from_progress_text("hello world"), [])
 
 
+class MediaLimitConfigurationTests(unittest.TestCase):
+    def test_defaults_support_large_application_artifacts(self):
+        adapter = load_adapter_module()
+        self.assertEqual(adapter.MAX_OUTBOUND_MEDIA_FILE_BYTES, 512 * 1024 * 1024 - 16)
+        self.assertEqual(
+            adapter.MAX_OUTBOUND_MEDIA_BATCH_BYTES,
+            adapter.MAX_OUTBOUND_MEDIA_FILE_BYTES,
+        )
+        self.assertGreater(adapter.MAX_OUTBOUND_MEDIA_FILE_BYTES, 250 * 1024 * 1024)
+
+
 class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter_module = load_adapter_module()

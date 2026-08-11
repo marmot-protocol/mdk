@@ -9,6 +9,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Encrypted media and Hermes/WN Agent file delivery now accept blobs up to
+  512 MiB (including the 16-byte authentication tag), enabling APKs and other
+  artifacts above the previous 64 MiB ceiling. Encryption/decryption is
+  performed in place, Blossom fallback retries share the same immutable upload
+  body, and large blob transfers have a 15-minute request budget. Receivers must
+  upgrade to this compatibility cohort before downloading blobs above 64 MiB;
+  the active blob remains memory-resident and one media request is bounded to
+  512 MiB total.
+
 ### Fixed
 
 - Engine fork-detection integration tests now exercise the pinned v1

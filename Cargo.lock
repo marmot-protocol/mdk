@@ -3239,6 +3239,7 @@ name = "marmot-app"
 version = "0.9.11"
 dependencies = [
  "async-trait",
+ "bytes",
  "cgka-engine",
  "cgka-session",
  "cgka-traits",
