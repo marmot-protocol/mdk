@@ -3748,7 +3748,7 @@ async def _standalone_send(
     return {"error": result.error or "Marmot send failed"}
 
 
-def _delete_marmot_message_tool(args: Dict[str, Any]) -> str:
+def _delete_marmot_message_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     message_id = str(args.get("message_id") or "").strip()
     if not message_id:
         return json.dumps({"ok": False, "error": "message_id required"})
@@ -3782,7 +3782,7 @@ def _delete_marmot_message_tool(args: Dict[str, Any]) -> str:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
-def _marmot_history_tool(args: Dict[str, Any]) -> str:
+def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     group_id_hex = str(args.get("group_id_hex") or "").strip()
     if not group_id_hex:
         return json.dumps({"ok": False, "error": "group_id_hex required"})

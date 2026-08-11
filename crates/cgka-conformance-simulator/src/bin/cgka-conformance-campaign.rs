@@ -1,6 +1,6 @@
 use cgka_conformance_simulator::{
-    HarnessStorageMode, ScenarioReport, generate_adversarial_reliability_case,
-    run_generated_case_report_with_storage_mode,
+    GeneratedScenarioCase, GeneratedScenarioInputV1, HarnessStorageMode, ReportArgs, ReportInput,
+    ScenarioReport, generate_family_case, resolve_scenario_input_bytes, run_report,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -10,26 +10,39 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 struct Args {
+    family: String,
     seed: u64,
     cases: usize,
-    case_index: Option<usize>,
     out: PathBuf,
     storage: HarnessStorageMode,
     case_timeout: Duration,
+    input: Option<PathBuf>,
+    capture_sensitive_replay: bool,
     worker: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProcessCampaignReportV1 {
     schema_version: String,
+    family: String,
     seed: u64,
+    storage: String,
+    case_timeout_ms: u64,
+    capture_sensitive_replay: bool,
     cases: Vec<ProcessCaseMeasurementV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProcessCaseMeasurementV1 {
     case_index: usize,
+    generated_input: PathBuf,
     report: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fixture_candidate: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_capsule: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sensitive_replay_capsule: Option<PathBuf>,
     exit_code: Option<i32>,
     signal: Option<i32>,
     timed_out: bool,
@@ -41,6 +54,27 @@ struct ProcessCaseMeasurementV1 {
     filesystem_block_write_lower_bound_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unavailable_process_fields: Vec<String>,
+    #[serde(default)]
+    artifact_integrity_errors: Vec<String>,
+}
+
+struct CaseArtifactPaths {
+    generated_input: PathBuf,
+    report: PathBuf,
+    fixture_candidate: PathBuf,
+    failure_capsule: PathBuf,
+    sensitive_replay_capsule: PathBuf,
+}
+
+struct PlannedCase {
+    case: GeneratedScenarioCase,
+    paths: CaseArtifactPaths,
+    generated_input_bytes: Vec<u8>,
+}
+
+struct CaseArtifactInspection {
+    integrity_errors: Vec<String>,
+    database_bytes: Option<u64>,
 }
 
 #[tokio::main]
@@ -59,31 +93,56 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
     if args.worker {
         return run_worker(&args).await;
     }
-    fs_private::create_dir_all_private(&args.out)?;
-
     let executable = std::env::current_exe()?;
+    let (summary_path, planned_cases) = preflight_campaign(&args)?;
+    #[cfg(unix)]
+    let _output_dir_guard = fs_private::prepare_directory_path(
+        &args.out,
+        fs_private::PRIVATE_DIR_MODE,
+        fs_private::ExistingDirectoryMode::Preserve,
+    )?;
+    #[cfg(not(unix))]
+    fs_private::create_dir_all_private(&args.out)?;
     let mut observations = Vec::with_capacity(args.cases);
-    for case_index in 0..args.cases {
-        let report = args.out.join(format!("case-{case_index}.json"));
+    for (case_index, planned) in planned_cases.into_iter().enumerate() {
+        let PlannedCase {
+            case,
+            paths,
+            generated_input_bytes,
+        } = planned;
+        fs_private::write_private(&paths.generated_input, &generated_input_bytes)?;
         let mut command = Command::new(&executable);
-        command.args([
-            "--worker",
-            "--seed",
-            &args.seed.to_string(),
-            "--case-index",
-            &case_index.to_string(),
-            "--out",
-            report.to_str().ok_or("non-UTF-8 report path")?,
-            "--storage",
-            storage_label(args.storage),
-        ]);
+        command
+            .arg("--worker")
+            .arg("--input")
+            .arg(&paths.generated_input)
+            .arg("--out")
+            .arg(&args.out)
+            .arg("--storage")
+            .arg(storage_label(args.storage));
+        if args.capture_sensitive_replay {
+            command.arg("--capture-sensitive-replay");
+        }
         let started = Instant::now();
         let child = command.spawn()?;
         let usage = wait_with_usage(child, args.case_timeout)?;
-        let database_bytes = read_database_bytes(&report);
+        let inspection = inspect_case_artifacts(&case, &paths, &usage);
         observations.push(ProcessCaseMeasurementV1 {
             case_index,
-            report,
+            generated_input: paths.generated_input,
+            report: paths.report,
+            fixture_candidate: paths
+                .fixture_candidate
+                .exists()
+                .then_some(paths.fixture_candidate),
+            failure_capsule: paths
+                .failure_capsule
+                .exists()
+                .then_some(paths.failure_capsule),
+            sensitive_replay_capsule: paths
+                .sensitive_replay_capsule
+                .exists()
+                .then_some(paths.sensitive_replay_capsule),
             exit_code: usage.exit_code,
             signal: usage.signal,
             timed_out: usage.timed_out,
@@ -91,21 +150,28 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
             user_cpu_us: usage.user_cpu_us,
             system_cpu_us: usage.system_cpu_us,
             peak_rss_bytes: usage.peak_rss_bytes,
-            database_bytes,
+            database_bytes: inspection.database_bytes,
             filesystem_block_write_lower_bound_bytes: usage
                 .filesystem_block_write_lower_bound_bytes,
             unavailable_process_fields: usage.unavailable_process_fields,
+            artifact_integrity_errors: inspection.integrity_errors,
         });
     }
-    let failed = observations
-        .iter()
-        .any(|case| case.timed_out || case.exit_code != Some(0) || case.signal.is_some());
+    let failed = observations.iter().any(|case| {
+        case.timed_out
+            || case.exit_code != Some(0)
+            || case.signal.is_some()
+            || !case.artifact_integrity_errors.is_empty()
+    });
     let summary = ProcessCampaignReportV1 {
         schema_version: "1".into(),
+        family: args.family,
         seed: args.seed,
+        storage: storage_label(args.storage).into(),
+        case_timeout_ms: elapsed_ms(args.case_timeout),
+        capture_sensitive_replay: args.capture_sensitive_replay,
         cases: observations,
     };
-    let summary_path = args.out.join("process-campaign.v1.json");
     fs_private::write_private(&summary_path, &serde_json::to_vec_pretty(&summary)?)?;
     println!("Process campaign report: {}", summary_path.display());
     Ok(if failed {
@@ -116,14 +182,20 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
 }
 
 async fn run_worker(args: &Args) -> Result<ExitCode, Box<dyn Error>> {
-    let case_index = args.case_index.ok_or("worker requires --case-index")?;
-    let case = generate_adversarial_reliability_case(args.seed, case_index as u64);
-    let report = run_generated_case_report_with_storage_mode(&case, None, args.storage).await?;
-    if let Some(parent) = args.out.parent() {
-        fs_private::create_dir_all_private(parent)?;
-    }
-    fs_private::write_private(&args.out, &serde_json::to_vec_pretty(&report)?)?;
-    let failed = !report.expectation_failures.is_empty() || !report.invariant_failures.is_empty();
+    let input = args.input.clone().ok_or("worker requires --input")?;
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::GeneratedInputs {
+            paths: vec![input],
+            adapter: None,
+        },
+        out: args.out.clone(),
+        strict_oracle: true,
+        storage_mode: args.storage,
+        capture_sensitive_replay: args.capture_sensitive_replay,
+    })
+    .await?;
+    println!("{}", summary.to_human_text());
+    let failed = summary.failed() > 0;
     Ok(if failed {
         ExitCode::FAILURE
     } else {
@@ -131,32 +203,123 @@ async fn run_worker(args: &Args) -> Result<ExitCode, Box<dyn Error>> {
     })
 }
 
-fn read_database_bytes(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice::<ScenarioReport>(&bytes)
-        .ok()?
-        .campaign_measurements
-        .database_bytes
+fn inspect_case_artifacts(
+    case: &GeneratedScenarioCase,
+    paths: &CaseArtifactPaths,
+    usage: &ChildUsage,
+) -> CaseArtifactInspection {
+    let mut errors = Vec::new();
+    let input_bytes = match std::fs::read(&paths.generated_input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            errors.push(format!("generated_input_unreadable:{error}"));
+            Vec::new()
+        }
+    };
+    let expected_source_sha256 = if input_bytes.is_empty() {
+        None
+    } else {
+        match resolve_scenario_input_bytes(&input_bytes) {
+            Ok(resolved) => {
+                if resolved.generated_case.as_ref() != Some(case) {
+                    errors.push("generated_input_case_mismatch".into());
+                }
+                Some(resolved.provenance.source_sha256)
+            }
+            Err(error) => {
+                errors.push(format!("generated_input_invalid:{error}"));
+                None
+            }
+        }
+    };
+
+    let normally_exited = !usage.timed_out && usage.signal.is_none();
+    let report = match std::fs::read(&paths.report) {
+        Ok(bytes) => match serde_json::from_slice::<ScenarioReport>(&bytes) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                if normally_exited {
+                    errors.push(format!("report_invalid:{error}"));
+                }
+                None
+            }
+        },
+        Err(error) => {
+            if normally_exited {
+                errors.push(format!("report_unreadable:{error}"));
+            }
+            None
+        }
+    };
+    let database_bytes = report
+        .as_ref()
+        .and_then(|report| report.campaign_measurements.database_bytes);
+
+    // A timeout or signal may interrupt the worker before it can publish a
+    // report. A normally exiting worker, including a strict-oracle failure,
+    // must leave a parseable report and fixture candidate.
+    if normally_exited {
+        if let Some(report) = report.as_ref() {
+            let generated = report.metadata.generated.as_ref();
+            if generated.map(|value| {
+                (
+                    value.family_name.as_str(),
+                    value.generator_version.as_str(),
+                    value.seed,
+                    value.case_index,
+                )
+            }) != Some((
+                case.family_name.as_str(),
+                case.generator_version.as_str(),
+                case.seed,
+                case.case_index,
+            )) {
+                errors.push("report_generated_metadata_mismatch".into());
+            }
+            if report
+                .metadata
+                .input_provenance
+                .as_ref()
+                .map(|value| value.source_sha256.as_str())
+                != expected_source_sha256.as_deref()
+            {
+                errors.push("report_input_digest_mismatch".into());
+            }
+        }
+        if !paths.fixture_candidate.is_file() {
+            errors.push("fixture_candidate_missing".into());
+        }
+        if usage.exit_code != Some(0) && paths.report.is_file() && !paths.failure_capsule.is_file()
+        {
+            errors.push("failure_capsule_missing".into());
+        }
+    }
+    CaseArtifactInspection {
+        integrity_errors: errors,
+        database_bytes,
+    }
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>> {
+    let mut family = "adversarial-reliability/v1".to_owned();
     let mut seed = 7;
     let mut cases = 12;
-    let mut case_index = None;
     let mut out = PathBuf::from("target/cgka-adversarial-reliability-process-campaign");
     let mut storage = HarnessStorageMode::TempFileBackedSqlite;
     let mut case_timeout = Duration::from_secs(300);
+    let mut input = None;
+    let mut capture_sensitive_replay = false;
     let mut worker = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--worker" => worker = true,
+            "--family" => family = args.next().ok_or("missing --family value")?,
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
             "--cases" => cases = args.next().ok_or("missing --cases value")?.parse()?,
-            "--case-index" => {
-                case_index = Some(args.next().ok_or("missing --case-index value")?.parse()?)
-            }
             "--out" => out = PathBuf::from(args.next().ok_or("missing --out value")?),
+            "--input" => input = Some(PathBuf::from(args.next().ok_or("missing --input value")?)),
+            "--capture-sensitive-replay" => capture_sensitive_replay = true,
             "--storage" => {
                 storage = match args.next().ok_or("missing --storage value")?.as_str() {
                     "memory" => HarnessStorageMode::InMemorySqlite,
@@ -174,15 +337,83 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
+    if worker && input.is_none() {
+        return Err("worker requires --input".into());
+    }
+    if !worker && input.is_some() {
+        return Err("--input is reserved for campaign workers".into());
+    }
+    if !worker && cases == 0 {
+        return Err("--cases must be greater than zero".into());
+    }
+    if !worker && case_timeout.is_zero() {
+        return Err("--case-timeout-secs must be greater than zero".into());
+    }
     Ok(Args {
+        family,
         seed,
         cases,
-        case_index,
         out,
         storage,
         case_timeout,
+        input,
+        capture_sensitive_replay,
         worker,
     })
+}
+
+fn preflight_campaign(args: &Args) -> Result<(PathBuf, Vec<PlannedCase>), Box<dyn Error>> {
+    let summary_path = args.out.join("process-campaign.v1.json");
+    ensure_path_absent(&summary_path)?;
+    let mut planned_cases = Vec::with_capacity(args.cases);
+    for case_index in 0..args.cases {
+        let case = generate_family_case(&args.family, args.seed, u64::try_from(case_index)?)?;
+        let paths = case_artifact_paths(&args.out, &case);
+        for path in [
+            &paths.generated_input,
+            &paths.report,
+            &paths.fixture_candidate,
+            &paths.failure_capsule,
+            &paths.sensitive_replay_capsule,
+        ] {
+            ensure_path_absent(path)?;
+        }
+        let generated_input_bytes =
+            serde_json::to_vec_pretty(&GeneratedScenarioInputV1::new(case.clone()))?;
+        planned_cases.push(PlannedCase {
+            case,
+            paths,
+            generated_input_bytes,
+        });
+    }
+    Ok((summary_path, planned_cases))
+}
+
+fn case_artifact_paths(out: &Path, case: &GeneratedScenarioCase) -> CaseArtifactPaths {
+    let stem = format!(
+        "{}-seed-{}-case-{}",
+        case.family_name.replace('/', "-"),
+        case.seed,
+        case.case_index
+    );
+    CaseArtifactPaths {
+        generated_input: out.join(format!("{stem}-generated-input.json")),
+        report: out.join(format!("{stem}.json")),
+        fixture_candidate: out.join(format!("{stem}-fixture.v1.json")),
+        failure_capsule: out.join(format!("{stem}-failure-capsule.v1.json")),
+        sensitive_replay_capsule: out.join(format!("{stem}-sensitive-replay-capsule.v1.json")),
+    }
+}
+
+fn ensure_path_absent(path: &Path) -> Result<(), Box<dyn Error>> {
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing campaign artifact: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn storage_label(storage: HarnessStorageMode) -> &'static str {
@@ -194,6 +425,10 @@ fn storage_label(storage: HarnessStorageMode) -> &'static str {
 
 fn elapsed_us(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct ChildUsage {
@@ -364,6 +599,108 @@ mod tests {
         assert_eq!(args.case_timeout, Duration::from_secs(17));
     }
 
+    #[test]
+    fn parses_family_and_sensitive_capture() {
+        let args = parse_args(
+            ["--family", "chat-journey/v1", "--capture-sensitive-replay"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect("arguments parse");
+        assert_eq!(args.family, "chat-journey/v1");
+        assert!(args.capture_sensitive_replay);
+    }
+
+    #[test]
+    fn every_report_family_generates_an_exact_case() {
+        for family in [
+            "send-leave/v1",
+            "convergence-e2e-delivery/v1",
+            "convergence-chaos/v1",
+            "admin-churn/v1",
+            "adversarial-reliability/v1",
+            "chat-journey/v1",
+        ] {
+            let case = generate_family_case(family, 42, 3).expect("family case generates");
+            assert_eq!(case.seed, 42);
+            assert_eq!(case.case_index, 3);
+            let legacy_prefix_case = match family {
+                "send-leave/v1" => cgka_conformance_simulator::generate_send_leave_family(42, 4),
+                "convergence-e2e-delivery/v1" => {
+                    cgka_conformance_simulator::generate_convergence_e2e_delivery_family(42, 4)
+                }
+                "convergence-chaos/v1" => {
+                    cgka_conformance_simulator::generate_convergence_chaos_family(42, 4)
+                }
+                "admin-churn/v1" => cgka_conformance_simulator::generate_admin_churn_family(42, 4),
+                "adversarial-reliability/v1" => {
+                    cgka_conformance_simulator::generate_adversarial_reliability_family(42, 4)
+                }
+                "chat-journey/v1" => {
+                    cgka_conformance_simulator::generate_stateful_chat_journey_family(42, 4)
+                }
+                _ => unreachable!("family list is exhaustive"),
+            }
+            .pop()
+            .expect("prefix contains requested case");
+            assert_eq!(case, legacy_prefix_case);
+        }
+    }
+
+    #[test]
+    fn rejects_empty_or_worker_only_parent_inputs() {
+        for args in [
+            vec!["--cases", "0"],
+            vec!["--case-timeout-secs", "0"],
+            vec!["--input", "case.json"],
+            vec!["--worker"],
+        ] {
+            let parsed = parse_args(args.iter().copied().map(str::to_owned));
+            assert!(parsed.is_err(), "{args:?} must fail");
+        }
+    }
+
+    #[test]
+    fn case_artifacts_use_the_report_cli_stem() {
+        let case = generate_family_case("convergence-chaos/v1", 42, 3).expect("case generates");
+        let paths = case_artifact_paths(Path::new("out"), &case);
+        let stem = "convergence-chaos-v1-seed-42-case-3";
+        assert_eq!(
+            paths.generated_input,
+            Path::new("out").join(format!("{stem}-generated-input.json"))
+        );
+        assert_eq!(paths.report, Path::new("out").join(format!("{stem}.json")));
+        assert_eq!(
+            paths.fixture_candidate,
+            Path::new("out").join(format!("{stem}-fixture.v1.json"))
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_an_unknown_family_without_creating_output() {
+        let temp = tempfile::tempdir().expect("temporary campaign root");
+        let out = temp.path().join("not-created");
+        let args = parse_args(
+            [
+                "--family",
+                "unknown/v1",
+                "--cases",
+                "1",
+                "--out",
+                out.to_str().expect("UTF-8 test path"),
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("arguments parse");
+        let error = preflight_campaign(&args)
+            .err()
+            .expect("unknown family must fail")
+            .to_string();
+        assert!(error.contains("unsupported family unknown/v1"));
+        assert!(!out.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn kills_and_reaps_a_worker_that_exceeds_its_timeout() {
@@ -374,5 +711,18 @@ mod tests {
         let usage = wait_with_usage(child, Duration::from_millis(10)).expect("reap child");
         assert!(usage.timed_out);
         assert!(usage.signal.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_a_workers_nonzero_exit_code() {
+        let child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn failing child");
+        let usage = wait_with_usage(child, Duration::from_secs(1)).expect("reap child");
+        assert!(!usage.timed_out);
+        assert_eq!(usage.exit_code, Some(7));
+        assert_eq!(usage.signal, None);
     }
 }

@@ -5,10 +5,7 @@ use crate::scenario_input::generated_scenario_input_provenance;
 use crate::{
     CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
     GeneratedScenarioInputV1, HarnessStorageMode, ScenarioInputProvenanceV1, ScenarioReport,
-    VectorFixture, coverage_matrix_entry, generate_admin_churn_family,
-    generate_adversarial_reliability_family, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    generate_stateful_chat_journey_family, resolve_scenario_input_bytes,
+    VectorFixture, coverage_matrix_entry, generate_family_case, resolve_scenario_input_bytes,
     run_vector_fixture_report_with_capture, write_failure_capsule,
 };
 
@@ -253,18 +250,9 @@ async fn run_generated_family_reports(
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
-    let cases = match family {
-        "send-leave/v1" => generate_send_leave_family(seed, cases),
-        "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_family(seed, cases),
-        "convergence-chaos/v1" => generate_convergence_chaos_family(seed, cases),
-        "admin-churn/v1" => generate_admin_churn_family(seed, cases),
-        "adversarial-reliability/v1" => generate_adversarial_reliability_family(seed, cases),
-        "chat-journey/v1" => generate_stateful_chat_journey_family(seed, cases),
-        other => return Err(format!("unsupported family {other}").into()),
-    };
-
-    let mut summaries = Vec::with_capacity(cases.len());
-    for case in cases {
+    let mut summaries = Vec::with_capacity(cases);
+    for case_index in 0..cases {
+        let case = generate_family_case(family, seed, u64::try_from(case_index)?)?;
         let input_output = out.join(format!(
             "{}-seed-{}-case-{}-generated-input.json",
             case.family_name.replace('/', "-"),
