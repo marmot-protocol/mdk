@@ -120,6 +120,18 @@
       ],
       "epoch": 2,
       "member_count": 2
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "winner-branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "winner-branch",
+      "description": ""
     }
   ]
 }

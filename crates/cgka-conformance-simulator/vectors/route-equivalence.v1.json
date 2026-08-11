@@ -160,6 +160,15 @@
         ]
       },
       {
+        "type": "probe_bidirectional_decryptability",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
         "type": "observe_exact",
         "clients": [
           "alice",
@@ -204,6 +213,30 @@
       "member_count": 4
     },
     {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "carol",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "dave",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
       "type": "clients_exactly_equivalent",
       "clients": [
         "alice",
@@ -223,7 +256,32 @@
     },
     {
       "type": "convergence_decision",
+      "client": "alice",
       "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "bob",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "carol",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "dave",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "clients_bidirectionally_decryptable",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "dave"
+      ]
     }
   ]
 }
