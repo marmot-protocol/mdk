@@ -1,6 +1,6 @@
 //! Parser behaviour: lenient to unknown shapes, loud on invalid input.
 
-use incident_replay::{Verdict, classify, parse};
+use incident_replay::{ParseError, Verdict, classify, parse};
 
 #[test]
 fn invalid_json_is_a_parse_error() {
@@ -22,6 +22,18 @@ fn unknown_event_kinds_and_absent_projections_are_tolerated() {
 fn stream_shaped_lines_are_rejected_as_documents() {
     // A stream line carrying a `t` discriminator must never be adopted by the
     // document parser as an empty (healthy) export.
-    assert!(parse(r#"{"t": "error", "complete": false}"#).is_err());
-    assert!(parse(r#"{"t": "manifest", "schema_version": "goggles-group-export/v1"}"#).is_err());
+    for input in [
+        r#"{"t": "error", "complete": false}"#,
+        r#"{"t": "manifest", "schema_version": "goggles-group-export/v1"}"#,
+        r#"{"t": null}"#,
+        r#"{"t": 0}"#,
+        r#"{"t": {}}"#,
+        r#"{"t": []}"#,
+        r#"{"t": "error", "t": null}"#,
+    ] {
+        assert!(
+            matches!(parse(input), Err(ParseError::StreamDiscriminator)),
+            "stream-shaped input was not rejected: {input}"
+        );
+    }
 }

@@ -100,6 +100,23 @@ fn a_manifest_less_error_remnant_is_detected_as_a_stream_and_rejected() {
 }
 
 #[test]
+fn malformed_stream_discriminators_never_fall_back_to_the_document_parser() {
+    for input in [
+        r#"{"t": null}"#,
+        r#"{"t": 0}"#,
+        r#"{"t": {}}"#,
+        r#"{"t": []}"#,
+        r#"{"t": "error", "t": null}"#,
+    ] {
+        assert!(is_stream(input), "stream-shaped input was missed: {input}");
+        assert!(
+            parse_stream(input).is_err(),
+            "malformed stream unexpectedly parsed: {input}"
+        );
+    }
+}
+
+#[test]
 fn a_stream_without_a_terminal_eof_is_rejected() {
     let input = concat!(
         r#"{"t": "manifest", "schema_version": "goggles-group-export/v1"}"#,

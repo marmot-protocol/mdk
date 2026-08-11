@@ -432,16 +432,14 @@ impl EventKind {
 
 /// Parse a Goggles `agent-state.json` export.
 pub fn parse(json: &str) -> Result<AgentStateExport, ParseError> {
-    #[derive(Deserialize)]
-    struct StreamDiscriminatorProbe {
-        t: Option<String>,
-    }
-    if let Ok(StreamDiscriminatorProbe { t: Some(t) }) =
-        serde_json::from_str::<StreamDiscriminatorProbe>(json)
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("t"))
     {
-        return Err(ParseError::StreamDiscriminator { t });
+        return Err(ParseError::StreamDiscriminator);
     }
-    Ok(serde_json::from_str(json)?)
+    Ok(serde_json::from_value(value)?)
 }
 
 /// Why an export could not be parsed.
@@ -449,8 +447,6 @@ pub fn parse(json: &str) -> Result<AgentStateExport, ParseError> {
 pub enum ParseError {
     #[error("agent-state export does not match the expected schema: {0}")]
     Json(#[from] serde_json::Error),
-    #[error(
-        "input is a streamed NDJSON line (discriminator `t` = `{t}`), not an agent-state document"
-    )]
-    StreamDiscriminator { t: String },
+    #[error("input carries the streamed NDJSON `t` discriminator, not an agent-state document")]
+    StreamDiscriminator,
 }
