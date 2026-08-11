@@ -554,7 +554,7 @@ impl SqliteAccountStorage {
                         None => state
                             .last_read_timeline_at
                             .zip(state.last_read_message_id_hex.as_deref())
-                            .map_or(true, |(at, id)| {
+                            .is_none_or(|(at, id)| {
                                 timeline_tuple_after(
                                     target.timeline_at,
                                     &target.message_id_hex,
