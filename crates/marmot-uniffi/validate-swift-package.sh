@@ -21,6 +21,7 @@ if [[ $# -eq 4 ]]; then
   fi
 else
   WORK_DIR="$(mktemp -d)"
+  trap 'rm -rf "$WORK_DIR"' EXIT
 fi
 
 [[ -f "$SWIFT_BINDING" ]] || { echo "error: missing Swift binding $SWIFT_BINDING" >&2; exit 1; }

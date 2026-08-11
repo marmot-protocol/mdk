@@ -21,14 +21,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
-  CARGO_PROFILE_RELEASE_DEBUG: "0"
-  CARGO_PROFILE_RELEASE_LTO: "false"
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-  CARGO_PROFILE_RELEASE_PANIC: unwind
-  CARGO_PROFILE_RELEASE_STRIP: none
-  CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
-  CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "false"
   IPHONEOS_DEPLOYMENT_TARGET: "18.0"
   OTLP_EXPORT: "1"
 
@@ -39,6 +31,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      builder_sha: ${{ steps.identity.outputs.builder_sha }}
       release_id: ${{ steps.identity.outputs.release_id }}
       release_tag: ${{ steps.identity.outputs.release_tag }}
       binary_name: ${{ steps.identity.outputs.binary_name }}
@@ -58,12 +51,17 @@ jobs:
         shell: bash
         env:
           REQUESTED_SHA: ${{ inputs.source_sha }}
+          BUILDER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse 'HEAD^{commit}')"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "error: snapshot publishing must run with the workflow from refs/heads/master" >&2
+              exit 1
+            fi
             if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
               echo "error: source_sha must be a full lowercase 40-character SHA" >&2
               exit 1
@@ -96,6 +94,7 @@ jobs:
 
           {
             echo "source_sha=$source_sha"
+            echo "builder_sha=$BUILDER_SHA"
             echo "release_id=$release_id"
             echo "release_tag=$release_tag"
             echo "binary_name=MarmotKitFFI-$release_id.xcframework.zip"
@@ -140,7 +139,9 @@ jobs:
           workspaces: packaged-source -> target
 
       - name: Build MarmotKit XCFramework
-        working-directory: packaged-source
+        env:
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: ./crates/marmot-uniffi/xcframework.sh
 
       - name: Package immutable iOS artifacts
@@ -149,12 +150,13 @@ jobs:
           RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
           RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
           MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
           MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: |
           set -euo pipefail
           ./crates/marmot-uniffi/package-ios-artifacts.sh \
-            "$RELEASE_ID" "$RELEASE_TAG" "$SOURCE_SHA" dist
+            "$RELEASE_ID" "$RELEASE_TAG" "$SOURCE_SHA" dist "$BUILDER_SHA"
 
       - name: Validate XCFramework slices and SwiftPM archive layout
         shell: bash
@@ -332,23 +334,26 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
         run: |
           set -euo pipefail
           mkdir -p dist/ios dist/android
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "marmotkit-ios-${{ needs.metadata.outputs.source_sha }}" --dir dist/ios
-          if [[ "${{ needs.metadata.outputs.is_snapshot }}" == "false" ]]; then
+            --name "marmotkit-ios-$SOURCE_SHA" --dir dist/ios
+          if [[ "$IS_SNAPSHOT" == "false" ]]; then
             gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-              --name "marmotkit-android-${{ needs.metadata.outputs.source_sha }}" --dir dist/android
+              --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
           fi
 
-      - name: Create immutable release
+      - name: Create and verify immutable release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
           RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
           IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
           BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
         run: |
@@ -358,7 +363,7 @@ jobs:
           notes="$RUNNER_TEMP/release-notes.md"
           checksum="$(cat "dist/ios/$BINARY_NAME.swiftpm-checksum")"
           cat > "$notes" <<EOF
-          MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\`.
+          MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.
 
           Assets:
           - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive.
@@ -371,9 +376,14 @@ jobs:
           and \`marmotkit-ios-$version.checksums.txt\`. Assets on this release are immutable.
           EOF
 
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "error: immutable MarmotKit release $tag already exists; refusing to replace assets" >&2
-            exit 1
+          if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$release_state" == "true" ]]; then
+              echo "Removing incomplete draft release $tag before retry"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            else
+              echo "error: immutable MarmotKit release $tag already exists; refusing to replace assets" >&2
+              exit 1
+            fi
           fi
 
           if [[ "$IS_SNAPSHOT" == "true" ]] && \
@@ -392,11 +402,50 @@ jobs:
             release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")
           fi
 
-          gh release create "$tag" "${assets[@]}" \
+          gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$title" \
             --notes-file "$notes" \
+            --draft \
             "${release_flags[@]}"
+
+          gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$tag\" and .draft == true) | .id" | head -n 1)"
+          [[ -n "$release_id" ]] || { echo "error: could not find draft release $tag" >&2; exit 1; }
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          [[ "$(jq '.assets | length' <<< "$release_json")" -eq "${#assets[@]}" ]] || {
+            echo "error: uploaded release asset count does not match local artifact count" >&2
+            exit 1
+          }
+          for asset in "${assets[@]}"; do
+            name="$(basename "$asset")"
+            size="$(stat -c %s "$asset")"
+            digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+            matches="$(jq --arg name "$name" --argjson size "$size" --arg digest "$digest" \
+              '[.assets[] | select(.name == $name and .size == $size and .digest == $digest)] | length' \
+              <<< "$release_json")"
+            [[ "$matches" -eq 1 ]] || {
+              echo "error: uploaded asset verification failed for $name" >&2
+              exit 1
+            }
+          done
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false -f make_latest=false >/dev/null
+          # The workflow token cannot read repository-administration settings,
+          # so assert their release-level effect directly after publication.
+          for _attempt in 1 2 3 4 5; do
+            release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+            if [[ "$(jq -r '.draft' <<< "$release_json")" == "false" && \
+                  "$(jq -r '.immutable' <<< "$release_json")" == "true" ]]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "error: published release did not become immutable" >&2
+          exit 1
 
   validate-published-ios:
     name: Validate published SwiftPM consumer

@@ -8,18 +8,20 @@ set -euo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 
 usage() {
-  echo "usage: $0 <release-id> <release-tag> <source-sha> <dist-dir>" >&2
+  echo "usage: $0 <release-id> <release-tag> <source-sha> <dist-dir> <builder-sha>" >&2
   exit 2
 }
 
-[[ $# -eq 4 ]] || usage
+[[ $# -eq 5 ]] || usage
 
 RELEASE_ID="$1"
 RELEASE_TAG="$2"
 SOURCE_SHA="$3"
 DIST_DIR="$4"
+BUILDER_SHA="$5"
 
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$TOOL_DIR/marmotkit-release-profile.env"
 WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
 CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 OUTPUT_DIR="$CRATE_DIR/output"
@@ -28,6 +30,10 @@ SWIFT_BINDING="$OUTPUT_DIR/MarmotKit.swift"
 
 if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "error: source SHA must be a full lowercase 40-character Git commit SHA" >&2
+  exit 1
+fi
+if [[ ! "$BUILDER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "error: builder SHA must be a full lowercase 40-character Git commit SHA" >&2
   exit 1
 fi
 if [[ ! -d "$XCFRAMEWORK" || ! -f "$SWIFT_BINDING" ]]; then
@@ -40,29 +46,6 @@ lock_sha="$(shasum -a 256 "$WORKSPACE_DIR/Cargo.lock" | awk '{print $1}')"
 rust_version="$(rustc --version)"
 cargo_version="$(cargo --version)"
 deployment_target="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
-release_opt_level="${CARGO_PROFILE_RELEASE_OPT_LEVEL:-3}"
-release_debug="${CARGO_PROFILE_RELEASE_DEBUG:-0}"
-release_lto="${CARGO_PROFILE_RELEASE_LTO:-false}"
-release_codegen_units="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}"
-release_panic="${CARGO_PROFILE_RELEASE_PANIC:-unwind}"
-release_strip="${CARGO_PROFILE_RELEASE_STRIP:-none}"
-release_debug_assertions="${CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS:-false}"
-release_overflow_checks="${CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS:-false}"
-
-if [[ "$release_opt_level" != "3" ]]; then
-  echo "error: MarmotKit release artifacts require opt-level=3 (got $release_opt_level)" >&2
-  exit 1
-fi
-if [[ "$release_debug" != "0" ]]; then
-  echo "error: MarmotKit release artifacts require debug=0 (got $release_debug)" >&2
-  exit 1
-fi
-if [[ "$release_lto" != "false" || "$release_codegen_units" != "16" || \
-      "$release_panic" != "unwind" || "$release_strip" != "none" || \
-      "$release_debug_assertions" != "false" || "$release_overflow_checks" != "false" ]]; then
-  echo "error: unexpected effective Rust release profile" >&2
-  exit 1
-fi
 if [[ "${OTLP_EXPORT:-}" != "1" && "${OTLP_EXPORT:-}" != "true" ]]; then
   echo "error: MarmotKit release artifacts require OTLP_EXPORT=1" >&2
   exit 1
@@ -99,8 +82,34 @@ rm -f \
 binary_sha="$(shasum -a 256 "$DIST_DIR/$binary_name" | awk '{print $1}')"
 swiftpm_checksum="$(swift package compute-checksum "$DIST_DIR/$binary_name")"
 swift_sha="$(shasum -a 256 "$SWIFT_BINDING" | awk '{print $1}')"
-device_library_sha="$(shasum -a 256 "$XCFRAMEWORK/ios-arm64/libmarmot_uniffi.a" | awk '{print $1}')"
-simulator_library_sha="$(shasum -a 256 "$XCFRAMEWORK/ios-arm64-simulator/libmarmot_uniffi.a" | awk '{print $1}')"
+plist="$XCFRAMEWORK/Info.plist"
+device_artifact=""
+simulator_artifact=""
+index=0
+while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryIdentifier" "$plist" 2>/dev/null)"; do
+  platform="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:SupportedPlatform" "$plist")"
+  variant="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:SupportedPlatformVariant" "$plist" 2>/dev/null || true)"
+  binary_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:BinaryPath" "$plist")"
+  [[ "$platform" == "ios" ]] || { echo "error: unexpected XCFramework platform $platform" >&2; exit 1; }
+  artifact="MarmotKit.xcframework/$identifier/$binary_path"
+  if [[ "$variant" == "simulator" ]]; then
+    [[ -z "$simulator_artifact" ]] || { echo "error: duplicate iOS simulator slice" >&2; exit 1; }
+    simulator_artifact="$artifact"
+  elif [[ -z "$variant" ]]; then
+    [[ -z "$device_artifact" ]] || { echo "error: duplicate iOS device slice" >&2; exit 1; }
+    device_artifact="$artifact"
+  else
+    echo "error: unexpected iOS platform variant $variant" >&2
+    exit 1
+  fi
+  index=$((index + 1))
+done
+[[ $index -eq 2 && -n "$device_artifact" && -n "$simulator_artifact" ]] || {
+  echo "error: expected exactly one iOS device slice and one simulator slice" >&2
+  exit 1
+}
+device_library_sha="$(shasum -a 256 "$XCFRAMEWORK/${device_artifact#MarmotKit.xcframework/}" | awk '{print $1}')"
+simulator_library_sha="$(shasum -a 256 "$XCFRAMEWORK/${simulator_artifact#MarmotKit.xcframework/}" | awk '{print $1}')"
 
 cp "$SWIFT_BINDING" "$DIST_DIR/$swift_name"
 
@@ -111,6 +120,7 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
   "release_identifier": "$RELEASE_ID",
   "release_tag": "$RELEASE_TAG",
   "source_sha": "$SOURCE_SHA",
+  "builder_sha": "$BUILDER_SHA",
   "workspace_version": "$workspace_version",
   "cargo_lock_sha256": "$lock_sha",
   "rustc": "$rust_version",
@@ -119,14 +129,14 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
   "ios_targets": ["aarch64-apple-ios", "aarch64-apple-ios-sim"],
   "ios_deployment_target": "$deployment_target",
   "rust_release_profile": {
-    "opt_level": "$release_opt_level",
-    "debug": "$release_debug",
+    "opt_level": "$CARGO_PROFILE_RELEASE_OPT_LEVEL",
+    "debug": "$CARGO_PROFILE_RELEASE_DEBUG",
     "debug_assertions": false,
     "overflow_checks": false,
-    "lto": $release_lto,
-    "codegen_units": $release_codegen_units,
-    "panic": "$release_panic",
-    "strip": "$release_strip"
+    "lto": $CARGO_PROFILE_RELEASE_LTO,
+    "codegen_units": $CARGO_PROFILE_RELEASE_CODEGEN_UNITS,
+    "panic": "$CARGO_PROFILE_RELEASE_PANIC",
+    "strip": "$CARGO_PROFILE_RELEASE_STRIP"
   },
   "artifacts": {
     "$binary_name": {
@@ -136,11 +146,11 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
     "$swift_name": {
       "sha256": "$swift_sha"
     },
-    "MarmotKit.xcframework/ios-arm64/libmarmot_uniffi.a": {
+    "$device_artifact": {
       "sha256": "$device_library_sha",
       "architecture": "arm64"
     },
-    "MarmotKit.xcframework/ios-arm64-simulator/libmarmot_uniffi.a": {
+    "$simulator_artifact": {
       "sha256": "$simulator_library_sha",
       "architecture": "arm64"
     }

@@ -348,7 +348,7 @@ The Android zip contains:
 - `jniLibs/<abi>/libmarmot_uniffi.so` for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`
 - `manifest.json`
 
-Each manifest records the release identifier, exact source commit, workspace version, `Cargo.lock` hash, Rust
+Each manifest records the release identifier, exact source commit, workflow builder commit, workspace version, `Cargo.lock` hash, Rust
 toolchain versions, enabled features, targets, deployment target, effective release profile, and artifact hashes. App
 repos must pin an exact tag, update generated Swift and binary references together, and verify the ordinary SHA-256
 and SwiftPM checksum. Existing release assets and snapshot tags are never overwritten.
@@ -425,15 +425,17 @@ git push origin wn-agent-v0.9.0
 
 If a release has already been consumed, create a new patch version instead.
 
-If the workflow succeeds but an uploaded asset is wrong, rerun the workflow from the same tag only when the source commit
-is correct and the failure was packaging-only. The release job uploads assets with `--clobber`, so a rerun can replace
-assets on the same GitHub Release.
+The MarmotKit release job uploads and verifies assets while the release is still a draft, then publishes it. A failed
+pre-publication run may be retried: the workflow deletes only its incomplete draft and starts again. If remote URL,
+size, digest, SwiftPM checksum, or consumer validation fails after publication, do not replace the immutable assets.
+Publish a new formal patch version or snapshot source SHA instead. Deleting an immutable release does not make its tag
+name reusable.
 
 ## Current Limits
 
 - The workspace is not published to crates.io.
 - The whole-workspace release is tag- and source-archive-based.
-- MarmotKit releases are zipped generated files, not SwiftPM or Maven packages.
+- MarmotKit does not publish a Swift package manifest or Maven package. Its binary-target ZIP is SwiftPM-compatible.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
 - The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the
   MarmotKit binding release.

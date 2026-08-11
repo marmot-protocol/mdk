@@ -69,37 +69,78 @@ while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index
     exit 1
   }
 
-  object_dir="$TEMP_DIR/objects-$index"
-  mkdir -p "$object_dir"
-  (
-    cd "$object_dir"
-    xcrun ar -x "$library"
-  )
-  primary_object="$(find "$object_dir" -type f -name 'marmot_uniffi.marmot_uniffi*.o' -print -quit)"
-  [[ -n "$primary_object" ]] || { echo "error: no MarmotKit Rust object in $identifier" >&2; exit 1; }
-  build_info="$(xcrun vtool -show-build "$primary_object")"
-  grep -Eq "minos[[:space:]]+$EXPECTED_DEPLOYMENT_TARGET$" <<< "$build_info" || {
-    echo "error: $identifier does not use iOS deployment target $EXPECTED_DEPLOYMENT_TARGET" >&2
-    echo "$build_info" >&2
-    exit 1
-  }
-
   if [[ "$variant" == "simulator" ]]; then
-    grep -Eq 'platform[[:space:]]+IOSSIMULATOR$' <<< "$build_info" || {
-      echo "error: $identifier is not an iOS simulator library" >&2
-      exit 1
-    }
+    expected_platform=7
+    expected_platform_name=IOSSIMULATOR
     found_simulator=1
   elif [[ -z "$variant" ]]; then
-    grep -Eq 'platform[[:space:]]+IOS$' <<< "$build_info" || {
-      echo "error: $identifier is not an iOS device library" >&2
-      exit 1
-    }
+    expected_platform=2
+    expected_platform_name=IOS
     found_device=1
   else
     echo "error: unexpected iOS platform variant $variant" >&2
     exit 1
   fi
+
+  # otool walks every member of a static archive, including duplicate member
+  # names. Validate every object carrying LC_BUILD_VERSION instead of sampling
+  # a single Rust object. An older minimum is compatible; a newer one would
+  # silently raise the consuming app's deployment requirement.
+  build_info="$(xcrun otool -l "$library")"
+  awk -v identifier="$identifier" \
+      -v expected_platform="$expected_platform" \
+      -v expected_platform_name="$expected_platform_name" \
+      -v expected_minos="$EXPECTED_DEPLOYMENT_TARGET" '
+    function version_gt(left, right, left_parts, right_parts, count, i) {
+      split(left, left_parts, ".")
+      split(right, right_parts, ".")
+      count = 3
+      for (i = 1; i <= count; i++) {
+        if ((left_parts[i] + 0) > (right_parts[i] + 0)) return 1
+        if ((left_parts[i] + 0) < (right_parts[i] + 0)) return 0
+      }
+      return 0
+    }
+    /^Archive : / { member = $0 }
+    /^.*\([^)]*\):$/ { member = $0 }
+    /^[[:space:]]*cmd LC_BUILD_VERSION$/ {
+      in_build_version = 1
+      platform_seen = 0
+      minos_seen = 0
+      count++
+      next
+    }
+    in_build_version && /^[[:space:]]*platform / {
+      platform_seen = 1
+      if (($2 + 0) != expected_platform) {
+        printf "error: %s member %s uses platform %s, expected %s (%s)\n", \
+          identifier, member, $2, expected_platform, expected_platform_name > "/dev/stderr"
+        failed = 1
+      }
+      next
+    }
+    in_build_version && /^[[:space:]]*minos / {
+      minos_seen = 1
+      if (version_gt($2, expected_minos)) {
+        printf "error: %s member %s requires iOS %s, newer than supported %s\n", \
+          identifier, member, $2, expected_minos > "/dev/stderr"
+        failed = 1
+      }
+      in_build_version = 0
+      next
+    }
+    END {
+      if (count == 0) {
+        printf "error: %s contains no LC_BUILD_VERSION commands\n", identifier > "/dev/stderr"
+        failed = 1
+      }
+      if (in_build_version && (!platform_seen || !minos_seen)) {
+        printf "error: incomplete LC_BUILD_VERSION in %s member %s\n", identifier, member > "/dev/stderr"
+        failed = 1
+      }
+      exit failed
+    }
+  ' <<< "$build_info"
   index=$((index + 1))
 done
 
@@ -108,4 +149,4 @@ done
   exit 1
 }
 
-echo "Validated arm64 iOS device and simulator XCFramework slices at deployment target $EXPECTED_DEPLOYMENT_TARGET"
+echo "Validated every arm64 iOS device and simulator archive member supports deployment target $EXPECTED_DEPLOYMENT_TARGET"

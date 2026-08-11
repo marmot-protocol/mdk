@@ -5,8 +5,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 ## Scope
 
 - Own the UniFFI export surface over `marmot-app` for Swift (iOS) and Kotlin (Android) consumers.
-- Own build/packaging scripts: `xcframework.sh` (Swift + XCFramework) and `kotlin-bindings.sh` (Android JNI libs +
-  generated Kotlin).
+- Own build/packaging scripts: `xcframework.sh` (Swift + XCFramework), `kotlin-bindings.sh` (Android JNI libs +
+  generated Kotlin), `package-ios-artifacts.sh`, `validate-ios-artifact.sh`, and `validate-swift-package.sh`.
+- Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
 - Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
 

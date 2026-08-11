@@ -23,44 +23,18 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # step fails with missing __chkstk_darwin and friends.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
 
-# Keep production release behavior and debug-symbol policy explicit for
-# distributable artifacts. Callers may repeat these exact values, but may not
-# silently trade runtime speed for archive size.
-export CARGO_PROFILE_RELEASE_OPT_LEVEL="${CARGO_PROFILE_RELEASE_OPT_LEVEL:-3}"
-export CARGO_PROFILE_RELEASE_DEBUG="${CARGO_PROFILE_RELEASE_DEBUG:-0}"
-export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}"
-export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}"
-export CARGO_PROFILE_RELEASE_PANIC="${CARGO_PROFILE_RELEASE_PANIC:-unwind}"
-export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-none}"
-export CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="${CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS:-false}"
-export CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS="${CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS:-false}"
-if [[ "$CARGO_PROFILE_RELEASE_OPT_LEVEL" != "3" ]]; then
-  echo "error: MarmotKit release builds require opt-level=3" >&2
-  exit 1
-fi
-if [[ "$CARGO_PROFILE_RELEASE_DEBUG" != "0" ]]; then
-  echo "error: MarmotKit release builds require debug=0" >&2
-  exit 1
-fi
-if [[ "$CARGO_PROFILE_RELEASE_LTO" != "false" || \
-      "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS" != "16" || \
-      "$CARGO_PROFILE_RELEASE_PANIC" != "unwind" || \
-      "$CARGO_PROFILE_RELEASE_STRIP" != "none" || \
-      "$CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS" != "false" || \
-      "$CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS" != "false" ]]; then
-  echo "error: MarmotKit release build uses an unexpected Rust release profile" >&2
-  exit 1
-fi
-
-CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
+TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Keep production release behavior and debug-symbol policy in one source of truth.
+source "$TOOL_DIR/marmotkit-release-profile.env"
+WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
+CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 TARGET_DIR="$WORKSPACE_DIR/target"
 BUILD_DIR="$CRATE_DIR/build"
 OUT_DIR="$CRATE_DIR/output"
 
 # Set public first-party endpoint defaults for values compiled via option_env!.
 # Tokens remain host-app runtime configuration.
-source "$CRATE_DIR/marmotkit-endpoints.env"
+source "$TOOL_DIR/marmotkit-endpoints.env"
 
 CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"

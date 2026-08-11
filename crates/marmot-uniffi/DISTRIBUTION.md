@@ -24,7 +24,8 @@ These URLs always contain an exact tag or snapshot identifier. Do not use a `lat
 
 ## SwiftPM
 
-Download the sibling `.swiftpm-checksum` asset or read `marmotkit-ios-<identifier>.checksums.txt`, then declare:
+Download the sibling `.swiftpm-checksum` asset or read the `swiftpm` record in
+`marmotkit-ios-<identifier>.checksums.txt`, then declare:
 
 ```swift
 .binaryTarget(
@@ -33,6 +34,10 @@ Download the sibling `.swiftpm-checksum` asset or read `marmotkit-ios-<identifie
     checksum: "<contents of .swiftpm-checksum>"
 )
 ```
+
+The consuming Swift package must declare iOS 18.0 or newer. The labeled records in `checksums.txt` are intended for
+inspection and provenance; they are not `shasum -c` input. Use the sibling `.sha256` files for ordinary SHA-256
+verification.
 
 Add the matching `MarmotKit-<identifier>.swift` file to a Swift source target that depends on `MarmotKitFFI`. Update
 the binary URL, checksum, and generated Swift source together. Mixing source and binary identifiers can compile
@@ -49,6 +54,10 @@ matching Swift source, and the same manifest for consumers that prefer a single 
 Pushing a formal `marmotkit-v*` tag publishes iOS and Android bindings. To publish an untagged TestFlight snapshot,
 run the `MarmotKit Bindings` workflow with a full SHA on `master`. Its immutable release tag is derived from that SHA.
 
-Publishing fails if the release already exists. Snapshot publishing also fails if its derived tag already exists.
-Assets and snapshot tags are never replaced, moved, or uploaded with `--clobber`; a changed build requires a new
-formal version or a new source SHA.
+Publishing first uploads and verifies every asset on a draft, then publishes it under repository-enforced immutable
+releases. A retry discards only an incomplete draft. Publishing fails if a public release already exists, and snapshot
+publishing also fails if its derived tag already exists. Assets and snapshot tags are never replaced or moved; a
+changed build requires a new formal version or a new source SHA.
+
+The iOS manifest records both the packaged source SHA and the workflow builder SHA. Snapshot dispatches must use the
+workflow from `master`, so an older reachable source commit cannot substitute its own packaging logic.
