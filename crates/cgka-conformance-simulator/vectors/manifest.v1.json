@@ -422,7 +422,7 @@
         "self-leave witness commit",
         "post-leave secrecy: departed member receives and processes all post-leave ciphertext, decrypts none"
       ],
-      "next": "Add the removed-member re-add leg once welcome-after-eviction is supported by the engine harness."
+      "next": "Keep as the departure-secrecy fixture; the removed-member re-add leg is covered by readd-after-eviction/v1."
     },
     {
       "id": "incremental-growth/v1",
