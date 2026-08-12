@@ -106,6 +106,7 @@ struct Participant {
 struct RecordingRelayDatabase {
     inner: MemoryDatabase,
     publication_log: Arc<Mutex<Vec<Event>>>,
+    hidden_event_ids: Arc<Mutex<BTreeSet<EventId>>>,
 }
 
 impl NostrDatabase for RecordingRelayDatabase {
@@ -130,22 +131,47 @@ impl NostrDatabase for RecordingRelayDatabase {
         &'a self,
         event_id: &'a EventId,
     ) -> BoxedFuture<'a, Result<DatabaseEventStatus, DatabaseError>> {
-        self.inner.check_id(event_id)
+        Box::pin(async move {
+            if self.hidden_event_ids.lock().await.contains(event_id) {
+                return Ok(DatabaseEventStatus::NotExistent);
+            }
+            self.inner.check_id(event_id).await
+        })
     }
 
     fn event_by_id<'a>(
         &'a self,
         event_id: &'a EventId,
     ) -> BoxedFuture<'a, Result<Option<Event>, DatabaseError>> {
-        self.inner.event_by_id(event_id)
+        Box::pin(async move {
+            if self.hidden_event_ids.lock().await.contains(event_id) {
+                return Ok(None);
+            }
+            self.inner.event_by_id(event_id).await
+        })
     }
 
     fn count(&self, filter: Filter) -> BoxedFuture<'_, Result<usize, DatabaseError>> {
-        self.inner.count(filter)
+        Box::pin(async move { Ok(self.query(filter).await?.len()) })
     }
 
     fn query(&self, filter: Filter) -> BoxedFuture<'_, Result<Events, DatabaseError>> {
-        self.inner.query(filter)
+        Box::pin(async move {
+            // Apply the requested limit only after hidden events are removed;
+            // otherwise one hidden newest event would incorrectly reduce the
+            // visible result below the relay client's requested page size.
+            let mut database_filter = filter.clone();
+            database_filter.limit = None;
+            let events = self.inner.query(database_filter).await?;
+            let hidden_event_ids = self.hidden_event_ids.lock().await;
+            let mut visible = Events::new(&filter);
+            visible.extend(
+                events
+                    .into_iter()
+                    .filter(|event| !hidden_event_ids.contains(&event.id)),
+            );
+            Ok(visible)
+        })
     }
 
     fn delete(&self, filter: Filter) -> BoxedFuture<'_, Result<(), DatabaseError>> {
@@ -182,7 +208,6 @@ impl Participant {
 /// In-process application harness backed by one real local Nostr relay.
 pub struct AppRuntimeHarness {
     _relay: LocalRelay,
-    relay_database: MemoryDatabase,
     relay_url: String,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
@@ -190,7 +215,7 @@ pub struct AppRuntimeHarness {
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
     relay_publication_log: Arc<Mutex<Vec<Event>>>,
     relay_action_events: BTreeMap<String, Vec<SequencedRelayEvent>>,
-    removed_relay_events: BTreeMap<String, Event>,
+    hidden_relay_event_ids: Arc<Mutex<BTreeSet<EventId>>>,
 }
 
 impl AppRuntimeHarness {
@@ -202,9 +227,11 @@ impl AppRuntimeHarness {
             max_events: Some(75_000),
         });
         let relay_publication_log = Arc::new(Mutex::new(Vec::new()));
+        let hidden_relay_event_ids = Arc::new(Mutex::new(BTreeSet::new()));
         let relay = LocalRelay::new(RelayBuilder::default().database(RecordingRelayDatabase {
             inner: relay_database.clone(),
             publication_log: Arc::clone(&relay_publication_log),
+            hidden_event_ids: Arc::clone(&hidden_relay_event_ids),
         }));
         relay.run().await.map_err(environment_error)?;
         let relay_url = relay.url().await.to_string();
@@ -260,8 +287,7 @@ impl AppRuntimeHarness {
             accepted_publications: BTreeMap::new(),
             relay_publication_log,
             relay_action_events: BTreeMap::new(),
-            removed_relay_events: BTreeMap::new(),
-            relay_database,
+            hidden_relay_event_ids,
         })
     }
 
@@ -347,26 +373,22 @@ impl AppRuntimeHarness {
                     "no immediately published group-message or Welcome relay event matched the scenario action; deferred publications are not action-addressable on this adapter",
                 )
             })?;
-        let event_id = event.id.to_hex();
         if visible {
-            let event = self.removed_relay_events.remove(&event_id).ok_or_else(|| {
-                SubjectError::classified(
+            let removed = self.hidden_relay_event_ids.lock().await.remove(&event.id);
+            if !removed {
+                return Err(SubjectError::classified(
                     SubjectFailureCategory::ExpectedRefusal,
                     "relay_event_not_removed",
-                    "the selected event is not currently removed from the shared relay",
-                )
-            })?;
-            self.relay_database
-                .save_event(&event)
-                .await
-                .map_err(environment_error)?;
+                    "the selected event is not currently hidden from the shared relay",
+                ));
+            }
             return Ok(());
         }
-        if self.removed_relay_events.contains_key(&event_id) {
+        if self.hidden_relay_event_ids.lock().await.contains(&event.id) {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "relay_event_already_removed",
-                "the selected event is already removed from the shared relay",
+                "the selected event is already hidden from the shared relay",
             ));
         }
         if clients
@@ -387,14 +409,10 @@ impl AppRuntimeHarness {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "relay_removal_requires_all_participants_offline",
-                "an event can be removed from the shared relay only while every harness participant is offline",
+                "an event can be hidden from the shared relay only while every harness participant is offline",
             ));
         }
-        self.relay_database
-            .delete(Filter::new().id(event.id))
-            .await
-            .map_err(environment_error)?;
-        self.removed_relay_events.insert(event_id, event);
+        self.hidden_relay_event_ids.lock().await.insert(event.id);
         Ok(())
     }
 
@@ -1497,12 +1515,14 @@ mod tests {
     #[tokio::test]
     async fn recording_database_preserves_successful_relay_admission_order() {
         let publication_log = Arc::new(Mutex::new(Vec::new()));
+        let hidden_event_ids = Arc::new(Mutex::new(BTreeSet::new()));
         let database = RecordingRelayDatabase {
             inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
                 events: true,
                 max_events: None,
             }),
             publication_log: Arc::clone(&publication_log),
+            hidden_event_ids: Arc::clone(&hidden_event_ids),
         };
         let keys = nostr::Keys::generate();
         let first = nostr::EventBuilder::new(Kind::MlsGroupMessage, "first admitted")
@@ -1522,6 +1542,38 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].id, first.id);
         assert_eq!(recorded[1].id, second.id);
+        drop(recorded);
+
+        hidden_event_ids.lock().await.insert(first.id);
+        assert_eq!(
+            database.check_id(&first.id).await.unwrap(),
+            DatabaseEventStatus::NotExistent
+        );
+        assert!(database.event_by_id(&first.id).await.unwrap().is_none());
+        let one_group_event = Filter::new().kind(Kind::MlsGroupMessage).limit(1);
+        assert_eq!(database.count(one_group_event.clone()).await.unwrap(), 1);
+        assert_eq!(
+            database
+                .query(one_group_event.clone())
+                .await
+                .unwrap()
+                .first()
+                .map(|event| event.id),
+            Some(second.id),
+            "the query limit must be applied after hidden events are filtered"
+        );
+
+        assert!(hidden_event_ids.lock().await.remove(&first.id));
+        assert_eq!(
+            database
+                .query(one_group_event)
+                .await
+                .unwrap()
+                .first()
+                .map(|event| event.id),
+            Some(first.id),
+            "restoring visibility must expose the original retained event"
+        );
     }
 
     #[test]

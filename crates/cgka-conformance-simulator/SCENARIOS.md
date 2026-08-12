@@ -134,23 +134,21 @@ These are the scenarios another implementation should be able to load from JSON 
 
 ### `cross-route-app-runtime-recovery/v1`
 
-- File: constructed by `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; promotion to a
-  portable saved input waits until the falsified oracle has a reviewed resolution.
+- File: constructed by `four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes`; promotion to a portable saved
+  input still requires an adapter-neutral representation of reversible retained-event staging.
 - Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
   `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
   Nostr relay.
 - Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
-  The harness removes Zeta's root from the whole shared-relay history before Alpha reconnects and authors its competing
-  root, removes Alpha's root relay-wide before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both
+  The harness reversibly hides Zeta's root from whole-relay queries before Alpha reconnects and authors its competing
+  root, hides Alpha's root before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both retained
   roots, and performs repeated full-history repair. Every harness participant must be offline before relay-wide
-  removal; the step's named clients are not a per-recipient visibility filter.
-- Current result: exact retained-engine settlement passes. Across repeated app-runtime executions, Zeta can remain one
-  epoch behind; public protocol state can agree while Alpha's later application probe remains absent and
-  non-invalidated at Zeta; or Alpha and Observer can remain on the competing root and baseline respectively while only
-  Yankee/Zeta reach the retained reference branch, with application probes split along those branch boundaries. Each
-  shape is asserted exactly, so a fourth shape or complete equivalence forces review. This is a retained counterexample
-  and keeps route equivalence, active decryptability, and complete application disposition open outside the
-  engine/retained reference.
+  hiding; the step's named clients are not a per-recipient visibility filter.
+- Current result: exact retained-engine settlement passes. The reversible relay layer fixes the former destructive
+  tombstone artifact, but repeated app-runtime executions still alternate between complete equivalence and reviewed
+  non-equivalent terminal surfaces, including a two-branch protocol/probe split. Route equivalence, active
+  decryptability, complete application disposition, process/container/VM execution, and per-durable-transition
+  permutations remain open.
 
 ### `convergence-committer-selected/v1`
 
