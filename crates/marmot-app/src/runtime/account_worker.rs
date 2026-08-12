@@ -28,12 +28,12 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
-    AppProjectionUpdate, AppQuarantinedGroup, ConvergenceScheduleState, GroupInviteDeclineResult,
-    MaintenanceRunSummary, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RetentionSweepReport, SecureDeleteExpiredResult,
-    SendSummary, SyncSummary,
+    AppProjectionUpdate, AppQuarantinedGroup, ConvergenceScheduleState, EpochBackfillRunOutcome,
+    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -2913,8 +2913,11 @@ fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
 /// ingest seam so the capture-before-run ordering cannot drift. A replay
 /// activation failure is both published and returned: explicit catch-up fails
 /// its response while background seams retain their existing event-only
-/// reporting behavior. Explicit full-history repair already performed the
-/// unfloored replay and consumes the same intent without calling this helper.
+/// reporting behavior. A deferred result is deliberately accepted only after
+/// the caller's ordinary sync has completed; the distinct outcome keeps that
+/// policy choice visible instead of conflating deferral with no pending work.
+/// Explicit full-history repair already performed the unfloored replay and
+/// consumes the same intent without calling this helper.
 async fn run_pending_epoch_backfill_reporting_arm(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -2925,11 +2928,11 @@ async fn run_pending_epoch_backfill_reporting_arm(
 ) -> Result<(), String> {
     let backfill_armed = client.has_pending_epoch_backfill();
     let result = match client.run_pending_epoch_backfill(seam).await {
-        Ok(Some(summary)) => {
+        Ok(EpochBackfillRunOutcome::Completed(summary)) => {
             publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
             Ok(())
         }
-        Ok(None) => Ok(()),
+        Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => Ok(()),
         Err(error) => {
             let message = account_error_message("epoch-gap backfill failed", &error);
             publish_app_runtime_account_error(
@@ -3388,6 +3391,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_catch_up_succeeds_after_ordinary_sync_when_backfill_defers() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("deferred explicit catch-up", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("backfill must be armed")
+            .groups
+            .insert(
+                test_group_id(0xde),
+                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
+            );
+        let subscriptions_before = relay.subscription_count();
+
+        let (events, _subscriber) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let mut pending = VecDeque::new();
+        let context = AccountWorkerCatchUpContext {
+            app: &app,
+            events: &events,
+            shared: &shared,
+            account_id_hex: "account-id",
+            account_label: "alice",
+        };
+        let (respond, response) = oneshot::channel();
+
+        handle_account_worker_catch_up(&mut client, respond, &mut commands, &mut pending, context)
+            .await;
+
+        response
+            .await
+            .unwrap()
+            .expect("the completed ordinary catch-up remains successful");
+        assert!(
+            relay.subscription_count() > subscriptions_before,
+            "ordinary catch-up must still activate and drain transport"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "the unavailable recovery intent must remain pending"
+        );
+        let outcome = client
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
+            .await
+            .expect("rechecking a deferred intent must not fail");
+        assert!(
+            matches!(outcome, EpochBackfillRunOutcome::Deferred),
+            "deferred work must remain distinct from no pending work"
+        );
+        drop(command_tx);
+    }
+
+    #[tokio::test]
     async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -3432,6 +3506,134 @@ mod tests {
             relay.subscription_count(),
             subscriptions_before_repair + 2,
             "the explicit unfloored repair already fulfills the pending replay",
+        );
+    }
+
+    #[tokio::test]
+    async fn full_history_repair_falls_back_when_every_pending_intent_defers() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("deferred full-history repair", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("backfill must be armed")
+            .groups
+            .insert(
+                test_group_id(0xde),
+                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
+            );
+        let subscriptions_before = relay.subscription_count();
+
+        client
+            .repair_full_history()
+            .await
+            .expect("explicit repair must fall back to its ordinary unfloored replay");
+
+        assert_eq!(
+            relay.subscription_count(),
+            subscriptions_before + 2,
+            "the fallback repair must install the complete account-wide replay"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "the deferred audit intent must remain retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_history_repair_runs_queued_intent_after_primary_defers() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let group_a = client.create_group("queued repair a", &[]).await.unwrap();
+        let group_b = client.create_group("queued repair b", &[]).await.unwrap();
+
+        let stalled_epoch_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_a,
+            stalled_epoch_a,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let execution = client
+            .begin_epoch_backfill_execution(EpochBackfillExecutionSeam::Maintenance)
+            .expect("first intent must begin");
+        let operation_a = execution.pending.attempt_id.clone();
+
+        let stalled_epoch_b = client.group_mls_state(&group_b).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_b,
+            stalled_epoch_b,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let operation_b = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("second intent must arm in flight")
+            .attempt_id
+            .clone();
+        client.test_finish_epoch_backfill_execution(execution, false);
+        client
+            .pending_epoch_backfill
+            .as_mut()
+            .expect("newer intent must be primary")
+            .groups
+            .insert(
+                test_group_id(0xde),
+                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
+            );
+        let unfloored_before = relay.unfloored_account_subscription_count();
+
+        client
+            .repair_full_history()
+            .await
+            .expect("repair must run the queued observable intent");
+
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            unfloored_before + 1,
+            "the queued intent must execute exactly one account-wide replay"
+        );
+        assert!(
+            client
+                .queued_epoch_backfills
+                .iter()
+                .any(|pending| pending.attempt_id == operation_b),
+            "the unavailable intent must remain queued"
+        );
+        assert!(
+            client
+                .pending_epoch_backfill
+                .as_ref()
+                .is_none_or(|pending| pending.attempt_id != operation_a)
+                && client
+                    .queued_epoch_backfills
+                    .iter()
+                    .all(|pending| pending.attempt_id != operation_a),
+            "the queued observable intent must be consumed"
         );
     }
 

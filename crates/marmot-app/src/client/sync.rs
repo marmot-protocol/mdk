@@ -49,6 +49,21 @@ struct EpochBackfillReplayOutcome {
     succeeded: bool,
 }
 
+/// Result of checking the pending epoch-gap replay queue at one execution seam.
+///
+/// `Deferred` is intentionally distinct from `NotPending`: explicit catch-up
+/// already completed its ordinary floored sync before checking this queue, so
+/// the worker may still return success while retaining the deferred recovery
+/// intent and its audit trail. Explicit full-history repair instead uses this
+/// distinction to try any queued runnable intent before falling back to its
+/// ordinary unfloored account-wide replay.
+#[derive(Debug)]
+pub(crate) enum EpochBackfillRunOutcome {
+    NotPending,
+    Deferred,
+    Completed(SyncSummary),
+}
+
 /// What the convergence scheduler should do next for a group, derived from
 /// the engine's durable pass state. Expected collection time is not an error;
 /// storage and projection failures are, and they surface as `Err` from
@@ -889,9 +904,6 @@ impl AppClient {
     fn requeue_failed_epoch_backfill_intent(&mut self, failed: PendingEpochBackfill) {
         match self.pending_epoch_backfill.take() {
             None => self.pending_epoch_backfill = Some(failed),
-            Some(current) if current.attempt_id == failed.attempt_id => {
-                self.pending_epoch_backfill = Some(failed);
-            }
             Some(current) => {
                 self.pending_epoch_backfill = Some(current);
                 self.queued_epoch_backfills.push_back(failed);
@@ -1092,9 +1104,12 @@ impl AppClient {
     pub(crate) async fn run_pending_epoch_backfill(
         &mut self,
         seam: EpochBackfillExecutionSeam,
-    ) -> Result<Option<SyncSummary>, AppError> {
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        if !self.has_pending_epoch_backfill() {
+            return Ok(EpochBackfillRunOutcome::NotPending);
+        }
         let Some(execution) = self.begin_epoch_backfill_execution(seam) else {
-            return Ok(None);
+            return Ok(EpochBackfillRunOutcome::Deferred);
         };
 
         match self.runtime.activate_transport(None).await {
@@ -1148,7 +1163,7 @@ impl AppClient {
                     deliveries,
                     true,
                 );
-                Ok(Some(summary))
+                Ok(EpochBackfillRunOutcome::Completed(summary))
             }
             Err(err) => {
                 let app_err: AppError = err.into();
@@ -1181,10 +1196,22 @@ impl AppClient {
             .set_transport_signer(self.transport_signer.clone())
             .await;
         if self.has_pending_epoch_backfill() {
-            return self
-                .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
-                .await?
-                .ok_or_else(|| AppError::UnknownGroup(String::new()));
+            // A deferred primary rotates behind queued work. Try each intent
+            // that was pending on entry once, so an unavailable group cannot
+            // hide a runnable retry. If every intent defers, retain them and
+            // fall through to the caller-directed unfloored repair below.
+            let pending_intents = usize::from(self.pending_epoch_backfill.is_some())
+                .saturating_add(self.queued_epoch_backfills.len());
+            for _ in 0..pending_intents {
+                match self
+                    .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
+                    .await?
+                {
+                    EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
+                    EpochBackfillRunOutcome::Deferred => continue,
+                    EpochBackfillRunOutcome::NotPending => break,
+                }
+            }
         }
         self.runtime.activate_transport(None).await?;
         self.sync_runtime_groups().await?;

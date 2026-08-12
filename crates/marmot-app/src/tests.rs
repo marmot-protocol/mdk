@@ -122,7 +122,7 @@ impl ScriptedPushRelayClient {
         self.subscriptions.lock().unwrap().len()
     }
 
-    fn unfloored_account_subscription_count(&self) -> usize {
+    pub(crate) fn unfloored_account_subscription_count(&self) -> usize {
         self.subscriptions
             .lock()
             .unwrap()
@@ -652,11 +652,14 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             "failed activation must retain pending recovery"
         );
 
-        client
+        let retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
-            .expect("retained recovery must retry")
-            .expect("retry must execute the pending replay");
+            .expect("retained recovery must retry");
+        assert!(
+            matches!(retry, crate::EpochBackfillRunOutcome::Completed(_)),
+            "retry must execute the pending replay"
+        );
         assert!(
             !client.has_pending_epoch_backfill(),
             "successful retry must consume pending recovery"
@@ -799,16 +802,28 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             "the failed operation must be queued instead of orphaned"
         );
 
-        client
+        let operation_b_retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
-            .expect("operation b must retry")
-            .expect("operation b must execute");
-        client
+            .expect("operation b must retry");
+        assert!(
+            matches!(
+                operation_b_retry,
+                crate::EpochBackfillRunOutcome::Completed(_)
+            ),
+            "operation b must execute"
+        );
+        let operation_a_retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
-            .expect("operation a must retry")
-            .expect("operation a must execute");
+            .expect("operation a must retry");
+        assert!(
+            matches!(
+                operation_a_retry,
+                crate::EpochBackfillRunOutcome::Completed(_)
+            ),
+            "operation a must execute"
+        );
         assert!(
             !client.has_pending_epoch_backfill(),
             "both operations must be consumed after successful retries"
@@ -1117,11 +1132,14 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
             "the deferred newer operation must rotate behind the queued older work"
         );
 
-        client
+        let older_retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
-            .expect("the queued older operation must retry")
-            .expect("the queued older operation must execute");
+            .expect("the queued older operation must retry");
+        assert!(
+            matches!(older_retry, crate::EpochBackfillRunOutcome::Completed(_)),
+            "the queued older operation must execute"
+        );
         assert!(
             client
                 .queued_epoch_backfills
