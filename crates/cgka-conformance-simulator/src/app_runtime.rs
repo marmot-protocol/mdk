@@ -445,7 +445,7 @@ impl AppRuntimeHarness {
         } else {
             let participant = self.participant_mut(client)?;
             if let Some(runtime) = participant.runtime.take() {
-                runtime.shutdown().await;
+                runtime.shutdown_and_close().await.map_err(app_error)?;
             }
             participant.events = None;
             participant.online = false;
@@ -459,7 +459,7 @@ impl AppRuntimeHarness {
         if participant.online
             && let Some(runtime) = participant.runtime.take()
         {
-            runtime.shutdown().await;
+            runtime.shutdown_and_close().await.map_err(app_error)?;
         }
         participant.app = app_for_root(participant.root(), &relay_url);
         let runtime = MarmotAppRuntime::new(participant.app.clone());
