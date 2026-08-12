@@ -4564,9 +4564,9 @@ impl MarmotApp {
     ///   branch"): every kind-1210 system row stamped with the superseded
     ///   commit's `origin_commit_id` is invalidated — including rows the
     ///   account's own published-and-confirmed commit synthesized. The engine
-    ///   pairs this event with both commit-rollback seams (`ForkRecovered`,
-    ///   `CommitRolledBack`), so those commit-level events intentionally do
-    ///   NOT dispatch here: one rollback must tombstone once, with one reason.
+    ///   pairs this event with the commit-rollback seam (`CommitRolledBack`),
+    ///   so that commit-level event intentionally does NOT dispatch here: one
+    ///   rollback must tombstone once, with one reason.
     ///
     /// Every other event carries no timeline invalidation and returns `None`.
     pub(crate) fn projection_update_for_invalidation_event(

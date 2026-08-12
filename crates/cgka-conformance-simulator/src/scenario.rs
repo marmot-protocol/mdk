@@ -370,7 +370,6 @@ pub struct ScenarioReport {
     pub pending_resolution_observations: Vec<PendingResolutionObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quiescence_observations: Vec<QuiescenceObservation>,
-    pub recovery_observations: Vec<crate::ForkRecoveryObservation>,
     pub epoch_change_observations: Vec<EpochChangeReportObservation>,
     pub app_invalidation_observations: Vec<AppInvalidationReportObservation>,
     #[serde(default)]
@@ -1336,11 +1335,6 @@ async fn run_scenario_report_inner(
         observations,
     };
     let pending_resolution_observations = observed_trace.pending_resolutions.clone();
-    let recovery_observations = observed_trace
-        .observations
-        .iter()
-        .flat_map(|observation| observation.recoveries.clone())
-        .collect();
     let epoch_change_observations = observed_trace
         .observations
         .iter()
@@ -1420,7 +1414,6 @@ async fn run_scenario_report_inner(
         step_log,
         pending_resolution_observations,
         quiescence_observations,
-        recovery_observations,
         epoch_change_observations,
         app_invalidation_observations,
         expectation_failures,

@@ -1084,20 +1084,61 @@ async fn four_party_cross_route_recovery_characterizes_corrected_app_runtime_out
         assert!(!app.application.pending_confirmation);
     }
 
-    // Adapter-local message ids cannot be compared across participants. Pin
-    // the two observed participant-local disposition shapes instead: either
-    // no losing system row has been projected, or Alpha alone has projected
-    // the invalidated kind-1210 row from its losing profile branch.
-    let no_invalidated_rows = clients
-        .iter()
-        .all(|client| invalidated_counts_by_client[client] == 0);
-    let alpha_losing_system_row = clients
-        .iter()
-        .all(|client| invalidated_counts_by_client[client] == usize::from(client == "alpha"));
-    assert!(
-        no_invalidated_rows || alpha_losing_system_row,
-        "unexpected invalidated disposition shape: {invalidated_counts_by_client:#?}"
-    );
+    // Applying Alpha's losing `alpha-root` commit synthesizes one kind-1210
+    // rename row stamped with that commit's id; reorging onto the selected
+    // branch rolls the commit back and `GroupStateInvalidated` withdraws that
+    // row. The retained tombstone is therefore each participant's own evidence
+    // that it once held the losing branch, so the rule below is per participant
+    // and never compares ids across them — a reorged peer's row is unattributed
+    // where Alpha's names itself, so the two are not even the same canonical id.
+    //
+    // Alpha published and confirmed the commit, so it always holds the row and
+    // owes a withdrawal exactly when it ends off that branch. Zeta is the rival
+    // same-epoch committer and defers only to a deeper branch; Yankee is already
+    // two commits deep on the selected branch before `step-25` reaches it.
+    // Neither ever synthesizes the row. Observer holds no branch of its own when
+    // both commits arrive, so whether it adopts Alpha's before the selected
+    // branch displaces it is a delivery-order detail: it may or may not carry
+    // the withdrawal, but only after leaving the losing branch.
+    for client in &clients {
+        let app = &app_observations[client];
+        let invalidated = invalidated_counts_by_client[client];
+        let left_the_losing_branch = app.protocol.group_name != "alpha-root"
+            && app.protocol.epoch > app_baseline[client.as_str()].epoch;
+        assert!(
+            invalidated <= 1,
+            "{client} withdrew more than the losing commit's one row: {invalidated_counts_by_client:#?}"
+        );
+        assert!(
+            invalidated == 0 || left_the_losing_branch,
+            "{client} withdrew a losing-branch row without leaving that branch: {app:#?}"
+        );
+        if client == "alpha" {
+            assert_eq!(
+                invalidated,
+                usize::from(left_the_losing_branch),
+                "alpha owes its own confirmed alpha-root row a withdrawal exactly when it leaves that branch: {app:#?}"
+            );
+        }
+        if client == "yankee" || client == "zeta" {
+            assert_eq!(
+                invalidated, 0,
+                "{client} never adopted alpha's branch yet withdrew a row: {app:#?}"
+            );
+        }
+        let visible = app
+            .application
+            .visible_message_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            app.application
+                .invalidated_message_ids
+                .iter()
+                .all(|id| !visible.contains(id)),
+            "{client} projected a withdrawn row as delivered: {app:#?}"
+        );
+    }
 
     let fully_equivalent = protocol_equivalent
         && app_payloads_by_client

@@ -26,7 +26,6 @@
 //! - [`canonicalization`] and [`convergence`] - executable policy model.
 //! - [`openmls_projection`] - bytes-first bridge between OpenMLS and the model.
 //! - [`epoch_manager`] - per-group state transitions and pending references.
-//! - [`fork_recovery`] - same-epoch commit rollback/replay support.
 //! - [`publish`] - publish-confirm and publish-failed lifecycle.
 //! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
 //! - [`auto_committer`] - SelfRemove auto-commit eligibility policy.
@@ -53,7 +52,6 @@ pub mod engine;
 pub mod engine_metrics;
 pub mod epoch_manager;
 pub mod feature_registry;
-pub mod fork_recovery;
 pub mod group_context_view;
 pub mod group_lifecycle;
 pub mod group_state_changes;

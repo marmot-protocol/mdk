@@ -608,9 +608,9 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
             entry.stimuli.contains(&ScenarioStimulus::InviteMembers)
                 && entry
                     .oracle_behaviors
-                    .contains(&OracleBehavior::ForkRecovered)
+                    .contains(&OracleBehavior::ClientConvergence)
         }),
-        "coverage matrix should show which generated cases check fork recovery"
+        "coverage matrix should show which generated cases check fork convergence"
     );
 
     fs::remove_dir_all(out_dir).expect("clean output dir");

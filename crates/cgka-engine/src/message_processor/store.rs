@@ -580,6 +580,48 @@ impl<S: StorageProvider> Engine<S> {
             Err(err) => Err(EngineError::Storage(err)),
         }
     }
+
+    /// Retire a raw transport wrapper whose content-derived row is now the
+    /// durably buffered convergence witness. Mirrors
+    /// [`Self::mark_raw_transport_message_failed_if_awaiting_retry`], but the
+    /// verdict is `Processed`: the wrapper's job is done and it must leave
+    /// the retry lifecycle instead of being re-peeled on every later
+    /// publish-cycle replay. A no-op on the direct path where no separate
+    /// raw row exists.
+    pub(crate) fn mark_raw_transport_message_processed_if_awaiting_retry(
+        &mut self,
+        raw_msg_id: &MessageId,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        match self.storage.get_message(raw_msg_id) {
+            Ok(record)
+                if matches!(
+                    record.state,
+                    MessageState::PeelDeferred | MessageState::Retryable
+                ) =>
+            {
+                self.storage
+                    .update_message_state(raw_msg_id, MessageState::Processed)?;
+                self.audit_group(
+                    &record.group_id,
+                    crate::audit_helpers::message_state_transition_event(
+                        hex::encode(raw_msg_id.as_slice()),
+                        Some(record.state),
+                        MessageState::Processed,
+                        Some(record.epoch),
+                        reason,
+                    ),
+                );
+                // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339).
+                if record.state == MessageState::PeelDeferred {
+                    self.note_peel_deferred_row_retired(&record.group_id);
+                }
+                Ok(())
+            }
+            Ok(_) | Err(StorageError::NotFound) => Ok(()),
+            Err(err) => Err(EngineError::Storage(err)),
+        }
+    }
 }
 
 #[cfg(test)]

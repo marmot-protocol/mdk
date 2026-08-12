@@ -1,3 +1,5 @@
+pub mod epoch_sealed_peeler;
+
 use std::sync::Arc;
 
 use cgka_engine::account_identity_proof::{

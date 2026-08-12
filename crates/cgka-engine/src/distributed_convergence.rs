@@ -1859,20 +1859,18 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Emit a [`GroupEvent::CommitRolledBack`] for every commit that this
     /// convergence pass deferred because its still-eligible branch lost
-    /// selection. This is the convergence-path analog of
-    /// the direct seam's [`GroupEvent::ForkRecovered`] commit attribution: a
-    /// commit that was previously applied through stored convergence (and so
-    /// synthesized kind-1210 group system rows stamped with its `origin_commit_id`)
-    /// can later lose a same-epoch fork during a reorg. The app uses
-    /// `invalidated_commit_id` to tombstone those origin-linked rows so a losing
-    /// branch's "Alice added Bob"-style history does not survive.
+    /// selection: a commit that was previously applied through stored
+    /// convergence (and so synthesized kind-1210 group system rows stamped
+    /// with its `origin_commit_id`) can later lose a same-epoch fork during a
+    /// reorg. The app uses `invalidated_commit_id` to tombstone those
+    /// origin-linked rows so a losing branch's "Alice added Bob"-style
+    /// history does not survive.
     ///
     /// Each rolled-back commit also gets a [`GroupEvent::GroupStateInvalidated`]:
     /// the spec-required explicit withdrawal of every state notification
     /// attributed to the superseded commit (convergence.md "Applying the
     /// selected branch"). This covers the client's own published-and-confirmed
-    /// commit when it loses branch selection through the stored-convergence
-    /// seam, mirroring the direct seam's `ForkRecovered` pairing.
+    /// commit when it loses branch selection.
     fn emit_rolled_back_commits(
         &mut self,
         group_id: &GroupId,
@@ -1922,9 +1920,8 @@ impl<S: StorageProvider> Engine<S> {
     /// The canonicalization drop set only covers commits the candidate BFS
     /// could materialize. A device's OWN published-and-confirmed commit is not
     /// replayable through `process_message` (MLS cannot process own messages),
-    /// so when a reorg supersedes it — e.g. after a restart cleared the
-    /// in-memory `committed_from` guard and routed a same-epoch sibling into
-    /// stored convergence — the own commit gets no disposition at all: no
+    /// so when a reorg supersedes it — a same-epoch sibling adjudicated
+    /// through stored convergence — the own commit gets no disposition at all: no
     /// `CommitRolledBack`, no withdrawal, and the confirm-time
     /// `GroupStateChanged` rows survive as the issue #363 lie.
     ///

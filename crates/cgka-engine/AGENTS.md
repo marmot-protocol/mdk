@@ -26,8 +26,12 @@ capability negotiation, and MIP-03 admin policy — everything that OpenMLS does
   - **Open...:** `src/feature_registry.rs` + tests in `tests/capabilities.rs`
 
 - **You want to...:** Understand fork handling
-  - **Open...:** `src/fork_recovery.rs` + `src/epoch_manager.rs::we_committed_from` + the `WrongEpoch` branch in
-    `src/message_processor/ingest.rs`
+  - **Open...:** the convergence admission gate (`commit_should_enter_convergence`) in
+    `src/message_processor/ingest.rs` + `src/distributed_convergence.rs` — same-epoch rivals are adjudicated by
+    distributed convergence for every member; the `WrongEpoch` branch retains and schedules an in-horizon rival whose
+    source anchor is gone, and the coordinator's `MissingRetainedAnchor` verdict owns the durable halt. Post-fork
+    traffic on an unadopted branch is unreadable until `openmls_projection::candidate_branch_peel` gives
+    `Engine::retry_deferred_peels` that branch's own state — see "Branch-relative peel" below
 
 - **You want to...:** Figure out SelfRemove auto-commit eligibility
   - **Open...:** `src/auto_committer.rs`
@@ -78,11 +82,7 @@ realises. Read those rustdocs as the source of truth — this table is just an i
     state transitions.
 
 - **Module:** `epoch_manager.rs`
-  - **Owns:** only place that mutates `EpochState`; owns `PendingMeta` (group_id + prior_epoch + kind),
-    `committed_from`, fork detection state
-
-- **Module:** `fork_recovery.rs`
-  - **Owns:** deterministic same-epoch commit ordering, pre-commit snapshot metadata, rollback-to-winner recovery
+  - **Owns:** only place that mutates `EpochState`; owns `PendingMeta` (group_id + prior_epoch + kind)
 
 - **Module:** `group_state_changes.rs`
   - **Owns:** pure, MLS-free before/after diff helpers that turn an applied commit's effect on canonical group state
@@ -115,9 +115,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
     async cancellation don't leave storage in mid-mutation state
 
 - **Module:** `pending_commit_guard.rs`
-  - **Owns:** `PendingCommitCleanupGuard` — RAII cleanup that clears an orphaned OpenMLS pending commit and releases the
-    fork-recovery snapshot if a commit-producing send path is dropped or returns early before handing off a
-    `PendingStateRef`
+  - **Owns:** `PendingCommitCleanupGuard` — RAII cleanup that clears an orphaned OpenMLS pending commit if a
+    commit-producing send path is dropped or returns early before handing off a `PendingStateRef`
 
 - **Module:** `wire_format.rs`
   - **Owns:** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker
@@ -154,7 +153,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** engine-side diagnostic telemetry for post-settle convergence reorgs
 
 - **Module:** `openmls_projection.rs`
-  - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay
+  - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay and
+    `candidate_branch_peel` (whether the graph is contested, plus candidate branch tips captured as owned peel
+    contexts)
 
 - **Module:** `update_group_data.rs`
   - **Owns:** `SendIntent::UpdateGroupData` — stages an `AppDataUpdate` commit for `marmot.group.profile.v1`
@@ -325,31 +326,77 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 `StagedCommit::export_secret` (`staged_commit.rs:778`, identical signature to `MlsGroup::export_secret`),
 `MlsGroup::merge_pending_commit` (`processing.rs:307`), `MlsGroup::clear_pending_commit` (`mod.rs:374`).
 
-### Done — ForkRecoveryManager (2026-05-04)
+### Done — fork-resolution route unification (2026-08-06, supersedes ForkRecoveryManager 2026-05-04)
 
-`crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is
-authenticated: source epoch, commit priority (`privileged` before `ordinary`), authenticated committer identity, then
-`SHA-256(mls_bytes)` as the same-committer fallback. Local and inbound commits create pre-commit snapshots; a better
-late candidate rolls storage back and replays, while a losing candidate is marked stale. Successful rollback emits
-`GroupEvent::ForkRecovered` so harness vectors can compare recovery
-trace, not just final state. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable
-shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
+Same-epoch rival commits are adjudicated by distributed convergence for every member — committer, observer, or
+restarted committer alike. The durable source-epoch anchor (`openmls-retained-anchor-{epoch}`, retained on every
+canonical advance) admits an in-horizon rival into the pass; own commits materialize from their commit-addressed
+checkpoints (#1285); a missing in-horizon anchor fails closed loudly, with ingest retaining and scheduling the
+unadjudicable rival and the convergence coordinator issuing the durable `Unrecoverable` +
+`GroupEvent::GroupUnrecoverable` from the authenticated pass. The former pairwise fast-path (`ForkRecoveryManager`, `committed_from` routing,
+send/apply-time `fork-` snapshots, `GroupEvent::ForkRecovered`) is deleted. The deterministic ordering key
+(source epoch, `privileged` before `ordinary`, authenticated committer identity, digest fallback) lives on inside
+branch selection, where valid branch depth outranks it. Tests: `tests/fork_detection.rs`, the route-equivalence
+family in the conformance simulator.
+
+**Branch-relative peel — the unified route's visibility half.** Branch selection ranks on valid commit depth and app
+witnesses counted over *stored* inputs, and a group message is sealed under the **sender's** current-epoch exporter
+secret with no epoch hint on the wire. So once two members commit from the same epoch, each branch's later traffic is
+opaque to every device that adopted the other branch: it sits retained as `PeelDeferred`, contributes neither depth nor
+witnesses, every committer over-scores its own branch, and the fork never heals. Candidate branch states are therefore
+part of a group's *peel context*, not a separate mechanism.
+`openmls_projection::candidate_branch_peel` materializes each candidate branch under a
+`SnapshotRollbackGuard` and captures its tip's owned `GroupContextSnapshot`; the exporter secret is derived while the
+branch state exists, so the transient state is rolled back before any (async) peel runs against it.
+`Engine::retry_deferred_peels` then offers those contexts to every retained row through the ordinary ingest seam.
+
+Gating, so the uncontested path pays no replay: the sweep returns before any context work on an empty backlog; context
+collection stops at the cheap "two commits share a source epoch" check before any replay; at most
+`MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS` branches are materialized, one bounded replay each under a fresh budget of the
+pass's shape. That cap is applied to candidates ranked by tip epoch then branch id, never to the BFS's own
+shallowest-first completion order: both keys are content-derived, so peers holding the same evidence keep the same
+branches, and a wide shallow fork cannot evict the deep branch that actually carries the post-fork traffic. Branch
+*selection* is uncapped — a branch past the prefix can still win a pass and peels natively once adopted. Finally,
+failure to enumerate branches (missing anchor, missing own-commit checkpoint, exhausted budget) yields no contexts
+rather than an error — the pass, not this helper, owns every verdict. Because candidate branch
+states are part of the peel context, `deferred_peel_context_fingerprint` folds in the stored commit graph: a newly
+retained rival commit adds a readable context even when the live epoch and retained-anchor set are unchanged, and
+without that term the sweep gate would stay armed exactly where it must not.
+
+**Contested-ness and contexts are separate answers.** That shared-source-epoch check is the *only* thing that decides
+whether the graph is contested, and `CandidateBranchPeel` carries it independently of the captured contexts, because
+every path after it — released anchor, missing own-commit checkpoint, exhausted budget, fewer than two surviving
+candidate paths, no tip captured — loses contexts without saying anything about whether the graph is split. Reading
+contested-ness off an empty context set would report a fork as healed exactly when this device stopped being able to
+see it. The two then drive different decisions and must stay split: `DeferredPeelSweep::is_contested` gates only the
+drain policy (a contested sweep's recovered rows are one evidence set, so the drain waits for the whole batch), while
+routing live-readable application traffic into the convergence seam keys on `has_branch_contexts` — a sweep holding no
+rival state would only feed evidence to a pass that, having halted on the same checkpoint or the same budget, almost
+certainly cannot read the rival branch either.
+
+**Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
+not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical
+OpenMLS cannot accept it anyway (same epoch number, different epoch secrets), and this seam must derive nothing from
+it. The peeled bytes are evidence of nothing on their own: the next pass's OpenMLS replay is what authenticates them,
+and a failed peel is silence, never a verdict. Tests: `tests/epoch_sealed_transport.rs` (Tier 2 opts into production
+epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-e2e-delivery/v1` and
+`adversarial-reliability/app-witness-value/v1` families in the conformance simulator.
 
 ## Conventions in this crate
 
 - **Mirror every ingest invariant on every inbound seam.** An inbound MLS message reaches application-visible state
-  through three seams — **direct ingest** (`message_processor/ingest.rs::ingest_group_message`),
-  **stored-convergence/replay** (`openmls_projection.rs::process_openmls_messages_inner`, materialization and apply),
-  and **fork recovery** (the `WrongEpoch` branch in `message_processor/ingest.rs` + `fork_recovery.rs`). Every
-  sender-authentication, admin/identity-proof, app-payload, and component-retention check MUST run identically on all
-  of them, through the *same* shared helper — never a seam-local re-implementation. Shared chokepoints:
+  through two seams — **direct ingest** (`message_processor/ingest.rs::ingest_group_message`) and
+  **stored-convergence/replay** (`openmls_projection.rs::process_openmls_messages_inner`, materialization and apply;
+  this is also the fork-resolution seam — same-epoch rivals are adjudicated inside the convergence pass). Every
+  sender-authentication, admin/identity-proof, app-payload, and component-retention check MUST run identically on
+  both, through the *same* shared helper — never a seam-local re-implementation. Shared chokepoints:
   `identity::member_id_of_sender` (MLS `Sender` → validated `MemberId`) and
   `app_payload::validate_app_payload_for_sender` (payload + `&MemberId` → validated `MarmotAppEvent`; rejects an empty
   id). An application message whose sender cannot resolve to a validated member id is never surfaced as
   `MessageReceived` and never accepted into canonical state on any seam (direct: `Failed`; replay: `Ignored` →
-  terminal disposition). Fork-recovery paths fail closed with typed errors (`EngineError::ForkedEpoch` / `Backend`) —
-  never `unreachable!`/`panic!` — on attacker-influenced input. When you add a guard to one seam, add it to the shared
-  helper (or all seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
+  terminal disposition). Fork-resolution paths fail closed with typed errors — never `unreachable!`/`panic!` — on
+  attacker-influenced input. When you add a guard to one seam, add it to the shared
+  helper (or both seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
 - **Never derive durable terminal group state from unauthenticated inbound bytes.** "Fail closed" means refuse the
   input, not punish the group. The `WrongEpoch` arm in `message_processor/ingest.rs` is the sharp case: OpenMLS raises
   it from `validate_framing`, the FIRST statement of `decrypt_message`, strictly upstream of membership-tag and
@@ -413,11 +460,9 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   transaction that merges the commit (`publish::do_confirm_published`, the inbound apply in `message_processor/ingest.rs`)
   or compensate the in-memory transition explicitly (`stage_auto_commit_for_queued_proposals`). A swallowed mirror error
   splits the two stores silently and the split resurfaces as a wrong epoch on the next session open. Undoing the apply
-  is only half the obligation: where the failing seam sits behind fork resolution — whose side effects (released
-  incumbent snapshot, `EpochInvalidated` incumbent commit) cannot be compensated — it must also release the recovery
-  snapshot it created and hand the still-retained winning commit back to stored convergence via
-  `schedule_pending_convergence_group`. Otherwise the group parks one epoch behind holding a durable winner nothing
-  will ever apply.
+  is only half the obligation: the failed inbound apply must also hand the still-retained commit back to stored
+  convergence via `schedule_pending_convergence_group`. Otherwise the group parks one epoch behind holding a durable
+  commit nothing will ever apply.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They

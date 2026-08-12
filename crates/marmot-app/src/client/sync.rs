@@ -1837,12 +1837,12 @@ impl AppClient {
             // Timeline invalidation dispatch: `AppMessageInvalidated` withdraws
             // the delivered source row; `GroupStateInvalidated` withdraws every
             // kind-1210 system row stamped with the superseded commit's
-            // `origin_commit_id`. The engine pairs `GroupStateInvalidated` with
-            // both commit-rollback seams (`ForkRecovered` on the direct
-            // staged-commit seam, `CommitRolledBack` on the stored-convergence
-            // seam), so those events no longer trigger tombstoning here — the
-            // explicit withdrawal event is the single authoritative signal and
-            // one rollback produces exactly one projection update.
+            // `origin_commit_id`. The engine pairs `GroupStateInvalidated`
+            // with the commit-rollback seam (`CommitRolledBack` on the
+            // stored-convergence path), so that event no longer triggers
+            // tombstoning here — the explicit withdrawal event is the single
+            // authoritative signal and one rollback produces exactly one
+            // projection update.
             if let Some(projection_update) = self
                 .app
                 .projection_update_for_invalidation_event(&self.state.label, event)?

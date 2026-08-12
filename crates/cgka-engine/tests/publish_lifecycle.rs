@@ -255,21 +255,6 @@ fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEn
         .unwrap()
 }
 
-fn build_with_peeler_and_storage(
-    id: &[u8],
-    peeler: Box<dyn TransportPeeler>,
-    storage: SqliteAccountStorage,
-) -> impl CgkaEngine {
-    EngineBuilder::new(storage)
-        .legacy_compatibility_profile()
-        .identity(pad32(id))
-        .account_identity_proof_signer(proof_signer(id))
-        .feature_registry(registry_with_reactions())
-        .peeler(peeler)
-        .build()
-        .unwrap()
-}
-
 fn build_engine_with_storage(
     id: &[u8],
     storage: SqliteAccountStorage,
@@ -284,7 +269,7 @@ fn build_engine_with_storage(
         .unwrap()
 }
 
-fn fork_snapshot_names(
+fn retained_anchor_snapshot_names(
     storage: &SqliteAccountStorage,
     gid: &cgka_traits::types::GroupId,
 ) -> Vec<String> {
@@ -292,7 +277,7 @@ fn fork_snapshot_names(
         .list_group_snapshots(gid)
         .unwrap()
         .into_iter()
-        .filter(|name| name.starts_with("fork-"))
+        .filter(|name| name.starts_with("openmls-retained-anchor-"))
         .collect::<Vec<_>>();
     names.sort();
     names
@@ -565,92 +550,15 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
 }
 
-// ── Regression #332: guard releases the pre-commit fork-recovery snapshot ──
+// ── Retained-anchor snapshots prune to the rewind horizon ──────────────────
 //
-// The orphan-window cleanup guard (#331 / #149) clears the staged OpenMLS
-// pending commit on a failed send, but the invite / auto-commit / upgrade /
-// group-data-update paths also create a `fork-{epoch}-{n}-{hash}` recovery
-// snapshot *before* the send can fail. The normal `publish_failed` path
-// releases that snapshot via `forget_pending_commit_for_recovery`; the guard
-// must mirror that so a send that fails inside the armed window does not leak
-// a snapshot row. These pre-commit snapshots are not in the retained-anchor
-// set, so epoch advancement never GCs them.
-#[tokio::test]
-async fn invite_wrap_failure_releases_pre_commit_recovery_snapshot() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
-    let mut alice = build_with_peeler_and_storage(
-        b"alice",
-        Box::new(FailFirstGroupWrapPeeler::new()),
-        storage.clone(),
-    );
-    let mut bob = build(b"bob");
-    let mut carol = build(b"carol");
-
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (gid, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "g".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let pending = match create {
-        SendResult::GroupCreated { pending, .. } => pending,
-        _ => unreachable!(),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
-
-    // Baseline snapshot rows after a clean group is established. The invite
-    // that fails below must not grow this set once the guard fires.
-    let baseline = storage.list_group_snapshots(&gid).unwrap().len();
-
-    let carol_kp = carol.fresh_key_package().await.unwrap();
-    let err = alice
-        .send(SendIntent::Invite {
-            group_id: gid.clone(),
-            key_packages: vec![carol_kp],
-        })
-        .await
-        .expect_err("first invite should fail at transport wrapping");
-    assert!(
-        matches!(err, EngineError::Peeler(PeelerError::WrapFailed(_))),
-        "unexpected error: {err:?}"
-    );
-
-    // The pre-commit fork-recovery snapshot created in the armed window must
-    // have been released by the guard's Drop — no orphaned snapshot row.
-    let after_failure = storage.list_group_snapshots(&gid).unwrap().len();
-    assert_eq!(
-        after_failure, baseline,
-        "failed invite leaked a pre-commit fork-recovery snapshot: \
-         baseline={baseline}, after_failure={after_failure}"
-    );
-
-    // And the group is still usable: a retry succeeds and converges.
-    let carol_kp2 = carol.fresh_key_package().await.unwrap();
-    let retry = alice
-        .send(SendIntent::Invite {
-            group_id: gid.clone(),
-            key_packages: vec![carol_kp2],
-        })
-        .await
-        .expect("retry after wrap failure must succeed");
-    let retry_pending = match retry {
-        SendResult::GroupEvolution { pending, .. } => pending,
-        _ => panic!("expected GroupEvolution"),
-    };
-    alice.confirm_published(retry_pending).await.unwrap();
-    assert_eq!(alice.epoch(&gid).unwrap().0, 2);
-    assert_eq!(alice.members(&gid).unwrap().len(), 3);
-}
+// Every confirm retains a source-epoch anchor (`openmls-retained-anchor-N`)
+// so a later same-epoch rival can be admitted into distributed convergence.
+// The retained set must stay bounded by `max_rewind_commits`, or every
+// confirmed commit would grow storage by a full group-state copy forever.
 
 #[tokio::test]
-async fn confirmed_commits_prune_fork_recovery_snapshots_to_rewind_horizon() {
+async fn confirmed_commits_prune_retained_anchor_snapshots_to_rewind_horizon() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
@@ -697,21 +605,21 @@ async fn confirmed_commits_prune_fork_recovery_snapshots_to_rewind_horizon() {
         };
         alice.confirm_published(pending).await.unwrap();
 
-        let snapshots = fork_snapshot_names(&storage, &gid);
+        let snapshots = retained_anchor_snapshot_names(&storage, &gid);
         assert!(
-            snapshots.len() <= 1,
-            "fork snapshots exceeded max_rewind_commits=1 after update {i}: {snapshots:?}"
+            snapshots.len() <= 2,
+            "retained anchors exceeded max_rewind_commits=1 after update {i}: {snapshots:?}"
         );
     }
 
     assert_eq!(alice.epoch(&gid).unwrap().0, 4);
-    let snapshots = fork_snapshot_names(&storage, &gid);
+    let snapshots = retained_anchor_snapshot_names(&storage, &gid);
     assert!(
         !snapshots.is_empty()
-            && snapshots
-                .iter()
-                .all(|snapshot| snapshot.starts_with("fork-3-")),
-        "only the current rewind horizon's source epoch should remain: {snapshots:?}"
+            && snapshots.iter().all(|snapshot| {
+                snapshot == "openmls-retained-anchor-3" || snapshot == "openmls-retained-anchor-4"
+            }),
+        "only the current rewind horizon's anchors should remain: {snapshots:?}"
     );
 }
 

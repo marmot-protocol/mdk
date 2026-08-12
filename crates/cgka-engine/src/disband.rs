@@ -12,7 +12,7 @@ use cgka_traits::app_components::{
     GROUP_LIFECYCLE_COMPONENT_ID, GroupLifecycleV1, encode_components_list,
     encode_group_lifecycle_v1,
 };
-use cgka_traits::engine::{CommitOrderingKey, SendResult};
+use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::{
@@ -375,12 +375,7 @@ impl<S: StorageProvider> Engine<S> {
             ))),
         ];
 
-        let mut guard = PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        let snapshot = self
-            .fork_recovery
-            .create_snapshot(&self.storage, group_id, source_epoch)?;
-        guard.set_snapshot(snapshot.clone());
-        self.audit_snapshot_created(group_id, &snapshot, source_epoch, "pre_disband_commit");
+        let guard = PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let commit = self.stage_commit_with_app_data_updates(
             &mut mls_group,
@@ -407,7 +402,6 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::validate_current_profile_invariants_for_staged_commit(
             &mls_group, staged, own_leaf,
         )?;
-        let priority = crate::app_components::commit_ordering_priority_for_staged(staged);
         let commit_bytes = commit
             .tls_serialize_detached()
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
@@ -454,19 +448,7 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::Disband,
             self.current_audit_context.clone(),
         )?;
-        self.track_pending_commit_for_recovery(
-            pending,
-            group_id.clone(),
-            source_epoch,
-            wrapped.id.clone(),
-            CommitOrderingKey::from_commit_bytes(
-                source_epoch,
-                priority,
-                self.identity.self_id().clone(),
-                &commit_bytes,
-            ),
-            snapshot,
-        );
+        self.track_pending_origin_commit(pending, wrapped.id.clone());
         guard.disarm();
         Ok(Some(SendResult::GroupEvolution {
             msg: wrapped,

@@ -893,8 +893,10 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state_digest: Option<DigestHex>,
     },
-    /// `ForkRecoveryManager::resolve` returned a verdict for a same-epoch
-    /// candidate.
+    /// A pairwise same-epoch fork resolution verdict. Emitted only by
+    /// pre-unification engine versions (the pairwise fork-resolution route
+    /// was deleted in favor of distributed convergence); the kind is kept so
+    /// historical JSONL exports remain parseable.
     ForkResolution {
         source_epoch: u64,
         candidate_digest: DigestHex,

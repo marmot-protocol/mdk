@@ -72,7 +72,7 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   action kinds are drift-checked against committed Scenario IR.
 - `mutation_adequacy` — eleven simulator-only single-rule mutants with minimal deterministic witnesses. The generated
   catalog kills selector order, witness dedup/admission, cutoff, frozen-state, scheduler re-arm, invalidation,
-  publication-ack, retention-boundary, group-profile-projection, and pairwise-loser terminalization mutations without
+  publication-ack, retention-boundary, group-profile-projection, and provisional-winner terminalization mutations without
   compiling mutation switches into production. Lifecycle
   mutants run through the shared Rust transition model; publication acknowledgement runs through a real independent
   reference subject and its structural pending-work observation; the profile mutant runs the production-shaped engine

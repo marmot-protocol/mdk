@@ -57,8 +57,8 @@ the property-test registry. This file is the agent-facing model.
 
 - **Module:** `src/family.rs`
   - **Role:** Deterministic generated scenario families. `generate_send_leave_family`,
-    `generate_convergence_e2e_delivery_family`, `generate_convergence_chaos_family`, and
-    `generate_admin_churn_family` record family name, generator
+    `generate_convergence_e2e_delivery_family`, `generate_convergence_chaos_family`,
+    `generate_admin_churn_family`, and `generate_bounded_convergence_pressure_family` record family name, generator
     version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report`
     adds generated metadata to report artifacts. Reliability families append a final global drain, exact canonical
     observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
@@ -146,7 +146,7 @@ the property-test registry. This file is the agent-facing model.
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
     facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
     commit/proposal/application input dispositions, pending-work blockers, active decryptability matrices, and
-    `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`.
+    settled `ConvergenceDecisionObservation` entries captured from the forensic recorder.
 
 - **Module:** `src/policy_cases.rs`
   - **Role:** Serializable `PolicyCase` DTOs plus selection-reasoning helpers (`parse_policy_cases`, `reason_against`,
@@ -242,6 +242,12 @@ shapes (arms 2, 6, 7, 8, 9) from the seed, so distinct seeds exercise distinct a
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed, so coverage grows with the seed
 without re-pinning vectors.
 
+The `bounded-convergence-pressure/v1` generated family is the finite-pressure acceptance campaign for the unified
+fork-resolution route: a same-epoch commit race, application sends issued inside the quiescence window, a committer
+restart taken mid-resolution, and a bounded self-update/profile/admin tail. It activates controlled virtual time before
+the race, so every later settle must be `AwaitQuiescence`; the driver's watchdog budget is the bounded-time assertion.
+The campaign is finite by construction and claims nothing about progress under unbounded self-updates.
+
 ## How to add a new scripted scenario
 
 1. Prefer a `ScenarioSpec` when the case should become portable or reportable.
@@ -262,7 +268,7 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 2. Include `scenario_name`, `vector_version`, `conformance_version`, `seed`, `scenario`, and either `expected_trace` or
    `expected_outcomes`.
 3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
-4. Make recovery behavior observable through `ForkRecoveryObservation`, not just final membership.
+4. Make fork-resolution behavior observable through a settled `convergence_decision` expectation, not just final membership.
 5. Run `cargo test -p cgka-conformance-simulator canonical_vector_fixtures_match_generated_traces`.
 
 ## OpenMLS replay probes

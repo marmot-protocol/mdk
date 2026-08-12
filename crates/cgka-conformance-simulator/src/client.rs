@@ -2108,19 +2108,6 @@ impl HarnessClient {
                             .record_app_invalidated(&scenario_input, *reason);
                     }
                 }
-                GroupEvent::ForkRecovered {
-                    invalidated_commit_id,
-                    ..
-                } => {
-                    if let Some(scenario_input) = self
-                        .bus
-                        .scenario_input_for_transport(invalidated_commit_id)
-                        .or_else(|| self.bus.scenario_input_for_content(invalidated_commit_id))
-                    {
-                        self.scenario_input_tracker
-                            .record_commit_invalidated(&scenario_input, "fork_recovered");
-                    }
-                }
                 GroupEvent::CommitRolledBack {
                     invalidated_commit_id,
                     ..

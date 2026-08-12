@@ -170,8 +170,6 @@ pub struct DurableGroupEvolution {
     pub target_epoch: EpochId,
     pub phase: GroupEvolutionPhase,
     pub semantic: GroupEvolutionSemantic,
-    /// Snapshot used for convergence reconciliation before any retry.
-    pub recovery_snapshot: Option<String>,
     /// Hash of the local LeafNode before staging.  Comparing this to the
     /// selected branch proves whether an intervening commit rotated our leaf.
     pub own_leaf_before_hash: Option<Vec<u8>>,
