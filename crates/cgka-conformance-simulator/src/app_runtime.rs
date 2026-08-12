@@ -99,6 +99,7 @@ struct Participant {
     runtime_events_observed: usize,
     cached_members: BTreeMap<String, Vec<String>>,
     cached_epochs: BTreeMap<String, u64>,
+    offline_observation: Option<AppRuntimeObservationV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +247,7 @@ impl AppRuntimeHarness {
                     runtime_events_observed: 0,
                     cached_members: BTreeMap::new(),
                     cached_epochs: BTreeMap::new(),
+                    offline_observation: None,
                 },
             );
         }
@@ -443,12 +445,28 @@ impl AppRuntimeHarness {
         if online {
             self.reopen(client).await
         } else {
+            if !self.participant(client)?.online {
+                return Ok(());
+            }
+            let mut offline_observation = if self.active_scenario_group.is_some() {
+                match self.layered_observation(client) {
+                    Ok(observation) => Some(observation),
+                    Err(error) if error.code == "unknown_group" => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            if let Some(observation) = offline_observation.as_mut() {
+                observation.local.online = false;
+            }
             let participant = self.participant_mut(client)?;
             if let Some(runtime) = participant.runtime.take() {
                 runtime.shutdown_and_close().await.map_err(app_error)?;
             }
             participant.events = None;
             participant.online = false;
+            participant.offline_observation = offline_observation;
             Ok(())
         }
     }
@@ -468,6 +486,7 @@ impl AppRuntimeHarness {
         participant.runtime = Some(runtime);
         participant.online = true;
         participant.reopen_count = participant.reopen_count.saturating_add(1);
+        participant.offline_observation = None;
         Ok(())
     }
 
@@ -644,6 +663,15 @@ impl AppRuntimeHarness {
         &mut self,
         client: &str,
     ) -> Result<AppRuntimeObservationV1, SubjectError> {
+        let participant = self.participant(client)?;
+        if !participant.online {
+            return participant.offline_observation.clone().ok_or_else(|| {
+                SubjectError::new(
+                    "offline_observation_unavailable",
+                    "no public projection was captured before the participant went offline",
+                )
+            });
+        }
         let group_label = self.active_scenario_group.clone().ok_or_else(|| {
             SubjectError::new("scenario_group_missing", "no scenario group is selected")
         })?;
