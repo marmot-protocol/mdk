@@ -338,9 +338,10 @@ struct RecordingAdapterInner {
     syncs: Mutex<Vec<TransportGroupSync>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
+    accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
+    error_endpoints: Mutex<Vec<TransportEndpoint>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
-    timeout_pattern: Mutex<VecDeque<bool>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
 }
 
@@ -379,16 +380,25 @@ impl RecordingAdapter {
             .push_back(accepted_count);
     }
 
+    /// Persistent endpoint accept policy: every publish call accepts exactly
+    /// the intersection of its target endpoints with this set. Deterministic
+    /// under concurrent single-endpoint publishes, unlike the FIFO knobs.
+    fn accept_only_endpoints(&self, endpoints: Vec<TransportEndpoint>) {
+        *self.inner.accept_policy.lock().unwrap() = Some(endpoints);
+    }
+
+    /// Persistent whole-call error policy: a publish call whose target
+    /// endpoints all sit in this set returns `Err` instead of a report.
+    fn error_for_endpoints(&self, endpoints: Vec<TransportEndpoint>) {
+        *self.inner.error_endpoints.lock().unwrap() = endpoints;
+    }
+
     fn report_message_id_next(&self, message_id: MessageId) {
         self.inner
             .reported_message_ids
             .lock()
             .unwrap()
             .push_back(message_id);
-    }
-
-    fn timeout_pattern(&self, pattern: impl IntoIterator<Item = bool>) {
-        self.inner.timeout_pattern.lock().unwrap().extend(pattern);
     }
 
     fn error_next(&self) {
@@ -447,13 +457,6 @@ impl TransportAdapter for RecordingAdapter {
             permit.forget();
             gate.active.fetch_sub(1, Ordering::SeqCst);
         }
-        let timed_out = self
-            .inner
-            .timeout_pattern
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(false);
         let ambiguous_error = self
             .inner
             .publish_errors
@@ -461,15 +464,49 @@ impl TransportAdapter for RecordingAdapter {
             .unwrap()
             .pop_front()
             .unwrap_or(false);
-        if timed_out || ambiguous_error {
+        if ambiguous_error {
             return Err(TransportAdapterError::Publish(
-                if timed_out {
-                    "simulated timeout"
-                } else {
-                    "injected ambiguous adapter failure"
-                }
-                .into(),
+                "injected ambiguous adapter failure".into(),
             ));
+        }
+        {
+            let error_endpoints = self.inner.error_endpoints.lock().unwrap();
+            if !error_endpoints.is_empty()
+                && request
+                    .target
+                    .endpoints()
+                    .iter()
+                    .all(|endpoint| error_endpoints.contains(endpoint))
+            {
+                return Err(TransportAdapterError::Publish(
+                    "endpoint-policy adapter error".into(),
+                ));
+            }
+        }
+        let accepted_endpoints = self.inner.accept_policy.lock().unwrap().clone();
+        if let Some(accepted_endpoints) = accepted_endpoints {
+            return Ok(TransportPublishReport {
+                message_id: self
+                    .inner
+                    .reported_message_ids
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(request.message.id),
+                accepted: request
+                    .target
+                    .endpoints()
+                    .iter()
+                    .filter(|endpoint| accepted_endpoints.contains(endpoint))
+                    .cloned()
+                    .map(|endpoint| TransportEndpointReceipt {
+                        endpoint,
+                        accepted_at: None,
+                    })
+                    .collect(),
+                failed: Vec::new(),
+                required_acks: request.required_acks,
+            });
         }
         let accepted_count = self
             .inner
@@ -3310,8 +3347,13 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
         .unwrap();
 
     let adapter = RecordingAdapter::default();
-    adapter.accept_next(1);
-    adapter.accept_next(0);
+    // Endpoint policy: group-a accepts the commit, group-b does not, and both
+    // carol inbox endpoints accept the welcome.
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group-a.example".into()),
+        TransportEndpoint("wss://carol-inbox-a.example".into()),
+        TransportEndpoint("wss://carol-inbox-b.example".into()),
+    ]);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)

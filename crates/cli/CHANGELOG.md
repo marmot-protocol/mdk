@@ -19,6 +19,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   upgrade to this compatibility cohort before downloading blobs above 64 MiB;
   the active blob remains memory-resident and one media request is bounded to
   512 MiB total.
+
+- One publish's relay fanout now runs its per-relay attempts concurrently
+  instead of one awaited relay at a time, so a slow relay no longer serially
+  delays every relay after it. Fanout duration can approach the slowest
+  individual attempt's budget when the transport makes concurrent progress,
+  instead of the sum of per-relay budgets.
+  ([#1397](https://github.com/marmot-protocol/mdk/pull/1397))
+
 - App-runtime encrypted-media secret caching now skips the MLS group load,
   exporter-secret derivation, and database write when the current epoch's
   secret is already cached, and the cache sweep's `required` pre-check uses
