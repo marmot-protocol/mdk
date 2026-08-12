@@ -185,18 +185,22 @@ export function createMarmotMessageActionAdapter(
         );
         const emoji = typeof ctx.params.emoji === "string" ? ctx.params.emoji : "";
         const remove = ctx.params.remove === true || emoji.length === 0;
-        if (remove) {
-          if (!client.removeReaction) {
-            return jsonResult({ ok: false, error: "reaction removal unavailable" });
+        try {
+          if (remove) {
+            if (!client.removeReaction) {
+              return jsonResult({ ok: false, error: "reaction removal unavailable" });
+            }
+            await client.removeReaction(marmotAccountIdHex, to, messageId);
+            return jsonResult({ ok: true, removed: true });
           }
-          await client.removeReaction(marmotAccountIdHex, to, messageId);
-          return jsonResult({ ok: true, removed: true });
+          if (!client.sendReaction) {
+            return jsonResult({ ok: false, error: "reactions unavailable" });
+          }
+          await client.sendReaction(marmotAccountIdHex, to, messageId, emoji);
+          return jsonResult({ ok: true, added: emoji });
+        } catch {
+          return jsonResult({ ok: false, error: "reaction operation failed" });
         }
-        if (!client.sendReaction) {
-          return jsonResult({ ok: false, error: "reactions unavailable" });
-        }
-        await client.sendReaction(marmotAccountIdHex, to, messageId, emoji);
-        return jsonResult({ ok: true, added: emoji });
       }
       if (ctx.action !== "delete") {
         return jsonResult({ ok: false, error: `unsupported action: ${ctx.action}` });

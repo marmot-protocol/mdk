@@ -276,6 +276,50 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(resultOk(result)).toBe(true);
   });
 
+  it("removes the bot's reaction when remove is true even with an emoji", async () => {
+    const removeReaction = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: { deleteMessage: async () => undefined, removeReaction },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      reactCtx(
+        { remove: true, emoji: "👀" },
+        { currentMessageId: HEX32("99"), currentMessagingTarget: HEX32("cc") },
+      ),
+    );
+
+    expect(removeReaction).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("99"));
+    expect(resultOk(result)).toBe(true);
+  });
+
+  it("returns a privacy-safe reaction failure", async () => {
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: {
+          deleteMessage: async () => undefined,
+          sendReaction: async () => { throw new Error("secret socket detail"); },
+        },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      reactCtx(
+        { emoji: "👀" },
+        { currentMessageId: HEX32("99"), currentMessagingTarget: HEX32("cc") },
+      ),
+    );
+    expect(resultOk(result)).toBe(false);
+    expect(resultError(result)).toBe("reaction operation failed");
+    expect(resultError(result)).not.toContain("secret");
+  });
+
   it("rejects an unsupported action", async () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => true,

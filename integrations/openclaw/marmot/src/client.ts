@@ -65,6 +65,20 @@ export interface AppEventSentResponse {
   message_ids_hex: string[];
 }
 
+function requireAppEventSent(response: Envelope): AppEventSentResponse {
+  if (
+    response.type !== "app_event_sent" ||
+    !Array.isArray(response.message_ids_hex) ||
+    response.message_ids_hex.length === 0 ||
+    response.message_ids_hex.some((value) => typeof value !== "string" || value.length === 0)
+  ) {
+    throw new AgentControlError("wn-agent returned invalid durable reaction response", {
+      code: "invalid_reaction_response",
+    });
+  }
+  return response as unknown as AppEventSentResponse;
+}
+
 export interface StreamBegunResponse {
   type: "stream_begun";
   stream_id_hex: string;
@@ -621,13 +635,14 @@ export class MarmotAgentControlClient {
     targetMessageIdHex: string,
     emoji: string,
   ): Promise<AppEventSentResponse> {
-    return (await this.request({
+    const response = await this.request({
       type: "send_reaction",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
       emoji: String(emoji),
-    })) as unknown as AppEventSentResponse;
+    });
+    return requireAppEventSent(response);
   }
 
   /** Remove this account's active reaction from a durable group message. */
@@ -636,12 +651,13 @@ export class MarmotAgentControlClient {
     groupIdHex: string,
     targetMessageIdHex: string,
   ): Promise<AppEventSentResponse> {
-    return (await this.request({
+    const response = await this.request({
       type: "remove_reaction",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
-    })) as unknown as AppEventSentResponse;
+    });
+    return requireAppEventSent(response);
   }
 
   async streamBegin(

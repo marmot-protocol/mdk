@@ -85,11 +85,17 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       });
       break;
     case "send_reaction":
-      send(socket, id, {
-        type: "app_event_sent",
-        message_ids_hex: [HEX32("e1")],
-        echoed_request: req,
-      });
+      if (req.emoji === "__wrong_type") {
+        send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("e1")] });
+      } else if (req.emoji === "__empty_ids") {
+        send(socket, id, { type: "app_event_sent", message_ids_hex: [] });
+      } else {
+        send(socket, id, {
+          type: "app_event_sent",
+          message_ids_hex: [HEX32("e1")],
+          echoed_request: req,
+        });
+      }
       break;
     case "remove_reaction":
       send(socket, id, {
@@ -357,6 +363,15 @@ describe("MarmotAgentControlClient", () => {
       group_id_hex: HEX32("cc"),
       target_message_id_hex: HEX32("dd"),
     });
+  });
+
+  it("rejects wrong-type and empty durable reaction responses", async () => {
+    await expect(
+      client.sendReaction(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__wrong_type"),
+    ).rejects.toMatchObject({ code: "invalid_reaction_response" });
+    await expect(
+      client.sendReaction(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__empty_ids"),
+    ).rejects.toMatchObject({ code: "invalid_reaction_response" });
   });
 
   it("uploads media and returns the durable message ids from send_media", async () => {
