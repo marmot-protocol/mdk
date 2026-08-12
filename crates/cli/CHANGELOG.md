@@ -22,8 +22,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - One publish's relay fanout now runs its per-relay attempts concurrently
   instead of one awaited relay at a time, so a slow relay no longer serially
-  delays every relay after it. The worst case drops from the sum of per-relay
-  budgets to the slowest single relay's budget.
+  delays every relay after it. Fanout duration can approach the slowest
+  individual attempt's budget when the transport makes concurrent progress,
+  instead of the sum of per-relay budgets.
   ([#1397](https://github.com/marmot-protocol/mdk/pull/1397))
 
 - App-runtime encrypted-media secret caching now skips the MLS group load,
