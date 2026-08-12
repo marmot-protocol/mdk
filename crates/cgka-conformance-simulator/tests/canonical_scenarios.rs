@@ -3547,3 +3547,82 @@ async fn failed_invite_staging_does_not_poison_fork_detection_via_harness() {
     alice.confirm(probe_pending).await;
     assert_eq!(alice.epoch().0, 3);
 }
+
+#[tokio::test]
+async fn removed_member_rejoins_via_fresh_welcome() {
+    // Alice removes Carol, then re-invites her with a fresh KeyPackage. The
+    // re-add is product-legal (leaver.rb re-add leg); Carol must land on the
+    // new epoch and exchange application traffic again.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("readd", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let pending = alice.remove_members(vec![carol.member_id()]).await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob removal outcomes: {bob_outcomes:?}"
+    );
+    let carol_outcomes = carol.tick().await;
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol removal outcomes: {carol_outcomes:?}"
+    );
+    assert_eq!(alice.members().len(), 2);
+
+    let carol_kp2 = carol.fresh_key_package().await;
+    let pending = alice.invite(vec![carol_kp2]).await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob re-add outcomes: {bob_outcomes:?}"
+    );
+    let carol_outcomes = carol.tick().await;
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol re-add outcomes: {carol_outcomes:?}"
+    );
+
+    assert_eq!(alice.epoch().0, 3);
+    assert_eq!(carol.epoch().0, 3);
+    assert_eq!(alice.members().len(), 3);
+    assert_eq!(carol.members().len(), 3);
+
+    carol.send_app(b"carol is back".to_vec()).await;
+    bus.deliver_all();
+    let alice_outcomes = alice.tick().await;
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice app outcomes: {alice_outcomes:?}"
+    );
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .filter(|e| matches!(e, GroupEvent::MessageReceived { .. }))
+        .count();
+    assert_eq!(
+        received, 1,
+        "alice must receive carol's post-rejoin message"
+    );
+}

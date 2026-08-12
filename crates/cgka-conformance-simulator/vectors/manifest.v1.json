@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-08-09",
+  "updated": "2026-08-11",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -422,7 +422,7 @@
         "self-leave witness commit",
         "post-leave secrecy: departed member receives and processes all post-leave ciphertext, decrypts none"
       ],
-      "next": "Add the removed-member re-add leg once welcome-after-eviction is supported by the engine harness."
+      "next": "Keep as the departure-secrecy fixture; the removed-member re-add leg is covered by readd-after-eviction/v1."
     },
     {
       "id": "incremental-growth/v1",
@@ -486,6 +486,20 @@
         "latecomer joining in the same delivery flight as a rename commit, with pre-join mailbox-isolation zero-count assertions (ciphertext-exposure forward secrecy stays with latecomer-forward-secrecy/v1) and the joiner pinned to exactly its retained join commit"
       ],
       "next": "Promote a reviewed case into vectors/ once the joiner join-commit deferral is resolved."
+    },
+    {
+      "id": "readd-after-eviction/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "readd-after-eviction.v1.json",
+      "coverage": [
+        "admin removal of a member",
+        "re-invite of the removed member with a fresh KeyPackage",
+        "welcome rejoin over stale evicted local state",
+        "evicted-era retained snapshots skipped as peel sources",
+        "post-rejoin application traffic"
+      ],
+      "next": "Keep as the re-add regression fixture; extend leaver-removal-secrecy with its re-add leg separately."
     }
   ]
 }
