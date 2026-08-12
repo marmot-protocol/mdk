@@ -231,8 +231,7 @@ async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .collect::<Vec<_>>()
         })
-        .filter(|row| row["kind"]["type"] == "sync_drain")
-        .last()
+        .rfind(|row| row["kind"]["type"] == "sync_drain")
         .expect("failed drain audit row");
     assert_eq!(
         failed_drain["kind"]["cursor_after_secs"], failed_drain["kind"]["cursor_before_secs"],
