@@ -27,6 +27,10 @@ begin inputs is an error, and trying to begin another active stream with an occu
 - Provides newline-delimited JSON framing with a 1 MiB per-frame cap.
 - Stays dependency-light: `serde` and Tokio IO only.
 
+`send_reaction` adds arbitrary non-blank reaction content to a durable message.
+`remove_reaction` takes the original target message id and retracts the calling
+account's matching reaction; callers do not need to discover the reaction event id.
+
 ## Materialized timeline reads
 
 `timeline_message_get` resolves one durable message id and `timeline_list` pages a

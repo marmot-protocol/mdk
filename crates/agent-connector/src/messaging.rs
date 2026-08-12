@@ -284,6 +284,47 @@ impl AgentConnector {
         })
     }
 
+    pub(crate) async fn send_reaction_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+        emoji: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .react_to_message(&account.label, &group_id, &target_message_id, emoji)
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    pub(crate) async fn remove_reaction_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .unreact_from_message(&account.label, &group_id, &target_message_id)
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
     /// Report group membership for an account's group so a channel can decide
     /// activation policy: `is_direct` (exactly two members, i.e. an effective DM
     /// where the agent always replies) vs a multi-party group that gates on

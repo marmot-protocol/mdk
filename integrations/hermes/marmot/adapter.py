@@ -1284,6 +1284,42 @@ class MarmotAgentControlClient:
             }
         )
 
+    async def send_reaction(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        target_message_id_hex: str,
+        emoji: str,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "send_reaction",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "target_message_id_hex": _normalize_hex(
+                    target_message_id_hex, "target_message_id_hex"
+                ),
+                "emoji": str(emoji),
+            }
+        )
+
+    async def remove_reaction(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        target_message_id_hex: str,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "remove_reaction",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "target_message_id_hex": _normalize_hex(
+                    target_message_id_hex, "target_message_id_hex"
+                ),
+            }
+        )
+
     async def group_info(self, account_id_hex: str, group_id_hex: str) -> Dict[str, Any]:
         return await self.request(
             {
@@ -1847,6 +1883,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         )
         self._profile_lookup_gate = ProfileLookupGate()
         self._sent_targets = SentMessageTargetCache()
+        self._last_inbound_message_ids: Dict[str, str] = {}
         self._activation_cache = GroupActivationCache()
         self._listener_task: Optional[asyncio.Task] = None
         self._inbound_queue = KeyedAsyncQueue()
@@ -2712,6 +2749,55 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.debug("Marmot delete_message failed: %s", exc)
             return False
 
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        try:
+            account_id = await self._ensure_account_id()
+            await self.client.send_reaction(account_id, chat_id, message_id, emoji)
+            return True
+        except Exception as exc:
+            logger.debug("Marmot send_reaction failed: %s", exc)
+            return False
+
+    async def add_reaction(
+        self,
+        chat_id: str,
+        emoji: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add an explicit agent-requested reaction to a durable message."""
+        target_message_id = message_id or self._last_inbound_message_ids.get(chat_id)
+        if not target_message_id:
+            return {"success": False, "error": "No Marmot message is available to react to"}
+        success = await self._add_reaction(chat_id, target_message_id, emoji)
+        return {"success": success, "emoji": emoji}
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
+        try:
+            account_id = await self._ensure_account_id()
+            await self.client.remove_reaction(account_id, chat_id, message_id)
+            return True
+        except AgentControlError as exc:
+            # A missing own reaction is already the desired state. This occurs
+            # after cancellation or when an earlier acknowledgement failed.
+            if exc.code == "reaction_not_found":
+                return True
+            logger.debug("Marmot remove_reaction failed: %s", exc)
+            return False
+        except Exception as exc:
+            logger.debug("Marmot remove_reaction failed: %s", exc)
+            return False
+
+    async def remove_reaction(
+        self,
+        chat_id: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Remove this account's reaction from a durable message."""
+        target_message_id = message_id or self._last_inbound_message_ids.get(chat_id)
+        if not target_message_id:
+            return {"success": False, "error": "No Marmot message is available to unreact"}
+        return {"success": await self._remove_reaction(chat_id, target_message_id)}
+
     async def _send_tool_progress_events(
         self,
         chat_id: str,
@@ -3202,6 +3288,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     tz=timezone.utc,
                 ),
             )
+            self._last_inbound_message_ids[group_id_hex] = message_id_hex
             reply = event.get("reply_to")
             if isinstance(reply, dict):
                 reply_sender = reply.get("sender")

@@ -1165,6 +1165,47 @@ async fn connector_socket_subscribes_to_inbound_messages() {
     assert!(!reply_to.text_truncated);
     assert!(reply_to.recorded_at.is_some());
 
+    let reaction_added = send_control_request(
+        &socket,
+        "req-agent-reaction-add",
+        AgentControlRequest::SendReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: "👀".to_owned(),
+        },
+    )
+    .await;
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex: reaction_message_ids,
+        ..
+    } = reaction_added.payload
+    else {
+        panic!("expected reaction add response");
+    };
+    assert_eq!(reaction_message_ids.len(), 1);
+    assert!(!reaction_message_ids[0].is_empty());
+
+    let reaction_removed = send_control_request(
+        &socket,
+        "req-agent-reaction-remove",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+        },
+    )
+    .await;
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex: removal_message_ids,
+        ..
+    } = reaction_removed.payload
+    else {
+        panic!("expected reaction remove response");
+    };
+    assert_eq!(removal_message_ids.len(), 1);
+    assert!(!removal_message_ids[0].is_empty());
+
     let deleted = send_control_request(
         &socket,
         "req-human-delete",

@@ -288,6 +288,32 @@ impl AgentConnector {
                 self.delete_message_response(&account_id_hex, &group_id_hex, &target_message_id_hex)
                     .await
             }
+            AgentControlRequest::SendReaction {
+                account_id_hex,
+                group_id_hex,
+                target_message_id_hex,
+                emoji,
+            } => {
+                self.send_reaction_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    &target_message_id_hex,
+                    &emoji,
+                )
+                .await
+            }
+            AgentControlRequest::RemoveReaction {
+                account_id_hex,
+                group_id_hex,
+                target_message_id_hex,
+            } => {
+                self.remove_reaction_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    &target_message_id_hex,
+                )
+                .await
+            }
             AgentControlRequest::StreamBegin {
                 account_id_hex,
                 group_id_hex,

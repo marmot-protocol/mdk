@@ -115,6 +115,19 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         target_message_id_hex: String,
     },
+    /// Add an arbitrary non-blank reaction to a durable message.
+    SendReaction {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        emoji: String,
+    },
+    /// Retract this account's reaction to a durable message.
+    RemoveReaction {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+    },
     StreamBegin {
         account_id_hex: String,
         group_id_hex: String,
@@ -933,6 +946,37 @@ mod tests {
     }
 
     #[test]
+    fn reaction_requests_have_stable_wire_shapes() {
+        let send = AgentControlRequest::SendReaction {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+            emoji: "👀".to_owned(),
+        };
+        let value = serde_json::to_value(&send).unwrap();
+        assert_eq!(value["type"], "send_reaction");
+        assert_eq!(value["emoji"], "👀");
+        assert_eq!(value["target_message_id_hex"], message());
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            send
+        );
+
+        let remove = AgentControlRequest::RemoveReaction {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+        };
+        let value = serde_json::to_value(&remove).unwrap();
+        assert_eq!(value["type"], "remove_reaction");
+        assert!(value.get("emoji").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            remove
+        );
+    }
+
+    #[test]
     fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
         // Optional field: omitted from the wire when None; present and
         // round-tripping when
@@ -1262,6 +1306,23 @@ mod tests {
                     target_message_id_hex: message(),
                 },
                 "delete_message",
+            ),
+            (
+                AgentControlRequest::SendReaction {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                    emoji: "👀".to_owned(),
+                },
+                "send_reaction",
+            ),
+            (
+                AgentControlRequest::RemoveReaction {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                },
+                "remove_reaction",
             ),
             (
                 AgentControlRequest::StreamBegin {
