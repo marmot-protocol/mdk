@@ -112,6 +112,7 @@ proptest = "1"
 insta = { version = "1", features = ["json"] }
 stateright = "0.31.0"
 test-log = { version = "0.2", features = ["trace"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 # workspace-internal
 fs-private = { path = "crates/fs-private" }
