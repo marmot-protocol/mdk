@@ -37,6 +37,10 @@ pub enum StorageError {
     AlreadyExists,
     #[error("snapshot not found: {0}")]
     SnapshotMissing(String),
+    /// A canonical timeline cursor row was removed by retention. Callers should
+    /// refresh from the timeline head instead of retrying the stale cursor.
+    #[error("timeline cursor no longer exists; refresh the timeline")]
+    TimelineCursorExpired,
     /// Transient lock contention: the backend could not acquire the database
     /// lock in time (for SQLite this is `SQLITE_BUSY` / `SQLITE_LOCKED`). It is
     /// distinct from [`StorageError::Backend`] so callers can recognise a
