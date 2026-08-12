@@ -714,6 +714,21 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
     if engine.pending_convergence_groups.contains(group_id) && !future_scheduled_work {
         runnable_work = runnable_work.saturating_add(1);
     }
+    // The schedule above is an edge a host consumes once; a durable intent is
+    // level state that outlives an unproductive drain. It stays runnable until
+    // the drain regenerates it and hands it to the app, which then owes the
+    // confirm or the retry. `Stable` is the drain's own precondition, and a
+    // pass inside its window reports the cutoff as the next wake instead.
+    let unreleased_outbound_intents = pending_work
+        .queued_outbound_intents
+        .saturating_sub(pending_work.regenerated_standalone_publishes)
+        .saturating_sub(pending_work.regenerated_pending_publishes);
+    if unreleased_outbound_intents > 0
+        && lifecycle == GroupLifecycleState::Stable
+        && !future_scheduled_work
+    {
+        runnable_work = runnable_work.saturating_add(1);
+    }
     if pass.is_none() && pending_work.unresolved_convergence_inputs > 0 {
         runnable_work = runnable_work.saturating_add(1);
     }

@@ -506,17 +506,24 @@ impl<S: StorageProvider> Engine<S> {
     /// outbound intents.
     ///
     /// Retained application payloads are released by the next convergence drain
-    /// (`converge_and_drain_queued_outbound_intents`), and in this process only
-    /// the seam that returns the group to `Stable` arranges that. While the
-    /// group is held — `PendingPublish`, or halted `Unrecoverable` — the caller
-    /// gates keep it still: ingest buffers rather than advances the state, and
-    /// the drain and send paths both return early on non-`Stable`. So every
-    /// such seam must schedule on its way out: a publish outcome and a verified
-    /// repair Welcome through this helper, quarantine recovery
-    /// (`retry_hydrate_quarantined_group`) unconditionally because it has
-    /// already read the group. (Across a restart, session-open hydration re-arms
-    /// the drain from the same durable queue whatever state the group landed
-    /// in.)
+    /// (`converge_and_drain_queued_outbound_intents`). `queue_outbound_intent`
+    /// arms that drain as it writes the row, but only for a `Stable` group, and
+    /// only as an edge a host consumes once.
+    ///
+    /// Three conditions hold a queue past that arm. `PendingPublish` and halted
+    /// `Unrecoverable` hold it through the caller gates — ingest buffers rather
+    /// than advances the state, and the drain and send paths both return early
+    /// on non-`Stable` — so arming into them would spend a schedule on a drain
+    /// that returns early, and the seam that ends each re-arms on its way out
+    /// instead: a publish outcome and a verified repair Welcome through this
+    /// helper, quarantine recovery (`retry_hydrate_quarantined_group`)
+    /// unconditionally because it has already read the group. `Stable` with an
+    /// unsettled convergence pass holds it too and has no such seam: it is
+    /// carried by the level signal, staying visible as runnable work until it
+    /// releases (`has_queued_outbound_intents`), which is what a scheduler
+    /// re-reads once it has consumed the edge. (Across a restart, session-open
+    /// hydration re-arms the drain from the same durable queue whatever state
+    /// the group landed in.)
     ///
     /// Best-effort by construction: this runs after the outcome is durable, so
     /// a transient backend lock here must not fail already-committed work.
