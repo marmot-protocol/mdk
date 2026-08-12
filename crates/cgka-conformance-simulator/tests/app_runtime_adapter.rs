@@ -317,6 +317,60 @@ async fn retained_relay_control_resolves_immediate_app_publication_action_ids() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_relay_control_restores_hidden_history_for_offline_repair() {
+    let clients = vec!["alice".to_owned(), "bob".to_owned()];
+    let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+    subject.select_scenario_group("main", true).unwrap();
+    subject
+        .create_group(cgka_conformance_simulator::SubjectCreateGroup {
+            action_id: "create",
+            creator: "alice",
+            name: "reversible relay history",
+            invitees: &["bob".into()],
+            required_features: &[],
+            initial_admins: &["alice".into()],
+            pending: "create",
+        })
+        .await
+        .unwrap();
+    subject.tick(&clients).await.unwrap();
+
+    subject.set_online("bob", false).await.unwrap();
+    subject
+        .send_application(cgka_conformance_simulator::SubjectSendApplication {
+            action_id: "offline-send",
+            sender: "alice",
+            payload: "restored relay history",
+        })
+        .await
+        .unwrap();
+    subject.set_online("alice", false).await.unwrap();
+
+    let selector = ScenarioMessageSelectorV2 {
+        action_id: Some("offline-send".into()),
+        ..ScenarioMessageSelectorV2::default()
+    };
+    subject
+        .set_relay_event_visibility("relay:shared", &selector, &clients, false)
+        .unwrap();
+    subject.set_online("bob", true).await.unwrap();
+    subject.repair_full_history(&["bob".into()]).await.unwrap();
+    let hidden = subject.observations(&["bob".into()]).await.unwrap();
+    assert!(hidden[0].application.visible_plaintexts.is_empty());
+
+    subject
+        .set_relay_event_visibility("relay:shared", &selector, &clients, true)
+        .unwrap();
+    subject.repair_full_history(&["bob".into()]).await.unwrap();
+    let restored = subject.observations(&["bob".into()]).await.unwrap();
+    assert_eq!(
+        restored[0].application.visible_plaintexts,
+        ["restored relay history"]
+    );
+    subject.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_wide_removal_refuses_an_omitted_online_participant() {
     let clients = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
     let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
