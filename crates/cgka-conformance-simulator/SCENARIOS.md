@@ -132,6 +132,26 @@ These are the scenarios another implementation should be able to load from JSON 
   the state, profile, recovery, pending-work, and decryptability contract; the focused Rust regression owns the
   retained-injection observations and stable commit-disposition subset.
 
+### `cross-route-app-runtime-recovery/v1`
+
+- File: constructed by `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; promotion to a
+  portable saved input waits until the falsified oracle has a reviewed resolution.
+- Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
+  `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
+  Nostr relay.
+- Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
+  The harness removes Zeta's root from the whole shared-relay history before Alpha reconnects and authors its competing
+  root, removes Alpha's root relay-wide before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both
+  roots, and performs repeated full-history repair. Every harness participant must be offline before relay-wide
+  removal; the step's named clients are not a per-recipient visibility filter.
+- Current result: exact retained-engine settlement passes. Across repeated app-runtime executions, Zeta can remain one
+  epoch behind; public protocol state can agree while Alpha's later application probe remains absent and
+  non-invalidated at Zeta; or Alpha and Observer can remain on the competing root and baseline respectively while only
+  Yankee/Zeta reach the retained reference branch, with application probes split along those branch boundaries. Each
+  shape is asserted exactly, so a fourth shape or complete equivalence forces review. This is a retained counterexample
+  and keeps route equivalence, active decryptability, and complete application disposition open outside the
+  engine/retained reference.
+
 ### `convergence-committer-selected/v1`
 
 - File: `vectors/convergence-committer-selected.v1.json`

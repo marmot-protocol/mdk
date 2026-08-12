@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,11 +16,15 @@ use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime,
 };
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::LocalRelay;
+use nostr_relay_builder::prelude::{
+    Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Event, EventId, Events, Filter, Kind,
+    MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder, SaveEventStatus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     ClientEventCounts, ClientObservation, ConvergenceSubject, ForkRecoveryObservation,
@@ -96,6 +101,67 @@ struct Participant {
     cached_epochs: BTreeMap<String, u64>,
 }
 
+#[derive(Clone, Debug)]
+struct RecordingRelayDatabase {
+    inner: MemoryDatabase,
+    publication_log: Arc<Mutex<Vec<Event>>>,
+}
+
+impl NostrDatabase for RecordingRelayDatabase {
+    fn backend(&self) -> Backend {
+        self.inner.backend()
+    }
+
+    fn save_event<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> BoxedFuture<'a, Result<SaveEventStatus, DatabaseError>> {
+        Box::pin(async move {
+            let status = self.inner.save_event(event).await?;
+            if status.is_success() {
+                self.publication_log.lock().await.push(event.clone());
+            }
+            Ok(status)
+        })
+    }
+
+    fn check_id<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> BoxedFuture<'a, Result<DatabaseEventStatus, DatabaseError>> {
+        self.inner.check_id(event_id)
+    }
+
+    fn event_by_id<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> BoxedFuture<'a, Result<Option<Event>, DatabaseError>> {
+        self.inner.event_by_id(event_id)
+    }
+
+    fn count(&self, filter: Filter) -> BoxedFuture<'_, Result<usize, DatabaseError>> {
+        self.inner.count(filter)
+    }
+
+    fn query(&self, filter: Filter) -> BoxedFuture<'_, Result<Events, DatabaseError>> {
+        self.inner.query(filter)
+    }
+
+    fn delete(&self, filter: Filter) -> BoxedFuture<'_, Result<(), DatabaseError>> {
+        self.inner.delete(filter)
+    }
+
+    fn wipe(&self) -> BoxedFuture<'_, Result<(), DatabaseError>> {
+        self.inner.wipe()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SequencedRelayEvent {
+    publication_sequence: usize,
+    event: Event,
+}
+
 impl Participant {
     fn root(&self) -> &Path {
         self.root.path()
@@ -114,17 +180,32 @@ impl Participant {
 
 /// In-process application harness backed by one real local Nostr relay.
 pub struct AppRuntimeHarness {
-    _relay: MockRelay,
+    _relay: LocalRelay,
+    relay_database: MemoryDatabase,
     relay_url: String,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
+    relay_publication_log: Arc<Mutex<Vec<Event>>>,
+    relay_action_events: BTreeMap<String, Vec<SequencedRelayEvent>>,
+    removed_relay_events: BTreeMap<String, Event>,
 }
 
 impl AppRuntimeHarness {
     pub async fn new(clients: &[String]) -> Result<Self, SubjectError> {
-        let relay = MockRelay::run().await.map_err(environment_error)?;
+        // These are RelayBuilder's prior in-memory defaults. Keeping them
+        // explicit preserves MockRelay behavior while exposing the database.
+        let relay_database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(75_000),
+        });
+        let relay_publication_log = Arc::new(Mutex::new(Vec::new()));
+        let relay = LocalRelay::new(RelayBuilder::default().database(RecordingRelayDatabase {
+            inner: relay_database.clone(),
+            publication_log: Arc::clone(&relay_publication_log),
+        }));
+        relay.run().await.map_err(environment_error)?;
         let relay_url = relay.url().await.to_string();
         let endpoint = TransportEndpoint::from(relay_url.clone());
         let mut participants = BTreeMap::new();
@@ -175,7 +256,144 @@ impl AppRuntimeHarness {
             scenario_groups: BTreeMap::new(),
             active_scenario_group: None,
             accepted_publications: BTreeMap::new(),
+            relay_publication_log,
+            relay_action_events: BTreeMap::new(),
+            removed_relay_events: BTreeMap::new(),
+            relay_database,
         })
+    }
+
+    async fn relay_publication_cursor(&self) -> usize {
+        self.relay_publication_log.lock().await.len()
+    }
+
+    async fn record_relay_action_events(
+        &mut self,
+        action_id: &str,
+        actor: &str,
+        before: usize,
+        include_welcomes: bool,
+    ) -> Result<(), SubjectError> {
+        self.participant(actor)?;
+        let publication_log = self.relay_publication_log.lock().await;
+        if before > publication_log.len() {
+            return Err(SubjectError::new(
+                "relay_publication_cursor_invalid",
+                "the retained relay publication cursor moved backwards",
+            ));
+        }
+        // Scenario commands execute serially. Kind-445 outer authors are
+        // intentionally ephemeral, so the successful command boundary—not
+        // event.pubkey—is the actor attribution available at this layer.
+        // Filtering to group messages and action-local Welcome gift wraps
+        // excludes unrelated runtime projections.
+        let mut events = publication_log[before..]
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.kind == Kind::MlsGroupMessage
+                    || (include_welcomes && event.kind == Kind::GiftWrap)
+            })
+            .map(|(offset, event)| SequencedRelayEvent {
+                publication_sequence: before + offset,
+                event: event.clone(),
+            })
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.publication_sequence);
+        self.relay_action_events
+            .insert(action_id.to_owned(), events);
+        Ok(())
+    }
+
+    async fn set_shared_relay_event_presence(
+        &mut self,
+        relay: &str,
+        selector: &crate::ScenarioMessageSelectorV2,
+        clients: &[String],
+        visible: bool,
+    ) -> Result<(), SubjectError> {
+        if relay != "relay:shared" {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "unknown_relay",
+                "the app-runtime adapter owns only relay:shared",
+            ));
+        }
+        if selector.publication.is_some() || selector.sender.is_some() || selector.class.is_some() {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "unsupported_relay_selector",
+                "the app-runtime relay gate requires an action_id-only selector",
+            ));
+        }
+        let action_id = selector.action_id.as_deref().ok_or_else(|| {
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "missing_relay_action_id",
+                "the app-runtime relay gate requires an action id",
+            )
+        })?;
+        let event = self
+            .relay_action_events
+            .get(action_id)
+            .and_then(|events| events.get(selector.occurrence))
+            .map(|event| event.event.clone())
+            .ok_or_else(|| {
+                SubjectError::classified(
+                    SubjectFailureCategory::ExpectedRefusal,
+                    "relay_event_not_found",
+                    "no immediately published group-message or Welcome relay event matched the scenario action; deferred publications are not action-addressable on this adapter",
+                )
+            })?;
+        let event_id = event.id.to_hex();
+        if visible {
+            let event = self.removed_relay_events.remove(&event_id).ok_or_else(|| {
+                SubjectError::classified(
+                    SubjectFailureCategory::ExpectedRefusal,
+                    "relay_event_not_removed",
+                    "the selected event is not currently removed from the shared relay",
+                )
+            })?;
+            self.relay_database
+                .save_event(&event)
+                .await
+                .map_err(environment_error)?;
+            return Ok(());
+        }
+        if self.removed_relay_events.contains_key(&event_id) {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_event_already_removed",
+                "the selected event is already removed from the shared relay",
+            ));
+        }
+        if clients
+            .iter()
+            .any(|client| !self.participants.contains_key(client))
+        {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "unknown_relay_removal_client",
+                "every named relay-removal client must belong to the harness",
+            ));
+        }
+        if self
+            .participants
+            .values()
+            .any(|participant| participant.online)
+        {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_removal_requires_all_participants_offline",
+                "an event can be removed from the shared relay only while every harness participant is offline",
+            ));
+        }
+        self.relay_database
+            .delete(Filter::new().id(event.id))
+            .await
+            .map_err(environment_error)?;
+        self.removed_relay_events.insert(event_id, event);
+        Ok(())
     }
 
     pub fn participant_roots(&self) -> BTreeMap<String, PathBuf> {
@@ -598,6 +816,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::ParticipantConnectivity,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
+                SubjectCapability::RetainedRelayControl,
             ]),
         }
     }
@@ -634,6 +853,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 "app-runtime adapter does not synthesize feature-gated key packages",
             ));
         }
+        let before = self.relay_publication_cursor().await;
         let invitees = self.account_ids(action.invitees)?;
         let participant = self.participant(action.creator)?;
         let group_id = participant
@@ -648,6 +868,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
         self.scenario_groups.insert(group_label, group_id.clone());
         self.apply_admin_set(action.creator, &group_id, action.initial_admins)
             .await?;
+        self.record_relay_action_events(action.action_id, action.creator, before, true)
+            .await?;
         self.record_accepted_publication(action.creator, action.pending);
         Ok(())
     }
@@ -656,6 +878,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectInviteMembers<'_>,
     ) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let invitees = self.account_ids(action.invitees)?;
         let participant = self.participant(action.inviter)?;
@@ -664,6 +887,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .invite_members(&participant.account_id, &group_id, &invitees)
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action.action_id, action.inviter, before, true)
+            .await?;
         self.record_accepted_publication(action.inviter, action.pending);
         Ok(())
     }
@@ -672,6 +897,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectUpdateGroupData<'_>,
     ) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(action.client)?;
         participant
@@ -684,6 +910,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action.action_id, action.client, before, false)
+            .await?;
         self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
@@ -692,6 +920,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectRemoveMembers<'_>,
     ) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let members = self.account_ids(action.members)?;
         let participant = self.participant(action.remover)?;
@@ -700,11 +929,14 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .remove_members(&participant.account_id, &group_id, &members)
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action.action_id, action.remover, before, false)
+            .await?;
         self.record_accepted_publication(action.remover, action.pending);
         Ok(())
     }
 
     async fn self_update(&mut self, action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(action.client)?;
         participant
@@ -712,6 +944,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .schedule_manual_self_update(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action.action_id, action.client, before, false)
+            .await?;
         self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
@@ -720,9 +954,14 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectUpdateAdminPolicy<'_>,
     ) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         self.apply_admin_set(action.client, &group_id, action.admins)
             .await?;
+        if let Some(action_id) = action.action_id {
+            self.record_relay_action_events(action_id, action.client, before, false)
+                .await?;
+        }
         if let Some(pending) = action.pending {
             self.record_accepted_publication(action.client, pending);
         }
@@ -771,6 +1010,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectSendApplication<'_>,
     ) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(action.sender)?;
         participant
@@ -782,10 +1022,13 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action.action_id, action.sender, before, false)
+            .await?;
         Ok(())
     }
 
-    async fn leave(&mut self, _action_id: &str, client: &str) -> Result<(), SubjectError> {
+    async fn leave(&mut self, action_id: &str, client: &str) -> Result<(), SubjectError> {
+        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(client)?;
         participant
@@ -793,6 +1036,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .leave_group(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
+        self.record_relay_action_events(action_id, client, before, false)
+            .await?;
         Ok(())
     }
 
@@ -883,6 +1128,16 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 block_on_subject(self.catch_up(clients))
             }
         }
+    }
+
+    fn set_relay_event_visibility(
+        &mut self,
+        relay: &str,
+        selector: &crate::ScenarioMessageSelectorV2,
+        clients: &[String],
+        visible: bool,
+    ) -> Result<(), SubjectError> {
+        block_on_subject(self.set_shared_relay_event_presence(relay, selector, clients, visible))
     }
 }
 
@@ -1210,6 +1465,36 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recording_database_preserves_successful_relay_admission_order() {
+        let publication_log = Arc::new(Mutex::new(Vec::new()));
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&publication_log),
+        };
+        let keys = nostr::Keys::generate();
+        let first = nostr::EventBuilder::new(Kind::MlsGroupMessage, "first admitted")
+            .custom_created_at(nostr::Timestamp::from_secs(200))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let second = nostr::EventBuilder::new(Kind::MlsGroupMessage, "second admitted")
+            .custom_created_at(nostr::Timestamp::from_secs(100))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(database.save_event(&first).await.unwrap().is_success());
+        assert!(database.save_event(&second).await.unwrap().is_success());
+        assert!(!database.save_event(&first).await.unwrap().is_success());
+
+        let recorded = publication_log.lock().await;
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].id, first.id);
+        assert_eq!(recorded[1].id, second.id);
+    }
 
     #[test]
     fn public_commitment_preserves_a_reported_zero_member_count() {
