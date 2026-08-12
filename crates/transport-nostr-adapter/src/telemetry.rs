@@ -172,10 +172,12 @@ impl RelayLabelResolution {
 struct DurationHistogram {
     buckets: [u64; BUCKET_BOUNDS_MS.len()],
     overflow: u64,
+    sum_ms: u64,
 }
 
 impl DurationHistogram {
     fn record(&mut self, delta_ms: u64) {
+        self.sum_ms = self.sum_ms.saturating_add(delta_ms);
         for (idx, bound) in BUCKET_BOUNDS_MS.iter().enumerate() {
             if delta_ms <= *bound {
                 self.buckets[idx] += 1;
@@ -197,6 +199,7 @@ impl DurationHistogram {
         DurationHistogramSnapshot {
             buckets,
             overflow_count: self.overflow,
+            sum_ms: self.sum_ms,
         }
     }
 }
@@ -207,11 +210,13 @@ fn aggregate_histograms<'a>(
 ) -> DurationHistogramSnapshot {
     let mut buckets = [0u64; BUCKET_BOUNDS_MS.len()];
     let mut overflow = 0;
+    let mut sum_ms = 0u64;
     for histogram in histograms {
         for (idx, count) in histogram.buckets.iter().enumerate() {
             buckets[idx] += count;
         }
         overflow += histogram.overflow;
+        sum_ms = sum_ms.saturating_add(histogram.sum_ms);
     }
     DurationHistogramSnapshot {
         buckets: BUCKET_BOUNDS_MS
@@ -223,6 +228,7 @@ fn aggregate_histograms<'a>(
             })
             .collect(),
         overflow_count: overflow,
+        sum_ms,
     }
 }
 
@@ -237,14 +243,17 @@ pub struct HistogramBucket {
 
 /// Aggregate duration histogram snapshot.
 ///
-/// Contains only counts and millisecond bucket bounds: no message ids, relay
-/// endpoints, subscription ids, or payload-derived values.
+/// Contains only counts, a duration sum, and millisecond bucket bounds: no
+/// message ids, relay endpoints, subscription ids, or payload-derived values.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurationHistogramSnapshot {
     /// Histogram by ascending upper bound.
     pub buckets: Vec<HistogramBucket>,
     /// Samples whose duration exceeded the largest bucket bound.
     pub overflow_count: u64,
+    /// Saturating sum of all observed durations, in milliseconds.
+    #[serde(default)]
+    pub sum_ms: u64,
 }
 
 impl DurationHistogramSnapshot {
@@ -451,6 +460,19 @@ struct SubscriptionProgress {
     relays: HashMap<RelayIndex, RelayProgress>,
 }
 
+/// Subscription progress and aggregate samples buffered for one in-flight
+/// subscription batch. Keeping this separate from committed telemetry lets a
+/// failed batch roll back without erasing live-ID progress or unrelated relay
+/// callbacks that arrived concurrently.
+#[derive(Clone, Debug, Default)]
+struct StagedSubscriptionProgress {
+    subscriptions: HashMap<String, SubscriptionProgress>,
+    first_event: Vec<(RelayIndex, u64)>,
+    eose: Vec<(RelayIndex, u64)>,
+    rollback_first_event: HashMap<(String, RelayIndex), u64>,
+    rollback_eose: HashMap<(String, RelayIndex), u64>,
+}
+
 /// Local recorder for subscription sync timing and the initial-sync gate.
 ///
 /// Diagnostic only; must never feed convergence or branch selection.
@@ -459,6 +481,7 @@ pub struct RelaySyncTelemetry {
     subscriptions: HashMap<String, SubscriptionProgress>,
     first_event: HashMap<RelayIndex, DurationHistogram>,
     eose: HashMap<RelayIndex, DurationHistogram>,
+    staged: StagedSubscriptionProgress,
 }
 
 impl RelaySyncTelemetry {
@@ -472,56 +495,133 @@ impl RelaySyncTelemetry {
         relays: &[RelayIndex],
         now_ms: u64,
     ) {
-        let progress = self
-            .subscriptions
-            .entry(subscription_id.to_string())
-            .or_default();
-        progress.relays = relays
-            .iter()
-            .map(|relay| {
-                (
-                    *relay,
-                    RelayProgress {
-                        started_ms: now_ms,
-                        first_event_seen: false,
-                        eose_seen: false,
-                    },
-                )
-            })
-            .collect();
+        self.subscriptions.insert(
+            subscription_id.to_string(),
+            subscription_progress(relays, now_ms),
+        );
+    }
+
+    /// Begin one serialized subscription batch whose callbacks must be visible
+    /// immediately but whose progress is not committed until every REQ succeeds.
+    pub fn begin_staged_subscription_starts(&mut self) {
+        debug_assert!(self.staged.subscriptions.is_empty());
+        debug_assert!(self.staged.first_event.is_empty());
+        debug_assert!(self.staged.eose.is_empty());
+        debug_assert!(self.staged.rollback_first_event.is_empty());
+        debug_assert!(self.staged.rollback_eose.is_empty());
+        self.staged = StagedSubscriptionProgress::default();
+    }
+
+    /// Register one subscription attempt in the current staged batch.
+    pub fn stage_subscription_start(
+        &mut self,
+        subscription_id: &str,
+        relays: &[RelayIndex],
+        now_ms: u64,
+    ) {
+        self.staged.subscriptions.insert(
+            subscription_id.to_string(),
+            subscription_progress(relays, now_ms),
+        );
+    }
+
+    /// Atomically promote staged progress and its aggregate samples after the
+    /// relay subscription batch succeeds.
+    pub fn commit_staged_subscription_starts(&mut self) {
+        let staged = std::mem::take(&mut self.staged);
+        self.subscriptions.extend(staged.subscriptions);
+        for (relay, elapsed_ms) in staged.first_event {
+            self.first_event
+                .entry(relay)
+                .or_default()
+                .record(elapsed_ms);
+        }
+        for (relay, elapsed_ms) in staged.eose {
+            self.eose.entry(relay).or_default().record(elapsed_ms);
+        }
+    }
+
+    /// Discard progress from a failed subscription batch. Callbacks for an ID
+    /// that was both staged and already committed are applied to the retained
+    /// committed progress, because they may have come from its still-live REQ.
+    pub fn rollback_staged_subscription_starts(&mut self) {
+        let staged = std::mem::take(&mut self.staged);
+        for ((subscription_id, relay), now_ms) in staged.rollback_first_event {
+            if let Some(elapsed_ms) =
+                mark_first_event(&mut self.subscriptions, &subscription_id, relay, now_ms)
+            {
+                self.first_event
+                    .entry(relay)
+                    .or_default()
+                    .record(elapsed_ms);
+            }
+        }
+        for ((subscription_id, relay), now_ms) in staged.rollback_eose {
+            if let Some(elapsed_ms) =
+                mark_eose(&mut self.subscriptions, &subscription_id, relay, now_ms)
+            {
+                self.eose.entry(relay).or_default().record(elapsed_ms);
+            }
+        }
     }
 
     /// Record the first event from `relay` for `subscription_id`. Later events
     /// and unknown subscription/relay pairs are ignored.
     pub fn record_first_event(&mut self, subscription_id: &str, relay: RelayIndex, now_ms: u64) {
-        if let Some(progress) = self
-            .subscriptions
-            .get_mut(subscription_id)
-            .and_then(|sub| sub.relays.get_mut(&relay))
-            && !progress.first_event_seen
+        if self.staged.subscriptions.contains_key(subscription_id) {
+            if callback_pending(&self.subscriptions, subscription_id, relay, |progress| {
+                progress.first_event_seen
+            }) {
+                self.staged
+                    .rollback_first_event
+                    .entry((subscription_id.to_string(), relay))
+                    .or_insert(now_ms);
+            }
+            if let Some(elapsed_ms) = mark_first_event(
+                &mut self.staged.subscriptions,
+                subscription_id,
+                relay,
+                now_ms,
+            ) {
+                self.staged.first_event.push((relay, elapsed_ms));
+            }
+            return;
+        }
+        if let Some(elapsed_ms) =
+            mark_first_event(&mut self.subscriptions, subscription_id, relay, now_ms)
         {
-            progress.first_event_seen = true;
             self.first_event
                 .entry(relay)
                 .or_default()
-                .record(now_ms.saturating_sub(progress.started_ms));
+                .record(elapsed_ms);
         }
     }
 
     /// Record EOSE from `relay` for `subscription_id`. Repeat EOSE and unknown
     /// subscription/relay pairs are ignored.
     pub fn record_eose(&mut self, subscription_id: &str, relay: RelayIndex, now_ms: u64) {
-        if let Some(progress) = self
-            .subscriptions
-            .get_mut(subscription_id)
-            .and_then(|sub| sub.relays.get_mut(&relay))
-            && !progress.eose_seen
+        if self.staged.subscriptions.contains_key(subscription_id) {
+            if callback_pending(&self.subscriptions, subscription_id, relay, |progress| {
+                progress.eose_seen
+            }) {
+                self.staged
+                    .rollback_eose
+                    .entry((subscription_id.to_string(), relay))
+                    .or_insert(now_ms);
+            }
+            if let Some(elapsed_ms) = mark_eose(
+                &mut self.staged.subscriptions,
+                subscription_id,
+                relay,
+                now_ms,
+            ) {
+                self.staged.eose.push((relay, elapsed_ms));
+            }
+            return;
+        }
+        if let Some(elapsed_ms) = mark_eose(&mut self.subscriptions, subscription_id, relay, now_ms)
         {
-            progress.eose_seen = true;
-            self.eose
-                .entry(relay)
-                .or_default()
-                .record(now_ms.saturating_sub(progress.started_ms));
+            self.eose.entry(relay).or_default().record(elapsed_ms);
         }
     }
 
@@ -534,6 +634,7 @@ impl RelaySyncTelemetry {
     /// relay count and are intentionally retained.
     pub fn forget_subscription(&mut self, subscription_id: &str) {
         self.subscriptions.remove(subscription_id);
+        self.staged.subscriptions.remove(subscription_id);
     }
 
     /// Whether every relay of `subscription_id` has reached EOSE.
@@ -544,36 +645,61 @@ impl RelaySyncTelemetry {
     pub fn subscription_synced(&self, subscription_id: &str) -> Option<bool> {
         self.subscriptions
             .get(subscription_id)
+            .or_else(|| self.staged.subscriptions.get(subscription_id))
             .map(subscription_is_synced)
+    }
+
+    /// Whether any relay for `subscription_id` has reached EOSE.
+    pub fn subscription_any_eose(&self, subscription_id: &str) -> Option<bool> {
+        self.subscriptions
+            .get(subscription_id)
+            .or_else(|| self.staged.subscriptions.get(subscription_id))
+            .map(|subscription| subscription.relays.values().any(|relay| relay.eose_seen))
     }
 
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
     pub fn snapshot(&self) -> RelaySyncSnapshot {
+        let tracked = self.subscriptions.len()
+            + self
+                .staged
+                .subscriptions
+                .keys()
+                .filter(|id| !self.subscriptions.contains_key(id.as_str()))
+                .count();
         let synced = self
             .subscriptions
             .values()
             .filter(|sub| subscription_is_synced(sub))
-            .count() as u64;
+            .count()
+            + self
+                .staged
+                .subscriptions
+                .iter()
+                .filter(|(id, sub)| {
+                    !self.subscriptions.contains_key(id.as_str()) && subscription_is_synced(sub)
+                })
+                .count();
 
-        let mut relays: Vec<RelayIndex> = self
-            .first_event
-            .keys()
-            .chain(self.eose.keys())
-            .copied()
-            .collect();
+        let mut first_event = self.first_event.clone();
+        for (relay, elapsed_ms) in &self.staged.first_event {
+            first_event.entry(*relay).or_default().record(*elapsed_ms);
+        }
+        let mut eose = self.eose.clone();
+        for (relay, elapsed_ms) in &self.staged.eose {
+            eose.entry(*relay).or_default().record(*elapsed_ms);
+        }
+        let mut relays: Vec<RelayIndex> = first_event.keys().chain(eose.keys()).copied().collect();
         relays.sort_unstable();
         relays.dedup();
         let per_relay = relays
             .into_iter()
             .map(|relay| RelayLatencyStats {
                 relay_index: relay.0,
-                first_event: self
-                    .first_event
+                first_event: first_event
                     .get(&relay)
                     .map(DurationHistogram::snapshot)
                     .unwrap_or_default(),
-                eose: self
-                    .eose
+                eose: eose
                     .get(&relay)
                     .map(DurationHistogram::snapshot)
                     .unwrap_or_default(),
@@ -581,13 +707,77 @@ impl RelaySyncTelemetry {
             .collect();
 
         RelaySyncSnapshot {
-            tracked_subscriptions: self.subscriptions.len() as u64,
-            synced_subscriptions: synced,
-            first_event: aggregate_histograms(self.first_event.values()),
-            eose: aggregate_histograms(self.eose.values()),
+            tracked_subscriptions: tracked as u64,
+            synced_subscriptions: synced as u64,
+            first_event: aggregate_histograms(first_event.values()),
+            eose: aggregate_histograms(eose.values()),
             per_relay,
         }
     }
+}
+
+fn subscription_progress(relays: &[RelayIndex], now_ms: u64) -> SubscriptionProgress {
+    SubscriptionProgress {
+        relays: relays
+            .iter()
+            .map(|relay| {
+                (
+                    *relay,
+                    RelayProgress {
+                        started_ms: now_ms,
+                        first_event_seen: false,
+                        eose_seen: false,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn mark_first_event(
+    subscriptions: &mut HashMap<String, SubscriptionProgress>,
+    subscription_id: &str,
+    relay: RelayIndex,
+    now_ms: u64,
+) -> Option<u64> {
+    let progress = subscriptions
+        .get_mut(subscription_id)?
+        .relays
+        .get_mut(&relay)?;
+    if progress.first_event_seen {
+        return None;
+    }
+    progress.first_event_seen = true;
+    Some(now_ms.saturating_sub(progress.started_ms))
+}
+
+fn mark_eose(
+    subscriptions: &mut HashMap<String, SubscriptionProgress>,
+    subscription_id: &str,
+    relay: RelayIndex,
+    now_ms: u64,
+) -> Option<u64> {
+    let progress = subscriptions
+        .get_mut(subscription_id)?
+        .relays
+        .get_mut(&relay)?;
+    if progress.eose_seen {
+        return None;
+    }
+    progress.eose_seen = true;
+    Some(now_ms.saturating_sub(progress.started_ms))
+}
+
+fn callback_pending(
+    subscriptions: &HashMap<String, SubscriptionProgress>,
+    subscription_id: &str,
+    relay: RelayIndex,
+    seen: impl FnOnce(&RelayProgress) -> bool,
+) -> bool {
+    subscriptions
+        .get(subscription_id)
+        .and_then(|subscription| subscription.relays.get(&relay))
+        .is_some_and(|progress| !seen(progress))
 }
 
 fn subscription_is_synced(sub: &SubscriptionProgress) -> bool {
@@ -739,6 +929,7 @@ mod tests {
         let snap = telem.snapshot();
         assert_eq!(snap.corroborated, 1);
         assert_eq!(snap.spread.sample_count(), 2);
+        assert_eq!(snap.spread.sum_ms, 320);
     }
 
     #[test]
@@ -797,6 +988,7 @@ mod tests {
         let snap = telem.snapshot();
         assert_eq!(snap.spread.overflow_count, 1);
         assert_eq!(snap.spread.sample_count(), 1);
+        assert_eq!(snap.spread.sum_ms, 40_000);
         assert_eq!(snap.spread.approx_percentile_ms(1.0), None);
     }
 
@@ -822,10 +1014,13 @@ mod tests {
         assert_eq!(snap.tracked_subscriptions, 1);
         assert_eq!(snap.synced_subscriptions, 1);
         assert_eq!(snap.eose.sample_count(), 2);
+        assert_eq!(snap.eose.sum_ms, 100);
         // Per-relay EOSE latency is attributed to both relays.
         assert_eq!(snap.per_relay.len(), 2);
         assert_eq!(snap.per_relay[0].eose.sample_count(), 1);
         assert_eq!(snap.per_relay[1].eose.sample_count(), 1);
+        assert_eq!(snap.per_relay[0].eose.sum_ms, 30);
+        assert_eq!(snap.per_relay[1].eose.sum_ms, 70);
     }
 
     #[test]
@@ -837,8 +1032,10 @@ mod tests {
 
         let snap = telem.snapshot();
         assert_eq!(snap.first_event.sample_count(), 1);
+        assert_eq!(snap.first_event.sum_ms, 40);
         assert_eq!(snap.per_relay[0].relay_index, 0);
         assert_eq!(snap.per_relay[0].first_event.sample_count(), 1);
+        assert_eq!(snap.per_relay[0].first_event.sum_ms, 40);
         let bucket = snap
             .first_event
             .buckets
@@ -871,5 +1068,92 @@ mod tests {
         // Reissued: the prior EOSE no longer counts.
         telem.record_subscription_start("sub", &[A], 100);
         assert_eq!(telem.subscription_synced("sub"), Some(false));
+    }
+
+    #[test]
+    fn committed_staged_reissue_keeps_synchronous_callback_progress() {
+        let mut telem = RelaySyncTelemetry::default();
+        telem.record_subscription_start("sub", &[A], 0);
+        telem.record_eose("sub", A, 10);
+
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("sub", &[A], 100);
+        telem.record_first_event("sub", A, 115);
+        telem.record_eose("sub", A, 125);
+        telem.commit_staged_subscription_starts();
+
+        assert_eq!(telem.subscription_synced("sub"), Some(true));
+        let snapshot = telem.snapshot();
+        assert_eq!(snapshot.tracked_subscriptions, 1);
+        assert_eq!(snapshot.synced_subscriptions, 1);
+        assert_eq!(snapshot.first_event.sample_count(), 1);
+        assert_eq!(snapshot.first_event.sum_ms, 15);
+        assert_eq!(snapshot.eose.sample_count(), 2);
+        assert_eq!(snapshot.eose.sum_ms, 35);
+    }
+
+    #[test]
+    fn staged_reissue_preserves_committed_gate_until_commit() {
+        let mut telem = RelaySyncTelemetry::default();
+        telem.record_subscription_start("sub", &[A], 0);
+        telem.record_eose("sub", A, 10);
+
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("sub", &[A], 100);
+
+        assert_eq!(telem.subscription_synced("sub"), Some(true));
+        assert_eq!(telem.subscription_any_eose("sub"), Some(true));
+        assert_eq!(telem.snapshot().synced_subscriptions, 1);
+    }
+
+    #[test]
+    fn rolled_back_reissue_applies_callbacks_to_unsynced_committed_progress() {
+        let mut telem = RelaySyncTelemetry::default();
+        telem.record_subscription_start("sub", &[A], 0);
+
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("sub", &[A], 100);
+        telem.record_first_event("sub", A, 110);
+        telem.record_eose("sub", A, 120);
+
+        assert_eq!(telem.subscription_synced("sub"), Some(false));
+        assert_eq!(telem.subscription_any_eose("sub"), Some(false));
+        telem.rollback_staged_subscription_starts();
+
+        assert_eq!(telem.subscription_synced("sub"), Some(true));
+        assert_eq!(telem.subscription_any_eose("sub"), Some(true));
+        let snapshot = telem.snapshot();
+        assert_eq!(snapshot.first_event.sample_count(), 1);
+        assert_eq!(snapshot.first_event.sum_ms, 110);
+        assert_eq!(snapshot.eose.sample_count(), 1);
+        assert_eq!(snapshot.eose.sum_ms, 120);
+    }
+
+    #[test]
+    fn rolled_back_staged_callbacks_preserve_prior_and_unrelated_progress() {
+        let mut telem = RelaySyncTelemetry::default();
+        telem.record_subscription_start("reissued", &[A], 0);
+        telem.record_eose("reissued", A, 10);
+        telem.record_subscription_start("unrelated", &[B], 0);
+        let mut expected = telem.clone();
+        expected.record_first_event("reissued", A, 110);
+        expected.record_first_event("unrelated", B, 30);
+        expected.record_eose("unrelated", B, 40);
+
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("reissued", &[A], 100);
+        telem.stage_subscription_start("new", &[C], 100);
+        telem.record_first_event("reissued", A, 110);
+        telem.record_eose("reissued", A, 120);
+        telem.record_first_event("new", C, 130);
+        telem.record_eose("new", C, 140);
+        telem.record_first_event("unrelated", B, 30);
+        telem.record_eose("unrelated", B, 40);
+        telem.rollback_staged_subscription_starts();
+
+        assert_eq!(telem.snapshot(), expected.snapshot());
+        assert_eq!(telem.subscription_synced("reissued"), Some(true));
+        assert_eq!(telem.subscription_synced("unrelated"), Some(true));
+        assert_eq!(telem.subscription_synced("new"), None);
     }
 }

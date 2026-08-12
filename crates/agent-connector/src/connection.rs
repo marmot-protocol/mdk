@@ -3,13 +3,59 @@
 use agent_control::{
     AgentControlEnvelope, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
-use tokio::io::BufReader;
+use serde::Serialize;
+use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
 
-use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::socket::current_effective_uid;
 use crate::validation::{auth_token_matches, unsupported_request_message};
+use crate::{
+    AgentConnector, CONTROL_OPERATION_TIMEOUT, with_control_operation_timeout,
+    with_control_operation_timeout_after,
+};
+
+pub(crate) fn try_acquire_inbound_subscription(
+    request: &AgentControlRequest,
+    limiter: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    if !matches!(request, AgentControlRequest::SubscribeInbound { .. }) {
+        return Ok(None);
+    }
+    std::sync::Arc::clone(limiter)
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ())
+}
+
+pub(crate) async fn write_control_frame<W, T>(
+    writer: &mut W,
+    message: &T,
+) -> Result<(), ConnectorError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_control_frame_with_timeout(writer, message, CONTROL_OPERATION_TIMEOUT).await
+}
+
+pub(crate) async fn write_control_frame_with_timeout<W, T>(
+    writer: &mut W,
+    message: &T,
+    timeout_after: std::time::Duration,
+) -> Result<(), ConnectorError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    with_control_operation_timeout_after(
+        "control_frame_write",
+        timeout_after,
+        write_frame(writer, message),
+    )
+    .await??;
+    Ok(())
+}
 
 impl AgentConnector {
     pub(crate) async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
@@ -18,7 +64,11 @@ impl AgentConnector {
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
         let Some(request): Option<AgentControlEnvelope<AgentControlRequest>> =
-            read_envelope(&mut reader).await?
+            with_control_operation_timeout(
+                "initial_control_frame_read",
+                read_envelope(&mut reader),
+            )
+            .await??
         else {
             return Ok(());
         };
@@ -29,14 +79,31 @@ impl AgentConnector {
                 request.id,
                 self.error_response("authorize_control_request", &err),
             );
-            write_frame(&mut write_half, &response).await?;
+            write_control_frame(&mut write_half, &response).await?;
             return Ok(());
         }
+        let subscription_permit =
+            match try_acquire_inbound_subscription(&request.payload, &self.subscription_limiter) {
+                Ok(permit) => permit,
+                Err(()) => {
+                    let response = AgentControlEnvelope::new(
+                        request.id,
+                        AgentControlResponse::Error {
+                            code: "server_busy".to_owned(),
+                            message: "agent connector subscription capacity is busy".to_owned(),
+                        },
+                    );
+                    write_control_frame(&mut write_half, &response).await?;
+                    return Ok(());
+                }
+            };
         if let AgentControlRequest::SubscribeInbound {
             account_id_hex,
             group_id_hex,
         } = request.payload
         {
+            let _subscription_permit = subscription_permit
+                .expect("SubscribeInbound admission must hold a subscription permit");
             return self
                 .stream_inbound_events(
                     request.id,
@@ -47,12 +114,16 @@ impl AgentConnector {
                 )
                 .await;
         }
-        let response = match self.handle_request(request.payload).await {
+        let envelope_request_id = request.id.clone();
+        let response = match self
+            .handle_request(envelope_request_id.as_deref(), request.payload)
+            .await
+        {
             Ok(response) => response,
             Err(err) => self.error_response("handle_connection", &err),
         };
         let response = AgentControlEnvelope::new(request.id, response);
-        write_frame(&mut write_half, &response).await?;
+        write_control_frame(&mut write_half, &response).await?;
         Ok(())
     }
 
@@ -78,6 +149,10 @@ impl AgentConnector {
         peer_authorized_by_uid: bool,
         auth_token: Option<&str>,
     ) -> Result<(), ConnectorError> {
+        // A configured token deliberately replaces peer-UID authorization and
+        // grants the whole local control API. There are no per-command or
+        // per-account scopes: deployments that do not share one trust boundary
+        // must use separate connector instances, sockets, homes, and tokens.
         if let Some(expected) = self.auth_token.as_deref() {
             if auth_token_matches(expected, auth_token) {
                 return Ok(());
@@ -94,10 +169,32 @@ impl AgentConnector {
 
     async fn handle_request(
         &self,
+        request_id: Option<&str>,
         request: AgentControlRequest,
     ) -> Result<AgentControlResponse, ConnectorError> {
         match request {
             AgentControlRequest::AccountList => self.account_list_response(),
+            AgentControlRequest::TimelineMessageGet {
+                account_id_hex,
+                group_id_hex,
+                message_id_hex,
+            } => self.timeline_message_response(&account_id_hex, &group_id_hex, &message_id_hex),
+            AgentControlRequest::TimelineList {
+                account_id_hex,
+                group_id_hex,
+                before,
+                after,
+                before_inclusive,
+                limit,
+            } => self.timeline_list_response(
+                request_id,
+                &account_id_hex,
+                &group_id_hex,
+                before,
+                after,
+                before_inclusive,
+                limit,
+            ),
             AgentControlRequest::AllowlistList { account_id_hex } => {
                 self.allowlist_response(&account_id_hex)
             }
@@ -115,6 +212,43 @@ impl AgentConnector {
             } => {
                 self.group_info_response(&account_id_hex, &group_id_hex)
                     .await
+            }
+            AgentControlRequest::MaintenanceStatus {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.maintenance_status_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
+            AgentControlRequest::KeyPackageMaintenanceStatus { account_id_hex } => {
+                self.key_package_maintenance_status_response(&account_id_hex)
+                    .await
+            }
+            AgentControlRequest::MaintenanceScheduleSelfUpdate {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.maintenance_schedule_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
+            AgentControlRequest::MaintenanceGetPolicy { account_id_hex } => {
+                self.maintenance_policy_response(&account_id_hex).await
+            }
+            AgentControlRequest::MaintenanceSetPolicy {
+                account_id_hex,
+                enabled_for_new_groups,
+            } => {
+                self.set_maintenance_policy_response(&account_id_hex, enabled_for_new_groups)
+                    .await
+            }
+            AgentControlRequest::MaintenancePause { account_id_hex } => {
+                self.pause_maintenance_response(&account_id_hex).await
+            }
+            AgentControlRequest::MaintenanceResume { account_id_hex } => {
+                self.resume_maintenance_response(&account_id_hex).await
+            }
+            AgentControlRequest::MaintenanceRun { account_id_hex } => {
+                self.run_maintenance_response(&account_id_hex).await
             }
             AgentControlRequest::DebugInjectInbound {
                 account_id_hex,
@@ -158,33 +292,46 @@ impl AgentConnector {
                 account_id_hex,
                 group_id_hex,
                 stream_id_hex,
+                parent_message_id_hex,
                 quic_candidates,
             } => {
                 self.stream_begin_response(
+                    request_id,
                     &account_id_hex,
                     &group_id_hex,
                     stream_id_hex,
+                    parent_message_id_hex,
                     quic_candidates,
                 )
                 .await
             }
             AgentControlRequest::StreamAppend {
                 stream_id_hex,
+                stream_capability,
                 append_text,
             } => {
-                self.stream_append_response(&stream_id_hex, append_text)
+                self.stream_append_response(&stream_id_hex, &stream_capability, append_text)
                     .await
             }
             AgentControlRequest::StreamStatus {
                 stream_id_hex,
+                stream_capability,
                 status,
-            } => self.stream_status_response(&stream_id_hex, status).await,
+            } => {
+                self.stream_status_response(&stream_id_hex, &stream_capability, status)
+                    .await
+            }
             AgentControlRequest::StreamProgress {
                 stream_id_hex,
+                stream_capability,
                 text,
-            } => self.stream_progress_response(&stream_id_hex, text).await,
+            } => {
+                self.stream_progress_response(&stream_id_hex, &stream_capability, text)
+                    .await
+            }
             AgentControlRequest::StreamFinalize {
                 stream_id_hex,
+                stream_capability,
                 final_text,
                 transcript_hash_hex,
                 chunk_count,
@@ -192,6 +339,7 @@ impl AgentConnector {
             } => {
                 self.stream_finalize_response(
                     &stream_id_hex,
+                    &stream_capability,
                     final_text,
                     &transcript_hash_hex,
                     chunk_count,
@@ -199,9 +347,11 @@ impl AgentConnector {
                 )
                 .await
             }
-            AgentControlRequest::StreamCancel { stream_id_hex, .. } => {
-                self.stream_cancel_response(&stream_id_hex)
-            }
+            AgentControlRequest::StreamCancel {
+                stream_id_hex,
+                stream_capability,
+                ..
+            } => self.stream_cancel_response(&stream_id_hex, &stream_capability),
             AgentControlRequest::AccountCreate {
                 label,
                 publish_key_package,
@@ -224,6 +374,9 @@ impl AgentConnector {
             } => {
                 self.publish_profile_response(&account_id_hex, name, display_name)
                     .await
+            }
+            AgentControlRequest::AccountProfileLookup { account_id_hex } => {
+                self.profile_lookup_response(&account_id_hex).await
             }
             AgentControlRequest::SendAgentActivity {
                 account_id_hex,
@@ -300,9 +453,16 @@ impl AgentConnector {
                 group_id_hex,
                 attachments,
                 caption,
+                idempotency_key,
             } => {
-                self.send_media_response(&account_id_hex, &group_id_hex, attachments, caption)
-                    .await
+                self.send_media_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    attachments,
+                    caption,
+                    idempotency_key,
+                )
+                .await
             }
             AgentControlRequest::DownloadMedia {
                 account_id_hex,

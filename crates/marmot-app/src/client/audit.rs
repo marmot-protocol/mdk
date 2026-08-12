@@ -1,11 +1,13 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditHumanActionContext, RelayRegistration,
+    AuditEventContext, AuditEventKind, AuditHumanActionContext, EpochBackfillActivationOutcome,
+    EpochBackfillDeferredReason, EpochBackfillExecutionSeam, EpochBackfillReplayScope,
+    EpochStallBackfillTrigger, RelayRegistration,
 };
 
 use crate::messages::AppMessageIntent;
@@ -14,6 +16,17 @@ use crate::{AppError, AppGroupRecord};
 use super::ObservedHumanActionAudit;
 
 use super::AppClient;
+
+pub(crate) struct EpochBackfillTerminalAudit {
+    pub retry_ordinal: u64,
+    pub duration_ms: u64,
+    pub activation_outcome: EpochBackfillActivationOutcome,
+    pub error_kind: Option<String>,
+    pub deliveries: u64,
+    pub local_epoch_before: u64,
+    pub local_epoch_after: u64,
+    pub group_advanced: bool,
+}
 
 impl AppClient {
     pub(crate) fn local_human_action_context(
@@ -186,6 +199,124 @@ impl AppClient {
                 deliveries,
                 cursor_before_secs,
                 cursor_after_secs,
+            },
+        );
+    }
+
+    /// Record an `epoch_stall_backfill_armed` forensic audit row at the arm
+    /// decision: the epoch the group was stalled at (`stalled_epoch`), the
+    /// distinct-undecryptable threshold that armed the backfill (`threshold`),
+    /// and the typed trigger that crossed the policy. Group-scoped, so
+    /// `group_ref` carries the stalled group id. `context.operation_id`
+    /// correlates the arm with the execution lifecycle rows.
+    pub(crate) fn record_epoch_stall_backfill_armed(
+        &self,
+        group_id: &GroupId,
+        stalled_epoch: u64,
+        trigger: EpochStallBackfillTrigger,
+        context: &AuditEventContext,
+    ) {
+        self.runtime.session().record_audit_event(
+            Some(group_id),
+            Some(context.clone()),
+            AuditEventKind::EpochStallBackfillArmed {
+                stalled_epoch,
+                threshold: self.epoch_stall.threshold() as u64,
+                trigger: Some(trigger),
+            },
+        );
+    }
+
+    pub(crate) fn record_epoch_stall_backfill_started(
+        &self,
+        seam: EpochBackfillExecutionSeam,
+        retry_ordinal: u64,
+        context: &AuditEventContext,
+    ) {
+        self.runtime.session().record_audit_event(
+            None,
+            Some(context.clone()),
+            AuditEventKind::EpochStallBackfillStarted {
+                seam,
+                replay_scope: EpochBackfillReplayScope::AccountFullHistory,
+                retry_ordinal,
+            },
+        );
+    }
+
+    pub(crate) fn record_epoch_stall_backfill_terminal(
+        &self,
+        group_id: &GroupId,
+        succeeded: bool,
+        terminal: EpochBackfillTerminalAudit,
+        context: &AuditEventContext,
+    ) {
+        let kind = if succeeded {
+            AuditEventKind::EpochStallBackfillCompleted {
+                retry_ordinal: terminal.retry_ordinal,
+                duration_ms: terminal.duration_ms,
+                activation_outcome: terminal.activation_outcome,
+                deliveries: terminal.deliveries,
+                local_epoch_before: terminal.local_epoch_before,
+                local_epoch_after: terminal.local_epoch_after,
+                group_advanced: terminal.group_advanced,
+            }
+        } else {
+            AuditEventKind::EpochStallBackfillFailed {
+                retry_ordinal: terminal.retry_ordinal,
+                duration_ms: terminal.duration_ms,
+                activation_outcome: terminal.activation_outcome,
+                error_kind: terminal.error_kind,
+                deliveries: terminal.deliveries,
+                local_epoch_before: terminal.local_epoch_before,
+                local_epoch_after: terminal.local_epoch_after,
+                group_advanced: terminal.group_advanced,
+            }
+        };
+        self.runtime
+            .session()
+            .record_audit_event(Some(group_id), Some(context.clone()), kind);
+    }
+
+    pub(crate) fn record_epoch_stall_backfill_deferred(
+        &self,
+        reason: EpochBackfillDeferredReason,
+        retry_ordinal: u64,
+        context: &AuditEventContext,
+    ) {
+        self.runtime.session().record_audit_event(
+            None,
+            Some(context.clone()),
+            AuditEventKind::EpochStallBackfillDeferred {
+                reason,
+                retry_ordinal,
+            },
+        );
+    }
+
+    /// Record an `epoch_stall_backfill_escalated` forensic audit row at the
+    /// escalation decision: the epoch the group was stalled at
+    /// (`stalled_epoch`), the backfills armed in the unrecovered run (`arms`),
+    /// and the run length that escalates (`arm_threshold`). Recorded once per
+    /// run, alongside that arm's `epoch_stall_backfill_armed` row, so a field
+    /// export shows which groups full-history replay could not repair — the
+    /// evidence loop for tuning the empirical run length. The run counter is
+    /// in-memory, so this row is also what makes an escalation survive the
+    /// restart that clears it. Group-scoped, so `group_ref` carries the stalled
+    /// group id.
+    pub(crate) fn record_epoch_stall_backfill_escalated(
+        &self,
+        group_id: &GroupId,
+        stalled_epoch: u64,
+        arms: u32,
+    ) {
+        self.runtime.session().record_audit_event(
+            Some(group_id),
+            None,
+            AuditEventKind::EpochStallBackfillEscalated {
+                stalled_epoch,
+                arms: u64::from(arms),
+                arm_threshold: u64::from(self.epoch_stall.escalation_arm_threshold()),
             },
         );
     }
@@ -436,7 +567,7 @@ impl AppClient {
                 ObservedHumanActionAudit::source(
                     "replace_encrypted_media_blob_endpoints",
                     vec!["encrypted_media"],
-                    vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+                    vec![updated.encrypted_media.component_id],
                     source_message_id_hex,
                 )
                 .with_target_count(updated.encrypted_media.default_blob_endpoints.len() as u64)

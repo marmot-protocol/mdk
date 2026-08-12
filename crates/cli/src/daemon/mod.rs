@@ -9,12 +9,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::process::CommandExt;
 
-use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
+#[cfg(test)]
+use agent_stream_compose::run_stream_compose_session;
+use agent_stream_compose::{
+    StreamComposeCommand, StreamComposeReport, run_stream_compose_session_candidates,
+    run_stream_compose_session_without_live,
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -38,6 +43,7 @@ mod stream_workers;
 mod subscriptions;
 
 pub use lifecycle::{default_log_path, default_pid_path, default_socket_path};
+pub(crate) use protocol::send_execute;
 pub use protocol::{
     DaemonClient, DaemonClientError, DaemonOutgoingStreamReport, DaemonRuntimeActivityReport,
     DaemonStatus, DaemonStreamError, DaemonStreamResponse, DaemonStreamWatchReport,
@@ -59,6 +65,9 @@ const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
 /// and starve every other client of `Status`/`Ping`/etc. On timeout the read is
 /// treated like any other per-connection failure: report and `continue`.
 const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-frame deadline for daemon responses. A client that stops draining its
+/// socket must release its connection permit instead of pinning the worker.
+const DAEMON_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
 /// Cap on concurrently served daemon connections. The socket is same-UID
@@ -68,6 +77,10 @@ const DAEMON_SOCKET_MODE: u32 = 0o600;
 /// relative to real CLI/TUI use (a handful of subscriptions plus one-shot
 /// commands).
 const MAX_DAEMON_CONNECTIONS: usize = 256;
+/// Long-lived streaming requests have a separate ceiling so they cannot
+/// consume the global pool needed by status, shutdown, and one-shot commands.
+const MAX_DAEMON_SUBSCRIPTIONS: usize = 64;
+const DAEMON_BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 
 type SharedDaemonWorkers = Arc<AsyncMutex<DaemonWorkers>>;
 
@@ -121,22 +134,9 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .clone()
         .map(|logs_dir| logs_dir.join("wnd.log"))
         .unwrap_or_else(|| default_log_path(&home));
-    if let Some(parent) = socket.parent() {
-        prepare_socket_dir(parent, &home)?;
-    }
-    if let Some(parent) = pid_path.parent() {
-        create_private_dir_all(parent)?;
-    }
-    remove_stale_socket(&socket).await?;
-    remove_stale_pid(&pid_path).await?;
-
-    // Bind via a 0700 staging dir so the socket is never reachable at
-    // umask-default permissions, even under a caller-supplied `--socket`
-    // whose parent dir the daemon does not own.
-    let listener = fs_private::bind_unix_listener_private(&socket, DAEMON_SOCKET_MODE)?;
-    listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(listener)?;
-    write_pid_file(&pid_path)?;
+    // Resolve every fallible relay setting before binding the socket or
+    // writing the pid file. Startup validation must not leave externally
+    // visible artifacts behind on failure.
     let hidden_relay = crate::resolve_relay(args.relay)?;
     let mut discovery_relays = normalize_relay_list(args.discovery_relays)?;
     let mut default_account_relays = normalize_relay_list(args.default_account_relays)?;
@@ -158,6 +158,23 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
         .ok_or(crate::WnError::MissingRelay)?;
+    let _socket_parent_guard = socket
+        .parent()
+        .map(|parent| prepare_socket_dir(parent, &home))
+        .transpose()?;
+    if let Some(parent) = pid_path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    remove_stale_socket(&socket).await?;
+    remove_stale_pid(&pid_path).await?;
+
+    // Bind via a 0700 staging dir so the socket is never reachable at
+    // umask-default permissions, even under a caller-supplied `--socket`
+    // whose parent dir the daemon does not own.
+    let listener = fs_private::bind_unix_listener_private(&socket, DAEMON_SOCKET_MODE)?;
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)?;
+    write_pid_file(&pid_path)?;
     let defaults = DaemonDefaults {
         home,
         socket: socket.clone(),
@@ -188,22 +205,36 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     }
     let mut worker_tasks: Vec<JoinHandle<()>> = Vec::new();
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_CONNECTIONS));
+    let subscription_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_SUBSCRIPTIONS));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let shutdown_result = loop {
         worker_tasks.retain(|task| !task.is_finished());
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) => {
+                        // Accept failures such as temporary fd/resource
+                        // pressure are listener-local events, not a reason to
+                        // bypass daemon cleanup or tear down every worker.
+                        // Back off to avoid a hot retry loop while pressure
+                        // persists; shutdown remains observable next cycle.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 // Bound concurrent per-connection tasks like the connector and
                 // broker accept loops: beyond the cap the connection is closed
                 // instead of served.
                 let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
-                    // Dropped without a log line: the repo-wide direct-output
-                    // audit forbids println!/eprintln! in library sources and
-                    // the daemon library is intentionally log-free at runtime.
-                    // The refused client observes its connection close without
-                    // a response.
-                    drop(stream);
+                    // Return a protocol-level error that both one-shot and
+                    // streaming clients can decode. Bound this tiny rejection
+                    // write so a non-reading over-cap peer cannot wedge accept.
+                    let _ = tokio::time::timeout(
+                        DAEMON_BUSY_RESPONSE_TIMEOUT,
+                        write_daemon_server_busy(stream),
+                    )
+                    .await;
                     continue;
                 };
                 let defaults = defaults.clone();
@@ -211,9 +242,19 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 let events = events.clone();
                 let workers = workers.clone();
                 let shutdown_tx = shutdown_tx.clone();
+                let subscription_limiter = subscription_limiter.clone();
                 worker_tasks.push(tokio::spawn(async move {
                     let _permit = permit;
-                    handle_daemon_connection(stream, defaults, state, events, workers, shutdown_tx).await;
+                    handle_daemon_connection(
+                        stream,
+                        defaults,
+                        state,
+                        events,
+                        workers,
+                        shutdown_tx,
+                        subscription_limiter,
+                    )
+                    .await;
                 }));
             }
             _ = shutdown_rx.recv() => {
@@ -240,6 +281,7 @@ async fn handle_daemon_connection(
     events: DaemonEventHub,
     workers: SharedDaemonWorkers,
     shutdown_tx: mpsc::UnboundedSender<()>,
+    subscription_limiter: Arc<tokio::sync::Semaphore>,
 ) {
     if let Err(err) = authorize_daemon_peer(&stream) {
         write_daemon_output(
@@ -273,6 +315,19 @@ async fn handle_daemon_connection(
             return;
         }
     };
+
+    let _subscription_permit =
+        match try_acquire_daemon_subscription(&request, &subscription_limiter) {
+            Ok(permit) => permit,
+            Err(()) => {
+                let response = DaemonStreamResponse::err_with_code(
+                    DAEMON_SERVER_BUSY_CODE,
+                    DAEMON_SERVER_BUSY_MESSAGE,
+                );
+                let _ = write_stream_response(&mut stream, &response).await;
+                return;
+            }
+        };
 
     match request {
         DaemonRequest::Status => {
@@ -375,11 +430,64 @@ async fn handle_daemon_connection(
             )
             .await;
         }
-        DaemonRequest::Execute { cli } => {
-            let _ = handle_execute_connection(cli, &mut stream, &defaults, state, events, &workers)
-                .await;
+        DaemonRequest::Execute { cli, import_nsec } => {
+            let _ = handle_execute_connection(
+                cli,
+                import_nsec,
+                &mut stream,
+                &defaults,
+                state,
+                events,
+                &workers,
+            )
+            .await;
         }
     }
+}
+
+fn daemon_request_is_subscription(request: &DaemonRequest) -> bool {
+    matches!(
+        request,
+        DaemonRequest::MessagesSubscribe { .. }
+            | DaemonRequest::ChatsSubscribe { .. }
+            | DaemonRequest::GroupStateSubscribe { .. }
+            | DaemonRequest::NotificationsSubscribe { .. }
+    )
+}
+
+fn try_acquire_daemon_subscription(
+    request: &DaemonRequest,
+    limiter: &Arc<tokio::sync::Semaphore>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    if !daemon_request_is_subscription(request) {
+        return Ok(None);
+    }
+    Arc::clone(limiter)
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn daemon_server_busy_frame() -> Vec<u8> {
+    let mut frame = serde_json::to_vec(&serde_json::json!({
+        "code": 1,
+        "stdout": "",
+        "stderr": format!("error: {DAEMON_SERVER_BUSY_MESSAGE}\n"),
+        "result": null,
+        "error": {
+            "code": DAEMON_SERVER_BUSY_CODE,
+            "message": DAEMON_SERVER_BUSY_MESSAGE,
+        },
+        "stream_end": false,
+    }))
+    .expect("static daemon busy response serializes");
+    frame.push(b'\n');
+    frame
+}
+
+async fn write_daemon_server_busy(mut stream: UnixStream) {
+    let _ = stream.write_all(&daemon_server_busy_frame()).await;
+    let _ = stream.shutdown().await;
 }
 
 async fn daemon_status_output(
@@ -430,6 +538,7 @@ async fn handle_stream_watch_connection(
 
 async fn handle_execute_connection(
     mut cli: Box<Cli>,
+    mut import_nsec: Option<crate::ImportNsec>,
     stream: &mut UnixStream,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
@@ -476,6 +585,7 @@ async fn handle_execute_connection(
     let refresh = app_runtime_refresh_after_execute(&cli);
     if let Some(output) = handle_app_runtime_account_setup_request(
         &cli,
+        &mut import_nsec,
         defaults,
         state.clone(),
         events.clone(),
@@ -495,7 +605,7 @@ async fn handle_execute_connection(
     }
     // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
     // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli).await;
+    let output = crate::run_cli_local(*cli, import_nsec).await;
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }

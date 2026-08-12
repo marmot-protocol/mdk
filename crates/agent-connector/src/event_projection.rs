@@ -5,17 +5,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agent_control::{
-    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent, AgentControlMediaLocator,
-    AgentControlMediaRef,
+    AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX, AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS,
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlActor, AgentControlAttachmentSummary,
+    AgentControlEvent, AgentControlMediaLocator, AgentControlMediaRef, AgentControlMessage,
+    AgentControlReferencedMessage, AgentControlReferencedMessageAvailability,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_EVENT_VERSION,
     GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
     GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED, GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
-    GROUP_SYSTEM_TYPE_GROUP_RENAMED, GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+    GROUP_SYSTEM_TYPE_GROUP_DISBANDED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+    GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GroupSystemEvent, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    STREAM_TAG, group_system_canonical_id,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
+    group_system_canonical_id,
 };
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
@@ -27,7 +31,11 @@ const PUBKEY_MENTION_TAG: &str = "p";
 /// id IS the Nostr pubkey hex), so check the plaintext for that; also honor a
 /// `["p", <pubkey-hex>]` tag in case a client emits one. Used to let a channel
 /// gate group replies on being addressed.
-fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_hex: &str) -> bool {
+pub(crate) fn message_mentions_account(
+    tags: &[Vec<String>],
+    plaintext: &str,
+    account_id_hex: &str,
+) -> bool {
     if account_id_hex.is_empty() {
         return false;
     }
@@ -47,11 +55,12 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
     // the account hex in the body, or the visible bech32 (`npub`) forms parsed
     // by marmot-markdown (`nostr:npub1…` and bare `@npub1…`).
     // `nprofile` mentions still rely on the p-tag above.
-    if plaintext_has_nostr_hex_ref(plaintext, account_id_hex) {
+    let scan_input = mention_plaintext_scan_input(plaintext);
+    if plaintext_has_nostr_hex_ref(scan_input, account_id_hex) {
         return true;
     }
     marmot_app::npub_for_account_id(account_id_hex)
-        .is_ok_and(|npub| plaintext_has_visible_npub_ref(plaintext, &npub))
+        .is_ok_and(|npub| plaintext_scan_has_visible_npub_ref(scan_input, &npub))
 }
 
 /// Whether `plaintext` contains a `nostr:<hex>` token that is not glued to
@@ -68,7 +77,7 @@ fn plaintext_has_nostr_hex_ref(plaintext: &str, reference: &str) -> bool {
 const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
-/// Whether `plaintext` contains a visible npub mention token for the account.
+/// Scan `plaintext` for a visible npub mention token for the account.
 ///
 /// This deliberately avoids `marmot_markdown::parse`: the parser has
 /// super-linear behavior on hostile emphasis/bracket input, and this caller is
@@ -77,10 +86,6 @@ const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
 /// recognizes (`@npub1…`, `nostr:npub1…`, and bare `npub1…`), so a bounded
 /// token-boundary scan is enough and keeps replay/live drain work predictable
 /// (mdk#663).
-fn plaintext_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
-    plaintext_scan_has_visible_npub_ref(mention_plaintext_scan_input(plaintext), npub)
-}
-
 fn plaintext_scan_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
     let bytes = plaintext.as_bytes();
     let npub_bytes = npub.as_bytes();
@@ -227,7 +232,7 @@ fn token_boundary_ok(b: u8) -> bool {
 /// The replied-to message id from the first `e` tag, if present. The tag value is
 /// sender-controlled, so it is normalized + validated as hex (a malformed value is
 /// dropped rather than passed through as a reply/delete target).
-fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
+pub(crate) fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
     tags.iter()
         .find(|tag| tag.first().is_some_and(|name| name == EVENT_REF_TAG))
         .and_then(|tag| tag.get(1))
@@ -239,7 +244,10 @@ fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
 /// structural validation is dropped (it would be unfetchable anyway) rather than
 /// failing the whole message. Loopback-HTTP locators are rejected here (the
 /// connector serves real deployments), matching the runtime download policy.
-fn media_refs_from_tags(tags: &[Vec<String>], source_epoch: u64) -> Vec<AgentControlMediaRef> {
+pub(crate) fn media_refs_from_tags(
+    tags: &[Vec<String>],
+    source_epoch: u64,
+) -> Vec<AgentControlMediaRef> {
     tags.iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
         .filter_map(|tag| {
@@ -274,87 +282,413 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use crate::INBOUND_CATCH_UP_INTERVAL;
 use crate::validation::normalize_hex;
 
-pub(crate) fn control_event_from_runtime_event(
+pub(crate) fn control_actor(
+    account_id_hex: impl Into<String>,
+    display_name: Option<String>,
+    self_account_id_hex: &str,
+) -> AgentControlActor {
+    let account_id_hex = account_id_hex.into();
+    AgentControlActor {
+        is_self: account_id_hex == self_account_id_hex,
+        account_id_hex,
+        display_name,
+    }
+}
+
+pub(crate) fn attachment_summaries_from_tags(
+    tags: &[Vec<String>],
+    source_epoch: Option<u64>,
+) -> (Vec<AgentControlAttachmentSummary>, bool) {
+    let mut summaries = tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .filter_map(|tag| {
+            marmot_app::media_attachment_from_imeta_tag(tag, source_epoch, false)
+                .ok()
+                .map(|media| AgentControlAttachmentSummary {
+                    media_type: media.media_type,
+                    file_name: media.file_name,
+                    dim: media.dim,
+                })
+        })
+        .collect::<Vec<_>>();
+    let truncated = summaries.len() > AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX;
+    summaries.truncate(AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX);
+    (summaries, truncated)
+}
+
+fn bounded_text_excerpt(text: &str) -> (String, bool) {
+    let mut chars = text.chars();
+    let excerpt = chars
+        .by_ref()
+        .take(AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS)
+        .collect::<String>();
+    (excerpt, chars.next().is_some())
+}
+
+fn referenced_message(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    self_account_id_hex: &str,
+    group_id_hex: &str,
+    message_id_hex: String,
+) -> Result<AgentControlReferencedMessage, AppError> {
+    let raw = runtime.message_by_id(account_ref, group_id_hex, &message_id_hex)?;
+    let target = runtime.message_target(account_ref, group_id_hex, &message_id_hex)?;
+    let availability = match target.as_ref() {
+        None => AgentControlReferencedMessageAvailability::Missing,
+        Some(target) if target.invalidated => {
+            AgentControlReferencedMessageAvailability::Invalidated
+        }
+        Some(target) if target.deleted => AgentControlReferencedMessageAvailability::Deleted,
+        Some(_) => AgentControlReferencedMessageAvailability::Available,
+    };
+    let sender = target
+        .as_ref()
+        .map(|target| control_actor(target.sender.clone(), None, self_account_id_hex))
+        .or_else(|| {
+            raw.as_ref()
+                .map(|raw| control_actor(raw.sender.clone(), None, self_account_id_hex))
+        });
+    let recorded_at = raw.as_ref().map(|raw| raw.recorded_at);
+
+    // Deleted and invalidated targets intentionally retain only attribution
+    // metadata. Their plaintext and attachment metadata are never projected.
+    let (text_excerpt, text_truncated, attachments, attachments_truncated) =
+        if availability == AgentControlReferencedMessageAvailability::Available {
+            let (text_excerpt, text_truncated) =
+                bounded_text_excerpt(&target.as_ref().expect("available target").plaintext);
+            let (attachments, attachments_truncated) = raw.as_ref().map_or_else(
+                || (Vec::new(), false),
+                |raw| attachment_summaries_from_tags(&raw.tags, raw.source_epoch),
+            );
+            (
+                Some(text_excerpt),
+                text_truncated,
+                attachments,
+                attachments_truncated,
+            )
+        } else {
+            (None, false, Vec::new(), false)
+        };
+
+    Ok(AgentControlReferencedMessage {
+        message_id_hex,
+        availability,
+        sender,
+        recorded_at,
+        text_excerpt,
+        text_truncated,
+        attachments,
+        attachments_truncated,
+    })
+}
+
+fn available_target_context(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    self_account_id_hex: &str,
+    group_id_hex: &str,
+    target_message_id_hex: &str,
+) -> Result<Option<AgentControlReferencedMessage>, AppError> {
+    let Some(raw_target) =
+        runtime.message_by_id(account_ref, group_id_hex, target_message_id_hex)?
+    else {
+        return Ok(None);
+    };
+    if raw_target.kind != MARMOT_APP_EVENT_KIND_CHAT || raw_target.invalidated {
+        return Ok(None);
+    }
+    let context = referenced_message(
+        runtime,
+        account_ref,
+        self_account_id_hex,
+        group_id_hex,
+        target_message_id_hex.to_owned(),
+    )?;
+    Ok(
+        (context.availability == AgentControlReferencedMessageAvailability::Available)
+            .then_some(context),
+    )
+}
+
+fn project_durable_record(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    account_id_hex: &str,
+    record: AppMessageRecord,
+    sender_display_name: Option<String>,
+    account_filter: Option<&str>,
+    group_filter: Option<&str>,
+) -> Result<Option<AgentControlEvent>, AppError> {
+    if !inbound_filter_matches(
+        account_filter,
+        account_id_hex,
+        group_filter,
+        &record.group_id_hex,
+    ) {
+        return Ok(None);
+    }
+
+    if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+        // Only locally synthesized group-system timeline rows represent the live
+        // `GroupEvent::GroupStateChanged` signal. Ignore sent/received kind-1210 app events.
+        if record.direction != "system" || record.invalidated {
+            return Ok(None);
+        }
+        let Some((change, detail)) = GroupSystemEvent::parse(&record.plaintext)
+            .ok()
+            .as_ref()
+            .and_then(group_system_control_parts)
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(AgentControlEvent::GroupStateChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            group_id_hex: record.group_id_hex,
+            change: change.to_owned(),
+            detail,
+        }));
+    }
+
+    if record.direction != "received" || record.sender == account_id_hex || record.invalidated {
+        return Ok(None);
+    }
+    let actor = control_actor(record.sender.clone(), sender_display_name, account_id_hex);
+    let group_id_hex = record.group_id_hex.clone();
+
+    match record.kind {
+        MARMOT_APP_EVENT_KIND_CHAT => {
+            let mentions_self =
+                message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
+            let reply_to = match reply_target_from_tags(&record.tags) {
+                Some(target_message_id_hex) => Some(referenced_message(
+                    runtime,
+                    account_ref,
+                    account_id_hex,
+                    &group_id_hex,
+                    target_message_id_hex,
+                )?),
+                None => None,
+            };
+            let media = media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or_default());
+            Ok(Some(AgentControlEvent::InboundMessage {
+                account_id_hex: account_id_hex.to_owned(),
+                group_id_hex,
+                message: AgentControlMessage {
+                    message_id_hex: record.message_id_hex,
+                    sender: actor,
+                    text: record.plaintext,
+                    recorded_at: record.recorded_at,
+                    media,
+                },
+                mentions_self,
+                reply_to,
+            }))
+        }
+        MARMOT_APP_EVENT_KIND_EDIT => {
+            let Some(target_message_id_hex) = reply_target_from_tags(&record.tags) else {
+                return Ok(None);
+            };
+            let Some(raw_target) =
+                runtime.message_by_id(account_ref, &group_id_hex, &target_message_id_hex)?
+            else {
+                return Ok(None);
+            };
+            if raw_target.kind != MARMOT_APP_EVENT_KIND_CHAT
+                || raw_target.sender != record.sender
+                || raw_target.invalidated
+            {
+                return Ok(None);
+            }
+            let Some(target) = available_target_context(
+                runtime,
+                account_ref,
+                account_id_hex,
+                &group_id_hex,
+                &target_message_id_hex,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(AgentControlEvent::MessageEdited {
+                account_id_hex: account_id_hex.to_owned(),
+                group_id_hex,
+                event_id_hex: record.message_id_hex,
+                target_message_id_hex,
+                actor,
+                replacement_text: record.plaintext,
+                recorded_at: record.recorded_at,
+                target,
+            }))
+        }
+        MARMOT_APP_EVENT_KIND_REACTION => {
+            let Some(target_message_id_hex) = reply_target_from_tags(&record.tags) else {
+                return Ok(None);
+            };
+            let Some(target) = available_target_context(
+                runtime,
+                account_ref,
+                account_id_hex,
+                &group_id_hex,
+                &target_message_id_hex,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(AgentControlEvent::ReactionAdded {
+                account_id_hex: account_id_hex.to_owned(),
+                group_id_hex,
+                event_id_hex: record.message_id_hex,
+                target_message_id_hex,
+                actor,
+                emoji: record.plaintext,
+                recorded_at: record.recorded_at,
+                target,
+            }))
+        }
+        MARMOT_APP_EVENT_KIND_DELETE => {
+            let Some(deleted_event_id_hex) = reply_target_from_tags(&record.tags) else {
+                return Ok(None);
+            };
+            let Some(deleted_event) =
+                runtime.message_by_id(account_ref, &group_id_hex, &deleted_event_id_hex)?
+            else {
+                return Ok(None);
+            };
+
+            if deleted_event.kind == MARMOT_APP_EVENT_KIND_REACTION {
+                // The materialized timeline accepts reaction removal only from
+                // the original reaction author; moderation grants do not apply.
+                if deleted_event.sender != record.sender || deleted_event.invalidated {
+                    return Ok(None);
+                }
+                let Some(target_message_id_hex) = reply_target_from_tags(&deleted_event.tags)
+                else {
+                    return Ok(None);
+                };
+                let Some(target) = available_target_context(
+                    runtime,
+                    account_ref,
+                    account_id_hex,
+                    &group_id_hex,
+                    &target_message_id_hex,
+                )?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(AgentControlEvent::ReactionRemoved {
+                    account_id_hex: account_id_hex.to_owned(),
+                    group_id_hex,
+                    event_id_hex: record.message_id_hex,
+                    reaction_event_id_hex: deleted_event_id_hex,
+                    target_message_id_hex,
+                    actor,
+                    emoji: deleted_event.plaintext,
+                    recorded_at: record.recorded_at,
+                    target,
+                }));
+            }
+
+            if deleted_event.kind != MARMOT_APP_EVENT_KIND_CHAT
+                || deleted_event.invalidated
+                || (deleted_event.sender != record.sender && !record.moderation_grant)
+            {
+                return Ok(None);
+            }
+            let target = referenced_message(
+                runtime,
+                account_ref,
+                account_id_hex,
+                &group_id_hex,
+                deleted_event_id_hex.clone(),
+            )?;
+            if target.availability != AgentControlReferencedMessageAvailability::Deleted {
+                return Ok(None);
+            }
+            Ok(Some(AgentControlEvent::MessageDeleted {
+                account_id_hex: account_id_hex.to_owned(),
+                group_id_hex,
+                event_id_hex: record.message_id_hex,
+                target_message_id_hex: deleted_event_id_hex,
+                actor,
+                recorded_at: record.recorded_at,
+                target,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn control_event_from_runtime_event_with_runtime(
+    runtime: &MarmotAppRuntime,
     event: MarmotAppEvent,
     account_filter: Option<&str>,
     group_filter: Option<&str>,
-) -> Option<AgentControlEvent> {
+) -> Result<Option<AgentControlEvent>, AppError> {
     match event {
         MarmotAppEvent::MessageReceived(update) => {
-            // A kind-5 deletion from another member retracts an earlier message;
-            // surface it as a distinct control event (the `e` tag is the target).
-            if update.message.kind == MARMOT_APP_EVENT_KIND_DELETE {
-                let group_id_hex = inbound_event_group_id_hex(
-                    account_filter,
-                    &update.account_id_hex,
-                    group_filter,
-                    &update.message.group_id,
-                    &update.message.sender,
-                )?;
-                let target_message_id_hex = reply_target_from_tags(&update.message.tags)?;
-                return Some(AgentControlEvent::MessageDeleted {
-                    account_id_hex: update.account_id_hex,
-                    group_id_hex,
-                    target_message_id_hex,
-                    sender_account_id_hex: update.message.sender,
-                });
-            }
-            // Only kind-9 chat/media is conversational input. Edits, reactions,
-            // and telemetry need explicit control semantics before they can
-            // safely influence an agent prompt.
-            if update.message.kind != MARMOT_APP_EVENT_KIND_CHAT {
-                return None;
-            }
-            let group_id_hex = inbound_event_group_id_hex(
+            let Some(group_id_hex) = inbound_event_group_id_hex(
                 account_filter,
                 &update.account_id_hex,
                 group_filter,
                 &update.message.group_id,
                 &update.message.sender,
-            )?;
-            let mentions_self = message_mentions_account(
-                &update.message.tags,
-                &update.message.plaintext,
+            ) else {
+                return Ok(None);
+            };
+            let Some(record) = runtime.message_by_id(
+                &update.account_label,
+                &group_id_hex,
+                &update.message.message_id_hex,
+            )?
+            else {
+                // Durable rows are authoritative for the agent feed. Retention
+                // pruning or convergence invalidation can remove a row between
+                // commit and broadcast; falling back to the in-memory plaintext
+                // here would re-expose content the durable projection has already
+                // discarded.
+                return Ok(None);
+            };
+            project_durable_record(
+                runtime,
+                &update.account_label,
                 &update.account_id_hex,
-            );
-            let reply_to_message_id_hex = reply_target_from_tags(&update.message.tags);
-            let media = media_refs_from_tags(&update.message.tags, update.message.source_epoch);
-            Some(AgentControlEvent::InboundMessage {
-                account_id_hex: update.account_id_hex,
-                group_id_hex,
-                message_id_hex: update.message.message_id_hex,
-                sender_account_id_hex: update.message.sender,
-                text: update.message.plaintext,
-                mentions_self,
-                reply_to_message_id_hex,
-                sender_display_name: update.message.sender_display_name,
-                media,
-            })
+                record,
+                update.message.sender_display_name,
+                account_filter,
+                group_filter,
+            )
         }
         MarmotAppEvent::AgentStreamStarted(update) => {
             if update.message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-                return None;
+                return Ok(None);
             }
-            let group_id_hex = inbound_event_group_id_hex(
+            let Some(group_id_hex) = inbound_event_group_id_hex(
                 account_filter,
                 &update.account_id_hex,
                 group_filter,
                 &update.message.group_id,
                 &update.message.sender,
-            )?;
-            let stream_id_hex = update
+            ) else {
+                return Ok(None);
+            };
+            let Some(stream_id_hex) = update
                 .message
                 .tags
                 .iter()
                 .find(|tag| tag.first().is_some_and(|name| name == STREAM_TAG))
                 .and_then(|tag| tag.get(1))
-                .and_then(|stream_id_hex| normalize_hex(stream_id_hex).ok())?;
-            Some(AgentControlEvent::StreamUpdate {
+                .and_then(|stream_id_hex| normalize_hex(stream_id_hex).ok())
+            else {
+                return Ok(None);
+            };
+            Ok(Some(AgentControlEvent::StreamUpdate {
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
                 stream_id_hex,
                 status: AGENT_CONTROL_STREAM_STATUS_STARTED.to_owned(),
-            })
+            }))
         }
         MarmotAppEvent::GroupEvent(group_event) => match group_event.event {
             GroupEvent::GroupJoined {
@@ -369,14 +703,14 @@ pub(crate) fn control_event_from_runtime_event(
                     group_filter,
                     &group_id_hex,
                 ) {
-                    return None;
+                    return Ok(None);
                 }
-                Some(AgentControlEvent::GroupInvite {
+                Ok(Some(AgentControlEvent::GroupInvite {
                     account_id_hex: group_event.account_id_hex,
                     group_id_hex,
                     via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
                     welcomer_account_id_hex: welcomer.map(|member| hex::encode(member.as_slice())),
-                })
+                }))
             }
             GroupEvent::GroupStateChanged {
                 group_id, change, ..
@@ -388,7 +722,7 @@ pub(crate) fn control_event_from_runtime_event(
                     group_filter,
                     &group_id_hex,
                 ) {
-                    return None;
+                    return Ok(None);
                 }
                 // Map to a coarse change kind. Privacy: the subject member's
                 // pubkey is NEVER surfaced; only a rename carries a detail (the
@@ -404,17 +738,18 @@ pub(crate) fn control_event_from_runtime_event(
                     GroupStateChange::MessageRetentionChanged { .. } => {
                         ("disappearing_timer_changed", None)
                     }
+                    GroupStateChange::GroupDisbanded => ("group_disbanded", None),
                 };
-                Some(AgentControlEvent::GroupStateChanged {
+                Ok(Some(AgentControlEvent::GroupStateChanged {
                     account_id_hex: group_event.account_id_hex,
                     group_id_hex,
                     change: change.to_owned(),
                     detail,
-                })
+                }))
             }
-            _ => None,
+            _ => Ok(None),
         },
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -426,7 +761,10 @@ pub(crate) fn runtime_replay_dedup_key(event: &MarmotAppEvent) -> Option<String>
     match event {
         MarmotAppEvent::MessageReceived(update) => matches!(
             update.message.kind,
-            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_DELETE
+            MARMOT_APP_EVENT_KIND_CHAT
+                | MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_EDIT
+                | MARMOT_APP_EVENT_KIND_REACTION
         )
         .then(|| update.message.message_id_hex.clone()),
         MarmotAppEvent::GroupEvent(group_event) => {
@@ -472,6 +810,7 @@ fn group_system_control_parts(event: &GroupSystemEvent) -> Option<(&'static str,
         )),
         GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED => Some(("group_avatar_changed", None)),
         GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED => Some(("disappearing_timer_changed", None)),
+        GROUP_SYSTEM_TYPE_GROUP_DISBANDED => Some(("group_disbanded", None)),
         _ => None,
     }
 }
@@ -482,7 +821,22 @@ pub(crate) fn control_event_from_debug_event(
     group_filter: Option<&str>,
 ) -> Option<AgentControlEvent> {
     let (account_id_hex, group_id_hex) = match &event {
-        AgentControlEvent::MessageDeleted {
+        AgentControlEvent::MessageEdited {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::MessageDeleted {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::ReactionAdded {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::ReactionRemoved {
             account_id_hex,
             group_id_hex,
             ..
@@ -573,80 +927,32 @@ pub(crate) fn resync_required_event(
 
 /// Project a stored app-message record into the same control event the live path emits, or
 /// `None` if the stored row is not relevant to this subscription. Replay covers the durable event
-/// kinds the live inbound stream surfaces: inbound chat messages, inbound kind-5 deletes, and
-/// synthesized kind-1210 group-system rows for authenticated group-state changes. Other app-event
-/// kinds remain ignored until they have explicit agent-control semantics.
-pub(crate) fn inbound_message_event_from_record(
+/// kinds the live inbound stream surfaces: inbound chat messages, accepted edits, reactions,
+/// reaction removals and message deletions, plus synthesized kind-1210 group-system rows for
+/// authenticated group-state changes. Other app-event kinds remain ignored until they have
+/// explicit agent-control semantics.
+pub(crate) fn inbound_message_event_from_record_with_runtime(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
     account_id_hex: &str,
     record: AppMessageRecord,
     account_filter: Option<&str>,
     group_filter: Option<&str>,
-) -> Option<AgentControlEvent> {
+) -> Result<Option<AgentControlEvent>, AppError> {
     debug_assert_ne!(
         MARMOT_APP_EVENT_KIND_CHAT,
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
     );
-    if !inbound_filter_matches(
-        account_filter,
+    project_durable_record(
+        runtime,
+        account_ref,
         account_id_hex,
-        group_filter,
-        &record.group_id_hex,
-    ) {
-        return None;
-    }
-
-    if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
-        // Only locally synthesized group-system timeline rows represent the live
-        // `GroupEvent::GroupStateChanged` signal. Ignore sent/received kind-1210 app events.
-        if record.direction != "system" {
-            return None;
-        }
-        let group_system = GroupSystemEvent::parse(&record.plaintext).ok()?;
-        let (change, detail) = group_system_control_parts(&group_system)?;
-        return Some(AgentControlEvent::GroupStateChanged {
-            account_id_hex: account_id_hex.to_owned(),
-            group_id_hex: record.group_id_hex,
-            change: change.to_owned(),
-            detail,
-        });
-    }
-
-    if record.direction != "received" {
-        return None;
-    }
-    // The live MessageReceived path drops messages whose sender is the subscribed account itself.
-    if record.sender == account_id_hex {
-        return None;
-    }
-
-    if record.kind == MARMOT_APP_EVENT_KIND_DELETE {
-        let target_message_id_hex = reply_target_from_tags(&record.tags)?;
-        return Some(AgentControlEvent::MessageDeleted {
-            account_id_hex: account_id_hex.to_owned(),
-            group_id_hex: record.group_id_hex,
-            target_message_id_hex,
-            sender_account_id_hex: record.sender,
-        });
-    }
-
-    if record.kind != MARMOT_APP_EVENT_KIND_CHAT {
-        return None;
-    }
-    let mentions_self = message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
-    let reply_to_message_id_hex = reply_target_from_tags(&record.tags);
-    let media = media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or(0));
-    Some(AgentControlEvent::InboundMessage {
-        account_id_hex: account_id_hex.to_owned(),
-        group_id_hex: record.group_id_hex,
-        message_id_hex: record.message_id_hex,
-        sender_account_id_hex: record.sender,
-        text: record.plaintext,
-        mentions_self,
-        reply_to_message_id_hex,
+        record,
         // Storage replay has no directory join; display name is best-effort live-only.
-        sender_display_name: None,
-        media,
-    })
+        None,
+        account_filter,
+        group_filter,
+    )
 }
 
 /// Bounded set of durable replay row ids already delivered on a subscription, used to dedup

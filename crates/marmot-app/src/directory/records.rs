@@ -54,6 +54,8 @@ pub struct UserProfileMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nip05: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lud16: Option<String>,
@@ -81,13 +83,17 @@ pub struct UserDirectorySearch {
     pub limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UserDirectorySearchResult {
     pub account_id_hex: String,
     pub npub: String,
     pub radius: u8,
-    pub matched_field: String,
-    pub match_quality: String,
+    pub matched_field: MatchedField,
+    pub match_quality: MatchQuality,
+    /// Rank assigned by an off-graph discovery provider. `None` for results
+    /// found only through the local social graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rank: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<UserProfileMetadata>,
 }
@@ -244,6 +250,7 @@ pub(crate) fn profile_from_record(
     record: RelayEventRecord,
 ) -> Option<(String, UserProfileMetadata)> {
     let content = serde_json::from_str::<serde_json::Value>(&record.event.content).ok()?;
+    content.as_object()?;
     Some((
         record.event.pubkey.clone(),
         UserProfileMetadata {
@@ -252,6 +259,7 @@ pub(crate) fn profile_from_record(
                 .or_else(|| string_field(&content, "displayName")),
             about: string_field(&content, "about"),
             picture: string_field(&content, "picture"),
+            banner: string_field(&content, "banner"),
             nip05: string_field(&content, "nip05"),
             lud16: string_field(&content, "lud16"),
             created_at: record.event.created_at,
@@ -280,6 +288,7 @@ fn is_known_profile_field(field: &str) -> bool {
             | "displayName"
             | "about"
             | "picture"
+            | "banner"
             | "nip05"
             | "lud16"
             | "created_at"
@@ -296,12 +305,16 @@ fn is_known_profile_field(field: &str) -> bool {
 const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 
 fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
-    value
+    let value = value
         .get(field)
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(MAX_PROFILE_FIELD_CHARS).collect())
+        .map(str::trim)?;
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PROFILE_FIELD_CHARS)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
 }
 
 pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
@@ -315,10 +328,50 @@ pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String
     relays
 }
 
-#[derive(Clone, Debug)]
+/// How closely a record's field matched the query, best first.
+///
+/// The declaration order *is* the ranking order — [`Ord`] is derived, so a
+/// new variant slots into the ranking by where it is written.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchQuality {
+    /// The whole field equals the query.
+    Exact,
+    /// The field starts with the query.
+    Prefix,
+    /// The query appears somewhere in the field.
+    Contains,
+}
+
+/// Which field of a record the query matched, most identifying first.
+///
+/// The declaration order *is* the ranking order (see [`MatchQuality`]): a
+/// name match outranks an `about` match of the same quality, and the two
+/// pubkey spellings rank last because matching them is incidental rather
+/// than a search for a person by that name.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchedField {
+    Name,
+    Nip05,
+    DisplayName,
+    About,
+    Npub,
+    Pubkey,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct UserRecordMatch {
-    pub(crate) field: String,
-    pub(crate) quality: String,
+    pub(crate) field: MatchedField,
+    pub(crate) quality: MatchQuality,
+}
+
+impl UserRecordMatch {
+    /// Ranking key: quality first, then which field matched. Sorting by this
+    /// orders best match first.
+    pub(crate) fn rank(&self) -> (MatchQuality, MatchedField) {
+        (self.quality, self.field)
+    }
 }
 
 pub(crate) fn user_record_match(
@@ -326,21 +379,21 @@ pub(crate) fn user_record_match(
     query: &str,
 ) -> Option<UserRecordMatch> {
     let mut candidates = vec![
-        ("npub", record.npub.as_str()),
-        ("pubkey", record.account_id_hex.as_str()),
+        (MatchedField::Npub, record.npub.as_str()),
+        (MatchedField::Pubkey, record.account_id_hex.as_str()),
     ];
     if let Some(profile) = &record.profile {
         if let Some(name) = profile.name.as_deref() {
-            candidates.push(("name", name));
+            candidates.push((MatchedField::Name, name));
         }
         if let Some(nip05) = profile.nip05.as_deref() {
-            candidates.push(("nip05", nip05));
+            candidates.push((MatchedField::Nip05, nip05));
         }
         if let Some(display_name) = profile.display_name.as_deref() {
-            candidates.push(("display_name", display_name));
+            candidates.push((MatchedField::DisplayName, display_name));
         }
         if let Some(about) = profile.about.as_deref() {
-            candidates.push(("about", about));
+            candidates.push((MatchedField::About, about));
         }
     }
 
@@ -349,45 +402,17 @@ pub(crate) fn user_record_match(
         .filter_map(|(field, value)| {
             let value = value.to_lowercase();
             let quality = if value == query {
-                "exact"
+                MatchQuality::Exact
             } else if value.starts_with(query) {
-                "prefix"
+                MatchQuality::Prefix
             } else if value.contains(query) {
-                "contains"
+                MatchQuality::Contains
             } else {
                 return None;
             };
-            Some(UserRecordMatch {
-                field: field.to_owned(),
-                quality: quality.to_owned(),
-            })
+            Some(UserRecordMatch { field, quality })
         })
-        .min_by(|a, b| {
-            match_quality_rank(&a.quality)
-                .cmp(&match_quality_rank(&b.quality))
-                .then_with(|| field_rank(&a.field).cmp(&field_rank(&b.field)))
-        })
-}
-
-pub(crate) fn match_quality_rank(quality: &str) -> u8 {
-    match quality {
-        "exact" => 0,
-        "prefix" => 1,
-        "contains" => 2,
-        _ => 3,
-    }
-}
-
-pub(crate) fn field_rank(field: &str) -> u8 {
-    match field {
-        "name" => 0,
-        "nip05" => 1,
-        "display_name" => 2,
-        "about" => 3,
-        "npub" => 4,
-        "pubkey" => 5,
-        _ => 6,
-    }
+        .min_by_key(UserRecordMatch::rank)
 }
 
 pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
@@ -417,6 +442,12 @@ pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json:
         value.insert(
             "picture".to_owned(),
             serde_json::Value::String(picture.clone()),
+        );
+    }
+    if let Some(banner) = profile.banner.as_ref().filter(|value| !value.is_empty()) {
+        value.insert(
+            "banner".to_owned(),
+            serde_json::Value::String(banner.clone()),
         );
     }
     if let Some(nip05) = profile.nip05.as_ref().filter(|value| !value.is_empty()) {
@@ -516,5 +547,134 @@ pub(crate) fn latest_fresh_profiles_from_records(
     DirectorySelection {
         value: latest_profiles_from_records(records),
         rejected_future,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cgka_traits::TransportEndpoint;
+    use transport_nostr_peeler::NostrTransportEvent;
+
+    use super::*;
+
+    /// The `matched_field` / `match_quality` wire strings are a published
+    /// contract: `wn users search --json` emits them and the TUI parses them
+    /// back (`cli/src/tui/model.rs`). They must survive any change to how the
+    /// two are modelled in Rust, so pin the serialized form rather than the
+    /// in-memory type.
+    #[test]
+    fn search_result_serializes_match_attribution_as_snake_case_strings() {
+        let result = UserDirectorySearchResult {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1example".to_owned(),
+            radius: 1,
+            matched_field: MatchedField::DisplayName,
+            match_quality: MatchQuality::Exact,
+            provider_rank: None,
+            profile: None,
+        };
+
+        let json = serde_json::to_value(&result).expect("search result serializes");
+
+        assert_eq!(json["matched_field"], "display_name");
+        assert_eq!(json["match_quality"], "exact");
+        assert!(
+            json.get("provider_rank").is_none(),
+            "graph-only results must not gain discovery metadata"
+        );
+        assert_eq!(
+            serde_json::from_value::<UserDirectorySearchResult>(json).expect("round-trips"),
+            result
+        );
+    }
+
+    /// Every wire spelling the CLI has ever emitted must still parse, in both
+    /// directions — a rename here would silently break an installed TUI.
+    #[test]
+    fn every_match_attribution_spelling_round_trips() {
+        for (field, wire) in [
+            (MatchedField::Name, "name"),
+            (MatchedField::Nip05, "nip05"),
+            (MatchedField::DisplayName, "display_name"),
+            (MatchedField::About, "about"),
+            (MatchedField::Npub, "npub"),
+            (MatchedField::Pubkey, "pubkey"),
+        ] {
+            assert_eq!(serde_json::to_value(field).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<MatchedField>(serde_json::json!(wire)).unwrap(),
+                field
+            );
+        }
+
+        for (quality, wire) in [
+            (MatchQuality::Exact, "exact"),
+            (MatchQuality::Prefix, "prefix"),
+            (MatchQuality::Contains, "contains"),
+        ] {
+            assert_eq!(serde_json::to_value(quality).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<MatchQuality>(serde_json::json!(wire)).unwrap(),
+                quality
+            );
+        }
+    }
+
+    #[test]
+    fn profile_string_fields_strip_control_characters() {
+        let content = serde_json::json!({
+            "name": "  alice\u{1b}[2J\nadmin\u{7}  ",
+            "about": "\u{0}\u{1b}",
+        });
+
+        assert_eq!(
+            string_field(&content, "name").as_deref(),
+            Some("alice[2Jadmin")
+        );
+        assert_eq!(string_field(&content, "about"), None);
+    }
+
+    #[test]
+    fn malformed_profile_content_is_not_treated_as_an_existing_profile() {
+        for malformed in ["not-json", "null", "[]", r#""string""#] {
+            let account_id = "11".repeat(32);
+            let records = vec![RelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
+                event: NostrTransportEvent::new_unsigned(
+                    account_id.clone(),
+                    KIND_NOSTR_METADATA,
+                    Vec::new(),
+                    malformed.to_owned(),
+                ),
+            }];
+
+            assert!(
+                !latest_profiles_from_records(records).contains_key(&account_id),
+                "accepted malformed kind-0 content: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_flattened_extra_banner_promotes_to_typed_field() {
+        // Before `banner` was typed, serde's flattened `extra` map wrote it at
+        // the profile's top level. New readers must promote that cached shape
+        // instead of losing it on the next profile update.
+        let cached: UserProfileMetadata = serde_json::from_value(serde_json::json!({
+            "name": "alice",
+            "banner": "https://example.test/banner.png",
+            "website": "https://example.test"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cached.banner.as_deref(),
+            Some("https://example.test/banner.png")
+        );
+        assert_eq!(
+            cached.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert!(!cached.extra.contains_key("banner"));
     }
 }

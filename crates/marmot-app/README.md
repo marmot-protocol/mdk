@@ -26,14 +26,24 @@ published to (and fetched from) the account's NIP-65 relays; there is no dedicat
 can check whether those lists are already present before writing local account state. The same status API can fetch
 those relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for deterministic
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
-KeyPackage ref separately; normal publish reuses the cached valid last-resort package, while explicit rotate or lifetime
-policy rejection creates a new package under the same slot.
+KeyPackage ref separately; normal publish reuses only a cached current-profile last-resort package, while explicit
+rotate, a legacy cache entry, or lifetime-policy rejection creates a new current-profile package under the same slot.
+
+Account open performs the strict profile cutover before transport processing: the encrypted session transactionally
+retires every locally stored legacy KeyPackage private bundle, then the app best-effort deletes cached and
+relay-discoverable legacy kind `30443` events. A private owner-only retry marker is written before relay cleanup, so a
+crash or relay failure cannot restore legacy join capability or lose the obligation to publish a current replacement.
+Legacy Welcomes are terminally rejected. Already-joined legacy groups remain usable by their existing members,
+including their Media V1 state, but membership additions and re-additions are refused.
 
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list
 event, pre-cache direct follows, and cache profile metadata for those likely contacts. Runtime startup builds chunked
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
-keep warming the cache. The crate also exposes bounded radius search over cached follow edges for future TUI/mobile
-pickers. That search is intentionally cache-backed and bounded; it is not a crawler for the whole Nostr social graph.
+keep warming the cache. The crate exposes two searches over that data for TUI/mobile pickers: `search_user_directory`
+answers offline from cached follow edges, and `search_users` streams matches while traversing the live follow graph,
+ranked by social distance. Live traversal is bounded by construction -- capped radius, batched author-scoped fetches
+under a per-radius timeout, and a per-search lifecycle that ends when its consumer drops the subscription -- and
+strangers it discovers are never promoted into the directory. It is not a crawler for the whole Nostr social graph.
 
 Group creation and invites still take pubkeys at the action boundary. If a member's KeyPackage is not already cached but
 the directory knows where their KeyPackages are published, the app fetches the latest package before building the MLS
@@ -50,10 +60,32 @@ the shared agent stream watch manager. The relay plane now also owns shared dire
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. Explicit catch-up remains
 available for repair and tests, but the daemon path is runtime-owned subscriptions plus typed events.
 
+`MarmotAppRuntime::start()` returns at local readiness: persisted account sessions are hydrated and worker-routed local
+reads are available. Relay activation, group-subscription registration, shared-directory synchronization, and initial
+catch-up continue asynchronously. Hosts should render local chat projections at that point, show network progress
+separately, and allow subsequent relay events to refresh or reorder the rendered rows. Mutating worker commands received
+during initial catch-up are deferred and replayed in order once the live client is ready.
+
 The crate root now keeps app construction, shared state, storage/projector wiring, directory bootstrap, account relay
 list helpers, and public re-exports. Runtime orchestration lives in the `src/runtime/` module, app-client commands and queries
 live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media
 DTOs plus Blossom upload/download helpers live in the `src/media/` module.
+
+## Encrypted media endpoints
+
+Encrypted media and encrypted group images are uploaded as opaque `application/octet-stream` blobs. A compatible
+Blossom server must accept arbitrary binary data rather than only recognizable image, audio, or video payloads. New
+groups use the ordered built-in ciphertext-compatible endpoint list unless the host build supplies
+`MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`. Encrypted media uploads try those endpoints in order; encrypted group-image
+uploads use only the primary (first) endpoint.
+
+The endpoint list is embedded in the signed `marmot.group.encrypted-media.v1` component. Changing application defaults
+does not rewrite existing group state. An active group admin can migrate an existing group with
+`replace_encrypted_media_blob_endpoints` through the app runtime or UniFFI API.
+
+Encrypted group images differ: no endpoint is stored in group state, so upload and fetch both resolve against the
+build's primary endpoint. Clients compiled with different defaults therefore look for group images in different
+places; re-setting the group image on a current build republishes it to the current primary endpoint.
 
 ## Run the tests
 

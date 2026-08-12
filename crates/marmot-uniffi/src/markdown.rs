@@ -2,13 +2,17 @@
 //!
 //! The parser crate owns the real AST. These records/enums keep the generated
 //! Swift/Kotlin surface stable and host-friendly.
+//!
+//! Destination classifications are renderer-policy input, not authorization.
+//! Hosts must inspect them before navigating to a link or fetching an image;
+//! the original untrusted destination is intentionally preserved.
 
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
     Alignment as MdAlignment, AutolinkKind as MdAutolinkKind, Block as MdBlock,
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
-    ListItem as MdListItem, ListKind as MdListKind, NostrEntity as MdNostrEntity,
-    NostrHrp as MdNostrHrp, TableCell as MdTableCell,
+    LinkDestinationKind as MdLinkDestinationKind, ListItem as MdListItem, ListKind as MdListKind,
+    NostrEntity as MdNostrEntity, NostrHrp as MdNostrHrp, TableCell as MdTableCell,
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
@@ -20,6 +24,9 @@ pub struct MarkdownDocumentFfi {
     /// True when the input exceeded the FFI Markdown safety cap and `blocks`
     /// were parsed from a UTF-8-boundary prefix.
     pub truncated: bool,
+    /// Blank source lines before each corresponding block, clamped by
+    /// `marmot-markdown` to its documented maximum.
+    pub blank_lines_before: Vec<u8>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -40,6 +47,8 @@ pub enum MarkdownBlockFfi {
     },
     BlockQuote {
         blocks: Vec<MarkdownBlockFfi>,
+        /// Blank source lines before each corresponding child block.
+        blank_lines_before: Vec<u8>,
     },
     /// Named `ListBlock` (not `List`) to match the sibling `*Block` variants and
     /// to avoid shadowing `kotlin.collections.List` in generated Kotlin bindings.
@@ -78,6 +87,8 @@ pub struct MarkdownListItemFfi {
     /// `None` for plain bullets/ordered items, `Some(false)` for `[ ]`,
     /// `Some(true)` for `[x]`.
     pub checked: Option<bool>,
+    /// Blank source lines before each corresponding child block.
+    pub blank_lines_before: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -117,15 +128,18 @@ pub enum MarkdownInlineFfi {
         dest: String,
         title: Option<String>,
         children: Vec<MarkdownInlineFfi>,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Image {
         dest: String,
         title: Option<String>,
         alt: Vec<MarkdownInlineFfi>,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Autolink {
         url: String,
         kind: MarkdownAutolinkKindFfi,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Math {
         content: String,
@@ -142,6 +156,20 @@ pub enum MarkdownInlineFfi {
 pub enum MarkdownAutolinkKindFfi {
     Uri,
     Email,
+    /// Bare `www.` host/path text. Hosts synthesize `https://` for navigation.
+    Www,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MarkdownLinkDestinationKindFfi {
+    Web,
+    Contact,
+    App,
+    Nostr,
+    Relative,
+    Unknown,
+    Dangerous,
+    Sensitive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -199,6 +227,7 @@ impl From<&MdDocument> for MarkdownDocumentFfi {
                 .map(|block| markdown_block_from_md(block, 0))
                 .collect(),
             truncated: false,
+            blank_lines_before: value.blank_lines_before.clone(),
         }
     }
 }
@@ -239,11 +268,15 @@ fn markdown_block_from_md(value: &MdBlock, depth: usize) -> MarkdownBlockFfi {
             info: info.clone(),
             content: content.clone(),
         },
-        MdBlock::BlockQuote { blocks } => MarkdownBlockFfi::BlockQuote {
+        MdBlock::BlockQuote {
+            blocks,
+            blank_lines_before,
+        } => MarkdownBlockFfi::BlockQuote {
             blocks: blocks
                 .iter()
                 .map(|block| markdown_block_from_md(block, depth + 1))
                 .collect(),
+            blank_lines_before: blank_lines_before.clone(),
         },
         MdBlock::List { kind, tight, items } => MarkdownBlockFfi::ListBlock {
             kind: kind.into(),
@@ -311,6 +344,7 @@ fn markdown_list_item_from_md(value: &MdListItem, depth: usize) -> MarkdownListI
             .map(|block| markdown_block_from_md(block, depth))
             .collect(),
         checked: value.checked,
+        blank_lines_before: value.blank_lines_before.clone(),
     }
 }
 
@@ -378,19 +412,32 @@ fn markdown_inline_from_md(value: &MdInline, depth: usize) -> MarkdownInlineFfi 
             dest,
             title,
             children,
+            classification,
         } => MarkdownInlineFfi::Link {
             dest: dest.clone(),
             title: title.clone(),
             children: markdown_inlines_from_md(children, depth + 1),
+            classification: (*classification).into(),
         },
-        MdInline::Image { dest, title, alt } => MarkdownInlineFfi::Image {
+        MdInline::Image {
+            dest,
+            title,
+            alt,
+            classification,
+        } => MarkdownInlineFfi::Image {
             dest: dest.clone(),
             title: title.clone(),
             alt: markdown_inlines_from_md(alt, depth + 1),
+            classification: (*classification).into(),
         },
-        MdInline::Autolink { url, kind } => MarkdownInlineFfi::Autolink {
+        MdInline::Autolink {
+            url,
+            kind,
+            classification,
+        } => MarkdownInlineFfi::Autolink {
             url: url.clone(),
             kind: (*kind).into(),
+            classification: (*classification).into(),
         },
         MdInline::Math(content) => MarkdownInlineFfi::Math {
             content: content.clone(),
@@ -409,6 +456,22 @@ impl From<MdAutolinkKind> for MarkdownAutolinkKindFfi {
         match value {
             MdAutolinkKind::Uri => Self::Uri,
             MdAutolinkKind::Email => Self::Email,
+            MdAutolinkKind::Www => Self::Www,
+        }
+    }
+}
+
+impl From<MdLinkDestinationKind> for MarkdownLinkDestinationKindFfi {
+    fn from(value: MdLinkDestinationKind) -> Self {
+        match value {
+            MdLinkDestinationKind::Web => Self::Web,
+            MdLinkDestinationKind::Contact => Self::Contact,
+            MdLinkDestinationKind::App => Self::App,
+            MdLinkDestinationKind::Nostr => Self::Nostr,
+            MdLinkDestinationKind::Relative => Self::Relative,
+            MdLinkDestinationKind::Unknown => Self::Unknown,
+            MdLinkDestinationKind::Dangerous => Self::Dangerous,
+            MdLinkDestinationKind::Sensitive => Self::Sensitive,
         }
     }
 }
@@ -488,7 +551,36 @@ mod tests {
         ));
         assert!(matches!(
             inlines[4],
-            MarkdownInlineFfi::Link { ref dest, .. } if dest == "https://example.com"
+            MarkdownInlineFfi::Link {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Web,
+                ..
+            } if dest == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn bridges_explicit_destination_classification_without_dropping_targets() {
+        let document =
+            parse_markdown_document("[verify](javascript:alert(1)) ![key](nostr:ncryptsec1qqqqqq)");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Link {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Dangerous,
+                ..
+            } if dest == "javascript:alert(1)"
+        ));
+        assert!(matches!(
+            inlines[2],
+            MarkdownInlineFfi::Image {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Sensitive,
+                ..
+            } if dest == "nostr:ncryptsec1qqqqqq"
         ));
     }
 
@@ -527,7 +619,51 @@ mod tests {
         };
         assert!(matches!(
             inlines[1],
-            MarkdownInlineFfi::Autolink { ref url, .. } if url == "marmot://profile/npub1abc"
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                classification: MarkdownLinkDestinationKindFfi::App,
+                ..
+            } if url == "marmot://profile/npub1abc"
+        ));
+    }
+
+    #[test]
+    fn bridges_www_autolink_kind() {
+        let document = parse_markdown_document("See www.example.com/path.");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Text { ref content } if content == "See "
+        ));
+        assert!(matches!(
+            inlines[1],
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                kind: MarkdownAutolinkKindFfi::Www,
+                classification: MarkdownLinkDestinationKindFfi::Web,
+            } if url == "www.example.com/path"
+        ));
+        assert!(matches!(
+            inlines[2],
+            MarkdownInlineFfi::Text { ref content } if content == "."
+        ));
+    }
+
+    #[test]
+    fn bridges_dangerous_autolink_classification_without_dropping_url() {
+        let document = parse_markdown_document("<javascript:alert(1)>");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                classification: MarkdownLinkDestinationKindFfi::Dangerous,
+                ..
+            } if url == "javascript:alert(1)"
         ));
     }
 
@@ -560,6 +696,25 @@ mod tests {
     }
 
     #[test]
+    fn bridges_blank_line_counts_for_every_block_owner() {
+        let document =
+            parse_markdown_document("first\n\n> quoted\n>\n> again\n\n- item\n\n  continuation");
+
+        assert_eq!(document.blank_lines_before, [0, 1, 1]);
+        let MarkdownBlockFfi::BlockQuote {
+            blank_lines_before, ..
+        } = &document.blocks[1]
+        else {
+            panic!("expected block quote");
+        };
+        assert_eq!(blank_lines_before, &[0, 1]);
+        let MarkdownBlockFfi::ListBlock { items, .. } = &document.blocks[2] else {
+            panic!("expected list");
+        };
+        assert_eq!(items[0].blank_lines_before, [0, 1]);
+    }
+
+    #[test]
     fn bridges_pathological_nesting_without_unbounded_recursion() {
         let document = parse_markdown_document(&">".repeat(2_000));
         assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);
@@ -571,7 +726,7 @@ mod tests {
 
     fn max_single_block_depth(block: &MarkdownBlockFfi) -> usize {
         match block {
-            MarkdownBlockFfi::BlockQuote { blocks } => 1 + max_block_depth(blocks),
+            MarkdownBlockFfi::BlockQuote { blocks, .. } => 1 + max_block_depth(blocks),
             MarkdownBlockFfi::ListBlock { items, .. } => {
                 1 + items
                     .iter()

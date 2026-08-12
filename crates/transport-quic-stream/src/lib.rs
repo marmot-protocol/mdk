@@ -6,12 +6,14 @@
 //! constants live in `cgka-traits`; live chunks are provisional preview data
 //! and the final MLS app payload remains authoritative.
 
+mod candidate;
 mod crypto;
 mod error;
 mod frame;
 mod hardening;
 mod limits;
 mod protocol;
+mod publisher_sequence;
 mod receive;
 mod send;
 mod tls;
@@ -19,6 +21,7 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
+pub use candidate::{QUIC_CANDIDATE_MAX_LEN, QuicCandidate, QuicCandidateError};
 pub use crypto::{
     AgentTextStreamCrypto, decrypt_record, derive_record_key, derive_record_nonce, encrypt_record,
     record_aad,
@@ -36,6 +39,12 @@ pub use limits::{
 pub use protocol::{
     AGENT_TEXT_STREAM_FRAME_ALLOWANCE, QUIC_STREAM_ALPN_V1, QUIC_STREAM_PROTOCOL_V1,
     effective_plaintext_cap, frame_len_cap,
+};
+#[doc(hidden)]
+pub use publisher_sequence::reserve_publisher_records as reserve_publisher_records_for_transport;
+pub use publisher_sequence::{
+    EphemeralPublisherSequenceStore, PublisherSequenceReservation, PublisherSequenceSnapshot,
+    PublisherSequenceStore, ReservedPublisherRecords,
 };
 pub use receive::{
     QuicTextStreamReceiver, ReceivedTextChunk, ReceivedTextStream, ServerTrust, stream_record_text,

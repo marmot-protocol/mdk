@@ -48,7 +48,7 @@ fn render_block(b: &Block, out: &mut String) {
             out.push_str(&escape(content));
             out.push_str("</code></pre>\n");
         }
-        Block::BlockQuote { blocks } => {
+        Block::BlockQuote { blocks, .. } => {
             out.push_str("<blockquote>\n");
             render_blocks(blocks, out);
             out.push_str("</blockquote>\n");
@@ -169,6 +169,7 @@ fn render_inline(i: &Inline, out: &mut String) {
             dest,
             title,
             children,
+            ..
         } => {
             let title_attr = title
                 .as_deref()
@@ -178,7 +179,9 @@ fn render_inline(i: &Inline, out: &mut String) {
             render_inlines(children, out);
             out.push_str("</a>");
         }
-        Inline::Image { dest, title, alt } => {
+        Inline::Image {
+            dest, title, alt, ..
+        } => {
             let title_attr = title
                 .as_deref()
                 .map(|t| format!(" title=\"{}\"", escape(t)))
@@ -192,10 +195,11 @@ fn render_inline(i: &Inline, out: &mut String) {
                 title_attr
             ));
         }
-        Inline::Autolink { url, kind } => {
+        Inline::Autolink { url, kind, .. } => {
             let href = match kind {
                 AutolinkKind::Uri => url.clone(),
                 AutolinkKind::Email => format!("mailto:{url}"),
+                AutolinkKind::Www => format!("https://{url}"),
             };
             out.push_str(&format!("<a href=\"{}\">", escape_attr(&href)));
             out.push_str(&escape(url));

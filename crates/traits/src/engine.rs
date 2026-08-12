@@ -18,10 +18,11 @@
 //! breaking the contract.
 
 use crate::app_components::{AppComponentData, AppComponentId};
+use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
-use crate::group::Member;
+use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
 use crate::transport::TransportMessage;
@@ -60,6 +61,14 @@ pub struct KeyPackage {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<KeyPackageSource>,
+    /// Persisted application-profile classification asserted by the wrapper.
+    ///
+    /// Raw KeyPackages constructed before the strict cutover default to
+    /// legacy. The engine must verify this value against the decoded
+    /// account-proof carrier before any behavior branches on it; it is not a
+    /// statement about whether the MLS bytes use `app_data_dictionary`.
+    #[serde(default)]
+    pub protocol_profile: ProtocolProfile,
 }
 
 impl KeyPackage {
@@ -67,6 +76,7 @@ impl KeyPackage {
         Self {
             bytes,
             source: None,
+            protocol_profile: ProtocolProfile::Legacy,
         }
     }
 
@@ -74,7 +84,13 @@ impl KeyPackage {
         Self {
             bytes,
             source: Some(KeyPackageSource { event_id }),
+            protocol_profile: ProtocolProfile::Legacy,
         }
+    }
+
+    pub fn with_protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
+        self.protocol_profile = protocol_profile;
+        self
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -84,7 +100,10 @@ impl KeyPackage {
 
 impl PartialEq for KeyPackage {
     fn eq(&self, other: &Self) -> bool {
-        self.bytes == other.bytes
+        // Transport provenance does not change KeyPackage identity, but the
+        // application-profile classification is security-relevant metadata
+        // and must not disappear from equality assertions or keyed sets.
+        self.bytes == other.bytes && self.protocol_profile == other.protocol_profile
     }
 }
 
@@ -93,6 +112,7 @@ impl Eq for KeyPackage {}
 impl Hash for KeyPackage {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.bytes.hash(state);
+        self.protocol_profile.hash(state);
     }
 }
 
@@ -113,6 +133,12 @@ pub enum SendIntent {
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
+    /// Rotate only this sender's MLS LeafNode key material.
+    ///
+    /// The engine forces an update path and deliberately leaves the proposal
+    /// store untouched, so maintenance cannot accidentally commit unrelated
+    /// pending proposals.
+    SelfUpdate { group_id: GroupId },
     /// Update one or more MLS app-component dictionary entries.
     ///
     /// This is the generic path for group settings such as profile,
@@ -129,6 +155,13 @@ pub enum SendIntent {
         name: Option<String>,
         description: Option<String>,
     },
+    /// Install `marmot.group.lifecycle.v1 = active` and require the component
+    /// in one admin Commit for a compatible existing group.
+    EnableDisbanding { group_id: GroupId },
+    /// Persist the irreversible local intent to terminate the group. Preparing
+    /// and publishing the terminal Commit is driven asynchronously from this
+    /// durable request.
+    Disband { group_id: GroupId },
 }
 
 /// The engine's response to [`CgkaEngine::send`].
@@ -137,8 +170,27 @@ pub enum SendIntent {
 /// member additions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
+    /// The requested idempotent mutation was already reflected by canonical
+    /// state, so no transport publication is necessary.
+    NoChange { group_id: GroupId },
+    /// The irreversible disband request is durable. The engine prepares its
+    /// terminal Commit asynchronously after any staged publish and the
+    /// mandatory convergence gate permit it.
+    DisbandRequested {
+        request: crate::storage::DisbandRequest,
+    },
     /// Pure application message — publish once, no state advance.
-    ApplicationMessage { msg: TransportMessage },
+    ApplicationMessage {
+        msg: TransportMessage,
+        group_id: GroupId,
+        /// Inner [`MarmotAppEvent::id`](crate::app_event::MarmotAppEvent)
+        /// from the encrypted application payload.
+        app_event_id: String,
+        /// Exact MLS epoch whose state encrypted this message.
+        source_epoch: EpochId,
+        /// Retention decision resolved from that same encryption state.
+        retention: AppMessageRetentionDecision,
+    },
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
     /// will be regenerated from the canonical state when the group becomes
@@ -163,15 +215,21 @@ pub enum SendResult {
         welcomes: Vec<TransportMessage>,
         pending: PendingStateRef,
     },
-    /// Initial group creation. Only `welcomes` need publishing — there's no
-    /// pre-existing member to consume a commit, so the founding client
-    /// doesn't emit one. The application calls
-    /// [`CgkaEngine::confirm_published`] once every welcome is handed off
-    /// to the transport.
+    /// Legacy-profile initial group creation. Only `welcomes` need publishing;
+    /// the founding commit is staged until the caller resolves `pending`.
+    /// Retained temporarily for explicit legacy-profile compatibility until
+    /// strict creation cutover removes this path.
     GroupCreated {
         welcomes: Vec<TransportMessage>,
         pending: PendingStateRef,
     },
+    /// Current-profile founding creation. The epoch-0 group and its optional
+    /// founding Add are already canonical when this result is returned. No
+    /// normal group message or pending publish handle exists; each Welcome is
+    /// an independent delivery obligation whose failure cannot roll back the
+    /// group. This result alone does not imply any Welcome was delivered:
+    /// callers must publish and acknowledge every entry independently.
+    FoundingGroupCreated { welcomes: Vec<TransportMessage> },
 }
 
 /// Group evolution produced as a side effect of inbound processing.
@@ -307,6 +365,9 @@ pub enum GroupStateChange {
     GroupAvatarChanged,
     /// The per-group disappearing-message retention changed. `0` means disabled.
     MessageRetentionChanged { old_seconds: u64, new_seconds: u64 },
+    /// The selected Commit terminalized the group. The authenticated committer
+    /// is carried as the surrounding event actor.
+    GroupDisbanded,
 }
 
 /// Why a stored group was skipped during session-open hydration.
@@ -317,7 +378,8 @@ pub enum GroupStateChange {
 /// surface per-group recovery while keeping healthy groups available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupHydrationQuarantineReason {
-    /// OpenMLS returned an error while loading the stored group state.
+    /// OpenMLS returned an error while loading the stored group state or while
+    /// persisting mandatory configuration normalization during hydration.
     OpenMlsLoadFailed,
     /// Marmot metadata referenced a group whose OpenMLS state was missing.
     OpenMlsGroupMissing,
@@ -339,13 +401,33 @@ pub enum GroupEvent {
     GroupJoined {
         group_id: GroupId,
         via_welcome: MessageId,
+        /// MLS-authenticated Welcome author derived from the GroupInfo signer
+        /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
+    },
+    /// A raw transport object was released solely because a local durable
+    /// resource budget expired. This is not a protocol validity verdict and
+    /// does not create terminal duplicate state; exact-id redelivery remains
+    /// eligible. Applications use it to arm transport-history recovery.
+    TransportObjectResourceRefused {
+        group_id: GroupId,
+        message_id: MessageId,
+        resource: crate::ingest::InboundResourceLimit,
     },
     MessageReceived {
         group_id: GroupId,
+        /// Content-derived transport message id. This binds application-layer
+        /// decisions to the engine's durable ingress order rather than to a
+        /// sender-controlled wall clock.
+        message_id: MessageId,
         sender: MemberId,
         epoch: EpochId,
         payload: Vec<u8>,
+        /// Retention policy resolved from the authenticated MLS source epoch.
+        /// `None` is a safe legacy/recovery result when that historical policy
+        /// is not recoverable; callers must not substitute the live policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention: Option<AppMessageRetentionDecision>,
     },
     AppMessageInvalidated {
         group_id: GroupId,
@@ -531,9 +613,10 @@ pub trait CgkaEngine: Send + Sync {
     /// [`IngestOutcome::Buffered`] and replay once the state returns to
     /// `Stable`.
     ///
-    /// **Errors.** `UnknownGroup`, `Peeler`, `ForkedEpoch`, `Backend`. Stale
-    /// / duplicate / not-for-us messages return
-    /// `Ok(IngestOutcome::Stale { .. })`, **not** `Err`.
+    /// **Errors.** `UnknownGroup`, `Peeler`, `ForkedEpoch`, `Backend`.
+    /// Duplicate/routing exclusions return `Ignored`, canonical local blocks
+    /// return `LocalState`, and stale convergence dispositions return `Stale`;
+    /// none are `Err`.
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError>;
 
     /// Drain ordered `GroupEvent`s produced since the last drain. Application
@@ -562,15 +645,73 @@ pub trait CgkaEngine: Send + Sync {
     /// [`IngestOutcome::Buffered`].
     fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId>;
 
+    /// Prepare this group's durable pass and return its remaining process-local
+    /// cutoff delay.
+    ///
+    /// This command may open a pass for eligible retained input, consume a
+    /// dormant fairness slot, or persist restart deadline rebasing. `None`
+    /// means no eligible pass is active. Applications use it only to arm
+    /// independent per-group timers; it is not a diagnostic query or a
+    /// branch-selection input.
+    fn prepare_convergence_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError>;
+
     // ── Outbound ────────────────────────────────────────────────────────────
 
     /// Encrypt + prepare an outbound message or group operation.
     ///
-    /// **State.** Valid when the group is in `Stable`. If convergence input
-    /// is still unresolved, the engine stores the intent and returns
-    /// [`SendResult::Queued`]. Returns `InvalidTransition` if called during
-    /// `PendingPublish` / `Merging`.
+    /// **State.** Group-state intents (commits, admin changes) are valid only
+    /// from `Stable`; any other state returns `InvalidTransition`. The one
+    /// exception is [`SendIntent::Disband`] — see below.
+    ///
+    /// [`SendIntent::AppMessage`] is additionally accepted while
+    /// [`EpochState::is_resolving_local_publish`], because a publication this
+    /// client staged owes its exit to a transport outcome and then a local
+    /// merge — neither of which the user who is typing controls, and both of
+    /// which can take minutes when relays misbehave. The payload is stored and
+    /// [`SendResult::Queued`] returned; the engine re-prepares it against
+    /// whatever canonical state the group lands on, so a message retained
+    /// across an epoch change is encrypted under the *later* epoch.
+    ///
+    /// Every other non-`Stable` state refuses it. `Recovering` awaits a
+    /// convergence decision over remote branches rather than a local
+    /// publication, which is a separate retention question; terminal states
+    /// (`Unrecoverable`, `Disbanded`) accept no new work at all. Refusal here is
+    /// about *new* work: intents already retained when a group halts persist for
+    /// its one legal exit, and a drain after a verified repair prepares them
+    /// under the post-repair epoch.
+    ///
+    /// Unresolved convergence input queues every intent kind the same way.
+    ///
+    /// [`SendIntent::Disband`] is not epoch-state gated at all: it only
+    /// persists the irreversible request, so `PendingPublish`, `Merging`, and
+    /// `Unrecoverable` all still accept it. Preparing its Commit keeps the
+    /// ordinary `Stable` requirement, so a halted group records the request
+    /// without acting on it. A `Disbanded` group refuses it like every other
+    /// intent.
+    ///
+    /// [`EpochState::is_resolving_local_publish`]:
+    ///     crate::engine_state::EpochState::is_resolving_local_publish
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError>;
+
+    /// Durably accept an application-message intent without preparing MLS or
+    /// transport bytes yet.
+    ///
+    /// This is the transport-lifecycle fallback for a locally ready signing
+    /// account whose transport is not active. The same authoritative
+    /// quarantine, disband, removal, unrecoverable, leave, and epoch-state
+    /// gates as [`Self::send`] still apply — including its retention boundary:
+    /// a state resolving a local publication accepts the payload, every other
+    /// non-`Stable` state refuses it. On success the group is scheduled for
+    /// convergence so the intent is regenerated from current canonical state
+    /// before publication.
+    async fn queue_app_message(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+    ) -> Result<SendResult, EngineError>;
 
     /// Advance convergence for a group and release any queued outbound work
     /// that is now safe to regenerate from the selected canonical state.
@@ -596,7 +737,16 @@ pub trait CgkaEngine: Send + Sync {
         group_id: &GroupId,
     ) -> Result<Vec<SendResult>, EngineError>;
 
-    /// Confirm that a [`SendResult::GroupEvolution`] (or
+    /// Retire a durable queued intent after its regenerated standalone
+    /// message or proposal was accepted by the transport. Group-evolution
+    /// intents are retired automatically by [`Self::confirm_published`].
+    fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError>;
+
+    /// Re-arm a group after a regenerated standalone queued publish reached no
+    /// endpoint. The durable intent remains intact until confirmation.
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId);
+
+    /// Confirm that a [`SendResult::GroupEvolution`] (or legacy-profile
     /// [`SendResult::GroupCreated`]) was successfully published to the
     /// transport. The engine applies the staged commit to local MLS state,
     /// updates Marmot bookkeeping + capability cache, and emits
@@ -616,12 +766,12 @@ pub trait CgkaEngine: Send + Sync {
         pending: PendingStateRef,
     ) -> Result<GroupEvent, EngineError>;
 
-    /// Report that a [`SendResult::GroupEvolution`] (or
-    /// [`SendResult::GroupCreated`]) failed to publish. The engine
-    /// discards the staged commit (`MlsGroup::clear_pending_commit`),
-    /// rewinds Marmot/cache state to its pre-stage shape, and transitions
-    /// back to `Stable` at the prior epoch. The group is immediately
-    /// usable for a fresh `send`.
+    /// Report that a [`SendResult::GroupEvolution`] (or legacy-profile
+    /// [`SendResult::GroupCreated`]) failed to publish. The engine discards
+    /// the staged commit
+    /// (`MlsGroup::clear_pending_commit`), rewinds Marmot/cache state to its
+    /// pre-stage shape, and transitions back to `Stable` at the prior epoch.
+    /// The group is immediately usable for a fresh `send`.
     ///
     /// **Errors.** `UnknownPending` if the ref has already been confirmed,
     /// rolled back, or was never issued.
@@ -630,8 +780,13 @@ pub trait CgkaEngine: Send + Sync {
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Create a new group with the named members (via their KeyPackages) and
-    /// the requested required features. Returns the new `GroupId` and a
-    /// `SendResult::GroupEvolution` carrying the initial welcomes.
+    /// the requested required features.
+    ///
+    /// Current-profile creation returns
+    /// [`SendResult::FoundingGroupCreated`]: the group is already canonical
+    /// locally and the result carries only independently deliverable
+    /// Welcomes. Explicit legacy-profile creation temporarily returns
+    /// [`SendResult::GroupCreated`] with its older pending lifecycle.
     ///
     /// **Validation.** Every invitee's KeyPackage must advertise the union of
     /// capabilities required by `required_features`. On mismatch, returns
@@ -640,6 +795,25 @@ pub trait CgkaEngine: Send + Sync {
         &mut self,
         req: CreateGroupRequest,
     ) -> Result<(GroupId, SendResult), EngineError>;
+
+    /// Create a group with additional initial GroupContext component state
+    /// that is deliberately not added to the group's required-component list.
+    ///
+    /// Optional state is useful for progressive presentation features such as
+    /// group avatars: capable members can render it, while the state does not
+    /// become a permanent membership gate.
+    async fn create_group_with_optional_app_components(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<AppComponentData>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        if optional_app_components.is_empty() {
+            return self.create_group(req).await;
+        }
+        Err(EngineError::Other(
+            "this engine does not support optional initial app-component state".into(),
+        ))
+    }
 
     /// Accept a welcome addressed to the local identity.
     ///
@@ -658,7 +832,8 @@ pub trait CgkaEngine: Send + Sync {
     ) -> Result<FeatureStatus, EngineError>;
 
     /// Capabilities that would result from constructing a group with the
-    /// given members (intersection of every invitee's advertised caps).
+    /// given members (intersection of the creator's and every invitee's
+    /// advertised caps).
     fn constructable_capabilities(
         &self,
         key_packages: &[KeyPackage],
@@ -675,6 +850,13 @@ pub trait CgkaEngine: Send + Sync {
     /// Upgrade the group to require every currently-upgradeable capability.
     /// Produces a `SendResult::GroupEvolution` whose commit updates
     /// `RequiredCapabilities`.
+    ///
+    /// A state-bearing app component must already have optional GroupContext
+    /// state before this method can promote it to required. Install and publish
+    /// that state first with [`SendIntent::UpdateAppComponents`], then call this
+    /// method and publish its second commit. Promotion fails closed without
+    /// staging a commit when the component state is absent; there is currently
+    /// no atomic require-and-populate API.
     async fn upgrade_group_capabilities(
         &mut self,
         group_id: &GroupId,

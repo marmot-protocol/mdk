@@ -1,11 +1,11 @@
 {
   "scenario_name": "convergence-incident/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.4",
+  "conformance_version": "0.9.11",
   "seed": null,
   "scenario": {
     "name": "convergence-incident/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -29,9 +29,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -68,14 +69,16 @@
         "pending": "invite-b"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "invite-a"
+        "publication": "invite-a",
+        "outcome": "accepted"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "bob",
-        "pending": "invite-b"
+        "publication": "invite-b",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -95,6 +98,27 @@
     ]
   },
   "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 7,
+      "client": "alice",
+      "pending": "invite-a",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "bob",
+      "pending": "invite-b",
+      "resolution": "confirmed"
+    },
     {
       "type": "convergence_decision",
       "client": "carol",

@@ -78,11 +78,42 @@ fn a_stream_reporting_a_mid_stream_failure_is_rejected() {
 #[test]
 fn a_stream_without_a_leading_manifest_is_rejected() {
     let input = r#"{"t": "event", "kind": {"type": "epoch_confirmed", "epoch": 1}}"#;
-    assert!(!is_stream(input));
+    assert!(is_stream(input));
     assert!(matches!(
         parse_stream(input),
         Err(StreamParseError::MissingManifest)
     ));
+}
+
+#[test]
+fn a_manifest_less_error_remnant_is_detected_as_a_stream_and_rejected() {
+    // A stream truncated to just its terminal in-band error line (e.g. after an
+    // immediate server abort) carries a `t` discriminator and must be classified
+    // as a stream so it fail-closes with ServerReportedError instead of reading
+    // as a healthy document.
+    let input = r#"{"t": "error", "complete": false}"#;
+    assert!(is_stream(input));
+    assert!(matches!(
+        parse_stream(input),
+        Err(StreamParseError::ServerReportedError { line: 1 })
+    ));
+}
+
+#[test]
+fn malformed_stream_discriminators_never_fall_back_to_the_document_parser() {
+    for input in [
+        r#"{"t": null}"#,
+        r#"{"t": 0}"#,
+        r#"{"t": {}}"#,
+        r#"{"t": []}"#,
+        r#"{"t": "error", "t": null}"#,
+    ] {
+        assert!(is_stream(input), "stream-shaped input was missed: {input}");
+        assert!(
+            parse_stream(input).is_err(),
+            "malformed stream unexpectedly parsed: {input}"
+        );
+    }
 }
 
 #[test]

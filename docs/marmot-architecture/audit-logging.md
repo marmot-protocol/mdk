@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-06-24
+updated: 2026-08-06
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -36,8 +36,8 @@ treated like telemetry.
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`fork_recovery.rs`](../../crates/cgka-engine/src/fork_recovery.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
 | Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
 | App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
-| Runtime tracker scheduling | [`crates/marmot-app/src/runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
-| UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions.rs`](../../crates/marmot-uniffi/src/conversions.rs) |
+| Runtime tracker scheduling | [`crates/marmot-app/src/runtime/`](../../crates/marmot-app/src/runtime) |
+| UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions/`](../../crates/marmot-uniffi/src/conversions) |
 | Tests | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/cgka-engine/tests/audit_log.rs`](../../crates/cgka-engine/tests/audit_log.rs), [`crates/marmot-app/tests/audit_logs.rs`](../../crates/marmot-app/tests/audit_logs.rs) |
 
 ## Enablement and lifecycle
@@ -190,6 +190,17 @@ and retain the raw line for forward-compatible reprocessing.
 
 ## Event catalogue
 
+This catalogue is not yet complete. `AuditEventKind` currently has 42 variants, and these thirteen have no section
+here yet — treat `crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
+`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_armed`,
+`epoch_stall_backfill_escalated`, `group_hydration_quarantined`, `group_hydration_recovered`,
+`message_content_decoded`, `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`,
+`subscription_rebuild`, `sync_drain`, and `transport_received`.
+
+The authoritative catalogue is the `AuditEventKind` enum together with
+[`audit-log-event.v2.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v2.schema.json); the
+`audit_log_event_schema_tracks_kind_catalog` test keeps those two in lockstep.
+
 ### `recorder_started`
 
 Emitted by `JsonlRecorder::open_with_account_ref()` as the first row for each local recorder opening.
@@ -328,25 +339,42 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex `MessageId` of the inbound message. |
-| `outcome_kind` | `processed`, `buffered`, or `stale`. |
-| `stale_reason` | Present only when `outcome_kind == "stale"`. |
+| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, or `rejected`. |
+| `stale_reason` | Legacy optional category field used by non-processed outcomes. |
 | `epoch` | Present for buffered outcomes and `already_at_epoch` stale outcomes. |
 
 `stale_reason` values:
 
 | Value | Meaning |
 | --- | --- |
-| `already_seen` | Message id was already ingested. |
+| `duplicate` | Message id or content was already ingested. |
 | `already_at_epoch` | Engine is already at or beyond the message epoch; `epoch` records the current epoch. |
-| `not_for_this_client` | Welcome/inbox message was not addressed to this client. |
+| `wrong_recipient` | Welcome/inbox message was not addressed to this client. |
 | `unknown_group` | Message referenced a group the engine does not know. |
 | `own_echo` | Message was produced by this engine and bounced back through ingest. |
-| `peel_failed` | MLS/transport peeling failed or could not be recovered. |
+| `invalid_encoding` | Transport or recovered protocol bytes failed structural validation. |
+| `invalid_signature` | A required transport or protocol signature failed validation. |
+| `unsupported_required_feature` | The input requires a feature the engine does not support. |
+| `authorization_failed` | Authenticated input was not authorized in the applicable state. |
+| `transport_deferred` | Current transport context cannot decrypt the object; a changed context may recover it. |
+| `resource_refused_deferred_capacity` | The per-group retained transport-deferred row cap was full. |
+| `resource_refused_retry_budget` | A retained transport object exhausted its changed-context retry budget and was released. |
+| `pre_membership` | The message predates this account-device's membership. |
+| `beyond_anchor` | Convergence excluded input below the retained anchor. |
+| `beyond_rollback_horizon` | Convergence excluded input beyond the rollback horizon. |
+| `beyond_app_retention` | The application-message source epoch is outside retained decryption history. |
+| `losing_branch` | The message belongs only to a losing branch. |
+| `invalid_against_canonical_state` | Authenticated input is invalid against the selected candidate state. |
+| `removed` | Authenticated canonical state records this local member's removal. |
+| `quarantined` | Hydration validation froze the local group pending repair. |
 
 Metadata notes:
 
 - This event is not emitted if `do_ingest()` returns an `Err`.
-- It has `group_ref` when the outcome is `buffered`, because that outcome carries the group id.
+- It has `group_ref` when the outcome is `buffered`, `transport_deferred`, or `resource_refused`, because those
+  outcomes carry the group id.
+- The JSON field remains named `stale_reason` for v1/v2 schema compatibility. Its type and required-field set did not
+  change, so this additive outcome taxonomy does not require a forensic schema-version bump.
 
 ### `ingest_error`
 
@@ -561,11 +589,17 @@ Current `new_state` values:
 
 Current `reason` values found in production call sites:
 
+- `founding_create`
 - `hydrate_stable_group`
+- `hydrate_unrecoverable_group`
+- `hydrate_durable_group_evolution`
 - `join_welcome`
+- `join_welcome_repair`
 - `begin_pending`
 - `publish_confirmed`
 - `publish_failed`
+- `auto_commit_stage_failed`
+- `update_group_data_stage_failed`
 - `fork_detected`
 - `missing_retained_anchor`
 
@@ -573,6 +607,25 @@ Metadata notes:
 
 - `epoch_confirmed` and `epoch_rolled_back` remain the detailed publish lifecycle rows. `epoch_state_changed` is the
   state-machine breadcrumb that lets analyzers reconstruct the client's group state without replaying engine internals.
+- `new_state = "unrecoverable"` is a terminal halt: convergence and ingest stay blocked for that group until a verified
+  repair path clears the marker, and `reason = "hydrate_unrecoverable_group"` means the halt was durable and survived a
+  process restart. `crates/incident-replay` treats these rows as one of its two halt surfaces (the other being
+  `convergence_run_state` with `phase = "unrecoverable"`) and quarantines the export naming the affected engines —
+  unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
+  `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
+  Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
+- `reason = "missing_retained_anchor"` has exactly one emission site: the convergence coordinator's
+  materialization-time halt, paired with a `convergence_run_state` row carrying the same `error_kind`. Direct ingest
+  never emits it. Ingest reaches the same missing-anchor condition through OpenMLS's `WrongEpoch` framing check, which
+  runs upstream of every signature and membership-tag check, so the rival's claimed source epoch is unauthenticated
+  there and no terminal state may be derived from it. Ingest instead records a `rejection` row with
+  `reason = "fork_rival_missing_retained_anchor"`, keeps the rival's retained content row, and schedules the group, so
+  the coordinator issues the halt from its own verdict. The retained row stays pass-opening precisely so that verdict
+  keeps being reachable; the `join_welcome_repair` exit is what clears it, retiring unresolved commits below the
+  replacement Welcome's own epoch with `message_state_changed`
+  `reason = "superseded_by_replacement_welcome"`. Without that retirement a repaired group re-halts on its next drain,
+  so an analyzer seeing `join_welcome_repair` with no following halt should expect those retirement rows in the same
+  join.
 
 ### `group_state_changed`
 
@@ -683,6 +736,63 @@ Metadata notes:
 - If `error_kinds` contains `missing_retained_anchor`, the engine also emits `epoch_state_changed` with
   `new_state = "unrecoverable"` and `reason = "missing_retained_anchor"`.
 
+### `convergence_run_state`
+
+Emitted when a distributed-convergence run changes lifecycle phase. Correlated with its `convergence_decision` through
+the `convergence.run_id` context, so a run's phases and its selection are one story.
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | Lifecycle phase the run moved into. |
+| `current_tip_epoch` | Canonical tip the run is working from. An epoch the engine has locally materialized. |
+| `retained_anchor_horizon` | Retained-history horizon available to the run, when known. |
+| `reason` | Stable call-site reason for the phase change, when one applies. |
+| `error_kind` | Stable error tag underlying a failed or unrecoverable phase. |
+
+`phase` values:
+
+- `started`
+- `waiting`
+- `evaluating`
+- `selected`
+- `blocked`
+- `applied`
+- `failed`
+- `stable`
+- `unrecoverable`
+
+`reason` values found in production call sites:
+
+- `no_eligible_input`
+- `resolving`
+- `syncing`
+- `blocked`
+- `group_quarantined`
+- `already_unrecoverable`
+- `frozen_pass_integrity_failure`
+
+`error_kind` values found in production call sites:
+
+- `frozen_member_integrity`
+- `missing_retained_anchor`
+
+Metadata notes:
+
+- This event has `group_ref`.
+- `phase = "unrecoverable"` is terminal: the convergence pass halted and the group stays blocked until a verified repair
+  path clears the marker. `crates/incident-replay` treats it as one of its two halt surfaces (the other being
+  `epoch_state_changed` with `new_state = "unrecoverable"`) and quarantines the export naming the affected engines.
+- `current_tip_epoch` is the engine's own materialized tip, so analyzers may fold it into a per-engine epoch high-water
+  mark the same way they fold `convergence_decision.current_tip_epoch`. Real exports carry roughly twice as many
+  run-state rows as decisions, making this the denser of the two signals.
+- A pass whose base epoch disagrees with the tip is no longer a halt. Older exports carry that disagreement as
+  `phase = "unrecoverable"` with `reason = "convergence_pass_base_changed"` and `error_kind = "base_epoch_mismatch"`;
+  since mdk#1182 the engine discards the stale pass and reopens at the tip, emitting the non-terminal
+  `convergence_pass_discarded` instead. Analyzers reading historical exports should still recognize the retired pair as
+  a halt; nothing emits it today.
+- The `missing_retained_anchor` halt is the one `unrecoverable` phase that carries no `reason`, only that `error_kind`,
+  so a consumer reporting a halt reason must fall back to `error_kind`.
+
 ### `peeler_outcome`
 
 Emitted around transport peeler results at the engine boundary.
@@ -757,15 +867,19 @@ Emitted when a stored message is inserted or changes `MessageState`.
 | `epoch` | Message epoch when known. |
 | `reason` | Stable call-site reason. |
 
-`new_state` values:
+`new_state` values — the `MessageState` strings, plus one non-state release marker:
 
 - `sent`
 - `created`
 - `processed`
 - `failed`
 - `retryable`
+- `convergence_deferred` — a completed convergence pass gave the input no terminal disposition. It stays graph input
+  for a later pass without reopening convergence itself; evidence that later selects it moves it to `processed`.
 - `peel_deferred`
 - `epoch_invalidated`
+- `released` — not a stored state: the deferred-peel row was deleted under a resource refusal
+  (`resource_refused_retry_budget` below), and same-id redelivery stays eligible.
 
 Current `reason` values found in production call sites:
 
@@ -775,9 +889,12 @@ Current `reason` values found in production call sites:
 | `state_update` | Generic `update_stored_message_state` path updates a stored message. |
 | `publish_confirmed` | A pending commit message is promoted to processed after publish confirmation. |
 | `fork_loser` | A same-epoch incumbent branch loses fork resolution and its message is invalidated. |
-| `peel_failed_no_snapshot` | Group-message peel failed and no fallback snapshot could recover it; state becomes `peel_deferred`. |
+| `peel_failed_no_snapshot` | Historical stable tag: group-message peel failed and no fallback snapshot could recover it; the outcome is `transport_deferred` and state becomes `peel_deferred`. |
+| `resource_refused_deferred_capacity` | The retained transport-deferred row cap refused an additional object without persisting it. |
+| `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
-| `too_distant_in_the_past` | A deferred raw transport message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained past-epoch window; state becomes `failed`. |
+| `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
+| `superseded_by_replacement_welcome` | A verified replacement Welcome discarded this device's live MLS copy, so an unresolved commit retained below the new copy's epoch can never be applied; state becomes `epoch_invalidated`. |
 
 Metadata notes:
 
@@ -797,9 +914,14 @@ Defined in the schema for structured message/intent rejection:
 
 Current production status:
 
-- No production call site currently emits `AuditEventKind::Rejection`.
-- The variant is covered by serde round-trip tests and should be handled by downstream tooling for forward
-  compatibility.
+- Emitted from the inbound seams (`message_processor/ingest.rs`, `message_processor/mod.rs`) and from
+  `distributed_convergence.rs`. `reason` is a low-cardinality stable string; the set is open, so downstream tooling
+  must tolerate unknown values.
+- `reason = "fork_rival_missing_retained_anchor"` records that direct ingest could not adjudicate an in-horizon rival
+  commit because the fork-source anchor snapshot is gone. It is an observation, not a verdict: the rival's content row
+  stays retained and the group is scheduled for convergence, which owns the `missing_retained_anchor` halt. Ingest
+  reaches this point through OpenMLS's `WrongEpoch` framing check, upstream of signature and membership-tag
+  verification, so the claimed source epoch on the row is unauthenticated and must not be read as an epoch assertion.
 
 ## Stable string catalog
 
@@ -809,8 +931,8 @@ metadata keys for indexing.
 | Category | Values |
 | --- | --- |
 | `envelope_kind` | `welcome`, `group_message` |
-| `outcome_kind` | `processed`, `buffered`, `stale` |
-| `stale_reason` | `already_seen`, `already_at_epoch`, `not_for_this_client`, `unknown_group`, `own_echo`, `peel_failed` |
+| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, `rejected` |
+| `stale_reason` | `duplicate`, `already_at_epoch`, `wrong_recipient`, `unknown_group`, `own_echo`, `invalid_encoding`, `invalid_signature`, `unsupported_required_feature`, `authorization_failed`, `transport_deferred`, `resource_refused_deferred_capacity`, `resource_refused_retry_budget`, `pre_membership`, `beyond_anchor`, `beyond_rollback_horizon`, `beyond_app_retention`, `losing_branch`, `invalid_against_canonical_state`, `removed`, `quarantined` |
 | `engine error_kind` | `unknown_group`, `unknown_pending`, `not_a_member`, `not_group_admin`, `unknown_member`, `invalid_credential_identity`, `admin_cannot_self_remove`, `admin_depletion`, `missing_required_capabilities`, `unsupported_ciphersuite`, `invalid_app_message_payload`, `invalid_account_identity_proof`, `forked_epoch`, `invalid_transition`, `storage`, `peeler`, `serialize`, `backend`, `other` |
 | `peeler error_kind` | `malformed`, `decrypt_failed`, `stale_epoch`, `missing_context`, `wrap_failed`, `backend` |
 | `intent_kind` | `app_message`, `invite`, `remove_members`, `leave`, `update_app_components`, `update_group_data` |

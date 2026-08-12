@@ -34,6 +34,15 @@
 //! time. Only autolinks — `<scheme:body>` and `<email@host>` — get
 //! structured treatment.
 //!
+//! ## Untrusted destinations
+//!
+//! Link, image, and autolink destinations are preserved and classified with
+//! [`LinkDestinationKind`]. Classification is descriptive, not permission to
+//! navigate or fetch. Renderers must inspect it before binding a destination
+//! to a WebView, OS opener, deep-link handler, or image loader. Dangerous and
+//! sensitive destinations should remain inert by default; recognized families
+//! still require the client's normal navigation, privacy, and network policy.
+//!
 //! ## Example
 //!
 //! ```
@@ -50,6 +59,7 @@
 
 pub mod ast;
 mod block;
+mod destination;
 mod entity;
 mod inline;
 mod nostr;
@@ -58,10 +68,14 @@ mod scanner;
 /// Maximum nested block-container depth emitted by the parser.
 pub const MAX_CONTAINER_DEPTH: usize = block::MAX_CONTAINER_DEPTH;
 
+/// Maximum blank-line source gap retained before a block.
+pub const MAX_SOURCE_BLANK_LINES: u8 = block::MAX_SOURCE_BLANK_LINES;
+
 pub use ast::{
-    Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, ListItem, ListKind,
-    NostrEntity, NostrHrp, TableCell,
+    Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, LinkDestinationKind, ListItem,
+    ListKind, NostrEntity, NostrHrp, TableCell,
 };
+pub use destination::classify_link_destination;
 
 /// Parse a CommonMark document (with this crate's nostr and GFM extensions)
 /// into a [`Document`].
@@ -73,21 +87,26 @@ pub use ast::{
 /// - GFM task-list items (`- [ ]`, `- [x]`).
 /// - Bare URLs (GFM-style extended autolinks) for the schemes `http://`,
 ///   `https://`, `mailto:`, `tel:`, `marmot://`, `whitenoise://`, and
-///   `whitenoise-staging://`. Recognized at word boundaries; trailing
-///   punctuation (`.,;:!?*_~` and unbalanced `)`) is excluded from the
-///   matched URL. Opaque app-scheme forms like `marmot:foo` and
-///   `whitenoise:foo` (no `//`) stay literal.
+///   `whitenoise-staging://`, plus bare `www.` host/path forms. `www.`
+///   autolinks preserve their source text; renderers synthesize an `https://`
+///   launch destination. Recognized at word boundaries; trailing punctuation
+///   (`.,;:!?*_~` and unbalanced `)`) is excluded from the matched URL. Opaque
+///   app-scheme forms like `marmot:foo` and `whitenoise:foo` (no `//`) stay
+///   literal.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
 /// - Nostr bare mentions (`@npub1…`) and URIs (`nostr:<hrp>1…`) for the
 ///   whitelisted HRPs `npub`, `note`, `nevent`, `nprofile`, `naddr`,
-///   `nrelay`. `nsec` is deliberately rejected — we never render private
-///   keys as ergonomic anchors. Bare `nostr:` URIs whose body isn't valid
-///   bech32 stay as literal text (they are *not* downgraded to a generic
-///   bare-URL autolink).
+///   `nrelay`. `nsec` is deliberately rejected from the ergonomic
+///   [`Inline::NostrMention`] / [`Inline::NostrUri`] entity forms. Bare
+///   `nostr:` URIs whose body isn't valid bech32 stay as literal text (they are
+///   *not* downgraded to a generic bare-URL autolink). When private-key text is
+///   deliberately used as an explicit destination or angle-bracket autolink,
+///   it is preserved with [`LinkDestinationKind::Sensitive`] so the client can
+///   display it without making it actionable.
 ///
 /// Bech32 strings are validated for *shape* only (no checksum).
 pub fn parse(input: &str) -> Document {
-    let (blocks, refs) = block::parse_blocks(input);
-    inline::parse_inlines(blocks, &refs)
+    let (blocks, blank_lines_before, refs) = block::parse_blocks(input);
+    inline::parse_inlines(blocks, blank_lines_before, &refs)
 }

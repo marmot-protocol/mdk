@@ -6,11 +6,12 @@
 //! decoded metadata, reconcile fresh vs cached results, merge KeyPackage
 //! records, and pick publish endpoints. They hold no `MarmotApp` state.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
+use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::{MessageId, TransportEndpoint};
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -24,7 +25,7 @@ use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as Relay
 use crate::{
     AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, DirectoryFreshness,
     DirectoryKeyPackage, DirectorySelection, FetchedKeyPackage, UserDirectoryRecord,
-    push_unique_strings, relays_from_relay_list_event, sort_directory_records,
+    push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 
 pub(crate) fn relay_list_status_from_records(
@@ -37,13 +38,12 @@ pub(crate) fn relay_list_status_from_records(
         if record.event.pubkey != account_id_hex {
             continue;
         }
-        let relays = relays_from_relay_list_event(&record.event);
-        if relays.is_empty() {
+        let Some(state) = relay_list_state_from_event(&record.event) else {
             continue;
-        }
+        };
         match record.event.kind {
-            KIND_NIP65_RELAY_LIST => status.nip65.relays = relays,
-            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox.relays = relays,
+            KIND_NIP65_RELAY_LIST => status.nip65 = state,
+            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox = state,
             _ => continue,
         }
         push_unique_strings(
@@ -101,7 +101,10 @@ fn latest_key_package_from_records(
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
         }
-        latest = Some(key_package_from_record(record)?);
+        let fetched = key_package_from_record(record)?;
+        if fetched.key_package.protocol_profile == ProtocolProfile::Current {
+            latest = Some(fetched);
+        }
     }
     latest.ok_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned()))
 }
@@ -171,6 +174,11 @@ fn validated_cached_key_package_with_ref(
     )?;
     let metadata = key_package_metadata(&decoded)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    if metadata.protocol_profile != ProtocolProfile::Current {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "strict cutover rejects legacy KeyPackages for new joins".into(),
+        ));
+    }
     if metadata.credential_identity_hex != account_id_hex {
         return Err(AppError::InvalidKeyPackageEvent(
             "cached KeyPackage credential identity does not match directory account".into(),
@@ -183,21 +191,28 @@ fn validated_cached_key_package_with_ref(
             "cached KeyPackage ref does not match decoded KeyPackageRef".into(),
         ));
     }
-    Ok((decoded, metadata.key_package_ref_hex))
+    Ok((
+        decoded.with_protocol_profile(metadata.protocol_profile),
+        metadata.key_package_ref_hex,
+    ))
 }
 
 pub(crate) fn key_package_from_hex_with_optional_source(
     key_package_hex: &str,
     event_id_hex: &str,
 ) -> Result<KeyPackage, AppError> {
+    // After the strict cutover, unannotated local/directory cache records are
+    // candidates only for the current profile. Mark them current before the
+    // decoded proof/profile consistency check; legacy bytes then fail closed
+    // and are replaced instead of being republished or selected for a join.
     let bytes = hex::decode(key_package_hex)?;
     if event_id_hex.is_empty() {
-        return Ok(KeyPackage::new(bytes));
+        return Ok(KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Current));
     }
-    Ok(KeyPackage::with_source_event_id(
-        bytes,
-        key_package_event_id_from_hex(event_id_hex)?,
-    ))
+    Ok(
+        KeyPackage::with_source_event_id(bytes, key_package_event_id_from_hex(event_id_hex)?)
+            .with_protocol_profile(ProtocolProfile::Current),
+    )
 }
 
 fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppError> {
@@ -209,26 +224,6 @@ fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppErr
         )));
     }
     Ok(MessageId::new(bytes))
-}
-
-pub(crate) fn relay_lists_have_any_relays(status: &AccountRelayListStatus) -> bool {
-    !status.nip65.relays.is_empty() || !status.inbox.relays.is_empty()
-}
-
-pub(crate) fn fill_missing_relay_lists_from_cached(
-    status: &mut AccountRelayListStatus,
-    cached: &AccountRelayListStatus,
-) {
-    if status.nip65.relays.is_empty() {
-        status.nip65.relays = cached.nip65.relays.clone();
-    }
-    if status.inbox.relays.is_empty() {
-        status.inbox.relays = cached.inbox.relays.clone();
-    }
-    if status.bootstrap_relays.is_empty() {
-        status.bootstrap_relays = cached.bootstrap_relays.clone();
-    }
-    status.refresh();
 }
 
 pub(crate) fn fresh_or_cached_key_package(
@@ -265,15 +260,6 @@ pub(crate) fn key_package_from_record(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing i tag".into()))?
         .to_owned();
-    require_key_package_tag(&event, "mls_ciphersuite", |value| !value.is_empty())?;
-    require_multi_value_key_package_tag(&event, "mls_extensions")?;
-    require_multi_value_key_package_tag_contains(
-        &event,
-        "mls_extensions",
-        &format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
-    )?;
-    require_multi_value_key_package_tag(&event, "mls_proposals")?;
-    require_multi_value_key_package_tag(&event, "app_components")?;
     let key_package_bytes = BASE64_STANDARD
         .decode(event.content.as_bytes())
         .map_err(|e| AppError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}")))?;
@@ -282,12 +268,41 @@ pub(crate) fn key_package_from_record(
             "empty key package content".into(),
         ));
     }
+    // Strict cutover only permits relay-fetched KeyPackages for new joins to
+    // use the current profile. Annotate the transport DTO before decoding its
+    // proof/profile metadata; the raw-byte constructor defaults to Legacy for
+    // backward-compatible callers and would otherwise misclassify every
+    // freshly published current KeyPackage.
     let key_package = KeyPackage::with_source_event_id(
         key_package_bytes,
         key_package_event_id_from_hex(&event.id)?,
-    );
+    )
+    .with_protocol_profile(ProtocolProfile::Current);
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    require_key_package_tag(&event, "mls_ciphersuite", |value| {
+        value == format!("0x{:04x}", metadata.ciphersuite)
+    })?;
+    require_multi_value_key_package_tag_matches(
+        &event,
+        "mls_extensions",
+        metadata.mls_extensions.iter().copied(),
+    )?;
+    require_multi_value_key_package_tag_matches(
+        &event,
+        "mls_proposals",
+        metadata.mls_proposals.iter().copied(),
+    )?;
+    require_multi_value_key_package_tag_matches(
+        &event,
+        "app_components",
+        metadata
+            .app_components
+            .iter()
+            .copied()
+            .filter(|id| *id >= PRIVATE_USE_APP_COMPONENT_ID_START),
+    )?;
+    let key_package = key_package.with_protocol_profile(metadata.protocol_profile);
     if metadata.credential_identity_hex != event.pubkey {
         return Err(AppError::InvalidKeyPackageEvent(
             "transport author does not match KeyPackage credential identity".into(),
@@ -337,38 +352,109 @@ pub(crate) fn account_key_package_record_from_fetched(
 }
 
 pub(crate) fn merge_key_package_records(
-    records: Vec<AccountKeyPackageRecord>,
+    mut records: Vec<AccountKeyPackageRecord>,
 ) -> Vec<AccountKeyPackageRecord> {
-    let mut merged: BTreeMap<String, AccountKeyPackageRecord> = BTreeMap::new();
-    for record in records {
-        let key = if !record.key_package_event_id.is_empty() {
-            record.key_package_event_id.clone()
-        } else if !record.key_package_ref_hex.is_empty() {
-            record.key_package_ref_hex.clone()
-        } else {
-            record.key_package_id.clone()
-        };
-        merged
-            .entry(key)
-            .and_modify(|existing| {
-                existing.local |= record.local;
-                existing.relay |= record.relay;
-                existing.published_at = existing.published_at.max(record.published_at);
-                if existing.account_label.is_none() {
-                    existing.account_label = record.account_label.clone();
-                }
-                push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
-            })
-            .or_insert(record);
+    // Normalize input order first. Matching by KeyPackageRef is deliberately
+    // not a general equivalence relation: multiple relay events may advertise
+    // the same usable package and each event id must remain addressable.
+    for record in &mut records {
+        record.source_relays.sort();
+        record.source_relays.dedup();
     }
-    let mut records = merged.into_values().collect::<Vec<_>>();
-    records.sort_by(|left, right| {
+    records.sort_by(record_identity_cmp);
+    let mut merged = Vec::<AccountKeyPackageRecord>::new();
+
+    for record in records.iter().filter(|record| record.relay) {
+        if let Some(existing) = merged.iter_mut().find(|existing| {
+            !record.key_package_event_id.is_empty()
+                && record.key_package_event_id == existing.key_package_event_id
+        }) {
+            merge_record_fields(existing, record);
+        } else {
+            merged.push(record.clone());
+        }
+    }
+
+    for record in records.iter().filter(|record| record.local) {
+        let matching_relay_indexes = merged
+            .iter()
+            .enumerate()
+            .filter_map(|(index, existing)| {
+                ((!record.key_package_event_id.is_empty()
+                    && record.key_package_event_id == existing.key_package_event_id)
+                    || (record.key_package_event_id.is_empty()
+                        && !record.key_package_ref_hex.is_empty()
+                        && record.key_package_ref_hex == existing.key_package_ref_hex))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if matching_relay_indexes.is_empty() {
+            if let Some(existing) = merged.iter_mut().find(|existing| {
+                existing.local
+                    && !existing.relay
+                    && ((!record.key_package_ref_hex.is_empty()
+                        && record.key_package_ref_hex == existing.key_package_ref_hex)
+                        || (record.key_package_ref_hex.is_empty()
+                            && existing.key_package_ref_hex.is_empty()
+                            && record.key_package_event_id.is_empty()
+                            && existing.key_package_event_id.is_empty()
+                            && record.key_package_id == existing.key_package_id))
+            }) {
+                merge_record_fields(existing, record);
+            } else {
+                merged.push(record.clone());
+            }
+        } else {
+            for index in matching_relay_indexes {
+                merge_record_fields(&mut merged[index], record);
+            }
+        }
+    }
+    merged.sort_by(|left, right| {
         right
             .published_at
             .cmp(&left.published_at)
             .then_with(|| left.key_package_event_id.cmp(&right.key_package_event_id))
+            .then_with(|| left.key_package_ref_hex.cmp(&right.key_package_ref_hex))
+            .then_with(|| left.key_package_id.cmp(&right.key_package_id))
     });
-    records
+    merged
+}
+
+fn record_identity_cmp(
+    left: &AccountKeyPackageRecord,
+    right: &AccountKeyPackageRecord,
+) -> std::cmp::Ordering {
+    left.key_package_event_id
+        .cmp(&right.key_package_event_id)
+        .then_with(|| left.key_package_ref_hex.cmp(&right.key_package_ref_hex))
+        .then_with(|| left.key_package_id.cmp(&right.key_package_id))
+        .then_with(|| left.local.cmp(&right.local))
+        .then_with(|| left.relay.cmp(&right.relay))
+        .then_with(|| left.published_at.cmp(&right.published_at))
+        .then_with(|| left.source_relays.cmp(&right.source_relays))
+}
+
+fn merge_record_fields(existing: &mut AccountKeyPackageRecord, record: &AccountKeyPackageRecord) {
+    existing.local |= record.local;
+    existing.relay |= record.relay;
+    existing.published_at = existing.published_at.max(record.published_at);
+    existing.key_package_bytes = existing.key_package_bytes.max(record.key_package_bytes);
+    if existing.account_label.is_none() {
+        existing.account_label.clone_from(&record.account_label);
+    }
+    if existing.key_package_event_id.is_empty() {
+        existing
+            .key_package_event_id
+            .clone_from(&record.key_package_event_id);
+    }
+    if existing.key_package_ref_hex.is_empty() {
+        existing
+            .key_package_ref_hex
+            .clone_from(&record.key_package_ref_hex);
+    }
+    push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
+    existing.source_relays.sort();
 }
 
 pub(crate) fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {
@@ -423,9 +509,10 @@ pub(crate) fn require_key_package_tag(
     }
 }
 
-pub(crate) fn require_multi_value_key_package_tag(
+pub(crate) fn require_multi_value_key_package_tag_matches(
     event: &NostrTransportEvent,
     name: &str,
+    expected_ids: impl IntoIterator<Item = u16>,
 ) -> Result<(), AppError> {
     reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
@@ -437,41 +524,18 @@ pub(crate) fn require_multi_value_key_package_tag(
             "missing {name} tag"
         )));
     };
-    if tag.iter().skip(1).any(|value| !value.trim().is_empty()) {
-        Ok(())
-    } else {
-        Err(AppError::InvalidKeyPackageEvent(format!(
-            "empty {name} tag"
-        )))
-    }
-}
-
-pub(crate) fn require_multi_value_key_package_tag_contains(
-    event: &NostrTransportEvent,
-    name: &str,
-    required: &str,
-) -> Result<(), AppError> {
-    reject_duplicate_key_package_tag(event, name)?;
-    let Some(tag) = event
-        .tags
-        .iter()
-        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
-    else {
+    let values = tag.iter().skip(1).cloned().collect::<Vec<_>>();
+    let actual = values.iter().cloned().collect::<BTreeSet<_>>();
+    let expected = expected_ids
+        .into_iter()
+        .map(|id| format!("0x{id:04x}"))
+        .collect::<BTreeSet<_>>();
+    if values.len() != actual.len() || actual != expected {
         return Err(AppError::InvalidKeyPackageEvent(format!(
-            "missing {name} tag"
+            "{name} tag does not exactly match decoded KeyPackage metadata"
         )));
-    };
-    if tag
-        .iter()
-        .skip(1)
-        .any(|value| value.eq_ignore_ascii_case(required))
-    {
-        Ok(())
-    } else {
-        Err(AppError::InvalidKeyPackageEvent(format!(
-            "{name} tag missing required value {required}"
-        )))
     }
+    Ok(())
 }
 
 pub(crate) fn publish_endpoints_from_bootstrap(
@@ -481,5 +545,67 @@ pub(crate) fn publish_endpoints_from_bootstrap(
         bootstrap.default_relays.clone()
     } else {
         bootstrap.bootstrap_relays.clone()
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn record(event: &str, reference: &str, local: bool, relay: bool) -> AccountKeyPackageRecord {
+        AccountKeyPackageRecord {
+            account_label: local.then(|| "device".to_owned()),
+            account_id_hex: "account".to_owned(),
+            key_package_id: format!("slot-{event}-{reference}"),
+            key_package_ref_hex: reference.to_owned(),
+            key_package_event_id: event.to_owned(),
+            published_at: event.len() as u64,
+            key_package_bytes: 123,
+            source_relays: relay
+                .then(|| "wss://relay.example".to_owned())
+                .into_iter()
+                .collect(),
+            local,
+            relay,
+        }
+    }
+
+    #[test]
+    fn local_and_relay_copy_merge_without_losing_distinct_relay_events() {
+        let records = merge_key_package_records(vec![
+            record("", "ref", true, false),
+            record("event-b", "ref", false, true),
+            record("event-a", "ref", false, true),
+        ]);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.local && record.relay));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.key_package_event_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["event-a", "event-b"])
+        );
+    }
+
+    #[test]
+    fn empty_identity_records_only_merge_by_stable_slot() {
+        let records = merge_key_package_records(vec![
+            record("", "", true, false),
+            record("", "", false, true),
+        ]);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn merge_is_independent_of_input_order() {
+        let input = vec![
+            record("", "ref", true, false),
+            record("event-b", "ref", false, true),
+            record("event-a", "ref", false, true),
+        ];
+        let expected = merge_key_package_records(input.clone());
+        let actual = merge_key_package_records(input.into_iter().rev().collect());
+        assert_eq!(actual, expected);
     }
 }

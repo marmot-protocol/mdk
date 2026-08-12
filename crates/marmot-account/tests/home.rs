@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 
 use marmot_account::{
-    AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSummary,
+    AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSetupKind,
+    AccountSetupPhase, AccountSetupState, AccountSummary, KeychainSecretStore,
 };
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
@@ -108,6 +109,141 @@ fn account_home_import_accepts_nsec_and_reopens_the_same_identity() {
 }
 
 #[test]
+fn runtime_import_recovers_journal_before_secret_or_account_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let account_dir = dir.path().join("accounts").join(&account_id);
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join(".account-setup.json"),
+        serde_json::to_vec(&AccountSetupState {
+            account_id_hex: account_id.clone(),
+            reused_account_id_credential: false,
+            kind: AccountSetupKind::ImportedIdentity,
+            phase: AccountSetupPhase::LocalStateCreated,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let home = AccountHome::open(dir.path());
+    let imported = home
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    assert_eq!(imported.account().account_id_hex, account_id);
+    assert_eq!(home.accounts().unwrap().len(), 1);
+    assert_eq!(
+        home.load_signing_keys(&account_id).unwrap().public_key(),
+        keys.public_key()
+    );
+}
+
+#[test]
+fn runtime_import_recovers_journal_and_secret_before_account_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let account = home
+        .import_nostr_account(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    std::fs::remove_file(home.account_dir(&account.label).join("account.json")).unwrap();
+    std::fs::write(
+        home.account_dir(&account.label).join(".account-setup.json"),
+        serde_json::to_vec(&AccountSetupState {
+            account_id_hex: account_id.clone(),
+            reused_account_id_credential: false,
+            kind: AccountSetupKind::ImportedIdentity,
+            phase: AccountSetupPhase::LocalStateCreated,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let imported = home
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    assert_eq!(imported.account().account_id_hex, account_id);
+    assert_eq!(home.accounts().unwrap().len(), 1);
+}
+
+#[test]
+fn setup_phase_update_fails_when_journal_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+
+    assert!(matches!(
+        home.set_account_setup_phase(
+            &account.label,
+            AccountSetupPhase::KeyPackagePublicationStarted
+        ),
+        Err(AccountHomeError::AccountSetupStateMissing)
+    ));
+}
+
+#[test]
+fn account_home_idempotent_import_reuses_existing_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let first = home.import_account_idempotent("agent", nsec).unwrap();
+    let second = home.import_account_idempotent("agent", nsec).unwrap();
+
+    assert_eq!(second, first);
+    assert_eq!(home.accounts().unwrap(), vec![first]);
+}
+
+#[test]
+fn account_home_idempotent_import_reactivates_signed_out_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    home.import_account_idempotent("agent", nsec).unwrap();
+    home.set_account_signed_out("agent", true).unwrap();
+
+    let imported = home.import_account_idempotent("agent", nsec).unwrap();
+
+    assert!(!imported.signed_out);
+    assert!(!home.account("agent").unwrap().signed_out);
+}
+
+#[test]
+fn account_home_idempotent_import_repairs_interrupted_record_first_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let account = AccountSummary {
+        label: "agent".to_owned(),
+        account_id_hex: keys.public_key().to_hex(),
+        local_signing: true,
+        external_signing: false,
+        signed_out: false,
+    };
+    let account_dir = dir.path().join("accounts").join(&account.label);
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join("account.json"),
+        serde_json::to_vec(&account).unwrap(),
+    )
+    .unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let repaired = home
+        .import_account_idempotent("agent", &keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    assert_eq!(repaired, account);
+    assert_eq!(
+        home.load_signing_keys("agent").unwrap().public_key(),
+        keys.public_key()
+    );
+}
+
+#[test]
 fn account_home_accounts_skips_unreadable_records() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -158,6 +294,21 @@ fn account_home_rejects_windows_drive_relative_labels() {
         Err(AccountHomeError::InvalidAccountLabel(label)) if label == "C:evil"
     ));
     assert!(!dir.path().join("accounts").join("C:evil").exists());
+}
+
+#[test]
+fn account_home_rejects_control_characters_in_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+
+    for label in ["evil\nlabel", "evil\rlabel", "evil\u{1b}[2Klabel"] {
+        assert!(matches!(
+            home.import_account(label, &secret_hex),
+            Err(AccountHomeError::InvalidAccountLabel(rejected)) if rejected == label
+        ));
+        assert!(!dir.path().join("accounts").join(label).exists());
+    }
 }
 
 #[test]
@@ -345,6 +496,84 @@ fn account_home_keychain_rejects_second_label_for_same_account_id() {
     assert!(matches!(
         home.import_account("label-two", &secret_hex),
         Err(AccountHomeError::AccountIdInUse(_))
+    ));
+}
+
+#[test]
+fn account_home_idempotent_import_recovers_orphaned_keychain_credential() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let home =
+        AccountHome::open_with_keychain(dir.path(), "com.marmot.test.orphan-recovery").unwrap();
+    let keys = nostr::Keys::generate();
+    let secret_hex = keys.secret_key().to_secret_hex();
+    let original = home.import_account("old-label", &secret_hex).unwrap();
+    std::fs::remove_dir_all(home.account_dir(&original.label)).unwrap();
+    assert!(home.accounts().unwrap().is_empty());
+
+    let recovered = home
+        .import_account_idempotent("agent", &secret_hex)
+        .unwrap();
+
+    assert_eq!(recovered.label, "agent");
+    assert_eq!(recovered.account_id_hex, original.account_id_hex);
+    assert_eq!(
+        home.load_signing_keys("agent").unwrap().public_key(),
+        keys.public_key()
+    );
+}
+
+#[test]
+fn account_home_runtime_import_does_not_capture_mismatched_keychain_credential() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let requested_keys = nostr::Keys::generate();
+    let unrelated_keys = nostr::Keys::generate();
+    let account_id = requested_keys.public_key().to_hex();
+    let account = AccountSummary {
+        label: account_id.clone(),
+        account_id_hex: account_id.clone(),
+        local_signing: true,
+        external_signing: false,
+        signed_out: false,
+    };
+    let store =
+        KeychainSecretStore::new(format!("com.marmot.test.runtime-mismatch-{account_id}")).unwrap();
+    store.write_secret(&account, &unrelated_keys).unwrap();
+    let home = AccountHome::open_with_secret_store(dir.path(), Arc::new(store.clone()));
+
+    assert!(matches!(
+        home.import_nostr_account_idempotent(&requested_keys.secret_key().to_secret_hex()),
+        Err(AccountHomeError::AccountIdMismatch)
+    ));
+    assert!(home.accounts().unwrap().is_empty());
+    assert_eq!(
+        store.load_secret(&account).unwrap().public_key(),
+        unrelated_keys.public_key()
+    );
+}
+
+#[test]
+fn runtime_import_resumes_only_while_durable_setup_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = nostr::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+
+    let first = home.import_nostr_account_idempotent(&secret).unwrap();
+    let resumed = home.import_nostr_account_idempotent(&secret).unwrap();
+    assert_eq!(resumed.account(), first.account());
+    assert!(
+        home.account_setup_state(&first.account().label)
+            .unwrap()
+            .is_some()
+    );
+
+    home.complete_account_setup(&first.account().label).unwrap();
+    assert!(matches!(
+        home.import_nostr_account_idempotent(&secret),
+        Err(AccountHomeError::AccountExists(account))
+            if account == first.account().account_id_hex
     ));
 }
 

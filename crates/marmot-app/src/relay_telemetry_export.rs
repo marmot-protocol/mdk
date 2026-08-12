@@ -123,6 +123,47 @@ pub mod metric_names {
     pub const APP_ACCOUNT_OPEN_SUCCESSES: &str = "app_account_open_successes";
     /// Failed account opens.
     pub const APP_ACCOUNT_OPEN_FAILURES: &str = "app_account_open_failures";
+    /// Engine session open (storage + engine build + hydration) duration histogram.
+    pub const APP_ACCOUNT_SESSION_OPEN_DURATION: &str = "app_account_session_open_duration_ms";
+    pub const APP_ACCOUNT_SESSION_OPEN_ATTEMPTS: &str = "app_account_session_open_attempts";
+    pub const APP_ACCOUNT_SESSION_OPEN_SUCCESSES: &str = "app_account_session_open_successes";
+    pub const APP_ACCOUNT_SESSION_OPEN_FAILURES: &str = "app_account_session_open_failures";
+    /// Stored-group hydration duration histogram (inside session open).
+    pub const APP_ACCOUNT_GROUP_HYDRATION_DURATION: &str =
+        "app_account_group_hydration_duration_ms";
+    pub const APP_ACCOUNT_GROUP_HYDRATION_ATTEMPTS: &str = "app_account_group_hydration_attempts";
+    pub const APP_ACCOUNT_GROUP_HYDRATION_SUCCESSES: &str = "app_account_group_hydration_successes";
+    pub const APP_ACCOUNT_GROUP_HYDRATION_FAILURES: &str = "app_account_group_hydration_failures";
+    /// Shared startup profile load duration histogram.
+    pub const APP_ACCOUNT_PROFILE_LOAD_DURATION: &str = "app_account_profile_load_duration_ms";
+    pub const APP_ACCOUNT_PROFILE_LOAD_ATTEMPTS: &str = "app_account_profile_load_attempts";
+    pub const APP_ACCOUNT_PROFILE_LOAD_SUCCESSES: &str = "app_account_profile_load_successes";
+    pub const APP_ACCOUNT_PROFILE_LOAD_FAILURES: &str = "app_account_profile_load_failures";
+    /// Startup group-read-snapshot capture duration histogram.
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_DURATION: &str =
+        "app_account_group_read_snapshot_duration_ms";
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_ATTEMPTS: &str =
+        "app_account_group_read_snapshot_attempts";
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_SUCCESSES: &str =
+        "app_account_group_read_snapshot_successes";
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_FAILURES: &str =
+        "app_account_group_read_snapshot_failures";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION: &str =
+        "app_account_transport_activation_duration_ms";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS: &str =
+        "app_account_transport_activation_attempts";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES: &str =
+        "app_account_transport_activation_successes";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES: &str =
+        "app_account_transport_activation_failures";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION: &str =
+        "app_account_subscription_registration_duration_ms";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS: &str =
+        "app_account_subscription_registration_attempts";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES: &str =
+        "app_account_subscription_registration_successes";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES: &str =
+        "app_account_subscription_registration_failures";
     /// Multi-account catch-up duration histogram.
     pub const APP_ACCOUNT_CATCH_UP_DURATION: &str = "app_account_catch_up_duration_ms";
     /// Multi-account catch-up attempts.
@@ -155,6 +196,84 @@ pub mod metric_names {
     pub const APP_OUTBOUND_MESSAGE_SEND_SUCCESSES: &str = "app_outbound_message_send_successes";
     /// Failed one-sided outbound message sends.
     pub const APP_OUTBOUND_MESSAGE_SEND_FAILURES: &str = "app_outbound_message_send_failures";
+    /// Group-create queue wait metrics.
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_DURATION: &str =
+        "app_group_create_queue_wait_duration_ms";
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_ATTEMPTS: &str = "app_group_create_queue_wait_attempts";
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_SUCCESSES: &str = "app_group_create_queue_wait_successes";
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_FAILURES: &str = "app_group_create_queue_wait_failures";
+    /// Group-create KeyPackage lookup metrics.
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION: &str =
+        "app_group_create_key_package_lookup_duration_ms";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_ATTEMPTS: &str =
+        "app_group_create_key_package_lookup_attempts";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_SUCCESSES: &str =
+        "app_group_create_key_package_lookup_successes";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES: &str =
+        "app_group_create_key_package_lookup_failures";
+    /// Group-create image upload metrics.
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION: &str =
+        "app_group_create_image_upload_duration_ms";
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_ATTEMPTS: &str =
+        "app_group_create_image_upload_attempts";
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_SUCCESSES: &str =
+        "app_group_create_image_upload_successes";
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_FAILURES: &str =
+        "app_group_create_image_upload_failures";
+    /// Group-create MLS prepare/persist metrics.
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION: &str =
+        "app_group_create_mls_prepare_persist_duration_ms";
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_ATTEMPTS: &str =
+        "app_group_create_mls_prepare_persist_attempts";
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_SUCCESSES: &str =
+        "app_group_create_mls_prepare_persist_successes";
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_FAILURES: &str =
+        "app_group_create_mls_prepare_persist_failures";
+    /// Group-create Welcome publish metrics.
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION: &str =
+        "app_group_create_welcome_publish_duration_ms";
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_ATTEMPTS: &str =
+        "app_group_create_welcome_publish_attempts";
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_SUCCESSES: &str =
+        "app_group_create_welcome_publish_successes";
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_FAILURES: &str =
+        "app_group_create_welcome_publish_failures";
+    /// Group-create local projection save metrics.
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION: &str =
+        "app_group_create_local_projection_save_duration_ms";
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_ATTEMPTS: &str =
+        "app_group_create_local_projection_save_attempts";
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_SUCCESSES: &str =
+        "app_group_create_local_projection_save_successes";
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES: &str =
+        "app_group_create_local_projection_save_failures";
+    /// Group-create subscription refresh metrics.
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION: &str =
+        "app_group_create_subscription_refresh_duration_ms";
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_ATTEMPTS: &str =
+        "app_group_create_subscription_refresh_attempts";
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_SUCCESSES: &str =
+        "app_group_create_subscription_refresh_successes";
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_FAILURES: &str =
+        "app_group_create_subscription_refresh_failures";
+    /// Group-create post-mutation catch-up metrics.
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION: &str =
+        "app_group_create_post_mutation_catch_up_duration_ms";
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_ATTEMPTS: &str =
+        "app_group_create_post_mutation_catch_up_attempts";
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_SUCCESSES: &str =
+        "app_group_create_post_mutation_catch_up_successes";
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_FAILURES: &str =
+        "app_group_create_post_mutation_catch_up_failures";
+    /// End-to-end group-create caller latency metrics.
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION: &str =
+        "app_group_create_total_caller_latency_duration_ms";
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_ATTEMPTS: &str =
+        "app_group_create_total_caller_latency_attempts";
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_SUCCESSES: &str =
+        "app_group_create_total_caller_latency_successes";
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_FAILURES: &str =
+        "app_group_create_total_caller_latency_failures";
     /// Group invite-member runtime duration histogram.
     pub const APP_GROUP_INVITE_MEMBERS_DURATION: &str = "app_group_invite_members_duration_ms";
     /// Group invite-member attempts.
@@ -271,6 +390,14 @@ pub mod metric_names {
     pub const APP_GROUP_MLS_STATE_READ_SUCCESSES: &str = "app_group_mls_state_read_successes";
     /// Failed group MLS state reads.
     pub const APP_GROUP_MLS_STATE_READ_FAILURES: &str = "app_group_mls_state_read_failures";
+    /// Group roster read duration histogram.
+    pub const APP_GROUP_ROSTER_READ_DURATION: &str = "app_group_roster_read_duration_ms";
+    /// Group roster read attempts.
+    pub const APP_GROUP_ROSTER_READ_ATTEMPTS: &str = "app_group_roster_read_attempts";
+    /// Successful group roster reads.
+    pub const APP_GROUP_ROSTER_READ_SUCCESSES: &str = "app_group_roster_read_successes";
+    /// Failed group roster reads.
+    pub const APP_GROUP_ROSTER_READ_FAILURES: &str = "app_group_roster_read_failures";
     /// Media upload duration histogram.
     pub const APP_MEDIA_UPLOAD_DURATION: &str = "app_media_upload_duration_ms";
     /// Media upload attempts.
@@ -287,6 +414,18 @@ pub mod metric_names {
     pub const APP_MEDIA_DOWNLOAD_SUCCESSES: &str = "app_media_download_successes";
     /// Failed media downloads.
     pub const APP_MEDIA_DOWNLOAD_FAILURES: &str = "app_media_download_failures";
+    pub const APP_HOST_SPLASH_READY_DURATION: &str = "app_host_splash_ready_duration_ms";
+    pub const APP_HOST_SPLASH_READY_ATTEMPTS: &str = "app_host_splash_ready_attempts";
+    pub const APP_HOST_SPLASH_READY_SUCCESSES: &str = "app_host_splash_ready_successes";
+    pub const APP_HOST_SPLASH_READY_FAILURES: &str = "app_host_splash_ready_failures";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_DURATION: &str =
+        "app_host_foreground_local_ready_duration_ms";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_ATTEMPTS: &str =
+        "app_host_foreground_local_ready_attempts";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES: &str =
+        "app_host_foreground_local_ready_successes";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_FAILURES: &str =
+        "app_host_foreground_local_ready_failures";
 }
 
 /// A fixed-bucket cumulative histogram in the export batch.
@@ -301,6 +440,8 @@ pub struct ExportHistogram {
     pub bucket_counts: Vec<u64>,
     /// Samples above the largest bound.
     pub overflow_count: u64,
+    /// Saturating sum of all observed durations, in milliseconds.
+    pub sum_ms: u64,
 }
 
 impl ExportHistogram {
@@ -313,6 +454,7 @@ impl ExportHistogram {
                 .collect(),
             bucket_counts: snapshot.buckets.iter().map(|bucket| bucket.count).collect(),
             overflow_count: snapshot.overflow_count,
+            sum_ms: snapshot.sum_ms,
         }
     }
 
@@ -581,6 +723,54 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.account_session_open,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_DURATION,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_SUCCESSES,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_group_hydration,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_DURATION,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_profile_load,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_DURATION,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_ATTEMPTS,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_SUCCESSES,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_group_read_snapshot,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_DURATION,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_ATTEMPTS,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_SUCCESSES,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_transport_activation,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_subscription_registration,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.account_catch_up,
         metric_names::APP_ACCOUNT_CATCH_UP_DURATION,
         metric_names::APP_ACCOUNT_CATCH_UP_ATTEMPTS,
@@ -610,6 +800,78 @@ fn append_app_performance_points(
         metric_names::APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_SUCCESSES,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_queue_wait,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_key_package_lookup,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_image_upload,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_mls_prepare_persist,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_welcome_publish,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_local_projection_save,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_subscription_refresh,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_post_mutation_catch_up,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_total_caller_latency,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_FAILURES,
     );
     append_app_operation_points(
         points,
@@ -701,6 +963,14 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.group_roster_read,
+        metric_names::APP_GROUP_ROSTER_READ_DURATION,
+        metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS,
+        metric_names::APP_GROUP_ROSTER_READ_SUCCESSES,
+        metric_names::APP_GROUP_ROSTER_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.media_upload,
         metric_names::APP_MEDIA_UPLOAD_DURATION,
         metric_names::APP_MEDIA_UPLOAD_ATTEMPTS,
@@ -714,6 +984,22 @@ fn append_app_performance_points(
         metric_names::APP_MEDIA_DOWNLOAD_ATTEMPTS,
         metric_names::APP_MEDIA_DOWNLOAD_SUCCESSES,
         metric_names::APP_MEDIA_DOWNLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_splash_ready,
+        metric_names::APP_HOST_SPLASH_READY_DURATION,
+        metric_names::APP_HOST_SPLASH_READY_ATTEMPTS,
+        metric_names::APP_HOST_SPLASH_READY_SUCCESSES,
+        metric_names::APP_HOST_SPLASH_READY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_foreground_local_ready,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_DURATION,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_ATTEMPTS,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_FAILURES,
     );
 }
 
@@ -979,6 +1265,7 @@ mod otlp {
                                 start_time_unix_nano: start_ns,
                                 time_unix_nano: now_ns,
                                 count,
+                                sum: Some(histogram.sum_ms as f64),
                                 bucket_counts,
                                 explicit_bounds: histogram
                                     .bounds_ms
@@ -1086,6 +1373,7 @@ mod otlp {
                             bounds_ms: vec![10, 50],
                             bucket_counts: vec![1, 2],
                             overflow_count: 3,
+                            sum_ms: 123,
                         }),
                     },
                 ],
@@ -1159,7 +1447,7 @@ mod otlp {
             assert_eq!(point.time_unix_nano, 200);
             assert_eq!(point.attributes[0].key, "relay");
 
-            // Histogram -> bucket_counts = per-bucket + overflow, same bounds, no label.
+            // Histogram -> bucket_counts = per-bucket + overflow, same bounds and sum, no label.
             let histogram = match &scope_metrics.metrics[2].data {
                 Some(metric::Data::Histogram(histogram)) => histogram,
                 other => panic!("expected histogram, got {other:?}"),
@@ -1172,6 +1460,7 @@ mod otlp {
             assert_eq!(point.bucket_counts, vec![1, 2, 3]);
             assert_eq!(point.explicit_bounds, vec![10.0, 50.0]);
             assert_eq!(point.count, 6);
+            assert_eq!(point.sum, Some(123.0));
         }
     }
 }

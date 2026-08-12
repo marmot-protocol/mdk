@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { BoundedKeyedAsyncQueue } from "../src/bounded-keyed-async-queue.js";
+import {
+  BoundedKeyedAsyncQueue,
+  classifyInboundDispatchFailure,
+} from "../src/bounded-keyed-async-queue.js";
 
 describe("BoundedKeyedAsyncQueue", () => {
   it("sheds incoming turns once per-key depth is reached", async () => {
@@ -43,5 +46,37 @@ describe("BoundedKeyedAsyncQueue", () => {
     });
 
     await vi.waitFor(() => expect(ran).toEqual(["after-reject"]));
+  });
+
+  it("reports the OpenClaw lifecycle mismatch without logging arbitrary error text", async () => {
+    const log = vi.fn();
+    const queue = new BoundedKeyedAsyncQueue(2, log);
+
+    queue.enqueue("group-a", async () => {
+      throw new Error(
+        "runChannelInboundEvent prepared turns must declare runDispatchLifecycle when creating runDispatch",
+      );
+    });
+
+    await vi.waitFor(() =>
+      expect(log).toHaveBeenCalledWith(
+        "marmot: inbound dispatch task failed (class=openclaw_dispatch_lifecycle_contract)",
+      ),
+    );
+  });
+
+  it("does not expose an arbitrary failure message", () => {
+    expect(classifyInboundDispatchFailure(new Error("secret conversation contents"))).toBe(
+      "error",
+    );
+  });
+
+  it("classifies beta's agent-scoped session-store requirement without exposing text", () => {
+    const error = new Error("potentially sensitive upstream detail");
+    error.name = "SessionStoreAgentIdRequiredError";
+
+    expect(classifyInboundDispatchFailure(error)).toBe(
+      "openclaw_session_store_agent_id_required",
+    );
   });
 });

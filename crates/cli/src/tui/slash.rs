@@ -1,6 +1,7 @@
 //! Slash-command parsing for the TUI composer.
 
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
     let trimmed = input.trim();
@@ -16,6 +17,13 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
     match command.as_str() {
         "help" | "?" => Ok(SlashCommand::Help),
         "refresh" => Ok(SlashCommand::Refresh),
+        "diagnostics" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Diagnostics)
+            } else {
+                Err("/diagnostics does not accept arguments".to_owned())
+            }
+        }
         "sync" => {
             Err("manual sync is not a TUI command; live updates come from subscriptions".to_owned())
         }
@@ -27,21 +35,48 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
             }
         }
         "login" => match rest.as_slice() {
-            [identity] if identity.starts_with("nsec") => {
+            [identity] if crate::is_nostr_secret(identity) => {
                 Ok(SlashCommand::AccountImportSecret(identity.clone()))
             }
             [identity] => Ok(SlashCommand::AccountAddPublic(identity.clone())),
             [] => Err("/login expects one nsec or npub".to_owned()),
             _ => Err("/login expects exactly one nsec or npub".to_owned()),
         },
+        "logout" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Logout)
+            } else {
+                Err("/logout acts on the selected account and takes no arguments".to_owned())
+            }
+        }
         "account" => parse_account_command(rest),
         "daemon" => parse_daemon_command(rest),
         "chat" => parse_chat_command(rest),
         "members" => parse_members_command(rest),
+        "react" => parse_react_command(rest),
+        "unreact" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Unreact)
+            } else {
+                Err("/unreact does not accept arguments".to_owned())
+            }
+        }
+        "delete" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Delete)
+            } else {
+                Err("/delete does not accept arguments".to_owned())
+            }
+        }
+        "reply" => parse_reply_command(rest),
+        "retry" => parse_retry_command(rest),
         "image" => parse_image_command(rest),
         "keys" => parse_keys_command(rest),
         "profile" => parse_profile_command(rest),
         "name" => parse_profile_name_command(rest),
+        "users" => Ok(SlashCommand::UsersSearch {
+            query: (!rest.is_empty()).then(|| rest.join(" ")),
+        }),
         "stream" => parse_stream_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
@@ -227,6 +262,86 @@ pub(crate) fn parse_members_command(args: Vec<String>) -> Result<SlashCommand, S
         }
         [] => Err("/members expects add, remove, or list".to_owned()),
         _ => Err("/members expects add, remove, or list".to_owned()),
+    }
+}
+
+/// The status-line error a rejected `/react` teaches: it names the contract (a
+/// single emoji), the bare-Enter default, and the `Esc` escape hatch. Shown when
+/// reaction content looks like typed prose rather than one emoji.
+pub(crate) const REACTION_GUARD_HINT: &str =
+    "reactions are a single emoji (Enter sends the default +); Esc clears";
+
+/// The most Unicode scalar values a single-emoji reaction may span. The longest
+/// standardized emoji sequences — the four-person ZWJ family and the two-skin-tone
+/// "people holding hands" — run to roughly ten scalars once joiners and variation
+/// selectors are counted; this cap leaves generous headroom for future sequences
+/// while still rejecting a pathological ZWJ chain packed into one cluster.
+const MAX_REACTION_SCALARS: usize = 16;
+
+/// Reject reaction content that is typed prose rather than a single emoji.
+///
+/// A valid reaction is the `+`/`-` NIP-25 sentinel or exactly one extended
+/// grapheme cluster that carries at least one non-ASCII scalar — the shape of
+/// every real emoji, including multi-scalar ZWJ/skin-tone/flag/keycap sequences.
+/// Prose is refused because it spans more than one cluster (any script: `café`,
+/// `你好吗`, `привет`) or is an all-ASCII token (`hello`, `:)`). A single CJK
+/// character is one non-ASCII cluster and so is accepted; that is the documented,
+/// acceptable ceiling. `MAX_REACTION_SCALARS` stays as a backstop against a
+/// pathological ZWJ chain crammed into one cluster. This is the TUI's UX guard;
+/// the `messages react` CLI stays protocol-faithful and publishes whatever
+/// content it is given.
+pub(crate) fn validate_reaction_content(content: &str) -> Result<(), String> {
+    if matches!(content, "+" | "-") {
+        return Ok(());
+    }
+    let mut clusters = content.graphemes(true);
+    let is_single_cluster = clusters.next().is_some() && clusters.next().is_none();
+    if is_single_cluster && !content.is_ascii() && content.chars().count() <= MAX_REACTION_SCALARS {
+        return Ok(());
+    }
+    Err(REACTION_GUARD_HINT.to_owned())
+}
+
+/// `/react [emoji]`: the emoji defaults to `+` (matching the `messages react`
+/// CLI default) so the `r` accelerator sends the default on a bare Enter. Any
+/// supplied content passes `validate_reaction_content` so typed prose (the field
+/// defect) is refused with the teaching hint instead of published as a reaction.
+pub(crate) fn parse_react_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [] => Ok(SlashCommand::React {
+            emoji: "+".to_owned(),
+        }),
+        [emoji] => {
+            validate_reaction_content(emoji)?;
+            Ok(SlashCommand::React {
+                emoji: emoji.clone(),
+            })
+        }
+        _ => Err(REACTION_GUARD_HINT.to_owned()),
+    }
+}
+
+/// `/reply <text>`: reply to the selected message. The text is required and joins
+/// the remaining words; the target message resolves at submit against the
+/// selected row. The `R` accelerator prefills `/reply ` in the composer.
+pub(crate) fn parse_reply_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    if args.is_empty() {
+        return Err("/reply requires message text".to_owned());
+    }
+    Ok(SlashCommand::Reply {
+        text: args.join(" "),
+    })
+}
+
+/// `/retry <event-id>`: retries a failed outbound event by id (not the selected
+/// message; timeline rows carry no failed-send state to target from).
+pub(crate) fn parse_retry_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [event_id] => Ok(SlashCommand::Retry {
+            event_id: event_id.clone(),
+        }),
+        [] => Err("/retry expects an event id".to_owned()),
+        _ => Err("/retry expects exactly one event id".to_owned()),
     }
 }
 

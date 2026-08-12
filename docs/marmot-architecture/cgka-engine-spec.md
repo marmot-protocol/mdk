@@ -55,13 +55,13 @@ The engine emits:
 
 ## Core Invariant
 
-Two honest engines with the same retained anchor, pending message set, negotiated policy, engine version, and lifecycle
-clock inputs MUST select the same canonical branch and produce the same protocol dispositions.
+Two honest engines with the same retained anchor, pending message set, pinned protocol policy, engine version, and
+lifecycle clock inputs MUST select the same canonical branch and produce the same protocol dispositions.
 
 ```text
 same retained anchor
 + same pending messages
-+ same negotiated policy
++ same pinned protocol policy
 + same engine version
 + same lifecycle clock inputs
 = same canonical branch and dispositions
@@ -107,9 +107,14 @@ TransportMessage
   -> emit IngestOutcome and later GroupEvent values
 ```
 
-The engine MUST return stale and non-applicable messages as typed `IngestOutcome::Stale` values. Duplicate messages,
-messages for unknown groups, messages addressed to another client, own echoes, and already-applied messages MUST NOT
-require string parsing by the caller.
+The engine MUST keep pre-convergence rejection, convergence disposition, and local canonical state distinct:
+
+- duplicate, own-echo, wrong-recipient, and unknown-group inputs return typed `IngestOutcome::Ignored` categories;
+- stale or invalid convergence candidates use convergence dispositions; and
+- authenticated local removal and quarantine return `IngestOutcome::LocalState`.
+
+Realizing removal remains an engine side effect even though removal is not a stale convergence disposition. None of
+these classifications may require string parsing by the caller.
 
 During `PendingPublish` or `Merging`, inbound group messages MAY be buffered. The engine MUST replay buffered messages
 when the group returns to `Stable`.
@@ -122,13 +127,20 @@ Stored message payloads are typed:
 
 For group messages, the engine MUST first peel with the current MLS exporter context. If that fails and retained epoch
 snapshots are available, it SHOULD try those retained contexts newest-to-oldest within the retention window before
-classifying the message as `PeelDeferred`.
+returning `IngestOutcome::TransportDeferred` and retaining it as `PeelDeferred`.
 
-Transport group envelopes SHOULD carry a clear source-epoch hint. If the peeler reports that the source epoch is older
-than the current local context and no retained snapshot can peel the message, the engine MUST classify the message as a
-terminal `PeelFailed`, not `PeelDeferred`. This is the expected path for an invitee who joined via welcome and later
-receives the invite commit that created that welcome: the invitee never had the pre-welcome epoch secret. Future-epoch
-group messages, or group messages without a usable source-epoch hint, MAY remain `PeelDeferred`.
+When a transport supplies authenticated source-epoch evidence and no retained snapshot can peel the object, the engine
+MAY establish a specific stale outcome such as `AlreadyAtEpoch`. The Nostr group envelope has no clear source-epoch
+hint, so a decrypt miss remains `TransportDeferred`: it might be a future-epoch object whose missing commit will later
+change the peel context. A local row or retry cap returns typed `ResourceRefused`, does not establish invalidity or
+permanent unreadability, and MUST leave exact-ID redelivery eligible.
+
+`PeelDeferred` rows MUST persist their distinct-context attempt count and conservative local residence deadline.
+Restart MUST NOT reset either budget. Live-process expiry uses monotonic time; restart rebases from durable wall time,
+and backwards wall movement MUST NOT shorten the remaining residence. The scheduler MUST keep a wakeup armed for the
+earliest deferred deadline even when the peel-context fingerprint stays unchanged. Deadline release is a local
+`ResourceRefused` outcome, deletes the raw row and releases its cap slot, creates no terminal dedup marker, and arms
+transport-history recovery before synchronization is considered complete.
 
 When convergence reaches a settled selected branch, the engine MUST retry `PeelDeferred` raw group messages for that
 group. A retry that peels into OpenMLS wire bytes promotes the stored payload from `RawTransport` to `OpenMlsWire`; it
@@ -180,6 +192,37 @@ group. Auto-publish and explicit `send` paths now share the same publish-before-
 If a group has unresolved convergence input, `send(intent)` MUST store the intent durably and return
 `SendResult::Queued`.
 
+`PendingPublish` and `Merging` are the two steps of resolving a publication this client staged, and neither exit is
+something the sender controls — a transport outcome, then the local merge that outcome authorizes. An
+application-message intent offered in one of those states MUST also be stored durably and returned as
+`SendResult::Queued` rather than refused, so a slow or failing publication cannot discard a user's message. Group-state
+intents MUST keep the strict `Stable` requirement, because a second staged evolution has no epoch to apply to.
+`Recovering` awaits a convergence decision over remote branches rather than a local publication; whether application
+work is retained across it is a separate lifecycle question and MUST NOT be assumed from this rule.
+
+`Disbanded` is terminal and MUST refuse every intent. `Unrecoverable` MUST refuse every intent except
+`SendIntent::Disband`, which persists an irreversible request rather than retaining a delivery, and whose Commit
+preparation MUST still wait for `Stable`. Neither state resolves on its own, so neither may accept new work.
+
+Refusing new work is not discarding accepted work. Intents retained before a group entered a terminal state MUST persist
+for that state's one legal exit: a verified repair returns an `Unrecoverable` group to `Stable`, and the drain then
+prepares the retained intents under the post-repair epoch. They MUST NOT be purged on the transition into
+`Unrecoverable`. `Disbanded` is the sole exception, and only because its terminal Commit purges the queue in the same
+transaction that writes the tombstone.
+
+Because retention stores the *intent*, not ciphertext, a message retained across an epoch change MUST be encrypted under
+the epoch it is regenerated at, never the epoch it was accepted at. That is what makes holding across a halt
+deliverable rather than a promise the engine cannot keep.
+
+When a publish outcome returns a group to `Stable`, the engine MUST schedule that group for convergence if it still
+holds durable outbound intents. Nothing else would release them.
+
+Releasing a retained intent is not ordered against a new send: a send accepted once the group is `Stable` publishes
+immediately if its convergence inputs have settled, while a retained intent waits for the next convergence drain, so a
+message accepted later MAY reach the transport first — by up to the settlement quiescence delay. Display order is
+unaffected, because the application timeline stamps a message when it is accepted rather than when it publishes;
+per-sender FIFO publication is not a protocol promise.
+
 When the group becomes stable, the application calls:
 
 ```text
@@ -194,8 +237,8 @@ pause later queued work until `confirm_published` or `publish_failed` resolves t
 
 ## Commit Convergence
 
-Commits are the consensus log. All honest engines that see the same valid commit set and policy MUST process commits in
-the same canonical order.
+Commits are the consensus log. All honest engines that see the same valid commit set under the same pinned protocol
+policy MUST process commits in the same canonical order.
 
 The engine builds a bounded candidate-state graph from retained MLS snapshots. Production engines MUST derive candidate
 edges by replaying MLS bytes against retained snapshots. They MUST NOT trust transport-provided parent metadata.
@@ -203,7 +246,7 @@ edges by replaying MLS bytes against retained snapshots. They MUST NOT trust tra
 Commit rules:
 
 - A commit creates a candidate edge only if it validates against exactly one parent state.
-- A child commit whose parent is unavailable remains pending until the parent appears or the child expires.
+- A child commit whose parent is unavailable is explicitly deferred until the parent appears or the child expires.
 - A commit at or after the retained anchor MAY be replayed from the retained snapshot for its source epoch.
 - A commit older than the retained anchor MUST be dropped with `BeyondAnchor`.
 - A commit that needs a retained snapshot inside the rewind window, when that snapshot is missing, MUST return
@@ -246,7 +289,7 @@ Branch selection uses these values:
 - `app_witness_score`: the sum of distinct app-message senders counted per branch epoch, capped by that epoch's sender
   quorum.
 - `witness_quorum_met`: true when the branch has enough distinct app-message senders in enough branch epochs under the
-  group policy.
+  pinned protocol policy.
 - `effective_commit_depth`: `raw_commit_depth` plus the bounded witness boost when `witness_quorum_met` is true.
 
 Witnesses are evidence that group members used a branch after it was created. They do not create epochs, apply commits,
@@ -256,14 +299,20 @@ Branches are compared in this order:
 
 1. Higher effective commit depth.
 2. Witness quorum beats no quorum.
-3. Higher raw commit depth.
-4. Higher app-witness score.
-5. Lower tip commit digest.
+3. Higher app-witness score.
+4. Lower tip commit priority (`Privileged` before `Ordinary`).
+5. Lower authenticated tip committer account id.
+6. Lower tip commit digest.
+
+Raw commit depth remains an input to effective depth and a diagnostic field, but it has no separate comparison step.
+
+The conformance scenario
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 3 and 4.
 
 Application witnesses are valid application messages that decrypt against a candidate state. Witness score counts
 distinct senders per epoch. One sender cannot increase score by sending many messages in the same epoch.
 
-The group policy defines the quorum. A typical policy uses:
+The pinned protocol policy defines the quorum through:
 
 ```text
 witness_quorum_senders_per_epoch
@@ -282,7 +331,7 @@ epoch_witness_score =
 A branch meets witness quorum when at least `witness_quorum_senders_per_epoch` distinct senders witnessed at least
 `witness_quorum_epochs` branch epochs.
 
-When a branch meets witness quorum, the selector MAY add a bounded boost:
+When a branch meets witness quorum, the selector adds the pinned bounded boost:
 
 ```text
 effective_commit_depth =
@@ -290,42 +339,42 @@ effective_commit_depth =
   + (witness_quorum_met ? max_witness_override_depth : 0)
 ```
 
-This boost is capped. If `max_witness_override_depth = 2`, witness quorum can make a branch compare as up to two commits
-deeper. It cannot compare as three or more commits deeper, no matter how many app messages exist.
+This boost is capped. Under the pinned v1 policy, `max_witness_override_depth = 1`, so witness quorum can make a branch
+compare as one commit deeper. It cannot compare as two or more commits deeper, no matter how many app messages exist.
 
-Example with `max_witness_override_depth = 2`:
+Example with the pinned v1 policy:
 
 ```text
 live branch:
   raw_commit_depth = 3
   witness_quorum_met = true
-  effective_commit_depth = 5
+  effective_commit_depth = 4
+
+private branch:
+  raw_commit_depth = 4
+  witness_quorum_met = false
+  effective_commit_depth = 4
+
+winner: live branch, because effective depth ties and witness quorum beats no quorum
+```
+
+The witnessed branch wins because the group had broad app-message evidence on that branch, and the competing branch is
+only one commit deeper.
+
+Another example with the pinned v1 policy:
+
+```text
+live branch:
+  raw_commit_depth = 3
+  witness_quorum_met = true
+  effective_commit_depth = 4
 
 private branch:
   raw_commit_depth = 5
   witness_quorum_met = false
   effective_commit_depth = 5
 
-winner: live branch, because effective depth ties and witness quorum beats no quorum
-```
-
-The witnessed branch wins because the group had broad app-message evidence on that branch, and the competing branch is
-only two commits deeper.
-
-Another example with the same policy:
-
-```text
-live branch:
-  raw_commit_depth = 3
-  witness_quorum_met = true
-  effective_commit_depth = 5
-
-private branch:
-  raw_commit_depth = 6
-  witness_quorum_met = false
-  effective_commit_depth = 6
-
-winner: private branch, because it is more than two valid commits deeper
+winner: private branch, because it is more than one valid commit deeper
 ```
 
 The cap keeps app-message evidence secondary to the commit log. Witness quorum can protect the branch most members were
@@ -340,7 +389,8 @@ Proposal rules:
 
 - A proposal is canonical only if a canonical commit consumes it.
 - A valid proposal not yet consumed MAY remain pending until policy expiry.
-- A proposal consumed only by a losing branch MUST be dropped.
+- A proposal consumed only by an eligible losing branch is deferred until a later pass accepts it or the branch becomes
+  permanently ineligible.
 - A duplicate proposal MUST be reported as `AlreadySeen`.
 
 Production engines derive proposal consumption from OpenMLS `ProposalRef` values observed before the staged commit is
@@ -356,8 +406,7 @@ Application-message rules:
 - A message that decrypts on the selected branch and is within the MLS past-epoch decryption limit MUST be emitted as
   `GroupEvent::MessageReceived`.
 - A transport-wrapped application message for a past epoch SHOULD be retried against retained epoch contexts before it
-  is left in `PeelDeferred` or, when source-epoch metadata proves it is older than every retained context, terminally
-  classified as `PeelFailed`.
+  returns `TransportDeferred`; authenticated source-epoch evidence can instead establish a specific stale outcome.
 - A transport-wrapped application message for a future candidate epoch SHOULD stay in `PeelDeferred` until branch
   selection advances the local MLS context; then it MUST be retried and emitted only if it decrypts on the selected
   branch.
@@ -371,19 +420,21 @@ The engine MUST NOT emit an invalidated message as a normal received message.
 
 ## Policy
 
-Convergence policy is group policy. Engines MUST persist the negotiated policy per group and load it before convergence
-after restart.
+The adopted v1 convergence policy is pinned by the protocol:
 
-The policy contains:
+```text
+max_rewind_commits = 5
+app_payload_past_epoch_limit = 5
+settlement_quiescence_ms = 1000
+witness_quorum_senders_per_epoch = 2
+witness_quorum_epochs = 1
+max_witness_override_depth = 1
+```
 
-- `max_rewind_commits`, default 5 for v0 groups.
-- app-message past-epoch limit, derived from the MLS configuration.
-- stable quiescence duration.
-- witness quorum parameters.
-- `max_witness_override_depth`.
-
-Unsupported policy is a capability mismatch. A local default is only a fallback for groups that do not yet have a stored
-policy.
+These are protocol constants, not group state or local preferences. A future policy change requires a new app component
+behind a required capability; clients MUST NOT negotiate or accept alternate values under v1. The canonical definition
+lives in the adopted Marmot
+[`protocol-core/convergence.md`](https://github.com/marmot-protocol/marmot/blob/master/protocol-core/convergence.md).
 
 The branch selection function MUST NOT depend on wall-clock time. Local monotonic time only gates sync stability and
 outbound publication.
@@ -396,7 +447,6 @@ Required storage:
 
 - group metadata and current epoch,
 - OpenMLS state,
-- negotiated convergence policy and engine version,
 - retained Marmot and OpenMLS snapshots from current tip back through `max_rewind_commits`,
 - durable message records for retained commits, proposals, app messages, and welcomes, with typed stored payloads
   distinguishing raw transport bytes from peeled OpenMLS wire bytes,
@@ -408,11 +458,15 @@ Required storage:
 - queued outbound intents,
 - last convergence-relevant input time.
 
+The current storage does not persist convergence-policy constants or an engine version per group. V1 constants are
+protocol-pinned, and the on-disk schema is versioned through storage migrations. A future policy revision that needs
+on-disk compatibility detection requires an explicit policy-version stamp and migration.
+
 Snapshot and rollback MUST be atomic across Marmot metadata and OpenMLS state. A rollback that restores only one side is
 invalid.
 
-Storage MAY discard artifacts outside negotiated retention horizons. Once discarded, those artifacts cannot cause
-rollback or app-message acceptance.
+Storage MAY discard artifacts outside the pinned protocol retention horizons. Once discarded, those artifacts cannot
+cause rollback or app-message acceptance.
 
 ## Errors And Dispositions
 
@@ -448,13 +502,14 @@ A conforming engine MUST pass scenario tests for:
 - witness quorum overriding only a bounded private-branch lead,
 - child commit delivered before parent,
 - proposal consumed by canonical commit,
-- proposal on losing branch dropped,
+- proposal on an eligible losing branch deferred,
 - app message on losing branch invalidated with payload reference when known,
 - late same-epoch commit replayed from a retained anchor,
 - missing retained anchor reported without mutation,
 - commit older than retained anchor dropped as `BeyondAnchor`,
 - duplicate commit, proposal, and app message reported as `AlreadySeen`,
 - outbound app and commit intents queued while syncing,
+- app message retained across a pending publish and regenerated under the epoch the publish established,
 - queued commit regenerated after settled convergence,
 - restart reproducing the same canonicalization result from persisted storage,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients.

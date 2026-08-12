@@ -22,6 +22,7 @@ fn jsonl_recorder_appends_events_with_monotonic_seq() {
     let dir = TempDir::new().unwrap();
     let path = default_jsonl_path(dir.path(), "engine-abc");
     let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    assert!(recorder.is_enabled());
     recorder.record(AuditRecord::new(
         None,
         AuditEventKind::SendEntry {
@@ -141,6 +142,7 @@ fn jsonl_recorder_rotate_discards_old_lines_and_keeps_recording() {
 #[test]
 fn noop_recorder_has_no_path_and_rotate_is_a_no_op() {
     let recorder = NoopRecorder;
+    assert!(!recorder.is_enabled());
     assert!(recorder.audit_log_path().is_none());
     recorder.rotate().unwrap();
 }
@@ -392,6 +394,82 @@ fn sync_drain_round_trips_through_serde() {
         serde_json::from_str::<AuditEventKind>(&empty_json).unwrap(),
         empty
     );
+}
+
+#[test]
+fn epoch_stall_backfill_armed_roundtrips_and_carries_its_fields() {
+    let kind = AuditEventKind::EpochStallBackfillArmed {
+        stalled_epoch: 19,
+        threshold: 8,
+        trigger: Some(EpochStallBackfillTrigger::ResourceRefusal),
+    };
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 7,
+        wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
+        recorder_session_id: Some("recorder-1".into()),
+        account_ref: None,
+        engine_id: "engine-xyz".into(),
+        group_ref: None,
+        context: None,
+        kind: kind.clone(),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["kind"]["type"], "epoch_stall_backfill_armed");
+    assert_eq!(value["kind"]["stalled_epoch"], 19);
+    assert_eq!(value["kind"]["threshold"], 8);
+    assert_eq!(value["kind"]["trigger"], "resource_refusal");
+    let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.kind, kind);
+}
+
+#[test]
+fn epoch_stall_backfill_armed_accepts_pre_trigger_v2_rows() {
+    let parsed: AuditEventKind = serde_json::from_value(serde_json::json!({
+        "type": "epoch_stall_backfill_armed",
+        "stalled_epoch": 19,
+        "threshold": 8
+    }))
+    .unwrap();
+    assert_eq!(
+        parsed,
+        AuditEventKind::EpochStallBackfillArmed {
+            stalled_epoch: 19,
+            threshold: 8,
+            trigger: None,
+        }
+    );
+}
+
+#[test]
+fn epoch_stall_backfill_escalated_roundtrips_and_carries_its_fields() {
+    let kind = AuditEventKind::EpochStallBackfillEscalated {
+        stalled_epoch: 12,
+        arms: 3,
+        arm_threshold: 3,
+    };
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 9,
+        wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
+        recorder_session_id: Some("recorder-1".into()),
+        account_ref: None,
+        engine_id: "engine-xyz".into(),
+        group_ref: None,
+        context: None,
+        kind: kind.clone(),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["kind"]["type"], "epoch_stall_backfill_escalated");
+    assert_eq!(value["kind"]["stalled_epoch"], 12);
+    assert_eq!(value["kind"]["arms"], 3);
+    assert_eq!(value["kind"]["arm_threshold"], 3);
+    let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.kind, kind);
 }
 
 fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
@@ -778,7 +856,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             epoch: Some(3),
             reason: "fork_loser".into(),
             retry_count: Some(2),
-            sweeps_waited: Some(5),
+            residence_ms: Some(5_000),
         },
         AuditEventKind::Rejection {
             msg_id: "m".into(),
@@ -803,6 +881,49 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             deliveries: 3,
             cursor_before_secs: Some(1_699_999_880),
             cursor_after_secs: Some(1_700_000_000),
+        },
+        AuditEventKind::EpochStallBackfillArmed {
+            stalled_epoch: 19,
+            threshold: 8,
+            trigger: Some(EpochStallBackfillTrigger::UndecryptableThreshold),
+        },
+        AuditEventKind::EpochStallBackfillStarted {
+            seam: EpochBackfillExecutionSeam::ExplicitCatchUp,
+            replay_scope: EpochBackfillReplayScope::AccountFullHistory,
+            retry_ordinal: 0,
+        },
+        AuditEventKind::EpochStallBackfillCompleted {
+            retry_ordinal: 0,
+            duration_ms: 120,
+            activation_outcome: EpochBackfillActivationOutcome::Succeeded,
+            deliveries: 4,
+            local_epoch_before: 19,
+            local_epoch_after: 20,
+            group_advanced: true,
+        },
+        AuditEventKind::EpochStallBackfillFailed {
+            retry_ordinal: 0,
+            duration_ms: 50,
+            activation_outcome: EpochBackfillActivationOutcome::Failed,
+            error_kind: Some("account_transport".into()),
+            deliveries: 0,
+            local_epoch_before: 19,
+            local_epoch_after: 19,
+            group_advanced: false,
+        },
+        AuditEventKind::EpochStallBackfillDeferred {
+            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
+            retry_ordinal: 1,
+        },
+        AuditEventKind::EpochStallBackfillEscalated {
+            stalled_epoch: 12,
+            arms: 3,
+            arm_threshold: 3,
+        },
+        AuditEventKind::ConvergencePassDiscarded {
+            stale_base_epoch: 7,
+            current_tip_epoch: 13,
+            generation: 4,
         },
     ]
 }
@@ -1529,7 +1650,21 @@ fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
                 }],
                 ..ConvergenceCandidate::default()
             }],
-            rule_trace: Vec::new(),
+            rule_trace: vec![ConvergenceRuleEvaluation {
+                rule_name: "committer_identity_comparison".into(),
+                inputs: Some(serde_json::json!({
+                    "tip_committer_pubkey_hex": "11".repeat(32),
+                })),
+                result: serde_json::json!({
+                    "selected_committer": "22".repeat(32),
+                }),
+                scope: None,
+                candidate_branch_id: None,
+                other_candidate_branch_id: None,
+                decisive: Some(true),
+                selected_branch_id: Some("branch-1".into()),
+                rejected_branch_id: None,
+            }],
             selected_branch_id: Some("branch-1".into()),
             selected_fork_epoch: None,
             selected_tip_epoch: None,
@@ -1540,7 +1675,13 @@ fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
     drop(recorder);
 
     let contents = fs::read_to_string(&path).unwrap();
-    for secret in [&"dd".repeat(32), &"ee".repeat(32), &"ff".repeat(32)] {
+    for secret in [
+        &"11".repeat(32),
+        &"22".repeat(32),
+        &"dd".repeat(32),
+        &"ee".repeat(32),
+        &"ff".repeat(32),
+    ] {
         assert!(
             !contents.contains(secret),
             "obfuscated-mode log leaked {secret:?}: {contents}"
@@ -1548,4 +1689,8 @@ fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
     }
     assert!(contents.contains("member-ref-1"), "{contents}");
     assert!(contents.contains("branch-1"), "{contents}");
+    assert!(
+        !contents.contains("committer_identity_comparison"),
+        "obfuscated-mode log retained an untyped rule trace: {contents}"
+    );
 }

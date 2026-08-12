@@ -21,6 +21,19 @@
 use crate::ingest::PeeledMessage;
 use crate::types::EpochId;
 use serde::{Deserialize, Serialize};
+
+/// Canonical application-facing group lifecycle classification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupLifecycleState {
+    #[default]
+    Stable,
+    PendingPublish,
+    Merging,
+    Recovering,
+    Unrecoverable,
+    Disbanded,
+}
 use std::fmt;
 
 /// Opaque handle to a staged MLS commit. The engine serializes its
@@ -142,6 +155,17 @@ pub struct Unrecoverable {
     last_stable_epoch: EpochId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Disbanded {
+    epoch: EpochId,
+}
+
+impl Disbanded {
+    pub fn epoch(&self) -> EpochId {
+        self.epoch
+    }
+}
+
 impl Unrecoverable {
     pub fn last_stable_epoch(&self) -> EpochId {
         self.last_stable_epoch
@@ -198,6 +222,11 @@ pub enum EpochState {
         epoch: EpochId,
     },
     PendingPublish(PendingPublish),
+    /// A confirmed publication whose Commit has not been merged into local MLS
+    /// state yet. Never stored or observable in practice:
+    /// `EpochManager::confirm_publish` builds it and consumes it in the same
+    /// expression, so no gate ever sees a group in this state. It exists so the
+    /// two halves of resolving a publication stay distinct transitions.
     Merging(Merging),
     Recovering(Recovering),
     /// The client cannot safely select a branch from its retained local
@@ -206,11 +235,18 @@ pub enum EpochState {
     /// applying and ingesting group-state changes until a verified repair path.
     /// See `spec/protocol-core/group-state.md:17,54-66`.
     Unrecoverable(Unrecoverable),
+    /// A selected authenticated disband Commit terminalized the group. Live MLS
+    /// state no longer exists and there is no legal transition out.
+    Disbanded(Disbanded),
 }
 
 impl EpochState {
     pub fn stable(epoch: EpochId) -> Self {
         EpochState::Stable { epoch }
+    }
+
+    pub fn disbanded(epoch: EpochId) -> Self {
+        EpochState::Disbanded(Disbanded { epoch })
     }
 
     /// Current epoch this state reflects. For `Recovering`, returns the last
@@ -222,6 +258,7 @@ impl EpochState {
             EpochState::Merging(m) => m.epoch(),
             EpochState::Recovering(r) => r.last_stable_epoch(),
             EpochState::Unrecoverable(u) => u.last_stable_epoch(),
+            EpochState::Disbanded(d) => d.epoch(),
         }
     }
 
@@ -234,10 +271,32 @@ impl EpochState {
         matches!(self, EpochState::Stable { .. } | EpochState::Recovering(_))
     }
 
+    /// Whether this state is a transient step in resolving a publication this
+    /// client staged: `PendingPublish` awaits the transport outcome, `Merging`
+    /// awaits the local merge that outcome authorizes. Neither exit is
+    /// something the sender controls, and both can take minutes when relays
+    /// misbehave. This is the boundary outbound application work is retained
+    /// across — see `CgkaEngine::send`.
+    ///
+    /// `Recovering` is deliberately outside this predicate even though it, too,
+    /// awaits an exit. Its exit is a convergence decision over remote branches
+    /// rather than a publication this client staged, and it may settle into a
+    /// terminal state instead of `Stable`. Retaining application work across it
+    /// is a separate lifecycle question (mdk#1177 scoped this boundary to a
+    /// stalled local publication), so a send while `Recovering` keeps reporting
+    /// the illegal transition it always has.
+    pub fn is_resolving_local_publish(&self) -> bool {
+        matches!(self, EpochState::PendingPublish(_) | EpochState::Merging(_))
+    }
+
     /// Whether this group is in the terminal `Unrecoverable` state and requires
     /// a repair path before it may apply or ingest more group traffic.
     pub fn is_unrecoverable(&self) -> bool {
         matches!(self, EpochState::Unrecoverable(_))
+    }
+
+    pub fn is_disbanded(&self) -> bool {
+        matches!(self, EpochState::Disbanded(_))
     }
 
     /// Whether this group is in the `Stable` state — the only state from which
@@ -257,6 +316,7 @@ impl EpochState {
             EpochState::Merging(_) => "Merging",
             EpochState::Recovering(_) => "Recovering",
             EpochState::Unrecoverable(_) => "Unrecoverable",
+            EpochState::Disbanded(_) => "Disbanded",
         }
     }
 
@@ -360,6 +420,32 @@ impl EpochState {
                 to: "Stable",
                 reason: "repair_to_stable requires Unrecoverable",
             }),
+        }
+    }
+
+    /// `Recovering → Disbanded`. Terminalization is legal only after the
+    /// mandatory bounded convergence pass selects a disband branch.
+    pub fn settle_to_disbanded(self, epoch: EpochId) -> Result<Self, InvalidTransition> {
+        match self {
+            EpochState::Recovering(_) => Ok(EpochState::disbanded(epoch)),
+            other => Err(InvalidTransition {
+                from: other.name(),
+                to: "Disbanded",
+                reason: "disband terminalization requires Recovering",
+            }),
+        }
+    }
+}
+
+impl From<&EpochState> for GroupLifecycleState {
+    fn from(value: &EpochState) -> Self {
+        match value {
+            EpochState::Stable { .. } => Self::Stable,
+            EpochState::PendingPublish(_) => Self::PendingPublish,
+            EpochState::Merging(_) => Self::Merging,
+            EpochState::Recovering(_) => Self::Recovering,
+            EpochState::Unrecoverable(_) => Self::Unrecoverable,
+            EpochState::Disbanded(_) => Self::Disbanded,
         }
     }
 }
@@ -533,6 +619,63 @@ mod tests {
             EpochState::Recovering(r) => assert_eq!(r.last_stable_epoch(), EpochId(4)),
             _ => panic!("expected Recovering"),
         }
+    }
+
+    #[test]
+    fn only_a_locally_staged_publish_retains_outbound_work() {
+        // The engine retains outbound application work across exactly the
+        // states a publication it staged passes through, so this split has to
+        // stay a deliberate decision rather than something a new variant joins
+        // by accident. `Stable` needs no retention, and a terminal state accepts
+        // no new work at all.
+        let pending = EpochState::stable(EpochId(1))
+            .begin_pending(EpochId(2), handle(), pref())
+            .unwrap();
+        let cases = [
+            (EpochState::stable(EpochId(1)), false),
+            (pending.clone(), true),
+            (pending.confirm_publish().unwrap(), true),
+            (EpochState::stable(EpochId(1)).detect_fork(vec![]), false),
+            (EpochState::stable(EpochId(1)).to_unrecoverable(), false),
+            (EpochState::disbanded(EpochId(1)), false),
+        ];
+
+        for (state, retains_outbound_work) in cases {
+            assert_eq!(
+                state.is_resolving_local_publish(),
+                retains_outbound_work,
+                "{} is misclassified",
+                state.name()
+            );
+            // The three classifications never overlap, so a caller may reason
+            // with any one of them without consulting the others.
+            assert!(
+                [
+                    state.is_stable(),
+                    retains_outbound_work,
+                    state.is_unrecoverable() || state.is_disbanded()
+                ]
+                .iter()
+                .filter(|holds| **holds)
+                .count()
+                    <= 1,
+                "{} must not be more than one of stable / resolving a publish / terminal",
+                state.name()
+            );
+        }
+
+        // They do not partition the machine either: `Recovering` is the one
+        // state in none of the three buckets. That is the carve-out above, and
+        // a future variant landing here needs its own deliberate answer rather
+        // than inheriting one from a negation.
+        let recovering = EpochState::stable(EpochId(1)).detect_fork(vec![]);
+        assert!(
+            !recovering.is_stable()
+                && !recovering.is_resolving_local_publish()
+                && !recovering.is_unrecoverable()
+                && !recovering.is_disbanded(),
+            "Recovering must stay unclassified; classifying it is a policy change"
+        );
     }
 
     #[test]

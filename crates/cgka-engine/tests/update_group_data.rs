@@ -11,21 +11,31 @@
 
 use async_trait::async_trait;
 use cgka_engine::DEFAULT_CIPHERSUITE;
-use cgka_engine::canonicalization::{ConvergenceStatus, DroppedMessageReason};
+use cgka_engine::canonicalization::{
+    ConvergenceStatus, DeferredMessageReason, DroppedMessageReason, MessageKind,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, default_group_components, encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1,
+    GroupLifecycleV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_lifecycle_v1,
+    default_group_components, encode_component_vectors, encode_components_list,
+    encode_group_avatar_url_v1, encode_nostr_routing_v1,
+};
+use cgka_traits::app_event::{
+    AppMessageRetentionDecision, MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -278,6 +288,7 @@ fn registry() -> FeatureRegistry {
 
 fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -289,6 +300,7 @@ fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -298,9 +310,52 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
     (engine, storage)
 }
 
+fn build_current(id: &[u8]) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_current_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
+fn build_with_storage_and_component(
+    id: &[u8],
+    component_id: u16,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut components: Vec<_> = default_group_components().into_iter().collect();
+    components.push(component_id);
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
 fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
     let result = engine
-        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(group_id, 1_000_000)
         .expect("buffered commit converges");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 }
@@ -311,8 +366,23 @@ fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
     let mut components: Vec<_> = default_group_components().into_iter().collect();
     components.push(NOSTR_ROUTING_COMPONENT_ID);
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry())
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_with_opaque_component(id: &[u8], component_id: u16) -> Engine<SqliteAccountStorage> {
+    let mut components: Vec<_> = default_group_components().into_iter().collect();
+    components.push(component_id);
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(components)
         .peeler(Box::new(MockPeeler))
@@ -357,7 +427,6 @@ async fn routing_rotation_reindexes_inbound_transport_group_id() {
     bob.join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
-
     // Alice rotates the routing X -> Y and confirms locally.
     let routing_y = NostrRoutingV1::new([0x59; 32], vec!["wss://y.example".into()]).unwrap();
     let res = alice
@@ -430,6 +499,23 @@ fn malicious_app_component_commit(
     group_id: &GroupId,
     updates: Vec<AppComponentData>,
 ) -> TransportMessage {
+    raw_app_data_commit(
+        storage,
+        sender,
+        group_id,
+        updates
+            .into_iter()
+            .map(|update| AppDataUpdateProposal::update(update.component_id, update.data))
+            .collect(),
+    )
+}
+
+fn raw_app_data_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    proposals: Vec<AppDataUpdateProposal>,
+) -> TransportMessage {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -448,27 +534,27 @@ fn malicious_app_component_commit(
     )
     .expect("MLS signer exists");
 
-    let proposals = updates
-        .iter()
-        .map(|update| {
-            Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
-                update.component_id,
-                update.data.clone(),
-            )))
-        })
-        .collect::<Vec<_>>();
     let mut builder = mls_group
         .commit_builder()
-        .add_proposals(proposals)
+        .add_proposals(
+            proposals
+                .into_iter()
+                .map(|proposal| Proposal::AppDataUpdate(Box::new(proposal))),
+        )
         .load_psks(provider.storage())
         .expect("load PSKs");
     let mut app_data = builder.app_data_dictionary_updater();
     for proposal in builder.app_data_update_proposals() {
-        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-            app_data.set(ComponentData::from_parts(
-                proposal.component_id(),
-                data.clone(),
-            ));
+        match proposal.operation() {
+            AppDataUpdateOperation::Update(data) => {
+                app_data.set(ComponentData::from_parts(
+                    proposal.component_id(),
+                    data.clone(),
+                ));
+            }
+            AppDataUpdateOperation::Remove => {
+                app_data.remove(&proposal.component_id());
+            }
         }
     }
     builder.with_app_data_dictionary_updates(app_data.changes());
@@ -532,6 +618,7 @@ fn build_with_storage_and_peeler(
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -892,7 +979,7 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
         .await
         .expect("malicious commit enters convergence");
     let result = alice
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("convergence should reject unauthorized commit without failing");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -915,6 +1002,185 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
             .expect("malicious message was stored")
             .state,
         MessageState::EpochInvalidated
+    );
+}
+
+#[tokio::test]
+async fn inbound_commit_cannot_unrequire_current_admin_policy() {
+    let (mut alice, alice_storage) = build_current_with_storage(b"alice");
+    let mut bob = build_current(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mandatory-invariants".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let malicious = raw_app_data_commit(
+        &alice_storage,
+        &alice.self_id(),
+        &gid,
+        vec![AppDataUpdateProposal::update(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(
+                &[
+                    GROUP_PROFILE_COMPONENT_ID,
+                    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )],
+    );
+    bob.ingest(malicious.clone())
+        .await
+        .expect("commit is retained for convergence");
+    let result = bob
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .expect("invalid commit receives a terminal disposition");
+
+    assert!(result.accepted_commits.is_empty());
+    assert!(result.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == hex::encode(content_id(&malicious).as_slice())
+            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    }));
+    assert_eq!(bob.epoch(&gid).unwrap().0, 1);
+    assert!(
+        bob.group_record(&gid)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+    );
+    assert_eq!(
+        bob.admin_pubkeys(&gid).unwrap(),
+        vec![<[u8; 32]>::try_from(pad32(b"alice")).unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn current_profile_component_update_preserves_active_lifecycle_for_peer() {
+    let mut alice = build_current(b"alice-lifecycle-update");
+    let mut bob = build_current(b"bob-lifecycle-update");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_group_profile_v1(
+                    &cgka_traits::app_components::GroupProfileV1 {
+                        name: "after".into(),
+                        description: String::new(),
+                    },
+                )
+                .unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match update {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        bob.ingest(commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    for _ in 0..24 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        bob.advance_convergence(&gid).await.unwrap();
+        if bob.group_record(&gid).unwrap().name == "after" {
+            break;
+        }
+    }
+
+    assert_eq!(bob.group_record(&gid).unwrap().name, "after");
+    assert_eq!(
+        decode_group_lifecycle_v1(
+            &bob.app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+                .unwrap()
+                .expect("lifecycle component present"),
+        )
+        .unwrap(),
+        GroupLifecycleV1::Active
+    );
+}
+
+#[tokio::test]
+async fn required_lifecycle_component_cannot_be_unrequired() {
+    let mut alice = build_current(b"alice-required-lifecycle");
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "required lifecycle".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
+    let mut required = alice
+        .group_record(&gid)
+        .unwrap()
+        .required_capabilities
+        .app_components;
+    assert!(required.ids.remove(&GROUP_LIFECYCLE_COMPONENT_ID));
+
+    let error = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: APP_COMPONENTS_COMPONENT_ID,
+                data: encode_components_list(&required.ids),
+            }],
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("lifecycle-v1 cannot be un-required"),
+        "unexpected error: {error}"
     );
 }
 
@@ -984,6 +1250,213 @@ async fn admin_policy_update_listing_non_member_is_rejected() {
 }
 
 // ── Partial update ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_members() {
+    const OPAQUE_COMPONENT_ID: u16 = 0xF301;
+    const OPAQUE_BYTES: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+
+    let mut alice = build_with_opaque_component(b"alice", OPAQUE_COMPONENT_ID);
+    let mut bob = build_with_opaque_component(b"bob", OPAQUE_COMPONENT_ID);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "orig description".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    // Add opaque state without listing it as required. Current-profile clients
+    // fail closed on unknown required components, but must preserve unknown
+    // OPTIONAL entries byte-for-byte across unrelated commits.
+    let result = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: OPAQUE_COMPONENT_ID,
+                data: OPAQUE_BYTES.to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match result {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    let result = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match result {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    assert_eq!(
+        alice.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
+        Some(OPAQUE_BYTES.to_vec())
+    );
+    assert_eq!(
+        bob.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
+        Some(OPAQUE_BYTES.to_vec())
+    );
+
+    // Exercise the distinct Add/Welcome transition after the unrelated
+    // profile update. The existing members and the new member must all retain
+    // the exact opaque bytes.
+    let mut carol = build_with_opaque_component(b"carol", OPAQUE_COMPONENT_ID);
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, pending, mut welcomes) = match invite {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => (msg, pending, welcomes),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    carol
+        .join_welcome(welcomes.remove(0))
+        .await
+        .expect("new member joins from the invite Welcome");
+
+    for (name, engine) in [("alice", &alice), ("bob", &bob), ("carol", &carol)] {
+        assert_eq!(
+            engine.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
+            Some(OPAQUE_BYTES.to_vec()),
+            "{name} must retain the opaque component through Add/Welcome"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inbound_commit_atomically_unrequires_and_removes_optional_component() {
+    let (mut alice, alice_storage) =
+        build_with_storage_and_component(b"alice", GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+    let mut bob = build_with_opaque_component(b"bob", GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let absent_image = encode_component_vectors(&[&[], &[], &[], &[], &[]]);
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "atomic-remove".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                data: absent_image,
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let resulting_required = [
+        GROUP_PROFILE_COMPONENT_ID,
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        GROUP_LIFECYCLE_COMPONENT_ID,
+    ]
+    .into_iter()
+    .collect();
+    let commit = raw_app_data_commit(
+        &alice_storage,
+        &alice.self_id(),
+        &gid,
+        vec![
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&resulting_required),
+            ),
+            AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
+        ],
+    );
+    bob.ingest(commit)
+        .await
+        .expect("atomic unrequire and remove is retained");
+    let result = bob
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .expect("atomic unrequire and remove converges");
+    assert_eq!(
+        result.accepted_commits.len(),
+        1,
+        "atomic transition was rejected: {result:?}"
+    );
+
+    assert_eq!(bob.epoch(&gid).unwrap().0, 2);
+    assert_eq!(
+        bob.app_component(&gid, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+            .unwrap(),
+        None
+    );
+    assert!(
+        !bob.group_record(&gid)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+    );
+}
 
 #[tokio::test]
 async fn update_group_data_with_only_name_preserves_description() {
@@ -1270,6 +1743,146 @@ async fn convergence_emits_attributed_message_retention_change_events() {
         )),
         "convergence apply must emit an attributed MessageRetentionChanged for alice, got: {events:?}",
     );
+}
+
+#[tokio::test]
+async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
+    let (mut alice, mut bob, gid) = create_pair().await;
+    let alice_pubkey = hex::encode(alice.self_id().as_slice());
+
+    let before_enable_payload = MarmotAppEvent::new(
+        alice_pubkey.clone(),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "before retention",
+    )
+    .encode()
+    .unwrap();
+    let before_enable_event_id = MarmotAppEvent::decode(&before_enable_payload).unwrap().id;
+    let before_enable = match alice
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload: before_enable_payload,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage {
+            msg,
+            group_id,
+            app_event_id,
+            source_epoch,
+            retention,
+        } => {
+            assert_eq!(group_id, gid);
+            assert_eq!(app_event_id, before_enable_event_id);
+            assert_eq!(source_epoch, cgka_traits::EpochId(1));
+            assert_eq!(
+                retention,
+                AppMessageRetentionDecision::new(1_700_000_000, 0)
+            );
+            route_to_group(&msg, &gid)
+        }
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+
+    let enable = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (enable_commit, enable_pending) = match enable {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(enable_pending).await.unwrap();
+    bob.ingest(route_to_group(&enable_commit, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    bob.drain_events();
+
+    bob.ingest(before_enable).await.unwrap();
+    assert!(bob.drain_events().iter().any(|event| matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            retention: Some(decision),
+            ..
+        } if *decision == AppMessageRetentionDecision::new(1_700_000_000, 0)
+    )));
+
+    let before_disable_payload = MarmotAppEvent::new(
+        alice_pubkey,
+        1_700_000_100,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "before disable",
+    )
+    .encode()
+    .unwrap();
+    let before_disable_event_id = MarmotAppEvent::decode(&before_disable_payload).unwrap().id;
+    let before_disable = match alice
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload: before_disable_payload,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage {
+            msg,
+            group_id,
+            app_event_id,
+            source_epoch,
+            retention,
+        } => {
+            assert_eq!(group_id, gid);
+            assert_eq!(app_event_id, before_disable_event_id);
+            assert_eq!(source_epoch, cgka_traits::EpochId(2));
+            assert_eq!(
+                retention,
+                AppMessageRetentionDecision::new(1_700_000_100, 60)
+            );
+            route_to_group(&msg, &gid)
+        }
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+
+    let disable = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 0u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (disable_commit, disable_pending) = match disable {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(disable_pending).await.unwrap();
+    bob.ingest(route_to_group(&disable_commit, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    bob.drain_events();
+
+    bob.ingest(before_disable).await.unwrap();
+    assert!(bob.drain_events().iter().any(|event| matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            retention: Some(decision),
+            ..
+        } if *decision == AppMessageRetentionDecision::new(1_700_000_100, 60)
+    )));
 }
 
 // ── Concurrent-rename supersession (issue #363) ─────────────────────────────
@@ -1666,10 +2279,10 @@ async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_or
         build_with_storage_and_peeler(loser_id, loser_storage.clone(), ephemeral_peeler());
     loser.drain_events();
     loser
-        .buffer_openmls_convergence_message(&gid, route_to_group(&winner_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&winner_commit, &gid), 1_000)
         .expect("winning sibling commit buffered on the restarted loser");
     let result = loser
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("loser converges over the fork");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     let loser_after = loser.drain_events();
@@ -1851,17 +2464,17 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
         build_with_storage_and_peeler(winner_id, winner_storage.clone(), ephemeral_peeler());
     winner.drain_events();
     winner
-        .buffer_openmls_convergence_message(&gid, route_to_group(&loser_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&loser_commit, &gid), 1_000)
         .expect("losing sibling commit buffered on the restarted winner");
     let result = winner
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("winner converges over the fork");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     let winner_after = winner.drain_events();
 
     // The winner's own branch was selected: canonical name and epoch are
-    // unchanged, and the losing sibling was dropped against the candidate
-    // state rather than applied.
+    // unchanged, and the eligible losing sibling was deferred rather than
+    // applied.
     assert_eq!(
         winner_storage.get_group(&gid).unwrap().name,
         winner_name,
@@ -1870,13 +2483,14 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
     );
     assert_eq!(winner.epoch(&gid).unwrap().0, 2);
     assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.message_id == hex::encode(content_id(&loser_commit).as_slice())
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == hex::encode(content_id(&loser_commit).as_slice())
+                && deferred.kind == MessageKind::Commit
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
         }),
-        "losing sibling must be dropped against the selected candidate state, \
+        "eligible losing sibling must be deferred for a later pass, \
          got {:?}",
-        result.dropped_messages
+        result.deferred_messages
     );
 
     // No withdrawal may name the winner's own confirmed commit: its rename is
@@ -2010,15 +2624,15 @@ async fn mutually_rebuilt_engines_converge_on_same_branch_after_concurrent_renam
     alice.drain_events();
     bob.drain_events();
     alice
-        .buffer_openmls_convergence_message(&gid, route_to_group(&bob_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&bob_commit, &gid), 1_000)
         .expect("bob's sibling commit buffered on restarted alice");
-    bob.buffer_openmls_convergence_message(&gid, route_to_group(&alice_commit, &gid), 1_000)
+    bob.buffer_openmls_convergence_message_at(&gid, route_to_group(&alice_commit, &gid), 1_000)
         .expect("alice's sibling commit buffered on restarted bob");
     let alice_result = alice
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("alice converges over the fork");
     let bob_result = bob
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("bob converges over the fork");
     assert_eq!(alice_result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(bob_result.convergence_status, ConvergenceStatus::Settled);
@@ -2284,25 +2898,26 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
 
     // The losing sibling commit arrives through stored convergence.
     winner
-        .buffer_openmls_convergence_message(&gid, route_to_group(&loser_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&loser_commit, &gid), 1_000)
         .expect("losing sibling auto-commit buffered on the restarted winner");
     let result = winner
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("apply must not replay the proposal consumed by the skipped own commit");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
     // Own branch selected and intact: carol removed, epoch unchanged, the
-    // losing sibling dropped against the candidate state.
+    // eligible losing sibling deferred for a later pass.
     assert_eq!(winner.epoch(&gid).unwrap().0, 3);
     let members = winner.members(&gid).unwrap();
     assert_eq!(members.len(), 2, "carol must stay removed; got {members:?}");
     assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.message_id == hex::encode(content_id(&loser_commit).as_slice())
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == hex::encode(content_id(&loser_commit).as_slice())
+                && deferred.kind == MessageKind::Commit
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
         }),
-        "losing sibling must be dropped against the selected candidate state, got {:?}",
-        result.dropped_messages
+        "eligible losing sibling must be deferred for a later pass, got {:?}",
+        result.deferred_messages
     );
 
     // The re-opened proposal was accepted on the selected branch WITHOUT being
@@ -2538,6 +3153,50 @@ async fn concurrent_rename_and_retention_change_withdraw_only_superseded_commit(
     }
 }
 
+#[tokio::test]
+async fn unrelated_profile_update_preserves_unknown_optional_component_bytes() {
+    const UNKNOWN_OPTIONAL_COMPONENT_ID: u16 = 0xf400;
+    let unknown_bytes = vec![0xff, 0x00, 0x80, 0x01, 0x7f];
+    let (mut alice, _bob, gid) = create_pair().await;
+
+    let add_unknown = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: UNKNOWN_OPTIONAL_COMPONENT_ID,
+                data: unknown_bytes.clone(),
+            }],
+        })
+        .await
+        .unwrap();
+    let pending = match add_unknown {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let pending = match rename {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    assert_eq!(
+        alice
+            .app_component(&gid, UNKNOWN_OPTIONAL_COMPONENT_ID)
+            .unwrap(),
+        Some(unknown_bytes)
+    );
+}
+
 // ── State guard ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2593,8 +3252,8 @@ async fn valid_group_avatar_url_component_is_accepted_and_stored() {
     let (mut alice, _bob, gid) = create_pair().await;
     let data = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
         url: "https://cdn.example.com/avatar.png".to_owned(),
-        dim: Some("512x512".to_owned()),
-        thumbhash: None,
+        dim: b"512x512".to_vec(),
+        thumbhash: Vec::new(),
     })
     .unwrap();
 

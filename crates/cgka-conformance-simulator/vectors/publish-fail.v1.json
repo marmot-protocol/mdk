@@ -1,11 +1,11 @@
 {
   "scenario_name": "publish-fail/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.4",
+  "conformance_version": "0.9.11",
   "seed": null,
   "scenario": {
     "name": "publish-fail/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob"
@@ -22,9 +22,10 @@
         "pending": "create"
       },
       {
-        "type": "fail_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "reached_no_endpoint"
       },
       {
         "type": "observe",

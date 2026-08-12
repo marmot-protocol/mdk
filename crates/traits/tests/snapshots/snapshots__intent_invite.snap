@@ -17,7 +17,8 @@ expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackag
           239,
           239,
           239
-        ]
+        ],
+        "protocol_profile": "legacy"
       }
     ]
   }

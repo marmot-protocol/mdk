@@ -92,7 +92,7 @@
 
 - serde + serde_json, postcard, tls_codec
 
-**Config:** Edition 2024, MSRV 1.90.0, workspace version 0.7.1
+**Config:** Edition 2024, MSRV 1.91.0, workspace version 0.7.1
 
 ### whitenoise-rs Dependencies
 
@@ -247,7 +247,7 @@ rust/src/api/ (20 modules, 4.8K LOC — thin FFI wrapper)
 | Total LOC | ~66K Rust | ~100K Rust | 66K Dart + 5K Rust |
 | Crates/packages | 6 | 2 | 1 |
 | Edition | 2024 | 2024 | Flutter 3.x |
-| MSRV | 1.90.0 | 1.90.0 | — |
+| MSRV | 1.91.0 | 1.90.0 | — |
 | DB technology | SQLCipher (rusqlite) | SQLite (sqlx) | — (delegates to Rust) |
 | Async model | Synchronous | Tokio (full) | Dart async |
 | FFI | UniFFI | flutter_rust_bridge | flutter_rust_bridge |

@@ -1,11 +1,11 @@
 {
   "scenario_name": "queue-faults/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.4",
+  "conformance_version": "0.9.11",
   "seed": null,
   "scenario": {
     "name": "queue-faults/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -24,9 +24,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -57,19 +58,19 @@
         "payload": "carol:second"
       },
       {
-        "type": "duplicate_queued",
-        "index": 0
+        "type": "duplicate_message",
+        "selector": { "sender": "bob", "class": "application" }
       },
       {
-        "type": "delay_queued",
-        "index": 1,
-        "delayed": "delayed-copy"
+        "type": "withhold_message",
+        "selector": { "sender": "bob", "class": "application", "occurrence": 1 },
+        "label": "delayed-copy"
       },
       {
-        "type": "reorder_queued",
+        "type": "reorder_messages",
         "order": [
-          1,
-          0
+          { "sender": "carol", "class": "application" },
+          { "sender": "bob", "class": "application" }
         ]
       },
       {
@@ -82,8 +83,8 @@
         ]
       },
       {
-        "type": "release_delayed",
-        "delayed": "delayed-copy"
+        "type": "release_withheld",
+        "label": "delayed-copy"
       },
       {
         "type": "deliver_all"

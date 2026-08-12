@@ -1,32 +1,141 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use cgka_traits::TransportAdapter;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::groups::{EventGroupProjection, event_group_id, fail_if_publish_failed, observe_event};
+use crate::app_telemetry::AppPerformanceOperation;
+use crate::groups::{
+    EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
+    observe_event,
+};
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AppError, AppGroupAdminPolicyComponent, AppMessageProjection, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW,
-    remember_seen_event, unix_now_seconds,
+    AppError, AppGroupAdminPolicyComponent, AppMessageProjection, AppPerformanceTelemetry,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event, unix_now_seconds,
+};
+use marmot_forensics::{
+    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillDeferredReason,
+    EpochBackfillExecutionSeam, EpochStallBackfillTrigger,
 };
 
 use super::AppClient;
+use super::audit::EpochBackfillTerminalAudit;
+use super::epoch_stall::{
+    BackfillDecision, EpochBackfillDeferredSnapshot, PendingEpochBackfill,
+    PendingEpochBackfillGroup,
+};
+use crate::config::CursorPersistence;
+
+/// In-flight epoch-gap replay bookkeeping shared by begin/finish helpers.
+pub(crate) struct EpochBackfillExecution {
+    pub(crate) pending: PendingEpochBackfill,
+    pub(crate) epochs_before: HashMap<cgka_traits::GroupId, u64>,
+    pub(crate) retry_ordinal: u64,
+    pub(crate) started: Instant,
+}
+
+struct EpochBackfillReplayOutcome {
+    duration_ms: u64,
+    activation_outcome: EpochBackfillActivationOutcome,
+    error_kind: Option<String>,
+    deliveries: u64,
+    succeeded: bool,
+}
+
+/// Result of checking the pending epoch-gap replay queue at one execution seam.
+///
+/// `Deferred` is intentionally distinct from `NotPending`: explicit catch-up
+/// already completed its ordinary floored sync before checking this queue, so
+/// the worker may still return success while retaining the deferred recovery
+/// intent and its audit trail. Explicit full-history repair instead uses this
+/// distinction to try any queued runnable intent before falling back to its
+/// ordinary unfloored account-wide replay.
+#[derive(Debug)]
+pub(crate) enum EpochBackfillRunOutcome {
+    NotPending,
+    Deferred,
+    Completed(SyncSummary),
+}
+
+/// What the convergence scheduler should do next for a group, derived from
+/// the engine's durable pass state. Expected collection time is not an error;
+/// storage and projection failures are, and they surface as `Err` from
+/// [`AppClient::convergence_schedule_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConvergenceScheduleState {
+    /// No active pass and no pending inputs: cancel scheduled wakeups.
+    Idle,
+    /// A pass is collecting or local deferred-peel residence is pending; wake
+    /// when the earliest cutoff elapses.
+    Collecting { remaining_ms: u64 },
+    /// A pass is frozen/resolving or its cutoff already elapsed: run now.
+    Ready,
+    /// Pending inputs exist but no pass can open yet (epoch not `Stable`, an
+    /// admin reservation holds the boundary, or the retained input has no
+    /// trigger). Re-check on the fallback delay; only this state counts
+    /// toward the unsettled re-arm cap.
+    PendingUnopenable,
+    /// No convergence work, but durable queued outbound intents remain. The
+    /// scheduled drain regenerates and publishes them (and a failed sync on
+    /// that tick triggers transport reactivation), so the wakeup stays armed
+    /// on the fallback delay — but a healthy waiting queue is not unsettled
+    /// convergence and never counts toward the re-arm cap.
+    PendingOutbound,
+}
 
 impl AppClient {
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
     }
 
-    pub(crate) fn has_pending_convergence_inputs(&self, group_id: &cgka_traits::GroupId) -> bool {
-        self.runtime
-            .has_pending_convergence_inputs(group_id)
-            .unwrap_or(false)
+    /// Engine-derived convergence scheduling state for one group.
+    ///
+    /// Errors propagate: a storage or engine failure must schedule a retry at
+    /// the caller, never read as "no pending work" (the previous
+    /// `unwrap_or(false)` wrapper let an error cancel future wakeups).
+    /// `prepare_convergence_cutoff_delay_ms` is a command, not a query — it
+    /// may open a pass or persist deadline rebasing before reporting.
+    pub(crate) fn convergence_schedule_state(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<ConvergenceScheduleState, AppError> {
+        let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        match convergence_delay {
+            Some(0) => Ok(ConvergenceScheduleState::Ready),
+            Some(remaining_ms) => {
+                let remaining_ms = self
+                    .runtime
+                    .deferred_peel_cutoff_delay_ms(group_id)?
+                    .map_or(remaining_ms, |deferred| remaining_ms.min(deferred));
+                if remaining_ms == 0 {
+                    Ok(ConvergenceScheduleState::Ready)
+                } else {
+                    Ok(ConvergenceScheduleState::Collecting { remaining_ms })
+                }
+            }
+            None => {
+                if self.runtime.has_pending_convergence_inputs(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else if self.runtime.has_queued_outbound_intents(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingOutbound)
+                } else {
+                    match self.runtime.deferred_peel_cutoff_delay_ms(group_id)? {
+                        Some(0) => Ok(ConvergenceScheduleState::Ready),
+                        Some(remaining_ms) => {
+                            Ok(ConvergenceScheduleState::Collecting { remaining_ms })
+                        }
+                        None => Ok(ConvergenceScheduleState::Idle),
+                    }
+                }
+            }
+        }
     }
 
     fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {
@@ -35,12 +144,44 @@ impl AppClient {
         }
     }
 
-    fn remember_pending_convergence_effects(
+    fn remember_pending_convergence_groups(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) {
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
+    }
+
+    fn arm_recovery_from_effects(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return;
+        }
+        for event in &effects.events {
+            let cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                group_id, ..
+            } = event
+            else {
+                continue;
+            };
+            let Ok(record) = self.runtime.group_record(group_id) else {
+                continue;
+            };
+            // Recording the recovery intent before the worker performs the
+            // external full-history replay, and recording an escalation this
+            // arm raises, are both the shared decision handler's job: a
+            // resource-refusal arm counts toward the same unrecovered run as a
+            // deferred-delivery arm, and the detector raises the run's
+            // escalation only once, at whichever path happens to arm third.
+            let decision = self
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch);
+            self.apply_backfill_decision(
+                group_id,
+                record.epoch.0,
+                decision,
+                EpochStallBackfillTrigger::ResourceRefusal,
+            );
+        }
     }
 
     pub(crate) async fn sync_runtime_groups(&self) -> Result<(), AppError> {
@@ -53,21 +194,77 @@ impl AppClient {
         Ok(())
     }
 
-    pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+    pub(crate) async fn prepare_transport(&self) -> Result<(), AppError> {
+        self.prepare_transport_with_telemetry(None).await
+    }
+
+    async fn prepare_transport_with_telemetry(
+        &self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<(), AppError> {
+        // Before any subscription goes out: auth-gated relays (NIP-42)
+        // withhold gift-wrapped welcomes from unauthenticated subscribers.
+        let activation_started = Instant::now();
+        self.relay_plane
+            .set_transport_signer(self.transport_signer.clone())
+            .await;
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
-        // Capture the derived `since` floor before it is moved into activation;
-        // the forensic `subscription_rebuild` row records it alongside the
-        // per-relay registration outcome the activation produces.
-        let rebuild_since_secs = rebuild_since.map(|timestamp| timestamp.0);
-        self.runtime.activate_transport(rebuild_since).await?;
-        self.sync_runtime_groups().await?;
+        let activation = self.runtime.activate_transport(rebuild_since).await;
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                AppPerformanceOperation::AccountTransportActivation,
+                activation_started.elapsed(),
+                activation.is_ok(),
+            );
+        }
+        activation?;
+
+        let registration_started = Instant::now();
+        let registration = self.sync_runtime_groups().await;
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                AppPerformanceOperation::AccountSubscriptionRegistration,
+                registration_started.elapsed(),
+                registration.is_ok(),
+            );
+        }
+        registration
+    }
+
+    pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+        self.sync_inner(None).await
+    }
+
+    pub(crate) async fn sync_with_startup_stage_telemetry(
+        &mut self,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<SyncSummary, AppError> {
+        self.sync_inner(Some(telemetry)).await
+    }
+
+    async fn sync_inner(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<SyncSummary, AppError> {
+        // Reconcile epoch-bounded prior routes before issuing the first relay
+        // subscriptions. This makes retirement deterministic even for a quiet
+        // group that has no new inbound events after restart.
+        if self.refresh_group_routes()? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        let rebuild_since_secs = self
+            .relay_plane
+            .subscription_rebuild_since(self.state.last_transport_timestamp)
+            .map(|timestamp| timestamp.0);
+        self.prepare_transport_with_telemetry(telemetry).await?;
         // Both the inbox/group activation and the group-subscription refresh
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.
         self.record_subscription_rebuild(rebuild_since_secs).await;
-        let mut summary = self.sync_sdk_relay().await?;
+        let mut deliveries = 0;
+        let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
         // `open()` hydration (mdk#426). If no relay delivery arrived
@@ -76,6 +273,7 @@ impl AppClient {
         // unrelated send/ingest. Fold any pending events into this summary.
         let drained = self.drain_pending_session_events().await?;
         summary.merge(drained);
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
@@ -93,9 +291,32 @@ impl AppClient {
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
         let effects = self.runtime.drain().await?;
-        fail_if_publish_failed(&effects)?;
+        self.observe_drained_session_events(&effects).await
+    }
+
+    /// Project one drained batch of engine events, split from the drain itself
+    /// so the projection is exercisable against a given batch of effects.
+    pub(crate) async fn observe_drained_session_events(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
+        // Session open seeds this list from durable queued/convergence input.
+        // Preserve that scheduling edge even when hydration emitted no app
+        // events; the worker drains this set immediately after startup sync.
+        self.remember_pending_convergence_groups(effects);
+        // Arm before the publish gate, not after. `drain()` empties the engine's
+        // in-memory event buffer one-shot and is these events' only source, and
+        // a `TransportObjectResourceRefused` is buffered only after its durable
+        // retention row is already deleted — so a refusal this pass does not arm
+        // on can never be re-observed. The arm survives the `?` because it is a
+        // field mutation plus a durable audit row, not summary state. The two
+        // conditions are correlated rather than independent: this drain
+        // publishes, so the failure and the refusal ride the same effects.
+        self.arm_recovery_from_effects(effects);
+        fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
         if effects.events.is_empty() {
+            self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
         let display_names = self.app.display_names_by_id()?;
@@ -104,27 +325,60 @@ impl AppClient {
         // drops it rather than emitting a schema-invalid `message_ids` entry
         // (see `schema_valid_message_ids`).
         let source_message_id_hex = String::new();
-        let source_recorded_at = unix_now_seconds();
+        let source_received_at = unix_now_seconds();
+        let local_group_deletion_frontiers =
+            self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
+        let mut gossip_message_ids = HashSet::new();
         for event in &effects.events {
+            let batch_start_frontier = event_group_id(event)
+                .and_then(|group_id| {
+                    local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
+                })
+                .copied();
+            let crosses_frontier = match batch_start_frontier {
+                Some(frontier) => self.local_deleted_group_event_crosses_frontier(
+                    event,
+                    frontier,
+                    &source_message_id_hex,
+                    source_received_at,
+                )?,
+                None => false,
+            };
+            if !crosses_frontier
+                && let Some(changed) =
+                    self.suppress_local_deleted_group_event(event, batch_start_frontier)?
+            {
+                routes_dirty |= changed;
+                self.prepare_pending_application_event_ack(event);
+                continue;
+            }
             let before = self.state.groups.len();
             let previous_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
             // Best-effort projection: a quarantined group is not live, so its
             // routing/metadata components may be unavailable. Skip projection
             // rather than propagate — the event must still reach subscribers.
-            let group_projection = event_group_id(event)
-                .and_then(|group_id| self.event_group_projection_best_effort(group_id));
-            observe_event(
+            let group_metadata =
+                event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
+            let group_projection = event_group_id(event).and_then(|group_id| {
+                self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
+            });
+            if let Some(message) = observe_event(
                 &mut self.state,
                 &display_names,
                 &mut summary,
                 event,
                 group_projection.as_ref(),
                 &source_message_id_hex,
-                source_recorded_at,
+                source_received_at,
+                None,
                 self.app.allow_loopback_blob_endpoints(),
-            );
+            ) && let Some(gossip_message_id) =
+                self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
+            {
+                gossip_message_ids.insert(gossip_message_id);
+            }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
             self.audit_observed_group_event(
@@ -133,36 +387,126 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
+            let can_ack_application_event = if crosses_frontier {
+                self.prepare_local_group_deletion_frontier_clear(
+                    event,
+                    batch_start_frontier.expect("crossing event has a frontier"),
+                )?
+            } else {
+                true
+            };
+            if can_ack_application_event {
+                self.prepare_pending_application_event_ack(event);
+            }
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
         }
-        // #695 + rotation: reconcile transport routes once after the batch drains
-        // instead of per membership-changing event. refresh_group_routes upserts
-        // every group's current subscription — picking up a join's new route AND
-        // an in-place nostr_group_id / relay rotation on an existing group
-        // (Finding 2) — and reports whether anything changed; a membership count
-        // change (join/leave) also forces the single resync.
+        if !gossip_message_ids.is_empty() {
+            summary
+                .messages
+                .retain(|message| !gossip_message_ids.contains(&message.message_id_hex));
+        }
+        self.clear_terminal_local_group_deletion_frontiers(effects)?;
+        // Reconcile transport routes once after the batch drains instead of per
+        // membership-changing event. This installs a join's current route and
+        // retains any still-live address displaced by a routing rotation.
         let routes_changed = self.refresh_group_routes()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
+    }
+
+    /// Observe group events the engine applied as a side effect of an outbound
+    /// send and buffer them for the account worker to broadcast.
+    ///
+    /// A send that lands while inbound convergence input is retained folds the
+    /// retained commits before publishing, so its effects can carry peer
+    /// `GroupStateChanged` / `EpochChanged` events (e.g. a group rename applied
+    /// mid-window). Those events never pass through the inbound ingest or
+    /// scheduled-convergence seams, so without this pass they reach no runtime
+    /// subscriber: storage shows the new state while chat-list and group-state
+    /// subscriptions stay silent. Runs the same observe pipeline as those seams
+    /// — state group refresh, push-gossip handling, kind-1210 system-row
+    /// synthesis (a deterministic upsert) — and merges the result into
+    /// `pending_applied_sync_summary`. The caller persists state afterwards.
+    pub(crate) async fn observe_send_applied_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if effects.events.is_empty() {
+            return Ok(());
+        }
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        // Synthetic source identity: these events have no single inbound
+        // transport message (see `drain_pending_session_events`).
+        let source_message_id_hex = String::new();
+        let source_received_at = unix_now_seconds();
+        let routes_dirty = self
+            .observe_account_device_effects(
+                effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                source_received_at,
+                None,
+            )
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
+        self.pending_applied_sync_summary.merge(summary);
+        Ok(())
+    }
+
+    /// Best-effort wrapper over [`Self::observe_send_applied_effects`] for the
+    /// outbound send paths: a projection or route-refresh failure here must
+    /// not fail a publish that already completed (or mask a publish error on
+    /// the failure path), so it is logged rather than propagated.
+    pub(crate) async fn observe_send_applied_effects_best_effort(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        if let Err(_err) = self.observe_send_applied_effects(effects).await {
+            tracing::warn!(
+                target: "marmot_app::messages",
+                method = "observe_send_applied_effects",
+                error_code = "send_applied_observe_failed",
+                "failed to observe group events applied during a send"
+            );
+        }
+    }
+
+    /// Drain the buffered summary of send-applied group events. Called by the
+    /// account worker after each command so the events broadcast on the same
+    /// seam that published the command's response.
+    pub(crate) fn take_pending_applied_sync_summary(&mut self) -> SyncSummary {
+        std::mem::take(&mut self.pending_applied_sync_summary)
     }
 
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
     /// component lookup fails (e.g. the group is quarantined and not live).
     /// Used by the no-inbound drain path where a missing projection must not
     /// abort processing.
-    fn event_group_projection_best_effort(
+    fn event_group_projection_best_effort<'a>(
         &self,
         group_id: &cgka_traits::GroupId,
-    ) -> Option<EventGroupProjection<'static>> {
+        group_metadata: Option<&'a cgka_traits::group::Group>,
+    ) -> Option<EventGroupProjection<'a>> {
+        #[cfg(test)]
+        if self.force_event_group_projection_unavailable {
+            return None;
+        }
         let nostr_routing = self.nostr_routing_for_group(group_id).ok()?;
         Some(EventGroupProjection {
             nostr_routing,
-            group_metadata: None,
+            group_metadata,
+            profile: self.profile_for_group(group_id),
             admin_policy: self
                 .runtime
                 .admin_pubkeys(group_id)
@@ -177,7 +521,32 @@ impl AppClient {
     }
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
-        let display_names = self.app.display_names_by_id()?;
+        loop {
+            let delivery = self.receive_next_delivery().await?;
+            let summary = self.ingest_received_delivery(delivery).await?;
+            if summary.joined_groups.is_empty()
+                && summary.messages.is_empty()
+                && summary.events.is_empty()
+                && summary.epoch_stall_escalations.is_empty()
+                && self.pending_convergence_groups.is_empty()
+                && !self.has_pending_epoch_backfill()
+            {
+                continue;
+            }
+            return Ok(summary);
+        }
+    }
+
+    /// Wait only for the next non-echo, non-duplicate transport delivery.
+    ///
+    /// The account worker selects this transport-only receive phase against
+    /// commands. Once a delivery is returned, it calls
+    /// [`Self::ingest_received_delivery`] outside the `select!`, so durable
+    /// engine ingest, incidental publish, and app projection cannot be dropped
+    /// halfway through when a command arrives.
+    pub(crate) async fn receive_next_delivery(
+        &mut self,
+    ) -> Result<cgka_traits::TransportDelivery, AppError> {
         let local_account_id_hex = self
             .app
             .account_home()
@@ -204,23 +573,29 @@ impl AppClient {
                 continue;
             }
             remember_seen_event(&mut seen, &mut self.state, event_id);
-
-            let mut summary = SyncSummary::default();
-            self.ingest_delivery(delivery, &display_names, &mut summary)
-                .await?;
-            self.app.save_state(&self.state)?;
-            if summary.joined_groups.is_empty()
-                && summary.messages.is_empty()
-                && summary.events.is_empty()
-                && self.pending_convergence_groups.is_empty()
-            {
-                continue;
-            }
-            return Ok(summary);
+            return Ok(delivery);
         }
     }
 
-    async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
+    pub(crate) async fn ingest_received_delivery(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, AppError> {
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        let routes_dirty = self
+            .ingest_delivery(delivery, &display_names, &mut summary)
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.drain_epoch_stall_escalations(&mut summary);
+        Ok(summary)
+    }
+
+    async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, AppError> {
         let display_names = self.app.display_names_by_id()?;
         let local_account_id_hex = self
             .app
@@ -241,7 +616,8 @@ impl AppClient {
         // compare the persisted floor against the ingested `created_at`s.
         let drain_started = std::time::Instant::now();
         let cursor_before_secs = self.state.last_transport_timestamp;
-        let mut deliveries: u64 = 0;
+        *deliveries = 0;
+        let mut routes_dirty = false;
 
         loop {
             let wait = if first_wait {
@@ -265,18 +641,23 @@ impl AppClient {
                 continue;
             }
             remember_seen_event(&mut seen, &mut self.state, event_id);
-            self.ingest_delivery(delivery, &display_names, &mut summary)
+            routes_dirty |= self
+                .ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
-            deliveries = deliveries.saturating_add(1);
+            *deliveries = deliveries.saturating_add(1);
         }
 
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            deliveries,
+            *deliveries,
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         Ok(summary)
     }
 
@@ -285,22 +666,560 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
-        let source_recorded_at = delivery.message.timestamp.0;
+        let outer_transport_at = delivery.message.timestamp.0;
+        let source_received_at = delivery.received_at.0;
+        let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
-        fail_if_publish_failed(&effects.effects)?;
+        let publish_error = fail_if_publish_failed(&effects.effects).err();
         self.remember_buffered_convergence_outcome(&effects.outcome);
-        self.remember_pending_convergence_effects(&effects.effects);
-        self.remember_transport_cursor(source_recorded_at);
-        self.observe_account_device_effects(
-            &effects.effects,
-            display_names,
-            summary,
-            &source_message_id_hex,
-            source_recorded_at,
-        )
-        .await
+        self.remember_pending_convergence_groups(&effects.effects);
+        self.arm_recovery_from_effects(&effects.effects);
+        self.remember_transport_cursor(outer_transport_at);
+        self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
+        let routes_dirty = self
+            .observe_account_device_effects(
+                &effects.effects,
+                display_names,
+                summary,
+                &source_message_id_hex,
+                source_received_at,
+                Some(outer_transport_at),
+            )
+            .await?;
+        if routes_dirty {
+            // The engine join/leave is already durable; persist the matching
+            // app-state projection (a fresh join's pending invite row) before
+            // the callers' route-refresh network awaits. A process exit in
+            // that window would otherwise tear the durable membership change
+            // from its app-state row, and the consumed welcome is never
+            // re-emitted to repair it.
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+
+        // Publishing here is incidental work triggered by the inbound
+        // delivery. A hard publish failure may roll that pending commit back,
+        // but it must not discard the already-authenticated inbound message or
+        // roster effects. They are projected above and the transport cursor is
+        // allowed to advance; the failed work remains represented by the
+        // engine's rollback/failure effects rather than turning relay
+        // redelivery into an AlreadySeen projection hole.
+        if let Some(err) = publish_error {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "ingest_delivery",
+                error_kind = err.privacy_safe_kind(),
+                "incidental auto-publish failed after inbound effects were projected"
+            );
+        }
+        Ok(routes_dirty)
+    }
+
+    /// Feed an unavailable group delivery to the epoch-stall detector.
+    /// Transport-deferred input arms a backfill after the stalled-epoch
+    /// threshold; resource refusal arms it immediately because it directly
+    /// proves the fetched history was not fully retained. Repeated arming that
+    /// never recovers the group escalates onto the next successful sync summary,
+    /// the seam every worker surface already publishes. Only observed under
+    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
+    /// own recovery, and the main app sees the same evidence on its own next
+    /// sync.
+    fn detect_epoch_stall(
+        &mut self,
+        group_id_hint: Option<cgka_traits::GroupId>,
+        message_id_hex: &str,
+        outcome: &IngestOutcome,
+    ) {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return;
+        }
+        let Some(group_id) = group_id_hint else {
+            return;
+        };
+        // A group we cannot resolve (unknown or quarantined) has its own recovery
+        // surface; do not track it here.
+        let Ok(record) = self.runtime.group_record(&group_id) else {
+            return;
+        };
+        let decision = match outcome {
+            IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
+                group_id.clone(),
+                message_id_hex.to_owned(),
+                record.epoch,
+            ),
+            IngestOutcome::ResourceRefused { .. } => self
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch),
+            // Any other outcome carries no stall evidence, but it does tell the
+            // detector where this device now sits: a tracked group that leaves an
+            // epoch without arming at it has stopped failing to catch up, which
+            // ends its escalation run.
+            _ => {
+                self.epoch_stall
+                    .observe_group_epoch(&group_id, record.epoch);
+                BackfillDecision::Skip
+            }
+        };
+        self.apply_backfill_decision(
+            &group_id,
+            record.epoch.0,
+            decision,
+            match outcome {
+                IngestOutcome::TransportDeferred { .. } => {
+                    EpochStallBackfillTrigger::UndecryptableThreshold
+                }
+                IngestOutcome::ResourceRefused { .. } => EpochStallBackfillTrigger::ResourceRefusal,
+                _ => EpochStallBackfillTrigger::UndecryptableThreshold,
+            },
+        );
+    }
+
+    /// Apply an epoch-stall backfill decision: arm the replay, and record an
+    /// escalation the detector raises.
+    ///
+    /// Every site that takes a [`BackfillDecision`] must route it through here.
+    /// The detector latches `escalated` when it raises
+    /// [`BackfillDecision::ArmAndEscalate`], so it raises that decision exactly
+    /// once per unrecovered run. That makes reporting exactly-once by
+    /// construction rather than by caller discipline: the escalation lands in
+    /// `pending_epoch_stall_escalations` instead of on whatever [`SyncSummary`]
+    /// the calling pass is building, so a later `?` on that pass cannot drop it
+    /// — it rides out on the next seam that returns `Ok` (see
+    /// [`Self::drain_epoch_stall_escalations`]).
+    pub(crate) fn apply_backfill_decision(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        stalled_epoch: u64,
+        decision: BackfillDecision,
+        trigger: EpochStallBackfillTrigger,
+    ) {
+        if decision.arms_backfill() {
+            let (attempt_id, record_arm) = {
+                let pending = self
+                    .pending_epoch_backfill
+                    .get_or_insert_with(PendingEpochBackfill::new);
+                let record_arm = match pending.groups.get_mut(group_id) {
+                    None => {
+                        pending.groups.insert(
+                            group_id.clone(),
+                            PendingEpochBackfillGroup { stalled_epoch },
+                        );
+                        true
+                    }
+                    Some(existing) if existing.stalled_epoch != stalled_epoch => {
+                        existing.stalled_epoch = stalled_epoch;
+                        true
+                    }
+                    Some(_) => false,
+                };
+                (pending.attempt_id.clone(), record_arm)
+            };
+            let context = AuditEventContext {
+                operation_id: Some(attempt_id),
+                ..AuditEventContext::default()
+            };
+            // Record the arm decision before the replay side effect runs (the
+            // worker seam calls run_pending_epoch_backfill after this returns).
+            // Best-effort, fire-and-forget: recording can never block or fail
+            // the backfill.
+            if record_arm {
+                self.record_epoch_stall_backfill_armed(group_id, stalled_epoch, trigger, &context);
+            }
+        }
+        if let BackfillDecision::ArmAndEscalate { arms } = decision {
+            // The replay is armed above regardless: escalating reports that
+            // replay alone is not repairing this group, it does not replace the
+            // attempt. The stronger repair (key-package rotation plus a full
+            // re-activation) publishes new key material, so it stays the app's
+            // decision — MDK reports the condition and names the repair.
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "apply_backfill_decision",
+                arms,
+                arm_threshold = self.epoch_stall.escalation_arm_threshold(),
+                "epoch-gap backfill armed repeatedly without recovering a group; escalating"
+            );
+            self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
+            self.pending_epoch_stall_escalations
+                .push(crate::EpochStallEscalation {
+                    group_id: group_id.clone(),
+                    stalled_epoch,
+                    arms,
+                });
+        }
+    }
+
+    /// Move every recorded escalation onto the summary a seam is about to
+    /// return.
+    ///
+    /// Call this as the LAST step before `Ok(summary)`, at every outermost seam
+    /// — the ones whose `Ok` is handed to a caller rather than followed by more
+    /// fallible work. An interior `?` returns before the move runs, so the stash
+    /// simply rides the next successful seam instead of being lost with the
+    /// failed pass's summary. Moving (not copying) is what keeps delivery
+    /// exactly-once. Because the stash is shared, a seam that omits this call
+    /// *defers* delivery to the next seam that does; it does not lose it.
+    ///
+    /// One nested case needs care: [`Self::drain_pending_session_events`] drains
+    /// while nested inside `sync_inner`, so its escalations leave the stash and
+    /// ride `summary` from the merge onwards. Nothing fallible may be inserted
+    /// between that merge and `sync_inner`'s `Ok` — past the merge they sit on a
+    /// local summary again, and a `?` would take them down with the pass. (Which
+    /// also makes `sync_inner`'s own call belt-and-braces rather than
+    /// load-bearing: the nested drain has already emptied the stash.)
+    ///
+    /// Residual: the receive arm drops the whole client on a failed pass, so the
+    /// replacement starts with an empty stash and a fresh detector; the
+    /// `epoch_stall_backfill_escalated` row recorded just before the push is the
+    /// only trace that outlives them, and only where audit logging is on (opt-in,
+    /// off by default). Re-escalating then costs a whole fresh three-arm run, and
+    /// only its first arm can land at the epoch the device already sits at — an
+    /// arm at an epoch already fired at is a `Skip` — so arms two and three each
+    /// need the local epoch to genuinely advance. A group that is still advancing
+    /// therefore re-escalates roughly two epochs later, delayed rather than lost;
+    /// a group frozen at one local epoch arms once and never escalates again.
+    /// That second case is a pre-existing blind spot of the arm counter, not a
+    /// rebuild artifact — a group frozen from its first arm never escalates in a
+    /// fresh process either — and is tracked for a follow-up.
+    fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
+        summary
+            .epoch_stall_escalations
+            .append(&mut self.pending_epoch_stall_escalations);
+    }
+
+    /// Whether an epoch-gap backfill is armed and awaiting its replay. Read by
+    /// the account worker to schedule a forensic audit-tracker upload for the
+    /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
+    pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
+        self.pending_epoch_backfill.is_some() || !self.queued_epoch_backfills.is_empty()
+    }
+
+    fn take_next_pending_epoch_backfill(&mut self) -> Option<PendingEpochBackfill> {
+        self.pending_epoch_backfill
+            .take()
+            .or_else(|| self.queued_epoch_backfills.pop_front())
+    }
+
+    fn requeue_failed_epoch_backfill_intent(&mut self, failed: PendingEpochBackfill) {
+        match self.pending_epoch_backfill.take() {
+            None => self.pending_epoch_backfill = Some(failed),
+            Some(current) => {
+                self.pending_epoch_backfill = Some(current);
+                self.queued_epoch_backfills.push_back(failed);
+            }
+        }
+    }
+
+    fn restore_deferred_epoch_backfill(&mut self, deferred: PendingEpochBackfill) {
+        if let Some(next) = self.queued_epoch_backfills.pop_front() {
+            self.queued_epoch_backfills.push_back(deferred);
+            self.pending_epoch_backfill = Some(next);
+        } else {
+            self.pending_epoch_backfill = Some(deferred);
+        }
+    }
+
+    fn epoch_backfill_deferred_snapshot(
+        reason: EpochBackfillDeferredReason,
+        retry_ordinal: u64,
+        pending: &PendingEpochBackfill,
+        observed_epochs: &HashMap<cgka_traits::GroupId, u64>,
+    ) -> EpochBackfillDeferredSnapshot {
+        let mut group_epochs = pending
+            .groups
+            .keys()
+            .map(|group_id| (group_id.clone(), observed_epochs.get(group_id).copied()))
+            .collect::<Vec<_>>();
+        group_epochs.sort_by(|(left, _), (right, _)| left.as_slice().cmp(right.as_slice()));
+        EpochBackfillDeferredSnapshot {
+            reason,
+            retry_ordinal,
+            group_epochs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_finish_epoch_backfill_execution(
+        &mut self,
+        execution: EpochBackfillExecution,
+        succeeded: bool,
+    ) {
+        self.finish_epoch_backfill_execution(
+            execution,
+            EpochBackfillActivationOutcome::Succeeded,
+            if succeeded {
+                None
+            } else {
+                Some("account_transport".to_string())
+            },
+            0,
+            succeeded,
+        );
+    }
+
+    fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
+        self.runtime
+            .group_record(group_id)
+            .ok()
+            .map(|record| record.epoch.0)
+    }
+
+    fn capture_pending_group_epochs(
+        &self,
+        pending: &PendingEpochBackfill,
+    ) -> HashMap<cgka_traits::GroupId, u64> {
+        pending
+            .groups
+            .keys()
+            .filter_map(|group_id| {
+                self.local_epoch_for_group(group_id)
+                    .map(|epoch| (group_id.clone(), epoch))
+            })
+            .collect()
+    }
+
+    fn epoch_backfill_audit_context(pending: &PendingEpochBackfill) -> AuditEventContext {
+        AuditEventContext {
+            operation_id: Some(pending.attempt_id.clone()),
+            ..AuditEventContext::default()
+        }
+    }
+
+    pub(crate) fn begin_epoch_backfill_execution(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Option<EpochBackfillExecution> {
+        let mut pending = self.take_next_pending_epoch_backfill()?;
+        let retry_ordinal = u64::from(pending.execution_attempts);
+        let epochs_before = self.capture_pending_group_epochs(&pending);
+        let context = Self::epoch_backfill_audit_context(&pending);
+        if epochs_before.len() != pending.groups.len() {
+            let defer_state = Self::epoch_backfill_deferred_snapshot(
+                EpochBackfillDeferredReason::GroupEpochUnavailable,
+                retry_ordinal,
+                &pending,
+                &epochs_before,
+            );
+            if pending.last_deferred_audit != Some(defer_state.clone()) {
+                self.record_epoch_stall_backfill_deferred(
+                    EpochBackfillDeferredReason::GroupEpochUnavailable,
+                    retry_ordinal,
+                    &context,
+                );
+                pending.last_deferred_audit = Some(defer_state);
+            }
+            self.restore_deferred_epoch_backfill(pending);
+            return None;
+        }
+        pending.last_deferred_audit = None;
+        pending.execution_attempts = pending.execution_attempts.saturating_add(1);
+        self.record_epoch_stall_backfill_started(seam, retry_ordinal, &context);
+        Some(EpochBackfillExecution {
+            pending,
+            epochs_before,
+            retry_ordinal,
+            started: Instant::now(),
+        })
+    }
+
+    fn finish_epoch_backfill_execution(
+        &mut self,
+        execution: EpochBackfillExecution,
+        activation_outcome: EpochBackfillActivationOutcome,
+        error_kind: Option<String>,
+        deliveries: u64,
+        succeeded: bool,
+    ) {
+        let duration_ms = execution.started.elapsed().as_millis() as u64;
+        let epochs_after = self.capture_pending_group_epochs(&execution.pending);
+        let observed_all_groups = epochs_after.len() == execution.pending.groups.len();
+        let succeeded = succeeded && observed_all_groups;
+        let error_kind = if !observed_all_groups && error_kind.is_none() {
+            Some("group_epoch_unavailable".to_string())
+        } else {
+            error_kind
+        };
+        self.record_epoch_backfill_terminal_rows(
+            &execution.pending,
+            execution.retry_ordinal,
+            &execution.epochs_before,
+            &epochs_after,
+            EpochBackfillReplayOutcome {
+                duration_ms,
+                activation_outcome,
+                error_kind,
+                deliveries,
+                succeeded,
+            },
+        );
+        if succeeded {
+            self.epoch_stall.mark_replayed();
+        } else {
+            self.requeue_failed_epoch_backfill_intent(execution.pending);
+        }
+    }
+
+    fn record_epoch_backfill_terminal_rows(
+        &self,
+        pending: &PendingEpochBackfill,
+        retry_ordinal: u64,
+        epochs_before: &HashMap<cgka_traits::GroupId, u64>,
+        epochs_after: &HashMap<cgka_traits::GroupId, u64>,
+        outcome: EpochBackfillReplayOutcome,
+    ) {
+        let context = Self::epoch_backfill_audit_context(pending);
+        for group_id in pending.groups.keys() {
+            let local_epoch_before = epochs_before
+                .get(group_id)
+                .copied()
+                .unwrap_or(pending.groups[group_id].stalled_epoch);
+            let local_epoch_after = epochs_after
+                .get(group_id)
+                .copied()
+                .unwrap_or(local_epoch_before);
+            let group_advanced = local_epoch_after > local_epoch_before;
+            self.record_epoch_stall_backfill_terminal(
+                group_id,
+                outcome.succeeded,
+                EpochBackfillTerminalAudit {
+                    retry_ordinal,
+                    duration_ms: outcome.duration_ms,
+                    activation_outcome: outcome.activation_outcome,
+                    error_kind: outcome.error_kind.clone(),
+                    deliveries: outcome.deliveries,
+                    local_epoch_before,
+                    local_epoch_after,
+                    group_advanced,
+                },
+                &context,
+            );
+        }
+    }
+
+    /// Recover any group that stalled below its live epoch during ingest by
+    /// replaying the account's full transport history (`since = None`). One replay
+    /// re-fetches every group, so the detector collapses simultaneously-stuck
+    /// groups into a single replay. A no-op when nothing stalled.
+    pub(crate) async fn run_pending_epoch_backfill(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        if !self.has_pending_epoch_backfill() {
+            return Ok(EpochBackfillRunOutcome::NotPending);
+        }
+        let Some(execution) = self.begin_epoch_backfill_execution(seam) else {
+            return Ok(EpochBackfillRunOutcome::Deferred);
+        };
+
+        match self.runtime.activate_transport(None).await {
+            Ok(()) => {
+                if let Err(err) = self.sync_runtime_groups().await {
+                    let terminal_error = err.privacy_safe_kind().to_string();
+                    self.finish_epoch_backfill_execution(
+                        execution,
+                        EpochBackfillActivationOutcome::Succeeded,
+                        Some(terminal_error),
+                        0,
+                        false,
+                    );
+                    return Err(err);
+                }
+                self.record_subscription_rebuild(None).await;
+                let mut deliveries = 0;
+                let mut summary = match self.sync_sdk_relay(&mut deliveries).await {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        let terminal_error = err.privacy_safe_kind().to_string();
+                        self.finish_epoch_backfill_execution(
+                            execution,
+                            EpochBackfillActivationOutcome::Succeeded,
+                            Some(terminal_error),
+                            deliveries,
+                            false,
+                        );
+                        return Err(err);
+                    }
+                };
+                let drained = match self.drain_pending_session_events().await {
+                    Ok(drained) => drained,
+                    Err(err) => {
+                        let terminal_error = err.privacy_safe_kind().to_string();
+                        self.finish_epoch_backfill_execution(
+                            execution,
+                            EpochBackfillActivationOutcome::Succeeded,
+                            Some(terminal_error),
+                            deliveries,
+                            false,
+                        );
+                        return Err(err);
+                    }
+                };
+                summary.merge(drained);
+                self.finish_epoch_backfill_execution(
+                    execution,
+                    EpochBackfillActivationOutcome::Succeeded,
+                    None,
+                    deliveries,
+                    true,
+                );
+                Ok(EpochBackfillRunOutcome::Completed(summary))
+            }
+            Err(err) => {
+                let app_err: AppError = err.into();
+                let terminal_error = app_err.privacy_safe_kind().to_string();
+                self.finish_epoch_backfill_execution(
+                    execution,
+                    EpochBackfillActivationOutcome::Failed,
+                    Some(terminal_error),
+                    0,
+                    false,
+                );
+                Err(app_err)
+            }
+        }
+    }
+
+    /// Explicit account-wide repair for a host that has independent evidence
+    /// its incremental cursor may be incomplete (for example, a long-offline
+    /// participant that has no new traffic capable of arming epoch-stall
+    /// detection). Unlike the automatic detector path, this is a caller-owned
+    /// operation and therefore does not mutate the detector's debounce state.
+    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, AppError> {
+        if self.refresh_group_routes()? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        // Caller-directed repair is a fresh transport preparation, not an
+        // assumption that startup ordering already installed the signer and
+        // current group subscriptions.
+        self.relay_plane
+            .set_transport_signer(self.transport_signer.clone())
+            .await;
+        if self.has_pending_epoch_backfill() {
+            // A deferred primary rotates behind queued work. Try each intent
+            // that was pending on entry once, so an unavailable group cannot
+            // hide a runnable retry. If every intent defers, retain them and
+            // fall through to the caller-directed unfloored repair below.
+            let pending_intents = usize::from(self.pending_epoch_backfill.is_some())
+                .saturating_add(self.queued_epoch_backfills.len());
+            for _ in 0..pending_intents {
+                match self
+                    .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
+                    .await?
+                {
+                    EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
+                    EpochBackfillRunOutcome::Deferred => continue,
+                    EpochBackfillRunOutcome::NotPending => break,
+                }
+            }
+        }
+        self.runtime.activate_transport(None).await?;
+        self.sync_runtime_groups().await?;
+        self.record_subscription_rebuild(None).await;
+        let mut deliveries = 0;
+        let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
+        summary.merge(self.drain_pending_session_events().await?);
+        Ok(summary)
     }
 
     pub(crate) async fn advance_convergence_after_runtime_sync(
@@ -311,35 +1230,285 @@ impl AppClient {
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
-        self.remember_pending_convergence_effects(&effects);
+        self.remember_pending_convergence_groups(&effects);
+        let mut summary = SyncSummary::default();
+        self.arm_recovery_from_effects(&effects);
         self.remember_published_reports(&effects);
+        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        let publish_new_message_notification =
+            effects.published_app_messages.iter().any(|published| {
+                let group_id_hex = hex::encode(published.group_id.as_slice());
+                self.app
+                    .reaction_target(&self.state.label, &group_id_hex, &published.app_event_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|message| {
+                        message.kind == MARMOT_APP_EVENT_KIND_CHAT
+                            && !message.deleted
+                            && !message.invalidated
+                    })
+            });
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
-        let mut summary = SyncSummary::default();
+        summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
-        let source_recorded_at = unix_now_seconds();
-        self.observe_account_device_effects(
-            &effects,
-            &display_names,
-            &mut summary,
-            &source_message_id_hex,
-            source_recorded_at,
-        )
-        .await?;
+        let source_received_at = unix_now_seconds();
+        let routes_dirty = self
+            .observe_account_device_effects(
+                &effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                source_received_at,
+                None,
+            )
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.prune_plaintext_retention_for_group(group_id)?;
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if publish_new_message_notification {
+            self.publish_notification_trigger_best_effort(
+                group_id,
+                notifications::NotificationTrigger::NewMessage,
+            )
+            .await;
+        }
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
+    /// Snapshot each affected group's durable local-delete frontier before any
+    /// event in the effects batch mutates projection state. Every event is then
+    /// classified against this same authority, independent of batch order.
+    fn local_group_deletion_frontiers_at_batch_start(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<HashMap<String, u64>, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let mut frontiers = HashMap::new();
+        let mut seen_group_ids = HashSet::new();
+        for event in &effects.events {
+            let Some(group_id) = event_group_id(event) else {
+                continue;
+            };
+            let group_id_hex = hex::encode(group_id.as_slice());
+            if !seen_group_ids.insert(group_id_hex.clone()) {
+                continue;
+            }
+            if let Some(frontier) = storage.local_group_deletion_frontier(&group_id_hex)? {
+                frontiers.insert(group_id_hex, frontier);
+            }
+        }
+        Ok(frontiers)
+    }
+
+    fn local_deleted_group_event_crosses_frontier(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+        frontier: u64,
+        source_message_id_hex: &str,
+        source_received_at: u64,
+    ) -> Result<bool, AppError> {
+        let Some(group_id) = event_group_id(event) else {
+            return Ok(false);
+        };
+        if self
+            .runtime
+            .group_record(group_id)
+            .is_ok_and(|group| group.removed || group.disbanded.is_some())
+        {
+            return Ok(false);
+        }
+        if matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }) {
+            return Ok(true);
+        }
+        let cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id,
+            message_id,
+            sender,
+            epoch,
+            payload,
+            retention,
+        } = event
+        else {
+            return Ok(false);
+        };
+        // One delivery can release buffered effects for several groups, so its
+        // outer timestamp is not valid provenance for every event in the batch.
+        // The authenticated engine message id resolves to a durable local ingress
+        // order. Strict app decoding then prevents malformed or sender-mismatched
+        // payloads from resurrecting a deliberately hidden group.
+        let sender_hex = hex::encode(sender.as_slice());
+        let Some(message) = decode_received_event(
+            payload,
+            &sender_hex,
+            None,
+            group_id,
+            epoch.0,
+            *retention,
+            source_message_id_hex,
+            source_received_at,
+            None,
+            self.app.allow_loopback_blob_endpoints(),
+        ) else {
+            return Ok(false);
+        };
+        if message.kind != MARMOT_APP_EVENT_KIND_CHAT {
+            return Ok(false);
+        }
+        let group_id_hex = hex::encode(group_id.as_slice());
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .local_group_deletion_message_is_newer_than(&group_id_hex, message_id, frontier)?)
+    }
+
+    fn prepare_local_group_deletion_frontier_clear(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+        frontier: u64,
+    ) -> Result<bool, AppError> {
+        let Some(group_id) = event_group_id(event) else {
+            return Ok(false);
+        };
+        if !self.adopt_local_deleted_group_prior_routes(group_id)? {
+            return Ok(false);
+        }
+        self.pending_local_group_deletion_frontier_clears
+            .entry(hex::encode(group_id.as_slice()))
+            .or_insert(frontier);
+        Ok(true)
+    }
+
+    fn project_received_message(
+        &mut self,
+        message: crate::ReceivedMessage,
+        group_metadata: Option<&cgka_traits::Group>,
+        summary: &mut SyncSummary,
+    ) -> Result<Option<String>, AppError> {
+        if notifications::is_push_gossip_kind(message.kind) {
+            let ingest_result = group_metadata
+                .map(|group| group.protocol_profile)
+                .ok_or_else(|| {
+                    AppError::InvalidPushGossip("group profile unavailable for push gossip".into())
+                })
+                .and_then(|profile| {
+                    self.runtime
+                        .members(&message.group_id)
+                        .map_err(AppError::from)
+                        .map(|members| {
+                            (
+                                profile,
+                                members
+                                    .into_iter()
+                                    .map(|member| hex::encode(member.id.as_slice()))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                })
+                .and_then(|(profile, active_member_ids)| {
+                    self.app.ingest_push_gossip_message(
+                        &self.state.label,
+                        &message,
+                        &active_member_ids,
+                        profile,
+                    )
+                });
+            if let Err(err) = ingest_result {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "project_received_message",
+                    error_kind = err.privacy_safe_kind(),
+                    "ignoring malformed push token gossip",
+                );
+            }
+            return Ok(Some(message.message_id_hex));
+        }
+        let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
+            && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
+        self.app.remember_directory_message_sender(&message)?;
+        let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
+            && self.delete_moderation_grant(&message.group_id, &message.sender);
+        let message_projection = AppMessageProjection {
+            message_id_hex: message.message_id_hex.clone(),
+            source_message_id_hex: Some(message.source_message_id_hex.clone()),
+            direction: "received".to_owned(),
+            group_id_hex: hex::encode(message.group_id.as_slice()),
+            sender: message.sender.clone(),
+            plaintext: message.plaintext.clone(),
+            kind: message.kind,
+            tags: message.tags.clone(),
+            source_epoch: Some(message.source_epoch),
+            retention: message.retention,
+            recorded_at: Some(message.recorded_at),
+            origin_commit_id: None,
+            moderation_grant,
+        };
+        let projection_update = self.app.record_account_app_event_at(
+            &self.state.label,
+            &message_projection,
+            message.received_at,
+        )?;
+        if retains_encrypted_media
+            && self
+                .remember_current_encrypted_media_secret(&message.group_id)
+                .is_err()
+        {
+            tracing::warn!(
+                target: "marmot_app::media",
+                method = "project_received_message",
+                error_code = "encrypted_media_secret_cache_skipped",
+                "failed to cache encrypted media source epoch secret",
+            );
+        }
+        summary.projection_updates.push(projection_update);
+        self.prune_plaintext_retention_for_group(&message.group_id)?;
+        Ok(None)
+    }
+
+    fn prepare_pending_application_event_ack(&mut self, event: &cgka_traits::engine::GroupEvent) {
+        if let cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } = event {
+            self.pending_application_event_acks
+                .insert(message_id.clone());
+        }
+    }
+
+    pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(
+        &mut self,
+    ) -> Result<(), AppError> {
+        let frontiers_to_clear = self
+            .pending_local_group_deletion_frontier_clears
+            .iter()
+            .map(|(group_id_hex, frontier)| (group_id_hex.clone(), *frontier))
+            .collect::<Vec<_>>();
+        let application_event_ids_to_ack = self
+            .pending_application_event_acks
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.app
+            .save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                &self.state,
+                &frontiers_to_clear,
+                &application_event_ids_to_ack,
+            )?;
+        self.pending_local_group_deletion_frontier_clears.clear();
+        self.pending_application_event_acks.clear();
+        Ok(())
+    }
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
-        source_recorded_at: u64,
-    ) -> Result<(), AppError> {
+        source_received_at: u64,
+        outer_transport_at: Option<u64>,
+    ) -> Result<bool, AppError> {
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
         // the local account leaving / being removed (or, for joins, returning).
@@ -353,7 +1522,31 @@ impl AppClient {
         // ONE pass after the loop. The previous per-message `retain` was O(n) per
         // gossip event → O(n²) over a batch a relay could flood with kind-448s.
         let mut gossip_message_ids: HashSet<String> = HashSet::new();
+        let local_group_deletion_frontiers =
+            self.local_group_deletion_frontiers_at_batch_start(effects)?;
         for event in &effects.events {
+            let batch_start_frontier = event_group_id(event)
+                .and_then(|group_id| {
+                    local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
+                })
+                .copied();
+            let crosses_frontier = match batch_start_frontier {
+                Some(frontier) => self.local_deleted_group_event_crosses_frontier(
+                    event,
+                    frontier,
+                    source_message_id_hex,
+                    source_received_at,
+                )?,
+                None => false,
+            };
+            if !crosses_frontier
+                && let Some(changed) =
+                    self.suppress_local_deleted_group_event(event, batch_start_frontier)?
+            {
+                routes_dirty |= changed;
+                self.prepare_pending_application_event_ack(event);
+                continue;
+            }
             let before = self.state.groups.len();
             let previous_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -364,6 +1557,7 @@ impl AppClient {
                     Ok::<_, AppError>(EventGroupProjection {
                         nostr_routing: self.nostr_routing_for_group(group_id)?,
                         group_metadata: group_metadata.as_ref(),
+                        profile: self.profile_for_group(group_id),
                         admin_policy: self
                             .runtime
                             .admin_pubkeys(group_id)
@@ -384,78 +1578,13 @@ impl AppClient {
                 event,
                 group_projection.as_ref(),
                 source_message_id_hex,
-                source_recorded_at,
+                source_received_at,
+                outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
-            ) {
-                if notifications::is_push_gossip_kind(message.kind) {
-                    // Bind inbound gossip to the carrying group's authenticated MLS
-                    // member set; owner signatures are then verified per record so
-                    // a kind 448 may apply other members' records (offline-member
-                    // bootstrap) without trusting the relaying sender.
-                    let ingest_result = self
-                        .runtime
-                        .members(&message.group_id)
-                        .map_err(AppError::from)
-                        .map(|members| {
-                            members
-                                .into_iter()
-                                .map(|member| hex::encode(member.id.as_slice()))
-                                .collect::<Vec<_>>()
-                        })
-                        .and_then(|active_member_ids| {
-                            self.app.ingest_push_gossip_message(
-                                &self.state.label,
-                                &message,
-                                &active_member_ids,
-                            )
-                        });
-                    if let Err(err) = ingest_result {
-                        tracing::warn!(
-                            target: "marmot_app::notifications",
-                            method = "ingest_delivery",
-                            error_kind = err.privacy_safe_kind(),
-                            "ignoring malformed push token gossip",
-                        );
-                    }
-                    gossip_message_ids.insert(message.message_id_hex.clone());
-                    continue;
-                }
-                if message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                    && media_imeta_tags_are_valid(
-                        &message.tags,
-                        self.app.allow_loopback_blob_endpoints(),
-                    )
-                    && self
-                        .remember_current_encrypted_media_secret(&message.group_id)
-                        .is_err()
-                {
-                    tracing::warn!(
-                        target: "marmot_app::media",
-                        method = "ingest_delivery",
-                        error_code = "encrypted_media_secret_cache_skipped",
-                        "failed to cache encrypted media source epoch secret",
-                    );
-                }
-                self.app.remember_directory_message_sender(&message)?;
-                let message_projection = AppMessageProjection {
-                    message_id_hex: message.message_id_hex.clone(),
-                    source_message_id_hex: Some(message.source_message_id_hex.clone()),
-                    direction: "received".to_owned(),
-                    group_id_hex: hex::encode(message.group_id.as_slice()),
-                    sender: message.sender.clone(),
-                    plaintext: message.plaintext.clone(),
-                    kind: message.kind,
-                    tags: message.tags.clone(),
-                    source_epoch: Some(message.source_epoch),
-                    recorded_at: Some(source_recorded_at),
-                    // Received app messages are not synthesized system rows.
-                    origin_commit_id: None,
-                };
-                let projection_update = self
-                    .app
-                    .record_account_app_event(&self.state.label, &message_projection)?;
-                summary.projection_updates.push(projection_update);
-                self.prune_plaintext_retention_for_group(&message.group_id)?;
+            ) && let Some(gossip_message_id) =
+                self.project_received_message(message, group_metadata.as_ref(), summary)?
+            {
+                gossip_message_ids.insert(gossip_message_id);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -513,6 +1642,23 @@ impl AppClient {
                     )?;
                 }
             }
+            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                ..
+            } = event
+            {
+                routes_dirty = true;
+                let group_id_hex = hex::encode(group_id.as_slice());
+                // Terminal groups never advertise notification destinations
+                // again. Queue the current registration's removal and discard
+                // every cached peer token immediately; publishing the removal
+                // rumor remains restart-safe in the normal outbox.
+                let _ = self.queue_current_push_registration_removal_for_group(group_id);
+                let _ =
+                    self.app
+                        .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
+            }
             // A (re-)join or create restores the local account's membership so a
             // re-add after removal un-suppresses the group's unread count. Same
             // source-of-truth write as the departure path above: propagate the
@@ -527,27 +1673,30 @@ impl AppClient {
                     SelfMembership::Member,
                 )?;
             }
+            let can_ack_application_event = if crosses_frontier {
+                self.prepare_local_group_deletion_frontier_clear(
+                    event,
+                    batch_start_frontier.expect("crossing event has a frontier"),
+                )?
+            } else {
+                true
+            };
+            if can_ack_application_event {
+                self.prepare_pending_application_event_ack(event);
+            }
         }
+        self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // #760: strip all collected push-gossip messages in one pass.
         if !gossip_message_ids.is_empty() {
             summary
                 .messages
                 .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
         }
-        // #695 + rotation: reconcile transport routes once after the batch drains.
-        // refresh_group_routes upserts every group's current subscription (a
-        // join's new route AND an in-place nostr_group_id / relay rotation on an
-        // existing group, Finding 2) and reports whether anything changed; a
-        // membership count change (join/leave) also forces the single resync.
-        let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
-        }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
-        let system_updates = self.project_group_system_rows(&effects.events, source_recorded_at);
+        let system_updates = self.project_group_system_rows(&effects.events, source_received_at);
         summary.projection_updates.extend(system_updates);
-        Ok(())
+        Ok(routes_dirty)
     }
 
     /// Advance the persisted transport cursor from an inbound message —

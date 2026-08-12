@@ -4,7 +4,7 @@ version.workspace = true
 description = "CommonMark + nostr extensions Markdown AST for Marmot"
 authors = ["Marmot Authors"]
 edition = "2024"
-rust-version = "1.90.0"
+rust-version = "1.91.0"
 publish = false
 
 [dependencies]

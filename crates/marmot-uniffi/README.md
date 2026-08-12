@@ -9,8 +9,27 @@ package that shared surface:
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
   `jniLibs` shared libraries.
 
+See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable SwiftPM binary artifacts, exact release and snapshot URLs,
+checksums, provenance, and the generated Swift synchronization rule.
+
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
+
+## Exclusive Root Ownership
+
+Every `Marmot` constructor acquires a nonblocking exclusive lease on
+`.marmot-runtime.lock` in `rootPath`. The lease prevents the foreground app and
+an independently launched notification service extension from hydrating and
+writing the same Marmot state at the same time. The lock is owned by an open
+file descriptor, so the kernel releases it if iOS terminates the process; the
+lock file itself is stable and must not be deleted.
+
+When another process or runtime owns the root, construction throws the typed
+Swift error `MarmotKitError.RuntimeBusy`. An NSE should take its bounded
+fallback path, while a foreground app can retry after the current owner exits.
+Calling `shutdown()` stops runtime work but intentionally does not release the
+lease while the `Marmot` object or one of its runtime handles is still alive.
+Release the final object reference before constructing a replacement.
 
 ## Service Endpoint Defaults
 
@@ -21,6 +40,11 @@ object, subscription objects, records, enums, and error variants.
 
 These are route URLs only. Host apps still supply audit and telemetry bearer tokens at runtime. Set either environment
 variable before invoking a build script to override the default for staging or local testing.
+
+Public profile-image uploads default to `https://blossom.primal.net`. Rust
+hosts can override or disable that third-party service with
+`MarmotServiceEndpoints::profile_image_blob_endpoint`; FFI callers can continue
+to pass an explicit Blossom server to `uploadProfileImage`.
 
 ## Kotlin / Android
 

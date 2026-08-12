@@ -20,9 +20,12 @@
 //! broadcast welcomes (then the engine's `NotForThisClient` filter kicks
 //! in client-side).
 
+use crate::pending_work::{BusPendingWorkSnapshot, BusStructuralProgressSnapshot};
+use crate::scenario_input_ledger::ScenarioInputMetadata;
+use crate::{ScenarioMessageSelectorV2, ScenarioTransportClass};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-use cgka_traits::types::MemberId;
-use std::collections::HashMap;
+use cgka_traits::types::{MemberId, MessageId};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Stable id assigned by the bus to every attached client.
@@ -47,6 +50,18 @@ struct InFlight {
     msg: TransportMessage,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundEmission {
+    pub sequence: u64,
+    pub msg: TransportMessage,
+}
+
+pub(crate) struct CapturedOutboundWindow {
+    pub observed_objects: u64,
+    pub observed_json_bytes: u64,
+    pub emissions: Vec<(ClientId, OutboundEmission)>,
+}
+
 #[derive(Clone)]
 pub struct TransportBus {
     inner: Arc<Mutex<Inner>>,
@@ -55,13 +70,28 @@ pub struct TransportBus {
 struct Inner {
     clients: HashMap<ClientId, MemberId>,
     next_client_id: usize,
+    next_outbound_sequence: u64,
     queue: Vec<InFlight>,
+    /// Append-only observation of transport artifacts emitted by each
+    /// participant. This is deliberately separate from the mutable delivery
+    /// queue so a black-box subject can expose publication work without
+    /// leaking queue indices or fault-injection internals.
+    outbound_emissions: HashMap<ClientId, Vec<OutboundEmission>>,
+    /// Bounded forensic evidence, separate from outbound lifecycle state.
+    captured_outbound_tail: VecDeque<(ClientId, OutboundEmission, u64)>,
+    captured_outbound_json_bytes: u64,
+    observed_outbound_objects: u64,
+    observed_outbound_json_bytes: u64,
     policy: DeliveryPolicy,
     /// Per-client pre-delivery buffer.
     mailboxes: HashMap<ClientId, Vec<TransportMessage>>,
     /// If Some, only deliver to clients in this allowlist (partition).
     partition_allowed: Option<std::collections::HashSet<ClientId>>,
     delayed: HashMap<String, Vec<InFlight>>,
+    scenario_input_by_transport_id: HashMap<MessageId, ScenarioInputMetadata>,
+    scenario_input_by_content_id: HashMap<MessageId, ScenarioInputMetadata>,
+    scenario_action_by_transport_id: HashMap<MessageId, String>,
+    exposed_recipient_counts: HashMap<MessageId, usize>,
 }
 
 impl TransportBus {
@@ -76,11 +106,21 @@ impl TransportBus {
             inner: Arc::new(Mutex::new(Inner {
                 clients: HashMap::new(),
                 next_client_id: 0,
+                next_outbound_sequence: 0,
                 queue: Vec::new(),
+                outbound_emissions: HashMap::new(),
+                captured_outbound_tail: VecDeque::new(),
+                captured_outbound_json_bytes: 0,
+                observed_outbound_objects: 0,
+                observed_outbound_json_bytes: 0,
                 policy,
                 mailboxes: HashMap::new(),
                 partition_allowed: None,
                 delayed: HashMap::new(),
+                scenario_input_by_transport_id: HashMap::new(),
+                scenario_input_by_content_id: HashMap::new(),
+                scenario_action_by_transport_id: HashMap::new(),
+                exposed_recipient_counts: HashMap::new(),
             })),
         }
     }
@@ -95,11 +135,186 @@ impl TransportBus {
         id
     }
 
+    pub(crate) fn capture_outbound_for(&self, sender: ClientId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .outbound_emissions
+            .entry(sender)
+            .or_default();
+    }
+
     /// Send a message into the bus from `sender`. The message becomes
     /// eligible for delivery on the next `step` / `deliver_all`.
     pub fn send(&self, sender: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.outbound_emissions.contains_key(&sender) {
+            let sequence = inner.next_outbound_sequence;
+            inner.next_outbound_sequence = inner
+                .next_outbound_sequence
+                .checked_add(1)
+                .expect("outbound emission sequence exhausted");
+            inner
+                .outbound_emissions
+                .get_mut(&sender)
+                .expect("outbound capture remains enabled")
+                .push(OutboundEmission {
+                    sequence,
+                    msg: msg.clone(),
+                });
+            let json_bytes = serde_json::to_vec(&msg).map_or(0, |bytes| bytes.len() as u64);
+            inner.observed_outbound_objects = inner.observed_outbound_objects.saturating_add(1);
+            inner.observed_outbound_json_bytes = inner
+                .observed_outbound_json_bytes
+                .saturating_add(json_bytes);
+            inner.captured_outbound_json_bytes = inner
+                .captured_outbound_json_bytes
+                .saturating_add(json_bytes);
+            inner.captured_outbound_tail.push_back((
+                sender,
+                OutboundEmission {
+                    sequence,
+                    msg: msg.clone(),
+                },
+                json_bytes,
+            ));
+            while inner.captured_outbound_tail.len() > crate::MAX_CAPTURED_TRANSPORT_OBJECTS
+                || inner.captured_outbound_json_bytes > crate::MAX_CAPTURED_TRANSPORT_JSON_BYTES
+            {
+                let Some((_, _, evicted_bytes)) = inner.captured_outbound_tail.pop_front() else {
+                    break;
+                };
+                inner.captured_outbound_json_bytes = inner
+                    .captured_outbound_json_bytes
+                    .saturating_sub(evicted_bytes);
+            }
+        }
         inner.queue.push(InFlight { sender, msg });
+    }
+
+    pub(crate) fn outbound_since(
+        &self,
+        sender: ClientId,
+        after_sequence: Option<u64>,
+    ) -> Vec<OutboundEmission> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .outbound_emissions
+            .get(&sender)
+            .into_iter()
+            .flatten()
+            .filter(|emission| after_sequence.is_none_or(|after| emission.sequence > after))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn captured_outbound_window(&self) -> CapturedOutboundWindow {
+        let inner = self.inner.lock().unwrap();
+        CapturedOutboundWindow {
+            observed_objects: inner.observed_outbound_objects,
+            observed_json_bytes: inner.observed_outbound_json_bytes,
+            emissions: inner
+                .captured_outbound_tail
+                .iter()
+                .map(|(sender, emission, _)| (*sender, emission.clone()))
+                .collect(),
+        }
+    }
+
+    /// Retract every still-undelivered artifact for one pending publication.
+    ///
+    /// A definite publication failure is valid only while none of the
+    /// artifacts has reached a recipient mailbox. Check that precondition
+    /// before mutating the queue or delayed sets so a caller cannot partially
+    /// retract an already-exposed publication.
+    pub(crate) fn retract_undelivered_publication(
+        &self,
+        sender: ClientId,
+        message_ids: &[MessageId],
+    ) -> Result<usize, usize> {
+        let mut inner = self.inner.lock().unwrap();
+        let delivered = message_ids
+            .iter()
+            .map(|message_id| {
+                inner
+                    .exposed_recipient_counts
+                    .get(message_id)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum();
+        if delivered > 0 {
+            return Err(delivered);
+        }
+
+        let queued_before = inner.queue.len();
+        inner.queue.retain(|in_flight| {
+            in_flight.sender != sender || !message_ids.contains(&in_flight.msg.id)
+        });
+        let mut retracted = queued_before - inner.queue.len();
+
+        for delayed in inner.delayed.values_mut() {
+            let delayed_before = delayed.len();
+            delayed.retain(|in_flight| {
+                in_flight.sender != sender || !message_ids.contains(&in_flight.msg.id)
+            });
+            retracted += delayed_before - delayed.len();
+        }
+        inner.delayed.retain(|_, messages| !messages.is_empty());
+
+        Ok(retracted)
+    }
+
+    pub(crate) fn register_scenario_input(
+        &self,
+        transport_id: MessageId,
+        content_id: MessageId,
+        mut metadata: ScenarioInputMetadata,
+    ) {
+        metadata.aliases = vec![transport_id.clone(), content_id.clone()];
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .scenario_input_by_transport_id
+            .insert(transport_id, metadata.clone());
+        inner
+            .scenario_input_by_content_id
+            .insert(content_id, metadata);
+    }
+
+    pub(crate) fn register_scenario_action(
+        &self,
+        transport_id: MessageId,
+        action_id: impl Into<String>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .scenario_action_by_transport_id
+            .insert(transport_id, action_id.into());
+    }
+
+    pub(crate) fn scenario_input_for_transport(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<ScenarioInputMetadata> {
+        self.inner
+            .lock()
+            .unwrap()
+            .scenario_input_by_transport_id
+            .get(message_id)
+            .cloned()
+    }
+
+    pub(crate) fn scenario_input_for_content(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<ScenarioInputMetadata> {
+        self.inner
+            .lock()
+            .unwrap()
+            .scenario_input_by_content_id
+            .get(message_id)
+            .cloned()
     }
 
     /// Deliver up to `n` messages from the queue into per-client mailboxes,
@@ -140,6 +355,10 @@ impl TransportBus {
                 };
                 if deliver {
                     inner.mailboxes.get_mut(cid).unwrap().push(msg.clone());
+                    *inner
+                        .exposed_recipient_counts
+                        .entry(msg.id.clone())
+                        .or_default() += 1;
                 }
             }
         }
@@ -165,6 +384,16 @@ impl TransportBus {
         std::mem::take(inner.mailboxes.get_mut(&client).unwrap())
     }
 
+    pub(crate) fn mailbox_snapshot(&self, client: ClientId) -> Vec<TransportMessage> {
+        self.inner
+            .lock()
+            .unwrap()
+            .mailboxes
+            .get(&client)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Restrict deliveries to a subset of clients (the others are
     /// partitioned away). Calling with `None` clears the partition.
     pub fn set_partition(&self, allow: Option<Vec<ClientId>>) {
@@ -176,17 +405,67 @@ impl TransportBus {
     /// specific client's mailbox, bypassing the queue + delivery policy.
     /// This is the hook the proptest "true same-id replay" property uses
     /// to deliver an identical message twice and prove the engine's
-    /// `StaleReason::AlreadySeen` dedup fires.
+    /// the typed duplicate exclusion fires.
     pub fn inject(&self, client: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(mb) = inner.mailboxes.get_mut(&client) {
-            mb.push(msg);
+            mb.push(msg.clone());
+            *inner.exposed_recipient_counts.entry(msg.id).or_default() += 1;
         }
     }
 
     /// Number of queued (not yet delivered) messages.
     pub fn queued_len(&self) -> usize {
         self.inner.lock().unwrap().queue.len()
+    }
+
+    /// Remove packet-bus copies after a higher-level retained transport adapter
+    /// has durably captured the same accepted engine emissions.
+    pub(crate) fn discard_queued_messages(&self, message_ids: &[MessageId]) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let queued_before = inner.queue.len();
+        inner
+            .queue
+            .retain(|in_flight| !message_ids.contains(&in_flight.msg.id));
+        let mut discarded = queued_before - inner.queue.len();
+        for delayed in inner.delayed.values_mut() {
+            let delayed_before = delayed.len();
+            delayed.retain(|in_flight| !message_ids.contains(&in_flight.msg.id));
+            discarded += delayed_before - delayed.len();
+        }
+        inner.delayed.retain(|_, messages| !messages.is_empty());
+        discarded
+    }
+
+    pub(crate) fn pending_work_snapshot(&self, client: ClientId) -> BusPendingWorkSnapshot {
+        let inner = self.inner.lock().unwrap();
+        let identity = inner
+            .clients
+            .get(&client)
+            .expect("pending-work client is attached");
+        BusPendingWorkSnapshot {
+            queued_messages: inner
+                .queue
+                .iter()
+                .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
+                .count(),
+            delayed_messages: inner
+                .delayed
+                .values()
+                .flatten()
+                .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
+                .count(),
+            mailbox_messages: inner.mailboxes.get(&client).map_or(0, Vec::len),
+        }
+    }
+
+    pub(crate) fn structural_progress_snapshot(&self) -> BusStructuralProgressSnapshot {
+        let inner = self.inner.lock().unwrap();
+        BusStructuralProgressSnapshot {
+            queued_messages: inner.queue.len(),
+            delayed_messages: inner.delayed.values().map(Vec::len).sum(),
+            mailbox_messages: inner.mailboxes.values().map(Vec::len).sum(),
+        }
     }
 
     /// Snapshot queued messages without altering delivery order.
@@ -198,6 +477,43 @@ impl TransportBus {
             .iter()
             .map(|in_flight| in_flight.msg.clone())
             .collect()
+    }
+
+    pub(crate) fn semantic_queue_index(
+        &self,
+        selector: &ScenarioMessageSelectorV2,
+        sender: Option<ClientId>,
+        publication_ids: Option<&std::collections::HashSet<MessageId>>,
+    ) -> Option<usize> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, in_flight)| {
+                sender.is_none_or(|sender| in_flight.sender == sender)
+                    && publication_ids
+                        .is_none_or(|message_ids| message_ids.contains(&in_flight.msg.id))
+                    && selector.action_id.as_ref().is_none_or(|action_id| {
+                        inner
+                            .scenario_action_by_transport_id
+                            .get(&in_flight.msg.id)
+                            .is_some_and(|registered| registered == action_id)
+                            || inner
+                                .scenario_input_by_transport_id
+                                .get(&in_flight.msg.id)
+                                .is_some_and(|metadata| metadata.scenario_id == *action_id)
+                    })
+                    && selector.class.is_none_or(|class| {
+                        transport_class_matches(
+                            class,
+                            &in_flight.msg.envelope,
+                            inner.scenario_input_by_transport_id.get(&in_flight.msg.id),
+                        )
+                    })
+            })
+            .nth(selector.occurrence)
+            .map(|(index, _)| index)
     }
 
     /// Drop one queued message by its current queue index.
@@ -270,6 +586,50 @@ impl TransportBus {
     }
 }
 
+fn transport_class_matches(
+    class: ScenarioTransportClass,
+    envelope: &TransportEnvelope,
+    metadata: Option<&ScenarioInputMetadata>,
+) -> bool {
+    match class {
+        ScenarioTransportClass::Welcome => matches!(envelope, TransportEnvelope::Welcome { .. }),
+        ScenarioTransportClass::GroupMessage => {
+            matches!(envelope, TransportEnvelope::GroupMessage { .. })
+        }
+        ScenarioTransportClass::Commit => {
+            metadata.is_some_and(|metadata| metadata.kind == crate::ScenarioInputKind::Commit)
+        }
+        ScenarioTransportClass::Proposal => {
+            metadata.is_some_and(|metadata| metadata.kind == crate::ScenarioInputKind::Proposal)
+        }
+        ScenarioTransportClass::Application => {
+            metadata.is_some_and(|metadata| metadata.kind == crate::ScenarioInputKind::Application)
+        }
+    }
+}
+
+fn targets_client(
+    policy: &DeliveryPolicy,
+    identity: &MemberId,
+    client: ClientId,
+    in_flight: &InFlight,
+) -> bool {
+    if in_flight.sender == client {
+        return false;
+    }
+    match &in_flight.msg.envelope {
+        TransportEnvelope::GroupMessage { .. } => true,
+        TransportEnvelope::Welcome { recipient } => {
+            matches!(
+                policy,
+                DeliveryPolicy::Ordered {
+                    broadcast_welcomes: true
+                }
+            ) || recipient == identity
+        }
+    }
+}
+
 fn take_batch(queue: &mut Vec<InFlight>, policy: &DeliveryPolicy, n: usize) -> Vec<InFlight> {
     let n = n.min(queue.len());
     match policy {
@@ -306,5 +666,41 @@ fn take_batch(queue: &mut Vec<InFlight>, policy: &DeliveryPolicy, n: usize) -> V
             }
             taken
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::transport::{Timestamp, TransportSource};
+
+    #[test]
+    fn forensic_outbound_capture_is_bounded_at_emission_time() {
+        let bus = TransportBus::ordered();
+        let sender = bus.attach(MemberId::new(vec![1; 32]));
+        bus.capture_outbound_for(sender);
+        for sequence in 0..300_u64 {
+            bus.send(
+                sender,
+                TransportMessage {
+                    id: MessageId::new(sequence.to_be_bytes().to_vec()),
+                    payload: vec![2; 32],
+                    timestamp: Timestamp(sequence),
+                    causal_deps: Vec::new(),
+                    source: TransportSource("test".into()),
+                    envelope: TransportEnvelope::GroupMessage {
+                        transport_group_id: vec![3; 32],
+                    },
+                },
+            );
+        }
+
+        let capture = bus.captured_outbound_window();
+        assert_eq!(capture.observed_objects, 300);
+        assert_eq!(
+            capture.emissions.len(),
+            crate::MAX_CAPTURED_TRANSPORT_OBJECTS
+        );
+        assert!(capture.observed_json_bytes > 0);
     }
 }

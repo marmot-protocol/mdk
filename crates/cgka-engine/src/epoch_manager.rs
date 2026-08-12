@@ -35,6 +35,14 @@ struct PendingMeta {
     /// rows, which are emitted on a later publish-confirm call after the
     /// engine's ambient context has cleared.
     audit_context: Option<AuditEventContext>,
+    /// Whether `begin_pending` newly inserted `prior_epoch` into
+    /// `committed_from` for this pending. A group holds at most one live
+    /// pending, so a fresh insert is owned solely by it and must be removed
+    /// again on `rollback_publish` — otherwise the phantom entry poisons
+    /// fork detection for later same-epoch siblings. `false` means the epoch
+    /// was already owned (e.g. by a previously confirmed commit after a
+    /// fork rollback), and rollback must leave that incumbent in place.
+    owns_committed_from: bool,
 }
 
 /// Discriminator the engine uses when emitting the post-confirm event.
@@ -44,6 +52,7 @@ struct PendingMeta {
 pub(crate) enum PendingKind {
     CreateGroup,
     GroupEvolution,
+    Disband,
 }
 
 #[derive(Default)]
@@ -67,6 +76,24 @@ impl EpochManager {
 
     pub(crate) fn state(&self, group_id: &GroupId) -> Option<&EpochState> {
         self.states.get(group_id)
+    }
+
+    /// Drop a group's in-memory epoch entry: the retraction path for the
+    /// session-open cheap pass's provisional `Stable` seed (mdk#1161).
+    ///
+    /// Two callers only. `ensure_hydrated` retracts the seed immediately
+    /// before running full per-group hydration, so hydration derives the real
+    /// entry (`set_stable` / `restore_pending` / `restore_unrecoverable`)
+    /// from exactly the entry-absent conditions the open-time loop always
+    /// had — a projected-forward record mirror must not become the
+    /// `begin_pending` base. And `quarantine_stored_group_on_hydrate` clears
+    /// whatever entry remains when hydration fails, because a quarantined
+    /// group must have no epoch entry: `live_group_ids` filters on entry
+    /// presence, and every convergence/ingest gate treats "no state" as "not
+    /// live". Durable halt markers are unaffected:
+    /// `sync_unrecoverable_halt_from_storage` re-syncs them on demand.
+    pub(crate) fn clear_group_state(&mut self, group_id: &GroupId) {
+        self.states.remove(group_id);
     }
 
     pub(crate) fn epoch(&self, group_id: &GroupId) -> Option<EpochId> {
@@ -97,7 +124,20 @@ impl EpochManager {
 
     /// Set a group's state to `Stable { epoch }`. Used by the join-welcome
     /// path (no prior state) and by the merge-to-stable path post-confirm.
+    ///
+    /// Refuses to overwrite `Unrecoverable` or terminal `Disbanded`: the only
+    /// legal exit from `Unrecoverable` is [`Self::repair_to_stable`] after a
+    /// verified repair path (mdk#971), while `Disbanded` has no outgoing
+    /// transition.
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
+        if self.is_unrecoverable(&group_id) || self.is_disbanded(&group_id) {
+            tracing::warn!(
+                target: "cgka_engine::epoch_manager",
+                method = "set_stable",
+                "refusing set_stable while Unrecoverable or Disbanded; verified repair must use repair_to_stable"
+            );
+            return;
+        }
         self.states.insert(group_id, EpochState::stable(epoch));
     }
 
@@ -137,7 +177,8 @@ impl EpochManager {
         let new_state = prev.begin_pending(new_epoch, pending, pending_ref)?;
 
         // The transition succeeded — commit every mutation together.
-        self.committed_from
+        let owns_committed_from = self
+            .committed_from
             .entry(group_id.clone())
             .or_default()
             .insert(pre_commit_epoch);
@@ -149,9 +190,35 @@ impl EpochManager {
                 prior_epoch: pre_commit_epoch,
                 kind,
                 audit_context,
+                owns_committed_from,
             },
         );
         Ok(())
+    }
+
+    /// Recreate a pending-publish slot from its durable frozen fanout after a
+    /// process restart. The restored ref also advances the allocator so a new
+    /// pending operation cannot reuse it in this session.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_pending(
+        &mut self,
+        group_id: GroupId,
+        pre_commit_epoch: EpochId,
+        new_epoch: EpochId,
+        pending: StagedCommitHandle,
+        pending_ref: PendingStateRef,
+        kind: PendingKind,
+    ) -> Result<(), EngineError> {
+        self.pending_counter = self.pending_counter.max(pending_ref.as_u64());
+        self.begin_pending(
+            group_id,
+            pre_commit_epoch,
+            new_epoch,
+            pending,
+            pending_ref,
+            kind,
+            None,
+        )
     }
 
     /// Peek at which group a pending publish belongs to without consuming
@@ -216,8 +283,10 @@ impl EpochManager {
     /// the OpenMLS `clear_pending_commit` + any Marmot/cache rewinds — this
     /// only handles the state-machine bookkeeping.
     ///
-    /// Atomic in the state map: a failed `rollback_pending` leaves both
-    /// `pending` and `states` untouched.
+    /// Atomic in the state map: a failed `rollback_pending` leaves
+    /// `pending`, `states`, and `committed_from` untouched. On success the
+    /// provisional `committed_from` entry inserted by this pending's
+    /// `begin_pending` is removed (a pre-existing incumbent survives).
     ///
     /// Returns `(group_id, prior_epoch)` so the caller can target the
     /// matching MLS group.
@@ -239,17 +308,21 @@ impl EpochManager {
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let stable = prev.rollback_pending(prior_epoch)?;
         self.pending.remove(&pending);
+        // Drop the provisional `committed_from` ownership recorded by
+        // `begin_pending` — the commit never reached anyone, so a later
+        // same-epoch sibling is a benign race, not a fork. Only the entry
+        // this pending itself inserted is removed; a pre-existing confirmed
+        // incumbent stays.
+        if meta.owns_committed_from
+            && let Some(epochs) = self.committed_from.get_mut(&group_id)
+        {
+            epochs.remove(&prior_epoch);
+            if epochs.is_empty() {
+                self.committed_from.remove(&group_id);
+            }
+        }
         self.states.insert(group_id.clone(), stable);
         Ok((group_id, prior_epoch))
-    }
-
-    /// Record a committed-from epoch outside the begin_pending path (used
-    /// by the auto-committer, which doesn't go through PendingPublish).
-    pub(crate) fn record_committed_from(&mut self, group_id: &GroupId, epoch: EpochId) {
-        self.committed_from
-            .entry(group_id.clone())
-            .or_default()
-            .insert(epoch);
     }
 
     pub(crate) fn prune_committed_from_before(
@@ -294,11 +367,79 @@ impl EpochManager {
             .insert(group_id.clone(), prev.to_unrecoverable());
     }
 
+    /// Restore `Unrecoverable` at a known frozen epoch (session-open hydration
+    /// of a durable halt marker). Overwrites any prior in-memory state for the
+    /// group — the persisted marker is authoritative across restart (mdk#971).
+    pub(crate) fn restore_unrecoverable(&mut self, group_id: GroupId, last_stable_epoch: EpochId) {
+        self.states.insert(
+            group_id,
+            EpochState::stable(last_stable_epoch).to_unrecoverable(),
+        );
+    }
+
+    /// `Unrecoverable → Stable` after a verified repair path (authenticated
+    /// re-join welcome). The only legal exit from `Unrecoverable`.
+    pub(crate) fn repair_to_stable(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        // Atomic in the state map (mirrors Sm1): fallible transition before
+        // mutating so a non-Unrecoverable prev cannot orphan the entry.
+        let prev = self
+            .states
+            .get(group_id)
+            .cloned()
+            .unwrap_or_else(|| EpochState::stable(EpochId(0)).to_unrecoverable());
+        let new = prev
+            .repair_to_stable(epoch)
+            .map_err(EngineError::InvalidTransition)?;
+        self.states.insert(group_id.clone(), new);
+        Ok(())
+    }
+
     /// Whether the named group is currently `Unrecoverable`.
     pub(crate) fn is_unrecoverable(&self, group_id: &GroupId) -> bool {
         self.states
             .get(group_id)
             .is_some_and(|s| s.is_unrecoverable())
+    }
+
+    pub(crate) fn is_disbanded(&self, group_id: &GroupId) -> bool {
+        self.states
+            .get(group_id)
+            .is_some_and(EpochState::is_disbanded)
+    }
+
+    pub(crate) fn mark_disbanded(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let previous = self
+            .states
+            .get(group_id)
+            .cloned()
+            .unwrap_or_else(|| EpochState::stable(epoch));
+        let next = previous
+            .detect_fork(Vec::new())
+            .settle_to_disbanded(epoch)
+            .map_err(EngineError::InvalidTransition)?;
+        self.states.insert(group_id.clone(), next);
+        Ok(())
+    }
+
+    pub(crate) fn restore_disbanded(
+        &mut self,
+        group_id: GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let recovering = EpochState::stable(epoch).detect_fork(Vec::new());
+        let disbanded = recovering
+            .settle_to_disbanded(epoch)
+            .map_err(EngineError::InvalidTransition)?;
+        self.states.insert(group_id, disbanded);
+        Ok(())
     }
 }
 
@@ -384,5 +525,127 @@ mod tests {
         assert_eq!(em.epoch(&group_id), Some(EpochId(8)));
         assert_eq!(em.group_for_pending(pending_ref), Some(group_id.clone()));
         assert!(em.we_committed_from(&group_id, EpochId(7)));
+    }
+
+    /// `rollback_publish` must remove the provisional `committed_from` entry
+    /// its `begin_pending` inserted — the commit reached no one, so a later
+    /// same-epoch sibling is a benign race, not a fork.
+    #[test]
+    fn rollback_publish_removes_provisional_committed_from() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(7));
+
+        let pending_ref = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            pending_ref,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("begin_pending from Stable succeeds");
+        assert!(em.we_committed_from(&group_id, EpochId(7)));
+
+        let (rolled_group, prior) = em
+            .rollback_publish(pending_ref)
+            .expect("rollback_publish succeeds");
+        assert_eq!(rolled_group, group_id);
+        assert_eq!(prior, EpochId(7));
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(7)));
+        assert!(
+            !em.we_committed_from(&group_id, EpochId(7)),
+            "rolled-back pending must not leave a phantom committed_from entry"
+        );
+    }
+
+    /// A `committed_from` epoch already owned by an earlier confirmed commit
+    /// must survive a later rollback of a pending staged from the same epoch
+    /// (reachable via fork-recovery rewinding to that epoch).
+    #[test]
+    fn rollback_publish_preserves_confirmed_committed_from_incumbent() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+
+        // Confirmed commit from epoch 7 → committed_from owns 7 legitimately.
+        em.set_stable(group_id.clone(), EpochId(7));
+        let first = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            first,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("first begin_pending succeeds");
+        em.confirm_publish(first).expect("confirm_publish succeeds");
+        assert!(em.we_committed_from(&group_id, EpochId(7)));
+
+        // Fork recovery rewinds the group to epoch 7; a second commit is
+        // staged from the same epoch and then rolled back.
+        em.set_stable(group_id.clone(), EpochId(7));
+        let second = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            second,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("second begin_pending succeeds");
+        em.rollback_publish(second)
+            .expect("rollback_publish succeeds");
+
+        assert!(
+            em.we_committed_from(&group_id, EpochId(7)),
+            "rollback must not clear the confirmed incumbent's committed_from entry"
+        );
+    }
+
+    /// mdk#971: `set_stable` must not silently clear Unrecoverable.
+    #[test]
+    fn set_stable_refuses_while_unrecoverable() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(4));
+        em.mark_unrecoverable(&group_id);
+        assert!(em.is_unrecoverable(&group_id));
+        em.set_stable(group_id.clone(), EpochId(9));
+        assert!(
+            em.is_unrecoverable(&group_id),
+            "set_stable must leave Unrecoverable intact"
+        );
+        assert_eq!(em.epoch(&group_id), Some(EpochId(4)));
+    }
+
+    /// mdk#971: verified repair is the only Unrecoverable exit.
+    #[test]
+    fn repair_to_stable_exits_unrecoverable() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.restore_unrecoverable(group_id.clone(), EpochId(4));
+        assert!(em.is_unrecoverable(&group_id));
+        em.repair_to_stable(&group_id, EpochId(5))
+            .expect("repair_to_stable from Unrecoverable");
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(5)));
+        assert!(!em.is_unrecoverable(&group_id));
+    }
+
+    #[test]
+    fn repair_to_stable_rejects_non_unrecoverable_without_orphaning() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(3));
+        assert!(em.repair_to_stable(&group_id, EpochId(4)).is_err());
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
     }
 }

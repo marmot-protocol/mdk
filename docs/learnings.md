@@ -303,9 +303,10 @@ shortcuts.
 
 **5. Relay backlog causes spurious peeler decrypt errors.** Any subscription without a `since` filter receives
 historical events encrypted with old-epoch secrets that the new joiner doesn't have. Fix in spike:
-`Filter::new()...since(Timestamp::now())`. The deeper fix was to treat peel-decrypt failures as `IngestOutcome::Stale`
-rather than hard errors. Current code uses `StaleReason::PeelFailed`, and stale source-epoch group envelopes can be
-terminal when no retained snapshot can peel them.
+`Filter::new()...since(Timestamp::now())`. The spike's deeper fix was to make peel-decrypt failures ordinary typed
+outcomes rather than hard errors. That taxonomy has since been refined: potentially recoverable misses are
+`IngestOutcome::TransportDeferred`, while terminal protocol rejection and stale reasons are explicit and resource
+limits return `ResourceRefused`.
 
 **6. Forked commit recovery is out of scope for the spike, but real.** When a commit race _does_ produce a fork (e.g.
 two admins committing concurrent adds), some members end up at irreconcilable epoch-N-alpha / epoch-N-beta states. The
@@ -349,8 +350,9 @@ walks; retains caps for removed members for audit/replay) — just not the _work
 ### What I would still change from the early spike
 
 - Add `EngineError::MissingRequiredCapabilities { required, had }` typed variant (see finding 9).
-- Add `StaleReason::PeelFailed` to distinguish peel-level stale from MLS-level stale. Superseded: this now exists, and
-  the Nostr group envelope carries a source-epoch hint so pre-join stale messages can be terminal.
+- Add a typed peel-failure outcome to distinguish transport availability from MLS stale state. Superseded:
+  `TransportDeferred` and `ResourceRefused` now cover availability; the Nostr group envelope intentionally carries no
+  clear source-epoch hint.
 - Fix the auto-commit race properly — the "lowest-index" rule is a shortcut that breaks when the lowest-index member is
   offline. Real fix: short randomized delay + observer-of-commit suppression.
 - Store members' advertised capabilities in a local index so `feature_status()` can give real

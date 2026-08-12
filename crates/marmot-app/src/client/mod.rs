@@ -1,23 +1,28 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_engine::key_package::is_last_resort_key_package;
+use cgka_session::PublishWork;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BLOSSOM_LOCATOR_KIND_V1,
-    BlobStoreEndpointV1, ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    BlobStoreEndpointV1, BlobStoreEndpointV2, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
+    EncryptedMediaPolicyV1, EncryptedMediaPolicyV2, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
 };
+use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
-use cgka_traits::{GroupId, SecretBytes};
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::transport::TransportEnvelope;
+use cgka_traits::{GroupId, MessageId, SecretBytes};
+use futures::StreamExt;
 use marmot_forensics::AuditEventContext;
 
 use crate::app_telemetry::AppPerformanceOperation;
@@ -27,69 +32,169 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, fetch_group_image,
-    is_loopback_http_endpoint, upload_encrypted_media, upload_group_image,
+    DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
+    download_encrypted_media, fetch_group_image, is_loopback_http_endpoint, upload_encrypted_media,
+    upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
-    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    PendingWelcomeDelivery, SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
+    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
+pub(crate) mod epoch_stall;
 mod projection;
 mod push;
+mod retention;
 mod sync;
 
+use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 // Re-exported so the crate's `tests` module can keep calling
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
 #[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
+pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
+
+const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+
+/// Run independent async work with fixed fan-out while returning results in
+/// input order. All started work finishes before deterministic error selection,
+/// so completion timing cannot change which member error the caller observes.
+async fn collect_bounded_ordered<I, F, T, E>(work: I, limit: usize) -> Result<Vec<T>, E>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let mut results = futures::stream::iter(work.into_iter().enumerate())
+        .map(|(index, future)| async move { (index, future.await) })
+        .buffer_unordered(limit.max(1))
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
 
 pub struct AppClient {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
+    // Struct fields drop in declaration order. Keep the engine-owning runtime
+    // before this guard so ownership is released only after engine teardown.
+    pub(crate) _session_guard: crate::AppAccountSessionGuard,
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
+    pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
     pub(crate) state: AccountState,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
+    /// Sync summary for group events the engine applied as a side effect of an
+    /// outbound send: a send that lands while inbound convergence input is
+    /// retained folds those commits before publishing, so its effects can carry
+    /// peer `GroupStateChanged` / `EpochChanged` events. The runtime account
+    /// worker drains this after each command and broadcasts it like an inbound
+    /// sync summary so live chat-list/group-state subscriptions observe the
+    /// applied commits.
+    pub(crate) pending_applied_sync_summary: crate::SyncSummary,
+    /// Epoch-stall escalations the detector has raised but no caller has been
+    /// handed yet.
+    ///
+    /// The detector latches `escalated` one-shot per unrecovered run, so an
+    /// escalation dropped by a later `?` on the recording pass is never raised
+    /// again — the run keeps arming in silence. Escalations therefore land here
+    /// rather than on whatever `SyncSummary` the recording pass happened to be
+    /// building, and move onto a summary only at a seam that is returning `Ok`
+    /// (see `Self::drain_epoch_stall_escalations`).
+    pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Batch-start local-deletion frontiers crossed by authenticated fresh
+    /// activity. They remain pending until the crossing projection and marker
+    /// clears commit in the same account-state transaction.
+    pub(crate) pending_local_group_deletion_frontier_clears: HashMap<String, u64>,
+    /// Authenticated application deliveries observed by this client but not yet
+    /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
+    /// committed with the account projection and any frontier clear.
+    pub(crate) pending_application_event_acks: HashSet<MessageId>,
+    /// Unit-test fault injection for the account-open replay path. This keeps
+    /// the live protocol group intact while exercising a missing best-effort
+    /// app projection.
+    #[cfg(test)]
+    pub(crate) force_event_group_projection_unavailable: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
+    /// counts the distinct undecryptable messages a group accumulates at a
+    /// stalled epoch. Ephemeral session state, like the pending sets above.
+    pub(crate) epoch_stall: EpochStallDetector,
+    /// Armed epoch-gap recovery intent awaiting its account-wide replay.
+    pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
+    /// when a replay failure must not overwrite a newer arm minted in flight.
+    pub(crate) queued_epoch_backfills:
+        std::collections::VecDeque<epoch_stall::PendingEpochBackfill>,
+    /// Temporary full-history subscriptions installed only while a post-join
+    /// maintenance obligation is waiting for its first relay EOSE.
+    pub(crate) post_join_maintenance_subscriptions:
+        HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
+}
+
+/// Cross the point-of-no-return for current-profile group creation without
+/// allowing repairable follow-up work to turn a canonical group into an
+/// apparent create failure. Returning `Err` after that boundary encourages a
+/// caller to retry and create a second group. The engine's retained outbound
+/// Welcome index and account-open reconciliation repair any missed projection
+/// work.
+fn recover_post_canonical_result<T: Default>(
+    method: &'static str,
+    result: Result<T, AppError>,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = method,
+                error_kind = error.privacy_safe_kind(),
+                "canonical group creation outpaced repairable follow-up work"
+            );
+            T::default()
+        }
+    }
 }
 
 /// A point-in-time copy of the live session's read-only group projections
-/// (`members`, `group_mls_state`, `quarantined_groups`).
+/// (`groups`, `members`, `group_mls_state`, `quarantined_groups`).
 ///
-/// The account worker captures this from the freshly hydrated session and uses
-/// it to answer read commands *while the initial relay catch-up runs in the
-/// background* — the catch-up future holds `&mut AppClient`, so concurrent reads
-/// cannot touch the live session and are served from this snapshot instead.
-/// Membership/epoch only change on a committed group operation, which the
+/// The account worker captures this from the live session and uses it to answer
+/// read commands while a relay catch-up runs in the background. The catch-up
+/// future holds `&mut AppClient`, so concurrent reads cannot touch the live
+/// session and are served from this snapshot instead.
+/// MLS membership/epoch only change on a committed group operation, which the
 /// catch-up surfaces via `GroupStateUpdated` so subscribers re-read once it
-/// lands; the snapshot is therefore a brief, self-healing stand-in, only used
-/// until the initial catch-up completes (after which reads go live again).
+/// lands. Storage-owned self-membership is refreshed separately when a roster
+/// is served, so an observed departure during catch-up is not hidden by this
+/// snapshot. The snapshot is only used until catch-up completes.
 ///
-/// Groups whose live read errored at capture time (e.g. quarantined / not yet
-/// live) are simply absent; a read for an absent group returns `UnknownGroup`,
-/// the same shape the live path returns for a group the session does not hold.
+/// Capture is atomic: if any known group's member or MLS projection cannot be
+/// read, the whole snapshot fails and the worker defers reads to live state
+/// after catch-up instead of misreporting a degraded known group as unknown.
 #[derive(Default)]
 pub(crate) struct GroupReadSnapshot {
+    groups: HashMap<GroupId, AppGroupRecord>,
     members: HashMap<GroupId, Vec<AppGroupMemberRecord>>,
     mls_state: HashMap<GroupId, AppGroupMlsState>,
     quarantined: Vec<AppQuarantinedGroup>,
@@ -106,11 +211,45 @@ impl GroupReadSnapshot {
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
 
+    pub(crate) fn member_ids_page(
+        &self,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        group_ids
+            .iter()
+            .map(|group_id| {
+                let members = self.members(group_id)?;
+                Ok(crate::AppGroupMemberIds {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    member_ids_hex: members
+                        .into_iter()
+                        .map(|member| member.member_id_hex)
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         self.mls_state
             .get(group_id)
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub(crate) fn group_roster(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record: self
+                .groups
+                .get(group_id)
+                .cloned()
+                .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            members: self.members(group_id)?,
+            mls_state: self.group_mls_state(group_id)?,
+        })
     }
 
     pub(crate) fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
@@ -193,18 +332,266 @@ impl AppClient {
             .await?;
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
-        match self.app.latest_key_package(&self.state.label) {
-            Ok(key_package) if is_last_resort_key_package(&key_package).unwrap_or(false) => {
-                self.app
-                    .publish_cached_key_package(&self.state.label, key_package)
-                    .await
-            }
-            Ok(_) => Ok(self.runtime.publish_fresh_key_package().await?),
-            Err(AppError::MissingKeyPackage(_)) => {
-                Ok(self.runtime.publish_fresh_key_package().await?)
-            }
-            Err(err) => Err(err),
+        let lifecycle = self.runtime.key_package_maintenance_status()?;
+        if lifecycle.as_ref().is_some_and(|lifecycle| {
+            lifecycle.pending_replacement.is_some() || lifecycle.current_key_package.is_none()
+        }) {
+            // A prior ambiguous or rejected setup attempt already owns exact
+            // signed bytes and private material, or a journaled setup owns a
+            // stable slot that has not promoted a current package yet. Resume
+            // or prepare that replacement; republish_key_package deliberately
+            // rejects pending rotations and requires a current package.
+            Ok(self.runtime.publish_fresh_key_package().await?)
+        } else {
+            Ok(self.runtime.republish_key_package().await?)
         }
+    }
+
+    pub fn maintenance_status(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.maintenance_status(group_id)?)
+    }
+
+    pub fn key_package_maintenance_status(
+        &self,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        Ok(self.runtime.key_package_maintenance_status()?)
+    }
+
+    pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, AppError> {
+        Ok(self.runtime.durably_owned_key_packages()?)
+    }
+
+    pub fn schedule_manual_self_update(&mut self, group_id: &GroupId) -> Result<String, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(hex::encode(
+            self.runtime
+                .schedule_manual_self_update(group_id)?
+                .as_slice(),
+        ))
+    }
+
+    pub fn periodic_maintenance_policy(
+        &self,
+    ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
+        Ok(self.runtime.periodic_maintenance_policy()?)
+    }
+
+    pub fn set_periodic_maintenance_policy(
+        &self,
+        policy: cgka_traits::PeriodicMaintenancePolicy,
+    ) -> Result<(), AppError> {
+        Ok(self.runtime.set_periodic_maintenance_policy(policy)?)
+    }
+
+    pub fn pause_maintenance(&mut self) {
+        self.runtime.pause_maintenance();
+    }
+
+    pub fn resume_maintenance(&mut self) {
+        self.runtime.resume_maintenance();
+    }
+
+    pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
+            self.runtime.sweep_expired_key_package_private_material()?;
+            let summary = self
+                .runtime
+                .maintenance_run_summary(&marmot_account::AccountDeviceEffects::default())?;
+            return Ok(maintenance_run_summary_from_account(summary));
+        }
+        let effects = self.runtime.run_due_maintenance().await?;
+        self.queue_own_group_system_projection_updates(&effects);
+        let summary = self.runtime.maintenance_run_summary(&effects)?;
+        Ok(maintenance_run_summary_from_account(summary))
+    }
+
+    pub(crate) fn key_package_maintenance_requires_catch_up(&self) -> bool {
+        self.app.cursor_persistence() == crate::CursorPersistence::Advance
+            && self
+                .runtime
+                .key_package_maintenance_requires_catch_up()
+                .unwrap_or(false)
+    }
+
+    /// Install, poll, and retire temporary post-join full-history
+    /// subscriptions. A restart reconstructs this ephemeral map from durable
+    /// CatchUp obligations; the EOSE deadline itself remains persisted.
+    pub(crate) async fn advance_post_join_maintenance_subscriptions(
+        &mut self,
+    ) -> Result<(), AppError> {
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.runtime.maintenance_is_paused()
+        {
+            let active = self
+                .post_join_maintenance_subscriptions
+                .iter()
+                .map(|(group_id, (_, route))| (group_id.clone(), route.clone()))
+                .collect::<Vec<_>>();
+            for (group_id, route) in active {
+                if let Err(_error) = self
+                    .adapter
+                    .remove_group_maintenance_subscription(&route)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "subscription_remove_failed",
+                        "could not remove paused post-join maintenance subscription"
+                    );
+                    continue;
+                }
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+            }
+            return Ok(());
+        }
+        let routes = self.routing.snapshot().group_routes;
+        let mut waiting = HashSet::new();
+
+        for group in self.state.groups.clone() {
+            let group_id = match hex::decode(&group.group_id_hex) {
+                Ok(bytes) => GroupId::new(bytes),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "malformed_route_identifier",
+                        "skipping malformed post-join maintenance group"
+                    );
+                    continue;
+                }
+            };
+            let status = match self.runtime.maintenance_status(&group_id) {
+                Ok(status) => status,
+                Err(_error) => {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "maintenance_status_unavailable",
+                        "skipping unavailable post-join maintenance group"
+                    );
+                    continue;
+                }
+            };
+            let needs_subscription = status.obligations.iter().any(|obligation| {
+                obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
+                    && matches!(
+                        obligation.phase,
+                        cgka_traits::MaintenancePhase::CatchUp
+                            | cgka_traits::MaintenancePhase::EoseTimeout
+                            | cgka_traits::MaintenancePhase::Grace
+                    )
+            });
+            if !needs_subscription {
+                continue;
+            }
+            waiting.insert(group_id.clone());
+
+            if !self
+                .post_join_maintenance_subscriptions
+                .contains_key(&group_id)
+            {
+                let Some(route) = routes
+                    .iter()
+                    .find(|route| route.group_id == group_id)
+                    .cloned()
+                else {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "missing_route",
+                        "skipping post-join maintenance group without a route"
+                    );
+                    continue;
+                };
+                let subscription_id = match self
+                    .adapter
+                    .install_group_maintenance_subscription(route.clone())
+                    .await
+                {
+                    Ok(subscription_id) => subscription_id,
+                    Err(_error) => {
+                        tracing::warn!(
+                            target: "marmot_app::maintenance",
+                            method = "advance_post_join_maintenance_subscriptions",
+                            error_kind = "subscription_install_failed",
+                            "post-join maintenance subscription installation failed"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(_error) = self
+                    .runtime
+                    .mark_post_join_subscription_installed(&group_id)
+                {
+                    let _ = self
+                        .adapter
+                        .remove_group_maintenance_subscription(&route)
+                        .await;
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "state_update_failed",
+                        "compensated post-join subscription after state update failure"
+                    );
+                    continue;
+                }
+                self.post_join_maintenance_subscriptions
+                    .insert(group_id.clone(), (subscription_id, route));
+            }
+
+            let first_eose = if let Some((subscription_id, _)) =
+                self.post_join_maintenance_subscriptions.get(&group_id)
+            {
+                self.adapter
+                    .group_maintenance_any_eose(subscription_id)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if first_eose && let Err(_error) = self.runtime.mark_post_join_eose(&group_id) {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "eose_state_update_failed",
+                    "could not advance post-join maintenance after EOSE"
+                );
+                continue;
+            }
+        }
+
+        let stale = self
+            .post_join_maintenance_subscriptions
+            .keys()
+            .filter(|group_id| !waiting.contains(*group_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for group_id in stale {
+            if let Some((_, route)) = self
+                .post_join_maintenance_subscriptions
+                .get(&group_id)
+                .cloned()
+                && let Err(_error) = self
+                    .adapter
+                    .remove_group_maintenance_subscription(&route)
+                    .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "subscription_remove_failed",
+                    "could not remove stale post-join maintenance subscription"
+                );
+                continue;
+            }
+            self.post_join_maintenance_subscriptions.remove(&group_id);
+        }
+        Ok(())
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
@@ -213,19 +600,102 @@ impl AppClient {
             .await?;
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
+        // SQLCipher lifecycle state is authoritative. On first rollout the
+        // publisher imports only the legacy JSON `d` slot, then performs the
+        // recorded upgrade replacement under that same slot.
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
+    /// Create a locally canonical group and attempt each founding Welcome.
+    ///
+    /// `Ok(group_id)` reports group creation, not blanket invitation success.
+    /// Any Welcome that misses its acknowledgement policy is reported through
+    /// `WelcomeDeliveryPending` and remains listed by
+    /// [`Self::pending_welcome_deliveries`] for explicit re-delivery.
     pub async fn create_group(
         &mut self,
         name: &str,
         member_refs: &[&str],
     ) -> Result<GroupId, AppError> {
-        validate_group_profile(name, "")?;
-        let mut members = Vec::with_capacity(member_refs.len());
-        for member in member_refs {
-            members.push(self.app.member_key_package(member).await?);
+        self.create_group_with_initial_image(name, member_refs, None)
+            .await
+    }
+
+    pub async fn create_group_with_initial_image(
+        &mut self,
+        name: &str,
+        member_refs: &[&str],
+        initial_image: Option<AppInitialGroupImage>,
+    ) -> Result<GroupId, AppError> {
+        let group_id = self
+            .create_group_with_initial_profile_and_optional_telemetry(
+                name,
+                "",
+                member_refs,
+                initial_image,
+                None,
+            )
+            .await?;
+        // Direct `AppClient` callers do not have the managed account worker to
+        // refresh subscriptions after its response. Preserve that API's
+        // historical readiness guarantee; the managed runtime uses the
+        // telemetry-aware entry point below and performs this step after
+        // replying so it stays off the user-visible latency boundary.
+        if let Err(error) = self.sync_runtime_groups().await {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "create_group",
+                error_kind = error.privacy_safe_kind(),
+                "confirmed group creation could not refresh subscriptions immediately"
+            );
         }
+        Ok(group_id)
+    }
+
+    pub(crate) async fn create_group_with_initial_profile_and_telemetry(
+        &mut self,
+        name: &str,
+        description: &str,
+        member_refs: &[&str],
+        initial_image: Option<AppInitialGroupImage>,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<GroupId, AppError> {
+        self.create_group_with_initial_profile_and_optional_telemetry(
+            name,
+            description,
+            member_refs,
+            initial_image,
+            Some(telemetry),
+        )
+        .await
+    }
+
+    async fn create_group_with_initial_profile_and_optional_telemetry(
+        &mut self,
+        name: &str,
+        description: &str,
+        member_refs: &[&str],
+        initial_image: Option<AppInitialGroupImage>,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<GroupId, AppError> {
+        validate_group_profile(name, description)?;
+        let key_package_started_at = Instant::now();
+        let lookups = member_refs
+            .iter()
+            .map(|member| {
+                let app = self.app.clone();
+                let member = (*member).to_owned();
+                async move { app.member_key_package(&member).await }
+            })
+            .collect::<Vec<_>>();
+        let key_packages = collect_bounded_ordered(lookups, CREATE_GROUP_LOOKUP_CONCURRENCY).await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateKeyPackageLookup,
+            key_package_started_at.elapsed(),
+            key_packages.is_ok(),
+        );
+        let members = key_packages?;
         self.refresh_routing()?;
         let nostr_routing = self.app.new_nostr_routing()?;
         let nostr_routing_bytes =
@@ -239,40 +709,173 @@ impl AppClient {
                 .to_app_component_data()
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
-        app_components.push(self.encrypted_media_component_for_new_group()?);
+        let encrypted_media = self.encrypted_media_component_for_new_group()?;
+        let encrypted_media_component_id = encrypted_media.component_id;
+        app_components.push(encrypted_media);
+        let constructable = self.runtime.constructable_capabilities(&members)?;
+        let has_initial_image = initial_image.is_some();
+        let image_started_at = Instant::now();
+        let optional_app_components = async {
+            let mut optional_app_components = Vec::new();
+            if let Some(image) = initial_image {
+                match preferred_initial_group_image_component(
+                    &constructable,
+                    image.source_url.is_some(),
+                ) {
+                    Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
+                        let upload =
+                            upload_group_image(&image.plaintext, &image.media_type, None).await?;
+                        let input = AppGroupImageInput::from(upload);
+                        optional_app_components.push(AppComponentData {
+                            component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                            data: hex::decode(AppGroupImageComponent::new(input).data_hex)?,
+                        });
+                    }
+                    Some(GROUP_AVATAR_URL_COMPONENT_ID) => {
+                        if let Some(url) = image.source_url {
+                            optional_app_components.push(
+                                AppGroupAvatarUrlComponent::new(url, image.dim, image.thumbhash)?
+                                    .to_app_component_data()?,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<_, AppError>(optional_app_components)
+        }
+        .await;
+        if has_initial_image {
+            record_app_performance(
+                telemetry,
+                AppPerformanceOperation::GroupCreateImageUpload,
+                image_started_at.elapsed(),
+                optional_app_components.is_ok(),
+            );
+        }
+        let optional_app_components = optional_app_components?;
+        let mut touched_components = vec![
+            NOSTR_ROUTING_COMPONENT_ID,
+            AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            encrypted_media_component_id,
+        ];
+        touched_components.extend(
+            optional_app_components
+                .iter()
+                .map(|component| component.component_id),
+        );
+        let mut changed_fields = vec!["name", "members"];
+        if !description.is_empty() {
+            changed_fields.push("description");
+        }
+        if !optional_app_components.is_empty() {
+            changed_fields.push("image");
+        }
         let audit_context = Self::local_human_action_context(
             "create_group",
-            vec!["name", "members"],
-            vec![
-                NOSTR_ROUTING_COMPONENT_ID,
-                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-            ],
+            changed_fields,
+            touched_components,
             Some(member_refs.len() as u64),
         );
 
-        let (group_id, effects) = self
+        let mls_started_at = Instant::now();
+        let prepared = self
             .runtime
-            .create_group_with_audit_context(
+            .prepare_create_group_with_optional_app_components_and_audit_context(
                 CreateGroupRequest {
                     name: name.to_owned(),
-                    description: String::new(),
+                    description: description.to_owned(),
                     members,
                     required_features: Vec::new(),
                     app_components,
                     initial_admins: Vec::new(),
                 },
+                optional_app_components,
                 audit_context.clone(),
             )
-            .await?;
-        fail_if_publish_failed(&effects)?;
-        self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
+            .await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateMlsPreparePersist,
+            mls_started_at.elapsed(),
+            prepared.is_ok(),
+        );
+        let prepared = prepared?;
+        let group_id = prepared.group_id;
+        // Current-profile founding creation is already canonical before
+        // transport delivery. Persist every exact Welcome obligation before
+        // the first external side effect, so a crash between recipients
+        // cannot lose the still-undelivered work or induce a second group.
+        let founding_welcome_intents = recover_post_canonical_result(
+            "record_founding_welcome_delivery_intents",
+            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
+        );
+        let welcome_publish_started_at = Instant::now();
+        let publish_result = self
+            .runtime
+            .publish_prepared_session_effects_with_audit_context(
+                prepared.effects,
+                audit_context.clone(),
+            )
+            .await
+            .map_err(AppError::from);
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateWelcomePublish,
+            welcome_publish_started_at.elapsed(),
+            publish_result.is_ok(),
+        );
+        let effects =
+            recover_post_canonical_result("publish_prepared_founding_group", publish_result);
+        recover_post_canonical_result(
+            "clear_delivered_founding_welcome_intents",
+            self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects),
+        );
+        recover_post_canonical_result(
+            "classify_founding_welcome_publish",
+            fail_if_publish_failed(&effects),
+        );
+        recover_post_canonical_result(
+            "record_founding_welcome_delivery_failures",
+            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
+        );
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
-        self.add_group(&group_id)?;
-        self.sync_runtime_groups().await?;
-        self.app.save_state(&self.state)?;
+        // The engine group is already published and confirmed. Projection,
+        // state persistence, and subscription refresh are downstream repairable
+        // work; none can roll the group back, so none may turn this operation
+        // into a false failure that invites the caller to create a duplicate.
+        let local_projection_started_at = Instant::now();
+        let local_projection_saved = match self.add_group(&group_id) {
+            Ok(()) => match self.app.save_state(&self.state) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "create_group",
+                        error_kind = error.privacy_safe_kind(),
+                        "confirmed group creation outpaced projection persistence; account open will reconcile it"
+                    );
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "create_group",
+                    error_kind = error.privacy_safe_kind(),
+                    "confirmed group creation could not be projected immediately; account open will reconcile it"
+                );
+                false
+            }
+        };
         self.queue_own_group_system_projection_updates(&effects);
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateLocalProjectionSave,
+            local_projection_started_at.elapsed(),
+            local_projection_saved,
+        );
         Ok(group_id)
     }
 
@@ -281,12 +884,35 @@ impl AppClient {
         self.members_with_profiles(group_id, &profiles)
     }
 
+    pub(crate) fn member_ids_page(
+        &self,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        group_ids
+            .iter()
+            .map(|group_id| {
+                self.ensure_group(group_id)?;
+                let member_ids_hex = self
+                    .runtime
+                    .members(group_id)?
+                    .into_iter()
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                Ok(crate::AppGroupMemberIds {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    member_ids_hex,
+                })
+            })
+            .collect()
+    }
+
     /// Build a group's member records against a caller-provided account-profile
     /// map, avoiding a fresh `profiles_by_id` load per group. `members` loads the
-    /// map for a single read; [`AppClient::group_read_snapshot`] loads it once
-    /// and reuses it across every group so capturing the snapshot stays a single
-    /// profile read plus in-memory engine reads (it runs on the worker readiness
-    /// path).
+    /// map for a single read;
+    /// [`AppClient::group_read_snapshot_with_stage_telemetry`] loads it once
+    /// and reuses it across every group so capturing the snapshot stays a
+    /// single profile read plus in-memory engine reads (it runs on the worker
+    /// readiness path).
     fn members_with_profiles(
         &self,
         group_id: &GroupId,
@@ -322,12 +948,112 @@ impl AppClient {
         self.group_mls_state_unchecked(group_id)
     }
 
+    pub(crate) fn group_roster_session(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let mut group_record = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .cloned()
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+        self.overlay_storage_self_membership(&mut group_record)?;
+        let profiles = self.app.profiles_by_id()?;
+        let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        let mls_state = self.group_mls_state_unchecked(group_id)?;
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record,
+            members,
+            mls_state,
+        })
+    }
+
+    fn overlay_storage_self_membership(
+        &self,
+        group_record: &mut AppGroupRecord,
+    ) -> Result<(), AppError> {
+        if let Some(membership) = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
+        {
+            group_record.self_membership = membership;
+        }
+        Ok(())
+    }
+
+    /// Reconcile a storage row still carrying the preserving `Member` default
+    /// against one hydrated engine roster. Used by on-demand startup reads so
+    /// they cannot expose a legacy migration default before the full hydration
+    /// pipeline finishes its once-only backfill.
+    pub(crate) fn reconcile_group_self_membership(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if !matches!(
+            self.app
+                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
+            Some(SelfMembership::Member)
+        ) {
+            return Ok(());
+        }
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        let members = self.runtime.members(group_id)?;
+        if local_account_removed_from_roster(&members, &local_account_id_hex) {
+            self.app.set_group_self_membership(
+                &self.state.label,
+                &group_id_hex,
+                SelfMembership::Removed,
+            )?;
+        }
+        Ok(())
+    }
+
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         let group = self.runtime.group_record(group_id)?;
+        let lifecycle_state = self
+            .runtime
+            .epoch_state(group_id)
+            .as_ref()
+            .map(cgka_traits::GroupLifecycleState::from)
+            .map(Into::into)
+            .unwrap_or_else(|| {
+                if group.disbanded.is_some() {
+                    crate::AppGroupLifecycleState::Disbanded
+                } else if group.unrecoverable {
+                    crate::AppGroupLifecycleState::Unrecoverable
+                } else {
+                    crate::AppGroupLifecycleState::Stable
+                }
+            });
+        let disbanding_enabled = group
+            .required_capabilities
+            .app_components
+            .contains(cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID)
+            && group.disbanded.is_none();
+        let disbanding_blockers = if disbanding_enabled || group.disbanded.is_some() {
+            Vec::new()
+        } else {
+            self.runtime
+                .disbanding_support_blockers(group_id)?
+                .into_iter()
+                .map(|member| hex::encode(member.as_slice()))
+                .collect()
+        };
         Ok(AppGroupMlsState {
             group_id_hex: hex::encode(group_id.as_slice()),
+            protocol_profile: group.protocol_profile.into(),
+            lifecycle_state,
             epoch: group.epoch.0,
             member_count: group.members.len(),
+            unrecoverable: group.unrecoverable,
             required_app_components: group
                 .required_capabilities
                 .app_components
@@ -335,6 +1061,10 @@ impl AppClient {
                 .iter()
                 .copied()
                 .collect(),
+            disbanding_enabled,
+            disbanding: self.runtime.disbanding_in_progress(group_id)?,
+            disbanding_blockers,
+            disband_request: self.runtime.disband_request(group_id)?.map(Into::into),
         })
     }
 
@@ -357,22 +1087,59 @@ impl AppClient {
     /// Capture a [`GroupReadSnapshot`] of every known group's read-only
     /// projections from the live (hydrated) session.
     ///
-    /// Used by the account worker to answer read commands during the initial
-    /// relay catch-up without blocking on it; see [`GroupReadSnapshot`]. Reads
-    /// that error for a given group (quarantined / not yet live) are omitted —
-    /// the snapshot accessor reports those as `UnknownGroup`, matching the live
-    /// path for a group the session does not hold.
+    /// Used by the account worker to answer read commands during relay catch-up
+    /// without blocking on it; see [`GroupReadSnapshot`]. If a known group's
+    /// member or MLS projection fails, snapshot capture
+    /// fails atomically. The worker then defers reads until it can answer them
+    /// from live state and preserve the underlying error classification.
     ///
     /// Returns the storage error if the one shared profile load fails, rather
     /// than masking it as empty profiles (which would make every member read
     /// `account: None` / `local: false` during the catch-up window). The worker
-    /// then falls back to serving those reads from the live session after
-    /// catch-up, matching the live path's error semantics.
+    /// treats that error as a failed local-readiness attempt (fail-closed
+    /// through the ready/reconcile path).
+    ///
+    /// The per-stage startup telemetry records the shared profile load as
+    /// `AccountProfileLoad` (the caller wraps the whole capture as
+    /// `AccountGroupReadSnapshot`, mdk#1161).
+    pub(crate) fn group_read_snapshot_with_stage_telemetry(
+        &self,
+        telemetry: &crate::app_telemetry::AppPerformanceTelemetry,
+    ) -> Result<GroupReadSnapshot, AppError> {
+        self.group_read_snapshot_inner(Some(telemetry))
+    }
+
     pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
+        self.group_read_snapshot_inner(None)
+    }
+
+    fn group_read_snapshot_inner(
+        &self,
+        telemetry: Option<&crate::app_telemetry::AppPerformanceTelemetry>,
+    ) -> Result<GroupReadSnapshot, AppError> {
+        if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_force_group_read_snapshot_failure
+        {
+            return Err(cgka_traits::StorageError::Backend(
+                "injected group-read snapshot failure".to_owned(),
+            )
+            .into());
+        }
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single
         // storage read to the worker readiness path regardless of group count.
-        let profiles = self.app.profiles_by_id()?;
+        let profile_load_started = Instant::now();
+        let profiles = self.app.profiles_by_id();
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                crate::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
+                profile_load_started.elapsed(),
+                profiles.is_ok(),
+            );
+        }
+        let profiles = profiles?;
+        let stored_self_memberships = self.app.account_group_self_memberships(&self.state.label)?;
+        let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
         let mut skipped_malformed_group_records = 0usize;
@@ -382,12 +1149,15 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(bytes);
-            if let Ok(records) = self.members_with_profiles_unchecked(&group_id, &profiles) {
-                members.insert(group_id.clone(), records);
+            let mut group_record = group.clone();
+            if let Some(membership) = stored_self_memberships.get(&group.group_id_hex) {
+                group_record.self_membership = *membership;
             }
-            if let Ok(state) = self.group_mls_state_unchecked(&group_id) {
-                mls_state.insert(group_id, state);
-            }
+            let records = self.members_with_profiles_unchecked(&group_id, &profiles)?;
+            let state = self.group_mls_state_unchecked(&group_id)?;
+            groups.insert(group_id.clone(), group_record);
+            members.insert(group_id.clone(), records);
+            mls_state.insert(group_id, state);
         }
         if skipped_malformed_group_records > 0 {
             tracing::warn!(
@@ -398,6 +1168,7 @@ impl AppClient {
             );
         }
         Ok(GroupReadSnapshot {
+            groups,
             members,
             mls_state,
             quarantined: self.quarantined_groups(),
@@ -629,15 +1400,115 @@ impl AppClient {
             .await
     }
 
+    /// Atomically install lifecycle-v1 and make it required for this group.
+    pub async fn enable_group_disbanding(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let audit_context = Self::local_human_action_context(
+            "enable_group_disbanding",
+            vec!["lifecycle"],
+            vec![
+                cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+            ],
+            None,
+        );
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::EnableDisbanding {
+                    group_id: group_id.clone(),
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        // Enabling lifecycle-v1 changes eligibility, not group history. It
+        // intentionally emits no kind-1210 system row.
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    /// Persist the irreversible request and return without waiting for the
+    /// disband Commit or its mandatory convergence pass.
+    pub async fn disband_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<AppDisbandRequest, AppError> {
+        self.ensure_group(group_id)?;
+        let audit_context = Self::local_human_action_context(
+            "disband_group",
+            vec!["lifecycle", "membership", "admins"],
+            vec![
+                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+                cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ],
+            None,
+        );
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::Disband {
+                    group_id: group_id.clone(),
+                },
+                audit_context,
+            )
+            .await?;
+        self.remember_published_reports(&effects);
+        if let Err(error) = self
+            .app
+            .delete_message_draft(&self.state.label, &hex::encode(group_id.as_slice()))
+        {
+            // The irreversible engine request is already durable. Treat draft
+            // cleanup like the other repairable post-canonical projections:
+            // report success for the request and reconcile local UI state on
+            // the next account mutation/open rather than inviting a retry.
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "disband_group",
+                error_kind = error.privacy_safe_kind(),
+                "durable disband request outpaced composer draft cleanup"
+            );
+        }
+        self.app.save_state(&self.state)?;
+        self.runtime
+            .disband_request(group_id)?
+            .map(Into::into)
+            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub fn acknowledge_disband_failure(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.acknowledge_disband_failure(group_id)?)
+    }
+
     /// Delete only this group's app-local data. This intentionally does not send
     /// an MLS leave and does not delete the stored MLS/OpenMLS group state; a
     /// future fresh group delivery can recreate the chat-list projection.
     ///
-    /// The live transport route is removed and synced before the DB wipe so the
-    /// account stops actively subscribing to the group before local rows vanish.
+    /// The live transport route is removed and synced before the DB wipe so no
+    /// delivery races the deletion transaction, then the current route is
+    /// restored without restoring the projection. The durable deletion frontier
+    /// filters historical replay until a strictly newer app message arrives.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        if self.runtime.disbanding_in_progress(group_id)? {
+            return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
+        }
+        // A local wipe removes this group's transport route. Any already-durable
+        // removal must publish first; retaining it after the route disappears
+        // would preserve bytes on disk without preserving liveness.
+        self.drain_existing_push_registration_removals_for_group(group_id)
+            .await?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let original_groups = self.state.groups.clone();
+        let original_routing = self.routing.snapshot();
         let was_live = original_groups
             .iter()
             .any(|group| group.group_id_hex == group_id_hex);
@@ -647,31 +1518,86 @@ impl AppClient {
                 .groups
                 .retain(|group| group.group_id_hex != group_id_hex);
             if let Err(error) = self.refresh_routing() {
-                self.state.groups = original_groups;
-                self.refresh_routing()?;
+                self.restore_local_group_after_failed_delete(
+                    original_groups,
+                    original_routing.clone(),
+                    false,
+                )
+                .await;
                 return Err(error);
             }
             if let Err(error) = self.sync_runtime_groups().await {
-                self.state.groups = original_groups;
-                self.refresh_routing()?;
-                self.sync_runtime_groups().await?;
+                self.restore_local_group_after_failed_delete(
+                    original_groups,
+                    original_routing.clone(),
+                    true,
+                )
+                .await;
                 return Err(error);
             }
         }
 
-        match self
+        let result = match self
             .app
             .delete_group_local_data(&self.state.label, &group_id_hex)
         {
-            Ok(deleted) => Ok(deleted || was_live),
+            Ok(result) => result,
             Err(error) => {
                 if was_live {
-                    self.state.groups = original_groups;
-                    self.refresh_routing()?;
-                    self.sync_runtime_groups().await?;
+                    self.restore_local_group_after_failed_delete(
+                        original_groups,
+                        original_routing,
+                        true,
+                    )
+                    .await;
                 }
-                Err(error)
+                return Err(error);
             }
+        };
+        if was_live {
+            // The wipe has committed. Route restoration is a best-effort
+            // post-success step: a transient adapter failure must not report
+            // the durable delete as failed. Startup reconciliation retries it.
+            match self.ensure_local_deleted_group_route(group_id) {
+                Ok(true) => {
+                    if let Err(error) = self.sync_runtime_groups().await {
+                        tracing::warn!(
+                            target: "marmot_app::client",
+                            method = "delete_group_local",
+                            error_kind = error.privacy_safe_kind(),
+                            "local-delete route restoration remains pending",
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "delete_group_local",
+                        error_kind = error.privacy_safe_kind(),
+                        "local-delete route restoration remains pending",
+                    );
+                }
+            }
+        }
+        Ok(was_live || result)
+    }
+
+    async fn restore_local_group_after_failed_delete(
+        &mut self,
+        original_groups: Vec<AppGroupRecord>,
+        original_routing: AppRoutingState,
+        sync_transport: bool,
+    ) {
+        self.state.groups = original_groups;
+        self.routing.replace(original_routing);
+        if sync_transport && let Err(error) = self.sync_runtime_groups().await {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "restore_local_group_after_failed_delete",
+                error_kind = error.privacy_safe_kind(),
+                "failed local-delete transport compensation remains pending",
+            );
         }
     }
 
@@ -682,17 +1608,40 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
-        self.sync_runtime_groups().await?;
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::Leave {
-                    group_id: group_id.clone(),
-                },
-                audit_context.clone(),
-            )
+        // Once the MLS leave commits we can no longer author an in-group token
+        // removal. Drain that durable intent first; if the leave later fails,
+        // queue the current registration update as compensation.
+        let removed_registration = self
+            .drain_push_registration_removal_before_departure(group_id)
             .await?;
-        fail_if_publish_failed(&effects)?;
+        let effects = match async {
+            self.sync_runtime_groups().await?;
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::Leave {
+                        group_id: group_id.clone(),
+                    },
+                    audit_context.clone(),
+                )
+                .await?;
+            fail_if_publish_failed(&effects)?;
+            Ok::<_, AppError>(effects)
+        }
+        .await
+        {
+            Ok(effects) => effects,
+            Err(err) => {
+                self.compensate_group_push_registration_removal(
+                    group_id,
+                    removed_registration.as_ref(),
+                );
+                let _ = self
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+                return Err(err);
+            }
+        };
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
@@ -753,6 +1702,7 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
+        let mut hydration_pending = false;
         for group_id_hex in self
             .app
             .account_group_ids_defaulting_to_member(&self.state.label)?
@@ -764,8 +1714,22 @@ impl AppClient {
             // Authoritative roster from engine state. On any engine error
             // (unknown/quarantined group, partially-missing live state) leave
             // the row at the preserving default — uncertainty never suppresses.
-            let Ok(members) = self.runtime.members(&group_id) else {
-                continue;
+            let members = match self.runtime.members(&group_id) {
+                Ok(members) => members,
+                Err(err) => {
+                    // A deferred-hydration open (mdk#1161) answers every
+                    // roster read with the retryable not-hydrated state.
+                    // Skipping is correct, but the once-only marker must not
+                    // burn on a pass that could not see any roster — the
+                    // worker re-runs this after its hydration pipeline.
+                    if matches!(
+                        AppError::from(err).as_engine_error(),
+                        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+                    ) {
+                        hydration_pending = true;
+                    }
+                    continue;
+                }
             };
             if local_account_removed_from_roster(&members, &local_account_id_hex) {
                 self.app.set_group_self_membership(
@@ -775,10 +1739,12 @@ impl AppClient {
                 )?;
             }
         }
-        self.app.mark_account_import_complete(
-            &self.state.label,
-            crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
-        )?;
+        if !hydration_pending {
+            self.app.mark_account_import_complete(
+                &self.state.label,
+                crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
+            )?;
+        }
         Ok(())
     }
 
@@ -938,21 +1904,37 @@ impl AppClient {
                 allowed_locator_kinds.push(endpoint.locator_kind.clone());
             }
         }
-        let policy = EncryptedMediaPolicyV1::new(
-            ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
-            allowed_locator_kinds,
-            endpoints.into_iter().map(|endpoint| BlobStoreEndpointV1 {
-                locator_kind: endpoint.locator_kind,
-                base_url: endpoint.base_url,
-            }),
-            true,
-        )
-        .map_err(AppError::InvalidEncryptedMedia)?;
-        let component = AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()?;
+        let existing = self.encrypted_media_policy_for_group(group_id)?;
+        let component = match existing.version {
+            EncryptedMediaVersion::V1 => AppGroupEncryptedMediaComponent::new_v1(
+                EncryptedMediaPolicyV1::new(
+                    ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
+                    allowed_locator_kinds,
+                    endpoints.into_iter().map(|endpoint| BlobStoreEndpointV1 {
+                        locator_kind: endpoint.locator_kind,
+                        base_url: endpoint.base_url,
+                    }),
+                    true,
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?,
+            )?,
+            EncryptedMediaVersion::V2 => AppGroupEncryptedMediaComponent::new_v2(
+                EncryptedMediaPolicyV2::new(
+                    ENCRYPTED_MEDIA_FORMAT_V2.to_owned(),
+                    allowed_locator_kinds,
+                    endpoints.into_iter().map(|endpoint| BlobStoreEndpointV2 {
+                        locator_kind: endpoint.locator_kind,
+                        base_url: endpoint.base_url,
+                    }),
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?,
+            )?,
+        }
+        .to_app_component_data()?;
         let audit_context = Self::local_human_action_context(
             "replace_encrypted_media_blob_endpoints",
             vec!["encrypted_media"],
-            vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+            vec![existing.component_id],
             Some(endpoint_count),
         );
 
@@ -1075,7 +2057,7 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         if let AppMessageIntent::Sticker { sticker_ref } = &intent {
             self.app
                 .authorize_sticker_ref(&self.state.label, sticker_ref)?;
@@ -1101,12 +2083,6 @@ impl AppClient {
             }
             other => other,
         };
-        let source_epoch = match &intent {
-            AppMessageIntent::Media { attachments, .. } => attachments
-                .first()
-                .map(|attachment| attachment.source_epoch),
-            _ => None,
-        };
         let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
         let payload = encode_inner_event(&event)?;
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -1114,87 +2090,118 @@ impl AppClient {
 
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
-            let update = self.record_local_app_event_projection(
-                &group_id_hex,
-                &sender,
-                &event,
-                None,
-                source_epoch,
-                false,
-            )?;
+            let update = self
+                .record_local_app_event_projection(group_id, &sender, &event, None, None, false)?;
             on_local_projection(update);
         }
 
-        let effects = match async {
-            self.sync_runtime_groups().await?;
-            let send_intent = SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload,
-            };
-            // Thread the human-action context through the engine so the send's
-            // audit rows carry `human_action`, matching create_group/invite/etc.
-            let effects = match &audit_context {
-                Some(context) => {
-                    self.runtime
-                        .send_with_audit_context(send_intent, context.clone())
-                        .await?
+        let send_result = match self.sync_runtime_groups().await {
+            Ok(()) => {
+                let send_intent = SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                };
+                // Thread the human-action context through the engine so the
+                // send's audit rows carry `human_action`, matching
+                // create_group/invite/etc.
+                match &audit_context {
+                    Some(context) => {
+                        self.runtime
+                            .send_with_audit_context(send_intent, context.clone())
+                            .await
+                    }
+                    None => self.runtime.send(send_intent).await,
                 }
-                None => self.runtime.send(send_intent).await?,
-            };
-            fail_if_publish_failed(&effects)?;
-            Ok::<_, AppError>(effects)
-        }
-        .await
-        {
+                .map_err(AppError::from)
+            }
+            Err(error) if error.is_account_not_active() => {
+                let context = audit_context.clone().unwrap_or_default();
+                self.runtime
+                    .queue_app_message_with_audit_context(group_id.clone(), payload, context)
+                    .await
+                    .map_err(AppError::from)
+            }
+            Err(error) => Err(error),
+        };
+        // The publish-status gate is applied separately from obtaining the
+        // effects: even when the outbound publish hard-fails, the engine may
+        // already have folded retained peer commits into this send, and those
+        // applied `GroupStateChanged` / `EpochChanged` events must still be
+        // observed and broadcast — only the local message is retracted.
+        let effects = match send_result {
             Ok(effects) => effects,
             Err(err) => {
-                if should_project_locally {
-                    // No read-marker rollback needed: the marker only advances
-                    // in the post-publish success projection below.
-                    match self.app.invalidate_timeline_app_event(
-                        &self.state.label,
-                        &group_id_hex,
-                        &app_event_id,
-                        "local_publish_failed",
-                    ) {
-                        Ok(Some(update)) => on_local_projection(update),
-                        Ok(None) => {}
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "marmot_app::messages",
-                                method = "send_app_event_with_local_projection",
-                                error_code = "local_projection_retract_failed",
-                                "failed to retract local projection after publish failure"
-                            );
-                        }
-                    }
-                }
+                self.retract_failed_local_projection(
+                    should_project_locally,
+                    &group_id_hex,
+                    &app_event_id,
+                    &mut on_local_projection,
+                );
                 return Err(err);
             }
         };
+        if let Err(publish_err) = fail_if_publish_failed(&effects) {
+            // The send itself failed to reach anyone, but any peer commits it
+            // folded are durably applied — broadcast them before surfacing the
+            // publish failure, best-effort so a projection error cannot mask
+            // the primary error.
+            self.observe_send_applied_effects_best_effort(&effects)
+                .await;
+            if let Err(_save_err) =
+                self.save_state_with_pending_local_group_deletion_frontier_clears()
+            {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_code = "send_applied_state_save_failed",
+                    "failed to persist state observed from a failed send"
+                );
+            }
+            self.retract_failed_local_projection(
+                should_project_locally,
+                &group_id_hex,
+                &app_event_id,
+                &mut on_local_projection,
+            );
+            return Err(publish_err);
+        }
         if let Some(context) = &audit_context {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
-        let source_message_id_hex = effects
-            .reports
-            .first()
-            .map(|report| hex::encode(report.message_id.as_slice()));
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        let published = effects.published_app_messages.iter().find(|published| {
+            published.group_id == *group_id && published.app_event_id == app_event_id
+        });
+        let source_message_id_hex =
+            published.map(|published| hex::encode(published.message_id.as_slice()));
+        let source_state =
+            published.map(|published| (published.source_epoch.0, published.retention));
         if should_project_locally {
             let update = self.record_local_app_event_projection(
-                &group_id_hex,
+                group_id,
                 &sender,
                 &event,
                 source_message_id_hex,
-                source_epoch,
+                source_state,
                 true,
             )?;
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
         }
-        self.app.save_state(&self.state)?;
-        self.queue_own_group_system_projection_updates(&effects);
-        if notification_trigger_for_intent(&intent).is_some() {
+        // A send that lands while inbound convergence input is retained folds
+        // those commits before publishing, so `effects.events` can carry peer
+        // state changes (e.g. a mid-window group rename). Observe them through
+        // the same pipeline as inbound deliveries — state group refresh plus
+        // kind-1210 system-row synthesis (replacing the narrower
+        // `queue_own_group_system_projection_updates`) — and buffer the summary
+        // for the account worker to broadcast; dropping the events here leaves
+        // storage renamed while chat-list/group-state subscribers never wake.
+        // Best-effort: a projection failure must not fail a completed publish.
+        self.observe_send_applied_effects_best_effort(&effects)
+            .await;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,
                 notifications::NotificationTrigger::NewMessage,
@@ -1206,8 +2213,43 @@ impl AppClient {
             SendSummary {
                 published: effects.reports.len(),
                 message_ids: vec![app_event_id],
+                maintenance_disposition: effects.maintenance_disposition,
             },
         ))
+    }
+
+    /// Retract the optimistic local timeline row for a send that failed. No
+    /// read-marker rollback is needed: the marker only advances in the
+    /// post-publish success projection.
+    fn retract_failed_local_projection<F>(
+        &mut self,
+        should_project_locally: bool,
+        group_id_hex: &str,
+        app_event_id: &str,
+        on_local_projection: &mut F,
+    ) where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        if !should_project_locally {
+            return;
+        }
+        match self.app.invalidate_timeline_app_event(
+            &self.state.label,
+            group_id_hex,
+            app_event_id,
+            "local_publish_failed",
+        ) {
+            Ok(Some(update)) => on_local_projection(update),
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_code = "local_projection_retract_failed",
+                    "failed to retract local projection after publish failure"
+                );
+            }
+        }
     }
 
     /// Most recent kind-7 reaction this account authored that targets
@@ -1314,18 +2356,15 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
-        // Validate every outbound attachment against the group's ACTUAL
-        // `marmot.group.encrypted-media.v1` policy before sending: a reference
-        // whose locator kind the group does not allow would be rejected by
-        // receivers, so fail the send early rather than emit it.
-        let allowed_locator_kinds = self
-            .encrypted_media_policy_for_group(group_id)?
-            .allowed_locator_kinds;
+        // Validate every outbound attachment against the group's exact,
+        // profile-selected media version and locator policy.
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
         for attachment in &attachments {
             attachment.validate_outbound(
-                &allowed_locator_kinds,
+                policy.version,
+                &policy.allowed_locator_kinds,
                 self.app.allow_loopback_blob_endpoints(),
             )?;
         }
@@ -1341,12 +2380,32 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Build one outbound encrypted-media `imeta` tag using the target
+    /// group's actual profile-selected media version and locator policy.
+    ///
+    /// This is the checked bridge used by host apps for optimistic message
+    /// records. It deliberately performs no publish.
+    pub async fn build_media_imeta_tag(
+        &mut self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        self.ensure_group_application_messages_allowed(group_id)?;
+        self.sync_runtime_groups().await?;
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
+        reference.build_imeta_tag(
+            policy.version,
+            &policy.allowed_locator_kinds,
+            self.app.allow_loopback_blob_endpoints(),
+        )
+    }
+
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<MediaUploadResult, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         // `upload_encrypted_media` always performs Blossom upload semantics and
@@ -1401,9 +2460,12 @@ impl AppClient {
             source_epoch,
             media_secret.as_ref(),
             nostr_signer.as_ref(),
-            &default_endpoints,
-            &policy.allowed_locator_kinds,
-            allow_loopback,
+            MediaOperationPolicy {
+                version: policy.version,
+                default_endpoints: &default_endpoints,
+                allowed_locator_kinds: &policy.allowed_locator_kinds,
+                allow_loopback_http: allow_loopback,
+            },
         )
         .await?;
         if should_send {
@@ -1412,10 +2474,31 @@ impl AppClient {
                 .iter()
                 .map(|attachment| attachment.reference.clone())
                 .collect();
-            result.sent = Some(
-                self.send_media_attachments(group_id, attachments, caption)
-                    .await?,
-            );
+            let summary = self
+                .send_media_attachments(group_id, attachments, caption)
+                .await?;
+            // The post-publish projection now durably references this source
+            // epoch. Persist again so a prior final-reference retirement cannot
+            // suppress the secret needed by the newly retained message.
+            if self
+                .remember_encrypted_media_epoch_secret(
+                    group_id,
+                    source_epoch,
+                    media_secret.as_ref(),
+                )
+                .is_err()
+            {
+                // Publication already succeeded. Do not report a false send
+                // failure that could make the caller publish a duplicate; the
+                // normal current-epoch cache pass can retry this durable write.
+                tracing::warn!(
+                    target: "marmot_app::media",
+                    method = "upload_media",
+                    error_code = "encrypted_media_secret_cache_skipped",
+                    "failed to cache encrypted media source epoch secret after publish",
+                );
+            }
+            result.sent = Some(summary);
         }
         Ok(result)
     }
@@ -1428,8 +2511,16 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
-        let media_secret =
-            self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch)?;
+        // The current group policy governs fetch endpoints, but the retained
+        // attachment's own version governs KDF/AAD and which versioned cache
+        // row contains its source-epoch exporter. Adopted V1 -> V2 migration
+        // deliberately leaves historical V1 references as V1.
+        let reference_version = EncryptedMediaVersion::parse(&reference.version)?;
+        let media_secret = self.encrypted_media_secret_for_epoch(
+            group_id,
+            reference.source_epoch,
+            reference_version.component_id(),
+        )?;
         download_encrypted_media(
             reference,
             media_secret.as_ref(),
@@ -1450,7 +2541,7 @@ impl AppClient {
         plaintext: Vec<u8>,
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         let audit_context = Self::local_human_action_context(
             "update_group_image",
             vec!["image"],
@@ -1462,13 +2553,7 @@ impl AppClient {
             AppGroupImageInput::default()
         } else {
             let upload = upload_group_image(&plaintext, media_type, None).await?;
-            AppGroupImageInput {
-                image_hash_hex: upload.image_hash_hex,
-                image_key_hex: upload.image_key_hex,
-                image_nonce_hex: upload.image_nonce_hex,
-                image_upload_key_hex: upload.image_upload_key_hex,
-                media_type: Some(upload.media_type),
-            }
+            AppGroupImageInput::from(upload)
         };
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
         let effects = self
@@ -1523,9 +2608,21 @@ impl AppClient {
         stream_id: &[u8],
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.start_agent_text_stream_with_parent(group_id, stream_id, None, quic_candidates)
+            .await
+    }
+
+    pub async fn start_agent_text_stream_with_parent(
+        &mut self,
+        group_id: &GroupId,
+        stream_id: &[u8],
+        parent_message_id: Option<String>,
+        quic_candidates: Vec<String>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         self.start_agent_text_stream_with_local_projection(
             group_id,
             stream_id,
+            parent_message_id,
             quic_candidates,
             |_| {},
         )
@@ -1536,6 +2633,7 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         stream_id: &[u8],
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
         on_local_projection: F,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
@@ -1546,6 +2644,7 @@ impl AppClient {
             group_id,
             AppMessageIntent::StreamStart {
                 stream_id: stream_id.to_vec(),
+                parent_message_id,
                 quic_candidates,
             },
             on_local_projection,
@@ -1674,6 +2773,7 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
@@ -1733,6 +2833,7 @@ impl AppClient {
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
+            profile: self.profile_for_group(group_id),
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
@@ -1751,6 +2852,7 @@ impl AppClient {
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
+            maintenance_disposition: effects.maintenance_disposition,
         })
     }
 
@@ -1766,6 +2868,27 @@ impl AppClient {
         } else {
             Err(AppError::UnknownGroup(group_id_hex))
         }
+    }
+
+    /// Fail before optimistic projection, media upload, or any other
+    /// application-message preparation once terminal convergence has gated the
+    /// group. The engine repeats this check at the authoritative mutation
+    /// boundary; this app-layer preflight keeps clients from briefly rendering
+    /// a message that can only be retracted.
+    fn ensure_group_application_messages_allowed(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        self.ensure_group(group_id)?;
+        let terminal = self
+            .runtime
+            .group_record(group_id)
+            .map(|group| group.disbanded.is_some())
+            .unwrap_or(false);
+        if terminal || self.runtime.disbanding_in_progress(group_id)? {
+            return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
+        }
+        Ok(())
     }
 
     /// Flip a group's local `archived` flag on the worker-owned in-memory
@@ -1830,7 +2953,7 @@ impl AppClient {
     fn encrypted_media_policy_for_group(
         &self,
         group_id: &GroupId,
-    ) -> Result<EncryptedMediaPolicyV1, AppError> {
+    ) -> Result<crate::groups::AppEncryptedMediaPolicy, AppError> {
         self.encrypted_media_for_group(group_id).endpoint_policy()
     }
 
@@ -1851,8 +2974,21 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         source_epoch: u64,
+        component_id: u16,
     ) -> Result<SecretBytes, AppError> {
-        if let Some(secret) = self.cached_encrypted_media_epoch_secret(group_id, source_epoch)? {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if !self
+            .app
+            .account_storage(&self.state.label)?
+            .encrypted_media_epoch_secret_may_be_served(&group_id_hex, source_epoch)?
+        {
+            return Err(AppError::InvalidEncryptedMedia(format!(
+                "encrypted media secret retired for epoch {source_epoch}"
+            )));
+        }
+        if let Some(secret) =
+            self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+        {
             return Ok(SecretBytes::new(secret));
         }
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
@@ -1860,16 +2996,37 @@ impl AppClient {
             GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
             32,
         )?;
-        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
-        if epoch.0 != source_epoch {
-            return Err(AppError::InvalidEncryptedMedia(format!(
-                "missing encrypted media secret for epoch {source_epoch}"
-            )));
+        if epoch.0 == source_epoch {
+            self.remember_encrypted_media_epoch_secret_for_component(
+                group_id,
+                component_id,
+                epoch.0,
+                secret.as_ref(),
+            )?;
+            if let Some(secret) =
+                self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+            {
+                return Ok(SecretBytes::new(secret));
+            }
         }
-        Ok(secret)
+        Err(AppError::InvalidEncryptedMedia(format!(
+            "missing encrypted media secret for epoch {source_epoch}"
+        )))
     }
 
     fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
+        // Exporting the secret loads the full MLS group state, so skip it when
+        // the current epoch's secret is already cached. The record epoch can
+        // trail a staged commit by one epoch; that window is covered by the
+        // live-export fallback in `encrypted_media_secret_for_epoch`.
+        let record = self.runtime.group_record(group_id)?;
+        let component_id = Self::encrypted_media_component_id(record.protocol_profile);
+        if self
+            .cached_encrypted_media_epoch_secret(group_id, component_id, record.epoch.0)?
+            .is_some()
+        {
+            return Ok(());
+        }
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
             group_id,
             GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
@@ -1890,7 +3047,15 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            if !self.encrypted_media_for_group(&group_id).required {
+            // The projected component is a positive-only fast path: `true`
+            // warms without an MLS group load. A projected `false` may be
+            // stale (a rebuild error can leave it lagging the signed
+            // component), so it must re-check the authoritative component
+            // before skipping — a missed warm here can strand a
+            // historical epoch's media once the group advances.
+            if !group.encrypted_media.required
+                && !self.encrypted_media_for_group(&group_id).required
+            {
                 continue;
             }
             if self
@@ -1913,11 +3078,29 @@ impl AppClient {
         source_epoch: u64,
         secret: &[u8],
     ) -> Result<(), AppError> {
+        let component_id = self
+            .encrypted_media_policy_for_group(group_id)?
+            .component_id;
+        self.remember_encrypted_media_epoch_secret_for_component(
+            group_id,
+            component_id,
+            source_epoch,
+            secret,
+        )
+    }
+
+    fn remember_encrypted_media_epoch_secret_for_component(
+        &self,
+        group_id: &GroupId,
+        component_id: u16,
+        source_epoch: u64,
+        secret: &[u8],
+    ) -> Result<(), AppError> {
         self.app
             .account_storage(&self.state.label)?
             .remember_encrypted_media_epoch_secret(
                 &hex::encode(group_id.as_slice()),
-                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                component_id,
                 source_epoch,
                 secret,
             )?;
@@ -1927,6 +3110,7 @@ impl AppClient {
     fn cached_encrypted_media_epoch_secret(
         &self,
         group_id: &GroupId,
+        component_id: u16,
         source_epoch: u64,
     ) -> Result<Option<Vec<u8>>, AppError> {
         Ok(self
@@ -1934,7 +3118,7 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .encrypted_media_epoch_secret(
                 &hex::encode(group_id.as_slice()),
-                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                component_id,
                 source_epoch,
             )?)
     }
@@ -1946,32 +3130,77 @@ impl AppClient {
             .encrypted_media_blob_endpoints
             .is_empty()
         {
-            vec![DEFAULT_BLOSSOM_SERVER_URL.to_owned()]
+            DEFAULT_BLOSSOM_SERVER_URLS
+                .iter()
+                .map(|endpoint| (*endpoint).to_owned())
+                .collect()
         } else {
             self.app
                 .service_endpoints()
                 .encrypted_media_blob_endpoints
                 .clone()
         };
-        let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
-            .map_err(AppError::InvalidEncryptedMedia)?;
-        AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()
+        match self.runtime.new_protocol_profile() {
+            ProtocolProfile::Legacy => {
+                let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
+                    .map_err(AppError::InvalidEncryptedMedia)?;
+                AppGroupEncryptedMediaComponent::new_v1(policy)?.to_app_component_data()
+            }
+            ProtocolProfile::Current => {
+                let policy = EncryptedMediaPolicyV2::blossom_default(endpoints)
+                    .map_err(AppError::InvalidEncryptedMedia)?;
+                AppGroupEncryptedMediaComponent::new_v2(policy)?.to_app_component_data()
+            }
+        }
     }
 
-    /// Upsert every group's current transport subscription into the routing
-    /// state, returning whether any route was added or modified. A modified
-    /// route means an in-place `nostr_group_id` / relay rotation on an existing
-    /// group (Finding 2) — `add_group` now replaces by `group_id` instead of
-    /// early-returning — so callers can trigger a single resync when routes
-    /// actually change rather than only on a membership-count change.
+    /// Reconcile every group's current and still-live prior transport
+    /// subscriptions, returning whether any installed route changed.
     pub(crate) fn refresh_group_routes(&mut self) -> Result<bool, AppError> {
         let mut changed = false;
-        for group in &self.state.groups {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+        for group in &mut self.state.groups {
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "refresh_group_routes",
+                    error_kind = "invalid_persisted_route_identifier",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
             if self
-                .routing
-                .add_group(group.nostr_routing.subscription(&group_id)?)
+                .runtime
+                .group_record(&group_id)
+                .is_ok_and(|group| group.disbanded.is_some())
             {
+                if self.routing.replace_group_routes(&group_id, Vec::new()) {
+                    changed = true;
+                }
+                continue;
+            }
+            // Retention is epoch-derived, never process-uptime-derived. Do not
+            // prune while convergence still has unresolved inputs: the
+            // retained anchor is not settled yet, so conservatively keep every
+            // prior address until the next stable reconciliation.
+            if !self
+                .runtime
+                .has_pending_convergence_inputs(&group_id)
+                .unwrap_or(true)
+                && let Ok(group_record) = self.runtime.group_record(&group_id)
+            {
+                group.prune_prior_nostr_routes(group_record.epoch.0);
+            }
+            let Ok(subscriptions) = group.transport_subscriptions(&group_id) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "refresh_group_routes",
+                    error_kind = "invalid_persisted_group_route",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            if self.routing.replace_group_routes(&group_id, subscriptions) {
                 changed = true;
             }
         }
@@ -1980,6 +3209,7 @@ impl AppClient {
 
     fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
+        self.preserve_local_deleted_group_routes(&routing)?;
         self.routing.replace(routing.snapshot());
         Ok(())
     }
@@ -2036,6 +3266,121 @@ impl AppClient {
         Ok(())
     }
 
+    /// Record current-profile founding Welcome delivery intent before any
+    /// transport publish. Returns the message ids so successful deliveries can
+    /// be cleared after the account runtime reports their acknowledgements.
+    fn record_founding_welcome_delivery_intents(
+        &mut self,
+        group_id: &GroupId,
+        effects: &cgka_session::SessionEffects,
+    ) -> Result<Vec<String>, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let recorded_at = unix_now_seconds();
+        let storage = self.app.account_storage(&self.state.label)?;
+        let mut message_ids = Vec::new();
+        for work in &effects.publish {
+            let PublishWork::FoundingGroupCreated { welcomes } = work else {
+                continue;
+            };
+            for welcome in welcomes {
+                let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+                    return Err(AppError::Publish(
+                        "founding delivery artifact was not a Welcome".into(),
+                    ));
+                };
+                let message_id_hex = hex::encode(welcome.id.as_slice());
+                storage.record_pending_welcome_delivery(
+                    &message_id_hex,
+                    &group_id_hex,
+                    &hex::encode(recipient.as_slice()),
+                    recorded_at,
+                )?;
+                message_ids.push(message_id_hex);
+            }
+        }
+        Ok(message_ids)
+    }
+
+    /// Clear only intent rows whose exact Welcome met its acknowledgement
+    /// policy. Failed or unattempted rows stay durable for re-delivery.
+    fn clear_delivered_founding_welcome_intents(
+        &mut self,
+        message_ids: &[String],
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        for message_id_hex in message_ids {
+            let delivered = effects.reports.iter().any(|report| {
+                hex::encode(report.message_id.as_slice()) == *message_id_hex
+                    && report.met_required_acks()
+            }) && !effects
+                .welcome_failures
+                .iter()
+                .any(|failure| hex::encode(failure.message_id.as_slice()) == *message_id_hex);
+            if delivered {
+                storage.clear_pending_welcome_delivery(message_id_hex)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile the app-facing repair index from the engine's authoritative
+    /// retained Welcome obligations.
+    ///
+    /// The engine persists founding Welcomes in the same transaction that
+    /// makes the group canonical. This closes the crash window between
+    /// `prepare_create_group` returning and the app recording its convenience
+    /// index: a cold restart can rebuild missing rows without re-creating the
+    /// group or re-consuming KeyPackages.
+    fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
+        let outstanding = self.runtime.outstanding_welcome_deliveries()?;
+        let tracked_ids = self
+            .runtime
+            .tracked_outbound_welcome_ids()?
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<HashSet<_>>();
+        let storage = self.app.account_storage(&self.state.label)?;
+        let existing = storage.list_pending_welcome_deliveries()?;
+        let outstanding_ids = outstanding
+            .iter()
+            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
+            .collect::<HashSet<_>>();
+
+        for record in &existing {
+            if tracked_ids.contains(&record.message_id_hex)
+                && !outstanding_ids.contains(&record.message_id_hex)
+            {
+                storage.clear_pending_welcome_delivery(&record.message_id_hex)?;
+            }
+        }
+
+        let existing_ids = existing
+            .into_iter()
+            .map(|record| record.message_id_hex)
+            .collect::<HashSet<_>>();
+        let recorded_at = unix_now_seconds();
+        for (group_id, welcome) in outstanding {
+            let TransportEnvelope::Welcome { recipient } = welcome.envelope else {
+                continue;
+            };
+            let message_id_hex = hex::encode(welcome.id.as_slice());
+            if existing_ids.contains(&message_id_hex) {
+                continue;
+            }
+            storage.record_pending_welcome_delivery(
+                &message_id_hex,
+                &hex::encode(group_id.as_slice()),
+                &hex::encode(recipient.as_slice()),
+                recorded_at,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Drain the welcomes queued for re-delivery during the last create/invite,
     /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
@@ -2047,6 +3392,7 @@ impl AppClient {
     /// first. Each entry's `message_id_hex` is the handle for
     /// [`AppClient::redeliver_welcome`].
     pub fn pending_welcome_deliveries(&self) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        self.reconcile_pending_welcome_delivery_index()?;
         Ok(self
             .app
             .account_storage(&self.state.label)?
@@ -2097,6 +3443,42 @@ impl AppClient {
     }
 }
 
+fn maintenance_run_summary_from_account(
+    summary: cgka_traits::MaintenanceRunSummary,
+) -> crate::MaintenanceRunSummary {
+    crate::MaintenanceRunSummary {
+        published: summary.published,
+        message_ids: summary
+            .message_ids
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect(),
+        deferred: summary.deferred,
+        ambiguous_exposure: summary.ambiguous_exposure,
+        failures: summary.failures,
+    }
+}
+
+fn preferred_initial_group_image_component(
+    constructable: &GroupCapabilities,
+    has_source_url: bool,
+) -> Option<u16> {
+    if constructable
+        .app_components
+        .contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+    {
+        Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+    } else if has_source_url
+        && constructable
+            .app_components
+            .contains(GROUP_AVATAR_URL_COMPONENT_ID)
+    {
+        Some(GROUP_AVATAR_URL_COMPONENT_ID)
+    } else {
+        None
+    }
+}
+
 /// Whether the local account (`local_account_id_hex`) is absent from a group's
 /// engine roster — the backfill's suppression decision. MLS member ids in this
 /// design are the Nostr account pubkey hex, so an account is "still a member"
@@ -2111,6 +3493,131 @@ fn local_account_removed_from_roster(
     !members
         .iter()
         .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
+}
+
+#[cfg(test)]
+mod post_canonical_create_tests {
+    use super::{
+        CREATE_GROUP_LOOKUP_CONCURRENCY, collect_bounded_ordered,
+        preferred_initial_group_image_component, recover_post_canonical_result,
+    };
+    use crate::AppError;
+    use cgka_traits::app_components::{
+        GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    };
+    use cgka_traits::capabilities::GroupCapabilities;
+
+    #[test]
+    fn founding_image_prefers_blossom_then_url_then_none() {
+        let mut capabilities = GroupCapabilities::default();
+        capabilities
+            .app_components
+            .insert(GROUP_AVATAR_URL_COMPONENT_ID);
+        capabilities
+            .app_components
+            .insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        assert_eq!(
+            preferred_initial_group_image_component(&capabilities, true),
+            Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+        );
+
+        capabilities
+            .app_components
+            .ids
+            .remove(&GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        assert_eq!(
+            preferred_initial_group_image_component(&capabilities, true),
+            Some(GROUP_AVATAR_URL_COMPONENT_ID)
+        );
+        assert_eq!(
+            preferred_initial_group_image_component(&capabilities, false),
+            None
+        );
+    }
+
+    #[test]
+    fn post_canonical_failures_default_instead_of_escaping() {
+        let recovered: Vec<String> = recover_post_canonical_result(
+            "test_post_canonical_failure",
+            Err(AppError::Publish("injected failure".into())),
+        );
+        assert!(recovered.is_empty());
+
+        let successful: u8 = recover_post_canonical_result("test_post_canonical_success", Ok(7));
+        assert_eq!(successful, 7);
+    }
+
+    #[tokio::test]
+    async fn bounded_create_group_lookups_scale_for_cached_and_delayed_sources() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+        use tokio::time::{Duration, timeout};
+
+        for item_count in [1, 5, 20] {
+            let cached = collect_bounded_ordered(
+                (0..item_count).map(|index| std::future::ready(Ok::<_, &'static str>(index))),
+                CREATE_GROUP_LOOKUP_CONCURRENCY,
+            )
+            .await
+            .unwrap();
+            assert_eq!(cached, (0..item_count).collect::<Vec<_>>());
+
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            let work_active = active.clone();
+            let work_max_active = max_active.clone();
+            let work_release = release.clone();
+            let work = (0..item_count).map(move |index| {
+                let active = work_active.clone();
+                let max_active = work_max_active.clone();
+                let release = work_release.clone();
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    let permit = release.acquire().await.unwrap();
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, &'static str>(index)
+                }
+            });
+
+            let expected_parallelism = item_count.min(CREATE_GROUP_LOOKUP_CONCURRENCY);
+            let task = tokio::spawn(collect_bounded_ordered(
+                work,
+                CREATE_GROUP_LOOKUP_CONCURRENCY,
+            ));
+            timeout(Duration::from_secs(1), async {
+                while max_active.load(Ordering::SeqCst) < expected_parallelism {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bounded collector should start the available parallel work");
+            assert_eq!(max_active.load(Ordering::SeqCst), expected_parallelism);
+            release.add_permits(item_count);
+
+            assert_eq!(
+                task.await.unwrap().unwrap(),
+                (0..item_count).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_create_group_work_reports_errors_in_input_order() {
+        use tokio::time::{Duration, sleep};
+
+        let work = (0..2).map(|index| async move {
+            if index == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err::<usize, _>(if index == 0 { "first" } else { "second" })
+        });
+
+        assert_eq!(collect_bounded_ordered(work, 2).await, Err("first"));
+    }
 }
 
 #[cfg(test)]

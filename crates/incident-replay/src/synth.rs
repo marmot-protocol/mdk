@@ -9,7 +9,10 @@
 //! outcome-equivalence, and the committer identities are synthetic labels the
 //! caller assigns so the designated winner's branch wins.
 
-use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep, TraceExpectation, VectorFixture};
+use cgka_conformance_simulator::{
+    ScenarioMessageSelectorV2, ScenarioSpec, ScenarioStep, ScenarioTransportClass,
+    TraceExpectation, VectorFixture,
+};
 
 use crate::convergence::{ConvergenceDecisionKind, RecoveredConvergence};
 use crate::fork::{ForkCommitKind, RecoveredFork};
@@ -20,21 +23,29 @@ pub const WINNER_BRANCH: &str = "winner-branch";
 /// The group name the losing branch commits.
 pub const LOSER_BRANCH: &str = "loser-branch";
 
-fn commit_step(kind: ForkCommitKind, client: &str, name: &str, pending: &str) -> ScenarioStep {
-    match kind {
-        ForkCommitKind::GroupData => ScenarioStep::UpdateGroupData {
-            client: client.to_owned(),
-            name: name.to_owned(),
-            pending: pending.to_owned(),
-        },
+/// The two new members each competing branch invites in a membership fork. An
+/// invite race is the proven reproduction (the `convergence-chaos/v1`
+/// invite-fork arm): after recovery, `member_count == 3` is the winner-agnostic
+/// proof that exactly one branch's invite survived (both would be 4, neither 2).
+const FORK_INVITEE_A: &str = "david";
+const FORK_INVITEE_B: &str = "eve";
+
+/// Build the concurrent-fork vector for a recovered fork, dispatching on the
+/// commit kind: a group-metadata fork races two `UpdateGroupData` commits and is
+/// winner-branch-checked by the accept path's label search; a membership fork
+/// races two competing invites and is winner-agnostic (see [`ForkCommitKind`]).
+pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -> VectorFixture {
+    match fork.commit {
+        ForkCommitKind::GroupData => synthesize_group_data_fork(name, winner, loser),
+        ForkCommitKind::Membership => synthesize_membership_fork(name, winner, loser),
     }
 }
 
-/// Build the concurrent-fork vector. `winner`/`loser` are the synthetic client
-/// labels; the caller (the accept path) tries both orderings so the label whose
-/// committer key wins the `CommitOrderingKey` tiebreak is the one on the winning
-/// branch.
-pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -> VectorFixture {
+/// Build the group-metadata concurrent-fork vector. `winner`/`loser` are the
+/// synthetic client labels; the caller (the accept path) tries both orderings so
+/// the label whose committer key wins the `CommitOrderingKey` tiebreak is the one
+/// on the winning branch.
+fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFixture {
     let steps = vec![
         ScenarioStep::CreateGroup {
             creator: winner.to_owned(),
@@ -44,10 +55,7 @@ pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -
             initial_admins: None,
             pending: "create".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: winner.to_owned(),
-            pending: "create".to_owned(),
-        },
+        ScenarioStep::accept_publication(winner.to_owned(), "create".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![loser.to_owned()],
@@ -55,17 +63,19 @@ pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -
         ScenarioStep::ClearEvents {
             clients: vec![winner.to_owned(), loser.to_owned()],
         },
-        // Competing commits from the same epoch — the fork.
-        commit_step(fork.commit, winner, WINNER_BRANCH, "w"),
-        commit_step(fork.commit, loser, LOSER_BRANCH, "l"),
-        ScenarioStep::ConfirmPending {
+        // Competing group-data commits from the same epoch — the fork.
+        ScenarioStep::UpdateGroupData {
             client: winner.to_owned(),
+            name: WINNER_BRANCH.to_owned(),
             pending: "w".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
+        ScenarioStep::UpdateGroupData {
             client: loser.to_owned(),
+            name: LOSER_BRANCH.to_owned(),
             pending: "l".to_owned(),
         },
+        ScenarioStep::accept_publication(winner.to_owned(), "w".to_owned()),
+        ScenarioStep::accept_publication(loser.to_owned(), "l".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![winner.to_owned(), loser.to_owned()],
@@ -80,14 +90,34 @@ pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -
         vector_version: "1".to_owned(),
         conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
         seed: None,
+        application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec![winner.to_owned(), loser.to_owned()],
             steps,
         },
         expected_trace: None,
         expected_outcomes: vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: winner.to_owned(),
+                pending: "create".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 7,
+                client: winner.to_owned(),
+                pending: "w".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 8,
+                client: loser.to_owned(),
+                pending: "l".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
             // Rule 4: assert the full recovery summary, not just the winner.
             TraceExpectation::RecoverySummary {
                 count: 1,
@@ -100,6 +130,116 @@ pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -
                 clients: vec![winner.to_owned(), loser.to_owned()],
                 epoch: Some(2),
                 member_count: Some(2),
+            },
+        ],
+    }
+}
+
+/// Build the membership concurrent-fork vector: two committers race competing
+/// invites from the same epoch and the engine fork-recovers on delivery. The two
+/// invitees are held out of the race with a partition so only the committers'
+/// competing commits reach each other (the proven `convergence-chaos/v1`
+/// invite-fork shape). The assertion is winner-agnostic: `member_count == 3`
+/// after recovery proves exactly one branch's invite survived, so unlike the
+/// group-data fork no branch-name survival check (and no label search) is needed.
+fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFixture {
+    let clients = vec![
+        winner.to_owned(),
+        loser.to_owned(),
+        FORK_INVITEE_A.to_owned(),
+        FORK_INVITEE_B.to_owned(),
+    ];
+    let steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: winner.to_owned(),
+            name: "replay".to_owned(),
+            invitees: vec![loser.to_owned()],
+            required_features: Vec::new(),
+            initial_admins: None,
+            pending: "create".to_owned(),
+        },
+        ScenarioStep::accept_publication(winner.to_owned(), "create".to_owned()),
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec![loser.to_owned()],
+        },
+        ScenarioStep::ClearEvents {
+            clients: clients.clone(),
+        },
+        // Hold the invitees out so only the two committers' competing commits
+        // race each other. (The runner auto-promotes `loser` to admin when it
+        // sends the competing invite.)
+        ScenarioStep::SetPartition {
+            allow: vec![winner.to_owned(), loser.to_owned()],
+        },
+        // Competing membership commits from the same epoch — the fork.
+        ScenarioStep::InviteMembers {
+            inviter: winner.to_owned(),
+            invitees: vec![FORK_INVITEE_A.to_owned()],
+            pending: "w".to_owned(),
+        },
+        ScenarioStep::InviteMembers {
+            inviter: loser.to_owned(),
+            invitees: vec![FORK_INVITEE_B.to_owned()],
+            pending: "l".to_owned(),
+        },
+        ScenarioStep::accept_publication(winner.to_owned(), "w".to_owned()),
+        ScenarioStep::accept_publication(loser.to_owned(), "l".to_owned()),
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec![winner.to_owned(), loser.to_owned()],
+        },
+        ScenarioStep::Observe {
+            clients: vec![winner.to_owned(), loser.to_owned()],
+        },
+    ];
+
+    VectorFixture {
+        scenario_name: name.to_owned(),
+        vector_version: "1".to_owned(),
+        conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
+        seed: None,
+        application_profile: None,
+        scenario: ScenarioSpec {
+            name: name.to_owned(),
+            spec_version: "2".to_owned(),
+            topology: Default::default(),
+            clients,
+            steps,
+        },
+        expected_trace: None,
+        expected_outcomes: vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: winner.to_owned(),
+                pending: "create".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 8,
+                client: winner.to_owned(),
+                pending: "w".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 9,
+                client: loser.to_owned(),
+                pending: "l".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            // Rule 4: assert the full recovery summary, not just the winner.
+            TraceExpectation::RecoverySummary {
+                count: 1,
+                source_epoch: Some(1),
+                recovered_epoch: Some(2),
+                winner_differs_from_invalidated: true,
+            },
+            // member_count 3 == exactly one branch's invite survived (both would
+            // be 4, neither 2): the winner-agnostic survival proof.
+            TraceExpectation::ClientsConverged {
+                clients: vec![winner.to_owned(), loser.to_owned()],
+                epoch: Some(2),
+                member_count: Some(3),
             },
         ],
     }
@@ -145,10 +285,7 @@ fn convergence_preamble() -> Vec<ScenarioStep> {
             initial_admins: Some(vec![COMMITTER_B.to_owned()]),
             pending: "create".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: COMMITTER_A.to_owned(),
-            pending: "create".to_owned(),
-        },
+        ScenarioStep::accept_publication(COMMITTER_A.to_owned(), "create".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![COMMITTER_B.to_owned(), OBSERVER.to_owned()],
@@ -171,14 +308,8 @@ fn convergence_preamble() -> Vec<ScenarioStep> {
             invitees: vec![INVITEE_B.to_owned()],
             pending: "invite-b".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: COMMITTER_A.to_owned(),
-            pending: "invite-a".to_owned(),
-        },
-        ScenarioStep::ConfirmPending {
-            client: COMMITTER_B.to_owned(),
-            pending: "invite-b".to_owned(),
-        },
+        ScenarioStep::accept_publication(COMMITTER_A.to_owned(), "invite-a".to_owned()),
+        ScenarioStep::accept_publication(COMMITTER_B.to_owned(), "invite-b".to_owned()),
     ]
 }
 
@@ -193,9 +324,11 @@ fn convergence_fixture(
         vector_version: "1".to_owned(),
         conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
         seed: None,
+        application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: [COMMITTER_A, COMMITTER_B, OBSERVER, INVITEE_A, INVITEE_B]
                 .into_iter()
                 .map(str::to_owned)
@@ -203,7 +336,27 @@ fn convergence_fixture(
             steps,
         },
         expected_trace: None,
-        expected_outcomes: vec![expected],
+        expected_outcomes: vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: COMMITTER_A.to_owned(),
+                pending: "create".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 7,
+                client: COMMITTER_A.to_owned(),
+                pending: "invite-a".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 8,
+                client: COMMITTER_B.to_owned(),
+                pending: "invite-b".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            expected,
+        ],
     }
 }
 
@@ -238,16 +391,20 @@ fn synthesize_committer_decided(conv: &RecoveredConvergence, name: &str) -> Vect
 /// Witness-decided: the observer delivers two distinct senders' app messages on
 /// one branch *before* the competing commit arrives, so on the reorg the
 /// app-witness quorum overrides the committer tiebreak. Holding the competing
-/// commit (`DelayQueued`/`ReleaseDelayed`) is what stages the "delivered, then
+/// commit (`WithholdMessage`/`ReleaseWithheld`) is what stages the "delivered, then
 /// contested" ordering; the second observer `Tick` after release is the reorg.
 fn synthesize_witness_decided(conv: &RecoveredConvergence, name: &str) -> VectorFixture {
     let mut steps = convergence_preamble();
     steps.extend([
-        // Hold the competing branch-B commit (queue index 3: welcome-a, commit-a,
-        // welcome-b, commit-b) so only branch A reaches the observer first.
-        ScenarioStep::DelayQueued {
-            index: 3,
-            delayed: "held-b".to_owned(),
+        // Hold the competing branch-B commit by its publication and protocol
+        // class so only branch A reaches the observer first.
+        ScenarioStep::WithholdMessage {
+            selector: ScenarioMessageSelectorV2 {
+                publication: Some("invite-b".to_owned()),
+                class: Some(ScenarioTransportClass::Commit),
+                ..Default::default()
+            },
+            label: "held-b".to_owned(),
         },
         ScenarioStep::DeliverAll,
         // The invitee joins branch A so it can be the second witness sender.
@@ -268,8 +425,8 @@ fn synthesize_witness_decided(conv: &RecoveredConvergence, name: &str) -> Vector
             clients: vec![OBSERVER.to_owned()],
         },
         // The competing branch-B commit now arrives, forcing a reorg.
-        ScenarioStep::ReleaseDelayed {
-            delayed: "held-b".to_owned(),
+        ScenarioStep::ReleaseWithheld {
+            label: "held-b".to_owned(),
         },
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {

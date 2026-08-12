@@ -4,24 +4,108 @@ on:
   push:
     tags:
       - marmotkit-v*
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit SHA on master to publish as an immutable iOS snapshot
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-bindings-${{ github.ref }}
+  group: marmotkit-bindings-${{ inputs.source_sha || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  IPHONEOS_DEPLOYMENT_TARGET: "18.0"
   OTLP_EXPORT: "1"
 
 jobs:
+  metadata:
+    name: Resolve immutable release identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      builder_sha: ${{ steps.identity.outputs.builder_sha }}
+      release_id: ${{ steps.identity.outputs.release_id }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      binary_name: ${{ steps.identity.outputs.binary_name }}
+      swift_name: ${{ steps.identity.outputs.swift_name }}
+      is_snapshot: ${{ steps.identity.outputs.is_snapshot }}
+
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.source_sha || github.sha }}
+
+      - name: Resolve release identity
+        id: identity
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ inputs.source_sha }}
+          BUILDER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse 'HEAD^{commit}')"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "error: snapshot publishing must run with the workflow from refs/heads/master" >&2
+              exit 1
+            fi
+            if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "error: source_sha must be a full lowercase 40-character SHA" >&2
+              exit 1
+            fi
+            if [[ "$source_sha" != "$REQUESTED_SHA" ]]; then
+              echo "error: requested SHA resolved to unexpected commit $source_sha" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin master
+            if ! git merge-base --is-ancestor "$source_sha" origin/master; then
+              echo "error: snapshot SHA must be a commit reachable from origin/master" >&2
+              exit 1
+            fi
+            release_id="snapshot-$source_sha"
+            release_tag="marmotkit-snapshot-$source_sha"
+            is_snapshot=true
+          else
+            if [[ ! "$GITHUB_REF_NAME" =~ ^marmotkit-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: binding releases must use a version tag like marmotkit-v0.1.0" >&2
+              exit 1
+            fi
+            release_id="${GITHUB_REF_NAME#marmotkit-v}"
+            release_tag="$GITHUB_REF_NAME"
+            is_snapshot=false
+            if [[ "$release_id" != "$workspace_version" ]]; then
+              echo "error: release tag version $release_id does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "source_sha=$source_sha"
+            echo "builder_sha=$BUILDER_SHA"
+            echo "release_id=$release_id"
+            echo "release_tag=$release_tag"
+            echo "binary_name=MarmotKitFFI-$release_id.xcframework.zip"
+            echo "swift_name=MarmotKit-$release_id.swift"
+            echo "is_snapshot=$is_snapshot"
+          } >> "$GITHUB_OUTPUT"
+
   ios-bindings:
     name: Build iOS bindings
     runs-on: macos-latest
+    needs: metadata
     timeout-minutes: 60
 
     steps:
@@ -29,21 +113,20 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
 
-      - name: Validate release tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$GITHUB_REF_NAME" =~ ^marmotkit-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "error: binding releases must use a version tag like marmotkit-v0.1.0" >&2
-            exit 1
-          fi
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source
 
       - name: Install Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
@@ -52,62 +135,60 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: packaged-source -> target
 
       - name: Build MarmotKit XCFramework
+        env:
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: ./crates/marmot-uniffi/xcframework.sh
 
-      - name: Package iOS bundle
+      - name: Package immutable iOS artifacts
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/package-ios-artifacts.sh \
+            "$RELEASE_ID" "$RELEASE_TAG" "$SOURCE_SHA" dist "$BUILDER_SHA"
+
+      - name: Validate XCFramework slices and SwiftPM archive layout
+        shell: bash
+        env:
+          BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/validate-ios-artifact.sh \
+            "dist/$BINARY_NAME" "$IPHONEOS_DEPLOYMENT_TARGET"
+
+      - name: Compile and link a local SwiftPM consumer
         shell: bash
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          version="${tag#marmotkit-v}"
-          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
-          stage_parent="$RUNNER_TEMP/marmotkit-ios-stage"
-          bundle_dir="$stage_parent/marmotkit-ios-$version"
-          asset="$RUNNER_TEMP/marmotkit-ios-$version.zip"
-
-          rm -rf "$stage_parent" "$asset" "$asset.sha256"
-          mkdir -p "$bundle_dir"
-          cp -R crates/marmot-uniffi/output/MarmotKit.xcframework "$bundle_dir/"
-          cp crates/marmot-uniffi/output/MarmotKit.swift "$bundle_dir/"
-
-          cat > "$bundle_dir/manifest.json" <<EOF
-          {
-            "name": "marmotkit-ios",
-            "version": "$version",
-            "tag": "$tag",
-            "source_sha": "$GITHUB_SHA",
-            "workspace_version": "$workspace_version",
-            "cargo_lock_sha256": "$lock_sha",
-            "rustc": "$(rustc --version)",
-            "cargo": "$(cargo --version)",
-            "contents": [
-              "MarmotKit.xcframework",
-              "MarmotKit.swift"
-            ]
-          }
-          EOF
-
-          (
-            cd "$stage_parent"
-            zip -r "$asset" "marmotkit-ios-$version"
-          )
-          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
-          mkdir -p dist
-          cp "$asset" "$asset.sha256" dist/
+          ./crates/marmot-uniffi/validate-swift-package.sh \
+            packaged-source/crates/marmot-uniffi/output/MarmotKit.xcframework \
+            - \
+            packaged-source/crates/marmot-uniffi/output/MarmotKit.swift \
+            "$RUNNER_TEMP/marmotkit-local-consumer"
 
       - name: Upload iOS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: marmotkit-ios
+          name: marmotkit-ios-${{ needs.metadata.outputs.source_sha }}
           path: dist/*
           if-no-files-found: error
 
   android-bindings:
     name: Build Android bindings
     runs-on: ubuntu-latest
+    needs: metadata
+    if: needs.metadata.outputs.is_snapshot == 'false'
     timeout-minutes: 60
 
     steps:
@@ -115,15 +196,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-
-      - name: Validate release tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$GITHUB_REF_NAME" =~ ^marmotkit-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "error: binding releases must use a version tag like marmotkit-v0.1.0" >&2
-            exit 1
-          fi
+          ref: ${{ needs.metadata.outputs.source_sha }}
 
       - name: Install Rust toolchain
         shell: bash
@@ -183,10 +256,14 @@ jobs:
 
       - name: Package Android bundle
         shell: bash
+        env:
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          version="${tag#marmotkit-v}"
+          tag="$RELEASE_TAG"
+          version="$RELEASE_ID"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
           stage_parent="$RUNNER_TEMP/marmotkit-android-stage"
@@ -203,7 +280,7 @@ jobs:
             "name": "marmotkit-android",
             "version": "$version",
             "tag": "$tag",
-            "source_sha": "$GITHUB_SHA",
+            "source_sha": "$SOURCE_SHA",
             "workspace_version": "$workspace_version",
             "cargo_lock_sha256": "$lock_sha",
             "rustc": "$(rustc --version)",
@@ -231,7 +308,7 @@ jobs:
       - name: Upload Android bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: marmotkit-android
+          name: marmotkit-android-${{ needs.metadata.outputs.source_sha }}
           path: dist/*
           if-no-files-found: error
 
@@ -239,8 +316,14 @@ jobs:
     name: Create GitHub release
     runs-on: ubuntu-latest
     needs:
+      - metadata
       - ios-bindings
       - android-bindings
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      needs.ios-bindings.result == 'success' &&
+      (needs.android-bindings.result == 'success' || needs.android-bindings.result == 'skipped')
     timeout-minutes: 15
     permissions:
       actions: read
@@ -251,45 +334,160 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
         run: |
           set -euo pipefail
           mkdir -p dist/ios dist/android
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmotkit-ios --dir dist/ios
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmotkit-android --dir dist/android
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-ios-$SOURCE_SHA" --dir dist/ios
+          if [[ "$IS_SNAPSHOT" == "false" ]]; then
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
+          fi
 
-      - name: Create or update release
+      - name: Create and verify immutable release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+          IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
+          BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          version="${tag#marmotkit-v}"
+          tag="$RELEASE_TAG"
+          version="$RELEASE_ID"
           notes="$RUNNER_TEMP/release-notes.md"
+          checksum="$(cat "dist/ios/$BINARY_NAME.swiftpm-checksum")"
           cat > "$notes" <<EOF
-          MarmotKit bindings generated from MDK commit \`$GITHUB_SHA\`.
+          MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.
 
           Assets:
-          - \`marmotkit-ios-$version.zip\`: \`MarmotKit.xcframework\` and generated Swift bindings.
-          - \`marmotkit-android-$version.zip\`: generated Kotlin bindings and Android JNI libraries.
+          - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive.
+          - \`MarmotKit-$version.swift\`: generated Swift source matching that binary.
+          - \`marmotkit-ios-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
 
-          Verify downloads with the accompanying \`.sha256\` files.
+          SwiftPM checksum: \`$checksum\`
+
+          Verify source and artifact provenance with \`marmotkit-ios-$version.manifest.json\`
+          and \`marmotkit-ios-$version.checksums.txt\`. Assets on this release are immutable.
           EOF
 
-          assets=(
-            "dist/ios/marmotkit-ios-$version.zip"
-            "dist/ios/marmotkit-ios-$version.zip.sha256"
-            "dist/android/marmotkit-android-$version.zip"
-            "dist/android/marmotkit-android-$version.zip.sha256"
-          )
-
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "v$version - MarmotKit" --notes-file "$notes"
-          else
-            gh release create "$tag" "${assets[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "v$version - MarmotKit" \
-              --notes-file "$notes" \
-              --latest=false
+          if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$release_state" == "true" ]]; then
+              echo "Removing incomplete draft release $tag before retry"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            else
+              echo "error: immutable MarmotKit release $tag already exists; refusing to replace assets" >&2
+              exit 1
+            fi
           fi
+
+          if [[ "$IS_SNAPSHOT" == "true" ]] && \
+             git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "error: immutable snapshot tag $tag already exists; refusing to move it" >&2
+            exit 1
+          fi
+
+          assets=(dist/ios/*)
+          if [[ "$IS_SNAPSHOT" == "false" ]]; then
+            assets+=(dist/android/*)
+            title="v$version - MarmotKit"
+            release_flags=(--latest=false)
+          else
+            title="$version - MarmotKit"
+            release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")
+          fi
+
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --notes-file "$notes" \
+            --draft \
+            "${release_flags[@]}"
+
+          gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$tag\" and .draft == true) | .id" | head -n 1)"
+          [[ -n "$release_id" ]] || { echo "error: could not find draft release $tag" >&2; exit 1; }
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          [[ "$(jq '.assets | length' <<< "$release_json")" -eq "${#assets[@]}" ]] || {
+            echo "error: uploaded release asset count does not match local artifact count" >&2
+            exit 1
+          }
+          for asset in "${assets[@]}"; do
+            name="$(basename "$asset")"
+            size="$(stat -c %s "$asset")"
+            digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+            matches="$(jq --arg name "$name" --argjson size "$size" --arg digest "$digest" \
+              '[.assets[] | select(.name == $name and .size == $size and .digest == $digest)] | length' \
+              <<< "$release_json")"
+            [[ "$matches" -eq 1 ]] || {
+              echo "error: uploaded asset verification failed for $name" >&2
+              exit 1
+            }
+          done
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false -f make_latest=false >/dev/null
+          # The workflow token cannot read repository-administration settings,
+          # so assert their release-level effect directly after publication.
+          for _attempt in 1 2 3 4 5; do
+            release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+            if [[ "$(jq -r '.draft' <<< "$release_json")" == "false" && \
+                  "$(jq -r '.immutable' <<< "$release_json")" == "true" ]]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "error: published release did not become immutable" >&2
+          exit 1
+
+  validate-published-ios:
+    name: Validate published SwiftPM consumer
+    runs-on: macos-latest
+    needs:
+      - metadata
+      - release
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download matching source and checksum
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
+          SWIFT_NAME: ${{ needs.metadata.outputs.swift_name }}
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          for attempt in 1 2 3 4 5; do
+            if curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$SWIFT_NAME" -o "$RUNNER_TEMP/MarmotKit.swift" && \
+              curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$BINARY_NAME.swiftpm-checksum" -o "$RUNNER_TEMP/swiftpm-checksum"; then
+              break
+            fi
+            if [[ $attempt -eq 5 ]]; then
+              echo "error: published MarmotKit assets did not become available" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          checksum="$(tr -d '[:space:]' < "$RUNNER_TEMP/swiftpm-checksum")"
+          ./crates/marmot-uniffi/validate-swift-package.sh \
+            "$base_url/$BINARY_NAME" \
+            "$checksum" \
+            "$RUNNER_TEMP/MarmotKit.swift" \
+            "$RUNNER_TEMP/marmotkit-remote-consumer"

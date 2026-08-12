@@ -29,6 +29,8 @@ pub(crate) enum WnError {
     EmptyMessage,
     #[error("group id is required")]
     MissingGroupId,
+    #[error("--reply-to must come before the message text; it was read as literal text here")]
+    ReplyToAfterMessageText,
     #[error("relay URL cannot be empty")]
     EmptyRelayUrl,
     #[error("invalid relay URL: {0}")]
@@ -49,6 +51,10 @@ pub(crate) enum WnError {
     PublicAccountCannotSign,
     #[error("invalid secret store: {0}")]
     InvalidSecretStore(String),
+    #[error(
+        "WN_DEV_SETTLEMENT_QUIESCENCE_MS requires a test-policy-overrides build; unset it in normal binaries"
+    )]
+    DevSettlementOverrideInRelease,
     #[error("stream text is required")]
     EmptyStreamText,
     #[error("no brokered stream start found")]
@@ -138,6 +144,8 @@ pub(crate) enum WnError {
         account_id: String,
         source_relays: Vec<String>,
     },
+    #[error("user search did not complete: {0}")]
+    UserSearch(String),
 }
 
 pub(crate) fn wn_error_json(err: &WnError) -> Value {
@@ -197,6 +205,10 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "repair": {
                 "retry_with_relay": "--relay <relay-that-has-the-current-profile>",
             },
+        }),
+        WnError::UserSearch(_) => json!({
+            "code": "user_search_failed",
+            "message": err.to_string(),
         }),
         WnError::AccountHome(err) => account_home_error_json(err),
         WnError::App(err) => app_error_json(err),
@@ -383,6 +395,13 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "missing_group_id",
             "message": err.to_string(),
         }),
+        WnError::ReplyToAfterMessageText => json!({
+            "code": "reply_to_after_message_text",
+            "message": err.to_string(),
+            "repair": {
+                "reorder": "put --reply-to before the text: wn messages send --group <group> --reply-to <message-id> <text>",
+            },
+        }),
         WnError::EmptyRelayUrl => json!({
             "code": "empty_relay_url",
             "message": err.to_string(),
@@ -438,6 +457,13 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "invalid_secret_store",
             "message": err.to_string(),
             "secret_store": store,
+        }),
+        WnError::DevSettlementOverrideInRelease => json!({
+            "code": "dev_settlement_override_in_release",
+            "message": err.to_string(),
+            "repair": {
+                "unset": "WN_DEV_SETTLEMENT_QUIESCENCE_MS",
+            },
         }),
     }
 }
@@ -539,6 +565,14 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "invalid_public_key",
             "message": err.to_string(),
         }),
+        AppError::UnexpectedPrivateKey => json!({
+            "code": "unexpected_private_key",
+            "message": err.to_string(),
+        }),
+        AppError::IdentityKeyMismatch => json!({
+            "code": "identity_key_mismatch",
+            "message": err.to_string(),
+        }),
         AppError::InvalidKeyPackageEvent(reason) => json!({
             "code": "invalid_key_package_event",
             "message": err.to_string(),
@@ -569,6 +603,27 @@ fn app_error_json(err: &AppError) -> Value {
         AppError::AccountCatchUp(_) => json!({
             "code": "account_catch_up",
             "message": err.to_string(),
+        }),
+        AppError::AccountSetupRecoveryRequired => json!({
+            "code": "account_setup_recovery_required",
+            "message": err.to_string(),
+            "repair": {
+                "action": "confirm possible orphaned KeyPackage exposure, then retry with the host recovery API",
+            },
+        }),
+        AppError::AccountSetupRetryRequired => json!({
+            "code": "account_setup_retry_required",
+            "message": err.to_string(),
+            "repair": { "action": "retry the original account setup operation" },
+        }),
+        AppError::AccountSetupResetNotApplicable => json!({
+            "code": "account_setup_reset_not_applicable",
+            "message": err.to_string(),
+        }),
+        AppError::AccountSetupKeyPackageRecoveryAvailable => json!({
+            "code": "account_setup_key_package_recovery_available",
+            "message": err.to_string(),
+            "repair": { "action": "retry the original account setup operation" },
         }),
         other => json!({
             "code": "command_failed",
@@ -615,5 +670,71 @@ fn engine_error_json(err: &EngineError) -> Value {
             "code": "engine_error",
             "message": other.to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_key_package_errors_include_repair_guidance() {
+        let account = "11".repeat(32);
+        let error = wn_error_json(&WnError::App(AppError::MissingKeyPackage(account.clone())));
+
+        assert_eq!(error["code"], "missing_key_package");
+        assert_eq!(error["account_id"], account);
+        assert_eq!(
+            error["repair"]["local"],
+            format!("wn --account {account} keys publish")
+        );
+        assert_eq!(
+            error["repair"]["remote"],
+            "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+        );
+    }
+
+    #[test]
+    fn secret_identity_errors_do_not_echo_nsec_material() {
+        let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+        let cases = [
+            WnError::SecretArgumentRejected { command: "login" },
+            WnError::ConflictingSecretInput { command: "login" },
+            WnError::MissingStdinSecret { command: "login" },
+            WnError::InvalidStdinSecret {
+                command: "account create",
+            },
+        ];
+        for err in cases {
+            let message = err.to_string();
+            assert!(!message.contains(nsec), "{message}");
+            let json = wn_error_json(&err).to_string();
+            assert!(!json.contains(nsec), "{json}");
+        }
+    }
+
+    #[test]
+    fn account_setup_recovery_errors_have_stable_json_codes() {
+        let cases = [
+            (
+                AppError::AccountSetupRecoveryRequired,
+                "account_setup_recovery_required",
+            ),
+            (
+                AppError::AccountSetupRetryRequired,
+                "account_setup_retry_required",
+            ),
+            (
+                AppError::AccountSetupResetNotApplicable,
+                "account_setup_reset_not_applicable",
+            ),
+            (
+                AppError::AccountSetupKeyPackageRecoveryAvailable,
+                "account_setup_key_package_recovery_available",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(wn_error_json(&WnError::App(error))["code"], code);
+        }
     }
 }

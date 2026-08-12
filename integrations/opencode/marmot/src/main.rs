@@ -1,16 +1,10 @@
-mod bridge;
-mod chunking;
 mod config;
-mod control;
-mod error;
 mod opencode;
-mod repo_picker;
-mod store;
 
 use std::process::ExitCode;
 
 use clap::Parser;
-use error::Result;
+use marmot_terminal_harness::Result;
 use tracing::error;
 
 #[derive(Debug, Parser)]
@@ -30,7 +24,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!(
-                target: bridge::TRACE_TARGET,
+                target: marmot_terminal_harness::TRACE_TARGET,
                 method = "main",
                 error_kind = err.privacy_safe_kind(),
                 "wn-opencode exiting after error"
@@ -43,14 +37,16 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let config = config::Config::from_env()?;
-    bridge::run(config).await
+    let (config, backend) = config.into_harness();
+    marmot_terminal_harness::run(config, backend).await
 }
 
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,wn_opencode=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,marmot_terminal_harness=info")
+            }),
         )
         .init();
 }

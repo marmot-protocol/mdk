@@ -102,6 +102,8 @@ pub(crate) fn unsupported_request_message(request: &AgentControlRequest) -> &'st
 pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
     match request {
         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
+        AgentControlRequest::TimelineMessageGet { .. } => "timeline_message_get",
+        AgentControlRequest::TimelineList { .. } => "timeline_list",
         AgentControlRequest::SendFinal { .. } => "send_final",
         AgentControlRequest::DeleteMessage { .. } => "delete_message",
         AgentControlRequest::StreamBegin { .. } => "stream_begin",
@@ -114,10 +116,21 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::AccountCreate { .. } => "account_create",
         AgentControlRequest::AccountPublishKeyPackage { .. } => "account_publish_key_package",
         AgentControlRequest::AccountPublishProfile { .. } => "account_publish_profile",
+        AgentControlRequest::AccountProfileLookup { .. } => "account_profile_lookup",
         AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
         AgentControlRequest::GroupInfo { .. } => "group_info",
+        AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
+        AgentControlRequest::KeyPackageMaintenanceStatus { .. } => "key_package_maintenance_status",
+        AgentControlRequest::MaintenanceScheduleSelfUpdate { .. } => {
+            "maintenance_schedule_self_update"
+        }
+        AgentControlRequest::MaintenanceGetPolicy { .. } => "maintenance_get_policy",
+        AgentControlRequest::MaintenanceSetPolicy { .. } => "maintenance_set_policy",
+        AgentControlRequest::MaintenancePause { .. } => "maintenance_pause",
+        AgentControlRequest::MaintenanceResume { .. } => "maintenance_resume",
+        AgentControlRequest::MaintenanceRun { .. } => "maintenance_run",
         AgentControlRequest::AllowlistList { .. } => "allowlist_list",
         AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
         AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",
@@ -143,6 +156,12 @@ pub(crate) fn validate_control_plane_config(
     if config.max_connections == 0 {
         return Err(ConnectorError::UnsafeControlPlaneConfig(
             "max connections must be nonzero",
+        ));
+    }
+
+    if config.dev_allow_any_invites && !config.debug_controls {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "dev allow-any invites requires debug controls",
         ));
     }
 
@@ -198,6 +217,9 @@ pub(crate) fn validate_profile_name(value: String) -> Result<String, ConnectorEr
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if value.is_empty() {
         return Err(ConnectorError::InvalidProfileName("empty"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ConnectorError::InvalidProfileName("control_characters"));
     }
     if value.chars().count() > MAX_PROFILE_NAME_CHARS {
         return Err(ConnectorError::InvalidProfileName("too_long"));

@@ -548,7 +548,7 @@ impl MarmotApp {
             }
             let url = upload_blossom_blob(
                 server,
-                &imported_sticker.bytes,
+                imported_sticker.bytes.clone().into(),
                 &imported_sticker.sha256,
                 signer.as_ref(),
                 self.allow_loopback_blob_endpoints(),

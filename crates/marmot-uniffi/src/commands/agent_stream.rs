@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::RngCore;
 use rand::rngs::OsRng;
 
+use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN;
+
 use crate::Marmot;
 use crate::conversions::{AgentStreamStartFfi, group_id_from_hex};
 use crate::errors::MarmotKitError;
@@ -15,6 +17,21 @@ fn random_agent_stream_id() -> Vec<u8> {
     let mut stream_id = vec![0; 32];
     OsRng.fill_bytes(&mut stream_id);
     stream_id
+}
+
+fn stream_id_from_hex(value: &str) -> Result<Vec<u8>, MarmotKitError> {
+    let bytes = hex::decode(value.trim()).map_err(|err| MarmotKitError::InvalidHex {
+        details: err.to_string(),
+    })?;
+    if bytes.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
+        return Err(MarmotKitError::InvalidHex {
+            details: format!(
+                "expected {AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN}-byte agent stream id, got {} bytes",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(bytes)
 }
 
 fn unix_now_seconds() -> u64 {
@@ -39,9 +56,7 @@ impl Marmot {
     ) -> Result<AgentStreamStartFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let stream_id = match stream_id_hex {
-            Some(value) => hex::decode(value).map_err(|err| MarmotKitError::InvalidHex {
-                details: err.to_string(),
-            })?,
+            Some(value) => stream_id_from_hex(&value)?,
             None => random_agent_stream_id(),
         };
         let stream_id_hex = hex::encode(&stream_id);
@@ -91,5 +106,24 @@ impl Marmot {
             )
             .await?;
         Ok(AgentStreamSubscription::new(watch))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_id_hex_requires_the_profile_length() {
+        assert_eq!(
+            stream_id_from_hex(&format!(" {} ", "AB".repeat(32))).unwrap(),
+            vec![0xAB; 32]
+        );
+        for invalid in [String::new(), "ab".repeat(31), "ab".repeat(33)] {
+            assert!(
+                stream_id_from_hex(&invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 }

@@ -22,9 +22,10 @@ App runtime bridge for the first real Marmot app surfaces.
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
   the cursor unit tests), `projection.rs` (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `push.rs` (push-token registration and
-  notification-trigger publishing), and `audit.rs` (audit-context construction, the local/observed `human_action`
-  recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files are widened to
-  `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
+  notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
+  per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
+  `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
+  are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).
@@ -51,9 +52,13 @@ App runtime bridge for the first real Marmot app surfaces.
   reused by `key_package_records.rs`, and public re-exports.
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
-  lists, relay lists, and KeyPackages, but it must not become an unbounded Nostr social-graph crawler.
-- Keep directory search bounded over cached follow edges. Do not add web-of-trust scoring unless that is reopened as a
-  deliberate product decision.
+  lists, relay lists, and KeyPackages. Web-of-trust search may traverse the live follow graph, but traversal is bounded
+  by construction: a capped search radius, a per-radius candidate cap, a per-radius fetch timeout, batched
+  author-scoped fetches, and a per-search lifecycle — traversal runs only while a search
+  subscription is live and stops as soon as its consumer drops. There is no background or open-ended crawl.
+- Keep web-of-trust search results un-promoted. Strangers discovered by search are never written to `directory_users`
+  and must never reach `directory_sync_plan` or live per-author subscriptions (mdk#418); cache them only in the
+  un-promoted `directory_search_graph_users` tier, which directory sync never reads.
 - Keep runtime directory subscriptions chunked and privacy-safe. Subscription identifiers must not embed raw pubkeys.
 - Treat Marmot kind `30443` KeyPackages as cached last-resort packages. Normal publish should reuse the cached valid
   package and stable replaceable d-tag; expired or policy-invalid packages rotate to a fresh package ref.
@@ -66,6 +71,11 @@ App runtime bridge for the first real Marmot app surfaces.
   `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
   dev flag). Do not add an outbound relay/broker path that bypasses them.
+- Keep `MarmotAppRuntime::shutdown_and_close` the one sequenced teardown for hosts whose process can be suspended: it
+  drains workers, then closes every SQLite database and releases the root runtime lease. `shutdown` alone does not
+  release file locks. Closing is terminal — do not add a path that transparently reopens a database afterwards, and
+  put shutdown checks at engine-step boundaries (never inside a step, where a snapshot guard may be live). See
+  `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.

@@ -4,6 +4,7 @@ use cgka_traits::GroupId;
 use cgka_traits::engine::{
     AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
 };
+use cgka_traits::ingest::InboundResourceLimit;
 use marmot_app::{AppGroupHydrationQuarantineReason, MarmotAppEvent};
 
 use super::group::AppGroupHydrationQuarantineReasonFfi;
@@ -16,6 +17,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }
@@ -79,6 +81,18 @@ pub enum MarmotEventFfi {
         message_id_hex: String,
         recipient_hex: String,
     },
+    /// This device armed `arms` epoch-gap history backfills for the group
+    /// without catching up: it is still stalled at `stalled_epoch` while the
+    /// group has moved on. Surface it as "this group cannot catch up; re-syncing
+    /// is recommended"; the sanctioned repair is rotating this device's key
+    /// package and re-activating transport, which is the host app's call.
+    EpochStallEscalated {
+        account_id_hex: String,
+        account_label: String,
+        group_id_hex: String,
+        stalled_epoch: u64,
+        arms: u32,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -98,6 +112,13 @@ pub enum GroupEventKindFfi {
     GroupJoined {
         via_welcome_hex: String,
         welcomer_id_hex: Option<String>,
+    },
+    /// A transport object was released because a local resource budget was
+    /// exhausted. This does not assert protocol invalidity; exact-id
+    /// redelivery remains eligible.
+    TransportObjectResourceRefused {
+        message_id_hex: String,
+        resource: String,
     },
     MessageReceived {
         sender_id_hex: String,
@@ -163,6 +184,7 @@ fn group_state_change_tag(change: &GroupStateChange) -> &'static str {
         GroupStateChange::GroupRenamed { .. } => "group_renamed",
         GroupStateChange::GroupAvatarChanged => "group_avatar_changed",
         GroupStateChange::MessageRetentionChanged { .. } => "disappearing_timer_changed",
+        GroupStateChange::GroupDisbanded => "group_disbanded",
     }
 }
 
@@ -187,6 +209,17 @@ fn app_message_invalidation_reason_tag(reason: &AppMessageInvalidationReason) ->
     }
 }
 
+/// Stable, low-cardinality tag for an [`InboundResourceLimit`].
+fn inbound_resource_limit_tag(resource: &InboundResourceLimit) -> &'static str {
+    match resource {
+        InboundResourceLimit::TransportDeferredCapacity => "transport_deferred_capacity",
+        InboundResourceLimit::TransportDeferredRetryBudget => "transport_deferred_retry_budget",
+        InboundResourceLimit::TransportDeferredResidenceBudget => {
+            "transport_deferred_residence_budget"
+        }
+    }
+}
+
 impl From<GroupEvent> for GroupEventKindFfi {
     fn from(event: GroupEvent) -> Self {
         match event {
@@ -198,6 +231,14 @@ impl From<GroupEvent> for GroupEventKindFfi {
             } => Self::GroupJoined {
                 via_welcome_hex: hex::encode(via_welcome.as_slice()),
                 welcomer_id_hex: welcomer.map(|m| hex::encode(m.as_slice())),
+            },
+            GroupEvent::TransportObjectResourceRefused {
+                message_id,
+                resource,
+                ..
+            } => Self::TransportObjectResourceRefused {
+                message_id_hex: hex::encode(message_id.as_slice()),
+                resource: inbound_resource_limit_tag(&resource).to_string(),
             },
             GroupEvent::MessageReceived { sender, epoch, .. } => Self::MessageReceived {
                 sender_id_hex: hex::encode(sender.as_slice()),
@@ -333,6 +374,47 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 message_id_hex,
                 recipient_hex,
             },
+            MarmotAppEvent::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id,
+                stalled_epoch,
+                arms,
+            } => Self::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch,
+                arms,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cgka_traits::{GroupId, MessageId};
+
+    use super::*;
+
+    #[test]
+    fn transport_resource_refusal_preserves_recovery_fields() {
+        let event = GroupEvent::TransportObjectResourceRefused {
+            group_id: GroupId::new(vec![0x11]),
+            message_id: MessageId::new(vec![0x22; 32]),
+            resource: InboundResourceLimit::TransportDeferredResidenceBudget,
+        };
+
+        assert_eq!(group_id_from_event(&event).as_slice(), &[0x11]);
+        match GroupEventKindFfi::from(event) {
+            GroupEventKindFfi::TransportObjectResourceRefused {
+                message_id_hex,
+                resource,
+            } => {
+                assert_eq!(message_id_hex, "22".repeat(32));
+                assert_eq!(resource, "transport_deferred_residence_budget");
+            }
+            other => panic!("unexpected FFI event: {other:?}"),
         }
     }
 }

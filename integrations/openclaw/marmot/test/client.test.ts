@@ -7,10 +7,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AgentControlError,
   MarmotAgentControlClient,
+  decodeAgentControlEvent,
   normalizeHex,
 } from "../src/client.js";
 
-const PROTOCOL = "marmot.agent-control.v1";
+const PROTOCOL = "marmot.agent-control.v2";
 const HEX32 = (b: string) => b.repeat(32);
 
 function send(socket: Socket, id: unknown, payload: Record<string, unknown>): void {
@@ -25,6 +26,47 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       send(socket, id, {
         type: "account_list",
         accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+      });
+      break;
+    case "timeline_message_get":
+      send(socket, id, {
+        type: "timeline_message",
+        account_id_hex: req.account_id_hex,
+        group_id_hex: req.group_id_hex,
+        message_id_hex: req.message_id_hex,
+        message: {
+          message_id_hex: req.message_id_hex,
+          sender: { account_id_hex: HEX32("bb"), is_self: false },
+          direction: "received",
+          kind: 9,
+          recorded_at: 10,
+          observed_at: 11,
+          availability: "available",
+          text: "earlier",
+          text_truncated: false,
+          attachments_truncated: false,
+          reactions_truncated: false,
+        },
+      });
+      break;
+    case "timeline_list":
+      send(socket, id, {
+        type: "timeline_page",
+        account_id_hex: req.account_id_hex,
+        group_id_hex: req.group_id_hex,
+        messages: [],
+        has_more_before: true,
+        has_more_after: false,
+        echoed_before: req.before ?? null,
+        echoed_limit: req.limit,
+      });
+      break;
+    case "account_profile_lookup":
+      send(socket, id, {
+        type: "profile_lookup",
+        account_id_hex: req.account_id_hex,
+        status: "profile_found",
+        retryable: false,
       });
       break;
     case "send_final":
@@ -55,8 +97,10 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       send(socket, id, {
         type: "stream_begun",
         stream_id_hex: HEX32("ee"),
+        stream_capability: HEX32("55"),
         start_message_id_hex: HEX32("ff"),
         quic_candidates: [],
+        echoed_parent_message_id_hex: req.parent_message_id_hex ?? null,
       });
       break;
     case "stream_finalize":
@@ -65,6 +109,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         stream_id_hex: req.stream_id_hex ?? HEX32("ee"),
         message_ids_hex: [HEX32("99")],
         echoed_idempotency_key: req.idempotency_key ?? null,
+        echoed_stream_capability: req.stream_capability ?? null,
       });
       break;
     case "group_info":
@@ -92,9 +137,18 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         type: "inbound_message",
         account_id_hex: req.account_id_hex ?? HEX32("aa"),
         group_id_hex: HEX32("cc"),
-        message_id_hex: HEX32("dd"),
-        sender_account_id_hex: HEX32("bb"),
-        text: "hello agent",
+        message: {
+          message_id_hex: HEX32("dd"),
+          sender: {
+            account_id_hex: HEX32("bb"),
+            display_name: "Alice",
+            is_self: false,
+          },
+          text: "hello agent",
+          recorded_at: 1_721_000_000,
+          media: [],
+        },
+        mentions_self: true,
       });
       send(socket, id, {
         type: "resync_required",
@@ -161,6 +215,41 @@ describe("MarmotAgentControlClient", () => {
     expect(res.accounts[0]?.label).toBe("agent");
   });
 
+  it("round-trips the typed account profile lookup", async () => {
+    const res = await client.accountLookupProfile(HEX32("aa"));
+    expect(res).toMatchObject({
+      type: "profile_lookup",
+      status: "profile_found",
+      retryable: false,
+    });
+  });
+
+  it("fetches one durable timeline message and pages by stable cursor", async () => {
+    const one = await client.timelineMessageGet(
+      HEX32("aa"),
+      HEX32("cc"),
+      HEX32("dd"),
+    );
+    expect(one.message).toMatchObject({
+      message_id_hex: HEX32("dd"),
+      text: "earlier",
+      availability: "available",
+    });
+
+    const page = (await client.timelineList(HEX32("aa"), HEX32("cc"), {
+      before: { recorded_at: 10, message_id_hex: HEX32("dd") },
+      limit: 500,
+    })) as unknown as {
+      echoed_before: { recorded_at: number; message_id_hex: string };
+      echoed_limit: number;
+    };
+    expect(page.echoed_before).toEqual({
+      recorded_at: 10,
+      message_id_hex: HEX32("dd"),
+    });
+    expect(page.echoed_limit).toBe(50);
+  });
+
   it("returns durable message ids from send_final", async () => {
     const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
     expect(res.message_ids_hex).toEqual([HEX32("ab")]);
@@ -187,20 +276,40 @@ describe("MarmotAgentControlClient", () => {
   it("forwards an idempotency_key on stream_finalize when supplied, and omits it otherwise", async () => {
     const withKey = (await client.streamFinalize(
       HEX32("ee"),
+      HEX32("55"),
       "done",
       HEX32("aa"),
       1,
       "stream-key-1",
-    )) as unknown as { echoed_idempotency_key?: string | null };
+    )) as unknown as {
+      echoed_idempotency_key?: string | null;
+      echoed_stream_capability?: string | null;
+    };
     expect(withKey.echoed_idempotency_key).toBe("stream-key-1");
+    expect(withKey.echoed_stream_capability).toBe(HEX32("55"));
 
     const withoutKey = (await client.streamFinalize(
       HEX32("ee"),
+      HEX32("55"),
       "done",
       HEX32("aa"),
       1,
     )) as unknown as { echoed_idempotency_key?: string | null };
     expect(withoutKey.echoed_idempotency_key).toBeNull();
+  });
+
+  it("forwards the optional parent message id on stream_begin", async () => {
+    const parentMessageIdHex = HEX32("dd");
+    const withParent = (await client.streamBegin(HEX32("aa"), HEX32("cc"), {
+      parentMessageIdHex,
+    })) as unknown as { echoed_parent_message_id_hex?: string | null };
+    expect(withParent.echoed_parent_message_id_hex).toBe(parentMessageIdHex);
+
+    const withoutParent = (await client.streamBegin(
+      HEX32("aa"),
+      HEX32("cc"),
+    )) as unknown as { echoed_parent_message_id_hex?: string | null };
+    expect(withoutParent.echoed_parent_message_id_hex).toBeNull();
   });
 
   it("deletes a message and returns the deletion event ids", async () => {
@@ -266,7 +375,10 @@ describe("MarmotAgentControlClient", () => {
       events.push(event);
     }
     expect(events.map((e) => e.type)).toEqual(["inbound_message", "resync_required"]);
-    expect(events[0]).toMatchObject({ text: "hello agent", group_id_hex: HEX32("cc") });
+    expect(events[0]).toMatchObject({
+      message: { text: "hello agent", recorded_at: 1_721_000_000 },
+      group_id_hex: HEX32("cc"),
+    });
   });
 
   it("surfaces a connection failure as a retryable error", async () => {
@@ -327,5 +439,57 @@ describe("normalizeHex", () => {
     expect(() => normalizeHex("")).toThrow(AgentControlError);
     expect(() => normalizeHex("zz")).toThrow(AgentControlError);
     expect(() => normalizeHex("abc")).toThrow(AgentControlError);
+  });
+});
+
+describe("decodeAgentControlEvent", () => {
+  const referencedMessage = {
+    message_id_hex: HEX32("dd"),
+    availability: "available",
+    sender: null,
+    recorded_at: null,
+    text_excerpt: "quoted",
+    text_truncated: false,
+    attachments: [],
+    attachments_truncated: false,
+  };
+
+  it("accepts a structured reply target", () => {
+    expect(
+      decodeAgentControlEvent({
+        type: "inbound_message",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: HEX32("cc"),
+        message: {
+          message_id_hex: HEX32("ee"),
+          sender: { account_id_hex: HEX32("bb"), is_self: false },
+          text: "hello",
+          recorded_at: 1,
+          media: [],
+        },
+        mentions_self: false,
+        reply_to: referencedMessage,
+      }),
+    ).toMatchObject({ reply_to: referencedMessage });
+  });
+
+  it("rejects malformed referenced-message routing and privacy fields", () => {
+    expect(() =>
+      decodeAgentControlEvent({
+        type: "message_deleted",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: HEX32("cc"),
+        event_id_hex: HEX32("ee"),
+        target_message_id_hex: HEX32("dd"),
+        actor: { account_id_hex: HEX32("bb"), is_self: false },
+        recorded_at: 1,
+        target: {
+          message_id_hex: HEX32("dd"),
+          availability: "available",
+          text_truncated: "false",
+          attachments_truncated: false,
+        },
+      }),
+    ).toThrowError(AgentControlError);
   });
 });

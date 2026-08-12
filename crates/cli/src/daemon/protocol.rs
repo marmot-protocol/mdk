@@ -1,6 +1,10 @@
 //! Daemon wire protocol: request/response types, framing, and the client.
 
 use super::*;
+use zeroize::Zeroizing;
+
+pub(crate) const DAEMON_SERVER_BUSY_CODE: &str = "server_busy";
+pub(crate) const DAEMON_SERVER_BUSY_MESSAGE: &str = "daemon connection capacity is busy";
 
 #[derive(Debug)]
 pub(crate) struct BoundedMessageSubscriptionIds {
@@ -61,6 +65,16 @@ pub enum DaemonClientError {
     EmptyResponse,
     #[error("daemon request is {size} bytes, exceeding the {limit} byte limit")]
     RequestTooLarge { size: usize, limit: usize },
+    #[error("{DAEMON_SERVER_BUSY_MESSAGE}")]
+    ServerBusy,
+}
+
+/// Failed daemon execute with the original `Cli` and stdin `nsec` sidecar when
+/// the client can safely retry locally (for example connect refused).
+pub(crate) struct RecoverableDaemonExecute {
+    pub err: DaemonClientError,
+    pub cli: Cli,
+    pub import_nsec: Option<crate::secret::ImportNsec>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -96,17 +110,31 @@ pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;
 
 pub type DaemonOutgoingStreamReport = StreamComposeReport;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum DaemonRequest {
     Ping,
     Status,
     Shutdown,
-    StreamWatch { cli: Box<Cli> },
-    MessagesSubscribe { cli: Box<Cli> },
-    ChatsSubscribe { cli: Box<Cli> },
-    GroupStateSubscribe { cli: Box<Cli> },
-    NotificationsSubscribe { cli: Box<Cli> },
-    Execute { cli: Box<Cli> },
+    StreamWatch {
+        cli: Box<Cli>,
+    },
+    MessagesSubscribe {
+        cli: Box<Cli>,
+    },
+    ChatsSubscribe {
+        cli: Box<Cli>,
+    },
+    GroupStateSubscribe {
+        cli: Box<Cli>,
+    },
+    NotificationsSubscribe {
+        cli: Box<Cli>,
+    },
+    Execute {
+        cli: Box<Cli>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_nsec: Option<crate::secret::ImportNsec>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,7 +149,13 @@ pub struct DaemonStreamResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonStreamError {
+    #[serde(default = "default_daemon_stream_error_code")]
+    pub code: String,
     pub message: String,
+}
+
+fn default_daemon_stream_error_code() -> String {
+    "stream_error".to_owned()
 }
 
 impl DaemonStreamResponse {
@@ -134,9 +168,14 @@ impl DaemonStreamResponse {
     }
 
     pub(crate) fn err(message: impl Into<String>) -> Self {
+        Self::err_with_code("stream_error", message)
+    }
+
+    pub(crate) fn err_with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             result: None,
             error: Some(DaemonStreamError {
+                code: code.into(),
                 message: message.into(),
             }),
             stream_end: false,
@@ -181,8 +220,28 @@ impl DaemonEventHub {
     }
 }
 
-pub(crate) async fn send_execute(socket: &Path, cli: Cli) -> Result<CliOutput, DaemonClientError> {
-    DaemonClient::new(socket).execute(cli).await
+pub(crate) async fn send_execute(
+    socket: &Path,
+    cli: Cli,
+    import_nsec: Option<crate::secret::ImportNsec>,
+) -> Result<CliOutput, RecoverableDaemonExecute> {
+    let request = DaemonRequest::Execute {
+        cli: Box::new(cli),
+        import_nsec,
+    };
+    match send_request(socket, &request).await {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            let DaemonRequest::Execute { cli, import_nsec } = request else {
+                unreachable!("send_execute only constructs Execute requests")
+            };
+            Err(RecoverableDaemonExecute {
+                err,
+                cli: *cli,
+                import_nsec,
+            })
+        }
+    }
 }
 
 pub(crate) async fn send_stream_watch(
@@ -248,10 +307,6 @@ impl DaemonClient {
         send_request(&self.socket, &DaemonRequest::Shutdown).await
     }
 
-    pub(crate) async fn execute(&self, cli: Cli) -> Result<CliOutput, DaemonClientError> {
-        send_request(&self.socket, &DaemonRequest::Execute { cli: Box::new(cli) }).await
-    }
-
     pub(crate) async fn stream_watch(&self, cli: Cli) -> Result<CliOutput, DaemonClientError> {
         send_request(
             &self.socket,
@@ -311,24 +366,50 @@ impl DaemonClient {
 }
 
 pub(crate) async fn write_daemon_output(stream: &mut UnixStream, output: &CliOutput) {
+    let _ = write_daemon_output_within(stream, output, DAEMON_RESPONSE_WRITE_TIMEOUT).await;
+}
+
+/// Write, flush, and close one daemon response within one deadline.
+///
+/// `false` is connection-fatal: the future may have been dropped after a
+/// partial frame was written, so callers must drop the stream and never retry
+/// or write another frame on it.
+pub(crate) async fn write_daemon_output_within<W>(
+    stream: &mut W,
+    output: &CliOutput,
+    timeout_after: Duration,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     let Ok(mut response) = serde_json::to_vec(output) else {
-        return;
+        return false;
     };
     response.push(b'\n');
-    let _ = stream.write_all(&response).await;
-    let _ = stream.shutdown().await;
+    matches!(
+        tokio::time::timeout(timeout_after, async {
+            stream.write_all(&response).await?;
+            stream.flush().await?;
+            stream.shutdown().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub(crate) async fn read_daemon_request(
     stream: &mut UnixStream,
 ) -> Result<DaemonRequest, Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = Vec::new();
+    let mut request = Zeroizing::new(Vec::new());
     // Buffer the raw stream so a near-1-MiB frame (e.g. an `Execute` request
     // carrying the whole `Cli`) costs a handful of `read()` syscalls instead of
     // one per byte. Cap the read at one byte past the limit so a client that
     // never sends a newline cannot make us buffer unbounded memory before the
     // size check runs (read_until on a Take adapter stops silently at the limit
     // instead of erroring). Mirrors agent-control's `read_frame`.
+    //
+    // `BufReader` may retain read-ahead bytes outside this `Zeroizing` buffer;
+    // only the assembled frame payload is wiped on drop.
     let limit = (MAX_DAEMON_REQUEST_BYTES + 1) as u64;
     let read = {
         let mut reader = BufReader::new(&mut *stream).take(limit);
@@ -373,11 +454,34 @@ pub(crate) async fn write_stream_response(
     stream: &mut UnixStream,
     response: &DaemonStreamResponse,
 ) -> bool {
+    write_stream_response_within(stream, response, DAEMON_RESPONSE_WRITE_TIMEOUT).await
+}
+
+/// Write and flush one streaming response within one deadline.
+///
+/// `false` is connection-fatal: the future may have been dropped after a
+/// partial frame was written, so callers must drop the stream and never retry
+/// or write another frame on it.
+pub(crate) async fn write_stream_response_within<W>(
+    stream: &mut W,
+    response: &DaemonStreamResponse,
+    timeout_after: Duration,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     let Ok(mut bytes) = serde_json::to_vec(response) else {
         return false;
     };
     bytes.push(b'\n');
-    stream.write_all(&bytes).await.is_ok()
+    matches!(
+        tokio::time::timeout(timeout_after, async {
+            stream.write_all(&bytes).await?;
+            stream.flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub(crate) async fn write_stream_end(stream: &mut UnixStream) -> bool {
@@ -398,8 +502,14 @@ pub(crate) async fn write_stream_end(stream: &mut UnixStream) -> bool {
 /// `read_daemon_request` / `MAX_DAEMON_REQUEST_BYTES`); checking client-side
 /// turns an oversized request (e.g. `messages send` with a huge body) into a
 /// clear local error instead of a connection the daemon must reject.
-pub(crate) fn encode_daemon_request(request: &DaemonRequest) -> Result<Vec<u8>, DaemonClientError> {
-    let mut bytes = serde_json::to_vec(request)?;
+///
+/// The returned buffer is zeroized on drop. `serde_json::to_vec` and the
+/// trailing `push` may leave transient copies in freed heap memory; this does
+/// not wipe every intermediate allocation.
+pub(crate) fn encode_daemon_request(
+    request: &DaemonRequest,
+) -> Result<Zeroizing<Vec<u8>>, DaemonClientError> {
+    let mut bytes = Zeroizing::new(serde_json::to_vec(request)?);
     // The daemon reads up to and excluding the trailing newline, so compare the
     // JSON payload length (without the framing newline) against the limit.
     if bytes.len() > MAX_DAEMON_REQUEST_BYTES {
@@ -432,7 +542,19 @@ pub(crate) async fn send_request(
     if response.is_empty() {
         return Err(DaemonClientError::EmptyResponse);
     }
-    Ok(serde_json::from_slice(&response)?)
+    decode_daemon_output(&response)
+}
+
+pub(crate) fn decode_daemon_output(response: &[u8]) -> Result<CliOutput, DaemonClientError> {
+    let response: serde_json::Value = serde_json::from_slice(response)?;
+    if response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        == Some(DAEMON_SERVER_BUSY_CODE)
+    {
+        return Err(DaemonClientError::ServerBusy);
+    }
+    Ok(serde_json::from_value(response)?)
 }
 
 pub(crate) async fn stream_request(

@@ -1,7 +1,7 @@
 /**
  * wn-agent control-plane smoke test (standalone; NOT part of the build).
  *
- * Exercises the `marmot.agent-control.v1` socket end-to-end through
+ * Exercises the `marmot.agent-control.v2` socket end-to-end through
  * `MarmotAgentControlClient`: account_list, group_info, send_final (capturing
  * the durable id), delete_message of that id, optional send_media, and a brief
  * subscribe_inbound that prints kinds + counts only. Prints clear PASS/FAIL per

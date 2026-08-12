@@ -1,0 +1,31 @@
+{
+  "name": "model-counterexample/admin-starvation-with-open-input",
+  "spec_version": "2",
+  "clients": ["alice", "bob"],
+  "steps": [
+    {
+      "type": "create_group",
+      "creator": "alice",
+      "name": "bounded-liveness",
+      "invitees": ["bob"],
+      "initial_admins": ["alice"],
+      "pending": "create"
+    },
+    {
+      "type": "acknowledge_outbound",
+      "client": "alice",
+      "publication": "create",
+      "outcome": "accepted"
+    },
+    { "type": "deliver_all" },
+    { "type": "tick", "clients": ["bob"] },
+    { "type": "self_update", "client": "bob", "pending": "self-update-0" },
+    {
+      "type": "update_admin_policy",
+      "client": "alice",
+      "admins": ["alice", "bob"],
+      "pending": "admin-change"
+    },
+    { "type": "barrier", "name": "input-remains-open-or-admin-is-unfairly-unscheduled" }
+  ]
+}

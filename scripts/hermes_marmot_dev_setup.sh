@@ -42,10 +42,12 @@ USAGE
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hermes_ref_override="${HERMES_AGENT_REF:-}"
+. "$repo_root/integrations/hermes/marmot/hermes-agent.lock"
 default_tmp="${TMPDIR:-/tmp}"
 dev_root="${HERMES_MARMOT_DEV_ROOT:-${default_tmp%/}/hermes-marmot-test}"
 hermes_url="${HERMES_AGENT_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
-hermes_ref="${HERMES_AGENT_REF:-}"
+hermes_ref="${hermes_ref_override:-${HERMES_AGENT_REF}}"
 marmot_home=""
 account_id="${MARMOT_ACCOUNT_ID_HEX:-}"
 group_id="${MARMOT_GROUP_ID_HEX:-}"
@@ -278,6 +280,7 @@ write_env_file() {
         printf 'export HERMES_HOME=%q\n' "$hermes_home"
         printf 'export MARMOT_HOME=%q\n' "$marmot_home"
         printf 'export MARMOT_AGENT_SOCKET=%q\n' "$marmot_home/dev/wn-agent.sock"
+        printf 'export MARMOT_OUTBOUND_MEDIA_DIR=%q\n' "$marmot_home/dev/outbound-media"
         printf 'export MARMOT_AGENT_AUTH_TOKEN_FILE=%q\n' "$auth_token_file"
         printf 'export MARMOT_AGENT_SOCKET_DIR_MODE=%q\n' "$socket_dir_mode"
         printf 'export MARMOT_AGENT_SOCKET_MODE=%q\n' "$socket_mode"
@@ -311,9 +314,12 @@ write_helper_scripts() {
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 cd "$MDK_REPO"
+mkdir -p "$MARMOT_OUTBOUND_MEDIA_DIR"
+chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
 wn_agent_control_args=(
     --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0700}"
     --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0600}"
+    --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR"
 )
 if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
     wn_agent_control_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
@@ -388,6 +394,14 @@ source "$dev_root/env.sh"
 exec "$MDK_REPO/scripts/hermes_marmot_connector_e2e.sh" --root "$dev_root"
 SCRIPT
 
+    cat >"$dev_root/verify-persisted-config.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+exec "$MDK_REPO/scripts/hermes_marmot_verify_persisted_config.sh" "$@" --root "$dev_root"
+SCRIPT
+
     cat >"$dev_root/bootstrap-agent.sh" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -457,6 +471,7 @@ SCRIPT
         "$dev_root/smoke-plugin.sh" \
         "$dev_root/e2e-deterministic.sh" \
         "$dev_root/e2e-connector.sh" \
+        "$dev_root/verify-persisted-config.sh" \
         "$dev_root/bootstrap-agent.sh" \
         "$dev_root/start-wn-agent.sh" \
         "$dev_root/start-hermes-gateway.sh" \
@@ -505,6 +520,7 @@ if [ "$print_env" -eq 1 ]; then
     echo "  $(printf '%q' "$dev_root/smoke-plugin.sh")"
     echo "  $(printf '%q' "$dev_root/e2e-deterministic.sh")"
     echo "  $(printf '%q' "$dev_root/e2e-connector.sh")"
+    echo "  $(printf '%q' "$dev_root/verify-persisted-config.sh")"
     echo "  $(printf '%q' "$dev_root/bootstrap-agent.sh") --qr"
     echo "  $(printf '%q' "$dev_root/run-wn-agent.sh")"
     echo "  $(printf '%q' "$dev_root/run-hermes-gateway.sh")"

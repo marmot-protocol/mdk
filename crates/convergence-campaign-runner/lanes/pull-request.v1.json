@@ -1,0 +1,29 @@
+{
+  "schema_version": "1",
+  "lane": "pull_request",
+  "contents": {
+    "strict_formal_gate": true,
+    "fixed_vectors": true,
+    "minimum_executed_cases": 1,
+    "file_backed_storage": true,
+    "crash_matrix": false,
+    "retained_relays": true,
+    "mutation_scope": "sentinel",
+    "process_campaigns": false,
+    "container_campaigns": false,
+    "resource_sweeps": false,
+    "constant_sweeps": false,
+    "mixed_version": false,
+    "incident_corpus": false
+  },
+  "budgets": {
+    "max_wall_clock_seconds": 3600,
+    "max_cpu_seconds": 7200,
+    "max_peak_rss_bytes": 6442450944,
+    "max_disk_bytes": 12884901888,
+    "max_artifact_bytes": 1073741824,
+    "artifact_retention_days": 14,
+    "max_flake_retries": 0,
+    "max_flake_rate_basis_points": 0
+  }
+}

@@ -46,6 +46,45 @@ fn generated_policy_cases_match_selector() {
     }
 }
 
+#[test]
+fn generated_priority_tie_matches_selector_before_digest() {
+    assert_named_pre_digest_case("priority_tie", "privileged", "priority_tie");
+}
+
+#[test]
+fn generated_committer_tie_matches_selector_before_digest() {
+    assert_named_pre_digest_case("committer_tie", "lower_committer", "committer_tie");
+}
+
+fn assert_named_pre_digest_case(name: &str, expected_branch: &str, expected_reason: &str) {
+    let case = parse_policy_cases(POLICY_CASES_JSON)
+        .into_iter()
+        .find(|case| case.name == name)
+        .unwrap_or_else(|| panic!("missing generated policy case {name:?}"));
+    let policy = ConvergencePolicy::from(&case.policy);
+    let candidates: Vec<BranchCandidate> = case
+        .branches
+        .iter()
+        .map(|branch| branch.to_candidate())
+        .collect();
+    let winner = select_canonical_branch(case.current_tip_epoch, &candidates, &policy)
+        .expect("named case selects a branch");
+    let loser = candidates
+        .iter()
+        .find(|candidate| candidate.id != winner.id)
+        .expect("named case has a loser");
+
+    assert_eq!(winner.id, expected_branch);
+    assert_eq!(
+        reason_against(&winner.score(&policy), &loser.score(&policy)),
+        expected_reason
+    );
+    assert!(
+        winner.tip_digest > loser.tip_digest,
+        "digest must favor the loser so the preceding rule is proven decisive"
+    );
+}
+
 fn candidate_orders(candidates: &[BranchCandidate]) -> Vec<Vec<BranchCandidate>> {
     let mut orders = vec![candidates.to_vec()];
     let mut reversed = candidates.to_vec();

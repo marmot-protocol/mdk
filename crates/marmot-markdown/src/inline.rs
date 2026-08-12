@@ -12,6 +12,7 @@ use crate::ast::{
     AutolinkKind, Block, Document, Inline, ListItem, NostrEntity, NostrHrp, TableCell,
 };
 use crate::block::LinkRef;
+use crate::destination::{classify_autolink_destination, classify_link_destination};
 use crate::entity;
 use crate::nostr;
 use crate::scanner;
@@ -20,10 +21,10 @@ use crate::scanner;
 /// Keep in sync with the explicit match arms — used as the exit condition
 /// for the plain-byte fast-scan in the `_` wildcard arm.
 ///
-/// `h`, `m`, `t`, `w` are tripwires for bare-URL schemes (`http(s)://`,
-/// `mailto:`, `marmot://`, `tel:`, `whitenoise:`); the bulk-scan rescue below keeps the
-/// fast path for the overwhelmingly common case of ordinary prose containing
-/// those letters.
+/// `h`, `m`, `t`, `w` are tripwires for bare-URL prefixes (`http(s)://`,
+/// `mailto:`, `marmot://`, `tel:`, `whitenoise:`, `www.`); the bulk-scan rescue
+/// below keeps the fast path for the overwhelmingly common case of ordinary
+/// prose containing those letters.
 const INLINE_SPECIAL: [bool; 128] = {
     let mut t = [false; 128];
     let chars = b"\\`$&[!*_~]<@nhmtw\n";
@@ -96,9 +97,14 @@ fn inline_children(item: &Inline) -> Option<&[Inline]> {
     }
 }
 
-pub(crate) fn parse_inlines(blocks: Vec<Block>, refs: &HashMap<String, LinkRef>) -> Document {
+pub(crate) fn parse_inlines(
+    blocks: Vec<Block>,
+    blank_lines_before: Vec<u8>,
+    refs: &HashMap<String, LinkRef>,
+) -> Document {
     Document {
         blocks: walk_blocks(blocks, refs),
+        blank_lines_before,
     }
 }
 
@@ -117,8 +123,12 @@ fn walk(block: Block, refs: &HashMap<String, LinkRef>) -> Block {
             level,
             inlines: tokenize(&extract_raw(inlines), refs),
         },
-        Block::BlockQuote { blocks } => Block::BlockQuote {
+        Block::BlockQuote {
+            blocks,
+            blank_lines_before,
+        } => Block::BlockQuote {
             blocks: walk_blocks(blocks, refs),
+            blank_lines_before,
         },
         Block::List { kind, tight, items } => Block::List {
             kind,
@@ -127,6 +137,7 @@ fn walk(block: Block, refs: &HashMap<String, LinkRef>) -> Block {
                 .into_iter()
                 .map(|item| ListItem {
                     blocks: walk_blocks(item.blocks, refs),
+                    blank_lines_before: item.blank_lines_before,
                     checked: item.checked,
                 })
                 .collect(),
@@ -213,6 +224,7 @@ impl BracketDelim {
 /// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
     let bytes = raw.as_bytes();
+    let code_span_index = CodeSpanIndex::new(bytes);
     let mut out: Vec<Inline> = Vec::new();
     // Entity decoding only ever shrinks bytes (e.g. `&amp;` → `&`), so
     // `raw.len()` is a safe upper bound. Pre-sizing avoids the doubling
@@ -271,7 +283,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 i += 1;
             }
             b'`' => {
-                if let Some((content, end)) = try_code_span(bytes, i) {
+                if let Some((content, end)) = try_code_span(bytes, i, &code_span_index) {
                     flush_text(&mut out, &mut buf, &delims);
                     out.push(Inline::Code(content));
                     i = end;
@@ -388,16 +400,20 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
             b'<' => {
                 if let Some((url, end)) = try_uri_autolink(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
+                    let classification = classify_autolink_destination(&url, AutolinkKind::Uri);
                     out.push(Inline::Autolink {
                         url,
                         kind: AutolinkKind::Uri,
+                        classification,
                     });
                     i = end;
                 } else if let Some((url, end)) = try_email_autolink(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
+                    let classification = classify_autolink_destination(&url, AutolinkKind::Email);
                     out.push(Inline::Autolink {
                         url,
                         kind: AutolinkKind::Email,
+                        classification,
                     });
                     i = end;
                 } else {
@@ -423,11 +439,13 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 }
             }
             b'h' | b'm' | b't' | b'w' => {
-                if let Some((url, end)) = try_bare_url(bytes, i) {
+                if let Some((url, kind, end)) = try_bare_url(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
+                    let classification = classify_autolink_destination(&url, kind);
                     out.push(Inline::Autolink {
                         url,
-                        kind: AutolinkKind::Uri,
+                        kind,
+                        classification,
                     });
                     i = end;
                 } else {
@@ -488,7 +506,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                                 continue;
                             }
                             // Same rescue for `h`/`m`/`t`/`w` — they're
-                            // tripwires for bare-URL schemes and most occur
+                            // tripwires for bare-URL prefixes and most occur
                             // mid-word in prose.
                             if matches!(cc, b'h' | b'm' | b't' | b'w')
                                 && !looks_like_bare_url_start(bytes, i)
@@ -581,31 +599,46 @@ fn trailing_space_count(buf: &str) -> usize {
     buf.bytes().rev().take_while(|&b| b == b' ').count()
 }
 
+/// Backtick runs indexed once by length. Without this, every unmatched opener
+/// rescans the remaining suffix, making distinct adversarial run lengths
+/// superlinear in the input size.
+struct CodeSpanIndex {
+    by_len: HashMap<usize, Vec<(usize, usize)>>,
+}
+
+impl CodeSpanIndex {
+    fn new(bytes: &[u8]) -> Self {
+        let mut by_len: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
+            }
+            let end = skip_backtick_run(bytes, i);
+            by_len.entry(end - i).or_default().push((i, end));
+            i = end;
+        }
+        Self { by_len }
+    }
+
+    fn next_run(&self, run_len: usize, after_start: usize) -> Option<(usize, usize)> {
+        let runs = self.by_len.get(&run_len)?;
+        let next = runs.partition_point(|(start, _)| *start <= after_start);
+        runs.get(next).copied()
+    }
+}
+
 /// Try to consume a code span starting at byte `i` (pointing at `` ` ``).
 /// Returns the (normalized content, end-index-just-past-closing-run).
-fn try_code_span(bytes: &[u8], i: usize) -> Option<(String, usize)> {
-    let mut j = i;
-    while j < bytes.len() && bytes[j] == b'`' {
-        j += 1;
-    }
-    let run_len = j - i;
-    let mut k = j;
-    while k < bytes.len() {
-        if bytes[k] == b'`' {
-            let mut m = k;
-            while m < bytes.len() && bytes[m] == b'`' {
-                m += 1;
-            }
-            if m - k == run_len {
-                let content = normalize_code_span(&bytes[j..k]);
-                return Some((content, m));
-            }
-            k = m;
-        } else {
-            k += 1;
-        }
-    }
-    None
+fn try_code_span(bytes: &[u8], i: usize, index: &CodeSpanIndex) -> Option<(String, usize)> {
+    let content_start = skip_backtick_run(bytes, i);
+    let run_len = content_start - i;
+    let (closing_start, closing_end) = index.next_run(run_len, i)?;
+    Some((
+        normalize_code_span(&bytes[content_start..closing_start]),
+        closing_end,
+    ))
 }
 
 fn skip_backtick_run(bytes: &[u8], i: usize) -> usize {
@@ -930,6 +963,9 @@ fn parse_ref_label(b: &[u8], i: usize) -> Option<(String, usize)> {
 /// raw bytes between `[` and `]` from the source. Backslash-escaped `]`
 /// inside is allowed.
 fn label_text(b: &[u8], start: usize, end: usize) -> String {
+    if end.saturating_sub(start) > 999 {
+        return String::new();
+    }
     let mut out = String::new();
     let src = std::str::from_utf8(&b[start..end]).unwrap_or("");
     let mut chars = src.chars().peekable();
@@ -984,6 +1020,7 @@ fn absorb_link(
     }
 
     let kind_is_image = opener.kind == b'!';
+    let classification = classify_link_destination(&dest);
     // Children = items after the placeholder.
     let children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
     // Drop the placeholder Text("[" / "![").
@@ -993,12 +1030,14 @@ fn absorb_link(
             dest,
             title,
             alt: children,
+            classification,
         });
     } else {
         out.push(Inline::Link {
             dest,
             title,
             children,
+            classification,
         });
     }
     // Pop all delimiters from opener_idx onward (any inner unclosed openers
@@ -1027,38 +1066,39 @@ fn absorb_link(
 // Autolinks + raw HTML
 // ---------------------------------------------------------------------------
 
-/// Schemes recognized as bare (unbracketed) URLs.
+/// Prefixes recognized as bare (unbracketed) URLs.
 ///
 /// **Order matters:** `whitenoise-staging://` must come before `whitenoise://`
 /// because the `find(..)` lookup is first-match-wins, and the latter is a
 /// strict prefix of the former. With them in the wrong order
 /// `whitenoise-staging://x` would parse as `whitenoise:` + literal
 /// `-staging://x`.
-const BARE_URL_SCHEMES: &[&[u8]] = &[
-    b"https://",
-    b"http://",
-    b"mailto:",
-    b"tel:",
-    b"marmot://",
-    b"whitenoise-staging://",
-    b"whitenoise://",
+const BARE_URL_PREFIXES: &[(&[u8], AutolinkKind)] = &[
+    (b"https://", AutolinkKind::Uri),
+    (b"http://", AutolinkKind::Uri),
+    (b"mailto:", AutolinkKind::Uri),
+    (b"tel:", AutolinkKind::Uri),
+    (b"marmot://", AutolinkKind::Uri),
+    (b"whitenoise-staging://", AutolinkKind::Uri),
+    (b"whitenoise://", AutolinkKind::Uri),
+    (b"www.", AutolinkKind::Www),
 ];
 
 /// True if the bytes starting at `i` begin with one of the recognized bare-URL
-/// scheme prefixes. Used by the bulk-scan tripwire to keep ordinary text
+/// prefixes. Used by the bulk-scan tripwire to keep ordinary text
 /// (every `d`/`h`/`m`/`t`/`w` byte in prose) on the fast path.
 fn looks_like_bare_url_start(bytes: &[u8], i: usize) -> bool {
-    BARE_URL_SCHEMES
+    BARE_URL_PREFIXES
         .iter()
-        .any(|s| bytes.get(i..i + s.len()) == Some(s))
+        .any(|(prefix, _)| bytes.get(i..i + prefix.len()) == Some(*prefix))
 }
 
 /// Try to consume a bare URL (no surrounding `<>`) starting at `i`. Matches
-/// `https://`, `http://`, `mailto:`, `tel:`, or an app deep-link authority form
-/// followed by a non-empty run of non-whitespace, non-`<` bytes. Trailing
-/// punctuation is stripped per the GFM extended-autolink rules (`.,;:!?*_~`
-/// always; `)` only when it would unbalance the URL body).
-fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+/// a recognized scheme or `www.` prefix followed by a non-empty run of
+/// non-whitespace, non-`<` bytes. Trailing punctuation is stripped per the GFM
+/// extended-autolink rules (`.,;:!?*_~` always; `)` only when it would
+/// unbalance the URL body).
+fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)> {
     let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
     if !nostr::left_boundary_ok(prev) {
         return None;
@@ -1070,10 +1110,11 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     if prev == Some(b'<') {
         return None;
     }
-    let scheme = BARE_URL_SCHEMES
+    let (prefix, kind) = BARE_URL_PREFIXES
         .iter()
-        .find(|s| bytes.get(i..i + s.len()) == Some(**s))?;
-    let body_start = i + scheme.len();
+        .copied()
+        .find(|(prefix, _)| bytes.get(i..i + prefix.len()) == Some(*prefix))?;
+    let body_start = i + prefix.len();
     let mut j = body_start;
     while j < bytes.len() {
         let c = bytes[j];
@@ -1098,7 +1139,7 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         return None;
     }
     let url = std::str::from_utf8(&bytes[i..j]).ok()?.to_string();
-    Some((url, j))
+    Some((url, kind, j))
 }
 
 /// Trim trailing punctuation from a bare-URL body per GFM:

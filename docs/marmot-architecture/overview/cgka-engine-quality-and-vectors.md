@@ -1,7 +1,7 @@
 ---
 title: "CGKA Engine Quality And Vectors"
 created: 2026-05-11
-updated: 2026-05-13
+updated: 2026-07-30
 tags: [marmot, overview, cgka, conformance, vectors]
 status: working-note
 ---
@@ -50,6 +50,11 @@ The current test stack has useful coverage at several levels:
 - Tamarin models for distributed convergence.
 
 The remaining gap is a broader byte-level vector story for encodings and transport shapes.
+
+The larger assurance and simulation program is tracked in
+[`../convergence-reliability-plan.md`](../convergence-reliability-plan.md). That plan owns the exact-state oracle,
+constant ledger, retained-relay model, sustained workload campaigns, independent verification, and progression from
+the engine harness to app-runtime and multi-process simulation.
 
 ## Scenario Vectors
 

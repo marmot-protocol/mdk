@@ -73,6 +73,10 @@ pub enum QuicTextStreamError {
     UnexpectedSequence { expected: u64, actual: u64 },
     #[error("agent text stream crypto failed: {0}")]
     Crypto(String),
+    #[error("durable publisher sequence state is required for encrypted preview records")]
+    PublisherSequenceStateRequired,
+    #[error("agent text stream publisher sequence state failed: {0}")]
+    PublisherSequence(String),
 }
 
 impl From<QuicConnectFault> for QuicTextStreamError {

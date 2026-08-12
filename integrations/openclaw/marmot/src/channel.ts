@@ -2,19 +2,18 @@
 //
 // Composed with `createChatChannelPlugin`: meta + capabilities + a config
 // adapter that resolves a Marmot account from the `channels.marmot` config (or
-// MARMOT_* env), the durable/live message adapter, DM allowlist security, and
-// reply threading. Outbound (durable send + live preview) flows through the
-// message adapter; inbound is driven by src/inbound-runtime.ts.
+// MARMOT_* env), the durable message adapter, gateway-owned inbound lifecycle,
+// DM allowlist security, and reply threading.
 
-import { jsonResult } from "openclaw/plugin-sdk/channel-actions";
 import type {
   ChannelMessageActionAdapter,
   ChannelMessageActionContext,
 } from "openclaw/plugin-sdk/channel-contract";
 import {
   createChatChannelPlugin,
+  jsonResult,
   type OpenClawConfig,
-} from "openclaw/plugin-sdk/channel-core";
+} from "openclaw/plugin-sdk/core";
 import {
   buildBaseChannelStatusSummary,
   collectStatusIssuesFromLastError,
@@ -29,6 +28,7 @@ import {
   type MarmotChannelAccountConfig,
   type ResolvedMarmotAccount,
 } from "./config.js";
+import { startMarmotGatewayAccount } from "./gateway.js";
 import { createMarmotMessagingAdapter } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
 import {
@@ -98,7 +98,7 @@ function accountSnapshot(
     lastInboundAt: inbound.lastInboundAt ?? runtime?.lastInboundAt ?? null,
     lastOutboundAt: inbound.lastOutboundAt ?? runtime?.lastOutboundAt ?? null,
     reconnectAttempts: inbound.reconnectAttempts ?? runtime?.reconnectAttempts,
-    mode: account.streamMode,
+    mode: "off",
     dmPolicy: account.dmPolicy ?? "allowlist",
     allowFrom: account.allowFrom.map(String),
     probe,
@@ -148,6 +148,7 @@ export function createMarmotDeleteActionAdapter(
 ): ChannelMessageActionAdapter {
   return {
     describeMessageTool: () => ({ actions: ["delete"] }),
+    supportsAction: ({ action }) => action === "delete",
     handleAction: async (ctx: ChannelMessageActionContext) => {
       if (ctx.action !== "delete") {
         return jsonResult({ ok: false, error: `unsupported action: ${ctx.action}` });
@@ -207,7 +208,7 @@ export function createMarmotChannelPlugin() {
         chatTypes: ["direct", "group"],
         reply: true,
         media: true,
-        blockStreaming: true,
+        blockStreaming: false,
         // Marmot supports deleting (unsending) a previously-sent message; gates
         // the agent-facing `delete` message action's visibility.
         unsend: true,
@@ -245,9 +246,13 @@ export function createMarmotChannelPlugin() {
         messageToolHints: () => [
           "- Marmot replies: to answer the current conversation, just write your reply as normal assistant text — it is delivered to the Marmot group automatically. You do not need the `message` tool to reply.",
           "- Marmot `message` targets: a Marmot conversation is addressed by its group id hex (optionally prefixed `marmot:`). There are no @handles or #channels.",
+          "- Marmot history: use `marmot_history` with the conversation group id when you need an exact durable message id, one referenced message, or an older transcript page.",
         ],
       },
       actions,
+      gateway: {
+        startAccount: startMarmotGatewayAccount,
+      },
     },
     security: {
       dm: {

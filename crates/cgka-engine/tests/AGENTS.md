@@ -51,6 +51,11 @@ backend on the same rail.
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, and retained-anchor behavior
 
+- **File:** `convergence_policy_pin.rs`
+  - **Owns:** Default-build pinned v1 policy rejection (mdk#970). Run
+    `just test-convergence-policy-pin` without `test-policy-overrides`; the broader integration
+    matrix enables that feature explicitly for settlement/rewind fixtures.
+
 - **File:** `mip03_guards.rs`
   - **Owns:** Phase 4.9 — committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove
 
@@ -58,21 +63,35 @@ backend on the same rail.
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
 
 - **File:** `pending_commit_recovery.rs`
-  - **Owns:** Crash-during-publish recovery at session open — `hydrate_stable_groups_from_storage` detects a surviving
+  - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `auto_commit_atomicity.rs`
-  - **Owns:** Auto-commit staging atomicity (mdk#333) — an injected `put_group` failure during staging leaves no torn
-    group record, no orphaned pending publish, no leaked snapshot, and no stale stored proposal; the group stays usable
+  - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
+    seam that projects the record plus direct-ingest capability-cache coverage. No torn record or capability cache,
+    orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
+    manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
+    stored convergence so it is eventually applied
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
+
+- **File:** `two_phase_hydration.rs`
+  - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`
+    promotion and quarantine parity, cheap-pass idempotency, durable transport-route seeding, the bounded ingest
+    route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
+    retention-window route retirement across rotation and restart
 
 - **File:** `snapshot_privacy.rs`
   - **Owns:** Snapshot names do not expose plaintext group ids
 
 - **File:** `sqlite_storage.rs`
   - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke
+
+- **File:** `crash_recovery_sqlite.rs`
+  - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
+    boundaries. Reopens encrypted SQLite, observes the stranded pre-hydration state, then verifies hydration restores
+    live state and releases convergence snapshots.
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh

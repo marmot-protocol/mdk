@@ -5,18 +5,25 @@
 //! behavior into seeded random send/leave sequences.
 
 use cgka_conformance_simulator::{
-    ClientBuilder, EpochChangeObservation, GeneratedScenarioCase, HarnessClient,
-    PendingResolutionObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
-    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
-    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
-    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
+    ClientBuilder, ConformanceCanonicalStateSnapshot, EpochChangeObservation,
+    GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind, HarnessClient,
+    HarnessStorageMode, PendingResolutionObservation, RelayHistoryCompletenessClaimV2,
+    ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+    ScenarioMessageSelectorV2, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
+    ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
+    compare_trace_expectations, generate_admin_churn_family, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
+    observe_client_exact, run_generated_case_report, run_generated_case_report_with_storage_mode,
+    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
+    run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
 };
+use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::GroupEvent;
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::TransportMessage;
@@ -30,6 +37,14 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     let n = name.len().min(32);
     out[..n].copy_from_slice(&name[..n]);
     out
+}
+
+fn application_selector(sender: &str) -> ScenarioMessageSelectorV2 {
+    ScenarioMessageSelectorV2 {
+        sender: Some(sender.into()),
+        class: Some(ScenarioTransportClass::Application),
+        ..Default::default()
+    }
 }
 
 fn selfremove_registry() -> FeatureRegistry {
@@ -118,6 +133,587 @@ async fn three_client_happy_path_via_harness() {
 }
 
 #[tokio::test]
+async fn exact_oracle_matches_full_canonical_state_after_join() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("exact-state", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    let alice_snapshot = alice.canonical_group_snapshot();
+    let bob_snapshot = bob.canonical_group_snapshot();
+    assert_eq!(alice_snapshot, bob_snapshot);
+    assert_eq!(alice_snapshot.leaves.len(), 2);
+    assert_eq!(alice_snapshot.sorted_member_identities_hex.len(), 2);
+    assert_eq!(alice_snapshot.exporter_commitment_sha256.len(), 64);
+    assert_eq!(alice_snapshot.group_context_sha256.len(), 64);
+
+    let trace = ScenarioTrace {
+        name: "exact-state-after-join/v1".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![
+            observe_client_exact("alice", &mut alice),
+            observe_client_exact("bob", &mut bob),
+        ],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+        &trace,
+    );
+    assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+}
+
+#[tokio::test]
+async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
+    let bus = TransportBus::ordered();
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .protocol_profile(ProtocolProfile::Current)
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .attach(&bus);
+    let (_group_id, pending) = alice
+        .create_group_with_admins_maybe_pending("terminal", vec![], vec![], vec![])
+        .await;
+    assert!(
+        pending.is_none(),
+        "current founding group is immediately live"
+    );
+    alice.drain_events();
+
+    alice.request_disband().await.expect("request disband");
+    alice
+        .advance_convergence()
+        .await
+        .expect("prepare disband commit");
+    let pending = alice.pending_publication_refs();
+    assert_eq!(pending.len(), 1, "disband prepares one publication");
+    alice.confirm(pending[0]).await;
+    alice
+        .advance_convergence()
+        .await
+        .expect("open disband collecting pass");
+    clock.advance_ms(1_000);
+    alice
+        .advance_convergence()
+        .await
+        .expect("settle disband convergence at quiescence");
+    assert!(
+        matches!(
+            alice.canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Disbanded(_)
+        ),
+        "disband must reach terminal state at the pinned quiescence boundary"
+    );
+    bus.deliver_all();
+
+    let before_restart = alice.canonical_state_snapshot();
+    let ConformanceCanonicalStateSnapshot::Disbanded(tombstone) = &before_restart else {
+        panic!("expected terminal tombstone, got {before_restart:#?}");
+    };
+    assert_eq!(tombstone.epoch, 1);
+    assert_eq!(tombstone.former_member_identities_hex.len(), 1);
+    assert_eq!(tombstone.commit_digest_hex.len(), 64);
+
+    let trace = ScenarioTrace {
+        name: "exact-disband-tombstone".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observe_client_exact("alice", &mut alice)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into()],
+            },
+        ],
+        &trace,
+    );
+    assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+
+    alice.restart();
+    assert_eq!(alice.canonical_state_snapshot(), before_restart);
+}
+
+#[tokio::test]
+async fn bidirectional_decryptability_probe_passes_for_settled_members() {
+    let spec = ScenarioSpec {
+        name: "bidirectional-decryptability/settled".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "decryptability".into(),
+                invitees: vec!["bob".into(), "carol".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "carol".into()],
+            },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            TraceExpectation::ClientsBidirectionallyDecryptable {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    )
+    .await
+    .expect("run settled decryptability probe");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "unexpected failures: {:#?}",
+        report.expectation_failures
+    );
+    let probe = &report
+        .observed_trace
+        .as_ref()
+        .expect("trace")
+        .decryptability_probes[0];
+    assert!(probe.succeeded());
+    assert_eq!(probe.probes.len(), 6);
+}
+
+#[tokio::test]
+async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachability() {
+    let spec = ScenarioSpec {
+        name: "bidirectional-decryptability/asymmetric-epoch".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "decryptability".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "advanced-without-bob".into(),
+                pending: "advance".into(),
+            },
+            ScenarioStep::accept_publication("alice", "advance"),
+            ScenarioStep::OmitMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    publication: Some("advance".into()),
+                    class: Some(ScenarioTransportClass::Commit),
+                    ..Default::default()
+                },
+            },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: vec!["alice".into(), "bob".into()],
+        }],
+    )
+    .await
+    .expect("run asymmetric decryptability probe");
+
+    assert_eq!(report.expectation_failures.len(), 1);
+    assert_eq!(
+        report.expectation_failures[0].kind,
+        "bidirectional_decryptability_failed"
+    );
+    let probe = &report
+        .observed_trace
+        .as_ref()
+        .expect("trace")
+        .decryptability_probes[0];
+    let alice_to_bob = probe
+        .probes
+        .iter()
+        .find(|edge| edge.sender == "alice" && edge.recipient == "bob")
+        .expect("alice to bob edge");
+    assert!(!alice_to_bob.succeeded());
+    assert_eq!(
+        alice_to_bob
+            .recipient_ledger
+            .as_ref()
+            .expect("deferred ledger")
+            .transport_deferred,
+        1
+    );
+    assert!(
+        probe
+            .probes
+            .iter()
+            .find(|edge| edge.sender == "bob" && edge.recipient == "alice")
+            .expect("bob to alice edge")
+            .succeeded()
+    );
+}
+
+#[tokio::test]
+async fn bidirectional_decryptability_probe_rejects_a_named_nonmember() {
+    let spec = ScenarioSpec {
+        name: "bidirectional-decryptability/nonmember".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "decryptability".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        }],
+    )
+    .await
+    .expect("run nonmember decryptability probe");
+
+    assert_eq!(report.expectation_failures.len(), 1);
+    let probe = &report
+        .observed_trace
+        .as_ref()
+        .expect("trace")
+        .decryptability_probes[0];
+    assert!(!probe.succeeded());
+    assert!(probe.probes.iter().any(|edge| {
+        edge.sender == "carol"
+            && matches!(
+                edge.send_status,
+                cgka_conformance_simulator::DecryptabilityProbeSendStatus::Failed { .. }
+            )
+    }));
+}
+
+#[tokio::test]
+async fn no_pending_work_rejects_delayed_transport_then_accepts_drained_delivery() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("pending-delayed", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    bob.send_app(b"held".to_vec()).await;
+    assert!(bus.delay_queued(0, "held-message"));
+    let held_trace = ScenarioTrace {
+        name: "pending-delayed/held".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observe_client_exact("alice", &mut alice)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        }],
+        &held_trace,
+    );
+    assert_eq!(failures.len(), 1, "expected delayed blocker: {failures:#?}");
+    assert_eq!(failures[0].kind, "pending_work_remaining");
+    assert!(
+        failures[0].message.contains("bus_delayed"),
+        "delayed subsystem should be named: {failures:#?}"
+    );
+
+    assert!(bus.release_delayed("held-message"));
+    bus.deliver_all();
+    alice.tick().await;
+    let drained_trace = ScenarioTrace {
+        name: "pending-delayed/drained".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observe_client_exact("alice", &mut alice)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        }],
+        &drained_trace,
+    );
+    assert!(
+        failures.is_empty(),
+        "unexpected pending work: {failures:#?}"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_rejects_bus_queue_and_unread_mailbox() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("pending-bus", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    bob.send_app(b"queued".to_vec()).await;
+    let queued_for_alice = observe_client_exact("alice", &mut alice);
+    assert_eq!(
+        queued_for_alice
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_queued_messages,
+        1
+    );
+    let sender_does_not_own_queued_delivery = observe_client_exact("bob", &mut bob);
+    assert_eq!(
+        sender_does_not_own_queued_delivery
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_queued_messages,
+        0
+    );
+
+    bus.deliver_all();
+    let unread_for_alice = observe_client_exact("alice", &mut alice);
+    assert_eq!(
+        unread_for_alice
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_mailbox_messages,
+        1
+    );
+    let sender_mailbox_remains_empty = observe_client_exact("bob", &mut bob);
+    assert_eq!(
+        sender_mailbox_remains_empty
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_mailbox_messages,
+        0
+    );
+
+    alice.tick().await;
+    let drained = observe_client_exact("alice", &mut alice);
+    assert!(
+        drained
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .is_empty(),
+        "all transport and engine work should be drained: {drained:#?}"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_does_not_claim_delivery_of_dropped_application_input() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("dropped-is-not-pending", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    alice.send_app(b"intentionally-dropped".to_vec()).await;
+    assert!(bus.drop_queued(0), "drop the application transport object");
+
+    let alice_observation = observe_client_exact("alice", &mut alice);
+    let bob_observation = observe_client_exact("bob", &mut bob);
+    let sender_entry = alice_observation
+        .scenario_input_ledger
+        .iter()
+        .find(|entry| entry.payload == "intentionally-dropped")
+        .expect("sender records the published application input");
+    assert_eq!(
+        sender_entry.disposition,
+        ScenarioInputDisposition::Accepted,
+        "sender acceptance is not an end-to-end delivery claim"
+    );
+    assert!(
+        bob_observation.scenario_input_ledger.is_empty(),
+        "a recipient cannot classify an object the scenario removed before delivery"
+    );
+
+    let trace = ScenarioTrace {
+        name: "dropped-is-not-pending".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![alice_observation, bob_observation],
+    };
+    let no_pending_failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into(), "bob".into()],
+        }],
+        &trace,
+    );
+    assert!(
+        no_pending_failures.is_empty(),
+        "NoPendingWork is local execution quiescence, not transport completeness: \
+         {no_pending_failures:#?}"
+    );
+
+    let delivery_failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::ClientState {
+            client: "bob".into(),
+            epoch: 1,
+            member_count: 2,
+            received_payloads: Some(vec!["intentionally-dropped".into()]),
+            added_members: None,
+            removed_members: None,
+        }],
+        &trace,
+    );
+    assert_eq!(
+        delivery_failures.len(),
+        1,
+        "delivery must be asserted independently from local quiescence"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_rejects_unconfirmed_publish() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("pending-publish", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    let pending_invite = alice.invite(vec![carol.fresh_key_package().await]).await;
+    let observation = observe_client_exact("alice", &mut alice);
+    assert_eq!(
+        observation
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .engine
+            .non_stable_epoch_state,
+        1
+    );
+    let trace = ScenarioTrace {
+        name: "pending-publish/unconfirmed".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observation],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        }],
+        &trace,
+    );
+    assert_eq!(failures.len(), 1, "expected publish blocker: {failures:#?}");
+    assert!(
+        failures[0].message.contains("engine"),
+        "engine subsystem should be named: {failures:#?}"
+    );
+
+    alice.fail(pending_invite).await;
+}
+
+#[tokio::test]
 async fn delayed_past_epoch_app_message_peels_from_retained_anchor() {
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
@@ -158,14 +754,9 @@ async fn delayed_past_epoch_app_message_peels_from_retained_anchor() {
     let outcomes = carol.tick().await;
 
     assert!(
-        outcomes.iter().all(|outcome| {
-            !matches!(
-                outcome,
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed
-                })
-            )
-        }),
+        outcomes
+            .iter()
+            .all(|outcome| { !matches!(outcome, Ok(IngestOutcome::TransportDeferred { .. })) }),
         "past-epoch app should peel from the retained epoch context: {outcomes:?}"
     );
     // The delayed past-epoch app message is stored under its content-derived
@@ -247,6 +838,7 @@ async fn three_client_message_exchange_vector_is_stable() {
         }],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -266,12 +858,17 @@ async fn three_client_message_exchange_vector_is_stable() {
             }],
             errors: vec![],
             admin_policies: vec![],
+            decryptability_probes: vec![],
             observations: vec![
                 cgka_conformance_simulator::ClientObservation {
                     client: "alice".into(),
                     epoch: 1,
                     member_count: 3,
                     group_name: "vector-smoke".into(),
+                    group_description: String::new(),
+                    canonical_state: None,
+                    scenario_input_ledger: vec![],
+                    pending_work: None,
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -289,6 +886,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     group_name: "vector-smoke".into(),
+                    group_description: String::new(),
+                    canonical_state: None,
+                    scenario_input_ledger: vec![],
+                    pending_work: None,
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -306,6 +907,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     group_name: "vector-smoke".into(),
+                    group_description: String::new(),
+                    canonical_state: None,
+                    scenario_input_ledger: vec![],
+                    pending_work: None,
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -327,7 +932,8 @@ async fn three_client_message_exchange_vector_is_stable() {
 async fn scenario_spec_runs_three_client_message_exchange() {
     let spec = ScenarioSpec {
         name: "three-client-message-exchange/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -338,10 +944,7 @@ async fn scenario_spec_runs_three_client_message_exchange() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into()],
@@ -377,7 +980,8 @@ async fn scenario_spec_runs_three_client_message_exchange() {
 async fn scenario_spec_supports_publish_fail() {
     let spec = ScenarioSpec {
         name: "publish-fail/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -388,10 +992,7 @@ async fn scenario_spec_supports_publish_fail() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::FailPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::fail_publication("alice", "create"),
             ScenarioStep::Observe {
                 clients: vec!["alice".into()],
             },
@@ -415,10 +1016,173 @@ async fn scenario_spec_supports_publish_fail() {
 }
 
 #[tokio::test]
+async fn definite_publish_failure_retracts_commit_before_local_rollback() {
+    let spec = ScenarioSpec {
+        name: "transported-commit-after-local-rollback/minimal/v1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "before".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "after".into(),
+                pending: "update".into(),
+            },
+            ScenarioStep::fail_publication("alice", "update"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    };
+
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: "alice".into(),
+                pending: "create".into(),
+                resolution: "confirmed".into(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 5,
+                client: "alice".into(),
+                pending: "update".into(),
+                resolution: "rolled_back".into(),
+            },
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    )
+    .await
+    .expect("definite-failure scenario reports");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "definite failure must leave no transported commit: {:?}",
+        report.expectation_failures
+    );
+    let trace = report.observed_trace.as_ref().expect("observed trace");
+    assert!(
+        trace
+            .observations
+            .iter()
+            .all(|observation| observation.epoch == 1),
+        "both clients must remain at the pre-publish epoch"
+    );
+    let bob = trace
+        .observations
+        .iter()
+        .find(|observation| observation.client == "bob")
+        .expect("bob observation");
+    assert!(
+        bob.scenario_input_ledger.is_empty(),
+        "bob must never observe the retracted commit"
+    );
+}
+
+#[tokio::test]
+async fn definite_publish_failure_retracts_commit_and_welcome() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol")).attach(&bus);
+    let (_group_id, create_pending) = alice
+        .create_group(
+            "retract-invite-artifacts",
+            vec![bob.fresh_key_package().await],
+            vec![],
+        )
+        .await;
+    alice.confirm(create_pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    let invite_pending = alice.invite(vec![carol.fresh_key_package().await]).await;
+    assert_eq!(bus.queued_len(), 2, "invite commit and Welcome are queued");
+    assert!(
+        bus.delay_queued(0, "pending-welcome"),
+        "hold the Welcome in the delayed set"
+    );
+    alice.fail(invite_pending).await;
+    assert_eq!(
+        bus.queued_len(),
+        0,
+        "definite failure must retract the complete publication"
+    );
+    assert!(
+        !bus.release_delayed("pending-welcome"),
+        "definite failure must retract delayed publication artifacts too"
+    );
+    bus.deliver_all();
+    carol.tick().await;
+    assert_eq!(alice.epoch(), EpochId(1));
+    assert_eq!(alice.members().len(), 2);
+}
+
+#[tokio::test]
+async fn publication_failure_rejects_artifact_that_already_reached_a_recipient() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let (_group_id, create_pending) = alice
+        .create_group(
+            "ambiguous-exposure-guard",
+            vec![bob.fresh_key_package().await],
+            vec![],
+        )
+        .await;
+    alice.confirm(create_pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    let pending = alice.update_group_data("after").await;
+    bus.deliver_all();
+    bob.tick().await;
+    let error = alice
+        .try_fail(pending)
+        .await
+        .expect_err("mailbox exposure is not a definite failure");
+    assert!(
+        error.to_string().contains("reached a recipient mailbox"),
+        "unexpected error: {error}"
+    );
+
+    alice.confirm(pending).await;
+    assert_eq!(alice.epoch(), EpochId(2));
+    assert_eq!(bob.epoch(), EpochId(2));
+    assert_eq!(alice.group_name(), "after");
+    assert_eq!(bob.group_name(), "after");
+}
+
+#[tokio::test]
 async fn scenario_spec_supports_leave_and_clear_partition() {
     let spec = ScenarioSpec {
         name: "leave-and-clear-partition/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -429,10 +1193,7 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -483,10 +1244,11 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
 }
 
 #[tokio::test]
-async fn scenario_spec_can_drop_queued_message() {
+async fn scenario_spec_can_omit_semantically_selected_message() {
     let spec = ScenarioSpec {
         name: "drop-queued/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -497,10 +1259,7 @@ async fn scenario_spec_can_drop_queued_message() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -509,7 +1268,9 @@ async fn scenario_spec_can_drop_queued_message() {
                 sender: "bob".into(),
                 payload: "bob:dropped".into(),
             },
-            ScenarioStep::DropQueued { index: 0 },
+            ScenarioStep::OmitMessage {
+                selector: application_selector("bob"),
+            },
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into()],
@@ -529,10 +1290,11 @@ async fn scenario_spec_can_drop_queued_message() {
 }
 
 #[tokio::test]
-async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
+async fn scenario_spec_can_duplicate_withhold_and_reorder_selected_messages() {
     let spec = ScenarioSpec {
         name: "queue-faults/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -543,10 +1305,7 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into()],
@@ -559,24 +1318,31 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
                 sender: "carol".into(),
                 payload: "carol:second".into(),
             },
-            ScenarioStep::DuplicateQueued { index: 0 },
-            ScenarioStep::DelayQueued {
-                index: 1,
-                delayed: "delayed-copy".into(),
+            ScenarioStep::DuplicateMessage {
+                selector: application_selector("bob"),
             },
-            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::WithholdMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    occurrence: 1,
+                    ..application_selector("bob")
+                },
+                label: "delayed-copy".into(),
+            },
+            ScenarioStep::ReorderMessages {
+                order: vec![application_selector("carol"), application_selector("bob")],
+            },
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into()],
             },
-            ScenarioStep::ReleaseDelayed {
-                delayed: "delayed-copy".into(),
+            ScenarioStep::ReleaseWithheld {
+                label: "delayed-copy".into(),
             },
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into()],
             },
-            ScenarioStep::Observe {
+            ScenarioStep::ObserveExact {
                 clients: vec!["alice".into()],
             },
         ],
@@ -588,6 +1354,102 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
         trace.observations[0].received_payloads,
         vec!["carol:second", "bob:first"]
     );
+    let bob_message = trace.observations[0]
+        .scenario_input_ledger
+        .iter()
+        .find(|entry| entry.payload == "bob:first")
+        .expect("bob's logical message is tracked");
+    assert_eq!(bob_message.ingest_attempts, 2);
+    assert_eq!(bob_message.ingest_accepted, 1);
+    assert_eq!(bob_message.delivered, 1);
+    assert_eq!(bob_message.deduplicated, 1);
+    assert!(!bob_message.pending);
+}
+
+#[tokio::test]
+async fn exact_observation_ledgers_commit_proposal_and_application_dispositions() {
+    let spec = ScenarioSpec {
+        name: "generalized-scenario-input-ledger/v1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "ledger".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "ledger-updated".into(),
+                pending: "rename".into(),
+            },
+            ScenarioStep::accept_publication("alice", "rename"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "ledger-message".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::Leave {
+                client: "bob".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+    let ledger = &trace.observations[0].scenario_input_ledger;
+
+    let commit = ledger
+        .iter()
+        .find(|entry| entry.scenario_id == "step-4:update_group_data")
+        .expect("named commit input");
+    assert_eq!(commit.kind, ScenarioInputKind::Commit);
+    assert_eq!(commit.disposition, ScenarioInputDisposition::Accepted);
+
+    let application = ledger
+        .iter()
+        .find(|entry| entry.scenario_id == "step-8:send_app_message")
+        .expect("named application input");
+    assert_eq!(application.kind, ScenarioInputKind::Application);
+    assert_eq!(application.payload, "ledger-message");
+    assert_eq!(application.disposition, ScenarioInputDisposition::Accepted);
+
+    let proposal = ledger
+        .iter()
+        .find(|entry| entry.scenario_id == "step-11:leave")
+        .expect("named proposal input");
+    assert_eq!(proposal.kind, ScenarioInputKind::Proposal);
+    assert!(
+        matches!(
+            proposal.disposition,
+            ScenarioInputDisposition::Pending
+                | ScenarioInputDisposition::Deferred
+                | ScenarioInputDisposition::Accepted
+        ),
+        "the ledger must expose the proposal's current durable disposition: {proposal:?}"
+    );
 }
 
 #[tokio::test]
@@ -598,7 +1460,7 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
     assert_eq!(cases.len(), 3);
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "send-leave/v1");
-        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.generator_version, "2");
         assert_eq!(case.seed, 42);
         assert_eq!(case.case_index, case_index as u64);
 
@@ -611,7 +1473,34 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
 
     let json = serde_json::to_value(&cases[0]).expect("case serializes");
     assert_eq!(json["seed"], 42);
-    assert_eq!(json["generator_version"], "1");
+    assert_eq!(json["generator_version"], "2");
+
+    for case in cases {
+        assert!(
+            case.scenario
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+        );
+        assert!(case.expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::ClientsExactlyEquivalent { .. }
+        )));
+        assert!(
+            case.expected_outcomes
+                .iter()
+                .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. }))
+        );
+        let report = run_generated_case_report(&case, None)
+            .await
+            .expect("strict send/leave case report runs");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "send/leave case {} failed strict expectations: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
+    }
 }
 
 #[tokio::test]
@@ -625,7 +1514,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .scenario
             .steps
             .iter()
-            .any(|step| matches!(step, ScenarioStep::DuplicateQueued { .. }))),
+            .any(|step| matches!(step, ScenarioStep::DuplicateMessage { .. }))),
         "generated cases should include duplicate-delivery variants"
     );
     assert!(
@@ -633,7 +1522,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .scenario
             .steps
             .iter()
-            .any(|step| matches!(step, ScenarioStep::DelayQueued { .. }))),
+            .any(|step| matches!(step, ScenarioStep::WithholdMessage { .. }))),
         "generated cases should include delayed-delivery variants"
     );
     assert!(
@@ -641,13 +1530,13 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .scenario
             .steps
             .iter()
-            .any(|step| matches!(step, ScenarioStep::ReorderQueued { .. }))),
+            .any(|step| matches!(step, ScenarioStep::ReorderMessages { .. }))),
         "generated cases should include reordered-delivery variants"
     );
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-e2e-delivery/v1");
-        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.generator_version, "2");
         assert_eq!(case.seed, 99);
         assert_eq!(case.case_index, case_index as u64);
 
@@ -655,9 +1544,17 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .await
             .expect("generated convergence variant reports");
         assert!(report.invariant_failures.is_empty());
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {case_index} failed generated expectations: {:?}",
+            report.expectation_failures
+        );
         assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
-        assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
-        assert!(report.app_invalidation_observations.is_empty());
+        assert!(
+            !report.epoch_change_observations.is_empty(),
+            "case {case_index} produced no epoch-change observations; steps={:?}",
+            report.step_log,
+        );
     }
 }
 
@@ -697,6 +1594,100 @@ where
     }
 }
 
+fn without_strict_reliability_outcomes(mut case: GeneratedScenarioCase) -> GeneratedScenarioCase {
+    case.expected_outcomes.retain(|expectation| {
+        !matches!(
+            expectation,
+            TraceExpectation::ClientsExactlyEquivalent { .. }
+                | TraceExpectation::NoPendingWork { .. }
+        )
+    });
+    case
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_churn_family_generates_deterministic_arms_that_pass() {
+    let cases = generate_admin_churn_family(123, 4);
+
+    assert_eq!(cases, generate_admin_churn_family(123, 4));
+    assert_eq!(cases.len(), 4);
+    assert!(
+        cases.iter().all(|case| !case.expected_outcomes.is_empty()),
+        "admin-churn cases should carry semantic expectations"
+    );
+    assert!(cases[..3].iter().all(|case| {
+        case.scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::UpdateAdminPolicy { .. }))
+    }));
+    assert!(
+        cases[2]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::RestartClient { .. }))
+    );
+    assert!(
+        cases[3]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::InviteMembers { .. }))
+    );
+    assert!(
+        cases[3]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::Assert { .. })),
+        "the latecomer arm carries pre-join mailbox-isolation zero-count assertions"
+    );
+    let pending_scope = |case: &GeneratedScenarioCase| {
+        case.expected_outcomes
+            .iter()
+            .find_map(|expectation| match expectation {
+                TraceExpectation::NoPendingWork { clients } => Some(clients.clone()),
+                _ => None,
+            })
+            .expect("every admin-churn case carries a no-pending-work expectation")
+    };
+    for case in &cases[..3] {
+        let mut expected_clients = case.scenario.clients.clone();
+        expected_clients.sort();
+        let mut scoped_clients = pending_scope(case);
+        scoped_clients.sort();
+        assert_eq!(
+            scoped_clients, expected_clients,
+            "non-latecomer arms keep the whole-roster pending-work oracle"
+        );
+    }
+    assert_eq!(
+        pending_scope(&cases[3]),
+        vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
+        "the latecomer arm scopes strict pending work to the founders"
+    );
+    assert!(
+        cases[3].expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { client } if client == "dave"
+        )),
+        "the latecomer arm pins the joiner to exactly its retained join commit"
+    );
+
+    for case in &cases {
+        let report = run_generated_case_report(case, None)
+            .await
+            .expect("admin-churn case reports");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {} failed: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
     let cases = generate_convergence_chaos_family(123, 24);
@@ -707,6 +1698,17 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         cases.iter().all(|case| !case.expected_outcomes.is_empty()),
         "chaos cases should carry semantic expectations"
     );
+    assert!(cases.iter().all(|case| {
+        case.scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+    }));
+    assert!(cases.iter().all(|case| {
+        case.expected_outcomes
+            .iter()
+            .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. }))
+    }));
     assert!(
         cases.iter().any(|case| case
             .scenario
@@ -732,11 +1734,15 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         "chaos cases should include group-data races"
     );
     assert!(
-        cases.iter().any(|case| case
-            .scenario
-            .steps
+        cases
             .iter()
-            .any(|step| matches!(step, ScenarioStep::FailPending { .. }))),
+            .any(|case| case.scenario.steps.iter().any(|step| matches!(
+                step,
+                ScenarioStep::AcknowledgeOutbound {
+                    outcome: SubjectOutboundOutcome::ReachedNoEndpoint,
+                    ..
+                }
+            ))),
         "chaos cases should include publish rollback"
     );
     assert!(
@@ -744,9 +1750,9 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
             .iter()
             .any(|case| case.scenario.steps.iter().any(|step| matches!(
                 step,
-                ScenarioStep::DuplicateQueued { .. }
-                    | ScenarioStep::DelayQueued { .. }
-                    | ScenarioStep::ReorderQueued { .. }
+                ScenarioStep::DuplicateMessage { .. }
+                    | ScenarioStep::WithholdMessage { .. }
+                    | ScenarioStep::ReorderMessages { .. }
             ))),
         "chaos cases should include queue schedule faults"
     );
@@ -805,12 +1811,16 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "3");
+        assert_eq!(case.generator_version, "6");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
     }
 
-    for_each_chaos_case_concurrently(cases, |case, report| {
+    let baseline_cases = cases
+        .into_iter()
+        .map(without_strict_reliability_outcomes)
+        .collect();
+    for_each_chaos_case_concurrently(baseline_cases, |case, report| {
         assert_eq!(report.expected_outcomes, case.expected_outcomes);
         assert!(
             report.expectation_failures.is_empty(),
@@ -848,19 +1858,19 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 
     // Arm 2 (rollback queue faults) must vary a real behavioral dimension, not
     // just the app payload string: the seed-driven delivery schedule (the
-    // ReorderQueued permutation) must differ across seeds. This is the
+    // semantic reorder schedule) must differ across seeds. This is the
     // regression guard for mdk#166's blocking review finding — before
     // the fix, arm 2's only rng use was a random u16 appended to a payload, so
     // normalizing the payload made both seeds' scenarios identical.
-    let reorder_order = |case: &GeneratedScenarioCase| -> Vec<usize> {
+    let reorder_order = |case: &GeneratedScenarioCase| -> Vec<ScenarioMessageSelectorV2> {
         case.scenario
             .steps
             .iter()
             .find_map(|step| match step {
-                ScenarioStep::ReorderQueued { order } => Some(order.clone()),
+                ScenarioStep::ReorderMessages { order } => Some(order.clone()),
                 _ => None,
             })
-            .expect("rollback arm should carry a seed-driven ReorderQueued step")
+            .expect("rollback arm should carry a seed-driven semantic reorder step")
     };
     assert_ne!(
         reorder_order(&seed_a[2]),
@@ -870,8 +1880,12 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 
     // Every seed-driven scenario must still satisfy its pinned expectations,
     // so the divergence reflects real behavior variation, not breakage.
-    let seeded_cases: Vec<GeneratedScenarioCase> =
-        seed_a.iter().chain(seed_b.iter()).cloned().collect();
+    let seeded_cases: Vec<GeneratedScenarioCase> = seed_a
+        .iter()
+        .chain(seed_b.iter())
+        .cloned()
+        .map(without_strict_reliability_outcomes)
+        .collect();
     for_each_chaos_case_concurrently(seeded_cases, |case, report| {
         assert!(
             report.expectation_failures.is_empty(),
@@ -888,35 +1902,38 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 #[tokio::test]
 async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message() {
     // Regression for mdk#163: the rollback arm must duplicate and delay
-    // a Bob app message that Alice actually ticks, not the rolled-back commit
-    // pinned at queue index 0 and addressed to Bob.
+    // a Bob app message that Alice actually ticks. The definitely failed
+    // group-data commit must already have been retracted from the bus.
     let cases = generate_convergence_chaos_family(123, 3);
     let case = &cases[2];
 
-    let duplicate_index = case
+    let duplicate_selector = case
         .scenario
         .steps
         .iter()
         .find_map(|step| match step {
-            ScenarioStep::DuplicateQueued { index } => Some(*index),
+            ScenarioStep::DuplicateMessage { selector } => Some(selector),
             _ => None,
         })
         .expect("rollback arm should duplicate a queued message");
     assert_eq!(
-        duplicate_index, 1,
-        "queue index 0 is Alice's rolled-back commit to Bob; duplicate the first post-rollback app message instead",
+        duplicate_selector.class,
+        Some(ScenarioTransportClass::Application)
     );
+    assert_eq!(duplicate_selector.occurrence, 0);
 
     let delayed_copy = case
         .scenario
         .steps
         .iter()
         .find_map(|step| match step {
-            ScenarioStep::DelayQueued { index, delayed } => Some((*index, delayed.as_str())),
+            ScenarioStep::WithholdMessage { selector, label } => Some((selector, label.as_str())),
             _ => None,
         })
         .expect("rollback arm should delay the duplicate copy");
-    assert_eq!(delayed_copy, (2, "duplicate-app"));
+    assert_eq!(delayed_copy.0.action_id, duplicate_selector.action_id);
+    assert_eq!(delayed_copy.0.occurrence, 1);
+    assert_eq!(delayed_copy.1, "duplicate-app");
 
     let report = run_generated_case_report(case, None)
         .await
@@ -942,10 +1959,67 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
 }
 
 #[tokio::test]
+async fn sender_ratchet_policy_preserves_reordered_rollback_floods_past_openmls_default() {
+    // Seed 2001 places generation 5 ahead of generation 0 in both instances
+    // of the rollback-fault family. OpenMLS's unconfigured tolerance of 5
+    // irreversibly dropped generation 0 when it arrived sixth; Marmot's pinned
+    // tolerance must retain all six application messages.
+    let cases = generate_convergence_chaos_family(2001, 14);
+    for case_index in [2, 13] {
+        let report = run_generated_case_report(&cases[case_index], None)
+            .await
+            .expect("sender-ratchet regression case reports");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {case_index} failed expectations: {:?}",
+            report.expectation_failures
+        );
+        assert!(
+            report.invariant_failures.is_empty(),
+            "case {case_index} failed invariants: {:?}",
+            report.invariant_failures
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_chaos_boundary_retires_pre_join_opaque_resource_work() {
+    let cases = generate_convergence_chaos_family(123, 5);
+
+    let repaired = run_generated_case_report(&cases[2], None)
+        .await
+        .expect("repaired rollback case reports");
+    assert!(
+        repaired.expectation_failures.is_empty(),
+        "definite publish rollback must retract transport artifacts before the strict drain: {:?}",
+        repaired.expectation_failures
+    );
+
+    let repaired_pre_join = run_generated_case_report(&cases[4], None)
+        .await
+        .expect("strict pre-join case reports");
+    assert!(
+        repaired_pre_join.expectation_failures.is_empty(),
+        "pre-join opaque input must leave no pending resource work after the controlled deadline: {:?}",
+        repaired_pre_join.expectation_failures
+    );
+
+    let self_remove_report = run_generated_case_report(&cases[3], None)
+        .await
+        .expect("strict self-remove case reports");
+    assert!(
+        self_remove_report.expectation_failures.is_empty(),
+        "strict self-remove case must retire consumed proposal work: {:?}",
+        self_remove_report.expectation_failures
+    );
+}
+
+#[tokio::test]
 async fn failing_generated_case_records_a_minimized_reproducer() {
-    let scenario = ScenarioSpec {
+    let mut scenario = ScenarioSpec {
         name: "convergence-chaos/minimizer-smoke/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -956,10 +2030,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -967,24 +2038,29 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
             ScenarioStep::ClearEvents {
                 clients: vec!["alice".into(), "bob".into()],
             },
-            ScenarioStep::SendAppMessage {
-                sender: "bob".into(),
-                payload: "irrelevant noise".into(),
-            },
-            ScenarioStep::DeliverAll,
-            ScenarioStep::Tick {
-                clients: vec!["alice".into()],
-            },
-            ScenarioStep::Observe {
-                clients: vec!["alice".into()],
-            },
         ],
     };
+    for index in 0..24 {
+        scenario.steps.push(ScenarioStep::SendAppMessage {
+            sender: "bob".into(),
+            payload: format!("irrelevant storm message {index}"),
+        });
+    }
+    scenario.steps.extend([
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec!["alice".into()],
+        },
+        ScenarioStep::Observe {
+            clients: vec!["alice".into()],
+        },
+    ]);
     let case = GeneratedScenarioCase {
         family_name: "convergence-chaos/v1".into(),
         generator_version: "1".into(),
         seed: 99,
         case_index: 0,
+        subject: cgka_conformance_simulator::GeneratedSubjectKind::Engine,
         expected_outcomes: vec![TraceExpectation::ClientState {
             client: "alice".into(),
             epoch: 1,
@@ -1010,6 +2086,13 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
     assert!(
         minimized.steps.len() < case.scenario.steps.len(),
         "minimized case should remove irrelevant delivery noise"
+    );
+    assert!(
+        minimized
+            .steps
+            .iter()
+            .all(|step| !matches!(step, ScenarioStep::SendAppMessage { .. })),
+        "semantic failure identity should let the reducer remove the entire application-message storm"
     );
     let minimized_report =
         run_scenario_report_with_outcomes(minimized, None, case.expected_outcomes.clone())
@@ -1096,6 +2179,7 @@ async fn vector_fixture_report_records_semantic_expectation_failures() {
         vector_version: "1".into(),
         conformance_version: env!("CARGO_PKG_VERSION").into(),
         seed: None,
+        application_profile: None,
         scenario: group_data_fork_recovery_spec(),
         expected_trace: None,
         expected_outcomes: vec![TraceExpectation::ClientState {
@@ -1133,7 +2217,8 @@ async fn vector_fixture_report_records_semantic_expectation_failures() {
 fn group_data_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "group-data-fork-recovery/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1144,10 +2229,7 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1165,14 +2247,8 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
                 name: "bob branch".into(),
                 pending: "bob-update".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-update".into(),
-            },
-            ScenarioStep::ConfirmPending {
-                client: "bob".into(),
-                pending: "bob-update".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-update"),
+            ScenarioStep::accept_publication("bob", "bob-update"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into(), "bob".into()],
@@ -1187,7 +2263,8 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
 fn deliberate_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "deliberate-fork-recovery/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "david".into(), "eve".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1198,10 +2275,7 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1219,14 +2293,8 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
                 invitees: vec!["eve".into()],
                 pending: "bob-invite".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-invite".into(),
-            },
-            ScenarioStep::ConfirmPending {
-                client: "bob".into(),
-                pending: "bob-invite".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-invite"),
+            ScenarioStep::accept_publication("bob", "bob-invite"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into(), "bob".into()],
@@ -1242,7 +2310,8 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
 async fn scenario_report_records_mismatch_as_invariant_failure() {
     let spec = ScenarioSpec {
         name: "report-mismatch/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1253,10 +2322,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1271,6 +2337,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![],
     };
 
@@ -1284,7 +2351,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
 
 #[tokio::test]
 async fn generated_case_report_records_generator_metadata() {
-    let case = generate_send_leave_family(7, 1).remove(0);
+    let case = generate_send_leave_family(42, 1).remove(0);
 
     let report = run_generated_case_report(&case, None)
         .await
@@ -1296,8 +2363,8 @@ async fn generated_case_report_records_generator_metadata() {
         .expect("generated metadata");
 
     assert_eq!(generated.family_name, "send-leave/v1");
-    assert_eq!(generated.generator_version, "1");
-    assert_eq!(generated.seed, 7);
+    assert_eq!(generated.generator_version, "2");
+    assert_eq!(generated.seed, 42);
     assert_eq!(generated.case_index, 0);
     assert!(generated.minimized_case.is_none());
 }
@@ -1345,12 +2412,49 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
         }],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
             observe_client("carol", &mut carol),
         ],
     }
+}
+
+#[tokio::test]
+async fn refused_leave_releases_named_scenario_input_reservation() {
+    // A refused leave must release the id reserved by
+    // name_next_scenario_input; otherwise the next named action panics on the
+    // unconsumed-id assertion or inherits the failed leave's id.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("leave-refusal", vec![bob_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    // Alice is the sole admin, so the engine refuses her SelfRemove.
+    alice.name_next_scenario_input("refused-leave");
+    alice
+        .leave()
+        .await
+        .expect_err("sole admin self-remove must be refused");
+
+    // Naming the next action must not trip the unconsumed-id assertion, and
+    // the app send consumes the fresh reservation (proven by naming again).
+    alice.name_next_scenario_input("post-refusal-app");
+    alice.send_app(b"still alive".to_vec()).await;
+    alice.name_next_scenario_input("post-refusal-consumed");
+    alice.send_app(b"second".to_vec()).await;
 }
 
 #[tokio::test]
@@ -1380,7 +2484,7 @@ async fn add_then_self_remove_via_harness() {
     carol.tick().await;
 
     // Bob (non-admin) leaves.
-    bob.leave().await;
+    bob.leave().await.expect("leave");
     bus.deliver_all();
     let alice_proposal_outcomes = alice.tick().await; // ingests proposal + auto-commits
     let carol_proposal_outcomes = carol.tick().await; // same: no deterministic election
@@ -1490,6 +2594,7 @@ async fn deliberate_fork_via_harness() {
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -1616,6 +2721,18 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     let frank_outcomes = frank.tick().await;
     assert_tick_reached_convergence("carol", &carol_outcomes);
     assert_tick_reached_convergence("frank", &frank_outcomes);
+    assert_canonical_scenario_input_ledger(
+        "carol",
+        &carol.scenario_input_ledger(),
+        &expected_payload,
+        &losing_payload,
+    );
+    assert_canonical_scenario_input_ledger(
+        "frank",
+        &frank.scenario_input_ledger(),
+        &expected_payload,
+        &losing_payload,
+    );
 
     assert_canonical_application_event(
         "carol",
@@ -1641,6 +2758,51 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
             "{name} should not contain the losing branch invitee"
         );
     }
+
+    let deferred_trace = ScenarioTrace {
+        name: "convergence-e2e/deferred-losing-transport".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![
+            observe_client_exact("carol", &mut carol),
+            observe_client_exact("frank", &mut frank),
+        ],
+    };
+    for observation in &deferred_trace.observations {
+        let pending = observation
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot");
+        assert!(
+            pending.engine.stored_transport_deferred_messages > 0,
+            "{} should expose the retained unpeeled transport object: {pending:#?}",
+            observation.client
+        );
+        assert!(
+            pending.scenario_inputs_pending > 0,
+            "{} should expose the unresolved scenario input: {pending:#?}",
+            observation.client
+        );
+    }
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["carol".into(), "frank".into()],
+        }],
+        &deferred_trace,
+    );
+    assert_eq!(
+        failures.len(),
+        2,
+        "each observer should fail quiescence while transport work remains: {failures:#?}"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.kind == "pending_work_remaining")
+    );
 }
 
 #[tokio::test]
@@ -1678,6 +2840,18 @@ async fn canonical_vector_fixtures_match_generated_traces() {
                 .is_some_and(|name| name.ends_with(".v1.json") && name != "manifest.v1.json")
         })
         .collect::<Vec<_>>();
+    fixtures.extend(
+        std::fs::read_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/incidents"),
+        )
+        .expect("incident vectors dir exists")
+        .map(|entry| entry.expect("incident vector entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".v1.json"))
+        }),
+    );
     fixtures.sort();
 
     for path in fixtures {
@@ -1688,9 +2862,11 @@ async fn canonical_vector_fixtures_match_generated_traces() {
         let fixture: VectorFixture =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture contents"))
                 .unwrap_or_else(|e| panic!("{fixture_name} parses: {e}"));
-        let observed_trace = run_scenario_spec(&fixture.scenario)
+        let observed_trace = run_vector_fixture_report(&fixture)
             .await
-            .expect("fixture scenario runs");
+            .expect("fixture scenario runs")
+            .observed_trace
+            .expect("successful fixture report has an observed trace");
         assert_vector_fixture_matches(fixture_name, &fixture, observed_trace);
     }
 }
@@ -1698,7 +2874,8 @@ async fn canonical_vector_fixtures_match_generated_traces() {
 fn convergence_e2e_group_events_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "convergence-e2e-group-events/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec![
             "alice".into(),
             "bob".into(),
@@ -1717,10 +2894,7 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into(), "frank".into()],
@@ -1733,28 +2907,19 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
                 invitees: vec!["david".into()],
                 pending: "alice-invite-david".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-invite-david".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-invite-david"),
             ScenarioStep::InviteMembers {
                 inviter: "alice".into(),
                 invitees: vec!["grace".into()],
                 pending: "alice-invite-grace".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-invite-grace".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-invite-grace"),
             ScenarioStep::InviteMembers {
                 inviter: "bob".into(),
                 invitees: vec!["eve".into()],
                 pending: "bob-invite-eve".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "bob".into(),
-                pending: "bob-invite-eve".into(),
-            },
+            ScenarioStep::accept_publication("bob", "bob-invite-eve"),
             ScenarioStep::SendAppMessage {
                 sender: "alice".into(),
                 payload: "alice canonical payload".into(),
@@ -1772,6 +2937,42 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
             },
         ],
     }
+}
+
+fn assert_canonical_scenario_input_ledger(
+    client: &str,
+    ledger: &[ScenarioInputLedgerEntry],
+    expected_payload: &[u8],
+    losing_payload: &[u8],
+) {
+    let expected_payload = String::from_utf8_lossy(expected_payload);
+    let losing_payload = String::from_utf8_lossy(losing_payload);
+    let expected = ledger
+        .iter()
+        .find(|entry| entry.payload == expected_payload)
+        .unwrap_or_else(|| panic!("{client} missing selected logical message: {ledger:#?}"));
+    let losing = ledger
+        .iter()
+        .find(|entry| entry.payload == losing_payload)
+        .unwrap_or_else(|| panic!("{client} missing losing logical message: {ledger:#?}"));
+
+    assert_eq!(
+        expected.delivered, 1,
+        "{client} must deliver the selected branch exactly once: {ledger:#?}"
+    );
+    assert_eq!(
+        losing.delivered, 0,
+        "{client} must not project losing-branch application output: {ledger:#?}"
+    );
+    assert!(
+        losing
+            .invalidated
+            .iter()
+            .any(|reason| reason == "losing_branch")
+            || (losing.transport_deferred > 0 && losing.pending),
+        "{client} must classify losing output as invalidated or visibly transport-pending: \
+         {ledger:#?}"
+    );
 }
 
 fn assert_tick_reached_convergence(
@@ -1841,7 +3042,26 @@ fn assert_canonical_application_event(
 }
 
 fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
+    // The settle tail observes the founders with `observe_client_exact` after
+    // canonical branch selection; those snapshots must agree with each other,
+    // and the family's own `clients_exactly_equivalent` expectation carries
+    // the exact claim. The branch-shape match below applies to the
+    // mid-schedule legacy observations only.
+    let settled = trace
+        .observations
+        .iter()
+        .filter(|observation| observation.canonical_state.is_some())
+        .collect::<Vec<_>>();
+    if let Some(first) = settled.first() {
+        for observation in &settled {
+            assert_eq!(observation.epoch, first.epoch);
+            assert_eq!(observation.member_count, first.member_count);
+        }
+    }
     for observation in &trace.observations {
+        if observation.canonical_state.is_some() {
+            continue;
+        }
         match observation.received_payloads.as_slice() {
             [payload] if payload == "alice canonical payload" => {
                 assert_eq!(observation.epoch, 3);
@@ -1934,26 +3154,27 @@ async fn welcome_before_commit_rejects_commit_echo_cleanly_via_harness() {
     alice.confirm(invite_pending).await;
 
     // Both arrive in the same delivery. Carol processes the welcome, then
-    // treats the group-message echo as a stale peel failure because the
+    // treats the group-message echo as transport-deferred because the
     // outer wrapper was encrypted for the pre-join epoch.
     bus.deliver_all();
     let outcomes = carol.tick().await;
     let saw_welcome = outcomes
         .iter()
         .any(|o| matches!(o, Ok(cgka_traits::ingest::IngestOutcome::Processed)));
-    let saw_peel_failed = outcomes.iter().any(|o| {
+    let saw_transport_deferred = outcomes.iter().any(|o| {
         matches!(
             o,
-            Ok(cgka_traits::ingest::IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::PeelFailed,
-            })
+            Ok(cgka_traits::ingest::IngestOutcome::TransportDeferred { .. })
         )
     });
     assert!(
         saw_welcome,
         "expected welcome to be processed: {outcomes:?}"
     );
-    assert!(saw_peel_failed, "expected stale peel failure: {outcomes:?}");
+    assert!(
+        saw_transport_deferred,
+        "expected transport-deferred commit echo: {outcomes:?}"
+    );
 }
 
 /// End-to-end proof of the convergence assert surface: an observer's engine
@@ -2022,6 +3243,7 @@ async fn harness_captures_and_asserts_convergence_decision() {
         pending_resolutions: Vec::new(),
         errors: Vec::new(),
         admin_policies: Vec::new(),
+        decryptability_probes: Vec::new(),
         observations: vec![observe_client("carol", &mut carol)],
     };
     let failures = compare_trace_expectations(
@@ -2040,4 +3262,515 @@ async fn harness_captures_and_asserts_convergence_decision() {
         failures.is_empty(),
         "carol should observe the committer-decided convergence decision: {failures:#?}"
     );
+}
+
+#[tokio::test]
+async fn cross_route_own_commit_recovery_survives_restart_with_exact_agreement() {
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("vectors/cross-route-own-commit-recovery.v1.json");
+    let fixture: VectorFixture = serde_json::from_str(
+        &std::fs::read_to_string(&fixture_path).expect("cross-route fixture contents"),
+    )
+    .expect("cross-route fixture parses");
+
+    let report = run_vector_fixture_report_with_storage_mode(
+        &fixture,
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .await
+    .expect("cross-route fixture executes");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "cross-route expectations must pass: {:#?}",
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "cross-route invariants must pass: {:#?}",
+        report.invariant_failures
+    );
+
+    let trace = report.observed_trace.expect("cross-route trace");
+    // Portable expectations cover recovery, restart progression, exact state,
+    // and decryptability. Keep only this semantic ledger subset harness-local:
+    // a complete portable ledger would also pin unrelated probe ids/counters.
+    for observation in &trace.observations {
+        for (scenario_id, disposition) in [
+            (
+                "step-5:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+            (
+                "step-6:update_group_data",
+                ScenarioInputDisposition::Invalidated,
+            ),
+            (
+                "step-12:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+        ] {
+            let entry = observation
+                .scenario_input_ledger
+                .iter()
+                .find(|entry| entry.scenario_id == scenario_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing durable disposition for {scenario_id}",
+                        observation.client
+                    )
+                });
+            assert_eq!(
+                entry.disposition, disposition,
+                "{} disposition for {scenario_id}",
+                observation.client
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cross_route_recovery_uses_retained_history_after_restart() {
+    let input_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "vectors/generated-inputs/cross-route-retained-history-recovery.generated-input.json",
+    );
+    let input: GeneratedScenarioInputV1 = serde_json::from_str(
+        &std::fs::read_to_string(&input_path).expect("retained cross-route input contents"),
+    )
+    .expect("retained cross-route input parses");
+    input
+        .validate()
+        .expect("generated input version is supported");
+    assert_eq!(input.case.subject, GeneratedSubjectKind::RetainedRelay);
+
+    let report = run_generated_case_report_with_storage_mode(
+        &input.case,
+        None,
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .await
+    .expect("retained cross-route scenario executes");
+    assert!(
+        report.expectation_failures.is_empty(),
+        "retained cross-route expectations must pass: {:#?}",
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "retained cross-route invariants must pass: {:#?}",
+        report.invariant_failures
+    );
+
+    let full_history = report
+        .relay_sync_observations
+        .iter()
+        .filter(|observation| {
+            observation.completeness == RelayHistoryCompletenessClaimV2::FullHistoryQueried
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        full_history.len(),
+        4,
+        "every participant queries full history"
+    );
+    assert!(
+        full_history
+            .iter()
+            .all(|observation| observation.injected_objects > 0),
+        "the final settlement must consume retained relay objects: {full_history:#?}"
+    );
+    for (client, events_returned) in [("yankee", 1), ("zeta", 2)] {
+        let partial_view = report
+            .relay_sync_observations
+            .iter()
+            .rfind(|observation| {
+                observation.client == client
+                    && observation.completeness == RelayHistoryCompletenessClaimV2::RelayEoseOnly
+            })
+            .unwrap_or_else(|| panic!("{client} is missing its partial retained-history view"));
+        assert_eq!(
+            (partial_view.events_returned, partial_view.injected_objects),
+            (events_returned, 1),
+            "{client}'s last pre-full-history sync must be the deliberate partial view"
+        );
+    }
+
+    let trace = report.observed_trace.expect("retained cross-route trace");
+    for observation in &trace.observations {
+        for (scenario_id, disposition) in [
+            (
+                "step-5:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+            (
+                "step-6:update_group_data",
+                ScenarioInputDisposition::Invalidated,
+            ),
+            (
+                "step-12:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+        ] {
+            let entry = observation
+                .scenario_input_ledger
+                .iter()
+                .find(|entry| entry.scenario_id == scenario_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing retained-route disposition for {scenario_id}",
+                        observation.client
+                    )
+                });
+            assert_eq!(
+                entry.disposition, disposition,
+                "{} disposition for {scenario_id}",
+                observation.client
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_invite_staging_does_not_poison_fork_detection_via_harness() {
+    // Harness mirror of the cgka-engine regression test
+    // `failed_invite_staging_does_not_poison_fork_detection`: a send-path
+    // staging failure must leave no phantom "we committed from this epoch"
+    // bookkeeping behind. Historically it did, and once the client advanced
+    // past that epoch via a PEER's commit (settled through convergence, so
+    // no fork-recovery incumbent of its own exists), a legitimate sibling
+    // commit for the poisoned epoch failed closed with ForkedEpoch and stuck
+    // the group in Recovering.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"phantom-alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"phantom-bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"phantom-carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut dave = ClientBuilder::new(pad32(b"phantom-dave"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut erin = ClientBuilder::new(pad32(b"phantom-erin"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    // Bob and Dave are admins: each later commits an invite from epoch 1.
+    let bob_kp = bob.fresh_key_package().await;
+    let dave_kp = dave.fresh_key_package().await;
+    let (_group_id, pending) = alice
+        .create_group_with_admins(
+            "phantom-committed-from",
+            vec![bob_kp, dave_kp],
+            vec![],
+            vec![bob.member_id(), dave.member_id()],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    dave.tick().await;
+    assert_eq!(alice.epoch().0, 1);
+    assert_eq!(bob.epoch().0, 1);
+    assert_eq!(dave.epoch().0, 1);
+
+    // Alice's invite fails DURING commit staging: the duplicate-Bob
+    // KeyPackage carries Bob's existing leaf signature key, which OpenMLS
+    // rejects inside add_members — after capability validation, before the
+    // pending-publish state transition. Nothing reaches the bus.
+    let duplicate_bob_kp = bob.fresh_key_package().await;
+    let failed = alice.try_invite(vec![duplicate_bob_kp]).await;
+    assert!(
+        failed.is_err(),
+        "duplicate-member invite must fail during staging"
+    );
+
+    // Partition Dave away so he stays at epoch 1 and never sees Bob's
+    // commit. Bob invites Carol; Alice advances to epoch 2 purely by
+    // settling Bob's commit through convergence (peer-driven advance — no
+    // own commit, no fork-recovery incumbent at epoch 1).
+    bus.set_partition(Some(vec![alice.bus_id, bob.bus_id, carol.bus_id]));
+    let carol_kp = carol.fresh_key_package().await;
+    let bob_pending = bob.invite(vec![carol_kp]).await;
+    bob.confirm(bob_pending).await;
+    bus.deliver_all();
+    carol.tick().await;
+    let alice_outcomes = alice.tick().await;
+    assert_eq!(
+        alice.epoch().0,
+        2,
+        "alice must settle bob's commit via convergence: {alice_outcomes:?}"
+    );
+
+    // Heal the partition. Dave — still at epoch 1 — commits a sibling
+    // invite from the epoch Alice's failed staging attempt touched.
+    bus.set_partition(None);
+    let erin_kp = erin.fresh_key_package().await;
+    let dave_pending = dave.invite(vec![erin_kp]).await;
+    dave.confirm(dave_pending).await;
+    bus.deliver_all();
+
+    // Alice must classify the sibling (stale losing branch, or a
+    // deterministic reorg onto the winning branch) — never fail closed with
+    // ForkedEpoch, which left the group stuck in Recovering.
+    let alice_outcomes = alice.tick().await;
+    let alice_forked = alice_outcomes
+        .iter()
+        .any(|o| matches!(o, Err(cgka_traits::EngineError::ForkedEpoch { .. })));
+    assert!(
+        !alice_forked,
+        "sibling commit after failed staging must not fail closed: {alice_outcomes:?}"
+    );
+    assert_eq!(alice.epoch().0, 2);
+
+    // Whichever branch won deterministically, alice holds exactly one of
+    // the two invitees and the group remains operational.
+    let members = alice.members();
+    let has_carol = members.iter().any(|m| m.id == carol.member_id());
+    let has_erin = members.iter().any(|m| m.id == erin.member_id());
+    assert_ne!(
+        has_carol, has_erin,
+        "exactly one branch must win: {members:?}"
+    );
+    // Usability probe: a fresh valid invite from Alice must stage normally.
+    // A group stuck in Recovering rejects the send outright.
+    let mut frank = ClientBuilder::new(pad32(b"phantom-frank"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let frank_kp = frank.fresh_key_package().await;
+    let probe_pending = alice
+        .try_invite(vec![frank_kp])
+        .await
+        .expect("group must remain usable after failed staging + sibling commit");
+    alice.confirm(probe_pending).await;
+    assert_eq!(alice.epoch().0, 3);
+}
+
+#[tokio::test]
+async fn removed_member_rejoins_via_fresh_welcome() {
+    // Alice removes Carol, then re-invites her with a fresh KeyPackage. The
+    // re-add is product-legal (leaver.rb re-add leg); Carol must land on the
+    // new epoch and exchange application traffic again.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("readd", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let pending = alice.remove_members(vec![carol.member_id()]).await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob removal outcomes: {bob_outcomes:?}"
+    );
+    let carol_outcomes = carol.tick().await;
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol removal outcomes: {carol_outcomes:?}"
+    );
+    assert_eq!(alice.members().len(), 2);
+
+    let carol_kp2 = carol.fresh_key_package().await;
+    let pending = alice.invite(vec![carol_kp2]).await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob re-add outcomes: {bob_outcomes:?}"
+    );
+    let carol_outcomes = carol.tick().await;
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol re-add outcomes: {carol_outcomes:?}"
+    );
+
+    assert_eq!(alice.epoch().0, 3);
+    assert_eq!(carol.epoch().0, 3);
+    assert_eq!(alice.members().len(), 3);
+    assert_eq!(carol.members().len(), 3);
+
+    carol.send_app(b"carol is back".to_vec()).await;
+    bus.deliver_all();
+    let alice_outcomes = alice.tick().await;
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice app outcomes: {alice_outcomes:?}"
+    );
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .filter(|e| matches!(e, GroupEvent::MessageReceived { .. }))
+        .count();
+    assert_eq!(
+        received, 1,
+        "alice must receive carol's post-rejoin message"
+    );
+}
+
+#[tokio::test]
+async fn commit_missing_proposal_defers_and_applies_after_proposal_backfill() {
+    // Carol's SelfRemove proposal never reaches Bob (partition drop), so
+    // Alice's removal commit arrives at Bob referencing a proposal he does
+    // not hold. The commit must stay deferred, and a later re-delivery of
+    // the proposal (relay backfill) must complete the removal at Bob.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("missing-proposal", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    // Carol leaves while only Alice can hear her.
+    bus.set_partition(Some(vec![alice.bus_id]));
+    let proposal_msg = carol.leave_capture().await.expect("leave proposal");
+    bus.deliver_all();
+    bus.set_partition(None);
+    let alice_outcomes = alice.tick().await; // ingest proposal + auto-commit
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice outcomes: {alice_outcomes:?}"
+    );
+
+    // The removal commit reaches Bob without its proposal.
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob outcomes: {bob_outcomes:?}"
+    );
+    assert_eq!(alice.epoch().0, 2);
+    assert_eq!(
+        bob.epoch().0,
+        1,
+        "bob cannot apply a commit whose proposal he never saw"
+    );
+
+    // Relay backfill: the proposal is re-delivered, and Bob completes.
+    bus.send(carol.bus_id, proposal_msg);
+    bus.deliver_all();
+    let bob_backfill = bob.tick().await;
+    assert!(
+        bob_backfill.iter().all(Result::is_ok),
+        "bob backfill outcomes: {bob_backfill:?}"
+    );
+    let bob_settle = bob.tick().await;
+    assert!(
+        bob_settle.iter().all(Result::is_ok),
+        "bob settle outcomes: {bob_settle:?}"
+    );
+    assert_eq!(
+        bob.epoch().0,
+        2,
+        "backfilled proposal must let bob apply the retained commit"
+    );
+    assert_eq!(bob.members().len(), 2);
+}
+
+#[tokio::test]
+async fn late_welcome_join_catches_up_via_redelivered_commits() {
+    // Dave's Welcome is delayed while the group advances, so the commits
+    // reach him before he can resolve the group and are dropped without a
+    // durable record (#740 unknown-route posture). Once he joins, relay
+    // redelivery of those same events must process rather than dedup
+    // against the pre-join drop.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut dave = ClientBuilder::new(pad32(b"dave"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("late-welcome", vec![bob_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    // Invite Dave but delay his Welcome; the invite commit still broadcasts.
+    let dave_kp = dave.fresh_key_package().await;
+    let pending = alice.invite(vec![dave_kp]).await;
+    alice.confirm(pending).await;
+    assert!(bus.delay_queued(0, "dave-welcome"), "welcome sits first");
+    bus.deliver_all();
+    bob.tick().await;
+    dave.tick().await; // pre-join commit lands as unknown-group input
+
+    // The group moves on without Dave. Keep a delayed duplicate of every
+    // post-invite commit: it stands in for relay redelivery after his join.
+    for (name, backfill) in [("rename-1", "bf-1"), ("rename-2", "bf-2")] {
+        let pending = alice.update_group_data(name).await;
+        alice.confirm(pending).await;
+        assert!(bus.duplicate_queued(0), "commit sits first in the queue");
+        assert!(bus.delay_queued(1, backfill));
+        bus.deliver_all();
+        bob.tick().await;
+        dave.tick().await; // pre-join commit is dropped without a record
+    }
+    assert_eq!(alice.epoch().0, 4);
+
+    // The Welcome finally arrives; Dave joins at the invite epoch.
+    assert!(bus.release_delayed("dave-welcome"));
+    bus.deliver_all();
+    let join_outcomes = dave.tick().await;
+    assert!(
+        join_outcomes.iter().all(Result::is_ok),
+        "dave join outcomes: {join_outcomes:?}"
+    );
+    assert_eq!(dave.epoch().0, 2);
+
+    // Relay redelivery of the commits he dropped pre-join.
+    assert!(bus.release_delayed("bf-1"));
+    assert!(bus.release_delayed("bf-2"));
+    bus.deliver_all();
+    let catchup_outcomes = dave.tick().await;
+    assert!(
+        catchup_outcomes.iter().all(Result::is_ok),
+        "dave catchup outcomes: {catchup_outcomes:?}"
+    );
+    assert_eq!(
+        dave.epoch().0,
+        4,
+        "redelivered commits must catch dave up after his late join"
+    );
+    assert_eq!(dave.members().len(), 3);
 }

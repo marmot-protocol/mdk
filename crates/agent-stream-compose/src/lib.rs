@@ -149,6 +149,74 @@ pub async fn run_stream_compose_session(
     .await;
 }
 
+/// Try resolved broker candidates in advertised order before disabling the
+/// provisional transport. Every candidate carries the same start-bound crypto
+/// and publisher store, so failover continues one sequence space.
+pub async fn run_stream_compose_session_candidates(
+    open: OpenBrokerTextPublisher,
+    candidates: Vec<OpenBrokerTextPublisher>,
+    chunk_bytes: usize,
+    rx: mpsc::Receiver<StreamComposeCommand>,
+    cancel_rx: mpsc::Receiver<()>,
+    report: StreamComposeReport,
+) {
+    let connect_timeout = DEFAULT_LIVE_BROKER_TIMEOUTS
+        .connect
+        .saturating_mul(u32::try_from(candidates.len()).unwrap_or(u32::MAX).max(1))
+        .saturating_add(Duration::from_secs(1));
+    let connect = async move {
+        let mut last_error = None;
+        for candidate in candidates {
+            match tokio::time::timeout(
+                DEFAULT_LIVE_BROKER_TIMEOUTS.connect,
+                BrokerTextPublisher::connect(candidate),
+            )
+            .await
+            {
+                Ok(Ok(publisher)) => return Ok(publisher),
+                Ok(Err(err)) => last_error = Some(err.to_string()),
+                Err(_) => last_error = Some("live broker connect timed out".to_owned()),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "live QUIC preview is unavailable".to_owned()))
+    };
+    run_stream_compose_session_with_connector(
+        open,
+        connect,
+        chunk_bytes,
+        rx,
+        cancel_rx,
+        report,
+        LiveBrokerTimeouts {
+            connect: connect_timeout,
+            ..DEFAULT_LIVE_BROKER_TIMEOUTS
+        },
+    )
+    .await;
+}
+
+/// Run the authoritative compose/transcript lifecycle with live QUIC disabled.
+/// Commands and finalization continue normally; only provisional writes fail
+/// closed. Used for valid zero-candidate starts and unusable live routes.
+pub async fn run_stream_compose_session_without_live(
+    open: OpenBrokerTextPublisher,
+    chunk_bytes: usize,
+    rx: mpsc::Receiver<StreamComposeCommand>,
+    cancel_rx: mpsc::Receiver<()>,
+    report: StreamComposeReport,
+) {
+    run_stream_compose_session_with_connector::<BrokerTextPublisher, _, String>(
+        open,
+        std::future::ready(Err("live QUIC preview is unavailable".to_owned())),
+        chunk_bytes,
+        rx,
+        cancel_rx,
+        report,
+        DEFAULT_LIVE_BROKER_TIMEOUTS,
+    )
+    .await;
+}
+
 async fn run_stream_compose_session_with_connector<P, C, E>(
     open: OpenBrokerTextPublisher,
     connect: C,

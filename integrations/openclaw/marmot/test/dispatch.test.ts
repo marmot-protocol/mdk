@@ -1,17 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { StreamMode } from "../src/config.js";
 import { AgentControlError, type AgentControlMediaRef } from "../src/client.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
+  buildMarmotTurnConfig,
   createMarmotInboundDispatcher,
-  MarmotReplySink,
+  TIMELINE_CONTEXT_BYTE_LIMIT,
+  TIMELINE_CONTEXT_MESSAGE_LIMIT,
   type MarmotDispatchClient,
-  type MarmotSinkClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
 
-import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import {
+  buildChannelInboundEventContext,
+  runChannelInboundEvent,
+} from "openclaw/plugin-sdk/channel-inbound";
+import { deliverInboundReplyWithMessageSendContext } from "openclaw/plugin-sdk/channel-outbound";
 
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   buildChannelInboundEventContext: vi.fn((params: unknown) => params),
@@ -21,6 +25,18 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
     },
   ),
 }));
+
+vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("openclaw/plugin-sdk/channel-outbound")>();
+  return {
+    ...actual,
+    deliverInboundReplyWithMessageSendContext: vi.fn(async () => ({
+      status: "handled_visible",
+      delivery: {},
+    })),
+  };
+});
 
 vi.mock("openclaw/plugin-sdk/media-store", () => ({
   saveMediaBuffer: vi.fn(async (_buf: Buffer, ct?: string, _sub?: string, _max?: number, name?: string) => ({
@@ -37,28 +53,41 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 const buildCtxMock = vi.mocked(buildChannelInboundEventContext);
+const runInboundEventMock = vi.mocked(runChannelInboundEvent);
+const durableDeliveryMock = vi.mocked(deliverInboundReplyWithMessageSendContext);
+
+beforeEach(() => {
+  runInboundEventMock.mockClear();
+  durableDeliveryMock.mockClear();
+});
 
 const HEX32 = (b: string) => b.repeat(32);
-const STREAM_ID = HEX32("11");
-const START_ID = HEX32("22");
-// Rust-anchored hash for stream=0x11*32 start=0x22*32, appends "hel"/"lo"/" world".
-const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81";
+
+describe("buildMarmotTurnConfig", () => {
+  it("denies sessions_send without mutating existing tool policy", () => {
+    const base = { tools: { deny: ["dangerous_tool"] }, marker: true };
+    const configured = buildMarmotTurnConfig(base);
+
+    expect(configured).toMatchObject({
+      marker: true,
+      tools: { deny: ["dangerous_tool", "sessions_send"] },
+    });
+    expect(base.tools.deny).toEqual(["dangerous_tool"]);
+  });
+});
 
 interface Calls {
   sendFinal: { accountIdHex: string; text: string; replyTo: string | null }[];
-  begin: number;
-  append: string[];
-  status: string[];
-  progress: string[];
-  finalize: { hash: string; count: number }[];
-  cancel: string[];
 }
 
 function emptyCalls(): Calls {
-  return { sendFinal: [], begin: 0, append: [], status: [], progress: [], finalize: [], cancel: [] };
+  return { sendFinal: [] };
 }
 
-function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSinkClient {
+function stubClient(
+  calls: Calls,
+  opts: { isDirect?: boolean; history?: unknown[] } = {},
+): MarmotDispatchClient {
   return {
     async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
       calls.sendFinal.push({ accountIdHex: _account, text, replyTo: replyTo ?? null });
@@ -74,401 +103,20 @@ function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSink
         subject: null,
       };
     },
-    async streamBegin() {
-      calls.begin += 1;
+    async timelineList(accountIdHex: string, groupIdHex: string) {
       return {
-        type: "stream_begun",
-        stream_id_hex: STREAM_ID,
-        start_message_id_hex: START_ID,
-        quic_candidates: [],
+        type: "timeline_page",
+        account_id_hex: accountIdHex,
+        group_id_hex: groupIdHex,
+        messages: opts.history ?? [],
+        has_more_before: false,
+        has_more_after: false,
       };
     },
-    async streamAppend(_id: string, text: string) {
-      calls.append.push(text);
-      return { type: "ack" };
-    },
-    async streamStatus(_id: string, text: string) {
-      calls.status.push(text);
-      return { type: "ack" };
-    },
-    async streamProgress(_id: string, text: string) {
-      calls.progress.push(text);
-      return { type: "ack" };
-    },
-    async streamFinalize(_id: string, _final: string, hash: string, count: number) {
-      calls.finalize.push({ hash, count });
-      return { type: "stream_finalized", stream_id_hex: STREAM_ID, message_ids_hex: [HEX32("ab")] };
-    },
-    async streamCancel(_id: string, reason?: string | null) {
-      calls.cancel.push(reason ?? "");
-      return { type: "ack" };
-    },
-  } as unknown as MarmotSinkClient;
+  } as unknown as MarmotDispatchClient;
 }
-
-function makeSink(
-  calls: Calls,
-  opts: {
-    streamMode?: StreamMode;
-    quicCandidates?: string[];
-    resolveFinalText?: () => Promise<string | undefined> | string | undefined;
-  } = {},
-): MarmotReplySink {
-  return new MarmotReplySink({
-    client: stubClient(calls),
-    accountIdHex: HEX32("aa"),
-    groupIdHex: HEX32("cc"),
-    streamMode: opts.streamMode ?? "block",
-    quicCandidates: opts.quicCandidates ?? ["quic://broker:4450"],
-    resolveFinalText: opts.resolveFinalText,
-  });
-}
-
-describe("MarmotReplySink", () => {
-  it("sends a plain final when there were no preview blocks", async () => {
-    const calls = emptyCalls();
-    await makeSink(calls).deliver({ text: "hello world" }, { kind: "final" });
-    expect(calls.begin).toBe(0);
-    expect(calls.append).toEqual([]);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
-  });
-
-  it("streams progressive blocks as append-only deltas and finalizes", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.deliver({ text: "hel" }, { kind: "block" });
-    await sink.deliver({ text: "hello" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.begin).toBe(1);
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("streams fragment-style blocks as append-only deltas and finalizes", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.deliver({ text: "hel" }, { kind: "block" });
-    await sink.deliver({ text: "lo" }, { kind: "block" });
-    await sink.deliver({ text: " world" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.begin).toBe(1);
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("streams partial snapshots before delayed block chunks and finalizes", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.partial({ text: "hel" });
-    await sink.partial({ text: "hello" });
-    await sink.partial({ text: "hello world" });
-    await sink.deliver({ text: "delayed block chunk" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.begin).toBe(1);
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
-    expect(calls.cancel).toEqual([]);
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("streams partial append deltas even when snapshots are windowed", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.partial({ text: "hel", delta: "hel" });
-    await sink.partial({ text: "lo window", delta: "lo" });
-    await sink.partial({ text: "world window", delta: " world" });
-    await sink.deliver({ text: "delayed block chunk" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.begin).toBe(1);
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
-    expect(calls.cancel).toEqual([]);
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("streams delta-only partial payloads", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.partial({ delta: "hel" });
-    await sink.partial({ delta: "lo" });
-    await sink.partial({ delta: " world" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.begin).toBe(1);
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("lets block snapshots recover after a delta-less non-append partial", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.prewarm();
-    await sink.partial({ text: "hel" });
-    await sink.partial({ text: "window shifted" });
-    await sink.deliver({ text: "hello" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.cancel).toEqual([]);
-    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("falls back durably when partial snapshots become non-append-only", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls, {
-      streamMode: "partial",
-      resolveFinalText: () => "hello complete answer",
-    });
-    await sink.partial({ text: "hello partial answer" });
-    await sink.partial({ text: "window shifted", replace: true });
-    await sink.flush();
-
-    expect(calls.append).toEqual(["hello partial answer"]);
-    expect(calls.cancel).toHaveLength(1);
-    expect(calls.finalize).toEqual([]);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello complete answer"]);
-  });
-
-  it("can prewarm a live preview before answer text arrives", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls, { streamMode: "partial" });
-    await sink.prewarm();
-    await sink.partial({ text: "done" });
-    await sink.flush();
-
-    expect(calls.begin).toBe(1);
-    expect(calls.status).toEqual([]);
-    expect(calls.append).toEqual(["done"]);
-    expect(calls.finalize[0]?.count).toBe(1);
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("abandons partial-only block previews instead of committing tool acknowledgements", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls, { streamMode: "block" });
-    await sink.prewarm();
-    await sink.partial({ text: "Sent." });
-    await sink.flush();
-
-    expect(calls.append).toEqual(["Sent."]);
-    expect(calls.cancel).toHaveLength(1);
-    expect(calls.finalize).toEqual([]);
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("streams tool deliveries as non-text progress and still finalizes answer text", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.deliver({ text: "searching" }, { kind: "tool" });
-    await sink.deliver({ text: "answer" }, { kind: "block" });
-    await sink.deliver({ text: "answer" }, { kind: "final" });
-
-    expect(calls.progress).toEqual(["searching"]);
-    expect(calls.append).toEqual(["answer"]);
-    expect(calls.finalize[0]?.count).toBe(2);
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("ignores blocks and sends a plain final when streaming is off", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls, { streamMode: "off" });
-    await sink.deliver({ text: "hel" }, { kind: "block" });
-    await sink.deliver({ text: "done" }, { kind: "final" });
-    expect(calls.begin).toBe(0);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
-  });
-
-  it("cancels the preview and falls back to send_final on a non-append-only block", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.deliver({ text: "hello" }, { kind: "block" });
-    await sink.deliver({ text: "goodbye" }, { kind: "block" }); // not an extension
-    await sink.deliver({ text: "goodbye" }, { kind: "final" });
-
-    expect(calls.append).toEqual(["hello", "goodbye"]);
-    expect(calls.cancel).toHaveLength(1);
-    expect(calls.finalize).toEqual([]);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["goodbye"]);
-  });
-
-  it("falls back to a durable final when a preview append fails (e.g. broker unreachable)", async () => {
-    const calls = emptyCalls();
-    const client = stubClient(calls);
-    // A QUIC/broker failure surfaces as a generic error, not a non-append-only
-    // rejection — the reply must still be delivered, just without a live preview.
-    client.streamAppend = (async () => {
-      throw new Error("broker unreachable");
-    }) as typeof client.streamAppend;
-    const sink = new MarmotReplySink({
-      client,
-      accountIdHex: HEX32("aa"),
-      groupIdHex: HEX32("cc"),
-      streamMode: "block",
-      quicCandidates: ["quic://broker:4450"],
-    });
-
-    await sink.deliver({ text: "hel" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    expect(calls.finalize).toEqual([]);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
-  });
-
-  it("falls back to a durable final when preview finalize fails", async () => {
-    const calls = emptyCalls();
-    const client = stubClient(calls);
-    client.streamFinalize = (async () => {
-      throw new Error("finalize failed");
-    }) as typeof client.streamFinalize;
-    const sink = new MarmotReplySink({
-      client,
-      accountIdHex: HEX32("aa"),
-      groupIdHex: HEX32("cc"),
-      streamMode: "block",
-      quicCandidates: ["quic://broker:4450"],
-    });
-
-    await sink.deliver({ text: "hel" }, { kind: "block" });
-    await sink.deliver({ text: "hello" }, { kind: "block" });
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-
-    // The final suffix is appended before stream_finalize is attempted; the
-    // finalize then throws, so we abandon and re-send the whole text durably.
-    expect(calls.append).toEqual(["hel", "lo", " world"]);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
-  });
-
-  it("commits the streamed reply at flush when the turn sends blocks but no final", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    // Block streaming delivered the whole answer as one block, with no trailing
-    // `final` delivery — the live preview must still be finalized durably.
-    await sink.deliver({ text: "the full answer" }, { kind: "block" });
-    await sink.flush();
-
-    expect(calls.begin).toBe(1);
-    expect(calls.append).toEqual(["the full answer"]);
-    expect(calls.finalize).toHaveLength(1);
-    expect(calls.sendFinal).toEqual([]);
-  });
-
-  it("recovers the full transcript final for partial-mode windowed previews", async () => {
-    const calls = emptyCalls();
-    const full =
-      "This is the complete recovered answer that OpenClaw persisted to the session transcript after the turn finished.";
-    const sink = makeSink(calls, {
-      streamMode: "partial",
-      resolveFinalText: () => full,
-    });
-
-    await sink.deliver(
-      { text: "This is the complete recovered answer that OpenClaw persisted..." },
-      { kind: "block" },
-    );
-    await sink.deliver({ text: "window shifted and no longer starts at the prefix" }, { kind: "block" });
-    await sink.flush();
-
-    expect(calls.finalize).toEqual([]);
-    expect(calls.cancel).toHaveLength(1);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual([full]);
-  });
-
-  it("flush sends a plain final for a blocks-only turn when streaming is off", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls, { streamMode: "off" });
-    await sink.deliver({ text: "the answer" }, { kind: "block" });
-    await sink.flush();
-
-    expect(calls.begin).toBe(0);
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["the answer"]);
-  });
-
-  it("flush is a no-op once a final delivery has committed the reply", async () => {
-    const calls = emptyCalls();
-    const sink = makeSink(calls);
-    await sink.deliver({ text: "answer" }, { kind: "final" });
-    await sink.flush();
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["answer"]);
-  });
-
-  it("flush sends nothing when the turn produced no reply", async () => {
-    const calls = emptyCalls();
-    await makeSink(calls).flush();
-    expect(calls).toEqual(emptyCalls());
-  });
-
-  it("ignores tool deliveries when streaming is off", async () => {
-    const calls = emptyCalls();
-    await makeSink(calls, { streamMode: "off" }).deliver({ text: "searching..." }, { kind: "tool" });
-    expect(calls).toEqual(emptyCalls());
-  });
-
-  it("retries a retryable durable final, reusing one idempotency key per call", async () => {
-    const keys: (string | undefined)[] = [];
-    let attempts = 0;
-    const client = {
-      async sendFinal(
-        _account: string,
-        _group: string,
-        _text: string,
-        _replyTo?: string | null,
-        idempotencyKey?: string,
-      ) {
-        keys.push(idempotencyKey);
-        attempts += 1;
-        if (attempts === 1) {
-          throw new AgentControlError("transient", { code: "io_error", retryable: true });
-        }
-        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
-      },
-    } as unknown as MarmotSinkClient;
-    const sink = new MarmotReplySink({
-      client,
-      accountIdHex: HEX32("aa"),
-      groupIdHex: HEX32("cc"),
-      streamMode: "off",
-      quicCandidates: [],
-    });
-
-    await sink.deliver({ text: "hello world" }, { kind: "final" });
-    expect(attempts).toBe(2);
-    expect(keys).toHaveLength(2);
-    expect(keys[0]).toBeTruthy();
-    expect(keys[1]).toBe(keys[0]); // same key reused across the retry
-  });
-
-  it("does not retry a non-retryable durable final and rethrows", async () => {
-    let attempts = 0;
-    const client = {
-      async sendFinal() {
-        attempts += 1;
-        throw new AgentControlError("bad request", { code: "bad_request", retryable: false });
-      },
-    } as unknown as MarmotSinkClient;
-    const sink = new MarmotReplySink({
-      client,
-      accountIdHex: HEX32("aa"),
-      groupIdHex: HEX32("cc"),
-      streamMode: "off",
-      quicCandidates: [],
-    });
-
-    await expect(sink.deliver({ text: "hello" }, { kind: "final" })).rejects.toThrow("bad request");
-    expect(attempts).toBe(1);
-  });
-});
-
 describe("createMarmotInboundDispatcher", () => {
-  it("enables OpenClaw block streaming when Marmot live block streaming is resolved on", async () => {
+  it("routes a final through OpenClaw's durable message context with streaming disabled", async () => {
     const calls = emptyCalls();
     const captured: unknown[] = [];
     const routeInputs: unknown[] = [];
@@ -504,9 +152,6 @@ describe("createMarmotInboundDispatcher", () => {
       runtimeChannel,
       client: stubClient(calls) as unknown as MarmotDispatchClient,
       channelAccountId: "default",
-      streamMode: "off",
-      blockStreaming: true,
-      quicCandidates: [],
       groupActivation: "always",
       mentionPatterns: [],
     });
@@ -528,15 +173,248 @@ describe("createMarmotInboundDispatcher", () => {
       },
     ]);
     expect(captured).toHaveLength(1);
+    const inboundEvent = runInboundEventMock.mock.calls[0]?.[0] as unknown as {
+      adapter: {
+        resolveTurn: () => {
+          runDispatchLifecycle?: {
+            turnAdoptionLifecycle?: unknown;
+            onDispatchSkipped?: (reason: string) => Promise<void>;
+          };
+        };
+      };
+    };
+    const lifecycle = inboundEvent.adapter.resolveTurn().runDispatchLifecycle;
+    expect(lifecycle).toMatchObject({ turnAdoptionLifecycle: undefined });
+    await expect(lifecycle?.onDispatchSkipped?.("observeOnly")).resolves.toBeUndefined();
     expect((captured[0] as { ctx: { accountId: string } }).ctx.accountId).toBe("default");
     expect(
       (captured[0] as { replyOptions: { disableBlockStreaming?: boolean } }).replyOptions
         .disableBlockStreaming,
-    ).toBe(false);
-    expect(calls.sendFinal[0]?.accountIdHex).toBe(HEX32("aa"));
-    expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
-    // GAP-01: the durable reply threads to the triggering message id.
-    expect(calls.sendFinal[0]?.replyTo).toBe(HEX32("dd"));
+    ).toBe(true);
+    expect(
+      (captured[0] as { replyOptions: { sourceReplyDeliveryMode?: string } }).replyOptions
+        .sourceReplyDeliveryMode,
+    ).toBe("automatic");
+    expect(calls.sendFinal).toEqual([]);
+    expect(durableDeliveryMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "marmot",
+        accountId: "default",
+        agentId: "agent",
+        payload: { text: "done" },
+        replyToId: HEX32("dd"),
+        ctxPayload: expect.objectContaining({
+          reply: expect.objectContaining({ to: HEX32("cc") }),
+        }),
+      }),
+    );
+  });
+
+  it("maps authenticated time, native quote, and ambient facts into supplemental context", async () => {
+    buildCtxMock.mockClear();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-rich-context",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => undefined),
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(emptyCalls(), {
+        history: [
+          {
+            message_id_hex: HEX32("10"),
+            sender: {
+              account_id_hex: HEX32("bb"),
+              display_name: "Alice",
+              is_self: false,
+            },
+            direction: "received",
+            kind: 9,
+            recorded_at: 1_720_999_800,
+            observed_at: 1_720_999_801,
+            availability: "available",
+            text: "earlier question",
+            text_truncated: false,
+            reply_to_message_id_hex: null,
+            attachments: [],
+            attachments_truncated: false,
+            reactions: [],
+            reactions_truncated: false,
+          },
+        ],
+      }) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "new message",
+      recordedAt: 1_721_000_000,
+      replyToMessageIdHex: HEX32("11"),
+      replyTo: {
+        message_id_hex: HEX32("11"),
+        availability: "available",
+        sender: {
+          account_id_hex: HEX32("aa"),
+          display_name: "Agent",
+          is_self: true,
+        },
+        recorded_at: 1_720_999_900,
+        text_excerpt: "quoted body",
+        text_truncated: false,
+        attachments: [{ media_type: "image/png", file_name: "quote.png" }],
+        attachments_truncated: false,
+      },
+      ambientContext: [
+        {
+          type: "reaction_added",
+          account_id_hex: HEX32("aa"),
+          group_id_hex: HEX32("cc"),
+          event_id_hex: HEX32("22"),
+          target_message_id_hex: HEX32("11"),
+          actor: {
+            account_id_hex: HEX32("bb"),
+            display_name: "Alice",
+            is_self: false,
+          },
+          emoji: "👍",
+          recorded_at: 1_721_000_001,
+          target: {
+            message_id_hex: HEX32("11"),
+            availability: "available",
+            text_excerpt: "quoted body",
+            text_truncated: false,
+            attachments_truncated: false,
+          },
+        },
+      ],
+    });
+
+    const context = buildCtxMock.mock.calls.at(-1)?.[0] as unknown as {
+      timestamp: number;
+      reply: { replyToId: string };
+      suppressSelfQuoteBody: boolean;
+      supplemental: {
+        quote: {
+          id: string;
+          body: string;
+          sender: string;
+          isQuote: boolean;
+          isSelf: boolean;
+        };
+        untrustedContext: Array<{ type: string; payload: unknown }>;
+      };
+    };
+    expect(context.timestamp).toBe(1_721_000_000_000);
+    expect(context.reply.replyToId).toBe(HEX32("11"));
+    expect(context.suppressSelfQuoteBody).toBe(false);
+    expect(context.supplemental.quote).toEqual({
+      id: HEX32("11"),
+      body: "quoted body",
+      sender: "Agent",
+      isQuote: true,
+      isSelf: true,
+    });
+    expect(context.supplemental.untrustedContext).toEqual([
+      expect.objectContaining({
+        type: "referenced_message",
+        payload: expect.objectContaining({
+          message_id_hex: HEX32("11"),
+          sender: expect.objectContaining({ account_id_hex: HEX32("aa") }),
+          text_excerpt: "quoted body",
+          attachments: [{ media_type: "image/png", file_name: "quote.png" }],
+        }),
+      }),
+      expect.objectContaining({
+        type: "chat_window",
+        payload: expect.objectContaining({
+          relation: "before_current_message",
+          messages: [
+            expect.objectContaining({
+              message_id_hex: HEX32("10"),
+              sender: expect.objectContaining({ display_name: "Alice" }),
+              text: "earlier question",
+            }),
+          ],
+        }),
+      }),
+      expect.objectContaining({ type: "reaction_added" }),
+    ]);
+  });
+
+  it("keeps three sequential replies bound to the same Marmot group", async () => {
+    const groupIdHex = HEX32("cc");
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-sequential-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "reply" }, { kind: "final" });
+        },
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(emptyCalls()) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    for (const byte of ["d1", "d2", "d3"]) {
+      await dispatch({
+        accountIdHex: HEX32("aa"),
+        groupIdHex,
+        messageIdHex: HEX32(byte),
+        senderAccountIdHex: HEX32("bb"),
+        text: "hello",
+      });
+    }
+
+    expect(durableDeliveryMock).toHaveBeenCalledTimes(3);
+    expect(
+      durableDeliveryMock.mock.calls.map(([params]) => ({
+        to: (params.ctxPayload as unknown as { reply: { to: string } }).reply.to,
+        replyToId: params.replyToId,
+      })),
+    ).toEqual(
+      ["d1", "d2", "d3"].map((byte) => ({
+        to: groupIdHex,
+        replyToId: HEX32(byte),
+      })),
+    );
   });
 });
 
@@ -590,9 +468,6 @@ describe("createMarmotInboundDispatcher activation gating", () => {
         isDirect: opts.isDirect,
       }) as unknown as MarmotDispatchClient,
       channelAccountId: "default",
-      streamMode: "off",
-      blockStreaming: false,
-      quicCandidates: [],
       groupActivation: opts.groupActivation,
       mentionPatterns: opts.mentionPatterns ?? [],
     });
@@ -701,9 +576,6 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       runtimeChannel: cachingRuntime(turns),
       client,
       channelAccountId: "default",
-      streamMode: "off",
-      blockStreaming: false,
-      quicCandidates: [],
       groupActivation: "mention",
       mentionPatterns: [],
     });
@@ -798,7 +670,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
 
   /** Dispatch a message and report whether an agent turn ran (the gate let it through). */
   async function runTurn(
-    dispatch: (message: MarmotInboundMessage) => Promise<void>,
+    dispatch: (message: MarmotInboundMessage) => Promise<boolean | void>,
     turns: { count: number },
     message: MarmotInboundMessage,
   ): Promise<boolean> {
@@ -888,9 +760,6 @@ describe("createMarmotInboundDispatcher inbound media", () => {
       runtimeChannel: mediaRuntime(),
       client,
       channelAccountId: "default",
-      streamMode: "off",
-      blockStreaming: false,
-      quicCandidates: [],
       groupActivation: "always",
       mentionPatterns: [],
     });
@@ -979,5 +848,171 @@ describe("createMarmotInboundDispatcher inbound media", () => {
     expect(downloads).toHaveLength(0);
     const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
     expect("media" in ctxArg).toBe(false);
+  });
+});
+
+describe("timeline context budget", () => {
+  interface ChatWindowEntry {
+    label: string;
+    source: string;
+    type: string;
+    payload: {
+      order: string;
+      relation: string;
+      messages: Array<Record<string, unknown>>;
+      messages_truncated?: boolean;
+      omitted_message_count?: number;
+      oversized_message_count?: number;
+    };
+  }
+
+  const utf8Bytes = (value: unknown): number =>
+    Buffer.byteLength(JSON.stringify(value), "utf8");
+
+  async function renderTimelineEntry(history: unknown[]): Promise<ChatWindowEntry | undefined> {
+    buildCtxMock.mockClear();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-history-budget",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => undefined),
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(emptyCalls(), { history }) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "ping",
+      recordedAt: 1_721_000_000,
+    });
+
+    const context = buildCtxMock.mock.calls.at(-1)?.[0] as unknown as {
+      supplemental?: { untrustedContext?: ChatWindowEntry[] };
+    };
+    return context.supplemental?.untrustedContext?.find((entry) => entry.type === "chat_window");
+  }
+
+  it("passes a small page through without truncation metadata", async () => {
+    const messages = [0, 1, 2].map((index) => ({
+      message_id_hex: `${index}`,
+      text: `message-${index}`,
+    }));
+
+    const entry = await renderTimelineEntry(messages);
+
+    expect(entry?.payload.messages).toEqual(messages);
+    expect(entry?.payload).not.toHaveProperty("messages_truncated");
+    expect(utf8Bytes(entry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
+  });
+
+  it("omits one oversized record rather than exceeding the budget", async () => {
+    const entry = await renderTimelineEntry([
+      { message_id_hex: "newest", text: "🙂".repeat(10_000) },
+    ]);
+
+    expect(entry?.payload.messages).toEqual([]);
+    expect(entry?.payload.omitted_message_count).toBe(1);
+    expect(entry?.payload.oversized_message_count).toBe(1);
+    expect(utf8Bytes(entry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
+  });
+
+  it("counts multiple oversized records dropped oldest-first", async () => {
+    const entry = await renderTimelineEntry([
+      { message_id_hex: "old-1", text: "🙂".repeat(10_000) },
+      { message_id_hex: "old-2", text: "🙂".repeat(10_000) },
+      { message_id_hex: "newest", text: "kept" },
+    ]);
+
+    expect(entry?.payload.messages.map((message) => message.message_id_hex)).toEqual(["newest"]);
+    expect(entry?.payload.omitted_message_count).toBe(2);
+    expect(entry?.payload.oversized_message_count).toBe(2);
+    expect(JSON.stringify(entry)).not.toContain("old-1");
+    expect(JSON.stringify(entry)).not.toContain("old-2");
+  });
+
+  it("counts oversized records outside the count window", async () => {
+    const entry = await renderTimelineEntry(
+      Array.from({ length: TIMELINE_CONTEXT_MESSAGE_LIMIT + 1 }, (_, index) => ({
+        message_id_hex: `${index}`,
+        text: "🙂".repeat(10_000),
+      })),
+    );
+
+    expect(entry?.payload.messages).toEqual([]);
+    expect(entry?.payload.omitted_message_count).toBe(TIMELINE_CONTEXT_MESSAGE_LIMIT + 1);
+    expect(entry?.payload.oversized_message_count).toBe(TIMELINE_CONTEXT_MESSAGE_LIMIT + 1);
+  });
+
+  it("does not misclassify a record displaced by aggregate metadata", async () => {
+    const finalMessage: { message_id_hex: string; text: string } = {
+      message_id_hex: "final",
+      text: "",
+    };
+    const referenceEntry = {
+      label: "Marmot conversation history",
+      source: "marmot",
+      type: "chat_window",
+      payload: {
+        order: "chronological",
+        relation: "before_current_message",
+        messages: [finalMessage],
+        messages_truncated: true,
+        omitted_message_count: 1,
+      },
+    };
+    finalMessage.text = "x".repeat(TIMELINE_CONTEXT_BYTE_LIMIT - utf8Bytes(referenceEntry));
+    // Sanity: as the sole retained record (with omission metadata) it exactly fits.
+    expect(utf8Bytes(referenceEntry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
+
+    const entry = await renderTimelineEntry([
+      { message_id_hex: "oversized", text: "🙂".repeat(10_000) },
+      ...Array.from({ length: TIMELINE_CONTEXT_MESSAGE_LIMIT - 1 }, (_, index) => ({
+        message_id_hex: `small-${index}`,
+        text: "",
+      })),
+      finalMessage,
+    ]);
+
+    expect(entry?.payload.messages).toEqual([]);
+    expect(entry?.payload.omitted_message_count).toBe(TIMELINE_CONTEXT_MESSAGE_LIMIT + 1);
+    expect(entry?.payload.oversized_message_count).toBe(1);
+  });
+
+  it("retains only the newest records from a twenty-record page", async () => {
+    const messageId = (index: number) => index.toString(16).padStart(64, "0");
+    const messages = Array.from({ length: 20 }, (_, index) => ({
+      message_id_hex: messageId(index),
+      text: "x".repeat(1_500),
+    }));
+
+    const entry = await renderTimelineEntry(messages);
+
+    expect(entry?.payload.messages.map((message) => message.message_id_hex)).toEqual(
+      Array.from({ length: TIMELINE_CONTEXT_MESSAGE_LIMIT }, (_, index) =>
+        messageId(20 - TIMELINE_CONTEXT_MESSAGE_LIMIT + index),
+      ),
+    );
+    expect(entry?.payload.omitted_message_count).toBe(20 - TIMELINE_CONTEXT_MESSAGE_LIMIT);
+    expect(entry?.payload).not.toHaveProperty("oversized_message_count");
+    expect(utf8Bytes(entry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
   });
 });

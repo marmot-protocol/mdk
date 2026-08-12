@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits,
-    stream_record_text,
+    EphemeralPublisherSequenceStore, stream_record_text,
 };
 
 use crate::client::{
@@ -1113,6 +1113,7 @@ fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empt
     for record_type in [
         AGENT_TEXT_STREAM_RECORD_ABORT,
         AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+        0xff,
     ] {
         assert_eq!(stream_record_text(&record(record_type, "ignored")), "");
     }
@@ -2144,7 +2145,8 @@ async fn broker_publish_frame_byte_limit_counts_wire_bytes_for_encrypted_records
             MemberId::new(vec![0x02; 32]),
             start_event_id.clone(),
         ),
-    );
+    )
+    .with_publisher_sequence_store(Arc::new(EphemeralPublisherSequenceStore::default()));
 
     let server = QuicBrokerServer::bind(QuicBrokerConfig {
         bind_addr: LOCAL_SERVER_BIND,

@@ -1,42 +1,59 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, optional_u64_to_i64, tags_from_json, u64_to_i64,
-    unix_now_seconds,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt,
+    encrypted_media_secrets::{
+        encrypted_media_component_ids, replace_encrypted_media_secret_references_for_parts_tx,
+        replace_encrypted_media_secret_references_tx,
+        retire_unreferenced_encrypted_media_secret_epochs_tx,
+    },
+    i64_to_u64, optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_CHUNKS_TAG, STREAM_HASH_TAG,
-    STREAM_START_TAG, STREAM_TAG,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
+    STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The ONE display order for the materialized message-timeline / chat-list
-/// surface: `(timeline_at, message_id_hex)` (#736 boundary contract 1). This is
-/// the cross-client user-visible order (`timeline_at == recorded_at` at
-/// projection). It is a SEPARATE surface from the raw-event replay cursor
-/// (`AppEventReplayCursor`, which additionally tie-breaks on the LOCAL
-/// `insert_order` and is used only for lag-recovery watermark/suppression). Keep
-/// the two distinct: the replay cursor MUST NOT be applied to timeline
-/// pagination. Non-aliased `ORDER BY` sites reference these; a few aliased
-/// subquery lookups and the keyset-pagination predicates express the SAME order
-/// inline (they carry a table alias / bind placeholders that don't fit a plain
-/// fragment).
-pub(crate) const TIMELINE_ORDER_BY_ASC: &str = "ORDER BY timeline_at ASC, message_id_hex ASC";
-pub(crate) const TIMELINE_ORDER_BY_DESC: &str = "ORDER BY timeline_at DESC, message_id_hex DESC";
+/// Canonical per-group display order for the materialized timeline. Authenticated
+/// source epochs establish the durable boundaries: a kind-1210 row establishing
+/// epoch N sorts before application rows authenticated in N, and every row in N
+/// sorts before the state row for N+1. The local observation timestamp remains a
+/// display/retention value, not the group-history authority.
+///
+/// The leading class keeps pre-source-epoch legacy and failed-local rows ahead of
+/// canonical history, while unresolved optimistic local rows (no source id, no
+/// epoch, and no invalidation) remain at the head.
+/// Global, cross-group queries retain wall-clock order because epochs are local
+/// to a group and therefore cannot be compared across groups.
+pub(crate) const TIMELINE_GROUP_ORDER_BY_ASC: &str = "ORDER BY
+     timeline.timeline_order_class ASC,
+     timeline.timeline_order_primary ASC,
+     timeline.timeline_order_phase ASC,
+     timeline.timeline_order_at ASC,
+     timeline.message_id_hex ASC";
+pub(crate) const TIMELINE_GROUP_ORDER_BY_DESC: &str = "ORDER BY
+     timeline.timeline_order_class DESC,
+     timeline.timeline_order_primary DESC,
+     timeline.timeline_order_phase DESC,
+     timeline.timeline_order_at DESC,
+     timeline.message_id_hex DESC";
+pub(crate) const TIMELINE_WALL_ORDER_BY_ASC: &str =
+    "ORDER BY timeline.timeline_at ASC, timeline.message_id_hex ASC";
+pub(crate) const TIMELINE_WALL_ORDER_BY_DESC: &str =
+    "ORDER BY timeline.timeline_at DESC, timeline.message_id_hex DESC";
 
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// Largest number of rows a single timeline cursor query returns. A
 /// materialized window kept above this cannot be re-fetched in one query, so
 /// window owners should not exceed it.
 pub const MAX_TIMELINE_LIMIT: usize = 200;
-const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
     pub group_id_hex: String,
@@ -55,6 +72,16 @@ pub struct StoredAppEvent {
     /// can produce many rows. Enables `invalidate_app_events_by_origin_commit`
     /// when that commit loses a fork. `None` for all other event kinds.
     pub origin_commit_id: Option<String>,
+    /// True only for a delete whose authenticated sender held group-admin
+    /// moderation authority in a non-direct group when the delete was
+    /// recorded. On the default [`record_app_event`] path a conflicting row's
+    /// value is frozen, so reprojection and relay echoes arriving after an
+    /// admin-set change can never flip an honored tombstone. The local
+    /// sender's post-publish reconciling projection uses
+    /// [`record_app_event_refreshing_moderation_grant`] instead, so the grant
+    /// recomputed after group sync supersedes the optimistic pre-send one.
+    /// `false` for every other event.
+    pub moderation_grant: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -84,13 +111,23 @@ pub struct TimelineMessageRecord {
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
     pub source_epoch: Option<u64>,
+    /// Retention decision pinned from the message's authenticated source epoch.
+    /// `None` means no recoverable decision; `Some(0)` means retention was
+    /// explicitly disabled for this message.
+    pub retention_seconds: Option<u64>,
+    /// Exact pinned expiration timestamp. A positive retention duration can
+    /// still have no finite expiry when timestamp addition overflowed.
+    pub retention_expires_at: Option<u64>,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
     pub kind: u64,
     pub tags: Vec<Vec<String>>,
+    /// Authenticated inner app-event time for app messages; local observation
+    /// time for synthesized rows that have no inner timestamp.
     pub timeline_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreview>,
@@ -104,6 +141,21 @@ pub struct TimelineMessageRecord {
     /// tombstone instead of silently disappearing. Carries the engine invalidation
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+}
+
+impl TimelineMessageRecord {
+    /// Stable per-group order derived only from accepted history plus the
+    /// authenticated inner event time. Local receive time never participates.
+    pub fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
+        canonical_timeline_order_key(
+            self.source_message_id_hex.as_deref(),
+            self.source_epoch,
+            self.invalidation_status.as_deref(),
+            self.kind,
+            self.timeline_at,
+            &self.message_id_hex,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +172,9 @@ pub struct TimelineReplyPreview {
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub deleted: bool,
+    /// Set when convergence invalidated the previewed message. Content remains
+    /// available so the application can choose whether to show or hide it.
+    pub invalidation_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,12 +222,20 @@ pub struct TimelineProjectionUpdate {
     pub changes: Vec<TimelineMessageChange>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecurePruneAppEventsResult {
     pub pruned_messages: usize,
+    /// Number of versioned encrypted-media epoch secrets whose final retained
+    /// source-message reference was removed in this transaction.
+    pub pruned_media_epoch_secrets: usize,
     /// Sorted set of encrypted-media blob ids referenced by pruned messages.
     /// Callers should treat this as an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
+    /// True when logical deletion committed but WAL truncation remains
+    /// durably pending. A later prune call retries the checkpoint even when
+    /// it finds no additional rows to delete.
+    #[serde(default)]
+    pub erasure_pending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -228,12 +291,14 @@ struct RawAppEvent {
     received_at: u64,
     invalidated: bool,
     invalidation_reason: Option<String>,
+    moderation_grant: bool,
 }
 
 #[derive(Clone, Debug)]
 struct PrunedAppEvent {
     message_id_hex: String,
     kind: u64,
+    source_epoch: Option<u64>,
     tags: Vec<Vec<String>>,
 }
 
@@ -278,11 +343,14 @@ enum CursorDirection {
     After,
 }
 
+type OwnedTimelineOrderKey = (u8, u64, u8, u64, String);
+
 #[derive(Clone, Debug)]
 struct ValidatedPagination {
     direction: CursorDirection,
     cursor_at: Option<u64>,
     cursor_message_id_hex: Option<String>,
+    cursor_order: Option<OwnedTimelineOrderKey>,
     /// Inclusive upper bound for a `Before` cursor (see
     /// [`TimelinePagination::before_inclusive`]); ignored for other directions.
     inclusive: bool,
@@ -293,6 +361,140 @@ impl SqliteAccountStorage {
     pub fn record_app_event(
         &self,
         event: &StoredAppEvent,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        // Default path freezes an existing row's moderation_grant on conflict
+        // (see the upsert below): a re-received or relay-echoed delete must not
+        // have its honored verdict recomputed against later admin state.
+        self.record_app_event_inner(event, false, None)
+    }
+
+    /// Record an app event together with the normalized retention decision
+    /// resolved from its authenticated MLS source epoch.
+    pub fn record_app_event_with_retention(
+        &self,
+        event: &StoredAppEvent,
+        retention: Option<AppMessageRetentionDecision>,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        self.record_app_event_inner(event, false, retention)
+    }
+
+    /// Like [`record_app_event`], but a conflicting row's `moderation_grant` is
+    /// replaced with this event's value instead of frozen. Used only by the
+    /// local sender's post-publish reconciling projection, where the grant
+    /// recomputed after group sync supersedes the optimistic pre-send one.
+    pub fn record_app_event_refreshing_moderation_grant(
+        &self,
+        event: &StoredAppEvent,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        self.record_app_event_inner(event, true, None)
+    }
+
+    pub fn record_app_event_refreshing_moderation_grant_with_retention(
+        &self,
+        event: &StoredAppEvent,
+        retention: Option<AppMessageRetentionDecision>,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        self.record_app_event_inner(event, true, retention)
+    }
+
+    /// Finalize an optimistic local row from the exact MLS state that encrypted
+    /// the message. The first decision wins: retries, relay echoes, and
+    /// duplicate publication cannot reinterpret the source epoch or deadline.
+    pub fn finalize_app_event_source_retention(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_epoch: u64,
+        retention: AppMessageRetentionDecision,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1
+                     FROM app_events
+                     WHERE group_id_hex = ?1
+                       AND message_id_hex = ?2
+                       AND retention_seconds IS NULL
+                       AND (source_epoch IS NULL OR source_epoch = ?3)",
+                    params![group_id_hex, message_id_hex, u64_to_i64(source_epoch)?],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?;
+            if exists.is_none() {
+                return Ok(None);
+            }
+            let updated = conn
+                .execute(
+                    "UPDATE app_events
+                     SET source_message_id_hex = COALESCE(source_message_id_hex, ?3),
+                         source_epoch = COALESCE(source_epoch, ?4),
+                         retention_seconds = ?5,
+                         retention_expires_at = ?6
+                     WHERE group_id_hex = ?1
+                       AND message_id_hex = ?2
+                       AND retention_seconds IS NULL
+                       AND (source_epoch IS NULL OR source_epoch = ?4)",
+                    params![
+                        group_id_hex,
+                        message_id_hex,
+                        source_message_id_hex,
+                        u64_to_i64(source_epoch)?,
+                        u64_to_i64(retention.retention_seconds)?,
+                        retention.expires_at.map(u64_to_i64).transpose()?,
+                    ],
+                )
+                .storage()?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            let (kind, tags) = app_event_projection_parts_tx(&conn, group_id_hex, message_id_hex)?
+                .ok_or_else(|| {
+                    StorageError::Backend("finalized app event row missing after update".to_owned())
+                })?;
+            replace_encrypted_media_secret_references_for_parts_tx(
+                &conn,
+                group_id_hex,
+                message_id_hex,
+                kind,
+                Some(source_epoch),
+                &tags,
+            )?;
+            let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+                &conn,
+                group_id_hex,
+                message_id_hex,
+                kind,
+                &tags,
+            )?;
+            for message_id in &affected_message_ids {
+                upsert_message_timeline_projection_for_message_tx(&conn, group_id_hex, message_id)?;
+            }
+            let messages =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            let changes = timeline_changes_for_event(
+                message_id_hex,
+                kind,
+                &tags,
+                None,
+                &affected_message_ids,
+                &messages,
+            );
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex: group_id_hex.to_owned(),
+                messages,
+                changes,
+            }))
+        })
+    }
+
+    fn record_app_event_inner(
+        &self,
+        event: &StoredAppEvent,
+        refresh_moderation_grant: bool,
+        retention: Option<AppMessageRetentionDecision>,
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -329,12 +531,13 @@ impl SqliteAccountStorage {
             conn.execute(
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
-                    plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id
+                    plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id,
+                    moderation_grant, retention_seconds, retention_expires_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
                     source_message_id_hex = excluded.source_message_id_hex,
-                    source_epoch = excluded.source_epoch,
+                    source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
                     plaintext = excluded.plaintext,
@@ -343,6 +546,12 @@ impl SqliteAccountStorage {
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
+                    moderation_grant = CASE WHEN ?16 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
+                    retention_seconds = COALESCE(app_events.retention_seconds, excluded.retention_seconds),
+                    retention_expires_at = CASE
+                        WHEN app_events.retention_seconds IS NULL THEN excluded.retention_expires_at
+                        ELSE app_events.retention_expires_at
+                    END,
                     invalidated = 0,
                     invalidation_reason = NULL",
                 params![
@@ -358,9 +567,19 @@ impl SqliteAccountStorage {
                     u64_to_i64(event.recorded_at)?,
                     u64_to_i64(event.received_at)?,
                     &event.origin_commit_id,
+                    event.moderation_grant,
+                    retention
+                        .map(|decision| u64_to_i64(decision.retention_seconds))
+                        .transpose()?,
+                    retention
+                        .and_then(|decision| decision.expires_at)
+                        .map(u64_to_i64)
+                        .transpose()?,
+                    refresh_moderation_grant,
                 ],
             )
             .storage()?;
+            replace_encrypted_media_secret_references_tx(&conn, event)?;
             upsert_message_modifier_edges_tx(&conn, event)?;
             if can_incrementally_project {
                 for message_id in &affected_message_ids {
@@ -608,9 +827,40 @@ impl SqliteAccountStorage {
     }
 
     pub fn message_timeline(&self, query: TimelineMessageQuery) -> StorageResult<TimelinePage> {
-        let pagination = validate_pagination(&query.pagination)?;
-        let (sql, params) = timeline_query_sql(&query, &pagination)?;
+        self.message_timeline_ordered(query, true)
+    }
+
+    /// Query by the legacy wall-clock tuple regardless of group source epochs.
+    /// Retention uses this because expiry cutoffs are timestamps, not display
+    /// cursors; ordinary group timelines should use [`Self::message_timeline`].
+    pub fn message_timeline_by_wall_clock(
+        &self,
+        query: TimelineMessageQuery,
+    ) -> StorageResult<TimelinePage> {
+        self.message_timeline_ordered(query, false)
+    }
+
+    fn message_timeline_ordered(
+        &self,
+        query: TimelineMessageQuery,
+        canonical_group_order: bool,
+    ) -> StorageResult<TimelinePage> {
+        let canonical_group_order = canonical_group_order && query.group_id_hex.is_some();
+        let mut pagination = validate_pagination(&query.pagination)?;
         let conn = self.lock()?;
+        if canonical_group_order
+            && let (Some(group_id_hex), Some(cursor_message_id_hex)) = (
+                query.group_id_hex.as_deref(),
+                pagination.cursor_message_id_hex.as_deref(),
+            )
+        {
+            pagination.cursor_order = Some(timeline_order_cursor_tx(
+                &conn,
+                group_id_hex,
+                cursor_message_id_hex,
+            )?);
+        }
+        let (sql, params) = timeline_query_sql(&query, &pagination, canonical_group_order)?;
         let rows = {
             let _span = tracing::debug_span!(
                 target: "storage_sqlite::timeline",
@@ -654,6 +904,42 @@ impl SqliteAccountStorage {
             has_more_before,
             has_more_after,
         })
+    }
+
+    /// Resolve one complete materialized-timeline row by group + message id.
+    /// This reads the user-visible projection (including current edit,
+    /// reaction, delete, and invalidation state), not the raw app-event row.
+    pub fn timeline_message(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<TimelineMessageRecord>> {
+        let conn = self.lock()?;
+        let mut message = conn
+            .query_row(
+                "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                        source.retention_seconds, source.retention_expires_at,
+                        timeline.direction, timeline.group_id_hex, timeline.sender,
+                        timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                        timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                        timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                        timeline.deleted_by_message_id_hex, timeline.invalidation_status
+                 FROM message_timeline AS timeline
+                 LEFT JOIN app_events AS source
+                   ON source.group_id_hex = timeline.group_id_hex
+                  AND source.message_id_hex = timeline.message_id_hex
+                 WHERE timeline.group_id_hex = ?1
+                   AND timeline.message_id_hex = ?2
+                 LIMIT 1",
+                params![group_id_hex, message_id_hex],
+                timeline_record_from_row,
+            )
+            .optional()
+            .storage()?;
+        if let Some(message) = message.as_mut() {
+            attach_reply_previews(&conn, std::slice::from_mut(message))?;
+        }
+        Ok(message)
     }
 
     /// Resolve a single materialized-timeline row by `(group_id_hex,
@@ -723,6 +1009,8 @@ pub(crate) fn secure_prune_app_events_before_tx(
     tx: &Connection,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     debug_assert_eq!(
         tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
@@ -731,6 +1019,48 @@ pub(crate) fn secure_prune_app_events_before_tx(
         "secure_delete must be ON before the prune transaction is opened"
     );
     let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    secure_prune_selected_app_events_tx(
+        tx,
+        group_id_hex,
+        pruned_events,
+        local_account_id_hex,
+        mention_classifier,
+    )
+}
+
+/// Securely prune only rows whose source-epoch retention decision has reached
+/// its exact expiry. Rows with no decision (legacy/unrecoverable), disabled
+/// retention, or a non-finite overflow result have NULL expiry and survive.
+pub(crate) fn secure_prune_expired_app_events_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    now: u64,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::chat_list::MentionClassifier<'_>,
+) -> StorageResult<SecurePruneAppEventsResult> {
+    debug_assert_eq!(
+        tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0),
+        1,
+        "secure_delete must be ON before the prune transaction is opened"
+    );
+    let pruned_events = expired_app_events_tx(tx, group_id_hex, now)?;
+    secure_prune_selected_app_events_tx(
+        tx,
+        group_id_hex,
+        pruned_events,
+        local_account_id_hex,
+        mention_classifier,
+    )
+}
+
+fn secure_prune_selected_app_events_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    pruned_events: Vec<PrunedAppEvent>,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::chat_list::MentionClassifier<'_>,
+) -> StorageResult<SecurePruneAppEventsResult> {
     if pruned_events.is_empty() {
         return Ok(SecurePruneAppEventsResult::default());
     }
@@ -738,9 +1068,16 @@ pub(crate) fn secure_prune_app_events_before_tx(
     let mut pruned_message_ids = BTreeSet::new();
     let mut affected_message_ids = BTreeSet::new();
     let mut media_ciphertext_sha256 = BTreeSet::new();
+    let mut retiring_media_epochs = BTreeSet::new();
     for event in &pruned_events {
         pruned_message_ids.insert(event.message_id_hex.clone());
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+        if event.kind == MARMOT_APP_EVENT_KIND_CHAT
+            && !encrypted_media_component_ids(&event.tags).is_empty()
+            && let Some(source_epoch) = event.source_epoch
+        {
+            retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
+        }
         affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
             tx,
             group_id_hex,
@@ -750,21 +1087,21 @@ pub(crate) fn secure_prune_app_events_before_tx(
         )?);
     }
 
-    scrub_app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    retain_pruned_chat_activity_tx(tx, group_id_hex, &pruned_message_ids)?;
+    scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     // `message_timeline.plaintext` is indexed for search; overwriting it
     // under `secure_delete` before DELETE also rewrites the old index key.
     scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
 
     // Deleting the owning app_events rows cascades to message_modifier_edges
-    // via its ON DELETE CASCADE foreign key.
-    let pruned = tx
-        .execute(
-            "DELETE FROM app_events
-             WHERE group_id_hex = ?1
-               AND recorded_at < ?2",
-            params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-        )
-        .storage()?;
+    // and encrypted-media secret references via their ON DELETE CASCADE
+    // foreign keys.
+    let pruned = delete_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    let pruned_media_epoch_secrets = retire_unreferenced_encrypted_media_secret_epochs_tx(
+        tx,
+        group_id_hex,
+        &retiring_media_epochs,
+    )?;
 
     delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
@@ -772,26 +1109,95 @@ pub(crate) fn secure_prune_app_events_before_tx(
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
     }
     refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
+    crate::chat_list::refresh_chat_list_unread_after_secure_prune_tx(
+        tx,
+        local_account_id_hex,
+        group_id_hex,
+        mention_classifier,
+    )?;
 
     Ok(SecurePruneAppEventsResult {
         pruned_messages: pruned,
+        pruned_media_epoch_secrets,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+        erasure_pending: false,
     })
+}
+
+fn retain_pruned_chat_activity_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    pruned_message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    let mut statement = tx
+        .prepare(
+            "SELECT timeline_at
+             FROM message_timeline
+             WHERE group_id_hex = ?1
+               AND message_id_hex = ?2
+               AND kind = ?3
+               AND (
+                   invalidation_status IS NULL
+                   OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+               )",
+        )
+        .storage()?;
+    let mut latest_pruned_activity = None;
+    for message_id_hex in pruned_message_ids {
+        let timeline_at = statement
+            .query_row(
+                params![
+                    group_id_hex,
+                    message_id_hex,
+                    u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?;
+        latest_pruned_activity = latest_pruned_activity.max(timeline_at);
+    }
+    if let Some(timeline_at) = latest_pruned_activity {
+        tx.execute(
+            "UPDATE chat_list_rows
+             SET retained_activity_sort_at = MAX(retained_activity_sort_at, ?2),
+                 activity_sort_at = MAX(activity_sort_at, ?2)
+             WHERE group_id_hex = ?1",
+            params![group_id_hex, timeline_at],
+        )
+        .storage()?;
+    }
+    Ok(())
 }
 
 fn refresh_chat_list_last_message_after_secure_prune_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
+    let sql = format!(
+        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
+                media_json,
+                CASE
+                    WHEN direction != 'sent' THEN 'not_applicable'
+                    WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
+                    WHEN source_message_id_hex IS NULL THEN 'pending'
+                    ELSE 'delivered'
+                END,
+                tags_json
+         FROM message_timeline
+         WHERE group_id_hex = ?1
+           AND kind = ?2
+           AND (
+               invalidation_status IS NULL
+               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+           )
+         ORDER BY {}
+         LIMIT 1",
+        crate::chat_list::CHAT_LIST_PREVIEW_ORDER_DESC
+    );
     let latest = tx
         .query_row(
-            "SELECT message_id_hex, sender, plaintext, kind, tags_json, timeline_at, deleted
-             FROM message_timeline
-             WHERE group_id_hex = ?1
-               AND kind = ?2
-               AND invalidation_status IS NULL
-             ORDER BY timeline_at DESC, message_id_hex DESC
-             LIMIT 1",
+            &sql,
             params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
             |row| {
                 Ok((
@@ -799,35 +1205,62 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
         .optional()
         .storage()?;
     let updated_at = u64_to_i64(unix_now_seconds())?;
-    if let Some((message_id, sender, plaintext, kind, tags_json, timeline_at, deleted)) = latest {
+    if let Some((
+        message_id,
+        sender,
+        plaintext,
+        kind,
+        timeline_at,
+        deleted,
+        media_json,
+        delivery_state,
+        tags_json,
+    )) = latest
+    {
         tx.execute(
             "UPDATE chat_list_rows
              SET last_message_id_hex = ?1,
                  last_message_sender = ?2,
                  last_message_preview = ?3,
                  last_message_kind = ?4,
-                 last_message_tags_json = ?5,
-                 last_message_timeline_at = ?6,
-                 last_message_deleted = ?7,
-                 updated_at = ?8
-             WHERE group_id_hex = ?9",
+                 last_message_timeline_at = ?5,
+                 last_message_deleted = ?6,
+                 last_message_media_json = ?7,
+                 last_message_delivery_state = ?8,
+                 last_message_tags_json = ?9,
+                 activity_sort_at = MAX(
+                     retained_activity_sort_at,
+                     ?5,
+                     COALESCE((
+                         SELECT last_read_timeline_at
+                         FROM conversation_read_state
+                         WHERE group_id_hex = ?11
+                     ), 0),
+                     conversation_created_at
+                 ),
+                 updated_at = ?10
+             WHERE group_id_hex = ?11",
             params![
                 message_id,
                 sender,
                 plaintext,
                 kind,
-                tags_json,
                 timeline_at,
                 deleted,
+                media_json,
+                delivery_state,
+                tags_json,
                 updated_at,
                 group_id_hex
             ],
@@ -840,9 +1273,20 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_sender = NULL,
                  last_message_preview = NULL,
                  last_message_kind = NULL,
-                 last_message_tags_json = NULL,
                  last_message_timeline_at = NULL,
                  last_message_deleted = 0,
+                 last_message_media_json = NULL,
+                 last_message_delivery_state = 'not_applicable',
+                 last_message_tags_json = NULL,
+                 activity_sort_at = MAX(
+                     retained_activity_sort_at,
+                     COALESCE((
+                         SELECT last_read_timeline_at
+                         FROM conversation_read_state
+                         WHERE group_id_hex = ?2
+                     ), 0),
+                     conversation_created_at
+                 ),
                  updated_at = ?1
              WHERE group_id_hex = ?2",
             params![updated_at, group_id_hex],
@@ -932,7 +1376,7 @@ fn project_single_message_timeline_tx(
         .query_row(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason
+                    invalidated, invalidation_reason, moderation_grant
              FROM app_events
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex, message_id_hex],
@@ -1066,7 +1510,10 @@ fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> Storag
         &row.message_id_hex,
     )?;
     for delete in deletes {
-        if row.sender != delete.sender {
+        // Self-retraction, or an admin moderation delete whose grant was
+        // authenticated and frozen at ingest (never granted in direct
+        // conversations). Anything else is a forged cross-sender delete.
+        if row.sender != delete.sender && !delete.moderation_grant {
             continue;
         }
         row.deleted = true;
@@ -1163,7 +1610,8 @@ fn app_events_targeting_message_tx(
                     app_events.source_epoch, app_events.direction, app_events.sender,
                     app_events.plaintext, app_events.kind, app_events.tags_json,
                     app_events.recorded_at, app_events.received_at,
-                    app_events.invalidated, app_events.invalidation_reason
+                    app_events.invalidated, app_events.invalidation_reason,
+                    app_events.moderation_grant
              FROM message_modifier_edges AS edges
              JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
@@ -1232,6 +1680,39 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
         ],
     )
     .storage()?;
+    // A read marker can point at an optimistic local row whose canonical key
+    // changes when the send is reconciled to authenticated MLS history. Keep
+    // the durable anchor synchronized with that row while it exists; if
+    // retention later removes the row, the last synchronized key remains.
+    let (order_class, order_primary, order_phase, order_at, _id) = canonical_timeline_order_key(
+        row.source_message_id_hex.as_deref(),
+        row.source_epoch,
+        row.invalidation_status.as_deref(),
+        row.kind,
+        row.timeline_at,
+        &row.message_id_hex,
+    );
+    tx.execute(
+        "UPDATE conversation_read_state
+         SET last_read_timeline_at = ?3,
+             last_read_order_class = ?4,
+             last_read_order_primary = ?5,
+             last_read_order_phase = ?6,
+             last_read_order_at = ?7,
+             updated_at = ?8
+         WHERE group_id_hex = ?1 AND last_read_message_id_hex = ?2",
+        params![
+            &row.group_id_hex,
+            &row.message_id_hex,
+            u64_to_i64(row.timeline_at)?,
+            i64::from(order_class),
+            u64_to_i64(order_primary)?,
+            i64::from(order_phase),
+            u64_to_i64(order_at)?,
+            u64_to_i64(unix_now_seconds())?
+        ],
+    )
+    .storage()?;
     Ok(())
 }
 
@@ -1276,7 +1757,7 @@ fn app_events_for_rebuild_tx(
         .prepare(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason
+                    invalidated, invalidation_reason, moderation_grant
              FROM app_events
              WHERE group_id_hex = ?1
              ORDER BY recorded_at, message_id_hex, insert_order",
@@ -1295,7 +1776,7 @@ fn app_events_before_cutoff_tx(
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
         .prepare(
-            "SELECT message_id_hex, kind, tags_json
+            "SELECT message_id_hex, kind, source_epoch, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
                AND recorded_at < ?2
@@ -1305,9 +1786,9 @@ fn app_events_before_cutoff_tx(
     stmt.query_map(
         params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
         |row| {
-            let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
+            let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    2,
+                    3,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
@@ -1315,6 +1796,9 @@ fn app_events_before_cutoff_tx(
             Ok(PrunedAppEvent {
                 message_id_hex: row.get(0)?,
                 kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+                source_epoch: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|value| value.try_into().ok()),
                 tags,
             })
         },
@@ -1324,27 +1808,98 @@ fn app_events_before_cutoff_tx(
     .storage()
 }
 
-fn scrub_app_events_before_cutoff_tx(
+fn expired_app_events_tx(
     tx: &Connection,
     group_id_hex: &str,
-    cutoff_recorded_at: u64,
+    now: u64,
+) -> StorageResult<Vec<PrunedAppEvent>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT message_id_hex, kind, source_epoch, tags_json
+             FROM app_events
+             WHERE group_id_hex = ?1
+               AND retention_expires_at IS NOT NULL
+               AND retention_expires_at <= ?2
+             ORDER BY retention_expires_at, message_id_hex, insert_order",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex, u64_to_i64(now)?], |row| {
+        let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+        })?;
+        Ok(PrunedAppEvent {
+            message_id_hex: row.get(0)?,
+            kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+            source_epoch: row
+                .get::<_, Option<i64>>(2)?
+                .and_then(|value| value.try_into().ok()),
+            tags,
+        })
+    })
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
+}
+
+fn scrub_app_event_rows_by_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
 ) -> StorageResult<()> {
-    tx.execute(
-        "UPDATE app_events
-         SET source_message_id_hex = NULL,
-             source_epoch = NULL,
-             direction = '',
-             sender = '',
-             plaintext = zeroblob(length(plaintext)),
-             tags_json = zeroblob(length(tags_json)),
-             invalidation_reason = NULL,
-             origin_commit_id = NULL
-         WHERE group_id_hex = ?1
-           AND recorded_at < ?2",
-        params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-    )
-    .storage()?;
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute(
+            &format!(
+                "UPDATE app_events
+                 SET source_message_id_hex = NULL,
+                     source_epoch = NULL,
+                     direction = '',
+                     sender = '',
+                     plaintext = zeroblob(length(plaintext)),
+                     tags_json = zeroblob(length(tags_json)),
+                     invalidation_reason = NULL,
+                     origin_commit_id = NULL,
+                     retention_seconds = NULL,
+                     retention_expires_at = NULL
+                 WHERE group_id_hex = ?
+                   AND message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+    }
     Ok(())
+}
+
+fn delete_app_event_rows_by_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<usize> {
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    let mut deleted = 0usize;
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        deleted = deleted.saturating_add(
+            tx.execute(
+                &format!(
+                    "DELETE FROM app_events
+                     WHERE group_id_hex = ?
+                       AND message_id_hex IN ({placeholders})"
+                ),
+                params_from_iter(values.iter()),
+            )
+            .storage()?,
+        );
+    }
+    Ok(deleted)
 }
 
 fn scrub_timeline_projection_rows_by_ids_tx(
@@ -1788,32 +2343,33 @@ fn reply_message_ids_for_targets_tx(
     tx: &Connection,
     group_id_hex: &str,
     target_message_ids: &[String],
-) -> StorageResult<Vec<String>> {
+) -> StorageResult<BTreeSet<String>> {
     if target_message_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeSet::new());
     }
-    let placeholders = std::iter::repeat_n("?", target_message_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT message_id_hex
-         FROM message_timeline
-         WHERE group_id_hex = ?
-           AND reply_to_message_id_hex IN ({placeholders})"
-    );
-    let mut values = Vec::<rusqlite::types::Value>::with_capacity(target_message_ids.len() + 1);
-    values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    values.extend(
-        target_message_ids
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::Text),
-    );
-    let mut stmt = tx.prepare(&sql).storage()?;
-    stmt.query_map(params_from_iter(values.iter()), |row| row.get(0))
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+    let mut message_ids = BTreeSet::new();
+    for chunk in target_message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id_hex
+             FROM message_timeline
+             WHERE group_id_hex = ?
+               AND reply_to_message_id_hex IN ({placeholders})"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+        values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_ids = stmt
+            .query_map(params_from_iter(values.iter()), |row| row.get(0))
+            .storage()?
+            .collect::<Result<Vec<String>, _>>()
+            .storage()?;
+        message_ids.extend(chunk_ids);
+    }
+    Ok(message_ids)
 }
 
 fn reaction_target_message_id_tx(
@@ -1858,29 +2414,91 @@ fn timeline_records_by_ids_tx(
     if message_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", message_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
-                plaintext, kind, tags_json, timeline_at, received_at,
-                reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                deleted, deleted_by_message_id_hex, invalidation_status
-         FROM message_timeline
-         WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
-         {TIMELINE_ORDER_BY_ASC}"
-    );
-    let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-    params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-    let mut stmt = tx.prepare(&sql).storage()?;
-    let mut messages = stmt
-        .query_map(params_from_iter(params.iter()), timeline_record_from_row)
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
+    let message_ids = message_ids.into_iter().collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                    source.retention_seconds, source.retention_expires_at,
+                    timeline.direction, timeline.group_id_hex, timeline.sender,
+                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status
+             FROM message_timeline AS timeline
+             LEFT JOIN app_events AS source
+               ON source.group_id_hex = timeline.group_id_hex
+              AND source.message_id_hex = timeline.message_id_hex
+             WHERE timeline.group_id_hex = ?
+               AND timeline.message_id_hex IN ({placeholders})"
+        );
+        let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+        params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_messages = stmt
+            .query_map(params_from_iter(params.iter()), timeline_record_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        messages.extend(chunk_messages);
+    }
+    messages.sort_by(|left, right| left.canonical_order_key().cmp(&right.canonical_order_key()));
     attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
+}
+
+fn timeline_order_cursor_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<OwnedTimelineOrderKey> {
+    let row = tx
+        .query_row(
+            "SELECT source_message_id_hex, source_epoch, invalidation_status,
+                    kind, timeline_at, message_id_hex
+             FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .storage()?;
+    let Some((
+        source_message_id_hex,
+        source_epoch,
+        invalidation_status,
+        kind,
+        timeline_at,
+        message_id_hex,
+    )) = row
+    else {
+        return Err(StorageError::TimelineCursorExpired);
+    };
+    let source_epoch = source_epoch.map(i64_to_u64).transpose()?;
+    let kind = i64_to_u64(kind)?;
+    let timeline_at = i64_to_u64(timeline_at)?;
+    let (class, primary, phase, at, _) = canonical_timeline_order_key(
+        source_message_id_hex.as_deref(),
+        source_epoch,
+        invalidation_status.as_deref(),
+        kind,
+        timeline_at,
+        &message_id_hex,
+    );
+    Ok((class, primary, phase, at, message_id_hex))
 }
 
 fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<ValidatedPagination> {
@@ -1919,19 +2537,37 @@ fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<Validat
         direction,
         cursor_at,
         cursor_message_id_hex,
+        cursor_order: None,
         inclusive: pagination.before_inclusive,
         limit,
     })
 }
 
+fn canonical_cursor_params(
+    class: u8,
+    primary: u64,
+    phase: u8,
+    timeline_at: u64,
+    message_id_hex: &str,
+) -> StorageResult<Vec<rusqlite::types::Value>> {
+    Ok(vec![
+        rusqlite::types::Value::Integer(i64::from(class)),
+        rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+        rusqlite::types::Value::Integer(i64::from(phase)),
+        rusqlite::types::Value::Integer(u64_to_i64(timeline_at)?),
+        rusqlite::types::Value::Text(message_id_hex.to_owned()),
+    ])
+}
+
 fn timeline_query_sql(
     query: &TimelineMessageQuery,
     pagination: &ValidatedPagination,
+    canonical_group_order: bool,
 ) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     if let Some(group_id_hex) = &query.group_id_hex {
-        clauses.push("group_id_hex = ?".to_owned());
+        clauses.push("timeline.group_id_hex = ?".to_owned());
         params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
     }
     if let Some(search) = query
@@ -1940,16 +2576,41 @@ fn timeline_query_sql(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        clauses.push("plaintext LIKE ? COLLATE NOCASE".to_owned());
-        params.push(rusqlite::types::Value::Text(format!("%{search}%")));
+        clauses.push("timeline.plaintext LIKE ? ESCAPE '\\' COLLATE NOCASE".to_owned());
+        params.push(rusqlite::types::Value::Text(format!(
+            "%{}%",
+            escape_like_literal(search)
+        )));
     }
-    match pagination.direction {
-        CursorDirection::Before => {
-            // An inclusive cursor returns the row equal to the bound too, so the
-            // tie-break comparison flips from `<` to `<=`.
+    match (pagination.direction, pagination.cursor_order.as_ref()) {
+        (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
+            let comparison = if pagination.inclusive { "<=" } else { "<" };
+            clauses.push(format!(
+                "(timeline.timeline_order_class,
+                  timeline.timeline_order_primary,
+                  timeline.timeline_order_phase,
+                  timeline.timeline_order_at,
+                  timeline.message_id_hex) {comparison} (?, ?, ?, ?, ?)"
+            ));
+            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+        }
+        (CursorDirection::After, Some((class, primary, phase, at, id))) => {
+            clauses.push(
+                "(timeline.timeline_order_class,
+                  timeline.timeline_order_primary,
+                  timeline.timeline_order_phase,
+                  timeline.timeline_order_at,
+                  timeline.message_id_hex) > (?, ?, ?, ?, ?)"
+                    .to_owned(),
+            );
+            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+        }
+        (CursorDirection::Before, None) if !canonical_group_order => {
+            // Wall-clock-only queries retain the timestamp cursor semantics.
+            // Canonical group queries resolve a retained row above instead.
             let id_comparison = if pagination.inclusive { "<=" } else { "<" };
             clauses.push(format!(
-                "(timeline_at < ? OR (timeline_at = ? AND message_id_hex {id_comparison} ?))"
+                "(timeline.timeline_at < ? OR (timeline.timeline_at = ? AND timeline.message_id_hex {id_comparison} ?))"
             ));
             let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
             params.push(rusqlite::types::Value::Integer(cursor_at));
@@ -1958,9 +2619,11 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        CursorDirection::After => {
-            clauses
-                .push("(timeline_at > ? OR (timeline_at = ? AND message_id_hex > ?))".to_owned());
+        (CursorDirection::After, None) if !canonical_group_order => {
+            clauses.push(
+                "(timeline.timeline_at > ? OR (timeline.timeline_at = ? AND timeline.message_id_hex > ?))"
+                    .to_owned(),
+            );
             let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
             params.push(rusqlite::types::Value::Integer(cursor_at));
             params.push(rusqlite::types::Value::Integer(cursor_at));
@@ -1968,7 +2631,10 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        CursorDirection::None => {}
+        (CursorDirection::Before | CursorDirection::After, None) => {
+            return Err(StorageError::TimelineCursorExpired);
+        }
+        (CursorDirection::None, _) => {}
     }
     params.push(rusqlite::types::Value::Integer(
         i64::try_from(pagination.limit + 1).unwrap_or(i64::MAX),
@@ -1978,23 +2644,70 @@ fn timeline_query_sql(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    let order_sql = match pagination.direction {
-        CursorDirection::After => TIMELINE_ORDER_BY_ASC,
-        CursorDirection::None | CursorDirection::Before => TIMELINE_ORDER_BY_DESC,
+    let order_sql = match (canonical_group_order, pagination.direction) {
+        (true, CursorDirection::After) => TIMELINE_GROUP_ORDER_BY_ASC,
+        (true, CursorDirection::None | CursorDirection::Before) => TIMELINE_GROUP_ORDER_BY_DESC,
+        (false, CursorDirection::After) => TIMELINE_WALL_ORDER_BY_ASC,
+        (false, CursorDirection::None | CursorDirection::Before) => TIMELINE_WALL_ORDER_BY_DESC,
     };
     Ok((
         format!(
-            "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
-                    plaintext, kind, tags_json, timeline_at, received_at,
-                    reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                    deleted, deleted_by_message_id_hex, invalidation_status
-             FROM message_timeline
+            "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                    source.retention_seconds, source.retention_expires_at,
+                    timeline.direction, timeline.group_id_hex, timeline.sender,
+                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status
+             FROM message_timeline AS timeline
+             LEFT JOIN app_events AS source
+               ON source.group_id_hex = timeline.group_id_hex
+              AND source.message_id_hex = timeline.message_id_hex
              {where_sql}
              {order_sql}
              LIMIT ?"
         ),
         params,
     ))
+}
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+pub(crate) fn canonical_timeline_order_key<'a>(
+    source_message_id_hex: Option<&str>,
+    source_epoch: Option<u64>,
+    _invalidation_status: Option<&str>,
+    kind: u64,
+    timeline_at: u64,
+    message_id_hex: &'a str,
+) -> (u8, u64, u8, u64, &'a str) {
+    // All unresolved local projections, including failed sends, stay at the
+    // optimistic head. Chat-list preview selection independently deprioritizes
+    // permanent failures once accepted history exists.
+    let (class, primary) = match source_epoch {
+        Some(epoch) => (1, epoch),
+        None if source_message_id_hex.is_none() => (2, timeline_at),
+        None => (0, timeline_at),
+    };
+    let phase = if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+        && source_message_id_hex.is_none()
+        && source_epoch.is_some()
+    {
+        0
+    } else {
+        1
+    };
+    let intra_epoch_at = if phase == 0 { 0 } else { timeline_at };
+    (class, primary, phase, intra_epoch_at, message_id_hex)
 }
 
 fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {
@@ -2112,7 +2825,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             let Some(row) = timeline.get_mut(target) else {
                 continue;
             };
-            if row.sender != delete.sender {
+            if row.sender != delete.sender && !delete.moderation_grant {
                 continue;
             }
             row.deleted = true;
@@ -2278,13 +2991,15 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         sender: row.get(5)?,
         plaintext: row.get(6)?,
         kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        // Timeline rows are a rebuildable projection. Degrade a corrupt source
+        // tag blob to no tags so one damaged row cannot poison every rebuild
+        // for the group; this matches the tolerant unread/search read paths.
+        tags: tags_from_json(row.get::<_, String>(8)?).unwrap_or_default(),
         recorded_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
         invalidated: row.get::<_, i64>(11)? != 0,
         invalidation_reason: row.get(12)?,
+        moderation_grant: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -2295,44 +3010,54 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         source_epoch: row
             .get::<_, Option<i64>>(2)?
             .and_then(|value| value.try_into().ok()),
-        direction: row.get(3)?,
-        group_id_hex: row.get(4)?,
-        sender: row.get(5)?,
-        plaintext: row.get(6)?,
-        kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
-        })?,
-        timeline_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
-        reply_to_message_id_hex: row.get(11)?,
-        reply_preview: None,
-        media: optional_value_from_json(row.get::<_, Option<String>>(12)?).map_err(|err| {
+        retention_seconds: row
+            .get::<_, Option<i64>>(3)?
+            .and_then(|value| value.try_into().ok()),
+        retention_expires_at: row
+            .get::<_, Option<i64>>(4)?
+            .and_then(|value| value.try_into().ok()),
+        direction: row.get(5)?,
+        group_id_hex: row.get(6)?,
+        sender: row.get(7)?,
+        plaintext: row.get(8)?,
+        kind: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        tags: tags_from_json(row.get::<_, String>(10)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                12,
+                10,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(13)?).map_err(
-            |err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    13,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            },
-        )?,
-        reactions: reaction_summary_from_json(row.get::<_, String>(14)?).map_err(|err| {
+        timeline_at: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+        received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
+        reply_to_message_id_hex: row.get(13)?,
+        reply_preview: None,
+        media: optional_value_from_json(row.get::<_, Option<String>>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        deleted: row.get::<_, i64>(15)? != 0,
-        deleted_by_message_id_hex: row.get(16)?,
-        invalidation_status: row.get(17)?,
+        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(15)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
+        reactions: reaction_summary_from_json(row.get::<_, String>(16)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                16,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        deleted: row.get::<_, i64>(17)? != 0,
+        deleted_by_message_id_hex: row.get(18)?,
+        invalidation_status: row.get(19)?,
     })
 }
 
@@ -2382,28 +3107,31 @@ fn load_reply_previews(
     for (group_id_hex, mut message_ids) in targets_by_group {
         message_ids.sort();
         message_ids.dedup();
-        let placeholders = std::iter::repeat_n("?", message_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT message_id_hex, sender, plaintext, kind, tags_json, media_json, agent_stream_json, deleted, source_epoch
-             FROM message_timeline
-             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
-        );
-        let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-        params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
-        params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-        let mut stmt = conn.prepare(&sql).storage()?;
-        let group_previews = stmt
-            .query_map(params_from_iter(params.iter()), reply_preview_from_row)
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        for preview in group_previews {
-            previews.insert(
-                (group_id_hex.clone(), preview.message_id_hex.clone()),
-                preview,
+        for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch,
+                        invalidation_status, tags_json
+                 FROM message_timeline
+                 WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
+            let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
+            params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+            let mut stmt = conn.prepare(&sql).storage()?;
+            let group_previews = stmt
+                .query_map(params_from_iter(params.iter()), reply_preview_from_row)
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            for preview in group_previews {
+                previews.insert(
+                    (group_id_hex.clone(), preview.message_id_hex.clone()),
+                    preview,
+                );
+            }
         }
     }
     Ok(previews)
@@ -2415,25 +3143,24 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         sender: row.get(1)?,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        tags: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
+        tags: crate::tags_from_json(row.get::<_, String>(9)?).unwrap_or_default(),
+        media: optional_value_from_json(row.get::<_, Option<String>>(4)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        media: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
-        })?,
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(6)?).map_err(
+        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    6,
+                    5,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        deleted: row.get::<_, i64>(7)? != 0,
+        deleted: row.get::<_, i64>(6)? != 0,
         source_epoch: row
-            .get::<_, Option<i64>>(8)?
+            .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
+        invalidation_status: row.get(8)?,
     })
 }
 

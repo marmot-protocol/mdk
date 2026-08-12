@@ -1,0 +1,99 @@
+name: Simulator Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  simulator-nightly:
+    name: Full simulator, campaigns, and vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: just
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run nightly convergence lane
+        run: just convergence-nightly-lane
+
+      - name: Run simulator doctests
+        run: cargo test -p cgka-conformance-simulator --doc --locked
+
+      - name: Build current distributed campaign image
+        run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
+
+      - name: Run selected real-container convergence campaign
+        env:
+          CGKA_CONVERGENCE_IMAGE: marmot-conformance:local
+        run: |
+          cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+            --run-ignored ignored-only --no-tests fail \
+            -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state)'
+
+      - name: Run encrypted file-backed vector report
+        run: |
+          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
+            --vectors crates/cgka-conformance-simulator/vectors \
+            --out target/cgka-conformance-simulator-nightly-reports \
+            --storage file \
+            --strict-oracle
+          jq -s -e 'all(.[]; .metadata.storage_backend == "encrypted-file-sqlite")' \
+            target/cgka-conformance-simulator-nightly-reports/*-report.json >/dev/null
+
+      - name: Upload nightly vector report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cgka-conformance-simulator-nightly-reports
+          path: target/cgka-conformance-simulator-nightly-reports
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Report nightly failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          run_date="$(date -u +%F)"
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Simulator nightly failed (${run_date})" \
+            --body "The simulator nightly failed. Run: ${RUN_URL}"

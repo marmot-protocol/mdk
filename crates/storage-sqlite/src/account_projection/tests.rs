@@ -1,9 +1,13 @@
 use super::*;
 use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+    QUOTE_REF_TAG, STREAM_TAG,
 };
+use cgka_traits::engine::GroupEvent;
+use cgka_traits::storage::MessageStorage;
+use cgka_traits::types::{EpochId, MemberId, MessageId};
 
 /// Test twin of the app layer's transport-cursor future-skew policy (five
 /// minutes). The storage layer treats it as an injected bound, so any value
@@ -12,6 +16,217 @@ const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
+}
+
+#[test]
+fn secure_delete_restore_failure_preserves_committed_outcome() {
+    let result = combine_secure_delete_operation_and_restore::<usize>(
+        Ok(7),
+        Err(StorageError::Backend("injected restore failure".to_owned())),
+    )
+    .unwrap();
+
+    assert_eq!(result, 7);
+}
+
+#[test]
+fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retention.sqlite");
+    let key = SqlCipherKey::new("source epoch retention test key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+
+    let mut due = app_event("due", "aa", 10);
+    due.source_epoch = Some(4);
+    store
+        .record_app_event_with_retention(
+            &due,
+            Some(AppMessageRetentionDecision::new(due.recorded_at, 5)),
+        )
+        .unwrap();
+
+    // A relay echo or restart replay cannot rewrite either the source epoch or
+    // the already-pinned deadline.
+    let mut duplicate = due.clone();
+    duplicate.source_epoch = Some(99);
+    store
+        .record_app_event_with_retention(
+            &duplicate,
+            Some(AppMessageRetentionDecision::new(duplicate.recorded_at, 500)),
+        )
+        .unwrap();
+
+    let later = app_event("later", "aa", 12);
+    store
+        .record_app_event_with_retention(
+            &later,
+            Some(AppMessageRetentionDecision::new(later.recorded_at, 4)),
+        )
+        .unwrap();
+    let disabled = app_event("disabled", "aa", 1);
+    store
+        .record_app_event_with_retention(
+            &disabled,
+            Some(AppMessageRetentionDecision::new(disabled.recorded_at, 0)),
+        )
+        .unwrap();
+    let overflow = app_event("overflow", "aa", 1);
+    store
+        .record_app_event_with_retention(
+            &overflow,
+            Some(AppMessageRetentionDecision::new(u64::MAX, 1)),
+        )
+        .unwrap();
+    store
+        .record_app_event(&app_event("legacy", "aa", 1))
+        .unwrap();
+    store
+        .record_app_event_with_retention(
+            &app_event("other-group", "bb", 1),
+            Some(AppMessageRetentionDecision::new(1, 1)),
+        )
+        .unwrap();
+
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let records = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            limit: None,
+        })
+        .unwrap();
+    let due_record = records
+        .iter()
+        .find(|record| record.message_id_hex == "due")
+        .unwrap();
+    assert_eq!(due_record.source_epoch, Some(4));
+    assert_eq!(
+        due_record.retention,
+        Some(AppMessageRetentionDecision::new(10, 5))
+    );
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.message_id_hex == "legacy")
+            .unwrap()
+            .retention,
+        None
+    );
+
+    let outcome = store
+        .secure_prune_expired_app_events("aa", 15, "local", &no_mentions)
+        .unwrap();
+    assert_eq!(outcome.pruned_messages, 1);
+    let surviving_ids = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: None,
+            limit: None,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|record| record.message_id_hex)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!surviving_ids.contains("due"));
+    assert!(surviving_ids.contains("later"));
+    assert!(surviving_ids.contains("disabled"));
+    assert!(surviving_ids.contains("overflow"));
+    assert!(surviving_ids.contains("legacy"));
+    assert!(surviving_ids.contains("other-group"));
+
+    assert_eq!(
+        store
+            .secure_prune_expired_app_events("aa", 16, "local", &no_mentions)
+            .unwrap()
+            .pruned_messages,
+        1
+    );
+}
+
+#[test]
+fn optimistic_local_retention_is_finalized_once_from_matching_source_epoch() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let optimistic = app_event("local", "aa", 10);
+    store.record_app_event(&optimistic).unwrap();
+
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "local",
+                Some("transport-id"),
+                4,
+                AppMessageRetentionDecision::new(12, 5),
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "local",
+                Some("different-id"),
+                99,
+                AppMessageRetentionDecision::new(10, 500),
+            )
+            .unwrap()
+            .is_none(),
+        "a duplicate publication cannot reinterpret a finalized decision"
+    );
+
+    let mut pinned_epoch = app_event("pinned-epoch", "aa", 20);
+    pinned_epoch.source_epoch = Some(7);
+    store.record_app_event(&pinned_epoch).unwrap();
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "pinned-epoch",
+                None,
+                8,
+                AppMessageRetentionDecision::new(20, 30),
+            )
+            .unwrap()
+            .is_none(),
+        "retention from a different epoch must not attach to an existing row"
+    );
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "pinned-epoch",
+                None,
+                7,
+                AppMessageRetentionDecision::new(20, 30),
+            )
+            .unwrap()
+            .is_some()
+    );
+
+    let records = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            limit: None,
+        })
+        .unwrap();
+    let local = records
+        .iter()
+        .find(|record| record.message_id_hex == "local")
+        .unwrap();
+    assert_eq!(local.source_epoch, Some(4));
+    assert_eq!(
+        local.retention,
+        Some(AppMessageRetentionDecision::new(12, 5))
+    );
+    let pinned = records
+        .iter()
+        .find(|record| record.message_id_hex == "pinned-epoch")
+        .unwrap();
+    assert_eq!(pinned.source_epoch, Some(7));
+    assert_eq!(
+        pinned.retention,
+        Some(AppMessageRetentionDecision::new(20, 30))
+    );
 }
 
 fn group(id: &str, name: &str) -> StoredAccountGroup {
@@ -28,8 +243,11 @@ fn group(id: &str, name: &str) -> StoredAccountGroup {
         admin_keys_hex: String::new(),
         archived: false,
         pending_confirmation: false,
+        member_count: None,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
+        nostr_routing_last_epoch: 0,
+        prior_nostr_routes: Vec::new(),
         self_membership: SelfMembership::Member,
         components: vec![
             StoredAccountGroupComponent {
@@ -60,6 +278,7 @@ fn app_event(id: &str, group_id_hex: &str, at: u64) -> StoredAppEvent {
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -82,6 +301,7 @@ fn agent_stream_start_event(
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -102,6 +322,7 @@ fn reply_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> StoredApp
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -119,6 +340,7 @@ fn reaction_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> Stored
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -142,17 +364,25 @@ fn delete_event(
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
 #[test]
 fn account_projection_state_roundtrips_groups_components_and_seen_events() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut stored_group = group("aa", "alpha");
+    stored_group.nostr_routing_last_epoch = 8;
+    stored_group.prior_nostr_routes = vec![StoredNostrRoute {
+        nostr_group_id_hex: "11".repeat(32),
+        relays: vec!["wss://prior.example".to_owned()],
+        last_epoch: 7,
+    }];
     let state = StoredAccountState {
         label: "alice".to_owned(),
         seen_events: vec!["old".to_owned(), "kept".to_owned()],
         last_transport_timestamp: Some(1_700_000_001),
-        groups: vec![group("aa", "alpha")],
+        groups: vec![stored_group],
     };
 
     store
@@ -165,6 +395,15 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
     assert_eq!(restored.groups[0].profile_name, "alpha");
     assert_eq!(restored.groups[0].components.len(), 2);
     assert_eq!(restored.groups[0].components[1].component_id, 0x8004);
+    assert_eq!(restored.groups[0].nostr_routing_last_epoch, 8);
+    assert_eq!(
+        restored.groups[0].prior_nostr_routes,
+        vec![StoredNostrRoute {
+            nostr_group_id_hex: "11".repeat(32),
+            relays: vec!["wss://prior.example".to_owned()],
+            last_epoch: 7,
+        }]
+    );
 }
 
 #[test]
@@ -504,6 +743,81 @@ fn account_projection_state_deletes_groups_removed_from_snapshot() {
 }
 
 #[test]
+fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit() {
+    const GROUP_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: The raw handle is only used to lower this test connection's
+        // bind-parameter limit before any concurrent use; rusqlite keeps owning
+        // the connection and no pointer is retained.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+    }
+    let groups = (0..GROUP_COUNT)
+        .map(|index| {
+            let mut stored_group = group(&format!("group-{index:04}"), "group");
+            stored_group.components.clear();
+            stored_group
+        })
+        .collect::<Vec<_>>();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: groups.clone(),
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    let retained = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: groups[1..].to_vec(),
+    };
+    store
+        .save_account_projection_state(&retained, 16, MAX_FUTURE_SKEW_SECS)
+        .expect("an unbounded retained set must not become SQL bind parameters");
+    assert_eq!(
+        store
+            .load_account_projection_state("alice", GROUP_COUNT)
+            .unwrap()
+            .groups
+            .len(),
+        GROUP_COUNT - 1
+    );
+
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                groups: Vec::new(),
+                ..retained
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .expect("more than one chunk of stale group keys should be deleted");
+    assert!(
+        store
+            .load_account_projection_state("alice", GROUP_COUNT)
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+}
+
+#[test]
 fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let state = StoredAccountState {
@@ -575,7 +889,12 @@ fn app_messages_list_raw_events_and_prune_updates_timeline() {
         .record_app_event(&app_event("old-bb", "bb", 10))
         .unwrap();
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let aa = store
         .app_messages(StoredAppMessageQuery {
@@ -658,7 +977,12 @@ fn prune_app_events_before_scrubs_pruned_plaintext_and_media_before_deleting() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let conn = store.lock().unwrap();
     let rows = conn
@@ -757,7 +1081,9 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         "fixture should place plaintext in the database file before secure prune"
     );
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash.clone()]);
     assert!(
@@ -833,7 +1159,9 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
         "fixture should place indexed plaintext in the database file before secure prune"
     );
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
     drop(store);
@@ -886,7 +1214,9 @@ fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
         "chat list should not retain this"
     );
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
     assert!(
@@ -911,14 +1241,16 @@ fn secure_prune_restores_caller_secure_delete_setting() {
         .record_app_event(&app_event("old-aa", "aa", 10))
         .unwrap();
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(secure_delete_pragma(&store), 0);
 }
 
 #[test]
-fn secure_prune_returns_hashes_when_wal_checkpoint_is_busy() {
+fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("account.sqlite");
     let store = SqliteAccountStorage::from_connection_with_options(
@@ -944,11 +1276,167 @@ fn secure_prune_returns_hashes_when_wal_checkpoint_is_busy() {
         .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
         .unwrap();
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let pending = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .expect("checkpoint contention is a committed result with pending erasure");
 
+    assert_eq!(pending.pruned_messages, 1);
+    assert_eq!(pending.media_ciphertext_sha256, vec![media_hash.clone()]);
+    assert!(pending.erasure_pending);
+    assert_eq!(
+        store.app_message_count().unwrap(),
+        0,
+        "logical deletion commits before the checkpoint failure is surfaced"
+    );
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    drop(store);
+
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .expect("retry after reopen must re-drive the durable pending checkpoint");
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash]);
-    reader.execute_batch("COMMIT").unwrap();
+    assert!(!outcome.erasure_pending);
+
+    let empty = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
+    assert_eq!(
+        empty,
+        crate::SecurePruneAppEventsResult::default(),
+        "the committed result is consumed exactly once after checkpoint completion"
+    );
+}
+
+#[test]
+fn competing_storage_handles_consume_one_checkpoint_intent_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("competing-checkpoint.sqlite");
+    let store_a = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        SqliteStorageOptions::default(),
+    )
+    .unwrap();
+    let store_b = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        SqliteStorageOptions::default(),
+    )
+    .unwrap();
+    let expected = crate::SecurePruneAppEventsResult {
+        pruned_messages: 1,
+        pruned_media_epoch_secrets: 0,
+        media_ciphertext_sha256: vec!["ab".repeat(32)],
+        erasure_pending: false,
+    };
+    {
+        let conn = store_a.lock().unwrap();
+        upsert_secure_delete_intent_tx(
+            &conn,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+            &serde_json::to_string(&expected).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let a = std::thread::spawn(move || {
+        finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
+            &store_a,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+        )
+        .unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
+            &store_b,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+        )
+        .unwrap()
+    });
+    let outcomes = [a.join().unwrap().result, b.join().unwrap().result];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+        1,
+        "exactly one competing finisher should consume the durable result"
+    );
+    assert!(
+        outcomes
+            .into_iter()
+            .flatten()
+            .all(|outcome| outcome == expected)
+    );
+}
+
+#[test]
+fn recreated_checkpoint_intent_cannot_be_deleted_by_a_stale_nonce() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let first_result = crate::SecurePruneAppEventsResult {
+        pruned_messages: 1,
+        ..crate::SecurePruneAppEventsResult::default()
+    };
+    let second_result = crate::SecurePruneAppEventsResult {
+        pruned_messages: 2,
+        ..crate::SecurePruneAppEventsResult::default()
+    };
+    let conn = store.lock().unwrap();
+    upsert_secure_delete_intent_tx(
+        &conn,
+        SECURE_DELETE_RETENTION_OPERATION,
+        "aa",
+        &serde_json::to_string(&first_result).unwrap(),
+    )
+    .unwrap();
+    let first = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+        .unwrap()
+        .unwrap();
+    conn.execute(
+        "DELETE FROM secure_delete_checkpoint_intents
+         WHERE operation_kind = ?1 AND scope = ?2",
+        params![SECURE_DELETE_RETENTION_OPERATION, "aa"],
+    )
+    .unwrap();
+    upsert_secure_delete_intent_tx(
+        &conn,
+        SECURE_DELETE_RETENTION_OPERATION,
+        "aa",
+        &serde_json::to_string(&second_result).unwrap(),
+    )
+    .unwrap();
+    let second = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.nonce.len(), 16);
+    assert_eq!(second.nonce.len(), 16);
+    assert_ne!(first.nonce, second.nonce);
+    assert_eq!(
+        conn.execute(
+            "DELETE FROM secure_delete_checkpoint_intents
+             WHERE operation_kind = ?1 AND scope = ?2 AND intent_nonce = ?3",
+            params![SECURE_DELETE_RETENTION_OPERATION, "aa", &first.nonce],
+        )
+        .unwrap(),
+        0,
+        "a stale finisher must not consume a recreated intent"
+    );
+    let remaining = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::SecurePruneAppEventsResult>(&remaining.result_json).unwrap(),
+        second_result
+    );
 }
 
 fn secure_delete_pragma(store: &SqliteAccountStorage) -> i64 {
@@ -981,7 +1469,12 @@ fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1025,7 +1518,12 @@ fn prune_app_events_before_deletes_only_pruned_agent_stream_start_rows() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let conn = store.lock().unwrap();
     let stream_start_ids = conn
@@ -1063,7 +1561,9 @@ fn prune_app_events_before_chunks_projection_deletes_under_sqlite_variable_limit
     }
 
     assert_eq!(
-        store.prune_app_events_before("aa", 2_000).unwrap(),
+        store
+            .prune_app_events_before("aa", 2_000, "local", &no_mentions)
+            .unwrap(),
         EVENT_COUNT
     );
 
@@ -1106,7 +1606,12 @@ fn prune_app_events_before_does_not_reproject_replies_when_parent_is_pruned() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1143,7 +1648,12 @@ fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1180,7 +1690,12 @@ fn prune_app_events_before_reprojects_survivor_when_delete_is_pruned() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1333,7 +1848,9 @@ fn push_registration_preserves_created_at_when_token_rotates() {
     store
         .upsert_push_registration(registration.clone(), vec![1, 2, 3])
         .unwrap();
-    store.mark_push_registration_shared("alice", 11).unwrap();
+    store
+        .mark_push_registration_shared("alice", "first", 10, 11)
+        .unwrap();
     let mut rotated = registration;
     rotated.token_fingerprint = "second".to_owned();
     rotated.updated_at_ms = 12;
@@ -1349,6 +1866,573 @@ fn push_registration_preserves_created_at_when_token_rotates() {
 }
 
 #[test]
+fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "first".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+
+    store
+        .upsert_push_registration(registration.clone(), vec![1, 2, 3])
+        .unwrap();
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), true)
+        .unwrap();
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    assert!(
+        store
+            .complete_push_registration_share("aa", "first", 10)
+            .unwrap()
+    );
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["bb".to_owned()]
+    );
+    store
+        .mark_push_registration_shared("alice", "first", 10, 11)
+        .unwrap();
+
+    let mut refreshed = registration;
+    refreshed.updated_at_ms = 10;
+    let stored = store
+        .upsert_push_registration(refreshed, vec![1, 2, 3])
+        .unwrap();
+
+    assert_eq!(stored.registration.last_shared_at_ms, None);
+    assert_eq!(stored.registration.updated_at_ms, 11);
+    assert_eq!(
+        store.pending_push_registration_shares("first", 11).unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    assert!(
+        !store
+            .complete_push_registration_share("aa", "first", 10)
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_push_registration_share("aa", "first", 11)
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_push_registration_share("bb", "first", 11)
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 11, 12)
+            .unwrap()
+    );
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), false)
+        .unwrap();
+    assert!(store.push_registration("alice").unwrap().is_none());
+    assert!(
+        store
+            .pending_push_registration_shares("first", 11)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.pending_push_registration_removals().unwrap().len(), 2);
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), true)
+        .unwrap();
+    assert!(store.push_registration("alice").unwrap().is_none());
+    assert_eq!(store.pending_push_registration_removals().unwrap().len(), 2);
+}
+
+#[test]
+fn push_registration_completion_is_version_guarded_and_membership_scoped() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let mut registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "first".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration.clone(), vec![1])
+        .unwrap();
+    store
+        .set_group_self_membership("bb", SelfMembership::Left)
+        .unwrap();
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["aa".to_owned()]
+    );
+
+    registration.token_fingerprint = "second".to_owned();
+    registration.updated_at_ms = 20;
+    store
+        .upsert_push_registration(registration, vec![2])
+        .unwrap();
+    assert!(
+        !store
+            .complete_push_registration_share("aa", "first", 10)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .pending_push_registration_shares("second", 20)
+            .unwrap(),
+        vec!["aa".to_owned()]
+    );
+
+    store
+        .set_group_self_membership("bb", SelfMembership::Member)
+        .unwrap();
+    assert_eq!(
+        store
+            .pending_push_registration_shares("second", 20)
+            .unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    store.clear_push_registration("alice").unwrap();
+    assert!(
+        store
+            .pending_push_registration_shares("second", 20)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.pending_push_registration_removals().unwrap().len(), 2);
+}
+
+#[test]
+fn push_registration_rotation_and_clear_queue_durable_removals() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let mut registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "first".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration.clone(), vec![1])
+        .unwrap();
+
+    registration.token_fingerprint = "same-key-refresh".to_owned();
+    registration.updated_at_ms = 11;
+    store
+        .upsert_push_registration(registration.clone(), vec![2])
+        .unwrap();
+    assert!(
+        store
+            .pending_push_registration_removals()
+            .unwrap()
+            .is_empty(),
+        "same record key is replaced by its newer update"
+    );
+
+    registration.token_fingerprint = "new-server".to_owned();
+    registration.server_pubkey_hex = "33".repeat(32);
+    registration.updated_at_ms = 12;
+    store
+        .upsert_push_registration(registration.clone(), vec![3])
+        .unwrap();
+    let old_server_removals = store.pending_push_registration_removals().unwrap();
+    assert_eq!(old_server_removals.len(), 2);
+    assert!(
+        old_server_removals
+            .iter()
+            .all(|pending| pending.registration.server_pubkey_hex == "22".repeat(32))
+    );
+
+    let cleared = store.clear_push_registration("alice").unwrap().unwrap();
+    assert_eq!(cleared.registration.token_fingerprint, "new-server");
+    assert!(store.push_registration("alice").unwrap().is_none());
+    assert!(
+        store
+            .pending_push_registration_shares("new-server", 12)
+            .unwrap()
+            .is_empty()
+    );
+    let removals = store.pending_push_registration_removals().unwrap();
+    assert_eq!(removals.len(), 4);
+
+    let completed = removals[0].clone();
+    store
+        .mark_push_registration_removal_attempted(&completed, 20)
+        .unwrap();
+    assert!(
+        store
+            .complete_push_registration_removal(&completed)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_push_registration_removal(&completed)
+            .unwrap(),
+        "completion is guarded by the exact queued revision"
+    );
+    assert_eq!(store.pending_push_registration_removals().unwrap().len(), 3);
+}
+
+#[test]
+fn push_registration_removal_outbox_preserves_same_server_revisions() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let mut registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "token-a".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration.clone(), vec![1])
+        .unwrap();
+    store.clear_push_registration("alice").unwrap();
+
+    registration.token_fingerprint = "token-b".to_owned();
+    registration.created_at_ms = 20;
+    registration.updated_at_ms = 20;
+    store
+        .upsert_push_registration(registration, vec![2])
+        .unwrap();
+    store.clear_push_registration("alice").unwrap();
+
+    let removals = store.pending_push_registration_removals().unwrap();
+    assert_eq!(removals.len(), 2);
+    assert_eq!(
+        removals
+            .iter()
+            .map(|pending| pending.registration.token_fingerprint.as_str())
+            .collect::<Vec<_>>(),
+        vec!["token-a", "token-b"]
+    );
+}
+
+#[test]
+fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local-delete-routes.sqlite");
+    let key = SqlCipherKey::new("local delete route preservation key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut deleted_group = group("aa", "alpha");
+    deleted_group.prior_nostr_routes = vec![StoredNostrRoute {
+        nostr_group_id_hex: "11".repeat(32),
+        relays: vec!["wss://old.example".to_owned()],
+        last_epoch: 7,
+    }];
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![deleted_group],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+
+    assert!(store.delete_local_group_data("aa").unwrap().did_delete());
+    drop(store);
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(
+        reopened
+            .local_group_deletion_prior_nostr_routes("aa")
+            .unwrap(),
+        vec![StoredNostrRoute {
+            nostr_group_id_hex: "11".repeat(32),
+            relays: vec!["wss://old.example".to_owned()],
+            last_epoch: 7,
+        }]
+    );
+}
+
+#[test]
+fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut deleted_group = group("aa", "alpha");
+    deleted_group.prior_nostr_routes = vec![
+        StoredNostrRoute {
+            nostr_group_id_hex: "11".repeat(32),
+            relays: vec!["wss://retired.example".to_owned()],
+            last_epoch: 1,
+        },
+        StoredNostrRoute {
+            nostr_group_id_hex: "22".repeat(32),
+            relays: vec!["wss://retained.example".to_owned()],
+            last_epoch: 2,
+        },
+    ];
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![deleted_group],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    {
+        let conn = store.lock().unwrap();
+        for (route, epoch) in [([0x22_u8; 32], 2_i64), ([0x33_u8; 32], 3_i64)] {
+            conn.execute(
+                "INSERT INTO cgka_transport_group_routes (
+                    transport_group_id, group_id, source_epoch
+                 ) VALUES (?1, ?2, ?3)",
+                rusqlite::params![route.as_slice(), &[0xaa_u8], epoch],
+            )
+            .unwrap();
+        }
+    }
+    store.delete_local_group_data("aa").unwrap();
+
+    store
+        .retain_local_group_deletion_nostr_routes(
+            "aa",
+            &[StoredNostrRoute {
+                nostr_group_id_hex: "33".repeat(32),
+                relays: vec!["wss://current.example".to_owned()],
+                last_epoch: 3,
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.local_group_deletion_prior_nostr_routes("aa").unwrap(),
+        vec![
+            StoredNostrRoute {
+                nostr_group_id_hex: "22".repeat(32),
+                relays: vec!["wss://retained.example".to_owned()],
+                last_epoch: 2,
+            },
+            StoredNostrRoute {
+                nostr_group_id_hex: "33".repeat(32),
+                relays: vec!["wss://current.example".to_owned()],
+                last_epoch: 3,
+            },
+        ],
+        "durable exact-route history must advance with the engine-owned overlap window",
+    );
+}
+
+#[test]
+fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    store.delete_local_group_data("aa").unwrap();
+    let frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    let fresh_message_id = MessageId::new(vec![9]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 4, ?3)",
+            rusqlite::params![fresh_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    let pending_event = GroupEvent::MessageReceived {
+        group_id: cgka_traits::GroupId::new(vec![0xaa]),
+        message_id: fresh_message_id.clone(),
+        sender: MemberId::new(vec![7; 32]),
+        epoch: EpochId(0),
+        payload: b"fresh chat".to_vec(),
+        retention: None,
+    };
+    store.put_pending_application_event(&pending_event).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_resurrection_projection
+             BEFORE INSERT ON account_groups
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected projection failure');
+             END;",
+        )
+        .unwrap();
+
+    let result = store.save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "resurrected")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+        &[("aa".to_owned(), frontier)],
+        std::slice::from_ref(&fresh_message_id),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(frontier),
+        "the marker clear must roll back when the crossing projection fails to persist",
+    );
+    assert!(
+        store
+            .load_account_projection_state("alice", 16)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "a failed save must not expose a partially resurrected group",
+    );
+    assert_eq!(
+        store.list_pending_application_events().unwrap(),
+        vec![pending_event],
+        "the durable delivery acknowledgement must roll back with the failed projection",
+    );
+}
+
+#[test]
+fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    let first_message_id = MessageId::new(vec![1]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![first_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    store.delete_local_group_data("aa").unwrap();
+    let first_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+
+    let buffered_message_id = MessageId::new(vec![2]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![buffered_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    store.delete_local_group_data("aa").unwrap();
+    let repeated_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+
+    assert!(repeated_frontier > first_frontier);
+    assert!(
+        !store
+            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &buffered_message_id)
+            .unwrap(),
+        "a message buffered before the repeated delete must remain behind its frontier"
+    );
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(repeated_frontier)
+    );
+
+    let fresh_message_id = MessageId::new(vec![3]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![fresh_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    assert!(
+        store
+            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &fresh_message_id)
+            .unwrap(),
+        "a message inserted after the repeated delete must cross the advanced frontier"
+    );
+}
+
+#[test]
 fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_state() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let state = StoredAccountState {
@@ -1360,9 +2444,10 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     store
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
-    store
-        .record_app_event(&app_event("msg-aa", "aa", 10))
-        .unwrap();
+    let mut group_a_message = app_event("msg-aa", "aa", 10);
+    group_a_message.source_epoch = Some(7);
+    group_a_message.tags = vec![vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()]];
+    store.record_app_event(&group_a_message).unwrap();
     store
         .record_app_event(&agent_stream_start_event(
             "stream-aa",
@@ -1380,6 +2465,16 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     store
         .remember_encrypted_media_epoch_secret("bb", 0x8008, 7, &[4, 5, 6])
         .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks (
+                 group_id_hex, retired_through_epoch, retired_at_unix_seconds
+             ) VALUES ('aa', 6, 10)",
+            [],
+        )
+        .unwrap();
     insert_group_push_token(&store, "aa", "member-aa");
     insert_group_push_token(&store, "bb", "member-bb");
     // Tombstones on a distinct leaf so they don't collide with the live rows
@@ -1393,8 +2488,93 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
     insert_read_and_chat_rows(&store, "aa");
     insert_protocol_group_marker(&store, &[0xaa]);
+    let historical_message_id = MessageId::new(vec![1]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![historical_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    let registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "push".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration.clone(), vec![1])
+        .unwrap();
+    store
+        .queue_push_registration_removals(&registration, 11)
+        .unwrap();
 
-    assert!(store.delete_local_group_data("aa").unwrap());
+    assert!(store.delete_local_group_data("aa").unwrap().did_delete());
+    let deletion_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    assert!(
+        !store
+            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &historical_message_id,)
+            .unwrap(),
+        "historical replay already inside the deletion frontier must stay suppressed"
+    );
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(deletion_frontier)
+    );
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    let after_stale_save = store.load_account_projection_state("alice", 16).unwrap();
+    assert!(
+        after_stale_save
+            .groups
+            .iter()
+            .all(|group| group.group_id_hex != "aa"),
+        "a stale concurrent snapshot must not recreate a locally deleted projection"
+    );
+    assert!(
+        after_stale_save
+            .groups
+            .iter()
+            .any(|group| group.group_id_hex == "bb"),
+        "unrelated groups must survive stale snapshot suppression"
+    );
+    assert_eq!(
+        store.local_group_deletion_frontier("aa").unwrap(),
+        Some(deletion_frontier)
+    );
+    let newer_message_id = MessageId::new(vec![2]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            rusqlite::params![newer_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
+        )
+        .unwrap();
+    assert!(
+        store
+            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &newer_message_id,)
+            .unwrap(),
+        "causally newer group activity must clear the deletion frontier"
+    );
+    assert_eq!(store.local_group_deletion_frontier("aa").unwrap(), None);
+    store
+        .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
+        .unwrap();
+    assert_eq!(
+        store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+        None,
+        "local group deletion must prevent retained MLS state from rehydrating wiped secrets"
+    );
 
     for table in [
         "account_groups",
@@ -1406,10 +2586,26 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "chat_list_rows",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "encrypted_media_epoch_secret_references",
+        "pending_push_registration_shares",
         "encrypted_media_epoch_secrets",
     ] {
         assert_eq!(group_row_count(&store, table, "aa"), 0, "{table}");
     }
+    assert_eq!(
+        group_row_count(
+            &store,
+            "encrypted_media_epoch_secret_retirement_watermarks",
+            "aa",
+        ),
+        1,
+        "the retirement barrier outlives the local group projection"
+    );
+    assert_eq!(
+        group_row_count(&store, "pending_push_registration_removals", "aa"),
+        1,
+        "removal intent must survive app-local projection deletion"
+    );
     for table in [
         "account_groups",
         "account_group_app_components",
@@ -1417,13 +2613,110 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "message_timeline",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "pending_push_registration_shares",
+        "pending_push_registration_removals",
         "encrypted_media_epoch_secrets",
     ] {
         assert!(group_row_count(&store, table, "bb") > 0, "{table}");
     }
     assert_eq!(all_row_count(&store, "seen_events"), 1);
     assert_eq!(all_row_count(&store, "cgka_groups"), 1);
-    assert!(!store.delete_local_group_data("aa").unwrap());
+    assert!(!store.delete_local_group_data("aa").unwrap().did_delete());
+}
+
+#[test]
+fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("local-wipe.sqlite");
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            secure_delete: false,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let group_id_hex = "aa";
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group(group_id_hex, "alpha")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let secret = "local-wipe-plaintext-secret";
+    let mut message = app_event("wipe-me", group_id_hex, 10);
+    message.plaintext = secret.to_owned();
+    store.record_app_event(&message).unwrap();
+    {
+        let conn = store.lock().unwrap();
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+    }
+    assert!(file_contains(&db_path, secret.as_bytes()));
+
+    let reader = rusqlite::Connection::open(&db_path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
+        .unwrap();
+
+    let pending = store
+        .delete_local_group_data(group_id_hex)
+        .expect("logical wipe commits while WAL erasure remains pending");
+    assert!(pending.did_delete());
+    assert!(pending.erasure_pending);
+    assert!(!pending.completed_pending_checkpoint);
+    assert_eq!(store.app_message_count().unwrap(), 0);
+    assert_eq!(
+        secure_delete_pragma(&store),
+        0,
+        "the caller's secure_delete setting must be restored after the committed wipe"
+    );
+
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    drop(store);
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            secure_delete: false,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let completed = store
+        .delete_local_group_data(group_id_hex)
+        .expect("retry after reopen should finish the prior checkpoint");
+    assert!(completed.did_delete());
+    assert!(completed.completed_pending_checkpoint);
+    assert!(!completed.erasure_pending);
+    assert!(completed.deleted_rows > 0);
+    drop(store);
+    for path in [
+        db_path.clone(),
+        db_path.with_extension("sqlite-wal"),
+        db_path.with_extension("sqlite-shm"),
+    ] {
+        if path.exists() {
+            assert!(
+                !file_contains(&path, secret.as_bytes()),
+                "{} must not retain locally wiped plaintext",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -1547,6 +2840,71 @@ fn push_token(
         record_digest: record_digest.to_owned(),
         updated_at_ms: owner_ts,
     }
+}
+
+#[test]
+fn push_token_apply_retries_concurrent_writer_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("push-token-contention.sqlite");
+    let key = SqlCipherKey::new("push token contention key").unwrap();
+    let options = SqliteStorageOptions {
+        busy_timeout_ms: 50,
+        ..SqliteStorageOptions::default()
+    };
+    let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+        .expect("writer storage opens");
+    let group_id = "aa".repeat(32);
+    let member_id = "bb".repeat(32);
+
+    let spawn_blocker = || {
+        let blocker_path = path.clone();
+        let blocker_options = options.clone();
+        let blocker_key = SqlCipherKey::new("push token contention key").unwrap();
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                &blocker_path,
+                &blocker_key,
+                blocker_options,
+            )
+            .expect("blocker storage opens");
+            let conn = blocker.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            lock_acquired_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        lock_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("blocker acquires write lock");
+        handle
+    };
+
+    let blocker = spawn_blocker();
+    assert!(
+        writer
+            .apply_group_push_token(&push_token(&group_id, &member_id, 100, "d1"))
+            .expect("token apply retries after transient contention")
+    );
+    blocker.join().unwrap();
+
+    let blocker = spawn_blocker();
+    assert!(
+        writer
+            .apply_group_push_token_tombstone(
+                &group_id,
+                &member_id,
+                0,
+                1,
+                &"cc".repeat(32),
+                200,
+                "r1",
+                200,
+            )
+            .expect("tombstone apply retries after transient contention")
+    );
+    blocker.join().unwrap();
+    assert!(writer.group_push_tokens(&group_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1677,6 +3035,77 @@ fn member_cleanup_clears_tokens_and_tombstones() {
     );
 }
 
+#[test]
+fn stale_push_token_cleanup_chunks_stale_keys_and_does_not_bind_retained_members() {
+    const ACTIVE_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
+    const STALE_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 1;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "aa".repeat(32);
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: The raw handle is only used to lower this test connection's
+        // bind-parameter limit before any concurrent use; rusqlite keeps owning
+        // the connection and no pointer is retained.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+        let mut token = conn
+            .prepare(
+                "INSERT INTO group_push_tokens (
+                    group_id_hex, member_id_hex, leaf_index, platform,
+                    token_fingerprint, server_pubkey_hex, relay_hint,
+                    encrypted_token, owner_ts, owner_sig, record_digest,
+                    updated_at_ms
+                 ) VALUES (?1, ?2, 0, 1, 'token', ?3, NULL, x'01', 1, 'sig', 'digest', 1)",
+            )
+            .unwrap();
+        let mut tombstone = conn
+            .prepare(
+                "INSERT INTO group_push_token_tombstones (
+                    group_id_hex, member_id_hex, leaf_index, platform,
+                    server_pubkey_hex, owner_ts, record_digest, created_at_ms
+                 ) VALUES (?1, ?2, 0, 1, ?3, 1, 'digest', 1)",
+            )
+            .unwrap();
+        for index in 0..(ACTIVE_COUNT + STALE_COUNT) {
+            let member_id = format!("member-{index:04}");
+            let server_key = "cc".repeat(32);
+            token
+                .execute(params![&group_id, &member_id, &server_key])
+                .unwrap();
+            tombstone
+                .execute(params![&group_id, &member_id, &server_key])
+                .unwrap();
+        }
+    }
+    let active_members = (0..ACTIVE_COUNT)
+        .map(|index| format!("member-{index:04}"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        store
+            .remove_stale_group_push_tokens(&group_id, &active_members)
+            .expect("retained members must not become an unbounded NOT IN bind set"),
+        STALE_COUNT
+    );
+    let conn = store.lock().unwrap();
+    for table in ["group_push_tokens", "group_push_token_tombstones"] {
+        let remaining: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE group_id_hex = ?1"),
+                params![&group_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, ACTIVE_COUNT as i64, "{table}");
+    }
+}
+
 fn insert_group_push_token(store: &SqliteAccountStorage, group_id_hex: &str, member_id_hex: &str) {
     store
         .lock()
@@ -1793,4 +3222,24 @@ fn app_messages_replay_order_matches_cursor_comparator() {
     );
     assert_eq!(dups[0].group_id_hex, "aa");
     assert_eq!(dups[1].group_id_hex, "bb");
+}
+
+#[test]
+fn stored_account_group_component_debug_redacts_blossom_image_payload() {
+    use cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID;
+
+    const IMAGE_KEY_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const UPLOAD_KEY_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let component = StoredAccountGroupComponent {
+        component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        component_name: "marmot.group.blossom.image.v1".to_owned(),
+        component_data_hex: format!("00{IMAGE_KEY_HEX}{UPLOAD_KEY_HEX}"),
+    };
+
+    let rendered = format!("{component:?}");
+    assert!(!rendered.contains(IMAGE_KEY_HEX));
+    assert!(!rendered.contains(UPLOAD_KEY_HEX));
+    assert!(rendered.contains("marmot.group.blossom.image.v1"));
+    assert!(rendered.contains("redacted"));
 }

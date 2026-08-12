@@ -31,9 +31,44 @@ pub(crate) async fn key_package_command_with_runtime(
     match command {
         KeyPackageCommand::List => {
             let account = resolve_account(account_home, account_flag)?;
-            let records = runtime
+            let mut records = runtime
                 .account_key_packages(&account.label, Vec::new())
                 .await?;
+            if let Ok(Some(lifecycle)) =
+                runtime.key_package_maintenance_status(&account.label).await
+                && let (Some(key_package), Some(key_package_ref), Some(event_id), Some(created_at)) = (
+                    lifecycle.current_key_package,
+                    lifecycle.current_key_package_ref,
+                    lifecycle.authored_event_id,
+                    lifecycle.authored_event_created_at,
+                )
+            {
+                let event_id = hex::encode(event_id.as_slice());
+                if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.key_package_event_id == event_id)
+                {
+                    record.account_label = Some(account.label.clone());
+                    record.local = true;
+                } else {
+                    records.push(AccountKeyPackageRecord {
+                        account_label: Some(account.label.clone()),
+                        account_id_hex: account.account_id_hex.clone(),
+                        key_package_id: lifecycle.stable_slot_id,
+                        key_package_ref_hex: hex::encode(key_package_ref),
+                        key_package_event_id: event_id,
+                        published_at: created_at.0,
+                        key_package_bytes: key_package.bytes().len(),
+                        source_relays: lifecycle
+                            .publication_targets
+                            .into_iter()
+                            .map(|target| target.endpoint.0)
+                            .collect(),
+                        local: true,
+                        relay: false,
+                    });
+                }
+            }
             let keys = records
                 .into_iter()
                 .map(account_key_package_record_json)
@@ -66,6 +101,26 @@ pub(crate) async fn key_package_command_with_runtime(
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
                     "key_package_bytes": key_package_bytes,
+                }),
+            })
+        }
+        KeyPackageCommand::MaintenanceStatus => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let status = runtime
+                .key_package_maintenance_status(&account.label)
+                .await?;
+            let phase = status
+                .as_ref()
+                .map(|status| status.phase.as_str().to_owned())
+                .unwrap_or_else(|| "uninitialized".to_owned());
+            Ok(CommandOutput {
+                plain: format!("key package maintenance {phase}"),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "key_package_maintenance": status,
                 }),
             })
         }

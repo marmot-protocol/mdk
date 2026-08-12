@@ -2,7 +2,8 @@
 
 use marmot_app::{
     GroupPushDebugInfo, GroupPushTokenDebugEntry, LocalPushRegistrationDebug, PushPlatform,
-    PushRegistration,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationShareStatus,
+    PushRegistrationSyncResult,
 };
 
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
@@ -54,6 +55,57 @@ impl From<PushRegistration> for PushRegistrationFfi {
             created_at_ms: value.created_at_ms,
             updated_at_ms: value.updated_at_ms,
             last_shared_at_ms: value.last_shared_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum PushRegistrationShareStatusFfi {
+    Complete,
+    Pending,
+}
+
+impl From<PushRegistrationShareStatus> for PushRegistrationShareStatusFfi {
+    fn from(value: PushRegistrationShareStatus) -> Self {
+        match value {
+            PushRegistrationShareStatus::Complete => Self::Complete,
+            PushRegistrationShareStatus::Pending => Self::Pending,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PushRegistrationShareOutcomeFfi {
+    pub status: PushRegistrationShareStatusFfi,
+    pub attempted_groups: u32,
+    pub succeeded_groups: u32,
+    pub failed_groups: u32,
+    pub pending_groups: u32,
+}
+
+impl From<PushRegistrationShareOutcome> for PushRegistrationShareOutcomeFfi {
+    fn from(value: PushRegistrationShareOutcome) -> Self {
+        Self {
+            status: value.status.into(),
+            attempted_groups: value.attempted_groups,
+            succeeded_groups: value.succeeded_groups,
+            failed_groups: value.failed_groups,
+            pending_groups: value.pending_groups,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PushRegistrationSyncResultFfi {
+    pub registration: PushRegistrationFfi,
+    pub share: PushRegistrationShareOutcomeFfi,
+}
+
+impl From<PushRegistrationSyncResult> for PushRegistrationSyncResultFfi {
+    fn from(value: PushRegistrationSyncResult) -> Self {
+        Self {
+            registration: value.registration.into(),
+            share: value.share.into(),
         }
     }
 }

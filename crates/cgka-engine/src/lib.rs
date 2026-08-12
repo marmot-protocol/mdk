@@ -22,6 +22,7 @@
 //! - [`group_lifecycle`] - `create_group`, `join_welcome`, group records.
 //! - [`message_processor`] - inbound `ingest` and outbound `send`.
 //! - [`distributed_convergence`] - stored-message convergence entry points.
+//! - `convergence_input` - role-aware convergence scheduling classification.
 //! - [`canonicalization`] and [`convergence`] - executable policy model.
 //! - [`openmls_projection`] - bytes-first bridge between OpenMLS and the model.
 //! - [`epoch_manager`] - per-group state transitions and pending references.
@@ -41,7 +42,12 @@ pub(crate) mod bounded_id_set;
 pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
+#[cfg(feature = "test-conformance-snapshot")]
+pub mod conformance_snapshot;
 pub mod convergence;
+pub mod convergence_clock;
+pub(crate) mod convergence_input;
+pub mod disband;
 pub mod distributed_convergence;
 pub mod engine;
 pub mod engine_metrics;
@@ -53,23 +59,29 @@ pub mod group_lifecycle;
 pub mod group_state_changes;
 pub mod identity;
 pub mod key_package;
+pub mod maintenance;
 pub(crate) mod message_disposition;
 pub mod message_processor;
 pub mod openmls_projection;
 pub mod pending_commit_guard;
 pub mod provider;
 pub mod publish;
+pub mod self_update;
 pub mod snapshot_guard;
+pub(crate) mod test_crash_hooks;
 pub mod update_group_data;
 pub mod upgrade;
 pub mod wire_format;
 
+pub use convergence_clock::{
+    ConvergenceClock, ConvergenceTime, ManualConvergenceClock, SystemConvergenceClock,
+};
 pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 pub use engine_metrics::{
     EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,
 };
 pub use feature_registry::FeatureRegistry;
-pub use key_package::{KeyPackageMetadata, key_package_metadata};
+pub use key_package::{KeyPackageMetadata, KeyPackageRetirementReport, key_package_metadata};
 pub use wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, WIRE_FORMAT_POLICY_REVIEW_REQUIRED,
     default_join_config, join_config,

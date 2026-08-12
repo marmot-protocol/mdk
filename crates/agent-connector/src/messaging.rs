@@ -1,8 +1,9 @@
 //! Final-message sends, agent activity/operation/group-system events, and debug send recording.
 
 use agent_control::{
-    AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
-    AgentControlResponse,
+    AgentControlActor, AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef,
+    AgentControlMediaUpload, AgentControlMessage, AgentControlResponse,
+    AgentControlSendMaintenanceDisposition,
 };
 use cgka_traits::GroupId;
 use marmot_app::{
@@ -10,12 +11,64 @@ use marmot_app::{
     MediaUploadAttachmentRequest, MediaUploadRequest,
 };
 
-use crate::AgentConnector;
 use crate::error::ConnectorError;
+use crate::maintenance::agent_maintenance_disposition;
+use crate::media_roots::MediaAllowedRoots;
+use crate::stream_session::SendIdempotencyAcquisition;
 use crate::validation::normalize_hex;
+use crate::{
+    AgentConnector, MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS,
+    MAX_MEDIA_UPLOAD_BATCH_BYTES,
+};
 
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
+/// Current schema version for persisted `send_media` request fingerprints.
+pub(crate) const SEND_MEDIA_FINGERPRINT_VERSION: u8 = 1;
+
+#[derive(Clone, Copy)]
+pub(crate) struct MediaUploadLimits {
+    pub(crate) max_attachments: usize,
+    pub(crate) max_attachment_bytes: u64,
+    pub(crate) max_batch_bytes: u64,
+}
+
+pub(crate) async fn read_media_upload_attachments_with_limits(
+    media_allowed_roots: &MediaAllowedRoots,
+    attachments: Vec<AgentControlMediaUpload>,
+    limits: MediaUploadLimits,
+) -> Result<Vec<MediaUploadAttachmentRequest>, ConnectorError> {
+    if attachments.len() > limits.max_attachments {
+        return Err(ConnectorError::MediaLimitsExceeded("attachment_count"));
+    }
+
+    let mut upload_attachments = Vec::with_capacity(attachments.len());
+    let mut total_bytes = 0_u64;
+    for attachment in attachments {
+        let remaining_batch_bytes = limits.max_batch_bytes.saturating_sub(total_bytes);
+        let max_read_bytes = limits.max_attachment_bytes.min(remaining_batch_bytes);
+        let limit_reason = if remaining_batch_bytes < limits.max_attachment_bytes {
+            "aggregate_bytes"
+        } else {
+            "attachment_bytes"
+        };
+        let plaintext = media_allowed_roots
+            .read_regular_file_limited(attachment.path.into(), max_read_bytes, limit_reason)
+            .await?;
+        if plaintext.is_empty() {
+            return Err(ConnectorError::MediaLimitsExceeded("empty_attachment"));
+        }
+        total_bytes += plaintext.len() as u64;
+        upload_attachments.push(MediaUploadAttachmentRequest {
+            file_name: attachment.file_name,
+            media_type: attachment.media_type,
+            plaintext,
+            dim: attachment.dim,
+            thumbhash: attachment.thumbhash,
+        });
+    }
+    Ok(upload_attachments)
+}
 
 /// Server-derived fingerprint of a `send_final` request: a versioned SHA-256 digest
 /// over the destination (account + group), message text, and optional reply target.
@@ -37,6 +90,41 @@ pub(crate) fn send_final_fingerprint(
         reply_to_message_id_hex,
     ]);
     let bytes = serde_json::to_vec(&preimage).expect("send_final fingerprint preimage cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Server-derived fingerprint of a media send. Local paths are deliberately
+/// excluded; retries may stage the same bytes under a different private path.
+/// Attachment order, safe metadata, caption, destination, and plaintext bytes
+/// are all bound so one key cannot return ids for a different album.
+pub(crate) fn send_media_fingerprint(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    caption: Option<&str>,
+    attachments: &[MediaUploadAttachmentRequest],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let attachments = attachments
+        .iter()
+        .map(|attachment| {
+            serde_json::json!([
+                attachment.file_name,
+                attachment.media_type,
+                hex::encode(Sha256::digest(&attachment.plaintext)),
+                attachment.dim,
+                attachment.thumbhash,
+            ])
+        })
+        .collect::<Vec<_>>();
+    let preimage = serde_json::json!([
+        SEND_MEDIA_FINGERPRINT_VERSION,
+        account_id_hex,
+        group_id_hex,
+        caption,
+        attachments,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("send_media fingerprint preimage cannot fail");
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -99,14 +187,20 @@ impl AgentConnector {
         reply_to_message_id_hex: Option<String>,
         idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        let group_id_hex = normalize_hex(group_id_hex)?;
         if self.debug_controls {
             return self.debug_record_final_send_response(
                 account_id_hex,
-                group_id_hex,
+                &group_id_hex,
                 text,
                 reply_to_message_id_hex,
             );
         }
+
+        // Reject unknown accounts and malformed group ids before a request can
+        // wait on or reserve an in-flight send gate.
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
 
         // Server-derived request fingerprint: a reused idempotency key only short-
         // circuits when the request it identifies is the same one. A reused key
@@ -114,22 +208,30 @@ impl AgentConnector {
         // return ids belonging to an unrelated send.
         let fingerprint = send_final_fingerprint(
             account_id_hex,
-            group_id_hex,
+            &group_id_hex,
             &text,
             reply_to_message_id_hex.as_deref(),
         );
 
-        // Idempotent durable send: if this key already committed a matching send,
-        // return the original message ids without re-sending so a retry after a
-        // post-write timeout cannot double-post an unrecallable message.
-        if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
-        {
-            return Ok(AgentControlResponse::FinalSent { message_ids_hex });
-        }
+        // Reserve matching requests before the first await so concurrent
+        // same-key retries cannot both miss the cache and both durably send.
+        let idempotency = if let Some(key) = idempotency_key {
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
+            }
+        } else {
+            None
+        };
 
-        let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
         let summary = if let Some(target_message_id) = reply_to_message_id_hex {
             self.runtime
                 .reply_to_message(&account.label, &group_id, &target_message_id, &text)
@@ -142,12 +244,21 @@ impl AgentConnector {
         // Record only after a successful send so a failed send remains retryable.
         // A key already bound to a different fingerprint is left untouched (first
         // write wins), so this send simply proceeds without caching.
-        if let Some(key) = idempotency_key {
-            self.idempotency
-                .record(key, fingerprint, summary.message_ids.clone());
+        if let Some((key, reservation)) = idempotency {
+            let message_ids = summary.message_ids.clone();
+            let maintenance_disposition =
+                agent_maintenance_disposition(summary.maintenance_disposition);
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids, maintenance_disposition);
         }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -160,7 +271,8 @@ impl AgentConnector {
         target_message_id_hex: &str,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let target_message_id = normalize_hex(target_message_id_hex)?;
         let summary = self
             .runtime
@@ -168,6 +280,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -181,7 +294,8 @@ impl AgentConnector {
         group_id_hex: &str,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let state = self
             .runtime
             .group_mls_state(&account.label, &group_id)
@@ -205,16 +319,24 @@ impl AgentConnector {
         text: String,
     ) -> Result<AgentControlResponse, ConnectorError> {
         self.ensure_debug_controls()?;
+        let account_id_hex = normalize_hex(account_id_hex)?;
+        let sender_account_id_hex = normalize_hex(sender_account_id_hex)?;
         let event = AgentControlEvent::InboundMessage {
-            account_id_hex: normalize_hex(account_id_hex)?,
+            account_id_hex: account_id_hex.clone(),
             group_id_hex: normalize_hex(group_id_hex)?,
-            message_id_hex: normalize_hex(message_id_hex)?,
-            sender_account_id_hex: normalize_hex(sender_account_id_hex)?,
-            text,
+            message: AgentControlMessage {
+                message_id_hex: normalize_hex(message_id_hex)?,
+                sender: AgentControlActor {
+                    is_self: sender_account_id_hex == account_id_hex,
+                    account_id_hex: sender_account_id_hex,
+                    display_name: None,
+                },
+                text,
+                recorded_at: 0,
+                media: Vec::new(),
+            },
             mentions_self: false,
-            reply_to_message_id_hex: None,
-            sender_display_name: None,
-            media: Vec::new(),
+            reply_to: None,
         };
         let _ = self.debug_events.send(event);
         Ok(AgentControlResponse::Ack)
@@ -248,6 +370,7 @@ impl AgentConnector {
         });
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: record.message_ids_hex,
+            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
         })
     }
 
@@ -287,6 +410,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -339,6 +463,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -359,6 +484,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -366,36 +492,55 @@ impl AgentConnector {
     /// message. The plaintext bytes are read from the connector host by path and
     /// never crossed the control plane; the content key stays in the runtime.
     ///
-    /// Trust boundary: the connector reads `attachment.path` verbatim and is the
-    /// generic glue serving every control-plane gateway (OpenClaw, Hermes), so it
-    /// cannot know which paths a given deployment considers safe. Confining the
-    /// path to an allowlisted media root is therefore the caller's responsibility
-    /// — e.g. the OpenClaw channel adapter validates the resolved local path with
-    /// `assertLocalMediaAllowed` before issuing `send_media`, mirroring the
-    /// inbound model where downloaded media is re-staged under an allowlisted
-    /// root. A gateway that forwards an unconstrained, tool-influenced path would
-    /// let a prompt-injected agent read an arbitrary connector-host file; that
-    /// must be prevented gateway-side, not here.
+    /// Every path must identify a regular, non-symlink file beneath a directory
+    /// handle opened from `media_allowed_roots` at connector startup. Gateways
+    /// should still validate their source policy and stage a private copy beneath
+    /// one of those roots; the connector independently enforces the final read.
     pub(crate) async fn send_media_response(
         &self,
         account_id_hex: &str,
         group_id_hex: &str,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
-        let mut upload_attachments = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
-            let plaintext = tokio::fs::read(&attachment.path).await?;
-            upload_attachments.push(MediaUploadAttachmentRequest {
-                file_name: attachment.file_name,
-                media_type: attachment.media_type,
-                plaintext,
-                dim: attachment.dim,
-                thumbhash: attachment.thumbhash,
-            });
-        }
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let upload_attachments = read_media_upload_attachments_with_limits(
+            &self.media_allowed_roots,
+            attachments,
+            MediaUploadLimits {
+                max_attachments: MAX_MEDIA_UPLOAD_ATTACHMENTS,
+                max_attachment_bytes: MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES,
+                max_batch_bytes: MAX_MEDIA_UPLOAD_BATCH_BYTES,
+            },
+        )
+        .await?;
+        let idempotency = if let Some(key) = idempotency_key {
+            let fingerprint = send_media_fingerprint(
+                account_id_hex,
+                &group_id_hex,
+                caption.as_deref(),
+                &upload_attachments,
+            );
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => {
+                    Some((key, fingerprint, reservation))
+                }
+            }
+        } else {
+            None
+        };
         let result = self
             .runtime
             .upload_media(
@@ -409,8 +554,26 @@ impl AgentConnector {
                 },
             )
             .await?;
+        let Some(sent) = result.sent else {
+            return Ok(AgentControlResponse::FinalSent {
+                message_ids_hex: Vec::new(),
+                maintenance_disposition: AgentControlSendMaintenanceDisposition::default(),
+            });
+        };
+        let message_ids_hex = sent.message_ids;
+        let maintenance_disposition = agent_maintenance_disposition(sent.maintenance_disposition);
+        if let Some((key, fingerprint, reservation)) = idempotency {
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids_hex.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids_hex.clone(), maintenance_disposition);
+        }
         Ok(AgentControlResponse::FinalSent {
-            message_ids_hex: result.sent.map(|sent| sent.message_ids).unwrap_or_default(),
+            message_ids_hex,
+            maintenance_disposition,
         })
     }
 
@@ -424,7 +587,8 @@ impl AgentConnector {
         media: AgentControlMediaRef,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let reference = media_ref_to_reference(media);
         let result = self
             .runtime

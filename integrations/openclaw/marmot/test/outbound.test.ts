@@ -2,10 +2,11 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
-import type {
-  ChannelMessageSendMediaContext,
-  ChannelMessageSendTextContext,
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  deriveDurableFinalDeliveryRequirements,
+  type ChannelMessageSendMediaContext,
+  type ChannelMessageSendTextContext,
 } from "openclaw/plugin-sdk/channel-outbound";
 
 import type {
@@ -17,8 +18,18 @@ import {
   receiptFromMessageIds,
   SentMessageTargetCache,
 } from "../src/outbound.js";
+import {
+  markMarmotInboundReady,
+  markMarmotInboundStarting,
+  marmotInboundRuntimeSnapshot,
+  resetMarmotInboundRuntimeForTests,
+} from "../src/runtime-state.js";
 
 const HEX32 = (b: string) => b.repeat(32);
+
+afterEach(() => {
+  resetMarmotInboundRuntimeForTests();
+});
 
 interface SendFinalCall {
   accountIdHex: string;
@@ -109,14 +120,56 @@ describe("createMarmotMessageAdapter", () => {
     expect(result.receipt.platformMessageIds).toEqual([HEX32("ab")]);
     expect(result.receipt.parts[0]).toMatchObject({ kind: "text", index: 0 });
     expect(result.receipt.sentAt).toBe(1234);
+    expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
   });
 
-  it("declares durable text + media + replyTo capabilities (no unproven live caps)", () => {
+  it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(emptyClientCalls()), marmotAccountIdHex: HEX32("aa") }),
     });
-    expect(adapter.durableFinal?.capabilities).toEqual({ text: true, media: true, replyTo: true });
+    expect(adapter.durableFinal?.capabilities).toEqual({
+      text: true,
+      media: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    });
+    const required = deriveDurableFinalDeliveryRequirements({
+      payload: { text: "done" },
+      replyToId: HEX32("dd"),
+    });
+    expect(required).toEqual({
+      text: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    });
+    expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
+  });
+
+  it("does not evict another account's active inbound status after a send", async () => {
+    markMarmotInboundStarting("work");
+    markMarmotInboundReady("work");
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(emptyClientCalls()),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+      nowMs: () => 2468,
+    });
+
+    await adapter.send!.text!({
+      cfg: {},
+      accountId: "personal",
+      to: HEX32("cc"),
+      text: "cross-account send",
+    } as unknown as ChannelMessageSendTextContext);
+
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      accountId: "work",
+      running: true,
+      connected: true,
+    });
+    expect(marmotInboundRuntimeSnapshot("personal").lastOutboundAt).toBeUndefined();
   });
 
   it("routes a media send with a local path to send_media with the caption", async () => {
@@ -128,6 +181,7 @@ describe("createMarmotMessageAdapter", () => {
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
         nowMs: () => 5678,
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
 
       const ctx = {
@@ -147,12 +201,14 @@ describe("createMarmotMessageAdapter", () => {
         caption: "look at this",
       });
       expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-        path: filePath,
         media_type: "image/png",
         file_name: "cat.png",
       });
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
       expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
       expect(result.receipt.sentAt).toBe(5678);
+      expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(5678);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -166,6 +222,7 @@ describe("createMarmotMessageAdapter", () => {
       const calls = emptyClientCalls();
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
       const ctx = {
         cfg: {},
@@ -178,10 +235,10 @@ describe("createMarmotMessageAdapter", () => {
       await adapter.send!.media!(ctx);
 
       expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-        path: filePath,
         media_type: "video/mp4",
         file_name: "clip.mp4",
       });
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
       // An empty caption is sent as null.
       expect(calls.sendMedia[0]?.caption).toBeNull();
     } finally {
@@ -305,6 +362,7 @@ describe("createMarmotMessageAdapter", () => {
       const calls = emptyClientCalls();
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
       const ctx = {
         cfg: {},
@@ -318,10 +376,40 @@ describe("createMarmotMessageAdapter", () => {
 
       expect(calls.sendMedia).toHaveLength(1);
       expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-        path: filePath,
         media_type: "image/png",
         file_name: "photo.png",
       });
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an in-root media path does not exist", async () => {
+    // `readLocalFileFromRoots` returns null for an allowlist miss *and* for a
+    // read failure under an allowed root. Both must fail the send rather than
+    // reaching wn-agent, and the message must not claim the path escaped the
+    // allowlist when it did not.
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "missing",
+        mediaUrl: join(tmpRoot, "absent.png"),
+        mediaLocalRoots: [tmpRoot],
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await expect(adapter.send!.media!(ctx)).rejects.toMatchObject({
+        name: "LocalMediaAccessError",
+      });
+      await expect(adapter.send!.media!(ctx)).rejects.toThrow(/not readable/);
+      expect(calls.sendMedia).toHaveLength(0);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -335,6 +423,7 @@ describe("createMarmotMessageAdapter", () => {
       const calls = emptyClientCalls();
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
       const ctx = {
         cfg: {},
@@ -347,7 +436,8 @@ describe("createMarmotMessageAdapter", () => {
       await adapter.send!.media!(ctx);
 
       expect(calls.sendMedia).toHaveLength(1);
-      expect(calls.sendMedia[0]?.attachments[0]?.path).toBe(filePath);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

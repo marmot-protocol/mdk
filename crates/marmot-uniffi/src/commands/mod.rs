@@ -21,4 +21,8 @@ mod push;
 mod relay;
 mod sticker;
 mod subscription;
+mod telemetry;
 mod timeline;
+
+pub use group::InitialGroupImageFfi;
+pub use media::parse_media_imeta_tag;

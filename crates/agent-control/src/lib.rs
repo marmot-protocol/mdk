@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const AGENT_CONTROL_PROTOCOL_V1: &str = "marmot.agent-control.v1";
+pub const AGENT_CONTROL_PROTOCOL_V2: &str = "marmot.agent-control.v2";
 pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
+pub const AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS: usize = 2_000;
+pub const AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX: usize = 16;
+pub const AGENT_CONTROL_TIMELINE_DEFAULT_LIMIT: u32 = 20;
+pub const AGENT_CONTROL_TIMELINE_MAX_LIMIT: u32 = 50;
+pub const AGENT_CONTROL_TIMELINE_TEXT_MAX_CHARS: usize = 8_192;
+pub const AGENT_CONTROL_TIMELINE_REACTIONS_MAX: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentControlError {
@@ -37,7 +43,7 @@ pub struct AgentControlEnvelope<T> {
 impl<T> AgentControlEnvelope<T> {
     pub fn new(id: Option<String>, payload: T) -> Self {
         Self {
-            marmot_agent_control: AGENT_CONTROL_PROTOCOL_V1.to_owned(),
+            marmot_agent_control: AGENT_CONTROL_PROTOCOL_V2.to_owned(),
             id,
             auth_token: None,
             payload,
@@ -54,7 +60,7 @@ impl<T> AgentControlEnvelope<T> {
     }
 
     pub fn validate_protocol(&self) -> Result<(), AgentControlError> {
-        if self.marmot_agent_control == AGENT_CONTROL_PROTOCOL_V1 {
+        if self.marmot_agent_control == AGENT_CONTROL_PROTOCOL_V2 {
             Ok(())
         } else {
             Err(AgentControlError::WrongProtocol(
@@ -70,6 +76,27 @@ pub enum AgentControlRequest {
     SubscribeInbound {
         account_id_hex: Option<String>,
         group_id_hex: Option<String>,
+    },
+    /// Resolve one row from the materialized, user-visible timeline.
+    TimelineMessageGet {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    },
+    /// Page through the materialized, user-visible timeline in stable
+    /// `(recorded_at, message_id_hex)` order. `before` and `after` are mutually
+    /// exclusive; an omitted cursor returns the newest page.
+    TimelineList {
+        account_id_hex: String,
+        group_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<AgentControlTimelineCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<AgentControlTimelineCursor>,
+        #[serde(default)]
+        before_inclusive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     SendFinal {
         account_id_hex: String,
@@ -92,18 +119,23 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
         stream_id_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_message_id_hex: Option<String>,
         quic_candidates: Vec<String>,
     },
     StreamAppend {
         stream_id_hex: String,
+        stream_capability: String,
         append_text: String,
     },
     StreamStatus {
         stream_id_hex: String,
+        stream_capability: String,
         status: String,
     },
     StreamProgress {
         stream_id_hex: String,
+        stream_capability: String,
         text: String,
     },
     /// Finalize an active preview stream into the durable final message.
@@ -114,6 +146,7 @@ pub enum AgentControlRequest {
     /// and/or re-issue `StreamFinalize`, or cancel the stream.
     StreamFinalize {
         stream_id_hex: String,
+        stream_capability: String,
         final_text: String,
         transcript_hash_hex: String,
         chunk_count: u64,
@@ -125,6 +158,7 @@ pub enum AgentControlRequest {
     },
     StreamCancel {
         stream_id_hex: String,
+        stream_capability: String,
         reason: Option<String>,
     },
     AccountList,
@@ -139,6 +173,12 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         name: String,
         display_name: Option<String>,
+    },
+    /// Resolve whether the selected account already has a valid published
+    /// Nostr kind-0 profile. The connector returns a typed outcome so relay
+    /// failures can never be mistaken for a confirmed absence.
+    AccountProfileLookup {
+        account_id_hex: String,
     },
     SendAgentActivity {
         account_id_hex: String,
@@ -176,6 +216,33 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
     },
+    MaintenanceStatus {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
+    KeyPackageMaintenanceStatus {
+        account_id_hex: String,
+    },
+    MaintenanceScheduleSelfUpdate {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
+    MaintenanceGetPolicy {
+        account_id_hex: String,
+    },
+    MaintenanceSetPolicy {
+        account_id_hex: String,
+        enabled_for_new_groups: bool,
+    },
+    MaintenancePause {
+        account_id_hex: String,
+    },
+    MaintenanceResume {
+        account_id_hex: String,
+    },
+    MaintenanceRun {
+        account_id_hex: String,
+    },
     AllowlistList {
         account_id_hex: String,
     },
@@ -203,6 +270,10 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        /// Optional client-supplied dedup key. Matching retries return the
+        /// original durable message ids without re-uploading or re-publishing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     /// Fetch + decrypt an inbound media reference and write the plaintext to a
     /// temp file on the connector host. The content key stays in the connector;
@@ -264,6 +335,20 @@ pub enum AgentControlResponse {
     AccountList {
         accounts: Vec<AgentControlAccount>,
     },
+    TimelineMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<AgentControlTimelineMessage>,
+    },
+    TimelinePage {
+        account_id_hex: String,
+        group_id_hex: String,
+        messages: Vec<AgentControlTimelineMessage>,
+        has_more_before: bool,
+        has_more_after: bool,
+    },
     AccountCreated {
         account: AgentControlAccount,
     },
@@ -276,11 +361,20 @@ pub enum AgentControlResponse {
         name: String,
         display_name: Option<String>,
     },
+    ProfileLookup {
+        account_id_hex: String,
+        status: AgentControlProfileLookupStatus,
+        retryable: bool,
+    },
     FinalSent {
         message_ids_hex: Vec<String>,
+        #[serde(default)]
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
     },
     AppEventSent {
         message_ids_hex: Vec<String>,
+        #[serde(default)]
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
     },
     Allowlist {
         account_id_hex: String,
@@ -296,8 +390,30 @@ pub enum AgentControlResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
     },
+    MaintenanceStatus {
+        status: AgentControlMaintenanceStatus,
+    },
+    KeyPackageMaintenanceStatus {
+        status: Option<AgentControlKeyPackageMaintenanceStatus>,
+    },
+    MaintenanceScheduled {
+        obligation_id_hex: String,
+    },
+    MaintenancePolicy {
+        enabled_for_new_groups: bool,
+    },
+    MaintenanceRun {
+        published: u32,
+        message_ids_hex: Vec<String>,
+        deferred: u32,
+        ambiguous_exposure: u32,
+        failures: u32,
+    },
     StreamBegun {
         stream_id_hex: String,
+        /// Random 256-bit bearer capability required for every subsequent
+        /// operation on this stream. Never log or persist this value.
+        stream_capability: String,
         start_message_id_hex: String,
         quic_candidates: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -321,6 +437,22 @@ pub enum AgentControlResponse {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlSendMaintenanceDisposition {
+    #[default]
+    Ready,
+    PostJoinRotationPendingRetryable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlProfileLookupStatus {
+    ProfileFound,
+    ProfileNotFound,
+    Indeterminate,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlAccount {
     pub account_id_hex: String,
@@ -338,41 +470,236 @@ pub struct AgentControlDebugFinalSend {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlActor {
+    pub account_id_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub is_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlTimelineCursor {
+    pub recorded_at: u64,
+    pub message_id_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlTimelineMessageAvailability {
+    Available,
+    Deleted,
+    Invalidated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlTimelineReaction {
+    pub reaction_message_id_hex: String,
+    pub actor: AgentControlActor,
+    pub emoji: String,
+    pub reacted_at: u64,
+}
+
+/// A bounded, privacy-aware view of one materialized timeline row. Deleted and
+/// invalidated rows retain identity/attribution but never carry plaintext or
+/// attachment summaries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlTimelineMessage {
+    pub message_id_hex: String,
+    pub sender: AgentControlActor,
+    pub direction: String,
+    pub kind: u64,
+    /// Sender-authenticated timeline time in Unix seconds.
+    pub recorded_at: u64,
+    /// Local observation/creation time in Unix seconds.
+    pub observed_at: u64,
+    pub availability: AgentControlTimelineMessageAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub text_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AgentControlAttachmentSummary>,
+    #[serde(default)]
+    pub attachments_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<AgentControlTimelineReaction>,
+    #[serde(default)]
+    pub reactions_truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMessage {
+    pub message_id_hex: String,
+    pub sender: AgentControlActor,
+    pub text: String,
+    /// Sender-authenticated inner app-event time in Unix seconds.
+    pub recorded_at: u64,
+    /// Encrypted media references attached to the message. The content key
+    /// remains inside `wn-agent`; connectors pass these refs back to
+    /// `download_media`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<AgentControlMediaRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachmentSummary {
+    pub media_type: String,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlReferencedMessageAvailability {
+    Available,
+    Missing,
+    Deleted,
+    Invalidated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlReferencedMessage {
+    pub message_id_hex: String,
+    pub availability: AgentControlReferencedMessageAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<AgentControlActor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_excerpt: Option<String>,
+    #[serde(default)]
+    pub text_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AgentControlAttachmentSummary>,
+    #[serde(default)]
+    pub attachments_truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMaintenanceObligation {
+    pub id_hex: String,
+    pub trigger: String,
+    pub phase: String,
+    pub created_at: u64,
+    pub operational_target_at: Option<u64>,
+    pub overdue: bool,
+    pub eose_deadline_at: Option<u64>,
+    pub grace_until: Option<u64>,
+    pub quiet_since: Option<u64>,
+    pub sampled_jitter_ms: u64,
+    pub not_before: Option<u64>,
+    pub attempt_count: u32,
+    pub semantic_rearm_count: u32,
+    pub last_failure_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMaintenanceStatus {
+    pub group_id_hex: String,
+    pub enrolled_at: Option<u64>,
+    pub periodic_enrolled: bool,
+    pub last_own_leaf_rotation_at: Option<u64>,
+    pub next_periodic_rotation_at: Option<u64>,
+    pub obligations: Vec<AgentControlMaintenanceObligation>,
+    pub preparing_evolutions: u32,
+    pub prepared_evolutions: u32,
+    pub attempting_evolutions: u32,
+    pub confirmed_evolutions: u32,
+    pub superseded_evolutions: u32,
+    pub accepted_fanout_targets: u32,
+    pub unattempted_fanout_targets: u32,
+    pub failed_fanout_targets: u32,
+    pub policy_prohibited_fanout_targets: u32,
+    pub paused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlKeyPackageMaintenanceStatus {
+    pub stable_slot_id: String,
+    pub phase: String,
+    pub current_key_package_ref_hex: Option<String>,
+    pub current_not_after: Option<u64>,
+    pub refresh_at: Option<u64>,
+    pub authored_event_id_hex: Option<String>,
+    pub last_consumed_key_package_ref_hex: Option<String>,
+    pub retained_private_material_count: u32,
+    pub accepted_fanout_targets: u32,
+    pub unattempted_fanout_targets: u32,
+    pub failed_fanout_targets: u32,
+    pub policy_prohibited_fanout_targets: u32,
+    pub pending_event_id_hex: Option<String>,
+    pub pending_attempt_count: u32,
+    pub pending_last_failure_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlEvent {
     InboundMessage {
         account_id_hex: String,
         group_id_hex: String,
-        message_id_hex: String,
-        sender_account_id_hex: String,
-        text: String,
+        message: AgentControlMessage,
         /// True when the message addresses the receiving agent account: a `p`
         /// tag, an inline `nostr:<account-pubkey-hex>` reference, or a visible
         /// `npub` mention parsed from the message body. Lets a channel gate
         /// group replies on being addressed.
         #[serde(default)]
         mentions_self: bool,
-        /// The message id this message replies to (`e` tag), when present.
+        /// Bounded, privacy-aware snapshot of the replied-to message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reply_to_message_id_hex: Option<String>,
-        /// The sender's display name, when resolvable from the directory.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sender_display_name: Option<String>,
-        /// Encrypted media references (`imeta` tags) attached to this message.
-        /// Empty for a plain text message; the content key is never carried here,
-        /// only the fetch + authentication metadata (use `download_media`).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        media: Vec<AgentControlMediaRef>,
+        reply_to: Option<AgentControlReferencedMessage>,
+    },
+    /// An accepted kind-1009 edit changed a prior message.
+    MessageEdited {
+        account_id_hex: String,
+        group_id_hex: String,
+        event_id_hex: String,
+        target_message_id_hex: String,
+        actor: AgentControlActor,
+        replacement_text: String,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
     },
     /// A previously-sent group message was deleted (kind-5) by another member.
     MessageDeleted {
         account_id_hex: String,
         group_id_hex: String,
+        event_id_hex: String,
         target_message_id_hex: String,
-        sender_account_id_hex: String,
+        actor: AgentControlActor,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
+    },
+    /// A kind-7 reaction was accepted for a message.
+    ReactionAdded {
+        account_id_hex: String,
+        group_id_hex: String,
+        event_id_hex: String,
+        target_message_id_hex: String,
+        actor: AgentControlActor,
+        emoji: String,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
+    },
+    /// A kind-5 deletion retracted a prior kind-7 reaction.
+    ReactionRemoved {
+        account_id_hex: String,
+        group_id_hex: String,
+        event_id_hex: String,
+        reaction_event_id_hex: String,
+        target_message_id_hex: String,
+        actor: AgentControlActor,
+        emoji: String,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
     },
     /// A durable, MLS-authenticated change to group state was observed (a member
-    /// add/remove/leave, an admin grant/revoke, or a group rename/avatar change).
+    /// add/remove/leave, an admin grant/revoke, a group rename/avatar change,
+    /// or a disappearing-message timer change).
     /// Privacy: the subject member's pubkey is never surfaced — only a coarse
     /// `change` kind plus, for a rename, the new group display name in `detail`.
     GroupStateChanged {
@@ -380,7 +707,8 @@ pub enum AgentControlEvent {
         group_id_hex: String,
         /// Coarse change kind: `"member_added"`, `"member_removed"`,
         /// `"member_left"`, `"admin_added"`, `"admin_removed"`,
-        /// `"group_renamed"`, or `"group_avatar_changed"`.
+        /// `"group_renamed"`, `"group_avatar_changed"`, or
+        /// `"disappearing_timer_changed"`.
         change: String,
         /// The new group display name for `group_renamed`; `None` otherwise.
         /// Never carries a member pubkey.
@@ -500,10 +828,36 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
-        AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame,
-        read_envelope, read_frame, write_frame,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlMediaUpload,
+        AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
+        AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
+        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
+        write_frame,
     };
+
+    #[test]
+    fn rich_context_golden_events_decode_and_deleted_targets_are_redacted() {
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/agent-control-v2-rich-context.json"),
+        )
+        .unwrap();
+        let events: Vec<AgentControlEvent> = serde_json::from_str(&fixture).unwrap();
+        assert_eq!(events.len(), 8);
+        let deleted = events
+            .iter()
+            .find_map(|event| match event {
+                AgentControlEvent::MessageDeleted { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("message_deleted fixture");
+        assert_eq!(
+            deleted.availability,
+            crate::AgentControlReferencedMessageAvailability::Deleted
+        );
+        assert!(deleted.text_excerpt.is_none());
+        assert!(deleted.attachments.is_empty());
+    }
 
     #[test]
     fn stream_append_frame_round_trips_as_append_only_text() {
@@ -512,6 +866,7 @@ mod tests {
             AgentControlRequest::StreamAppend {
                 stream_id_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
+                stream_capability: "11".repeat(32),
                 append_text: "lo".to_owned(),
             },
         );
@@ -519,10 +874,11 @@ mod tests {
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.ends_with(b"\n"));
         let json: Value = serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
-        assert_eq!(json["marmot_agent_control"], "marmot.agent-control.v1");
+        assert_eq!(json["marmot_agent_control"], "marmot.agent-control.v2");
         assert_eq!(json["id"], "req-1");
         assert_eq!(json["type"], "stream_append");
         assert_eq!(json["append_text"], "lo");
+        assert_eq!(json["stream_capability"], "11".repeat(32));
         assert!(json.get("text").is_none());
         assert!(json.get("replace_text").is_none());
 
@@ -547,9 +903,39 @@ mod tests {
     }
 
     #[test]
+    fn stream_begin_parent_message_id_is_optional_and_round_trips_when_present() {
+        let without = AgentControlRequest::StreamBegin {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            stream_id_hex: None,
+            parent_message_id_hex: None,
+            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(
+            value.get("parent_message_id_hex").is_none(),
+            "absent parent must not be serialized"
+        );
+        let decoded: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, without);
+
+        let with = AgentControlRequest::StreamBegin {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            stream_id_hex: Some("55".repeat(32)),
+            parent_message_id_hex: Some("dd".repeat(32)),
+            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["parent_message_id_hex"], "dd".repeat(32));
+        let decoded: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, with);
+    }
+
+    #[test]
     fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
-        // Additive, v1-compatible field: omitted from the wire when None so an
-        // old peer's frame stays byte-identical; present and round-tripping when
+        // Optional field: omitted from the wire when None; present and
+        // round-tripping when
         // a client supplies it for dedup.
         let without = AgentControlRequest::SendFinal {
             account_id_hex: "aa".repeat(32),
@@ -578,11 +964,63 @@ mod tests {
     }
 
     #[test]
+    fn send_media_idempotency_key_is_omitted_when_absent_and_present_when_set() {
+        let upload = || AgentControlMediaUpload {
+            path: "/tmp/a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            file_name: "a.png".to_owned(),
+            dim: None,
+            thumbhash: None,
+        };
+        let without = AgentControlRequest::SendMedia {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            attachments: vec![upload()],
+            caption: Some("look".to_owned()),
+            idempotency_key: None,
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(value.get("idempotency_key").is_none());
+
+        let with = AgentControlRequest::SendMedia {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            attachments: vec![upload()],
+            caption: Some("look".to_owned()),
+            idempotency_key: Some("media-key-1".to_owned()),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["idempotency_key"], "media-key-1");
+        let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn successful_send_response_carries_machine_readable_maintenance_disposition() {
+        let response = AgentControlResponse::FinalSent {
+            message_ids_hex: vec![message()],
+            maintenance_disposition:
+                AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "final_sent");
+        assert_eq!(
+            value["maintenance_disposition"],
+            "post_join_rotation_pending_retryable"
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentControlResponse>(value).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn stream_finalize_idempotency_key_is_omitted_when_absent_and_present_when_set() {
         // Same additive contract as send_final: old peers see the same frame
         // when the key is absent, while newer clients can opt into dedup.
         let without = AgentControlRequest::StreamFinalize {
             stream_id_hex: "55".repeat(32),
+            stream_capability: "66".repeat(32),
             final_text: "done".to_owned(),
             transcript_hash_hex: "ab".repeat(32),
             chunk_count: 1,
@@ -596,6 +1034,7 @@ mod tests {
 
         let with = AgentControlRequest::StreamFinalize {
             stream_id_hex: "55".repeat(32),
+            stream_capability: "66".repeat(32),
             final_text: "done".to_owned(),
             transcript_hash_hex: "ab".repeat(32),
             chunk_count: 1,
@@ -611,6 +1050,7 @@ mod tests {
     fn stream_begun_response_carries_policy_plaintext_cap_when_present() {
         let begun = AgentControlResponse::StreamBegun {
             stream_id_hex: "aa".repeat(32),
+            stream_capability: "cc".repeat(32),
             start_message_id_hex: "bb".repeat(32),
             quic_candidates: vec!["quic://127.0.0.1:4433".to_owned()],
             policy_max_plaintext_frame_len: Some(4),
@@ -736,6 +1176,7 @@ mod tests {
                     stream_id_hex:
                         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             .to_owned(),
+                    stream_capability: capability(),
                     append_text,
                 },
             )
@@ -783,6 +1224,28 @@ mod tests {
                 "subscribe_inbound",
             ),
             (
+                AgentControlRequest::TimelineMessageGet {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    message_id_hex: message(),
+                },
+                "timeline_message_get",
+            ),
+            (
+                AgentControlRequest::TimelineList {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    before: Some(AgentControlTimelineCursor {
+                        recorded_at: 42,
+                        message_id_hex: message(),
+                    }),
+                    after: None,
+                    before_inclusive: false,
+                    limit: Some(20),
+                },
+                "timeline_list",
+            ),
+            (
                 AgentControlRequest::SendFinal {
                     account_id_hex: account(),
                     group_id_hex: group(),
@@ -805,6 +1268,7 @@ mod tests {
                     account_id_hex: account(),
                     group_id_hex: group(),
                     stream_id_hex: None,
+                    parent_message_id_hex: None,
                     quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
                 },
                 "stream_begin",
@@ -812,6 +1276,7 @@ mod tests {
             (
                 AgentControlRequest::StreamAppend {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     append_text: "hel".to_owned(),
                 },
                 "stream_append",
@@ -819,6 +1284,7 @@ mod tests {
             (
                 AgentControlRequest::StreamStatus {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     status: "thinking".to_owned(),
                 },
                 "stream_status",
@@ -826,6 +1292,7 @@ mod tests {
             (
                 AgentControlRequest::StreamProgress {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     text: "{\"v\":1,\"status\":\"started\"}".to_owned(),
                 },
                 "stream_progress",
@@ -833,6 +1300,7 @@ mod tests {
             (
                 AgentControlRequest::StreamFinalize {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     final_text: "hello".to_owned(),
                     transcript_hash_hex: hash(),
                     chunk_count: 1,
@@ -843,6 +1311,7 @@ mod tests {
             (
                 AgentControlRequest::StreamCancel {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     reason: Some("gateway_replaced_text".to_owned()),
                 },
                 "stream_cancel",
@@ -868,6 +1337,12 @@ mod tests {
                     display_name: Some("Agent".to_owned()),
                 },
                 "account_publish_profile",
+            ),
+            (
+                AgentControlRequest::AccountProfileLookup {
+                    account_id_hex: account(),
+                },
+                "account_profile_lookup",
             ),
             (
                 AgentControlRequest::SendAgentActivity {
@@ -918,6 +1393,57 @@ mod tests {
                 "group_info",
             ),
             (
+                AgentControlRequest::MaintenanceStatus {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "maintenance_status",
+            ),
+            (
+                AgentControlRequest::KeyPackageMaintenanceStatus {
+                    account_id_hex: account(),
+                },
+                "key_package_maintenance_status",
+            ),
+            (
+                AgentControlRequest::MaintenanceScheduleSelfUpdate {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "maintenance_schedule_self_update",
+            ),
+            (
+                AgentControlRequest::MaintenanceGetPolicy {
+                    account_id_hex: account(),
+                },
+                "maintenance_get_policy",
+            ),
+            (
+                AgentControlRequest::MaintenanceSetPolicy {
+                    account_id_hex: account(),
+                    enabled_for_new_groups: true,
+                },
+                "maintenance_set_policy",
+            ),
+            (
+                AgentControlRequest::MaintenancePause {
+                    account_id_hex: account(),
+                },
+                "maintenance_pause",
+            ),
+            (
+                AgentControlRequest::MaintenanceResume {
+                    account_id_hex: account(),
+                },
+                "maintenance_resume",
+            ),
+            (
+                AgentControlRequest::MaintenanceRun {
+                    account_id_hex: account(),
+                },
+                "maintenance_run",
+            ),
+            (
                 AgentControlRequest::AllowlistList {
                     account_id_hex: account(),
                 },
@@ -963,6 +1489,7 @@ mod tests {
                         thumbhash: None,
                     }],
                     caption: Some("look".to_owned()),
+                    idempotency_key: None,
                 },
                 "send_media",
             ),
@@ -996,6 +1523,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn account_profile_lookup_has_typed_found_absent_and_indeterminate_outcomes() {
+        let request = AgentControlRequest::AccountProfileLookup {
+            account_id_hex: account(),
+        };
+        let request_json = serde_json::to_value(&request).unwrap();
+        assert_eq!(request_json["type"], "account_profile_lookup");
+        assert_eq!(request_json["account_id_hex"], account());
+
+        for (status, retryable) in [
+            (AgentControlProfileLookupStatus::ProfileFound, false),
+            (AgentControlProfileLookupStatus::ProfileNotFound, false),
+            (AgentControlProfileLookupStatus::Indeterminate, true),
+        ] {
+            let response = AgentControlResponse::ProfileLookup {
+                account_id_hex: account(),
+                status,
+                retryable,
+            };
+            let value = serde_json::to_value(&response).unwrap();
+            assert_eq!(value["type"], "profile_lookup");
+            assert_eq!(value["account_id_hex"], account());
+            assert_eq!(value["retryable"], retryable);
+            let round_tripped: AgentControlResponse = serde_json::from_value(value).unwrap();
+            assert_eq!(round_tripped, response);
+        }
+    }
+
     fn account() -> String {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
     }
@@ -1010,6 +1565,10 @@ mod tests {
 
     fn stream() -> String {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned()
+    }
+
+    fn capability() -> String {
+        "6666666666666666666666666666666666666666666666666666666666666666".to_owned()
     }
 
     fn message() -> String {

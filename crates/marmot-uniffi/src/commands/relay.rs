@@ -1,11 +1,35 @@
 //! Relay-list, relay-health, and relay-telemetry commands.
 
-use crate::conversions::{RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi};
+use crate::conversions::{
+    RelayEndpointClassificationFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
+};
 use crate::errors::MarmotKitError;
 use crate::{Marmot, conversions};
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Hostnames the relay plane will never dial or adopt.
+    pub fn retired_relay_hosts(&self) -> Vec<String> {
+        marmot_app::retired_relay_hosts()
+    }
+
+    /// Classify relay URLs using the same policy enforced at the dial boundary.
+    ///
+    /// Results preserve input order and cardinality so clients can batch the
+    /// NIP-65 and inbox lists and associate every decision with its source URL.
+    pub fn classify_relay_endpoints(
+        &self,
+        endpoints: Vec<String>,
+    ) -> Vec<RelayEndpointClassificationFfi> {
+        self.runtime
+            .shared_services()
+            .relay_plane()
+            .classify_relay_endpoints(endpoints)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
     /// Per-account relay lists: the NIP-65 and inbox lists the account has
     /// published, plus the configured default/bootstrap sets.
     pub fn account_relay_lists(

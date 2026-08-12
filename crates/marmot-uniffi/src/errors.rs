@@ -10,9 +10,24 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    #[error("group membership page exceeds the maximum of {max_groups} groups")]
+    InvalidGroupMembershipPage { max_groups: u64 },
+    /// The group exists but its full hydration has not completed yet
+    /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
+    /// group shortly after account readiness, and worker-routed reads wait
+    /// for exactly the named group. Distinct from `UnknownGroup` so hosts can
+    /// render "still loading" instead of "no such group".
+    #[error("group hydration pending: {group_id_hex}")]
+    GroupHydrationPending { group_id_hex: String },
+    #[error("invalid chat pin: {details}")]
+    InvalidChatPin { details: String },
     /// Host-supplied draft attachment metadata is malformed.
     #[error("invalid message draft: {details}")]
     InvalidMessageDraft { details: String },
+    /// Host-supplied encrypted-media metadata is malformed or does not match
+    /// the target group's selected media profile.
+    #[error("invalid media reference: {details}")]
+    InvalidMediaReference { details: String },
     #[error("invalid hex: {details}")]
     InvalidHex { details: String },
     #[error("invalid nostr identity: {details}")]
@@ -26,8 +41,33 @@ pub enum MarmotKitError {
     MissingKeyPackage { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
+    /// No current kind-3 event was found on the account's known outbox/default
+    /// relays. Retrying after directory/relay recovery is safe; publishing from
+    /// an assumed empty list is not.
+    #[error("current account follow list is unavailable")]
+    FollowListUnavailable,
     #[error("transport closed")]
     TransportClosed,
+    /// Another process or runtime owns the shared Marmot root. This is a typed,
+    /// retryable/fallback signal for the iOS foreground app and NSE; neither
+    /// host should open an unleased runtime after receiving it.
+    #[error("marmot runtime root is already in use")]
+    RuntimeBusy,
+    /// Another client or managed worker in this runtime currently owns the
+    /// account's in-memory engine session. Retry only after that owner closes.
+    #[error("marmot account session is already in use")]
+    AccountSessionBusy,
+    /// A pre-journal account has an encrypted database but no recoverable
+    /// stable KeyPackage slot. Automatic retry cannot prove non-exposure; the
+    /// host may offer `reset_incomplete_account_setup` with explicit consent.
+    #[error("incomplete account setup requires explicit recovery")]
+    AccountSetupRecoveryRequired,
+    #[error("durable account setup can be resumed by retrying")]
+    AccountSetupRetryRequired,
+    #[error("account is not eligible for incomplete-setup reset")]
+    AccountSetupResetNotApplicable,
+    #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
+    AccountSetupKeyPackageRecoveryAvailable,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -41,8 +81,23 @@ pub enum MarmotKitError {
     NotGroupAdmin { group_id_hex: String },
     #[error("admin must self-demote before leaving group {group_id_hex}")]
     AdminCannotSelfRemove { group_id_hex: String },
+    /// A leave is already in flight for this group. The durable request survives
+    /// restarts and the engine keeps re-proposing until a commit removes us, so
+    /// this is not a failure to retry — surface progress instead. Check
+    /// `GroupManagementStateFfi::leave_request_pending` before offering Leave.
+    #[error("a leave request is already pending for group {group_id_hex}")]
+    LeaveAlreadyRequested { group_id_hex: String },
     #[error("operation would remove the last admin from group {group_id_hex}")]
     WouldRemoveLastAdmin { group_id_hex: String },
+    #[error("group {group_id_hex} cannot enable disbanding until all members support it")]
+    DisbandingUnsupportedMembers {
+        group_id_hex: String,
+        member_ids_hex: Vec<String>,
+    },
+    #[error("group {group_id_hex} has not enabled disbanding")]
+    DisbandingNotEnabled { group_id_hex: String },
+    #[error("group {group_id_hex} is disbanding or disbanded")]
+    GroupDisbanding { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -66,6 +121,17 @@ pub enum MarmotKitError {
     /// surfacing it as a fatal "Send failed".
     #[error("storage busy: {details}")]
     StorageBusy { details: String },
+    /// The store has been closed by [`Marmot::shutdown_and_close`][crate::Marmot::shutdown_and_close]
+    /// and this call reached a database that is no longer open.
+    ///
+    /// Typed, and deliberately not [`MarmotKitError::Runtime`], because it is
+    /// an *expected* outcome rather than a fault: a host closing its store
+    /// before suspension races whatever work was still in flight, and that work
+    /// must be reportable as "we shut down" instead of as a storage failure the
+    /// user gets told about. Never retryable — the handle is spent; construct a
+    /// new `Marmot` when the app resumes.
+    #[error("storage closed: {details}")]
+    StorageClosed { details: String },
     /// The account exists but its raw private key could not be located in the
     /// keystore — e.g. a public-only / watch-only account, or a secret that was
     /// never loaded. Distinct, typed variant (#543) so a key-backup surface can
@@ -119,6 +185,19 @@ pub enum MarmotKitError {
     StickerImport { details: String },
     #[error("Signal sticker import is unavailable for external-signing accounts")]
     StickerImportUnsupported,
+    /// The group's outbound retention queue is full
+    /// (`MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP`), so this message was **not**
+    /// accepted and nothing was queued for it. The app layer has already
+    /// retracted the optimistic local row; this variant is typed rather than
+    /// the untyped [`MarmotKitError::Runtime`] bucket so the host can say the
+    /// group is stuck instead of reporting an opaque failure. Unlike
+    /// [`MarmotKitError::StorageBusy`] it is not worth an automatic retry:
+    /// whatever the group is waiting on — a stalled publication, unsettled
+    /// convergence input, or an inactive transport — clears on its own schedule,
+    /// not on a timer this call could pick. Prompt the user to resend once the
+    /// group is sending again.
+    #[error("group {group_id_hex} has too many messages waiting to be sent")]
+    GroupSendQueueFull { group_id_hex: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -169,7 +248,17 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
+                max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
+            },
+            AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
+            AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
+            // Encrypted-media validation failures are always media-boundary
+            // errors; map them to the typed variant so send/upload/download
+            // agree with build/parse even when a call site uses `?`/`From`.
+            AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
+            AppError::UnsafeMediaFetch(details) => Self::InvalidMediaReference { details },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
@@ -177,9 +266,24 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidPublicKey => Self::InvalidIdentity {
                 details: "invalid nostr public key".into(),
             },
+            AppError::UnexpectedPrivateKey => Self::InvalidIdentity {
+                details: "this operation does not accept a private key".into(),
+            },
+            AppError::IdentityKeyMismatch => Self::InvalidIdentity {
+                details: "public identity does not match the imported private key".into(),
+            },
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent { details },
             AppError::Publish(details) => Self::Publish { details },
+            AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::TransportClosed => Self::TransportClosed,
+            AppError::RuntimeBusy => Self::RuntimeBusy,
+            AppError::AccountSessionBusy => Self::AccountSessionBusy,
+            AppError::AccountSetupRecoveryRequired => Self::AccountSetupRecoveryRequired,
+            AppError::AccountSetupRetryRequired => Self::AccountSetupRetryRequired,
+            AppError::AccountSetupResetNotApplicable => Self::AccountSetupResetNotApplicable,
+            AppError::AccountSetupKeyPackageRecoveryAvailable => {
+                Self::AccountSetupKeyPackageRecoveryAvailable
+            }
             AppError::RuntimeStopping => Self::RuntimeStopping,
             AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
             // #484: a transient storage busy error can also surface directly at
@@ -187,6 +291,12 @@ impl From<AppError> for MarmotKitError {
             // as the typed transient variant here too, so Android never sees
             // transient contention as an untyped fatal Runtime error.
             AppError::Storage(ref storage_err) if storage_err.is_transient() => Self::StorageBusy {
+                details: storage_err.to_string(),
+            },
+            // A store closed for suspension is an orderly end state, not a
+            // fault. Give it its own variant so hosts can drop the result
+            // silently instead of surfacing an error while backgrounding.
+            AppError::Storage(ref storage_err) if storage_err.is_closed() => Self::StorageClosed {
                 details: storage_err.to_string(),
             },
             AppError::ExternalSignerUnavailable(account) => {
@@ -212,24 +322,57 @@ impl MarmotKitError {
             EngineError::UnknownGroup(group_id) => Self::UnknownGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            EngineError::GroupNotHydrated(group_id) => Self::GroupHydrationPending {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             EngineError::NotGroupAdmin { group_id } => Self::NotGroupAdmin {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
             EngineError::AdminCannotSelfRemove { group_id } => Self::AdminCannotSelfRemove {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            // The authoritative already-leaving signal. `Marmot::leave_group`
+            // prechecks the pending flag for fast UX, but that check is a
+            // check-then-act race, so the engine's verdict must map to the same
+            // named error rather than falling through to `Runtime`.
+            EngineError::LeaveAlreadyRequested { group_id } => Self::LeaveAlreadyRequested {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             EngineError::AdminDepletion { group_id } => Self::WouldRemoveLastAdmin {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
+            EngineError::DisbandingUnsupportedMembers { group_id, members } => {
+                Self::DisbandingUnsupportedMembers {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    member_ids_hex: members
+                        .iter()
+                        .map(|member| hex::encode(member.as_slice()))
+                        .collect(),
+                }
+            }
+            EngineError::DisbandingNotEnabled { group_id } => Self::DisbandingNotEnabled {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
             EngineError::UnknownMember { group_id, member } => Self::MemberNotInGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),
             },
+            // The send was refused, not deferred: the host must be able to say
+            // so, and must not auto-retry a condition that cannot clear until
+            // the group resolves.
+            EngineError::QueuedOutboundAtCapacity { group_id } => Self::GroupSendQueueFull {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             // #484: surface transient storage lock contention as a typed,
             // app-distinguishable variant rather than flattening it into the
             // untyped `Runtime` bucket. `StorageError::is_transient()` is the
             // single source of truth for which storage errors are transient.
             EngineError::Storage(storage_err) if storage_err.is_transient() => Self::StorageBusy {
+                details: storage_err.to_string(),
+            },
+            // Engine work racing a close for suspension: an orderly end state,
+            // reported as such rather than as a runtime fault.
+            EngineError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
                 details: storage_err.to_string(),
             },
             other => Self::Runtime {
@@ -246,6 +389,16 @@ mod tests {
     use cgka_traits::storage::StorageError;
     use marmot_account::{AccountError, AccountHomeError};
     use marmot_app::AppError;
+
+    #[test]
+    fn oversized_membership_page_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError =
+            AppError::InvalidGroupMembershipPage("too many groups".into()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::InvalidGroupMembershipPage { max_groups: 100 }
+        ));
+    }
 
     // #484: a transient SQLITE_BUSY surfaced from a send must cross the UniFFI
     // boundary as the typed `StorageBusy` variant — never the untyped `Runtime`
@@ -267,6 +420,122 @@ mod tests {
                 );
             }
             other => panic!("expected AccountCatchUp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_busy_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError = AppError::RuntimeBusy.into();
+        assert!(
+            matches!(ffi, MarmotKitError::RuntimeBusy),
+            "exclusive-root contention must remain distinguishable at the host boundary"
+        );
+    }
+
+    #[test]
+    fn account_session_busy_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError = AppError::AccountSessionBusy.into();
+        assert!(
+            matches!(ffi, MarmotKitError::AccountSessionBusy),
+            "in-process account-session contention must remain distinguishable at the host boundary"
+        );
+    }
+
+    // The `leave_group` precheck on `leave_request_pending` is not atomic with
+    // the send it guards, so two concurrent leaves can both pass it. The engine
+    // settles the race under its own lock, and the loser's verdict has to reach
+    // the host as the same named error the precheck would have produced — never
+    // the untyped `Runtime` bucket, which is exactly the opaque failure this
+    // field was added to eliminate.
+    // Asserted against `from_engine_error` directly rather than through an
+    // `AppError`: a leave failure arrives wrapped as
+    // `AppError::Session(SessionError::Engine(..))`, and `cgka-session` is not a
+    // dependency of this crate. `From<AppError>` funnels every such error through
+    // `as_engine_error()` into this same function (see above), so this covers the
+    // mapping without pulling in a crate just to construct a wrapper.
+    #[test]
+    fn leave_already_requested_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x11; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::LeaveAlreadyRequested {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::LeaveAlreadyRequested { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected LeaveAlreadyRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disbanding_not_enabled_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x22; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::DisbandingNotEnabled {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::DisbandingNotEnabled { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected DisbandingNotEnabled, got {other:?}"),
+        }
+    }
+
+    // A refused send is the one signal the retention feature owes the host: the
+    // message was not accepted at all. Flattened into `Runtime` the host cannot
+    // tell it from any other failure without string-parsing, and cannot explain
+    // to the user why the group stopped accepting messages.
+    #[test]
+    fn queued_outbound_at_capacity_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::QueuedOutboundAtCapacity {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::GroupSendQueueFull { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected GroupSendQueueFull, got {other:?}"),
+        }
+    }
+
+    // The variant it replaced must not regress into the opaque bucket by way of
+    // some future refactor reusing `InvalidTransition` for this case.
+    #[test]
+    fn invalid_transition_remains_the_untyped_engine_bug_signal() {
+        let ffi = MarmotKitError::from_engine_error(&EngineError::InvalidTransition(
+            cgka_traits::engine_state::InvalidTransition {
+                from: "Leaving",
+                to: "AppMessage",
+                reason: "leave request is current",
+            },
+        ));
+        assert!(
+            matches!(ffi, MarmotKitError::Runtime { .. }),
+            "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_media_fetch_crosses_ffi_as_typed_media_reference() {
+        let app_err = AppError::UnsafeMediaFetch("unsafe profile image URL".into());
+        let ffi: MarmotKitError = app_err.into();
+        assert!(matches!(ffi, MarmotKitError::InvalidMediaReference { .. }));
+    }
+
+    #[test]
+    fn invalid_encrypted_media_crosses_ffi_as_typed_media_reference() {
+        let app_err =
+            AppError::InvalidEncryptedMedia("group requires encrypted-media-v2 references".into());
+        let ffi: MarmotKitError = app_err.into();
+        match ffi {
+            MarmotKitError::InvalidMediaReference { details } => {
+                assert!(
+                    details.contains("encrypted-media-v2"),
+                    "typed InvalidMediaReference should carry the media detail, got: {details}"
+                );
+            }
+            other => panic!("expected InvalidMediaReference, got {other:?}"),
         }
     }
 
@@ -395,6 +664,28 @@ mod tests {
             ),
             "invalid KeyPackage events must not be flattened into InvalidIdentity, got {ffi:?}"
         );
+    }
+
+    #[test]
+    fn incomplete_account_setup_crosses_ffi_as_typed_recovery() {
+        let ffi: MarmotKitError = AppError::AccountSetupRecoveryRequired.into();
+        assert!(matches!(ffi, MarmotKitError::AccountSetupRecoveryRequired));
+    }
+
+    #[test]
+    fn account_setup_reset_refusals_cross_ffi_as_typed_variants() {
+        assert!(matches!(
+            MarmotKitError::from(AppError::AccountSetupRetryRequired),
+            MarmotKitError::AccountSetupRetryRequired
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::AccountSetupResetNotApplicable),
+            MarmotKitError::AccountSetupResetNotApplicable
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::AccountSetupKeyPackageRecoveryAvailable),
+            MarmotKitError::AccountSetupKeyPackageRecoveryAvailable
+        ));
     }
 
     #[test]

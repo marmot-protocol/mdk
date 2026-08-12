@@ -146,6 +146,7 @@ KeyPackage commands:
 ```sh
 wn --account <npub-or-hex> keys list
 wn --account <npub-or-hex> keys publish
+wn --account <npub-or-hex> keys maintenance-status
 wn --account <npub-or-hex> keys rotate
 wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>
 wn keys check <npub-or-hex>
@@ -153,8 +154,12 @@ wn --account <npub-or-hex> keys delete <event-id>
 wn --account <npub-or-hex> keys delete-all --confirm
 ```
 
-`keys publish` republishes the currently cached KeyPackage; `keys rotate` (alias `force-publish`) force-mints and
-publishes a fresh replacement KeyPackage.
+`keys publish` initializes or retries the durable KeyPackage lifecycle and publishes a fresh replacement under the
+account-device's stable kind-30443 `d` slot. Once an exact event has been signed, every retry reuses it.
+`keys rotate` (alias `force-publish`) explicitly starts the same replacement operation when no replacement is
+already pending. Routine replacement does not publish a kind-5 deletion; `keys delete` and `keys delete-all` remain
+explicit teardown/legacy-cleanup tools. `keys maintenance-status` shows the persisted slot, lifetime, refresh,
+replacement, retry, and retained-private-material state.
 
 KeyPackage publish/fetch/check/list use the current relay-directory path. `keys list` returns the relay event id for
 each known KeyPackage record. `keys delete` publishes a Nostr deletion for one event id, and `keys delete-all
@@ -174,7 +179,35 @@ wn --account <npub-or-hex> chats unarchive <group-hex>
 wn --account <npub-or-hex> chats mute <group-hex> 1h
 wn --account <npub-or-hex> chats mute <group-hex> forever
 wn --account <npub-or-hex> chats unmute <group-hex>
+wn --account <npub-or-hex> chats mark-read <group-hex>
+wn --account <npub-or-hex> chats mark-read <group-hex> <message-id-hex>
 ```
+
+Each `chats list`, `chats list-archived`, and `chats subscribe`/`subscribe-archived` row carries the group
+record plus a per-chat projection so a chat list can render unread badges and a last-message preview without a
+second query: `unread_count` (number), `has_unread` (bool), `last_message` (the last chat message as
+`{ message_id_hex, sender, sender_display_name, plaintext, kind, timeline_at, deleted }`, or `null`), and the
+`last_read_message_id_hex` / `last_read_timeline_at` read marker (either may be `null`). These keys use the same
+names and `last_message` shape as the `chat_list_row` object on the `messages timeline subscribe` feed, so both
+feeds agree. A chat with no messages or reads yet reports empty defaults (`0` / `false` / `null`) rather than
+omitting the keys.
+
+On the `chats subscribe`/`subscribe-archived` feeds these projection keys refresh only when the feed emits a
+row, and the feed emits on group-state changes (create, rename, archive/unarchive, membership) — not on every
+new message or read. So the unread count and last-message preview on a subscribed row are a point-in-time
+snapshot taken at the last group-state emit, and live unread/last-message deltas ride the
+`messages timeline subscribe` feed's `chat_list_row` object instead. `chats mark-read` returns the refreshed
+projection directly in its own response.
+
+`chats mark-read <group-hex> [<message-id-hex>]` advances the chat's read marker and clears its unread count.
+With no message id it marks the newest message read (the "clear on chat open" case); with an explicit message id
+it marks read up to that message. The read marker is a forward-only high-water mark, so marking an older message
+leaves any newer ones unread and re-marking never moves it backward; an empty chat is a no-op success. A
+`<message-id-hex>` that is not a kind-9 chat message in the chat — foreign, non-existent, or a different event
+kind — likewise leaves the marker untouched and returns the current projection as success, the same silent
+contract as `messages react`/`delete` with unknown ids. It returns
+`account_id`, `npub`, `group_id`, and the same five projection keys as the `chats list` rows
+(`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 
 Group commands:
 
@@ -197,6 +230,14 @@ wn --account <npub-or-hex> groups set-avatar-url <group-hex> --clear
 wn --account <npub-or-hex> groups promote <group-hex> <member-npub-or-hex>
 wn --account <npub-or-hex> groups demote <group-hex> <member-npub-or-hex>
 wn --account <npub-or-hex> groups self-demote <group-hex>
+wn --account <npub-or-hex> groups maintenance-status <group-hex>
+wn --account <npub-or-hex> groups schedule-self-update <group-hex>
+wn --account <npub-or-hex> groups maintenance-policy
+wn --account <npub-or-hex> groups maintenance-policy --set enabled
+wn --account <npub-or-hex> groups maintenance-policy --set disabled
+wn --account <npub-or-hex> groups pause-maintenance
+wn --account <npub-or-hex> groups resume-maintenance
+wn --account <npub-or-hex> groups run-maintenance
 wn --account <npub-or-hex> groups subscribe-state <group-hex>
 
 wn --account <npub-or-hex> group create <name> [member-npub-or-hex ...]
@@ -209,11 +250,19 @@ wn --account <npub-or-hex> group set-avatar-url <group-hex> --url <https-url> [-
 wn --account <npub-or-hex> group set-avatar-url <group-hex> --clear
 ```
 
+Newly created or joined groups follow the persisted periodic-maintenance policy, which defaults to enabled.
+Pre-rollout groups are not automatically enrolled; `groups schedule-self-update` schedules one rotation without
+changing their enrollment. Pause/resume is process-local: it stops new preparation while preserving durable
+obligations and already-prepared publication recovery. Application-message JSON results include
+`maintenance_disposition`, which is `ready` or `post_join_rotation_pending_retryable`; a pending post-join rotation
+does not block the send.
+
 Message commands:
 
 ```sh
 wn --account <npub-or-hex> messages send <group-hex> "hello"
 wn --account <npub-or-hex> messages send --group <group-hex> "--text that starts with a dash"
+wn --account <npub-or-hex> messages send --group <group-hex> --reply-to <message-id> "replying to you"
 wn --account <npub-or-hex> messages list
 wn --account <npub-or-hex> messages list <group-hex> --limit 20
 wn --account <npub-or-hex> messages list <group-hex> --before <unix-seconds> --before-message-id <event-id>
@@ -229,6 +278,18 @@ wn --account <npub-or-hex> messages timeline list <group-hex> --limit 20
 wn --account <npub-or-hex> messages timeline search <group-hex> <query> --limit 20
 wn --account <npub-or-hex> messages timeline subscribe <group-hex>
 ```
+
+`messages send --reply-to <message-id>` sends the text as a reply to an existing message. It uses the same wire
+format other Marmot clients produce, so recipients see the row with its reply reference and a hydrated reply preview
+of the parent. Pass the group with `--group` and put `--reply-to` before the text when replying: the message text uses
+hyphen-tolerant parsing, so a `--reply-to` placed after the text (in either the positional-group or the `--group`
+form, and in either spelling: `--reply-to <id>` or `--reply-to=<id>`) is read as literal text rather than as the flag.
+Instead of silently sending that stray `--reply-to` as part of the body, the CLI rejects the mis-ordering with a clear
+error (code `reply_to_after_message_text`) so it fails loudly. The tradeoff: the guard rejects any message whose text
+contains a bare `--reply-to` or `--reply-to=<id>` token anywhere (e.g. `hello --reply-to friend`), so such text can no
+longer be sent this way. The parent id is not required to
+exist locally; a reply to a message you have not yet synced is still sent (its preview hydrates once the parent
+arrives). The JSON response is the same shape as a plain send.
 
 The `messages timeline` subcommands list, search, and subscribe to the materialized message timeline (the projection
 that interleaves messages, media, and agent-stream anchors/finals in conversation order).
@@ -247,14 +308,19 @@ Media commands:
 ```sh
 wn --account <npub-or-hex> media list <group-hex>
 wn --account <npub-or-hex> media upload <group-hex> <file-path> --send --message <caption>
-wn --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.primal.net
+wn --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.divine.video
 wn --account <npub-or-hex> media download <group-hex> <file-hash> --output ./file.jpg
 ```
 
 `media upload` encrypts the file with the group's current `MLS-Exporter("marmot", "encrypted-media", 32)` media secret,
-uploads the ciphertext to Blossom, and optionally sends a kind-9 media message. Without `--server`, the upload targets
-the endpoints in the group's `marmot.group.encrypted-media.v1` component (`https://blossom.primal.net` is the endpoint
-baked into newly created groups' component, not a hardcoded CLI default).
+uploads the ciphertext to Blossom, and optionally sends a kind-9 media message. Because the encrypted bytes are opaque,
+the server must accept `application/octet-stream` uploads. Without `--server`, the upload targets the ordered endpoints
+in the group's exact versioned encrypted-media component: frozen V1 (`0x8008`) for already-joined legacy groups and V2
+(`0x800b`) for current-profile groups. Newly created current groups use MDK's ciphertext-compatible built-in endpoint
+list unless the application was compiled with `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`.
+
+Endpoint policy is signed group state. Upgrading MDK changes the defaults for new groups only; an active group admin can
+call `replace_encrypted_media_blob_endpoints` to change endpoints without changing that group's media version.
 Upload JSON returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
 decrypts it, and writes the plaintext file.
@@ -442,35 +508,205 @@ real time.
 
 ## TUI
 
-`wn tui` is a Ratatui interface over the real `wn --json` command surface. It lists local accounts, shows
-visible chats for the selected local signing account, renders recent messages, sends messages from a composer, and
-keeps the latest status plus selected-chat MLS/component state in a status panel below the composer.
+`wn tui` is a Ratatui interface over the real `wn --json` command surface. It opens on a login screen when it has
+no single obvious account, then drops into a chat-first main view: the chat list on the left, the materialized
+message timeline on the right (with reactions, reply context, deletion tombstones, and inline images as cell-exact
+half-blocks on image-capable terminals, with `[img name]`/`[file name]` placeholders otherwise), the composer below
+them, and a one-line hints bar plus a one-line status bar at the bottom.
 
 ```sh
 wn tui
 ```
 
-When a daemon is running for the same home, TUI child commands use the daemon socket. The header shows daemon
+Startup routes by how many local accounts exist: no accounts open the login menu (create an identity or log in
+with an nsec), exactly one drops straight into the main view, and several open an account picker. An explicit
+`--account <npub-or-hex>` (or `WN_ACCOUNT`) that resolves to a loaded account enters the main view directly with
+that account, even when several accounts exist. The main view no
+longer has an always-visible accounts panel; press `A` from the chat list to reopen the account picker, or use the
+`/account`, `/login`, and `/create-identity` slash commands.
+
+First run without any relay configuration would otherwise dead-end, because creating an identity and starting the
+daemon both need relays. Pass them to `wn tui` and they are forwarded to the daemon-start and account-setup child
+commands:
+
+```sh
+wn tui \
+  --discovery-relays wss://relay.discovery.example \
+  --default-account-relays wss://relay.one.example,wss://relay.two.example
+```
+
+When a daemon is running for the same home, TUI child commands use the daemon socket. The status bar shows daemon
 state. While the daemon is running, the TUI attaches to daemon-backed runtime subscriptions for live message, chat, and
 group-state changes, and refreshes snapshots when the composer is idle.
 
-Controls:
+When the daemon is not running at launch, the TUI auto-starts it — exactly as `/daemon start` would — provided it
+holds a relay source to give it: the passthrough flags above, a global `--relay`, or `WN_RELAY`. The start runs off
+the event loop (`wn daemon start` waits on a readiness poll), so the status line shows `starting daemon...` and then
+the outcome, and the status-bar dot flips green when it lands. Without any relay source no start is attempted — it
+would only fail requiring a relay URL — and one status says so; the login/main flow continues degraded. To fix it,
+restart `wn tui` with `--discovery-relays`/`--default-account-relays` (or `WN_RELAY`); `/daemon start` in-session reads
+the same relay sources and would fail identically. Unlike the retired reference client, which killed its auto-started
+daemon on exit, the TUI never stops the daemon when it quits:
+other `wn` commands share it. Stop it explicitly with `/daemon stop` or `wn daemon stop`.
 
-- `Tab`: cycle accounts, chats, and composer.
-- Arrow keys or `j`/`k`: move the selected account or chat.
-- `Enter`: select the highlighted account/chat or submit the composer.
-- `?`: open help.
-- `Esc`: clear help or input.
+User-initiated commands — sending a message, replying, reacting/unreacting, deleting, opening a chat, searching users,
+opening group detail, and listing invites — run on a background worker so a `wn` round-trip never freezes typing,
+scrolling, or input. The ambient chat-list re-read that a notification for a non-selected chat triggers runs on that
+same worker, so a burst of notifications never blocks key handling either. Each shows in-flight feedback (`sending...`,
+`loading chat...`, `searching...`) and folds its result in on the next frame; user-initiated mutations keep their
+submission order, and a load whose target you have already moved past is dropped rather than overwriting the current
+view. Modal or rare flows (login, logout, daemon start/stop, and popup submits such as rename or follow) stay
+synchronous.
+
+Login screen controls:
+
+- Menu (no accounts): `c` create a new identity, `l` log in with an nsec, `q` quit.
+- Account picker (several accounts): `j`/`k` or arrows move the selection; `Enter` selects the account and enters
+  the main view; `c` create; `l` nsec login; `Esc` returns to the main view when one is already active; `q` quit.
+- Nsec entry: type or paste the nsec (rendered masked); `Enter` submits it over stdin; `Esc` cancels.
+
+Main view controls:
+
+- `Tab`/`BackTab`: cycle the chat list, messages, and composer.
+- Chats: `j`/`k` or arrows move the selection; moving it also live-previews the highlighted chat in the message pane
+  after a brief pause (~150ms of quiet), with focus staying on the list, so flicking through with `j`/`k` loads only
+  the chat you settle on. The messages-pane title names the loaded chat (falling back to "Messages"), and the composer
+  sends to that same chat, so the pane always shows which conversation you are reading and sending to — whether it was
+  opened or previewed. `Enter` opens the highlighted chat and moves focus to the messages pane (cancelling any pending
+  preview; opening the chat already shown is just a focus move); a previewed chat is marked read the same way opening
+  it is. `g` opens the
+  group-detail screen for the selected chat; `s` opens user search; `p` opens your profile; `h` opens the relay-health
+  screen; `I` opens the pending-invites picker; `A` reopens the
+  account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender
+  plus truncated text), and the list orders by last activity, newest first. The badge and the status bar's unread
+  total come from the runtime's per-chat projection (`chats list`), so they survive a restart rather than being
+  counted in the TUI. Opening a chat clears its badge immediately (via `chats mark-read`); a chat you are viewing
+  updates its badge and preview live from the timeline feed, and other chats refresh from a background
+  `notifications subscribe` feed (a debounced `chats list` re-read on each new message elsewhere). A group invite
+  surfaces as a one-line status notice that prompts `I` to open the invites picker. A background refresh never moves the highlight off the chat you have
+  selected. These ambient updates require a running `wnd`: without a daemon, off-screen badges and previews
+  update only when you manually refresh (`/refresh`) or re-open the chat. The badge and unread total still
+  survive a restart either way, since they come from the runtime's durable `chats list` projection.
+- Messages: `j`/`k` or arrows move the message selection; `PageUp`/`PageDown` page; `G`/`End` jump to the newest
+  message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
+  the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
+  the previous page of history. `i` or `Enter` focuses the composer.
+- Messages, on the selected message: `r` reacts (it prefills `/react` followed by a space in the composer, so
+  `Enter` sends the default
+  `+` and typing an emoji first customizes it); `u` removes your own reaction immediately; `d` deletes your own
+  message (it prefills `/delete`, so `Enter` is the visible confirmation); `R` replies (it prefills `/reply`
+  followed by a space and
+  shows the reply target on the status line, so you type the reply and `Enter` sends it). Counts update live in both
+  directions from the timeline projection; the list is not reloaded, and a sent reply upserts optimistically the same
+  way a plain send does. The `r`, `d`, and `R` prefills are skipped when the composer already holds a draft, so an
+  in-progress message is never clobbered (a status-line notice explains the skip). While the composer holds one of
+  these prefills, the hints line shows a persistent reminder of what `Enter` will do and to which message (for
+  example `reacting to <sender>: <preview> — Enter sends the reaction, Esc clears`), recomputed each frame so it stays
+  visible until you send or clear; `Esc` clears the armed prefill (pristine or after you have typed into it) as that
+  escape hatch, while a hand-typed draft is left intact (use `Ctrl-U` to clear a hand-typed draft). `/react` accepts
+  only one emoji — exactly one grapheme cluster carrying a non-ASCII scalar (real emoji, including ZWJ families, skin
+  tones, flags, and keycaps), or the NIP-25 `+`/`-` sentinels. Anything else — multi-word prose, plain-ASCII tokens,
+  and non-Latin or accented words like `café`, `你好吗`, or `привет` — is refused with a status-line error that names
+  the contract and the escape hatch (`reactions are a single emoji (Enter sends the default +); Esc clears`), so typed
+  prose is never published as a reaction. These also work as the `/react`,
+  `/unreact`, `/delete`, and `/reply <text>` slash commands, which resolve the target at submit and error to the
+  status line when no message is selected (and `/delete` when the message is not yours). `/reply` sends
+  `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
+  text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
+  viewer (see "Inbound media" below).
+- Inbound media: an image attachment renders inline in the message pane as a filtered half-block preview — cell-exact
+  `▀` colored cells, downscaled with a proper resampling filter (Lanczos3) so the small preview stays legible — on any
+  image-capable terminal. The inline rendering is deliberately cell-exact rather than a native pixel image
+  (iTerm2/Kitty/Sixel): half-blocks are ordinary colored cells bounded strictly to the reserved block, so an image can
+  never overdraw a neighboring message or leave a terminal-side artifact behind when you scroll. Each image is
+  downloaded and decoded in the background — never blocking the event loop — and its placeholder walks `[img name]` ->
+  `[downloading name...]` -> `[loading name...]` -> the inline image, or `[name failed: err]` on error. A terminal
+  with no image capability keeps the `[img name]` placeholder (and non-image attachments always show `[file name]`).
+  The `o` full-size viewer shows the actual image with the terminal's native pixel protocol when the startup
+  capability query found one (in an iTerm2 session it uses iTerm2's own inline-image protocol), and closing the
+  viewer — like closing any popup — forces a full terminal repaint so nothing lingers on screen. Viewer pixels are
+  kept in a small in-memory pool (the most recent images, oldest evicted first); on terminals without a pixel
+  protocol, or for an evicted image, the viewer falls back to the same cell-exact half-block rendering. Each image is
+  decrypted to a private `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file
+  is then removed right away — inline preview and full-size viewer both draw from memory, so nothing reads the file
+  again and no decrypted media is left at rest. Any files a prior crashed session left behind are swept from that
+  directory at startup.
+- Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
+  character, `Ctrl-U` clears the whole composer (a readline kill-line that empties it whatever it holds — armed prefill
+  or hand-typed draft), and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard
+  newline, so multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8
+  rows), taking the space from the messages pane.
+- `?`: open the help popup.
+- `Esc`: clear an armed message-interaction prefill (`/react`, `/reply`, or `/delete`, whether untouched or after you
+  have typed into it); a hand-typed draft is left intact so `Esc` never destroys text you wrote — use `Ctrl-U` to
+  clear a hand-typed draft. With a popup open, `Esc` closes it.
+- `Ctrl-U`: clear the whole composer (readline kill-line), whatever it holds. Also clears the masked nsec-entry field.
 - `Ctrl-C`: quit.
+
+Popups are modal: while one is open it captures every key and the screen behind it is inert. A text-entry popup
+submits on `Enter` (when non-empty) and cancels on `Esc`; a confirm popup takes `y`/`Enter` or `n`/`Esc`; a list
+picker moves with `j`/`k` and closes on `Esc`; and dismiss-on-any-key cards (help, info, errors) close on the next
+key. Because the help card is a popup, `q` under it closes the card instead of quitting.
+
+Group detail (`g` from the chat list) shows the selected group's members with admin badges (and a `(you)` marker),
+its relay hints, and its name and description; `Esc` returns to the main view. Its keys: `j`/`k` move the member
+selection; `A` adds a member by npub/hex (text popup → `groups add-members`); `x` removes the selected member
+(confirm → `groups remove-members`); `P` promotes the selected member to admin (confirm → `groups promote`); `R`
+renames the group (text popup prefilled with the current name → `groups rename`); `L` leaves the group. An admin
+cannot leave: `L` shows a "Cannot Leave Group" info card (sole admins are told to promote another member first,
+co-admins to step down as admin), while a non-admin gets a confirm popup (→ `groups leave`) and, on success, the
+chat leaves the list and the view returns to the main screen. `I` opens the invites picker from here too.
+
+Invites (`I` from the chat list or group detail) opens a picker of pending invites (`groups invites`): `a` or
+`Enter` accepts the highlighted invite (`groups accept`) and opens the newly joined chat, `d` declines it
+(`groups decline`), and `Esc` closes the picker. The picker stays open across actions, refolding the refreshed
+list after each accept or decline and closing only once no invites remain; accepting from the group-detail screen
+returns to the main view. With no pending invites it shows an info card instead.
+
+User search (`s` from the chat list, or `/users [query]`) is a one-shot search over the cached follow-graph directory
+(`users search`, default radius `0..2`). The screen has two regions and a two-state focus: in query focus you type the
+query (so `j`/`k` are literal text) and `Enter` runs the search; once there are results, focus moves to the list where
+`j`/`k` (or arrows) navigate, `Enter` opens the selected user's profile card (`users show`, dismiss-on-any-key), `c`
+starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to an existing chat: a
+group picker lists your chats (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), preselecting the open
+chat when one is loaded, and `Enter` opens the confirm popup that guards the add (`groups add-members`), naming both
+the user and the chosen chat. With no chats a status notice explains and points at `c`. `f` follows the highlighted
+result (`follows add`) and `x` unfollows them (`follows remove`) — the same key letters as the Profile screen's
+`f`/`x`, but acting directly on the highlighted result (Profile's go through popups). Both run on the background
+worker with in-flight feedback and fold into a per-row
+`[following]` badge; rows you already follow are badged up front from a `follows list` snapshot taken with each
+search. `i` returns to the query, and
+`Esc` returns to the main view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
+attribution the search returns.
+
+Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no
+avatar is fetched), nip05, lud16, and npub — from `profile show`, plus your follows from `follows list`. `j`/`k` move a
+single cursor over the six fields then the follows; `Enter` on a field opens a text popup prefilled with the current
+value and, on submit, publishes only that one field (`profile update --<field>`, which merges over the current profile
+so the other fields survive); `f` follows a user by npub/hex (`follows add`), and `x` unfollows the selected follow
+(confirm → `follows remove`). There is no nsec export anywhere. `Esc` returns to the main view.
+
+Relay health (`h` from the chat list) is a redacted, device-local telemetry dashboard from `relay-stats` (which reads
+the live `wnd` runtime when a socket exists and a fresh in-process read otherwise, so it always renders something —
+the header notes the daemon state). It shows the connection-health summary, lifecycle counters, cross-relay delivery
+spread (with p50/p99 derived from the fixed-bucket histograms, honest about `n/a` and `>Nms` overflow), subscription
+first-event/EOSE sync timing, and per-relay first-deliverer and timing rows keyed by an opaque device-local index.
+Per privacy decision, no relay URLs appear anywhere on this screen. `r` refreshes, `j`/`k` and PageUp/PageDown scroll,
+and `Esc` returns to the main view.
+
+Group MLS/component diagnostics are hidden by default; `/diagnostics` toggles a diagnostics panel between the
+messages pane and the composer.
 
 Composer slash commands:
 
 ```text
 /help
 /refresh
+/diagnostics
 /account <npub-or-hex>
 /create-identity
 /login <nsec-or-npub>
+/logout
 /daemon status
 /daemon start
 /daemon stop
@@ -485,11 +721,17 @@ Composer slash commands:
 /members add <npub-or-hex> [...]
 /members remove <npub-or-hex> [...]
 /members list
+/react [emoji]
+/unreact
+/delete
+/reply <text>
+/retry <event-id>
 /image <file-path> [caption]
 /keys fetch <npub-or-hex>
 /keys rotate
 /name <display-name>
 /profile name <display-name>
+/users [query]
 /stream [--stream-id <hex>] [--quic-candidate <quic-url>]
 /stream start [--stream-id <hex>] --quic-candidate <quic-url>
 /stream watch [--stream-id <hex>] [--insecure-local]
@@ -501,10 +743,28 @@ Composer slash commands:
 
 `/stream` uses `quic://quic-broker.ipf.dev:4450` when no candidate is supplied.
 
+`/logout` acts on the currently selected account and is always confirmed first. `wn logout` is destructive: it
+permanently removes that account's local data (messages, group membership, and MLS state) from this device, and for a
+local-signing account it deletes the signing key too, so the confirmation says so plainly, never softens the wording,
+and always shows the account npub so it is unambiguous which account is destroyed. A local-signing logout is
+irreversible, so its confirmation requires typing the literal word `logout` and pressing `Enter`; an empty or
+mismatched entry keeps the popup open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A
+public-only account is re-addable, so it keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). On confirmation
+the account list reloads; if the removed account was the last one, the TUI returns to the login menu rather than
+pointing at a removed account.
+
 `/login <nsec>` redacts the secret in the composer and pipes it to the child `wn` process over stdin instead of argv.
 `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
 visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
 the CLI.
+`/react`, `/unreact`, and `/delete` operate on the selected message in the messages pane and call the real
+`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. `/react` also guards its content: it is a
+single emoji or the `+` default, so content with whitespace, plain ASCII text, or too long for one emoji is rejected
+with a status-line error rather than published as a reaction (the guard lives in the TUI; the `messages react` CLI
+command stays protocol-faithful). On success they only update the status
+line — the timeline projection folds the reaction or tombstone into the existing row, so the list is not reloaded.
+`/retry <event-id>` retries a failed outbound event by id; it takes the id as an argument rather than acting on the
+selected message, because timeline rows do not carry per-message failed-send state to target from.
 `/image` uses the real encrypted media path (`wn media upload <group> <file> --send`) and sends the optional caption
 as the media message text; it does not send plaintext file paths or placeholder messages.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews

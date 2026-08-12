@@ -12,6 +12,15 @@ pub enum EngineError {
     #[error("unknown group")]
     UnknownGroup(GroupId),
 
+    /// The group was seeded by the session-open cheap pass but its full
+    /// per-group hydration (MLS load, validation, pending-commit recovery)
+    /// has not run yet (mdk#1161). Retryable: the caller can wait for the
+    /// background hydration pipeline or drive `ensure_hydrated` on a `&mut`
+    /// entry point. Distinct from [`Self::UnknownGroup`] so hosts can render
+    /// "still loading" instead of "no such group".
+    #[error("group not hydrated yet; retry after hydration")]
+    GroupNotHydrated(GroupId),
+
     #[error("unknown pending send reference")]
     UnknownPending,
 
@@ -37,6 +46,23 @@ pub enum EngineError {
     #[error("admin cannot self-remove: leave the admin set first")]
     AdminCannotSelfRemove { group_id: GroupId },
 
+    /// A durable leave request already covers this group's current epoch, so a
+    /// fresh SelfRemove proposal would be redundant.
+    ///
+    /// Not an engine bug and not a transient failure: the durable intent is
+    /// already recorded and the engine re-proposes on each new epoch until a
+    /// commit removes the local member. Callers should surface progress rather
+    /// than retry.
+    ///
+    /// This is deliberately its own variant rather than an
+    /// [`InvalidTransition`](crate::engine_state::InvalidTransition), which is
+    /// documented below as indicating an engine bug: a user double-tapping Leave
+    /// is routine input, and the classification has to be decided here — under
+    /// the same lock as the durable read and write — because any check made
+    /// above this layer is a check-then-act race.
+    #[error("leave already requested for the current epoch")]
+    LeaveAlreadyRequested { group_id: GroupId },
+
     /// MIP-03 §150 — a commit that would result in zero admins is rejected
     /// before construction. Used when an inbound SelfRemove from the only
     /// admin would deplete admins on commit.
@@ -50,6 +76,19 @@ pub enum EngineError {
         required: Box<GroupCapabilities>,
         had: Box<GroupCapabilities>,
     },
+
+    /// One or more current member leaves have not yet advertised lifecycle-v1
+    /// support, so the group cannot atomically require the component.
+    #[error("group disbanding is blocked by unsupported member leaves")]
+    DisbandingUnsupportedMembers {
+        group_id: GroupId,
+        members: Vec<MemberId>,
+    },
+
+    /// The group has not yet installed and required lifecycle-v1, so it cannot
+    /// accept a terminal disband request.
+    #[error("group disbanding is not enabled")]
+    DisbandingNotEnabled { group_id: GroupId },
 
     /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
     /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
@@ -89,6 +128,19 @@ pub enum EngineError {
         conflicting_epoch: EpochId,
     },
 
+    /// The group's durable outbound-intent retention queue is full
+    /// (`MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP`), so this send was not
+    /// accepted. Nothing was persisted; the intents already queued are intact
+    /// and still drain when the group resolves.
+    ///
+    /// Deliberately **not** [`is_transient`](EngineError::is_transient): that
+    /// predicate drives automatic retry loops, and a full queue cannot clear
+    /// until the group leaves the state that is holding it — which, for a
+    /// publication whose exposure is ambiguous, may be never. It is retryable
+    /// by the user once the group recovers, not by a loop.
+    #[error("queued outbound retention is at capacity for this group")]
+    QueuedOutboundAtCapacity { group_id: GroupId },
+
     /// Illegal state-machine transition (from
     /// [`crate::engine_state::InvalidTransition`]). Indicates an engine bug.
     #[error(transparent)]
@@ -102,6 +154,15 @@ pub enum EngineError {
 
     #[error("serialization failure: {0}")]
     Serialize(String),
+
+    /// The transport envelope decrypted successfully, but the carried MLS
+    /// Welcome could not be validated or staged. This is terminal for that
+    /// inbound object, not a backend outage worth retrying.
+    #[error("invalid welcome")]
+    InvalidWelcome,
+
+    #[error("welcome already processed")]
+    WelcomeAlreadyProcessed,
 
     /// Last-resort bucket. Prefer adding a typed variant.
     #[error("backend failure: {0}")]
@@ -132,6 +193,18 @@ impl EngineError {
 pub enum PeelerError {
     #[error("malformed transport payload: {0}")]
     Malformed(String),
+
+    /// A required outer transport signature or signed-event id failed
+    /// authentication. Kept distinct from malformed byte encoding so callers
+    /// can report the adopted `invalid_signature` category without parsing
+    /// error strings.
+    #[error("invalid transport signature")]
+    InvalidSignature,
+
+    /// The outer transport object names a routing id or recipient that does
+    /// not match the transport envelope presented to the engine.
+    #[error("transport input is addressed to another recipient")]
+    WrongRecipient,
 
     #[error("decrypt failed (likely stale or wrong-epoch exporter secret)")]
     DecryptFailed,

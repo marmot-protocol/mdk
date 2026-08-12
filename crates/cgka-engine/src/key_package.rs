@@ -10,20 +10,96 @@ use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    Extensions, KeyPackage as MlsKeyPackage, KeyPackageVerifyError, MlsMessageBodyIn, MlsMessageIn,
-    MlsMessageOut, ProtocolVersion,
+    KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, MlsMessageBodyIn,
+    MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::crypto::OpenMlsCrypto;
+use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackageMetadata {
     pub key_package_ref_hex: String,
     pub credential_identity_hex: String,
+    pub protocol_profile: ProtocolProfile,
+    pub not_before: u64,
+    pub not_after: u64,
+    pub ciphersuite: u16,
+    pub mls_extensions: Vec<u16>,
+    pub mls_proposals: Vec<u16>,
+    pub app_components: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyPackageRetirementReport {
+    pub legacy_retired: usize,
+    pub invalid_retired: usize,
+    pub current_retained: usize,
+}
+
+/// Enumerate KeyPackages whose private OpenMLS bundles are durably usable.
+///
+/// This is deliberately a storage-only query so callers can establish device
+/// ownership while an account is signed out and no signing runtime is active.
+pub fn durably_owned_key_packages<S: StorageProvider>(
+    storage: &S,
+    protocol_profile: ProtocolProfile,
+) -> Result<Vec<KeyPackage>, EngineError> {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let mut owned = Vec::new();
+    let mut seen_references = std::collections::BTreeSet::new();
+    let mut skipped = 0_usize;
+    for stored in storage.stored_key_package_bundles()? {
+        let Ok(bundle) = serde_json::from_slice::<KeyPackageBundle>(&stored.value) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(reference) = bundle.key_package().hash_ref(provider.crypto()) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(Some(persisted_bundle)) = OpenMlsStorageProvider::key_package::<_, KeyPackageBundle>(
+            provider.storage(),
+            &reference,
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        if persisted_bundle.key_package() != bundle.key_package() {
+            skipped += 1;
+            continue;
+        }
+        if !seen_references.insert(reference.as_slice().to_vec()) {
+            skipped += 1;
+            continue;
+        }
+        let mls_message: MlsMessageOut = bundle.key_package().clone().into();
+        let Ok(bytes) = mls_message.tls_serialize_detached() else {
+            skipped += 1;
+            continue;
+        };
+        let key_package = KeyPackage::new(bytes).with_protocol_profile(protocol_profile);
+        if key_package_metadata(&key_package).is_err() {
+            skipped += 1;
+            continue;
+        }
+        owned.push(key_package);
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            target: "cgka_engine::key_package",
+            method = "durably_owned_key_packages",
+            skipped,
+            "stored key package bundles were not usable"
+        );
+    }
+    Ok(owned)
 }
 
 /// Parse and validate a transported KeyPackage enough for transport-directory
@@ -47,21 +123,31 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     // is correct only while the engine is single-ciphersuite; deriving it from
     // the KeyPackage keeps these directory helpers consistent with the invite
     // path the instant a second ciphersuite is supported.
-    crate::account_identity_proof::validate_leaf_account_identity_proof(
+    let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
         key_package.ciphersuite(),
     )?;
+    ensure_key_package_profile(kp, protocol_profile)?;
+    let capabilities = crate::capabilities::capabilities_of_key_package(&key_package);
     let key_package_ref = key_package
         .hash_ref(&crypto)
         .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
     Ok(KeyPackageMetadata {
         key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
         credential_identity_hex: hex::encode(member_id.as_slice()),
+        protocol_profile,
+        not_before: key_package.life_time().not_before(),
+        not_after: key_package.life_time().not_after(),
+        ciphersuite: u16::from(key_package.ciphersuite()),
+        mls_extensions: capabilities.extensions.into_iter().collect(),
+        mls_proposals: capabilities.proposals.into_iter().collect(),
+        app_components: capabilities.app_components.ids.into_iter().collect(),
     })
 }
 
 /// Parse and validate a transported KeyPackage and report whether it carries
-/// the MLS last-resort extension.
+/// either the current last-resort application-data component or the legacy
+/// last-resort extension.
 pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> {
     let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
         .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
@@ -78,23 +164,85 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // See `key_package_metadata`: validate against the KeyPackage's own
     // ciphersuite, not `DEFAULT_CIPHERSUITE` (mdk#747).
-    crate::account_identity_proof::validate_leaf_account_identity_proof(
+    let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
         key_package.ciphersuite(),
     )?;
+    ensure_key_package_profile(kp, protocol_profile)?;
     Ok(key_package.last_resort())
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Permanently retire every locally persisted KeyPackage bundle that is not
+    /// usable by the current protocol profile.
+    ///
+    /// This runs synchronously during strict-cutover session open, before any
+    /// Welcome can be processed. Enumeration and deletion occur in one storage
+    /// transaction, making restart behavior idempotent. Corrupt or
+    /// unclassifiable bundles are deleted as well: retaining private join
+    /// capability is only safe when the bundle is positively identified as
+    /// current-profile.
+    pub fn retire_non_current_key_packages(
+        &mut self,
+    ) -> Result<KeyPackageRetirementReport, EngineError> {
+        self.storage.with_transaction(|storage| {
+            let mut report = KeyPackageRetirementReport::default();
+            for stored in storage.stored_key_package_bundles()? {
+                let bundle = match serde_json::from_slice::<KeyPackageBundle>(&stored.value) {
+                    Ok(bundle) => bundle,
+                    Err(_) => {
+                        storage.delete_stored_key_package_bundle(&stored.storage_key)?;
+                        report.invalid_retired += 1;
+                        continue;
+                    }
+                };
+                match crate::account_identity_proof::validate_leaf_account_identity_proof(
+                    bundle.key_package().leaf_node(),
+                    bundle.key_package().ciphersuite(),
+                ) {
+                    Ok(ProtocolProfile::Current) => report.current_retained += 1,
+                    Ok(ProtocolProfile::Legacy) => {
+                        storage.delete_stored_key_package_bundle(&stored.storage_key)?;
+                        report.legacy_retired += 1;
+                    }
+                    Err(_) => {
+                        storage.delete_stored_key_package_bundle(&stored.storage_key)?;
+                        report.invalid_retired += 1;
+                    }
+                }
+            }
+            Ok::<_, EngineError>(report)
+        })
+    }
+
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
-        let caps = leaf_capabilities(&self.registry, self.ciphersuite);
-        let leaf_extensions = Extensions::from_vec(vec![
-            crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
-            self.identity.account_identity_proof_extension.clone(),
-        ])
-        .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        self.build_fresh_key_package(&self.storage)
+    }
+
+    /// Enumerate KeyPackages whose private OpenMLS bundles are durably usable
+    /// by this account-device.
+    ///
+    /// The storage row key is part of the ownership proof: OpenMLS looks a
+    /// bundle up by the serialized KeyPackageRef while processing a Welcome.
+    /// A decodable bundle stored under any other key is therefore not usable
+    /// and must not be reported as device-owned. Corrupt or otherwise invalid
+    /// rows are skipped rather than turning a read-only ownership query into a
+    /// destructive repair operation.
+    pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, EngineError> {
+        durably_owned_key_packages(&self.storage, self.new_protocol_profile)
+    }
+
+    /// Build + persist a fresh KeyPackage using the supplied storage view.
+    ///
+    /// Maintenance uses this inside `StorageProvider::with_transaction` so the
+    /// OpenMLS private bundle and the lifecycle record become durable together.
+    pub(crate) fn build_fresh_key_package(&self, storage: &S) -> Result<KeyPackage, EngineError> {
+        let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
+        let leaf_extensions = self
+            .identity
+            .leaf_extensions(&self.supported_app_components)?;
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()
             .leaf_node_capabilities(caps)
@@ -112,7 +260,7 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = mls_msg
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        Ok(KeyPackage::new(bytes))
+        Ok(KeyPackage::new(bytes).with_protocol_profile(self.new_protocol_profile))
     }
 
     /// Delete a previously generated (and persisted) KeyPackage bundle from
@@ -124,8 +272,9 @@ impl<S: StorageProvider> Engine<S> {
     /// KeyPackage it must call this to prune the orphaned private bundle;
     /// otherwise retries against a failing publisher accumulate unused private
     /// key material indefinitely (mdk#160). The KeyPackages produced
-    /// here carry the last-resort extension, so OpenMLS never deletes them on
-    /// the welcome path — cleanup is entirely the caller's responsibility.
+    /// here carry the last-resort application-data component, so OpenMLS never
+    /// deletes them on the welcome path — cleanup is entirely the caller's
+    /// responsibility.
     ///
     /// Deleting a KeyPackage that is not present in storage is a no-op (the
     /// underlying `DELETE` matches zero rows), so this is safe to call
@@ -177,15 +326,29 @@ impl<S: StorageProvider> Engine<S> {
         // identity is not a valid Marmot account identity. This single gate
         // covers both the create-group and invite invitee paths.
         crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
-        crate::account_identity_proof::validate_leaf_account_identity_proof(
+        let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             key_package.leaf_node(),
-            self.ciphersuite,
+            key_package.ciphersuite(),
         )?;
+        ensure_key_package_profile(kp, protocol_profile)?;
         Ok(key_package)
     }
 }
 
-fn validate_key_package(
+fn ensure_key_package_profile(
+    key_package: &KeyPackage,
+    wire_profile: ProtocolProfile,
+) -> Result<(), EngineError> {
+    if key_package.protocol_profile != wire_profile {
+        return Err(EngineError::InvalidAccountIdentityProof(format!(
+            "KeyPackage metadata says {:?}, but its decoded account proof is {wire_profile:?}",
+            key_package.protocol_profile
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_key_package(
     kp_in: openmls::prelude::KeyPackageIn,
     crypto: &impl OpenMlsCrypto,
 ) -> Result<MlsKeyPackage, EngineError> {
@@ -198,7 +361,7 @@ fn validate_key_package(
 
 fn key_package_verify_error(err: KeyPackageVerifyError) -> EngineError {
     match err {
-        KeyPackageVerifyError::InvalidLifetime | KeyPackageVerifyError::MissingLifetime => {
+        KeyPackageVerifyError::LifetimeError(_) | KeyPackageVerifyError::MissingLifetime => {
             EngineError::InvalidKeyPackageLifetime {
                 not_before: None,
                 not_after: None,

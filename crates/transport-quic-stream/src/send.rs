@@ -16,6 +16,7 @@ use crate::error::QuicTextStreamError;
 use crate::frame::write_record;
 use crate::hardening::{QUIC_PREVIEW_CONNECT_TIMEOUT, connect_with_timeout};
 use crate::protocol::{SEND_CLOSE_WAIT, effective_plaintext_cap};
+use crate::publisher_sequence::reserve_publisher_records;
 use crate::receive::ServerTrust;
 use crate::tls::client_endpoint;
 
@@ -70,15 +71,43 @@ pub async fn send_text_stream(
     )
     .await?;
     let mut send = connection.open_uni().await?;
-    let mut transcript =
-        AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
-
-    for (index, chunk) in split_text_deltas(&config.text, max_chunk_bytes)
+    let frames = split_text_deltas(&config.text, max_chunk_bytes)
         .into_iter()
-        .enumerate()
-    {
-        let record =
-            AgentTextStreamRecordV1::text_delta(config.stream_id.clone(), index as u64 + 1, chunk);
+        .map(|chunk| {
+            (
+                cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+                chunk,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut transcript =
+        AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id.clone());
+    let reservation = config
+        .crypto
+        .as_ref()
+        .filter(|_| !frames.is_empty())
+        .map(|crypto| {
+            reserve_publisher_records(crypto, &config.stream_id, &config.start_event_id, &frames)
+        })
+        .transpose()?;
+    let records = if let Some(reservation) = &reservation {
+        reservation.records.clone()
+    } else {
+        frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, (record_type, plaintext))| {
+                AgentTextStreamRecordV1::new(
+                    config.stream_id.clone(),
+                    index as u64 + 1,
+                    record_type,
+                    plaintext,
+                )
+            })
+            .collect()
+    };
+
+    for record in records {
         let wire_record = if let Some(crypto) = &config.crypto {
             encrypt_record(crypto, &record)?
         } else {
@@ -90,6 +119,14 @@ pub async fn send_text_stream(
             sleep(config.chunk_delay).await;
         }
     }
+    let (transcript_hash, chunk_count) = if let Some(reservation) = reservation {
+        let transcript_hash = reservation.transcript_hash;
+        let chunk_count = reservation.chunk_count;
+        reservation.confirm()?;
+        (transcript_hash, chunk_count)
+    } else {
+        (transcript.hash(), transcript.chunk_count())
+    };
 
     send.finish()?;
     if timeout(SEND_CLOSE_WAIT, connection.closed()).await.is_err() {
@@ -98,8 +135,8 @@ pub async fn send_text_stream(
     endpoint.wait_idle().await;
     Ok(SentTextStream {
         stream_id: transcript.stream_id().to_vec(),
-        transcript_hash: transcript.hash(),
-        chunk_count: transcript.chunk_count(),
+        transcript_hash,
+        chunk_count,
     })
 }
 

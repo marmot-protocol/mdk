@@ -1,0 +1,16 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    {
+      "engine_id": "engine-a",
+      "group_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": { "type": "epoch_state_changed", "epoch": 7, "new_state": "unrecoverable", "reason": "hydrate_unrecoverable_group" }
+    },
+    {
+      "engine_id": "engine-a",
+      "group_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": { "type": "epoch_state_changed", "epoch": 8, "new_state": "stable", "reason": "join_welcome_repair" }
+    }
+  ],
+  "derived_projections": { "pagination": {} }
+}

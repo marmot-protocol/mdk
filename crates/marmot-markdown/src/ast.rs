@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     pub blocks: Vec<Block>,
+    /// Number of consecutive blank source lines immediately before each
+    /// corresponding entry in `blocks`.
+    #[serde(default)]
+    pub blank_lines_before: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +31,9 @@ pub enum Block {
     },
     BlockQuote {
         blocks: Vec<Block>,
+        /// Blank source lines before each corresponding child block.
+        #[serde(default)]
+        blank_lines_before: Vec<u8>,
     },
     List {
         kind: ListKind,
@@ -58,6 +65,9 @@ pub enum ListKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListItem {
     pub blocks: Vec<Block>,
+    /// Blank source lines before each corresponding child block.
+    #[serde(default)]
+    pub blank_lines_before: Vec<u8>,
     pub checked: Option<bool>,
 }
 
@@ -87,15 +97,24 @@ pub enum Inline {
         dest: String,
         title: Option<String>,
         children: Vec<Inline>,
+        /// Renderer-facing classification. The original destination is
+        /// preserved; clients decide whether it should be actionable.
+        classification: LinkDestinationKind,
     },
     Image {
         dest: String,
         title: Option<String>,
         alt: Vec<Inline>,
+        /// Renderer-facing classification. Clients decide whether fetching
+        /// this untrusted destination is appropriate.
+        classification: LinkDestinationKind,
     },
     Autolink {
         url: String,
         kind: AutolinkKind,
+        /// Renderer-facing classification. The original URL is preserved;
+        /// clients decide whether it should be actionable.
+        classification: LinkDestinationKind,
     },
     Math(String),
     NostrMention(NostrEntity),
@@ -106,6 +125,25 @@ pub enum Inline {
 pub enum AutolinkKind {
     Uri,
     Email,
+    /// Bare `www.` host/path text. Renderers synthesize an `https://` launch
+    /// destination while displaying the original source text.
+    Www,
+}
+
+/// Security-relevant classification of an untrusted Markdown destination.
+///
+/// This classification does not authorize navigation or fetching. Renderers
+/// apply their own policy and can still display every original destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkDestinationKind {
+    Web,
+    Contact,
+    App,
+    Nostr,
+    Relative,
+    Unknown,
+    Dangerous,
+    Sensitive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -9,12 +9,14 @@ pub mod agent_text_stream;
 pub mod app_components;
 pub mod app_event;
 pub mod capabilities;
+pub mod convergence_pass;
 pub mod engine;
 pub mod engine_state;
 pub mod error;
 pub mod group;
 pub mod group_context;
 pub mod ingest;
+pub mod maintenance;
 pub mod message;
 pub mod peeler;
 pub mod storage;
@@ -51,10 +53,10 @@ pub use app_components::{
 };
 pub use app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
-    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
-    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    AGENT_OPERATION_TYPE_TAG, AppMessageRetentionDecision, EVENT_REF_TAG,
+    GROUP_SYSTEM_TYPE_GROUP_DISBANDED, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent, MarmotAppEventError, QUOTE_REF_TAG,
     STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
     STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
@@ -64,34 +66,56 @@ pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,
 };
+pub use convergence_pass::{
+    ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole, ConvergencePassPhase,
+    DurableConvergencePass,
+};
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
     GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource, SendIntent, SendResult,
     WelcomeMetadata,
 };
 pub use engine_state::{
-    EpochState, InvalidTransition, Merging, PendingPublish, PendingStateRef, PendingWelcomeState,
-    Recovering, StagedCommitHandle, WelcomeState,
+    Disbanded, EpochState, GroupLifecycleState, InvalidTransition, Merging, PendingPublish,
+    PendingStateRef, PendingWelcomeState, Recovering, StagedCommitHandle, WelcomeState,
 };
 pub use error::{EngineError, PeelerError};
-pub use group::{Group, Member};
+pub use group::{DisbandTombstone, Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
-pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
-pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
-pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
+pub use ingest::{
+    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent, PeeledMessage,
+    ProposalRejectionCategory, StaleReason,
+};
+pub use maintenance::{
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
+    GroupMaintenanceState, GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation,
+    MaintenancePhase, MaintenanceRandom, MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock,
+    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
+    SendMaintenanceDisposition, SignedPublicationArtifact, TransportFanoutAttemptState,
+    TransportFanoutTarget, WallClock,
+};
+pub use message::{
+    MessageRecord, MessageState, OwnApplicationConvergenceStamp, OwnCommitConvergenceStamp,
+    StoredMessagePayload,
+};
+pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use storage::{
-    CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MessageStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    WelcomeStorage,
+    CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,
+    DisbandFailureReason, DisbandRequest, DisbandRequestStatus, DisbandRequestStorage,
+    DisbandTombstoneStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 pub use transport_adapter::{
+    FanoutMlsState, FanoutTargetStatus, OutboundFanout, OutboundFanoutOutcome,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,
+    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportGroupSubscription,
+    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget, TransportWireMetadata, collapse_publish_failure_summaries,
 };
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;

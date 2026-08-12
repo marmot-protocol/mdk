@@ -149,6 +149,24 @@ fn table_delimiter_column_mismatch_is_paragraph() {
 }
 
 #[test]
+fn table_over_column_cap_degrades_to_paragraph() {
+    let header = std::iter::repeat_n("cell", 129)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let delimiter = std::iter::repeat_n("-", 129)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let input = format!("{header}\n{delimiter}\n| one |");
+
+    assert!(
+        parse(&input)
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, Block::Table { .. }))
+    );
+}
+
+#[test]
 fn table_cell_contains_emphasis() {
     let input = "| a |\n| - |\n| *b* |";
     assert_eq!(

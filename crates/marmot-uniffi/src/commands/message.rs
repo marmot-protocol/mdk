@@ -4,8 +4,8 @@ use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppMessageRecordFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi, StickerRefFfi,
-    group_id_from_hex,
+    AppMessageRecordFfi, RetentionSweepReportFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi,
+    StickerRefFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
@@ -153,6 +153,21 @@ impl Marmot {
             .secure_delete_expired_plaintext(&account_ref, &group_id)
             .await?;
         Ok(outcome.into())
+    }
+
+    /// Run the engine-owned disappearing-message sweep for one account using
+    /// the supplied Unix wall-clock time in milliseconds. Each group reports
+    /// pruning, a fail-closed deferral, or a privacy-safe failure category.
+    pub async fn sweep_expired_retention(
+        &self,
+        account_ref: String,
+        now_ms: u64,
+    ) -> Result<RetentionSweepReportFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .sweep_expired_retention(&account_ref, now_ms)
+            .await?
+            .into())
     }
 
     /// Edit `target_message_id` by publishing a kind-1009 event that

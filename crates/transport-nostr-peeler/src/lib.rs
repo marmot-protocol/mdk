@@ -44,4 +44,5 @@ pub const NOSTR_GROUP_KEY_LEN: usize = 32;
 pub const NOSTR_GROUP_CONTENT_MIN_LEN: usize = 12 + 16;
 
 pub(crate) const GROUP_TAG: &str = "h";
+pub(crate) const EXPIRATION_TAG: &str = "expiration";
 pub(crate) const RECIPIENT_TAG: &str = "p";

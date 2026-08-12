@@ -25,21 +25,46 @@
 //! - [`accept`] — [`accept::accept`] / [`accept::accept_convergence`] run the
 //!   synthesized scenario against the simulator and return the vector only if the
 //!   recorded outcome reproduces.
+//! - [`artifact`] — a versioned evidence envelope plus a fail-closed,
+//!   producer-attested normalized-history import/accept gate. Archetypes never
+//!   masquerade as source-verified replay, and byte replay remains unavailable
+//!   without sensitive local state.
+//! - [`route`] — [`route::route`] composes the above into one
+//!   [`route::Routing`]: the primary [`route::Outcome`] plus the
+//!   [`route::Advisory`] lines for co-occurring findings. Every incident route
+//!   reads the producer-attested history first and only then synthesizes an
+//!   archetype, and a route whose recovery fails closed falls through to the
+//!   remaining lower-precedence ones, so a reproducible incident sharing the
+//!   export is not discarded.
 
 pub mod accept;
+pub mod artifact;
 pub mod classify;
 pub mod convergence;
 pub mod export;
 pub mod fork;
 pub mod ndjson;
+pub mod route;
 pub mod synth;
 
 pub use accept::{AcceptError, accept, accept_convergence};
-pub use classify::{BehindEngine, BehindMode, QuarantineReason, Verdict, classify};
+pub use artifact::{
+    EvidenceConfidenceV1, IncidentArtifactSensitivityV1, IncidentReplayFidelityV1,
+    IncidentReproductionStatusV1, IncidentScenarioArtifactV1, IncidentSourceFormatV1,
+    NormalizedActionEvidenceV1, NormalizedHistoryImportError, NormalizedScenarioHistoryV1,
+    UnavailableEvidenceV1, accept_attested_history, archetype_artifact, import_attested_history,
+};
+pub use classify::{
+    BehindEngine, BehindMode, HaltedEngine, QuarantineReason, Verdict, classify, halt_advisory,
+    liveness_advisory,
+};
 pub use convergence::{
     ConvergenceDecisionKind, ConvergenceRecoveryError, RecoveredConvergence, recover_convergence,
 };
 pub use export::{AgentStateExport, ParseError, parse};
 pub use fork::{ForkCommitKind, ForkRecoveryError, RecoveredFork, recover_fork};
 pub use ndjson::{StreamParseError, is_stream, parse_stream};
+pub use route::{
+    Advisory, CONVERGENCE_NAME, INCIDENT_NAME, MEMBERSHIP_INCIDENT_NAME, Outcome, Routing, route,
+};
 pub use synth::{synthesize, synthesize_convergence};

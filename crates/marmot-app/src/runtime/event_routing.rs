@@ -23,6 +23,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -38,6 +39,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -54,6 +56,8 @@ pub(crate) fn projection_update_matches_query(
 }
 
 pub(crate) fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
+    // Projection application already derives canonical-vs-wall ordering from
+    // this field, so global windows can safely merge per-group deltas.
     query
         .search
         .as_ref()
@@ -84,6 +88,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -108,6 +113,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -131,7 +137,9 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             | GroupEvent::GroupHydrationRecovered { .. } => {
                 ChatListUpdateTrigger::MembershipChanged
             }
-            GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => {
+            GroupEvent::MessageReceived { .. }
+            | GroupEvent::AppMessageInvalidated { .. }
+            | GroupEvent::TransportObjectResourceRefused { .. } => {
                 ChatListUpdateTrigger::SnapshotRefresh
             }
         },
@@ -139,6 +147,9 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        // A stalled group's escalation reports a repair need, not a state
+        // change: the chat list has nothing new to show for it.
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
 }
@@ -147,6 +158,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }

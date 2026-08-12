@@ -1,7 +1,7 @@
 # Distributed Convergence
 
-**Status:** design draft. This is the target model for Marmot clients that need to converge on one MLS group state from
-unordered multi-relay input.
+**Status:** implemented engine architecture. This is the MDK model for converging one MLS group state from unordered
+multi-relay input.
 
 The engine contract that packages this model as a state-machine operation lives in
 [`cgka-engine-canonicalization-contract.md`](./cgka-engine-canonicalization-contract.md).
@@ -80,7 +80,7 @@ Late commits are handled by their source epoch:
   as invalidated.
 
 This rule is the local storage boundary for the forward-secrecy tradeoff. A client cannot be forced to replay commits
-older than the group policy says it will retain.
+older than the pinned protocol policy says it will retain.
 
 ## Convergence Status
 
@@ -103,6 +103,59 @@ The application drives this lifecycle through `advance_convergence(group_id)`. T
 against the engine's monotonic clock and, when convergence is settled, returns regenerated `SendResult`s for queued
 local work. A regenerated group evolution pauses draining until its publish lifecycle is resolved; timer ticks in that
 pending-publish window return no work.
+
+## Frozen pass boundary
+
+Each group owns an independent durable pass. Retaining a message is not itself admission: the engine opens or extends a
+pass only while that group is stable and the input can participate inside the current replay horizon.
+
+A collecting pass persists:
+
+- its generation and base epoch;
+- its opening time and quiescence deadline in millisecond wall-clock terms;
+- the immutable absolute deadline;
+- every admitted message id and SHA-256 digest of its peeled MLS bytes; and
+- its collecting, frozen, resolving, or completed phase.
+
+Process-local monotonic deadlines are in-memory scheduling state derived from
+those durable wall-clock terms. They are stored only to identify and schedule
+the current clock domain and are never authoritative after restart.
+
+The cutoff is:
+
+```text
+min(last_selection_relevant_input + 1000ms,
+    pass_opened + 5000ms)
+```
+
+At the cutoff, the engine verifies the persisted payload digests and freezes the exact membership set. Candidate
+materialization and replay receive only those members. A message retained after the cutoff remains stored for the next
+generation; it cannot alter the frozen result. Missing dependencies likewise remain eligible for a later generation
+instead of reopening the current one.
+
+Monotonic deadlines are never trusted across process restart. The engine rebases a collecting pass from its persisted
+millisecond wall deadlines. An elapsed deadline becomes immediately due, and a backwards wall-clock discontinuity
+fails closed to an immediate cutoff. Frozen and resolving passes resume their exact persisted membership without
+re-enumerating storage.
+
+A pass is scheduling state for one base epoch. A pass whose base epoch disagrees with the current tip is discarded, and
+the next generation opens at the tip (`convergence_pass_discarded`). This is a repair path, not a steady-state
+transition: the tip does not move forward underneath an open pass, because an active pass gates outbound work and an
+inbound commit inside the rewind horizon re-enters convergence instead of applying directly. What it repairs is
+inherited scheduling state — a base epoch stamped from the durable group record while the tip was read from the epoch
+manager, two authorities for one epoch that can split across a restart — so an inherited base can sit either behind or
+ahead of the tip, and both directions are discarded regardless of pass phase. The pass holds no canonical state of its
+own, so its members reseed from retained storage.
+`stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting`,
+`frozen_stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting`, and
+`future_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` pin that rule. Only a frozen member that no
+longer matches the record it was admitted from is an integrity failure, and that alone halts the group
+`Unrecoverable`.
+
+The runtime arms one timer deadline per group. Scheduling traffic for one group cannot postpone another group's earlier
+cutoff. After a completed pass, one persisted, already-queued admin group-state intent receives one preparation attempt
+before an inbound-only follow-up generation. App messages, leave work, and automatic maintenance do not consume that
+slot; a failed preparation cannot hold it indefinitely.
 
 ## Branch Selection
 
@@ -135,9 +188,16 @@ Branches are compared in this order:
 
 1. Higher `effective_commit_depth`.
 2. Witness quorum beats no quorum.
-3. Higher `valid_commit_depth`.
-4. Higher `app_witness_score`.
-5. Lower tip commit digest.
+3. Higher `app_witness_score`.
+4. Prefer a `Privileged` tip commit over an `Ordinary` one.
+5. Lower authenticated tip committer account id.
+6. Lower tip commit digest.
+
+`valid_commit_depth` remains a score diagnostic and an input to effective depth. It has no separate comparison step:
+when effective depth and quorum status tie, raw depth is necessarily tied as well.
+
+The conformance scenario
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 3 and 4.
 
 ```mermaid
 flowchart TD
@@ -145,7 +205,7 @@ flowchart TD
     B --> C["Drop branches outside rewind horizon"]
     C --> D["Count distinct app witnesses per epoch"]
     D --> E["Apply bounded quorum boost"]
-    E --> F["Tie-break by raw depth, witness score, digest"]
+    E --> F["Compare effective depth, quorum, witness score, priority, committer, digest"]
     F --> G["Materialize selected branch"]
     F --> H["Mark losing-branch messages invalidated"]
 ```
@@ -156,51 +216,52 @@ with message volume.
 
 ## Policy
 
-The convergence policy should be group-negotiated. Working defaults:
+The adopted v1 convergence policy is pinned by the protocol:
 
 ```text
 convergence_policy = {
   max_rewind_commits: 5,
-  witness_quorum_senders_per_epoch: <group policy>,
-  witness_quorum_epochs: <group policy>,
-  max_witness_override_depth: <group policy>,   // MUST be <= max_rewind_commits
+  app_payload_past_epoch_limit: 5,
+  settlement_quiescence_ms: 1000,
+  max_convergence_pass_ms: 5000,
+  witness_quorum_senders_per_epoch: 2,
+  witness_quorum_epochs: 1,
+  max_witness_override_depth: 1,
 }
 ```
 
-`max_witness_override_depth` MUST NOT exceed `max_rewind_commits` (the worked example below uses `2` against the default
-`5`). The engine enforces this bound — `ConvergencePolicy::validate` rejects an out-of-bound policy when it is set or
-decoded — so the witness-quorum boost can never push a branch past the rollback horizon.
-
-`max_rewind_commits` also bounds snapshot retention, so the forward-secrecy cost is explicit. The engine persists the
-per-group policy and uses that stored value after restart. Once MLS app components are available, the policy should live
-there. Until then, Marmot can carry it in a group context extension and treat an unsupported policy as a capability
-mismatch.
+These are protocol constants, not group state or local preferences. `max_witness_override_depth` remains bounded by
+`max_rewind_commits`, so the witness-quorum boost can never push a branch past the rollback horizon.
+`max_rewind_commits` also bounds snapshot retention, making the forward-secrecy cost explicit. A future policy change
+requires a new app component behind a required capability; v1 clients MUST NOT negotiate or accept alternate values.
+The canonical definition lives in the adopted Marmot
+[`protocol-core/convergence.md`](https://github.com/marmot-protocol/marmot/blob/master/protocol-core/convergence.md).
 
 ## Examples
 
 ### Equal-depth fork
 
 Two branches both have depth 2. One branch has app witnesses from more distinct members. The witnessed branch wins
-before digest tie-break.
+before priority, committer, and digest tie-breaks.
 
 ### Withheld private branch
 
-The live branch has 3 commits and witness quorum across 2 epochs. A private branch later publishes 5 commits from the
-same fork. If `max_witness_override_depth = 2`, the live branch receives a bounded boost and wins the tie:
+The live branch has 3 commits and witness quorum. A private branch later publishes 4 commits from the same fork. Under
+the pinned v1 `max_witness_override_depth = 1`, the live branch receives a bounded boost and wins the tie:
 
 ```text
-live:     depth 3 + quorum boost 2 = effective 5
-private:  depth 5 + quorum boost 0 = effective 5
+live:     depth 3 + quorum boost 1 = effective 4
+private:  depth 4 + quorum boost 0 = effective 4
 winner:   live branch, because quorum beats no quorum
 ```
 
 ### Longer valid branch
 
-The live branch has 3 commits plus quorum boost 2. A competing branch has 6 valid commits. The longer branch wins:
+The live branch has 3 commits plus quorum boost 1. A competing branch has 5 valid commits. The longer branch wins:
 
 ```text
-live:      effective 5
-competing: effective 6
+live:      effective 4
+competing: effective 5
 winner:    competing branch
 ```
 
@@ -248,9 +309,9 @@ Tamarin is a good fit for the security-adjacent part of this model if we keep th
 
 The initial scaffold lives in
 [`formal/tamarin/distributed_convergence_v0.spthy`](../../formal/tamarin/distributed_convergence_v0.spthy). It models
-the selector boundary only: two honest clients, the same valid candidate set, the same negotiated policy, and
-deterministic branch selection. Scores are represented as bounded symbolic classes so the model can prove the comparison
-order without modeling MLS internals.
+the selector boundary only: two honest clients, the same valid candidate set, a projection of the pinned policy containing
+only the selector-relevant rewind and quorum fields, and deterministic branch selection. Scores are represented as bounded
+symbolic classes so the model can prove the comparison order without modeling MLS internals.
 
 Model first:
 
@@ -285,7 +346,7 @@ Initial lemmas:
     arriving afterward is `AlreadyAtEpoch` and does not trigger convergence selection or fork recovery. A stale
     same-source commit is fork-shaped only when the local client previously committed from that source epoch.
 14. **Proposal disposition:** a proposal is accepted only when a canonical branch consumes it; proposals that belong
-    only to losing branches are dropped and cannot also become accepted.
+    only to an eligible losing branch are deferred for reconsideration in a later pass.
 15. **Delivery-order robustness:** reordered, duplicate, and delayed peeled delivery yields the same canonical branch,
     creates only one pending input per logical message, emits selected-branch app output once per client, and emits
     losing-branch invalidation dispositions once.

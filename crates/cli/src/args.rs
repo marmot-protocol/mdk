@@ -78,10 +78,31 @@ impl SecretStoreKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+pub(crate) enum MaintenancePolicySetting {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum Command {
     #[command(about = "Open the interactive terminal UI")]
-    Tui,
+    Tui {
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated discovery relays forwarded to daemon start and account setup on first run"
+        )]
+        discovery_relays: Vec<String>,
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated default account relays forwarded to daemon start and account setup on first run"
+        )]
+        default_account_relays: Vec<String>,
+    },
     #[command(about = "Inspect local runtime diagnostics")]
     Debug {
         #[command(subcommand)]
@@ -303,8 +324,13 @@ pub(crate) enum AccountCommand {
 pub(crate) enum KeyPackageCommand {
     #[command(about = "List local KeyPackage publication records")]
     List,
-    #[command(about = "Republish the currently cached KeyPackage")]
+    #[command(about = "Publish or retry the durable stable-slot KeyPackage replacement")]
     Publish,
+    #[command(
+        name = "maintenance-status",
+        about = "Show durable KeyPackage lifecycle and replacement status"
+    )]
+    MaintenanceStatus,
     #[command(
         about = "Force mint and publish a fresh replacement KeyPackage",
         alias = "force-publish"
@@ -384,6 +410,16 @@ pub(crate) enum ChatsCommand {
     Unmute {
         #[arg(help = "Group id to unmute")]
         group: String,
+    },
+    #[command(
+        name = "mark-read",
+        about = "Mark a chat read, clearing its unread count"
+    )]
+    MarkRead {
+        #[arg(help = "Group id to mark read")]
+        group: String,
+        #[arg(help = "Message id to mark read up to; defaults to the newest message")]
+        message_id: Option<String>,
     },
 }
 
@@ -591,6 +627,47 @@ pub(crate) enum GroupsCommand {
         group_id: String,
     },
     #[command(
+        name = "maintenance-status",
+        about = "Show durable self-update maintenance state for a group"
+    )]
+    MaintenanceStatus {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "schedule-self-update",
+        about = "Schedule one manual own-leaf rotation"
+    )]
+    ScheduleSelfUpdate {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+    },
+    #[command(
+        name = "maintenance-policy",
+        about = "Show or configure automatic periodic maintenance for newly enrolled groups"
+    )]
+    MaintenancePolicy {
+        #[arg(
+            long,
+            value_enum,
+            value_name = "enabled|disabled",
+            help = "Set the persisted policy; omit to show it"
+        )]
+        set: Option<MaintenancePolicySetting>,
+    },
+    #[command(
+        name = "pause-maintenance",
+        about = "Pause new maintenance preparations until this runtime resumes"
+    )]
+    PauseMaintenance,
+    #[command(
+        name = "resume-maintenance",
+        about = "Resume maintenance preparations for this runtime"
+    )]
+    ResumeMaintenance,
+    #[command(name = "run-maintenance", about = "Run one due-maintenance pass now")]
+    RunMaintenance,
+    #[command(
         name = "subscribe-state",
         about = "Subscribe to live group-state updates through the daemon"
     )]
@@ -606,6 +683,12 @@ pub(crate) enum MessageCommand {
     Send {
         #[arg(long = "group", value_name = "GROUP", help = "Group id to send to")]
         group_flag: Option<String>,
+        #[arg(
+            long = "reply-to",
+            value_name = "MESSAGE_ID",
+            help = "Send as a reply to this message id (use with --group, before the text)"
+        )]
+        reply_to: Option<String>,
         #[arg(
             value_name = "GROUP_OR_TEXT",
             allow_hyphen_values = true,
@@ -649,13 +732,13 @@ pub(crate) enum MessageCommand {
         group_id: Option<String>,
         #[arg(long, help = "Group id to list")]
         group: Option<String>,
-        #[arg(long, help = "Only include messages before this unix timestamp")]
+        #[arg(long, help = "Before-cursor timestamp; requires --before-message-id")]
         before: Option<u64>,
-        #[arg(long, help = "Only include messages before this message id")]
+        #[arg(long, help = "Before-cursor message id; requires --before")]
         before_message_id: Option<String>,
-        #[arg(long, help = "Only include messages after this unix timestamp")]
+        #[arg(long, help = "After-cursor timestamp; requires --after-message-id")]
         after: Option<u64>,
-        #[arg(long, help = "Only include messages after this message id")]
+        #[arg(long, help = "After-cursor message id; requires --after")]
         after_message_id: Option<String>,
         #[arg(long, help = "Maximum number of messages to return")]
         limit: Option<usize>,
@@ -698,13 +781,13 @@ pub(crate) enum MessageTimelineCommand {
         group_id: Option<String>,
         #[arg(long, help = "Group id to list")]
         group: Option<String>,
-        #[arg(long, help = "Only include timeline rows before this unix timestamp")]
+        #[arg(long, help = "Before-cursor timestamp; requires --before-message-id")]
         before: Option<u64>,
-        #[arg(long, help = "Only include timeline rows before this message id")]
+        #[arg(long, help = "Before-cursor message id; requires --before")]
         before_message_id: Option<String>,
-        #[arg(long, help = "Only include timeline rows after this unix timestamp")]
+        #[arg(long, help = "After-cursor timestamp; requires --after-message-id")]
         after: Option<u64>,
-        #[arg(long, help = "Only include timeline rows after this message id")]
+        #[arg(long, help = "After-cursor message id; requires --after")]
         after_message_id: Option<String>,
         #[arg(long, help = "Maximum number of timeline rows to return")]
         limit: Option<usize>,
@@ -829,15 +912,15 @@ pub(crate) enum UsersCommand {
         #[arg(value_name = "NPUB_OR_HEX", help = "User to show")]
         pubkey: String,
     },
-    #[command(about = "Search known users in the local directory")]
+    #[command(about = "Search users across your follow graph")]
     Search {
         #[arg(help = "Search query")]
         query: String,
         #[arg(
             long,
-            default_value = "0..2",
+            default_value = "0..1",
             value_parser = parse_radius,
-            help = "Directory graph radius as START..END"
+            help = "Follow-graph radius as START..END (0 is you, 1 who you follow, 2 follows-of-follows)"
         )]
         radius: (u8, u8),
     },

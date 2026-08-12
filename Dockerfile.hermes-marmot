@@ -1,7 +1,9 @@
-FROM rust:1.90-bookworm
+FROM rust:1.91-bookworm
 
 ARG HERMES_AGENT_REPO_URL=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_AGENT_REF=
+
+COPY integrations/hermes/marmot/hermes-agent.lock /tmp/hermes-agent.lock
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -16,11 +18,12 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 "$HERMES_AGENT_REPO_URL" /opt/hermes-agent \
-    && if [ -n "$HERMES_AGENT_REF" ]; then \
-        git -C /opt/hermes-agent fetch --depth 1 origin "$HERMES_AGENT_REF" || true; \
-        git -C /opt/hermes-agent checkout "$HERMES_AGENT_REF"; \
-    fi \
+RUN requested_ref="$HERMES_AGENT_REF" \
+    && . /tmp/hermes-agent.lock \
+    && resolved_ref="${requested_ref:-$HERMES_AGENT_REF}" \
+    && git clone --filter=blob:none --no-checkout "$HERMES_AGENT_REPO_URL" /opt/hermes-agent \
+    && git -C /opt/hermes-agent fetch --depth 1 origin "$resolved_ref" \
+    && git -C /opt/hermes-agent checkout "$resolved_ref" \
     && python3.11 -m venv /opt/hermes-agent/.venv \
     && /opt/hermes-agent/.venv/bin/python -m pip install --upgrade pip \
     && /opt/hermes-agent/.venv/bin/python -m pip install -e "/opt/hermes-agent[all,dev]"
@@ -40,6 +43,7 @@ ENV MARMOT_HOME=/data/marmot-agent \
     MARMOT_AGENT_AUTH_TOKEN_FILE=/data/marmot-agent/control.token \
     MARMOT_AGENT_SOCKET_DIR_MODE=0770 \
     MARMOT_AGENT_SOCKET_MODE=0660 \
+    MARMOT_OUTBOUND_MEDIA_DIR=/run/marmot-media/outbound \
     MARMOT_RELAYS=wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat \
     MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450 \
     HERMES_MARMOT_STREAMING=1 \

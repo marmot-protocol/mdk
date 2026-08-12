@@ -1,25 +1,93 @@
 use super::SqliteOpenMlsStorageError;
 use openmls_traits::storage::{CURRENT_VERSION, traits};
 
-pub(crate) const KEY_PACKAGE_LABEL: &[u8] = b"KeyPackage";
-pub(crate) const PSK_LABEL: &[u8] = b"Psk";
-pub(crate) const ENCRYPTION_KEY_PAIR_LABEL: &[u8] = b"EncryptionKeyPair";
-pub(crate) const SIGNATURE_KEY_PAIR_LABEL: &[u8] = b"SignatureKeyPair";
-pub(crate) const EPOCH_KEY_PAIRS_LABEL: &[u8] = b"EpochKeyPairs";
-pub(crate) const TREE_LABEL: &[u8] = b"Tree";
-pub(crate) const GROUP_CONTEXT_LABEL: &[u8] = b"GroupContext";
-pub(crate) const APPLICATION_EXPORT_TREE_LABEL: &[u8] = b"ApplicationExportTree";
-pub(crate) const INTERIM_TRANSCRIPT_HASH_LABEL: &[u8] = b"InterimTranscriptHash";
-pub(crate) const CONFIRMATION_TAG_LABEL: &[u8] = b"ConfirmationTag";
-pub(crate) const JOIN_CONFIG_LABEL: &[u8] = b"MlsGroupJoinConfig";
-pub(crate) const OWN_LEAF_NODES_LABEL: &[u8] = b"OwnLeafNodes";
-pub(crate) const GROUP_STATE_LABEL: &[u8] = b"GroupState";
-pub(crate) const QUEUED_PROPOSAL_LABEL: &[u8] = b"QueuedProposal";
-pub(crate) const PROPOSAL_QUEUE_REFS_LABEL: &[u8] = b"ProposalQueueRefs";
-pub(crate) const OWN_LEAF_NODE_INDEX_LABEL: &[u8] = b"OwnLeafNodeIndex";
-pub(crate) const EPOCH_SECRETS_LABEL: &[u8] = b"EpochSecrets";
-pub(crate) const RESUMPTION_PSK_STORE_LABEL: &[u8] = b"ResumptionPsk";
-pub(crate) const MESSAGE_SECRETS_LABEL: &[u8] = b"MessageSecrets";
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::openmls_storage) enum ValueSensitivity {
+    Public,
+    Secret,
+}
+
+/// A stable OpenMLS storage label with an explicit serialized-value sensitivity.
+///
+/// Requiring this type at the value-store boundary prevents a newly added label
+/// from silently inheriting ordinary `Vec<u8>` serialization buffers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::openmls_storage) struct OpenMlsValueLabel {
+    bytes: &'static [u8],
+    sensitivity: ValueSensitivity,
+}
+
+impl OpenMlsValueLabel {
+    const fn public(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes,
+            sensitivity: ValueSensitivity::Public,
+        }
+    }
+
+    const fn secret(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes,
+            sensitivity: ValueSensitivity::Secret,
+        }
+    }
+
+    pub(in crate::openmls_storage) const fn as_bytes(self) -> &'static [u8] {
+        self.bytes
+    }
+
+    pub(in crate::openmls_storage) const fn sensitivity(self) -> ValueSensitivity {
+        self.sensitivity
+    }
+
+    #[cfg(test)]
+    pub(in crate::openmls_storage) const fn test_public(bytes: &'static [u8]) -> Self {
+        Self::public(bytes)
+    }
+
+    #[cfg(test)]
+    pub(in crate::openmls_storage) const fn test_secret(bytes: &'static [u8]) -> Self {
+        Self::secret(bytes)
+    }
+}
+
+macro_rules! define_openmls_value_labels {
+    ($($(#[$meta:meta])* $name:ident => $sensitivity:ident($bytes:literal);)+) => {
+        $(
+            $(#[$meta])*
+            pub(crate) const $name: OpenMlsValueLabel =
+                OpenMlsValueLabel::$sensitivity($bytes);
+        )+
+
+        #[cfg(test)]
+        const ALL_LABELS: &[OpenMlsValueLabel] = &[$($name),+];
+    };
+}
+
+define_openmls_value_labels! {
+    /// OpenMLS's `KeyPackage` storage entity is a `KeyPackageBundle`, including
+    /// its private init and leaf-encryption keys.
+    KEY_PACKAGE_LABEL => secret(b"KeyPackage");
+    PSK_LABEL => secret(b"Psk");
+    ENCRYPTION_KEY_PAIR_LABEL => secret(b"EncryptionKeyPair");
+    SIGNATURE_KEY_PAIR_LABEL => secret(b"SignatureKeyPair");
+    EPOCH_KEY_PAIRS_LABEL => secret(b"EpochKeyPairs");
+    TREE_LABEL => public(b"Tree");
+    GROUP_CONTEXT_LABEL => public(b"GroupContext");
+    APPLICATION_EXPORT_TREE_LABEL => secret(b"ApplicationExportTree");
+    INTERIM_TRANSCRIPT_HASH_LABEL => public(b"InterimTranscriptHash");
+    CONFIRMATION_TAG_LABEL => public(b"ConfirmationTag");
+    JOIN_CONFIG_LABEL => public(b"MlsGroupJoinConfig");
+    OWN_LEAF_NODES_LABEL => public(b"OwnLeafNodes");
+    /// Pending `MlsGroupState` embeds staged epoch/message secrets and HPKE keypairs.
+    GROUP_STATE_LABEL => secret(b"GroupState");
+    QUEUED_PROPOSAL_LABEL => public(b"QueuedProposal");
+    PROPOSAL_QUEUE_REFS_LABEL => public(b"ProposalQueueRefs");
+    OWN_LEAF_NODE_INDEX_LABEL => public(b"OwnLeafNodeIndex");
+    EPOCH_SECRETS_LABEL => secret(b"EpochSecrets");
+    RESUMPTION_PSK_STORE_LABEL => secret(b"ResumptionPsk");
+    MESSAGE_SECRETS_LABEL => secret(b"MessageSecrets");
+}
 
 const VALUE_STORAGE_KEY_V1: &[u8] = b"mdk.openmls.value-key.v1";
 
@@ -83,4 +151,76 @@ pub(crate) fn epoch_key_pairs_id_legacy(
     key.extend_from_slice(&serde_json::to_vec(epoch)?);
     key.extend_from_slice(&serde_json::to_vec(&leaf_index)?);
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_bearing_openmls_labels_require_zeroizing_buffers() {
+        let secret_labels = [
+            KEY_PACKAGE_LABEL,
+            PSK_LABEL,
+            ENCRYPTION_KEY_PAIR_LABEL,
+            SIGNATURE_KEY_PAIR_LABEL,
+            EPOCH_KEY_PAIRS_LABEL,
+            APPLICATION_EXPORT_TREE_LABEL,
+            GROUP_STATE_LABEL,
+            EPOCH_SECRETS_LABEL,
+            RESUMPTION_PSK_STORE_LABEL,
+            MESSAGE_SECRETS_LABEL,
+        ];
+        for label in secret_labels {
+            assert_eq!(label.sensitivity(), ValueSensitivity::Secret);
+        }
+
+        assert_eq!(
+            ALL_LABELS
+                .iter()
+                .filter(|label| label.sensitivity() == ValueSensitivity::Secret)
+                .count(),
+            secret_labels.len(),
+            "the secret-label test list must exhaust the label registry"
+        );
+        for label in ALL_LABELS
+            .iter()
+            .filter(|label| label.sensitivity() == ValueSensitivity::Secret)
+        {
+            assert!(secret_labels.contains(label));
+        }
+    }
+
+    #[test]
+    fn public_only_openmls_labels_keep_ordinary_buffers() {
+        let public_labels = [
+            TREE_LABEL,
+            GROUP_CONTEXT_LABEL,
+            INTERIM_TRANSCRIPT_HASH_LABEL,
+            CONFIRMATION_TAG_LABEL,
+            JOIN_CONFIG_LABEL,
+            OWN_LEAF_NODES_LABEL,
+            QUEUED_PROPOSAL_LABEL,
+            PROPOSAL_QUEUE_REFS_LABEL,
+            OWN_LEAF_NODE_INDEX_LABEL,
+        ];
+        for label in public_labels {
+            assert_eq!(label.sensitivity(), ValueSensitivity::Public);
+        }
+
+        assert_eq!(
+            ALL_LABELS
+                .iter()
+                .filter(|label| label.sensitivity() == ValueSensitivity::Public)
+                .count(),
+            public_labels.len(),
+            "the public-label test list must exhaust the label registry"
+        );
+        for label in ALL_LABELS
+            .iter()
+            .filter(|label| label.sensitivity() == ValueSensitivity::Public)
+        {
+            assert!(public_labels.contains(label));
+        }
+    }
 }

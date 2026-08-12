@@ -36,6 +36,15 @@ fn component_list_rejects_duplicate_or_trailing_bytes() {
 }
 
 #[test]
+fn component_list_rejects_non_canonical_id_order() {
+    let descending = vec![4, 0x80, 0x02, 0x80, 0x01];
+    assert_eq!(
+        decode_components_list(&descending),
+        Err("component list is not sorted".into())
+    );
+}
+
+#[test]
 fn quic_varint_decoder_rejects_non_canonical_lengths() {
     assert_eq!(
         decode_quic_varint(&[0x40, 0x3f]),
@@ -62,6 +71,203 @@ fn nostr_routing_round_trips_canonical_state() {
         vec!["wss://relay-a.example", "wss://relay-b.example"]
     );
     assert_eq!(decoded.nostr_group_id, [0x42; 32]);
+}
+
+#[test]
+fn nostr_routing_keeps_plaintext_relays_structurally_representable() {
+    let routing = NostrRoutingV1::new([0x42; 32], vec!["ws://relay.example".into()]).unwrap();
+    assert_eq!(
+        decode_nostr_routing_v1(&encode_nostr_routing_v1(&routing).unwrap()).unwrap(),
+        routing
+    );
+}
+
+#[test]
+fn nostr_routing_enforces_relay_count_boundaries() {
+    assert!(NostrRoutingV1::new([0x42; 32], Vec::new()).is_err());
+    let mut zero_encoded = vec![0x42; 32];
+    encode_var_bytes(&[], &mut zero_encoded);
+    assert_eq!(
+        decode_nostr_routing_v1(&zero_encoded),
+        Err("Nostr routing component must contain at least one relay".into())
+    );
+
+    let sixteen = (0..16)
+        .map(|index| format!("wss://relay-{index:02}.example"))
+        .collect();
+    let sixteen = NostrRoutingV1::new([0x42; 32], sixteen).unwrap();
+    assert_eq!(
+        decode_nostr_routing_v1(&encode_nostr_routing_v1(&sixteen).unwrap()).unwrap(),
+        sixteen
+    );
+
+    let seventeen = (0..17)
+        .map(|index| format!("wss://relay-{index:02}.example"))
+        .collect();
+    assert_eq!(
+        NostrRoutingV1::new([0x42; 32], seventeen),
+        Err("Nostr routing component must contain at most 16 relays".into())
+    );
+    assert_eq!(
+        NostrRoutingV1::new(
+            [0x42; 32],
+            vec!["wss://relay.example".to_owned(); NOSTR_ROUTING_MAX_RELAYS + 1],
+        ),
+        Err("Nostr routing component must contain at most 16 relays".into()),
+        "known oversize input must be rejected before sorting or deduplication"
+    );
+
+    let mut seventeen_encoded = vec![0x42; 32];
+    let mut relay_vector = Vec::new();
+    for index in 0..17 {
+        encode_var_bytes(
+            format!("wss://relay-{index:02}.example").as_bytes(),
+            &mut relay_vector,
+        );
+    }
+    encode_var_bytes(&relay_vector, &mut seventeen_encoded);
+    assert_eq!(
+        decode_nostr_routing_v1(&seventeen_encoded),
+        Err("Nostr routing component must contain at most 16 relays".into())
+    );
+}
+
+#[test]
+fn nostr_routing_rejects_oversized_relay_vector_before_reading_body() {
+    let mut bytes = vec![0x42; 32];
+    encode_quic_varint(8_225, &mut bytes);
+    assert_eq!(
+        decode_nostr_routing_v1(&bytes),
+        Err("Nostr relay vector exceeds maximum length".into())
+    );
+}
+
+#[test]
+fn group_profile_golden_distinguishes_absent_from_present_empty() {
+    let absent: Option<GroupProfileV1> = None;
+    let present_empty = GroupProfileV1 {
+        name: String::new(),
+        description: String::new(),
+    };
+    let encoded = encode_group_profile_v1(&present_empty).unwrap();
+
+    assert!(absent.is_none());
+    assert_eq!(encoded, vec![0x00, 0x00]);
+    assert_eq!(decode_group_profile_v1(&encoded).unwrap(), present_empty);
+}
+
+#[test]
+fn group_profile_codec_preserves_utf8_bytes_without_unicode_normalization() {
+    let composed = GroupProfileV1 {
+        name: "é".to_owned(),
+        description: String::new(),
+    };
+    let decomposed = GroupProfileV1 {
+        name: "e\u{301}".to_owned(),
+        description: String::new(),
+    };
+    let composed_bytes = encode_group_profile_v1(&composed).unwrap();
+    let decomposed_bytes = encode_group_profile_v1(&decomposed).unwrap();
+
+    assert_ne!(composed_bytes, decomposed_bytes);
+    assert_eq!(decode_group_profile_v1(&composed_bytes).unwrap(), composed);
+    assert_eq!(
+        decode_group_profile_v1(&decomposed_bytes).unwrap(),
+        decomposed
+    );
+}
+
+#[test]
+fn group_profile_codec_rejects_oversized_length_before_reading_body() {
+    let mut bytes = Vec::new();
+    encode_quic_varint(257, &mut bytes);
+    assert_eq!(
+        decode_group_profile_v1(&bytes),
+        Err("group profile name exceeds maximum length".into())
+    );
+}
+
+#[test]
+fn blossom_image_codec_canonicalizes_on_encode_and_rejects_non_canonical_decode() {
+    let image = GroupBlossomImageV1 {
+        image_hash: vec![1; 32],
+        image_key: vec![2; 32],
+        image_nonce: vec![3; 12],
+        image_upload_key: vec![4; 32],
+        media_type: " Image/JPG; charset=utf-8 ".to_owned(),
+    };
+    let encoded = encode_group_blossom_image_v1(&image).unwrap();
+    let decoded = decode_group_blossom_image_v1(&encoded).unwrap();
+    assert_eq!(decoded.media_type, "image/jpeg");
+
+    let non_canonical =
+        encode_component_vectors(&[&[1; 32], &[2; 32], &[3; 12], &[4; 32], b"image/jpg"]);
+    assert_eq!(
+        decode_group_blossom_image_v1(&non_canonical),
+        Err("group image media type is not canonical".into())
+    );
+}
+
+#[test]
+fn marmot_media_type_algorithm_matches_frozen_boundaries() {
+    for (input, expected) in [
+        ("image/png", "image/png"),
+        ("\t Image/JPG \r; charset=utf-8", "image/jpeg"),
+        ("application/vnd.marmot+json", "application/vnd.marmot+json"),
+        ("x!#$%&'*+-.^_`|~/y", "x!#$%&'*+-.^_`|~/y"),
+    ] {
+        assert_eq!(
+            canonicalize_marmot_media_type(input),
+            Ok(expected.to_owned())
+        );
+    }
+
+    let type_too_long = format!("{}/x", "a".repeat(65));
+    for invalid in [
+        "image",
+        "image/png/extra",
+        "/png",
+        "image/",
+        "image/(png)",
+        "image/π",
+        "\u{000b}image/png",
+        type_too_long.as_str(),
+    ] {
+        assert!(
+            canonicalize_marmot_media_type(invalid).is_err(),
+            "invalid media type {invalid:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn blossom_image_codec_rejects_oversized_length_before_reading_body() {
+    let mut bytes = Vec::new();
+    encode_quic_varint(33, &mut bytes);
+    assert_eq!(
+        decode_group_blossom_image_v1(&bytes),
+        Err("group image hash exceeds maximum length".into())
+    );
+}
+
+#[test]
+fn blossom_image_debug_redacts_cryptographic_fields() {
+    let image = GroupBlossomImageV1 {
+        image_hash: vec![222; 32],
+        image_key: vec![223; 32],
+        image_nonce: vec![224; 12],
+        image_upload_key: vec![225; 32],
+        media_type: "image/png".to_owned(),
+    };
+
+    let debug = format!("{image:?}");
+    for byte in [222, 223, 224, 225] {
+        assert!(
+            !debug.contains(&byte.to_string()),
+            "cryptographic byte {byte} leaked through Debug: {debug}"
+        );
+    }
+    assert!(debug.contains("image/png"));
 }
 
 #[test]
@@ -94,6 +300,98 @@ fn encrypted_media_policy_round_trips_ordered_endpoints() {
                 base_url: "https://blossom-b.example/".to_owned(),
             },
         ]
+    );
+}
+
+#[test]
+fn encrypted_media_v2_policy_has_independent_golden_bytes() {
+    const EXPECTED: &[u8] = &[
+        0x12, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x65, 0x64, 0x2d, 0x6d, 0x65, 0x64, 0x69,
+        0x61, 0x2d, 0x76, 0x32, // "encrypted-media-v2"
+        0x0b, 0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76,
+        0x31, // ["blossom-v1"]
+        0x27, 0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76, 0x31, 0x1b, 0x68, 0x74,
+        0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2e, 0x70,
+        0x72, 0x69, 0x6d, 0x61, 0x6c, 0x2e, 0x6e, 0x65, 0x74,
+        0x2f, // [{"blossom-v1", "https://blossom.primal.net/"}]
+    ];
+    let policy =
+        EncryptedMediaPolicyV2::blossom_default(["https://blossom.primal.net".to_owned()]).unwrap();
+
+    assert_eq!(encode_encrypted_media_policy_v2(&policy).unwrap(), EXPECTED);
+    assert_eq!(decode_encrypted_media_policy_v2(EXPECTED).unwrap(), policy);
+    assert!(decode_encrypted_media_policy_v1(EXPECTED).is_err());
+    assert!(
+        decode_encrypted_media_policy_v2(
+            &encode_encrypted_media_policy_v1(
+                &EncryptedMediaPolicyV1::blossom_default(
+                    ["https://blossom.primal.net".to_owned()],
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn encrypted_media_v2_endpoint_validity_is_not_destination_policy() {
+    for raw in [
+        "http://10.0.0.1/media",
+        "https://127.0.0.1/",
+        "http://localhost:3000/",
+    ] {
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url_v2(raw),
+            Ok(raw.to_owned())
+        );
+    }
+    for raw in [
+        "ftp://media.example/",
+        "https://user@media.example/",
+        "https://media.example/?token=x",
+        "https://media.example/#fragment",
+    ] {
+        assert!(
+            validate_and_normalize_blob_endpoint_url_v2(raw).is_err(),
+            "{raw} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn encrypted_media_v2_decode_rejects_noncanonical_and_duplicate_state() {
+    let mut allowed = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+    let mut endpoints = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+    encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+    let duplicate = encode_component_vectors(&[
+        ENCRYPTED_MEDIA_FORMAT_V2.as_bytes(),
+        allowed.as_slice(),
+        endpoints.as_slice(),
+    ]);
+    assert_eq!(
+        decode_encrypted_media_policy_v2(&duplicate),
+        Err("encrypted media policy has a duplicate allowed locator kind".into())
+    );
+
+    let mut allowed = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+    let mut endpoints = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+    encode_var_bytes(b"https://blossom.primal.net", &mut endpoints);
+    let noncanonical = encode_component_vectors(&[
+        ENCRYPTED_MEDIA_FORMAT_V2.as_bytes(),
+        allowed.as_slice(),
+        endpoints.as_slice(),
+    ]);
+    assert_eq!(
+        decode_encrypted_media_policy_v2(&noncanonical),
+        Err("encrypted media endpoint base URL is not normalized".into())
     );
 }
 
@@ -148,6 +446,16 @@ fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
         validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
         Err("encrypted media endpoint URL must not point at a non-routable address".into())
     );
+    assert_eq!(
+        validate_and_normalize_blob_endpoint_url("https://[2001:2::1]", false),
+        Err("encrypted media endpoint URL must not point at a non-routable address".into())
+    );
+    for raw in ["https://localhost./", "https://sub.localhost./"] {
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url(raw, false),
+            Err("encrypted media https endpoint must not point at localhost".into())
+        );
+    }
 }
 
 /// Regression for #374: the spec's invalidity list (group-encrypted-media-v1.md)
@@ -343,22 +651,49 @@ fn encrypted_media_policy_decode_rejects_non_canonical_media_format() {
 }
 
 #[test]
-fn group_avatar_url_rejects_documentation_ipv6_ranges() {
+fn group_avatar_contact_policy_rejects_documentation_ipv6_ranges() {
     // 2001:db8::/32 is the spec-required documentation range; 3fff::/20 is the
-    // newer RFC 9637 documentation range.
+    // newer RFC 9637 documentation range. These remain valid group state, but
+    // contact policy must refuse them before a client dials.
     for raw in [
         "https://[2001:db8::1]/a.png",
         "https://[2001:db8:abcd:12::1]/a.png",
         "https://[3fff::1]/a.png",
-        "https://[3fff:ffff::1]/a.png",
+        "https://[3fff:0fff::1]/a.png",
     ] {
         assert!(
-            validate_and_normalize_group_avatar_url(raw).is_err(),
-            "{raw} should be rejected"
+            validate_and_normalize_group_avatar_url(raw).is_ok(),
+            "{raw} must remain valid group state"
+        );
+        assert!(
+            reject_unsafe_group_avatar_contact_url(raw).is_err(),
+            "{raw} should be rejected by contact policy"
         );
     }
-    // A globally-routable IPv6 address is still accepted.
-    assert!(validate_and_normalize_group_avatar_url("https://[2606:4700::1]/a.png").is_ok());
+    assert!(reject_unsafe_group_avatar_contact_url("https://[3ffe::1]/a.png").is_ok());
+    assert!(reject_unsafe_group_avatar_contact_url("https://[3fff:1000::1]/a.png").is_ok());
+    assert!(reject_unsafe_group_avatar_contact_url("https://[2606:4700::1]/a.png").is_ok());
+}
+
+#[test]
+fn group_avatar_contact_policy_rejects_iana_special_purpose_ipv6_pool() {
+    for raw in [
+        "https://[2001:1::1]/a.png",
+        "https://[2001:2::1]/a.png",
+        "https://[2001:4:112::1]/a.png",
+        "https://[2001:20::1]/a.png",
+        "https://[2001:1ff:ffff::1]/a.png",
+    ] {
+        assert!(
+            validate_and_normalize_group_avatar_url(raw).is_ok(),
+            "{raw} must remain valid group state"
+        );
+        assert!(
+            reject_unsafe_group_avatar_contact_url(raw).is_err(),
+            "{raw} should be rejected by contact policy"
+        );
+    }
+    assert!(reject_unsafe_group_avatar_contact_url("https://[2001:200::1]/a.png").is_ok());
 }
 
 #[test]
@@ -397,11 +732,31 @@ fn nostr_routing_rejects_invalid_relay_urls() {
 }
 
 #[test]
+fn group_avatar_url_validity_does_not_apply_contact_safety_policy() {
+    for raw in [
+        "https://localhost/avatar.png",
+        "https://127.0.0.1/avatar.png",
+        "https://10.0.0.1/avatar.png",
+        "https://[::1]/avatar.png",
+        "https://[2001:db8::1]/avatar.png",
+    ] {
+        assert!(
+            validate_and_normalize_group_avatar_url(raw).is_ok(),
+            "component validity must not reject locally unsafe destination {raw}"
+        );
+        assert!(
+            reject_unsafe_group_avatar_contact_url(raw).is_err(),
+            "contact policy must still reject locally unsafe destination {raw}"
+        );
+    }
+}
+
+#[test]
 fn group_avatar_url_round_trips_all_fields() {
     let avatar = GroupAvatarUrlV1 {
         url: "https://cdn.example.com/avatar.png".to_owned(),
-        dim: Some("512x512".to_owned()),
-        thumbhash: Some("abc123".to_owned()),
+        dim: b"512x512".to_vec(),
+        thumbhash: b"abc123".to_vec(),
     };
     let bytes = encode_group_avatar_url_v1(&avatar).unwrap();
     assert_eq!(decode_group_avatar_url_v1(&bytes).unwrap(), avatar);
@@ -411,8 +766,8 @@ fn group_avatar_url_round_trips_all_fields() {
 fn group_avatar_url_round_trips_url_only() {
     let avatar = GroupAvatarUrlV1 {
         url: "https://cdn.example.com/avatar.png".to_owned(),
-        dim: None,
-        thumbhash: None,
+        dim: Vec::new(),
+        thumbhash: Vec::new(),
     };
     let bytes = encode_group_avatar_url_v1(&avatar).unwrap();
     assert_eq!(decode_group_avatar_url_v1(&bytes).unwrap(), avatar);
@@ -429,8 +784,8 @@ fn group_avatar_url_empty_state_round_trips_as_absent() {
 fn group_avatar_url_absent_state_rejects_hints() {
     let absent_with_hint = GroupAvatarUrlV1 {
         url: String::new(),
-        dim: Some("512x512".to_owned()),
-        thumbhash: None,
+        dim: b"512x512".to_vec(),
+        thumbhash: Vec::new(),
     };
 
     assert!(encode_group_avatar_url_v1(&absent_with_hint).is_err());
@@ -442,40 +797,6 @@ fn group_avatar_url_requires_https() {
         "http://cdn.example.com/a.png",
         "ftp://cdn.example.com/a.png",
         "ws://cdn.example.com/a.png",
-    ] {
-        assert!(
-            validate_and_normalize_group_avatar_url(raw).is_err(),
-            "{raw} should be rejected"
-        );
-    }
-}
-
-#[test]
-fn group_avatar_url_rejects_localhost_and_non_routable_hosts() {
-    for raw in [
-        "https://localhost/a.png",
-        "https://app.localhost/a.png",
-        "https://127.0.0.1/a.png",
-        "https://10.0.0.5/a.png",
-        "https://192.168.1.2/a.png",
-        "https://172.16.0.1/a.png",
-        "https://169.254.1.1/a.png",
-        // Ranges aligned with the canonical unsafe-host set / media validator.
-        "https://0.0.0.1/a.png",     // 0.0.0.0/8 this-host
-        "https://100.64.0.1/a.png",  // CGNAT 100.64.0.0/10
-        "https://192.0.0.1/a.png",   // IETF protocol assignments 192.0.0.0/24
-        "https://192.88.99.1/a.png", // 6to4 relay anycast 192.88.99.0/24
-        "https://198.18.0.1/a.png",  // benchmarking 198.18.0.0/15
-        "https://240.0.0.1/a.png",   // reserved 240.0.0.0/4
-        "https://[::1]/a.png",
-        "https://[::ffff:127.0.0.1]/a.png",
-        "https://[::ffff:10.0.0.1]/a.png",
-        "https://[fc00::1]/a.png",
-        "https://[fe80::1]/a.png",
-        "https://[2002::1]/a.png", // 6to4 transition prefix
-        "https://[2001::1]/a.png", // Teredo 2001:0000::/32
-        "https://[3fff::1]/a.png", // documentation 3fff::/20 (RFC 9637)
-        "https://[4000::1]/a.png", // outside global unicast 2000::/3
     ] {
         assert!(
             validate_and_normalize_group_avatar_url(raw).is_err(),
@@ -534,8 +855,8 @@ fn group_avatar_url_decode_rejects_absent_state_with_hints() {
 fn group_avatar_url_decode_rejects_trailing_bytes() {
     let avatar = GroupAvatarUrlV1 {
         url: "https://cdn.example.com/a.png".to_owned(),
-        dim: None,
-        thumbhash: None,
+        dim: Vec::new(),
+        thumbhash: Vec::new(),
     };
     let mut bytes = encode_group_avatar_url_v1(&avatar).unwrap();
     bytes.push(0);
@@ -543,10 +864,10 @@ fn group_avatar_url_decode_rejects_trailing_bytes() {
 }
 
 #[test]
-fn group_avatar_url_decode_treats_non_utf8_hint_as_absent() {
-    // dim/thumbhash are opaque length-bounded hints: a non-UTF-8 hint MUST NOT
-    // invalidate the component (else the same commit forks accept/reject across
-    // clients). It is interpreted as absent.
+fn group_avatar_url_codec_preserves_opaque_hint_bytes() {
+    // dim/thumbhash are opaque length-bounded hints. Decoding must preserve
+    // their bytes even when an application renderer cannot interpret them as
+    // UTF-8, otherwise encode(decode(bytes)) collapses distinct valid states.
     let url = validate_and_normalize_group_avatar_url("https://cdn.example.com/a.png").unwrap();
     let mut bytes = Vec::new();
     encode_var_bytes(url.as_bytes(), &mut bytes);
@@ -556,24 +877,19 @@ fn group_avatar_url_decode_treats_non_utf8_hint_as_absent() {
     let decoded = decode_group_avatar_url_v1(&bytes)
         .expect("non-UTF-8 opaque hints must not invalidate the avatar component");
     assert_eq!(decoded.url, url);
-    assert_eq!(decoded.dim, None);
-    assert_eq!(decoded.thumbhash, None);
-
-    // A within-bounds UTF-8 hint is still surfaced for rendering.
-    let mut bytes = Vec::new();
-    encode_var_bytes(url.as_bytes(), &mut bytes);
-    encode_var_bytes(b"512x512", &mut bytes);
-    encode_var_bytes(b"", &mut bytes);
-    let decoded = decode_group_avatar_url_v1(&bytes).unwrap();
-    assert_eq!(decoded.dim.as_deref(), Some("512x512"));
+    assert_eq!(
+        encode_group_avatar_url_v1(&decoded).unwrap(),
+        bytes,
+        "canonical decode/re-encode must preserve opaque hint bytes"
+    );
 }
 
 #[test]
 fn group_avatar_hint_length_is_bounded() {
     let avatar = GroupAvatarUrlV1 {
         url: "https://cdn.example.com/a.png".to_owned(),
-        dim: Some("a".repeat(GROUP_AVATAR_HINT_MAX_LEN + 1)),
-        thumbhash: None,
+        dim: vec![b'a'; GROUP_AVATAR_HINT_MAX_LEN + 1],
+        thumbhash: Vec::new(),
     };
     assert!(encode_group_avatar_url_v1(&avatar).is_err());
 }

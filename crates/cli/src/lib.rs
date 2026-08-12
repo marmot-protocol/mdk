@@ -12,9 +12,10 @@ use cgka_traits::app_event::{
 };
 use clap::Parser;
 use marmot_account::{AccountHome, DEFAULT_KEYCHAIN_SERVICE_NAME};
+pub(crate) use marmot_app::is_nostr_secret;
 use marmot_app::{
-    AccountRelayListStatus, AppError, AppGroupRecord, MarmotApp, MarmotAppConfig, StreamStartView,
-    UserProfileMetadata, tag_value,
+    AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
+    StreamStartView, UserProfileMetadata, tag_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,16 +24,18 @@ mod args;
 pub(crate) mod commands;
 pub mod daemon;
 mod error;
+mod secret;
 pub mod tui;
 
 pub use args::SecretStoreKind;
 pub(crate) use args::{
     AccountCommand, ChatsCommand, Cli, Command, DaemonCommand, DebugCommand, FollowsCommand,
-    GroupCommand, GroupsCommand, KeyPackageCommand, MediaCommand, MessageCommand,
-    MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand, SettingsCommand,
-    StreamCommand, UsersCommand,
+    GroupCommand, GroupsCommand, KeyPackageCommand, MaintenancePolicySetting, MediaCommand,
+    MessageCommand, MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand,
+    SettingsCommand, StreamCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
+pub(crate) use secret::ImportNsec;
 
 pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -102,7 +105,7 @@ where
 {
     let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let wants_json = argv.iter().any(|arg| arg.to_string_lossy() == "--json");
-    let mut cli = match Cli::try_parse_from(argv) {
+    let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
@@ -148,15 +151,23 @@ where
             };
         }
     };
-    if let Err(err) = materialize_secret_inputs(&mut cli) {
+    if let Err(err) = validate_secret_input_flags(&cli) {
         return command_output_result(cli.json, Err(err));
     }
+    let import_nsec = match read_import_nsec_for_cli(&cli) {
+        Ok(import_nsec) => import_nsec,
+        Err(err) => return command_output_result(cli.json, Err(err)),
+    };
 
+    run_cli_with_import_nsec(cli, import_nsec).await
+}
+
+async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNsec>) -> CliOutput {
     if let Command::Daemon { command } = cli.command.clone() {
         return daemon::run_daemon_command(cli, command).await;
     }
 
-    if matches!(cli.command, Command::Tui) {
+    if matches!(cli.command, Command::Tui { .. }) {
         return tui::run_tui(cli).await;
     }
 
@@ -204,39 +215,39 @@ where
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         let explicit_daemon_socket =
             cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
-        match daemon::send_execute(&socket, cli.clone()).await {
+        let json_output = cli.json;
+        match daemon::send_execute(&socket, cli, import_nsec).await {
             Ok(output) => return output,
-            // An oversized request is a client-side limit violation, not a
-            // daemon-unavailable or lost-response condition: the encoder rejects
-            // it before it ever reaches `wnd`. Surface it as a terminal error
-            // even on the implicit-socket path, otherwise the request silently
-            // falls through to `run_cli_local` and masks the size cap (see #190).
-            Err(err @ daemon::DaemonClientError::RequestTooLarge { .. }) => {
-                return daemon_client_error(cli.json, err);
-            }
-            // Only fall back to local execution when the client could not reach
-            // `wnd` over an auto-discovered socket. If the daemon accepted the
-            // command but the response was lost/malformed, do NOT re-run locally
-            // (that would double-execute); report it via `daemon_execute_error`.
-            Err(err)
+            Err(recover) => {
+                if matches!(
+                    recover.err,
+                    daemon::DaemonClientError::RequestTooLarge { .. }
+                ) {
+                    return daemon_client_error(json_output, recover.err);
+                }
                 if should_fallback_to_local_after_daemon_execute_error(
                     explicit_daemon_socket,
-                    &err,
-                ) => {}
-            Err(err) => return daemon_execute_error(cli.json, err),
+                    &recover.err,
+                ) {
+                    cli = recover.cli;
+                    import_nsec = recover.import_nsec;
+                } else {
+                    return daemon_execute_error(json_output, recover.err);
+                }
+            }
         }
     }
 
-    run_cli_local(cli).await
+    run_cli_local(cli, import_nsec).await
 }
 
-fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), WnError> {
-    match &mut cli.command {
+fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
+    match &cli.command {
         Command::Login {
             identity,
             nsec_stdin,
             ..
-        } => materialize_identity_secret_input("login", identity, *nsec_stdin),
+        } => validate_materialized_secret_identity("login", identity, *nsec_stdin),
         Command::Account {
             command:
                 AccountCommand::Create {
@@ -252,36 +263,65 @@ fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), WnError> {
                     nsec_stdin,
                     ..
                 },
-        } => materialize_identity_secret_input("account create", identity, *nsec_stdin),
+        } => validate_materialized_secret_identity("account create", identity, *nsec_stdin),
         _ => Ok(()),
     }
 }
 
-fn materialize_identity_secret_input(
+fn read_import_nsec_for_cli(cli: &Cli) -> Result<Option<ImportNsec>, WnError> {
+    match &cli.command {
+        Command::Login {
+            identity,
+            nsec_stdin,
+            ..
+        } => read_identity_secret_input("login", identity, *nsec_stdin),
+        Command::Account {
+            command:
+                AccountCommand::Create {
+                    identity,
+                    nsec_stdin,
+                    ..
+                },
+        }
+        | Command::Accounts {
+            command:
+                AccountCommand::Create {
+                    identity,
+                    nsec_stdin,
+                    ..
+                },
+        } => read_identity_secret_input("account create", identity, *nsec_stdin),
+        _ => Ok(None),
+    }
+}
+
+fn read_identity_secret_input(
     command: &'static str,
-    identity: &mut Option<String>,
+    identity: &Option<String>,
     nsec_stdin: bool,
-) -> Result<(), WnError> {
+) -> Result<Option<ImportNsec>, WnError> {
     if nsec_stdin {
         if identity.is_some() {
             return Err(WnError::ConflictingSecretInput { command });
         }
-        *identity = Some(read_nsec_from_stdin(command)?);
+        return Ok(Some(read_nsec_from_stdin(command)?));
     }
-    validate_materialized_secret_identity(command, identity, nsec_stdin)
+    Ok(None)
 }
 
-fn read_nsec_from_stdin(command: &'static str) -> Result<String, WnError> {
-    let mut value = String::new();
+fn read_nsec_from_stdin(command: &'static str) -> Result<ImportNsec, WnError> {
+    use zeroize::Zeroizing;
+
+    let mut value = Zeroizing::new(String::new());
     std::io::stdin().read_to_string(&mut value)?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         return Err(WnError::MissingStdinSecret { command });
     }
-    if !is_nostr_secret(&value) {
+    if !is_nostr_secret(trimmed) {
         return Err(WnError::InvalidStdinSecret { command });
     }
-    Ok(value)
+    Ok(ImportNsec::new(Zeroizing::new(trimmed.to_owned())))
 }
 
 pub(crate) fn validate_materialized_secret_identity(
@@ -353,8 +393,8 @@ fn is_notifications_subscribe(cli: &Cli) -> bool {
     )
 }
 
-pub(crate) async fn run_cli_local(cli: Cli) -> CliOutput {
-    match execute(cli).await {
+pub(crate) async fn run_cli_local(cli: Cli, import_nsec: Option<ImportNsec>) -> CliOutput {
+    match execute(cli, import_nsec).await {
         Ok((json_output, output)) => command_output_result(json_output, Ok(output)),
         Err((json_output, err)) => command_output_result(json_output, Err(err)),
     }
@@ -391,15 +431,21 @@ pub(crate) fn command_output_result(
     }
 }
 
-async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, WnError)> {
+async fn execute(
+    cli: Cli,
+    import_nsec: Option<ImportNsec>,
+) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
-    execute_inner(cli)
+    execute_inner(cli, import_nsec)
         .await
         .map(|output| (json_output, output))
         .map_err(|err| (json_output, err))
 }
 
-async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
+async fn execute_inner(
+    cli: Cli,
+    mut import_nsec: Option<ImportNsec>,
+) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
@@ -437,7 +483,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
             .or_else(|| cli.daemon_discovery_relays.first().cloned())
             .or_else(|| cli.daemon_default_account_relays.first().cloned()),
         account_home.clone(),
-    );
+    )?;
     match command {
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
@@ -461,6 +507,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
                 &app,
                 runtime_info,
                 identity,
+                import_nsec.take(),
                 nsec_stdin,
                 relay,
                 cli.daemon_default_account_relays,
@@ -481,6 +528,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
                 runtime_info,
                 account_flag,
                 relay,
+                import_nsec.take(),
             )
             .await
         }
@@ -492,6 +540,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
                 runtime_info,
                 account_flag,
                 relay,
+                import_nsec.take(),
             )
             .await
         }
@@ -531,7 +580,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
         }
         Command::Settings { command } => commands::settings::settings_command(&home, command),
         Command::Users { command } => {
-            commands::users::users_command(&account_home, &app, command, account_flag)
+            commands::users::users_command(&account_home, &app, command, account_flag).await
         }
         Command::Notifications { command } => {
             commands::notifications::notifications_command(command)
@@ -543,7 +592,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
             plain: "daemon command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),
-        Command::Tui => Ok(CommandOutput {
+        Command::Tui { .. } => Ok(CommandOutput {
             plain: "tui command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),
@@ -619,6 +668,9 @@ fn should_fallback_to_local_after_daemon_execute_error(
 fn daemon_execute_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
     match err {
         err @ daemon::DaemonClientError::Connect { .. } => daemon_client_error(json_output, err),
+        err @ daemon::DaemonClientError::ServerBusy => {
+            daemon_client_error_with_code(json_output, "server_busy", err)
+        }
         err => daemon_execute_state_unknown_error(json_output, err),
     }
 }
@@ -655,6 +707,14 @@ fn daemon_execute_state_unknown_error(
 }
 
 fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
+    daemon_client_error_with_code(json_output, "daemon_unavailable", err)
+}
+
+fn daemon_client_error_with_code(
+    json_output: bool,
+    code: &str,
+    err: daemon::DaemonClientError,
+) -> CliOutput {
     if json_output {
         return CliOutput {
             code: 1,
@@ -663,7 +723,7 @@ fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> Cli
                 serde_json::to_string(&json!({
                     "ok": false,
                     "error": {
-                        "code": "daemon_unavailable",
+                        "code": code,
                         "message": err.to_string(),
                     }
                 }))
@@ -849,6 +909,70 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
     })
 }
 
+/// Render a `chats` row: the group record (`group_json`) enriched with the
+/// runtime's durable per-chat projection state so a chat-list UI can bootstrap
+/// unread badges and a last-message preview without a second query. Consumed by
+/// `chats list`, `chats list-archived`, and the `chats subscribe`/
+/// `subscribe-archived` feeds so those surfaces stay byte-identical.
+pub(crate) fn chat_json(group: AppGroupRecord, chat_list_row: Option<ChatListRow>) -> Value {
+    let mut value = group_json(group);
+    insert_chat_projection(&mut value, chat_list_row);
+    value
+}
+
+/// Project the durable `ChatListRow` state onto a chats row as additive keys.
+///
+/// The field names and the `last_message` preview shape mirror the
+/// `chat_list_row` object embedded on every `timeline_projection_updated`
+/// event, so the snapshot feed (`chats list`/`subscribe`) and the live timeline
+/// feed agree key-for-key. The surface is deliberately the minimal reviewed set
+/// — unread state, durable `activity_sort_at`, a last-message preview, and the
+/// last-read marker — rather than the full `ChatListRow` (whose title/avatar/membership fields either
+/// duplicate `group_json` or are group-state concerns).
+///
+/// The keys are always present: a group with no projection row yet (or no
+/// messages/reads) reports empty defaults (`0`/`false`/`null`), matching the
+/// always-present `avatar_url` block convention rather than omitting keys.
+pub(crate) fn insert_chat_projection(value: &mut Value, chat_list_row: Option<ChatListRow>) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let (
+        unread_count,
+        has_unread,
+        activity_sort_at,
+        last_message,
+        last_read_message_id_hex,
+        last_read_timeline_at,
+    ) = match chat_list_row {
+        Some(row) => (
+            json!(row.unread_count),
+            json!(row.has_unread),
+            json!(row.activity_sort_at),
+            json!(row.last_message),
+            json!(row.last_read_message_id_hex),
+            json!(row.last_read_timeline_at),
+        ),
+        None => (
+            json!(0),
+            json!(false),
+            json!(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+    };
+    object.insert("unread_count".to_owned(), unread_count);
+    object.insert("has_unread".to_owned(), has_unread);
+    object.insert("activity_sort_at".to_owned(), activity_sort_at);
+    object.insert("last_message".to_owned(), last_message);
+    object.insert(
+        "last_read_message_id_hex".to_owned(),
+        last_read_message_id_hex,
+    );
+    object.insert("last_read_timeline_at".to_owned(), last_read_timeline_at);
+}
+
 pub(crate) fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<String> {
     let account_id = parse_public_key(sender).ok()?;
     let profile = app
@@ -857,10 +981,6 @@ pub(crate) fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<S
         .flatten()
         .and_then(|entry| entry.profile);
     profile_display_name(profile.as_ref())
-}
-
-pub(crate) fn is_nostr_secret(value: &str) -> bool {
-    value.starts_with("nsec")
 }
 
 fn resolve_relay(relay: Option<String>) -> Result<Option<String>, WnError> {
@@ -876,7 +996,14 @@ pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, WnErr
         return Err(WnError::EmptyRelayUrl);
     }
     let parsed = url::Url::parse(relay).map_err(|_| WnError::InvalidRelayUrl(relay.to_owned()))?;
-    if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host().is_none() {
+    let Some(host) = parsed.host() else {
+        return Err(WnError::InvalidRelayUrl(relay.to_owned()));
+    };
+    let scheme_allowed = parsed.scheme() == "wss"
+        || (parsed.scheme() == "ws"
+            && wn_allow_loopback_relays()
+            && cgka_traits::app_components::is_loopback_host(host));
+    if !scheme_allowed {
         return Err(WnError::InvalidRelayUrl(relay.to_owned()));
     }
     Ok(relay.to_owned())
@@ -972,7 +1099,11 @@ pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
     })
 }
 
-fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
+fn app_for(
+    home: PathBuf,
+    relay: Option<String>,
+    account_home: AccountHome,
+) -> Result<MarmotApp, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
@@ -980,19 +1111,17 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
     let mut config = MarmotAppConfig::default()
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays());
-    // Dev/test only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
-    // convergence settlement window (e.g. `0` for instant settlement in
-    // integration tests). Production installs leave it unset and use the pinned
-    // default.
-    if let Some(ms) = wn_dev_settlement_quiescence_ms() {
+    // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
+    // pinned convergence settlement window (e.g. `0` for integration tests).
+    if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
-    MarmotApp::with_relays_and_account_home_and_config(
+    Ok(MarmotApp::with_relays_and_account_home_and_config(
         home,
         relay.into_iter().collect(),
         account_home,
         config,
-    )
+    ))
 }
 
 fn wn_allow_loopback_blob_endpoints() -> bool {
@@ -1014,10 +1143,19 @@ fn wn_allow_loopback_relays() -> bool {
     )
 }
 
-fn wn_dev_settlement_quiescence_ms() -> Option<u64> {
-    std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
+fn resolve_dev_settlement_quiescence_ms(
+    value: Option<&str>,
+    dev_overrides_enabled: bool,
+) -> Result<Option<u64>, WnError> {
+    if value.is_some() && !dev_overrides_enabled {
+        return Err(WnError::DevSettlementOverrideInRelease);
+    }
+    Ok(value.and_then(|value| value.trim().parse().ok()))
+}
+
+fn wn_dev_settlement_quiescence_ms() -> Result<Option<u64>, WnError> {
+    let value = std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS").ok();
+    resolve_dev_settlement_quiescence_ms(value.as_deref(), cfg!(feature = "test-policy-overrides"))
 }
 
 fn open_account_home(
@@ -1159,17 +1297,108 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
+    use clap::Parser;
+
     use super::commands::account::{GlobalRelayDefaults, apply_global_relay_defaults};
-    use super::commands::messages::{apply_message_cursors, validate_message_list_cursors};
+    use super::commands::messages::{
+        apply_message_cursors, reject_misplaced_reply_to, validate_message_list_cursors,
+    };
     use super::commands::relay_stats::{relay_stats_output, relay_stats_plain};
     use super::commands::stream::{
-        first_quic_candidate_is_loopback, parse_quic_candidate, quic_candidate_host,
-        resolve_quic_candidate_addr,
+        broker_trust_for_candidate, first_quic_candidate_is_loopback, parse_quic_candidate,
+        quic_candidate_host, resolve_quic_candidate_addr,
     };
     use super::{
         Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
-        default_home_from_env, npub_for_account_id, relay_endpoints, resolve_relay, run_from,
+        default_home_from_env, insert_chat_projection, npub_for_account_id, relay_endpoints,
+        resolve_dev_settlement_quiescence_ms, resolve_relay, run_from,
     };
+
+    use serde_json::json;
+
+    #[test]
+    fn chat_projection_emits_empty_defaults_when_no_row() {
+        // A group with no chat-list projection row yet keeps every base key and
+        // gains the projection keys as empty defaults (never absent).
+        let mut value = json!({ "group_id": "abcd", "archived": false });
+        insert_chat_projection(&mut value, None);
+        assert_eq!(value["group_id"], "abcd");
+        assert_eq!(value["archived"], false);
+        assert_eq!(value["unread_count"], 0);
+        assert_eq!(value["has_unread"], false);
+        assert_eq!(value["activity_sort_at"], 0);
+        assert!(value["last_message"].is_null());
+        assert!(value["last_read_message_id_hex"].is_null());
+        assert!(value["last_read_timeline_at"].is_null());
+    }
+
+    #[test]
+    fn chat_projection_mirrors_timeline_chat_list_row_fields() {
+        // `ChatListRow` is the exact type serialized as `chat_list_row` on the
+        // timeline feed; deserializing from that shape proves the chats row
+        // agrees key-for-key.
+        let row: marmot_app::ChatListRow = serde_json::from_value(json!({
+            "group_id_hex": "abcd",
+            "pinned": false,
+            "pinned_position": null,
+            "archived": false,
+            "pending_confirmation": false,
+            "title": "General",
+            "group_name": "General",
+            "avatar_url": null,
+            "avatar": null,
+            "last_message": {
+                "message_id_hex": "m1",
+                "sender": "bob_hex",
+                "sender_display_name": "Bob",
+                "plaintext": "hello alice",
+                "kind": 9,
+                "timeline_at": 1_700_000_050_u64,
+                "deleted": false,
+                "attachment_kind": null,
+                "attachment_count": 0,
+                "delivery_state": "not_applicable"
+            },
+            "unread_count": 3_u64,
+            "has_unread": true,
+            "manually_marked_unread": false,
+            "unread_mention_count": 1_u64,
+            "has_unread_mention": true,
+            "first_unread_message_id_hex": "m0",
+            "last_read_message_id_hex": "r1",
+            "last_read_timeline_at": 1_700_000_000_u64,
+            "conversation_created_at": 1_699_999_000_u64,
+            "activity_sort_at": 1_700_000_050_u64,
+            "updated_at": 1_700_000_060_u64,
+            "self_membership": "Member",
+            "conversation_kind": "group",
+            "muted": false,
+            "muted_until_ms": null
+        }))
+        .expect("valid chat list row");
+        assert!(!row.pinned);
+        assert_eq!(row.pinned_position, None);
+
+        let mut value = json!({ "group_id": "abcd" });
+        insert_chat_projection(&mut value, Some(row));
+
+        assert_eq!(value["unread_count"], 3);
+        assert_eq!(value["has_unread"], true);
+        assert_eq!(value["activity_sort_at"], 1_700_000_050_u64);
+        assert_eq!(value["last_read_message_id_hex"], "r1");
+        assert_eq!(value["last_read_timeline_at"], 1_700_000_000_u64);
+        // `last_message` is byte-identical to the timeline feed's preview.
+        assert_eq!(value["last_message"]["message_id_hex"], "m1");
+        assert_eq!(value["last_message"]["sender"], "bob_hex");
+        assert_eq!(value["last_message"]["sender_display_name"], "Bob");
+        assert_eq!(value["last_message"]["plaintext"], "hello alice");
+        assert_eq!(value["last_message"]["timeline_at"], 1_700_000_050_u64);
+        assert_eq!(value["last_message"]["deleted"], false);
+        // Minimal surface: mention state and the full row are not dumped here.
+        assert!(value.get("unread_mention_count").is_none());
+        assert!(value.get("first_unread_message_id_hex").is_none());
+        assert!(value.get("self_membership").is_none());
+    }
 
     use marmot_app::{
         AppMessageRecord, DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics,
@@ -1184,6 +1413,7 @@ mod tests {
                 count: 1,
             }],
             overflow_count: 0,
+            sum_ms: upper_bound_ms,
         }
     }
 
@@ -1246,6 +1476,41 @@ mod tests {
             .expect_err("invalid account ids must surface as a CLI error");
         let rendered = super::wn_error_json(&err);
         assert_eq!(rendered["code"], "invalid_public_key");
+    }
+
+    #[test]
+    fn dev_settlement_override_is_available_in_explicit_test_builds() {
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(Some("0"), true).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn dev_settlement_override_is_rejected_without_test_feature() {
+        let error =
+            resolve_dev_settlement_quiescence_ms(Some("0"), false).expect_err("feature rejection");
+        assert!(matches!(&error, WnError::DevSettlementOverrideInRelease));
+        assert_eq!(
+            super::wn_error_json(&error)["code"],
+            "dev_settlement_override_in_release"
+        );
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(None, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_or_missing_dev_settlement_override_remains_inactive_when_enabled() {
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(Some("not-a-duration"), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(None, true).unwrap(),
+            None
+        );
     }
 
     fn test_cli(command: Command) -> Cli {
@@ -1605,6 +1870,10 @@ mod tests {
             relay_endpoints(vec!["mailto:relay@example.com".to_owned()]),
             Err(WnError::InvalidRelayUrl(value)) if value == "mailto:relay@example.com"
         ));
+        assert!(matches!(
+            resolve_relay(Some("ws://relay.example".to_owned())),
+            Err(WnError::InvalidRelayUrl(value)) if value == "ws://relay.example"
+        ));
         assert_eq!(
             resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),
             Some("wss://relay.example/path".to_owned())
@@ -1677,6 +1946,17 @@ mod tests {
         assert!(addr.ip().is_loopback());
     }
 
+    #[test]
+    fn candidate_trust_rejects_conflicting_insecure_and_certificate_flags() {
+        let result = broker_trust_for_candidate(
+            "broker.example",
+            "203.0.113.10:4450".parse().unwrap(),
+            Some(hex::encode([1_u8; 8])),
+            true,
+        );
+        assert!(matches!(result, Err(WnError::ConflictingStreamTrust)));
+    }
+
     #[tokio::test]
     async fn resolve_quic_candidate_accepts_public_address() {
         // A public numeric address is accepted even without local opt-in.
@@ -1732,9 +2012,12 @@ mod tests {
                 kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
                 tags: Vec::new(),
                 source_epoch: None,
+                retention: None,
                 recorded_at: 100 + u64::try_from(index / 2).unwrap(),
                 received_at: 100 + u64::try_from(index / 2).unwrap(),
                 insert_order: i64::try_from(index).unwrap(),
+                invalidated: false,
+                moderation_grant: false,
             })
             .collect::<Vec<_>>();
 
@@ -1756,6 +2039,249 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    fn parse_send(argv: &[&str]) -> (Option<String>, Option<String>, Vec<String>) {
+        let cli = Cli::try_parse_from(argv.iter().copied()).expect("send args parse");
+        match cli.command {
+            Command::Message {
+                command:
+                    crate::MessageCommand::Send {
+                        group_flag,
+                        reply_to,
+                        args,
+                    },
+            }
+            | Command::Messages {
+                command:
+                    crate::MessageCommand::Send {
+                        group_flag,
+                        reply_to,
+                        args,
+                    },
+            } => (group_flag, reply_to, args),
+            other => panic!("expected a message send command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_send_reply_to_flag_parses_before_positional_text() {
+        // `--group` + `--reply-to` before the text: the canonical reply form.
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "messages",
+            "send",
+            "--group",
+            "GROUP",
+            "--reply-to",
+            "PARENT",
+            "hello",
+            "world",
+        ]);
+        assert_eq!(group_flag.as_deref(), Some("GROUP"));
+        assert_eq!(reply_to.as_deref(), Some("PARENT"));
+        assert_eq!(args, vec!["hello".to_owned(), "world".to_owned()]);
+
+        // Positional group works too, as long as `--reply-to` precedes the
+        // positional group (the older singular `message` surface shares the enum).
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "message",
+            "send",
+            "--reply-to",
+            "PARENT",
+            "GROUP",
+            "hi",
+        ]);
+        assert_eq!(group_flag, None);
+        assert_eq!(reply_to.as_deref(), Some("PARENT"));
+        assert_eq!(args, vec!["GROUP".to_owned(), "hi".to_owned()]);
+    }
+
+    #[test]
+    fn message_send_reply_to_after_positional_group_is_literal_text() {
+        // The trailing positional text uses `allow_hyphen_values`, so once a
+        // positional group is consumed everything after it (including a stray
+        // `--reply-to`) is literal message text — the same rule that lets
+        // `send --group <g> "--dash text"` work. Callers must use the `--group`
+        // form to attach `--reply-to`. This locks that intentional behavior.
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "messages",
+            "send",
+            "GROUP",
+            "--reply-to",
+            "PARENT",
+            "text",
+        ]);
+        assert_eq!(group_flag, None);
+        assert_eq!(reply_to, None);
+        assert_eq!(
+            args,
+            vec![
+                "GROUP".to_owned(),
+                "--reply-to".to_owned(),
+                "PARENT".to_owned(),
+                "text".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_send_reply_to_after_group_flag_text_is_literal_text() {
+        // The `--group` form carries the same footgun as the positional-group form
+        // above: the trailing message args use `allow_hyphen_values`, so a
+        // `--reply-to` placed *after* the text is swallowed as literal message text
+        // (`reply_to` stays `None`) instead of setting the reply target. The send
+        // handler turns this exact parse into a loud error (see
+        // `reject_misplaced_reply_to`); this locks the parse the guard fires on.
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "messages",
+            "send",
+            "--group",
+            "GROUP",
+            "hello",
+            "--reply-to",
+            "PARENT",
+        ]);
+        assert_eq!(group_flag.as_deref(), Some("GROUP"));
+        assert_eq!(reply_to, None);
+        assert_eq!(
+            args,
+            vec![
+                "hello".to_owned(),
+                "--reply-to".to_owned(),
+                "PARENT".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_send_without_reply_to_leaves_it_unset() {
+        let (group_flag, reply_to, args) =
+            parse_send(&["wn", "messages", "send", "GROUP", "hello"]);
+        assert_eq!(group_flag, None);
+        assert_eq!(reply_to, None);
+        assert_eq!(args, vec!["GROUP".to_owned(), "hello".to_owned()]);
+    }
+
+    #[test]
+    fn message_send_stray_reply_to_in_text_is_rejected() {
+        // A `--reply-to` that lands *after* the message text is swallowed as
+        // literal text (see the parse-lock tests above). The send handler must
+        // reject that mis-ordering loudly instead of publishing a body carrying a
+        // stray `--reply-to <id>` that silently attaches to no reply.
+        let err = reject_misplaced_reply_to(
+            None,
+            &[
+                "hello".to_owned(),
+                "--reply-to".to_owned(),
+                "PARENT".to_owned(),
+            ],
+        )
+        .expect_err("a stray --reply-to in the message text must be rejected");
+        assert!(matches!(err, WnError::ReplyToAfterMessageText));
+    }
+
+    #[test]
+    fn message_send_reply_to_guard_allows_real_replies_and_plain_text() {
+        // A parsed `--reply-to` already did its job (the flag was consumed), so an
+        // identical token surviving in the body is fine and the guard stays quiet.
+        assert!(
+            reject_misplaced_reply_to(Some("PARENT"), &["--reply-to".to_owned(), "b".to_owned()])
+                .is_ok()
+        );
+        // Plain text with no stray flag is always fine.
+        assert!(reject_misplaced_reply_to(None, &["hello".to_owned(), "world".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn reply_to_after_message_text_error_renders_reply_to_code() {
+        let value = super::wn_error_json(&WnError::ReplyToAfterMessageText);
+        assert_eq!(value["code"], "reply_to_after_message_text");
+        assert_eq!(
+            value["message"],
+            "--reply-to must come before the message text; it was read as literal text here"
+        );
+    }
+
+    #[test]
+    fn message_send_reply_to_footgun_is_rejected_on_both_send_surfaces() {
+        // The guard lives on the shared `MessageCommand::Send` arm, so the plural
+        // `messages send` and the older singular `message send` are protected
+        // identically. With `--group`, the parsed positional args are the message
+        // text, so a trailing `--reply-to` is exactly what the guard rejects.
+        for argv in [
+            [
+                "wn",
+                "messages",
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to",
+                "PARENT",
+            ],
+            [
+                "wn",
+                "message",
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to",
+                "PARENT",
+            ],
+        ] {
+            let (group_flag, reply_to, text) = parse_send(&argv);
+            assert_eq!(group_flag.as_deref(), Some("GROUP"));
+            assert_eq!(reply_to, None);
+            let err = reject_misplaced_reply_to(reply_to.as_deref(), &text)
+                .expect_err("stray --reply-to must be rejected on both send surfaces");
+            assert!(matches!(err, WnError::ReplyToAfterMessageText));
+        }
+    }
+
+    #[test]
+    fn message_send_stray_reply_to_equals_form_is_rejected() {
+        // The equals spelling `--reply-to=PARENT` placed *after* the text is also
+        // swallowed as one literal `allow_hyphen_values` token (verified: it parses
+        // to `reply_to=None`, args `["hello", "--reply-to=PARENT"]`). An exact-token
+        // guard would miss it and publish a body carrying a stray reply flag, so the
+        // guard must reject the `=` form on both send surfaces too.
+        let cases: [&[&str]; 2] = [
+            &[
+                "wn",
+                "messages",
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to=PARENT",
+            ],
+            &[
+                "wn",
+                "messages",
+                "send",
+                "GROUP",
+                "hello",
+                "--reply-to=PARENT",
+            ],
+        ];
+        for argv in cases {
+            let (group_flag, reply_to, args) = parse_send(argv);
+            assert_eq!(reply_to, None);
+            // Mirror the handler: the positional-group form drops the leading group.
+            let text = if group_flag.is_some() {
+                args.as_slice()
+            } else {
+                &args[1..]
+            };
+            let err = reject_misplaced_reply_to(reply_to.as_deref(), text)
+                .expect_err("a stray --reply-to=<id> in the text must be rejected");
+            assert!(matches!(err, WnError::ReplyToAfterMessageText));
+        }
     }
 
     #[test]
@@ -1801,6 +2327,18 @@ mod tests {
                 timestamp_flag: "--before",
                 message_id_flag: "--before-message-id",
             }
+        ));
+    }
+
+    #[test]
+    fn uppercase_nsec_argv_rejected_at_early_identity_gate() {
+        let identity =
+            Some("NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99".to_owned());
+        let err = super::validate_materialized_secret_identity("login", &identity, false)
+            .expect_err("uppercase nsec argv must be rejected before daemon/json materialization");
+        assert!(matches!(
+            err,
+            WnError::SecretArgumentRejected { command: "login" }
         ));
     }
 

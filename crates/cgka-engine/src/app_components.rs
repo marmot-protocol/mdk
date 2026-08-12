@@ -3,22 +3,50 @@
 use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
-    APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
-    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GroupLifecycleV1, GroupProfileV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
+    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
+    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
     decode_quic_varint, encode_component_vectors, encode_components_list,
+    encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::ingest::ProposalRejectionCategory;
 use cgka_traits::types::{GroupId, MemberId};
-use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
-use openmls::group::{MlsGroup, StagedCommit};
-use openmls::messages::proposals::{AppDataUpdateOperation, Proposal};
-use openmls::prelude::{BasicCredential, LeafNode, Sender};
+use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
+use openmls::group::{
+    GroupContext, MlsGroup, ProcessMessageError, StageCommitError, StagedCommit, ValidationError,
+};
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::prelude::{
+    BasicCredential, ContentType, ExtensionType, LeafNode, LeafNodeIndex, ProposalOrRefType,
+    ProposalType, ProposalValidationError, QueuedProposal, Sender,
+};
+use openmls::treesync::Node;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Registry-level contract enforced for every current-profile group state.
+///
+/// These values are public so portable conformance vectors can cross-check
+/// their implementation-neutral hexadecimal contract against the exact set the
+/// engine validator consumes.
+pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS: [u16; 1] = [0x0006];
+pub const CURRENT_PROFILE_REQUIRED_PROPOSALS: [u16; 1] = [0x0008];
+pub const CURRENT_PROFILE_REQUIRED_APP_COMPONENTS: [AppComponentId; 2] = [
+    GROUP_ADMIN_POLICY_COMPONENT_ID,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+];
+pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS: [AppComponentId; 1] =
+    [GROUP_ADMIN_POLICY_COMPONENT_ID];
+pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
+    [ACCOUNT_IDENTITY_PROOF_COMPONENT_ID];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
@@ -26,14 +54,19 @@ pub(crate) struct InitialComponentState {
     pub(crate) description: String,
     pub(crate) admins: Vec<[u8; 32]>,
     pub(crate) app_components: Vec<AppComponentData>,
+    pub(crate) optional_app_components: Vec<AppComponentData>,
 }
 
 pub(crate) fn leaf_app_components_extension(
     supported: &AppComponentSet,
+    account_identity_proof: Option<&[u8]>,
 ) -> Result<Extension, EngineError> {
     let mut dict = AppDataDictionary::new();
     let mut advertised = supported.ids.clone();
     advertised.insert(APP_COMPONENTS_COMPONENT_ID);
+    if account_identity_proof.is_some() {
+        advertised.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    }
     dict.insert(
         APP_COMPONENTS_COMPONENT_ID,
         encode_components_list(&advertised),
@@ -42,6 +75,9 @@ pub(crate) fn leaf_app_components_extension(
         SAFE_AAD_COMPONENT_ID,
         encode_components_list(&BTreeSet::new()),
     );
+    if let Some(proof) = account_identity_proof {
+        dict.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof.to_vec());
+    }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
     ))
@@ -91,6 +127,12 @@ pub(crate) fn app_data_dictionary_extension_for_group(
             encode_admin_policy(&initial.admins)?,
         );
     }
+    if required.contains(GROUP_LIFECYCLE_COMPONENT_ID) {
+        dict.insert(
+            GROUP_LIFECYCLE_COMPONENT_ID,
+            encode_group_lifecycle_v1(GroupLifecycleV1::Active),
+        );
+    }
     let mut seen_initial = BTreeSet::new();
     for component in &initial.app_components {
         if !seen_initial.insert(component.component_id) {
@@ -102,6 +144,15 @@ pub(crate) fn app_data_dictionary_extension_for_group(
         if required.contains(component.component_id) {
             dict.insert(component.component_id, component.data.clone());
         }
+    }
+    for component in &initial.optional_app_components {
+        if !seen_initial.insert(component.component_id) {
+            return Err(EngineError::Other(
+                "group creation request contains duplicate app components".into(),
+            ));
+        }
+        validate_initial_app_component(component)?;
+        dict.insert(component.component_id, component.data.clone());
     }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
@@ -129,19 +180,9 @@ pub(crate) fn group_profile_of_group(
 }
 
 pub(crate) fn decode_group_profile(bytes: &[u8]) -> Result<(String, String), EngineError> {
-    let mut cursor = bytes;
-    let name = decode_var_bytes(&mut cursor, 256, "profile name")?;
-    let description = decode_var_bytes(&mut cursor, 4096, "profile description")?;
-    if !cursor.is_empty() {
-        return Err(EngineError::Serialize(
-            "profile component has trailing bytes".into(),
-        ));
-    }
-    let name = String::from_utf8(name)
-        .map_err(|e| EngineError::Serialize(format!("profile name is not UTF-8: {e}")))?;
-    let description = String::from_utf8(description)
-        .map_err(|e| EngineError::Serialize(format!("profile description is not UTF-8: {e}")))?;
-    Ok((name, description))
+    let profile = decode_group_profile_v1(bytes)
+        .map_err(|e| EngineError::Serialize(format!("profile component decode failed: {e}")))?;
+    Ok((profile.name, profile.description))
 }
 
 pub(crate) fn admins_of_group(mls_group: &MlsGroup) -> Result<Vec<[u8; 32]>, EngineError> {
@@ -149,6 +190,17 @@ pub(crate) fn admins_of_group(mls_group: &MlsGroup) -> Result<Vec<[u8; 32]>, Eng
         return Ok(Vec::new());
     };
     decode_admin_policy(bytes)
+}
+
+pub(crate) fn lifecycle_of_group(
+    mls_group: &MlsGroup,
+) -> Result<Option<GroupLifecycleV1>, EngineError> {
+    let Some(bytes) = app_component_bytes(mls_group, GROUP_LIFECYCLE_COMPONENT_ID) else {
+        return Ok(None);
+    };
+    decode_group_lifecycle_v1(bytes).map(Some).map_err(|error| {
+        EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+    })
 }
 
 pub(crate) fn app_component_data_of_group(
@@ -223,6 +275,308 @@ pub(crate) fn require_admin_for_staged_commit(
     require_admin(mls_group, group_id, sender)
 }
 
+pub(crate) const fn proposal_rejection_category_tag(
+    category: ProposalRejectionCategory,
+) -> &'static str {
+    match category {
+        ProposalRejectionCategory::AuthorizationFailed => "authorization_failed",
+        ProposalRejectionCategory::UnsupportedProposal => "unsupported_proposal",
+        ProposalRejectionCategory::InvalidEncoding => "invalid_encoding",
+        ProposalRejectionCategory::InvalidSignature => "invalid_signature",
+        ProposalRejectionCategory::InvalidSelfRemove => "invalid_self_remove",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StandaloneProposalRejection {
+    pub(crate) category: ProposalRejectionCategory,
+}
+
+impl StandaloneProposalRejection {
+    const fn authorization(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::AuthorizationFailed,
+        }
+    }
+
+    const fn invalid_self_remove(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::InvalidSelfRemove,
+        }
+    }
+
+    const fn unsupported(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::UnsupportedProposal,
+        }
+    }
+
+    const fn invalid(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::InvalidEncoding,
+        }
+    }
+}
+
+/// Membership-tag and sender-leaf authentication depend on the source-epoch
+/// group state. A same-epoch proposal can therefore fail against the live
+/// branch but authenticate against a retained parent branch.
+pub(crate) fn is_parent_dependent_process_message_error<StorageError>(
+    error: &ProcessMessageError<StorageError>,
+    content_type: ContentType,
+) -> bool {
+    matches!(
+        (content_type, error),
+        (
+            ContentType::Proposal,
+            ProcessMessageError::ValidationError(
+                ValidationError::UnknownMember | ValidationError::InvalidMembershipTag
+            )
+        )
+    )
+}
+
+/// Map only proposal-specific MLS processing failures into the stable,
+/// privacy-safe rejection taxonomy. Unrelated commit and local-state failures
+/// remain retryable and therefore return `None`.
+pub(crate) fn classify_process_message_rejection<StorageError>(
+    error: &ProcessMessageError<StorageError>,
+    content_type: ContentType,
+) -> Option<ProposalRejectionCategory> {
+    if is_parent_dependent_process_message_error(error, content_type) {
+        return None;
+    }
+    match (content_type, error) {
+        (ContentType::Proposal, ProcessMessageError::UnsupportedProposalType) => {
+            Some(ProposalRejectionCategory::UnsupportedProposal)
+        }
+        (ContentType::Proposal, ProcessMessageError::IncompatibleWireFormat) => {
+            Some(ProposalRejectionCategory::InvalidEncoding)
+        }
+        (ContentType::Proposal, ProcessMessageError::ValidationError(validation)) => {
+            match validation {
+                ValidationError::WrongEpoch => None,
+                ValidationError::MissingMembershipTag
+                | ValidationError::InvalidSignature
+                | ValidationError::UnauthorizedExternalSender
+                | ValidationError::NoExternalSendersExtension
+                | ValidationError::InvalidLeafNodeSignature
+                | ValidationError::InvalidSenderType => {
+                    Some(ProposalRejectionCategory::InvalidSignature)
+                }
+                _ => Some(ProposalRejectionCategory::InvalidEncoding),
+            }
+        }
+        (
+            ContentType::Commit,
+            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat),
+        ) => Some(ProposalRejectionCategory::InvalidEncoding),
+        (
+            ContentType::Commit,
+            ProcessMessageError::InvalidCommit(StageCommitError::ProposalValidationError(
+                validation,
+            )),
+        ) => Some(match validation {
+            ProposalValidationError::InsufficientCapabilities
+            | ProposalValidationError::UnsupportedProposalType => {
+                ProposalRejectionCategory::UnsupportedProposal
+            }
+            ProposalValidationError::UnknownMember
+            | ProposalValidationError::UpdateFromNonMember => {
+                ProposalRejectionCategory::InvalidSignature
+            }
+            _ => ProposalRejectionCategory::InvalidEncoding,
+        }),
+        (
+            ContentType::Commit,
+            ProcessMessageError::InvalidCommit(
+                StageCommitError::AppDataUpdateValidationError(_)
+                | StageCommitError::ApplyAppDataUpdateError(_)
+                | StageCommitError::GroupContextExtensionsProposalValidationError(_)
+                | StageCommitError::LeafNodeValidation(_),
+            ),
+        ) => Some(ProposalRejectionCategory::InvalidEncoding),
+        _ => None,
+    }
+}
+
+/// Authorize one authenticated proposal against its source-epoch group state.
+///
+/// This is shared by direct ingest, convergence replay, delayed SelfRemove
+/// replay, and staged-Commit validation. OpenMLS has already authenticated the
+/// sender and parsed the proposal before this function runs; this layer owns
+/// Marmot roles, component semantics, profile rules, and capability checks.
+pub(crate) fn authorize_standalone_proposal(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+) -> Result<(), StandaloneProposalRejection> {
+    authorize_proposal(mls_group, proposal, true)
+}
+
+fn authorize_proposal(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+    validate_app_data_payload: bool,
+) -> Result<(), StandaloneProposalRejection> {
+    let Sender::Member(sender_index) = proposal.sender() else {
+        return Err(StandaloneProposalRejection::authorization(
+            "proposal_sender_not_member",
+        ));
+    };
+    let Some(sender_member) = mls_group.member_at(*sender_index) else {
+        return Err(StandaloneProposalRejection::authorization(
+            "proposal_sender_not_current_member",
+        ));
+    };
+    let sender_id = crate::identity::validated_member_id(&sender_member.credential)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_sender_identity_invalid"))?;
+    let profile = crate::account_identity_proof::protocol_profile_of_group(mls_group)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_group_profile_invalid"))?;
+    let admins = admins_of_group(mls_group)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_admin_policy_invalid"))?;
+    let sender_pubkey = admin_pubkey_from_member_id(&sender_id)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_sender_identity_invalid"))?;
+    let sender_is_admin = admins.iter().any(|admin| admin == &sender_pubkey);
+
+    match proposal.proposal() {
+        Proposal::SelfRemove => {
+            if sender_is_admin {
+                return Err(StandaloneProposalRejection::invalid_self_remove(
+                    "self_remove_sender_is_active_admin",
+                ));
+            }
+        }
+        Proposal::AppDataUpdate(update) => {
+            if !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "app_data_update_sender_not_admin",
+                ));
+            }
+            if update.component_id() == GROUP_LIFECYCLE_COMPONENT_ID
+                && proposal.proposal_or_ref_type() == ProposalOrRefType::Reference
+            {
+                return Err(StandaloneProposalRejection::invalid(
+                    "group_lifecycle_update_must_be_inline",
+                ));
+            }
+            if validate_app_data_payload {
+                validate_standalone_app_data_update(update).map_err(|_| {
+                    StandaloneProposalRejection::invalid("app_data_update_payload_invalid")
+                })?;
+            }
+        }
+        Proposal::GroupContextExtensions(update) => {
+            if !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "group_context_extensions_sender_not_admin",
+                ));
+            }
+            validate_group_context_extension_proposal(mls_group, profile, update.extensions())?;
+        }
+        Proposal::Add(_) | Proposal::Remove(_) => {
+            if !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "membership_proposal_sender_not_admin",
+                ));
+            }
+            validate_membership_proposal(mls_group, proposal)?;
+        }
+        Proposal::Update(_) => {
+            // The current profile's only non-admin standalone proposal is
+            // SelfRemove. Deployed legacy groups retain the ordinary MLS
+            // member self-update proposal flow.
+            if profile == ProtocolProfile::Current && !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "update_proposal_sender_not_admin",
+                ));
+            }
+            validate_membership_proposal(mls_group, proposal)?;
+        }
+        Proposal::PreSharedKey(_)
+        | Proposal::ReInit(_)
+        | Proposal::ExternalInit(_)
+        | Proposal::AppEphemeral(_)
+        | Proposal::Custom(_) => {
+            return Err(StandaloneProposalRejection::unsupported(
+                "standalone_proposal_type_unsupported",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-run proposal-sender authorization for every proposal carried by a
+/// staged Commit. By-reference proposals keep their original authenticated
+/// sender; by-value proposals are attributed to the committer by MLS.
+pub(crate) fn authorize_staged_commit_proposals(
+    mls_group: &MlsGroup,
+    staged: &StagedCommit,
+) -> Result<(), StandaloneProposalRejection> {
+    for proposal in staged.queued_proposals() {
+        authorize_proposal(mls_group, proposal, false)?;
+    }
+    validate_app_data_update_batch(
+        mls_group,
+        staged.queued_proposals().filter_map(|proposal| {
+            if let Proposal::AppDataUpdate(update) = proposal.proposal() {
+                Some(update.as_ref())
+            } else {
+                None
+            }
+        }),
+    )
+    .map_err(|_| StandaloneProposalRejection::invalid("app_data_update_payload_invalid"))?;
+    Ok(())
+}
+
+fn validate_membership_proposal(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+) -> Result<(), StandaloneProposalRejection> {
+    if let Proposal::Remove(remove) = proposal.proposal()
+        && mls_group.member_at(remove.removed()).is_none()
+    {
+        return Err(StandaloneProposalRejection::invalid(
+            "remove_target_not_current_member",
+        ));
+    }
+    crate::account_identity_proof::validate_standalone_proposal_account_identity_proof(
+        proposal,
+        mls_group,
+        mls_group.ciphersuite(),
+    )
+    .map_err(|_| StandaloneProposalRejection::invalid("proposal_account_proof_invalid"))
+}
+
+fn validate_group_context_extension_proposal(
+    mls_group: &MlsGroup,
+    profile: ProtocolProfile,
+    extensions: &Extensions<GroupContext>,
+) -> Result<(), StandaloneProposalRejection> {
+    let required_components = if profile == ProtocolProfile::Current {
+        validate_current_profile_group_context(extensions, "proposed group state").map_err(
+            |_| {
+                StandaloneProposalRejection::invalid(
+                    "group_context_extensions_current_profile_invalid",
+                )
+            },
+        )?
+    } else {
+        AppComponentSet::default()
+    };
+    let leaves = ratchet_tree_leaves(mls_group.export_ratchet_tree()).map_err(|_| {
+        StandaloneProposalRejection::invalid("group_context_extensions_tree_invalid")
+    })?;
+    validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components).map_err(
+        |_| {
+            StandaloneProposalRejection::unsupported(
+                "group_context_extensions_not_supported_by_all_members",
+            )
+        },
+    )
+}
+
 fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
     let basic = BasicCredential::try_from(cred).ok()?;
     <[u8; 32]>::try_from(basic.identity()).ok()
@@ -239,7 +593,7 @@ fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 
 /// storage provider now wraps `merge_staged_commit` in a backend transaction.
 pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     mls_group: &MlsGroup,
-    group_id: &GroupId,
+    _group_id: &GroupId,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
     // Resulting admins come from the staged (provisional) app_data_dictionary, so
@@ -311,9 +665,10 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
         .iter()
         .any(|admin| !accounts.contains(admin))
     {
-        return Err(EngineError::Other(format!(
-            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch (group {group_id:?})"
-        )));
+        return Err(EngineError::Other(
+            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -335,37 +690,64 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
 /// Enforced rules, in order:
 /// 1. the `app_data_dictionary` extension itself may never be dropped;
 /// 2. the engine-owned `app_components` entry and the state entry of every
-///    component in the current epoch's required set may never be dropped
-///    (mirrors [`validate_app_component_remove`]: a component becomes
-///    droppable only after a prior commit removes it from the required list);
+///    component in the resulting epoch's required set may never be dropped;
+///    one Commit may atomically unrequire and remove an optional component;
 /// 3. every dictionary entry that changes relative to the current epoch —
 ///    added, rewritten, or removed — must match one of this commit's own
 ///    `AppDataUpdate` operations, whose payloads passed the component
 ///    validators before the commit was staged.
 pub(crate) fn validate_app_component_integrity_for_staged_commit(
     mls_group: &MlsGroup,
-    group_id: &GroupId,
+    _group_id: &GroupId,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
     let current = mls_group.extensions().app_data_dictionary();
     let resulting = staged.group_context().extensions().app_data_dictionary();
     if current.is_some() && resulting.is_none() {
-        return Err(EngineError::Other(format!(
-            "commit is invalid: resulting GroupContext drops the app_data_dictionary (group {group_id:?})"
-        )));
+        return Err(EngineError::Other(
+            "commit is invalid: resulting GroupContext drops the app_data_dictionary".into(),
+        ));
     }
     let current = current.map(|ext| ext.dictionary());
     let resulting = resulting.map(|ext| ext.dictionary());
 
-    let mut protected = required_app_components_of_group(mls_group)?.ids;
-    protected.insert(APP_COMPONENTS_COMPONENT_ID);
+    // Protect the RESULTING required set. This deliberately permits one
+    // authorized Commit to atomically unrequire and remove an optional
+    // component, while still rejecting a required entry that disappears.
+    let is_current = crate::account_identity_proof::protocol_profile_of_group(mls_group)?
+        == ProtocolProfile::Current;
+    let mut protected = if resulting
+        .and_then(|dictionary| dictionary.get(&APP_COMPONENTS_COMPONENT_ID))
+        .is_some()
+    {
+        required_app_components_of_extensions(
+            staged.group_context().extensions(),
+            "resulting GroupContext",
+        )?
+        .ids
+    } else if is_current {
+        return Err(EngineError::Other(
+            "commit is invalid: resulting GroupContext drops current-profile app_components".into(),
+        ));
+    } else {
+        BTreeSet::new()
+    };
+    if is_current
+        || current.is_some_and(|dictionary| dictionary.contains(&APP_COMPONENTS_COMPONENT_ID))
+    {
+        protected.insert(APP_COMPONENTS_COMPONENT_ID);
+    }
     for component_id in &protected {
-        let currently_present = current.is_some_and(|dict| dict.contains(component_id));
+        // The account proof is required by the GroupContext but its data is
+        // LeafNode-only. It must never appear as GroupContext state.
+        if *component_id == ACCOUNT_IDENTITY_PROOF_COMPONENT_ID {
+            continue;
+        }
         let still_present = resulting.is_some_and(|dict| dict.contains(component_id));
-        if currently_present && !still_present {
+        if !still_present {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext drops required app component \
-                 {component_id:#06x} (group {group_id:?})"
+                 {component_id:#06x}"
             )));
         }
     }
@@ -402,8 +784,507 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
         if !update_backed {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext changes app component \
-                 {component_id:#06x} outside an AppDataUpdate proposal (group {group_id:?})"
+                 {component_id:#06x} outside an AppDataUpdate proposal"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the complete current application profile carried by an already
+/// materialized MLS group.
+///
+/// Legacy groups deliberately skip these current-profile requirements. Their
+/// deployed proof/component rules remain selected by their explicit profile.
+pub(crate) fn validate_current_profile_group_invariants(
+    group: &MlsGroup,
+) -> Result<(), EngineError> {
+    let profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
+    if profile == ProtocolProfile::Legacy {
+        return Ok(());
+    }
+    let required_components =
+        validate_current_profile_group_context(group.extensions(), "group state")?;
+    let leaves = ratchet_tree_leaves(group.export_ratchet_tree())?;
+    validate_resulting_leaf_capabilities(leaves.iter(), group.extensions(), &required_components)
+}
+
+/// Validate current-profile invariants against the complete state a staged
+/// Commit would produce, before the Commit can mutate canonical group state.
+pub(crate) fn validate_current_profile_invariants_for_staged_commit(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+) -> Result<(), EngineError> {
+    let profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
+    if profile == ProtocolProfile::Legacy {
+        return Ok(());
+    }
+    let extensions = staged.group_context().extensions();
+    let required_components =
+        validate_current_profile_group_context(extensions, "resulting group state")?;
+    let leaves = conceptual_resulting_leaves(group, staged, committer_index)?;
+    validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
+    validate_group_lifecycle_transition(group, staged, committer_index)
+}
+
+fn lifecycle_from_extensions(
+    extensions: &Extensions<GroupContext>,
+) -> Result<Option<GroupLifecycleV1>, EngineError> {
+    let Some(bytes) = extensions
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&GROUP_LIFECYCLE_COMPONENT_ID))
+    else {
+        return Ok(None);
+    };
+    decode_group_lifecycle_v1(bytes).map(Some).map_err(|error| {
+        EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+    })
+}
+
+pub(crate) fn staged_commit_disbands(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+) -> Result<bool, EngineError> {
+    Ok(
+        lifecycle_from_extensions(group.extensions())? == Some(GroupLifecycleV1::Active)
+            && lifecycle_from_extensions(staged.group_context().extensions())?
+                == Some(GroupLifecycleV1::Disbanded),
+    )
+}
+
+/// Enforce lifecycle-v1 transition and terminal Commit shape at the shared
+/// staged-Commit chokepoint used by local sends, direct ingest, convergence
+/// replay, and fork recovery.
+pub(crate) fn validate_group_lifecycle_transition(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+) -> Result<(), EngineError> {
+    let before = lifecycle_from_extensions(group.extensions())?;
+    let after = lifecycle_from_extensions(staged.group_context().extensions())?;
+    let before_required =
+        required_app_components_of_group(group)?.contains(GROUP_LIFECYCLE_COMPONENT_ID);
+    let after_required = required_app_components_of_extensions(
+        staged.group_context().extensions(),
+        "resulting group state",
+    )?
+    .contains(GROUP_LIFECYCLE_COMPONENT_ID);
+
+    if before == Some(GroupLifecycleV1::Disbanded) {
+        return Err(EngineError::Other(
+            "commit is invalid: Disbanded has no outgoing transition".into(),
+        ));
+    }
+
+    let enabling = !before_required && after_required;
+    if before_required && !after_required {
+        return Err(EngineError::Other(
+            "commit is invalid: lifecycle-v1 cannot be un-required".into(),
+        ));
+    }
+    if enabling {
+        if after != Some(GroupLifecycleV1::Active) {
+            return Err(EngineError::Other(
+                "commit is invalid: lifecycle enablement must install Active".into(),
+            ));
+        }
+        for queued in staged.queued_proposals() {
+            if queued.proposal_or_ref_type() != ProposalOrRefType::Proposal {
+                return Err(EngineError::Other(
+                    "commit is invalid: lifecycle enablement proposals must be inline".into(),
+                ));
+            }
+            match queued.proposal() {
+                Proposal::AppDataUpdate(update)
+                    if matches!(
+                        update.component_id(),
+                        APP_COMPONENTS_COMPONENT_ID | GROUP_LIFECYCLE_COMPONENT_ID
+                    ) => {}
+                _ => {
+                    return Err(EngineError::Other(
+                        "commit is invalid: lifecycle enablement contains unrelated proposals"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if before != Some(GroupLifecycleV1::Active) || after != Some(GroupLifecycleV1::Disbanded) {
+        if before != after {
+            return Err(EngineError::Other(
+                "commit is invalid: unsupported group lifecycle transition".into(),
+            ));
+        }
+        if staged.queued_proposals().any(|queued| {
+            matches!(
+                queued.proposal(),
+                Proposal::AppDataUpdate(update)
+                    if update.component_id() == GROUP_LIFECYCLE_COMPONENT_ID
+            )
+        }) {
+            return Err(EngineError::Other(
+                "commit is invalid: redundant lifecycle update".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if !before_required || !after_required {
+        return Err(EngineError::Other(
+            "commit is invalid: disband requires lifecycle-v1 in the parent and result".into(),
+        ));
+    }
+
+    let committer = group
+        .member_at(committer_index)
+        .ok_or_else(|| EngineError::Other("commit is invalid: committer leaf is absent".into()))?;
+    let committer_id = crate::identity::validated_member_id(&committer.credential)?;
+    let committer_admin = admin_pubkey_from_member_id(&committer_id)?;
+    let mut lifecycle_updates = 0usize;
+    let mut admin_updates = 0usize;
+    let mut removed = BTreeSet::new();
+
+    for queued in staged.queued_proposals() {
+        if queued.proposal_or_ref_type() != ProposalOrRefType::Proposal {
+            return Err(EngineError::Other(
+                "commit is invalid: every disband proposal must be inline".into(),
+            ));
+        }
+        match queued.proposal() {
+            Proposal::Remove(remove) => {
+                removed.insert(remove.removed().u32());
+            }
+            Proposal::AppDataUpdate(update)
+                if update.component_id() == GROUP_LIFECYCLE_COMPONENT_ID =>
+            {
+                let AppDataUpdateOperation::Update(data) = update.operation() else {
+                    return Err(EngineError::Other(
+                        "commit is invalid: lifecycle component cannot be removed".into(),
+                    ));
+                };
+                if decode_group_lifecycle_v1(data.as_slice()).map_err(|error| {
+                    EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+                })? != GroupLifecycleV1::Disbanded
+                {
+                    return Err(EngineError::Other(
+                        "commit is invalid: terminal lifecycle update is not Disbanded".into(),
+                    ));
+                }
+                lifecycle_updates += 1;
+            }
+            Proposal::AppDataUpdate(update)
+                if update.component_id() == GROUP_ADMIN_POLICY_COMPONENT_ID =>
+            {
+                let AppDataUpdateOperation::Update(data) = update.operation() else {
+                    return Err(EngineError::Other(
+                        "commit is invalid: disband must replace the admin policy".into(),
+                    ));
+                };
+                if decode_admin_policy(data.as_slice())? != vec![committer_admin] {
+                    return Err(EngineError::Other(
+                        "commit is invalid: disband admin policy must contain only the committer"
+                            .into(),
+                    ));
+                }
+                admin_updates += 1;
+            }
+            _ => {
+                return Err(EngineError::Other(
+                    "commit is invalid: disband contains a forbidden proposal".into(),
+                ));
+            }
+        }
+    }
+    if lifecycle_updates != 1 || admin_updates != 1 {
+        return Err(EngineError::Other(
+            "commit is invalid: disband needs exactly one lifecycle and one admin-policy update"
+                .into(),
+        ));
+    }
+
+    let expected: BTreeSet<u32> = group
+        .members()
+        .filter_map(|member| (member.index != committer_index).then_some(member.index.u32()))
+        .collect();
+    if removed != expected {
+        return Err(EngineError::Other(
+            "commit is invalid: disband must remove every source-state leaf except the committer"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_current_profile_group_context(
+    extensions: &Extensions<GroupContext>,
+    context: &str,
+) -> Result<AppComponentSet, EngineError> {
+    let required = extensions.required_capabilities().ok_or_else(|| {
+        EngineError::Other(format!(
+            "invalid current-profile {context}: missing required_capabilities"
+        ))
+    })?;
+    if !CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS
+        .iter()
+        .all(|extension_type| {
+            required
+                .extension_types()
+                .contains(&ExtensionType::from(*extension_type))
+        })
+    {
+        return Err(EngineError::Other(format!(
+            "invalid current-profile {context}: app_data_dictionary is not a required extension"
+        )));
+    }
+    if !CURRENT_PROFILE_REQUIRED_PROPOSALS
+        .iter()
+        .all(|proposal_type| {
+            required
+                .proposal_types()
+                .contains(&ProposalType::from(*proposal_type))
+        })
+    {
+        return Err(EngineError::Other(format!(
+            "invalid current-profile {context}: app_data_update is not a required proposal"
+        )));
+    }
+
+    let dictionary = extensions.app_data_dictionary().ok_or_else(|| {
+        EngineError::Other(format!(
+            "invalid current-profile {context}: missing app_data_dictionary"
+        ))
+    })?;
+    let required_components = required_app_components_of_extensions(extensions, context)?;
+    if required_components.contains(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID)
+        || dictionary
+            .dictionary()
+            .contains(&GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID)
+    {
+        return Err(EngineError::Other(format!(
+            "invalid current-profile {context}: frozen encrypted-media V1 component \
+             {GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID:#06x} is not permitted"
+        )));
+    }
+    for mandatory in CURRENT_PROFILE_REQUIRED_APP_COMPONENTS {
+        if !required_components.contains(mandatory) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: missing mandatory component requirement \
+                 {mandatory:#06x}"
+            )));
+        }
+    }
+    for component_id in CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS {
+        if dictionary.dictionary().contains(&component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: leaf-only account proof appears in GroupContext"
+            )));
+        }
+    }
+    for component_id in CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS {
+        if !dictionary.dictionary().contains(&component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: required component {component_id:#06x} \
+                 has no GroupContext state"
+            )));
+        }
+    }
+
+    for entry in dictionary.dictionary().entries() {
+        let component_id = entry.id();
+        if is_known_group_component(component_id) {
+            validate_app_component_update(&AppComponentData {
+                component_id,
+                data: entry.data().to_vec(),
+            })?;
+        }
+    }
+    for component_id in &required_components.ids {
+        if CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(component_id) {
+            continue;
+        }
+        if !is_known_group_component(*component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: unsupported required component \
+                 {component_id:#06x}"
+            )));
+        }
+        if !dictionary.dictionary().contains(component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: required component {component_id:#06x} \
+                 has no GroupContext state"
+            )));
+        }
+    }
+    Ok(required_components)
+}
+
+fn required_app_components_of_extensions(
+    extensions: &Extensions<GroupContext>,
+    context: &str,
+) -> Result<AppComponentSet, EngineError> {
+    let dictionary = extensions.app_data_dictionary().ok_or_else(|| {
+        EngineError::Other(format!("invalid {context}: missing app_data_dictionary"))
+    })?;
+    let bytes = dictionary
+        .dictionary()
+        .get(&APP_COMPONENTS_COMPONENT_ID)
+        .ok_or_else(|| {
+            EngineError::Other(format!(
+                "invalid {context}: missing app_components requirement list"
+            ))
+        })?;
+    let ids = decode_components_list(bytes).map_err(|error| {
+        EngineError::Serialize(format!("invalid {context} app_components: {error}"))
+    })?;
+    Ok(AppComponentSet::from(ids))
+}
+
+fn is_known_group_component(component_id: AppComponentId) -> bool {
+    matches!(
+        component_id,
+        APP_COMPONENTS_COMPONENT_ID
+            | SAFE_AAD_COMPONENT_ID
+            | GROUP_PROFILE_COMPONENT_ID
+            | GROUP_BLOSSOM_IMAGE_COMPONENT_ID
+            | GROUP_ADMIN_POLICY_COMPONENT_ID
+            | NOSTR_ROUTING_COMPONENT_ID
+            | GROUP_MESSAGE_RETENTION_COMPONENT_ID
+            | AGENT_TEXT_STREAM_QUIC_COMPONENT_ID
+            | GROUP_AVATAR_URL_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+            | GROUP_LIFECYCLE_COMPONENT_ID
+    )
+}
+
+pub(crate) fn ratchet_tree_nodes(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<Vec<Option<Node>>, EngineError> {
+    // RatchetTree intentionally keeps its node vector private. Its stable
+    // serde representation exposes the same public Node enum that MDK already
+    // uses for cold-path proof and capability validation.
+    let value = serde_json::to_value(tree)
+        .map_err(|error| EngineError::Backend(format!("export ratchet tree: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))
+}
+
+fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafNode>, EngineError> {
+    Ok(ratchet_tree_nodes(tree)?
+        .into_iter()
+        .filter_map(|node| match node {
+            Some(Node::LeafNode(leaf)) => Some(*leaf),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Deduplicated account identifiers for current leaves that have not yet
+/// advertised lifecycle-v1 support. The tree walk is leaf-precise, so sibling
+/// devices cannot be hidden by the account-keyed capability cache.
+pub(crate) fn lifecycle_support_blockers(group: &MlsGroup) -> Result<Vec<MemberId>, EngineError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut blockers = Vec::new();
+    for leaf in ratchet_tree_leaves(group.export_ratchet_tree())? {
+        if !app_components_of_leaf(&leaf)?.contains(GROUP_LIFECYCLE_COMPONENT_ID) {
+            let member = crate::identity::validated_member_id_of_leaf(&leaf)?;
+            if seen.insert(member.clone()) {
+                blockers.push(member);
+            }
+        }
+    }
+    Ok(blockers)
+}
+
+fn indexed_ratchet_tree_leaves(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<BTreeMap<u32, LeafNode>, EngineError> {
+    let mut leaves = BTreeMap::new();
+    for (node_index, node) in ratchet_tree_nodes(tree)?.into_iter().enumerate() {
+        if let Some(Node::LeafNode(leaf)) = node {
+            let leaf_index = u32::try_from(node_index / 2)
+                .map_err(|_| EngineError::Backend("ratchet tree index overflow".into()))?;
+            leaves.insert(leaf_index, *leaf);
+        }
+    }
+    Ok(leaves)
+}
+
+fn conceptual_resulting_leaves(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+) -> Result<Vec<LeafNode>, EngineError> {
+    let mut leaves = indexed_ratchet_tree_leaves(group.export_ratchet_tree())?;
+    for remove in staged.remove_proposals() {
+        leaves.remove(&remove.remove_proposal().removed().u32());
+    }
+    for queued in staged.queued_proposals() {
+        if matches!(queued.proposal(), Proposal::SelfRemove)
+            && let Sender::Member(index) = queued.sender()
+        {
+            leaves.remove(&index.u32());
+        }
+    }
+    for update in staged.update_proposals() {
+        let Sender::Member(index) = update.sender() else {
+            return Err(EngineError::Other(
+                "invalid resulting group state: Update has no member sender".into(),
+            ));
+        };
+        leaves.insert(index.u32(), update.update_proposal().leaf_node().clone());
+    }
+    if let Some(path_leaf) = staged.update_path_leaf_node() {
+        leaves.insert(committer_index.u32(), path_leaf.clone());
+    }
+    let mut result = leaves.into_values().collect::<Vec<_>>();
+    result.extend(
+        staged
+            .add_proposals()
+            .map(|add| add.add_proposal().key_package().leaf_node().clone()),
+    );
+    Ok(result)
+}
+
+fn validate_resulting_leaf_capabilities<'a>(
+    leaves: impl Iterator<Item = &'a LeafNode>,
+    extensions: &Extensions<GroupContext>,
+    required_components: &AppComponentSet,
+) -> Result<(), EngineError> {
+    let required = extensions.required_capabilities().ok_or_else(|| {
+        EngineError::Other(
+            "invalid current-profile group state: missing required_capabilities".into(),
+        )
+    })?;
+    for leaf in leaves {
+        let capabilities = leaf.capabilities();
+        let supports_required = required
+            .extension_types()
+            .iter()
+            .all(|required| capabilities.extensions().contains(required))
+            && required
+                .proposal_types()
+                .iter()
+                .all(|required| capabilities.proposals().contains(required))
+            && required
+                .credential_types()
+                .iter()
+                .all(|required| capabilities.credentials().contains(required));
+        if !supports_required {
+            return Err(EngineError::Other(
+                "invalid current-profile resulting state: member lacks a required MLS capability"
+                    .into(),
+            ));
+        }
+        let advertised = app_components_of_leaf(leaf)?;
+        if !required_components.missing_from(&advertised).is_empty() {
+            return Err(EngineError::Other(
+                "invalid current-profile resulting state: member lacks a required app component"
+                    .into(),
+            ));
         }
     }
     Ok(())
@@ -457,15 +1338,13 @@ pub(crate) fn member_account_pubkeys(mls_group: &MlsGroup) -> BTreeSet<[u8; 32]>
 pub(crate) fn reject_admins_without_member_accounts(
     admins: &[[u8; 32]],
     member_accounts: &BTreeSet<[u8; 32]>,
-    group_id: &GroupId,
+    _group_id: &GroupId,
 ) -> Result<(), EngineError> {
     if admins.is_empty() {
         return Ok(());
     }
     if admins.iter().any(|admin| !member_accounts.contains(admin)) {
-        return Err(EngineError::Other(format!(
-            "admin key has no member leaf (group {group_id:?})"
-        )));
+        return Err(EngineError::Other("admin key has no member leaf".into()));
     }
     Ok(())
 }
@@ -599,20 +1478,11 @@ pub(crate) fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], Eng
 }
 
 pub(crate) fn encode_group_profile(name: &str, description: &str) -> Result<Vec<u8>, EngineError> {
-    if name.len() > 256 {
-        return Err(EngineError::Other(
-            "group profile name must be at most 256 UTF-8 bytes".into(),
-        ));
-    }
-    if description.len() > 4096 {
-        return Err(EngineError::Other(
-            "group profile description must be at most 4096 UTF-8 bytes".into(),
-        ));
-    }
-    Ok(encode_component_vectors(&[
-        name.as_bytes(),
-        description.as_bytes(),
-    ]))
+    encode_group_profile_v1(&GroupProfileV1 {
+        name: name.to_owned(),
+        description: description.to_owned(),
+    })
+    .map_err(EngineError::Other)
 }
 
 pub(crate) fn encode_admin_policy(admins: &[[u8; 32]]) -> Result<Vec<u8>, EngineError> {
@@ -681,6 +1551,7 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
     match component.component_id {
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
+        | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
         | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
@@ -692,37 +1563,155 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
         GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
         AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
-        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+            validate_encrypted_media_policy_v1(&component.data)
+        }
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+            validate_encrypted_media_policy_v2(&component.data)
+        }
         _ => Ok(()),
     }
+}
+
+/// Validate every known component in a complete GroupContext dictionary.
+/// Unknown optional components remain opaque and are intentionally accepted.
+pub(crate) fn validate_app_component_dictionary(mls_group: &MlsGroup) -> Result<(), EngineError> {
+    let Some(dictionary) = mls_group.extensions().app_data_dictionary() else {
+        return Ok(());
+    };
+    for entry in dictionary.dictionary().entries() {
+        validate_app_component_bytes(entry.id(), entry.data())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_app_component_update(
     component: &AppComponentData,
 ) -> Result<(), EngineError> {
-    match component.component_id {
-        APP_COMPONENTS_COMPONENT_ID => decode_components_list(&component.data)
+    validate_app_component_bytes(component.component_id, &component.data)
+}
+
+fn validate_app_component_bytes(
+    component_id: AppComponentId,
+    data: &[u8],
+) -> Result<(), EngineError> {
+    match component_id {
+        APP_COMPONENTS_COMPONENT_ID => decode_components_list(data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid app_components component: {e}"))),
         SAFE_AAD_COMPONENT_ID => Err(EngineError::Other(
             "safe_aad group-component state is not supported yet".into(),
         )),
-        GROUP_PROFILE_COMPONENT_ID => decode_group_profile(&component.data).map(|_| ()),
-        GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(&component.data).map(|_| ()),
-        NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID => Err(EngineError::Other(
+            "account identity proof is LeafNode-only and cannot be updated in GroupContext".into(),
+        )),
+        GROUP_PROFILE_COMPONENT_ID => decode_group_profile(data).map(|_| ()),
+        GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(data).map(|_| ()),
+        NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid Nostr routing component: {e}"))),
-        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => validate_group_image(&component.data),
-        GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
-        GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
-        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
-        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
+        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => validate_group_image(data),
+        GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(data),
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(data),
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(data),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => validate_encrypted_media_policy_v1(data),
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => validate_encrypted_media_policy_v2(data),
+        GROUP_LIFECYCLE_COMPONENT_ID => {
+            decode_group_lifecycle_v1(data)
+                .map(|_| ())
+                .map_err(|error| {
+                    EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+                })
+        }
         _ => Ok(()),
     }
 }
 
-pub(crate) fn validate_app_component_remove(
+/// Validate all AppDataUpdate operations in one Commit as a batch.
+///
+/// Removal legality is evaluated against the resulting `app_components`
+/// requirement list, not the parent epoch's list. That permits the spec's
+/// atomic "unrequire and remove" operation while still failing closed if the
+/// resulting epoch requires a component whose GroupContext data is removed.
+pub(crate) fn validate_app_data_update_batch<'a>(
     mls_group: &MlsGroup,
+    updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
+) -> Result<(), EngineError> {
+    validate_app_data_update_batch_against(required_app_components_of_group(mls_group)?, updates)
+}
+
+/// Validate the parts of an AppDataUpdate operation that are decidable before
+/// a Commit supplies the complete proposal batch.
+///
+/// A standalone removal can be valid only together with another proposal that
+/// un-requires the component in the same Commit. Therefore proposal admission
+/// checks the operation's intrinsic encoding/removability here and defers the
+/// resulting required-component rule to [`validate_app_data_update_batch`].
+fn validate_standalone_app_data_update(update: &AppDataUpdateProposal) -> Result<(), EngineError> {
+    match update.operation() {
+        AppDataUpdateOperation::Update(data) => validate_app_component_update(&AppComponentData {
+            component_id: update.component_id(),
+            data: data.as_slice().to_vec(),
+        }),
+        AppDataUpdateOperation::Remove => validate_app_component_remove_against(
+            &AppComponentSet::default(),
+            update.component_id(),
+        ),
+    }
+}
+
+fn validate_app_data_update_batch_against<'a>(
+    mut resulting_required: AppComponentSet,
+    updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
+) -> Result<(), EngineError> {
+    let updates = updates.into_iter().collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+
+    for update in &updates {
+        if !seen.insert(update.component_id()) {
+            return Err(EngineError::Other(format!(
+                "commit contains multiple AppDataUpdate operations for component {:#06x}",
+                update.component_id()
+            )));
+        }
+        if update.component_id() == APP_COMPONENTS_COMPONENT_ID {
+            match update.operation() {
+                AppDataUpdateOperation::Update(data) => {
+                    resulting_required = AppComponentSet::from(
+                        decode_components_list(data.as_slice()).map_err(|error| {
+                            EngineError::Serialize(format!(
+                                "invalid app_components component: {error}"
+                            ))
+                        })?,
+                    );
+                }
+                AppDataUpdateOperation::Remove => {
+                    return Err(EngineError::Other(
+                        "app_components component cannot be removed".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    for update in updates {
+        match update.operation() {
+            AppDataUpdateOperation::Update(data) => {
+                validate_app_component_update(&AppComponentData {
+                    component_id: update.component_id(),
+                    data: data.as_slice().to_vec(),
+                })?;
+            }
+            AppDataUpdateOperation::Remove => {
+                validate_app_component_remove_against(&resulting_required, update.component_id())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_app_component_remove_against(
+    resulting_required: &AppComponentSet,
     component_id: AppComponentId,
 ) -> Result<(), EngineError> {
     if component_id == APP_COMPONENTS_COMPONENT_ID {
@@ -735,7 +1724,12 @@ pub(crate) fn validate_app_component_remove(
             "safe_aad group-component state is not supported yet".into(),
         ));
     }
-    if required_app_components_of_group(mls_group)?.contains(component_id) {
+    if component_id == GROUP_LIFECYCLE_COMPONENT_ID {
+        return Err(EngineError::Other(
+            "group lifecycle component cannot be removed".into(),
+        ));
+    }
+    if resulting_required.contains(component_id) {
         return Err(EngineError::Other(
             "required Marmot app components cannot be removed".into(),
         ));
@@ -750,38 +1744,9 @@ fn validate_group_avatar_url(bytes: &[u8]) -> Result<(), EngineError> {
 }
 
 fn validate_group_image(bytes: &[u8]) -> Result<(), EngineError> {
-    let mut cursor = bytes;
-    let image_hash = decode_var_bytes(&mut cursor, 32, "group image hash")?;
-    let image_key = decode_var_bytes(&mut cursor, 32, "group image key")?;
-    let image_nonce = decode_var_bytes(&mut cursor, 12, "group image nonce")?;
-    let image_upload_key = decode_var_bytes(&mut cursor, 32, "group image upload key")?;
-    let media_type = decode_var_bytes(&mut cursor, 128, "group image media type")?;
-    if !cursor.is_empty() {
-        return Err(EngineError::Serialize(
-            "group image component has trailing bytes".into(),
-        ));
-    }
-    let present = !image_hash.is_empty()
-        || !image_key.is_empty()
-        || !image_nonce.is_empty()
-        || !image_upload_key.is_empty()
-        || !media_type.is_empty();
-    if !present {
-        return Ok(());
-    }
-    if image_hash.len() != 32
-        || image_key.len() != 32
-        || image_nonce.len() != 12
-        || image_upload_key.len() != 32
-        || media_type.is_empty()
-    {
-        return Err(EngineError::Serialize(
-            "group image component has invalid partial state".into(),
-        ));
-    }
-    std::str::from_utf8(&media_type)
-        .map_err(|e| EngineError::Serialize(format!("group image media type is not UTF-8: {e}")))?;
-    Ok(())
+    decode_group_blossom_image_v1(bytes)
+        .map(|_| ())
+        .map_err(|e| EngineError::Serialize(format!("invalid group image component: {e}")))
 }
 
 /// Whether avatar/image component bytes encode a *present* avatar. An empty
@@ -800,22 +1765,7 @@ pub(crate) fn avatar_component_present(component_id: AppComponentId, bytes: &[u8
 }
 
 fn group_image_present(bytes: &[u8]) -> bool {
-    let mut cursor = bytes;
-    let mut next = |max, label| decode_var_bytes(&mut cursor, max, label).ok();
-    let (Some(hash), Some(key), Some(nonce), Some(upload_key), Some(media_type)) = (
-        next(32, "group image hash"),
-        next(32, "group image key"),
-        next(12, "group image nonce"),
-        next(32, "group image upload key"),
-        next(128, "group image media type"),
-    ) else {
-        return true;
-    };
-    !hash.is_empty()
-        || !key.is_empty()
-        || !nonce.is_empty()
-        || !upload_key.is_empty()
-        || !media_type.is_empty()
+    decode_group_blossom_image_v1(bytes).map_or(true, |image| image.is_present())
 }
 
 pub(crate) fn decode_message_retention(bytes: &[u8]) -> Result<u64, EngineError> {
@@ -841,41 +1791,56 @@ fn validate_agent_text_stream_policy(bytes: &[u8]) -> Result<(), EngineError> {
         .map_err(|e| EngineError::Serialize(format!("invalid agent text stream component: {e}")))
 }
 
-fn validate_encrypted_media_policy(bytes: &[u8]) -> Result<(), EngineError> {
+fn validate_encrypted_media_policy_v1(bytes: &[u8]) -> Result<(), EngineError> {
     decode_encrypted_media_policy_v1(bytes)
         .map(|_| ())
-        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media component: {e}")))
+        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media V1 component: {e}")))
 }
 
-fn decode_var_bytes(
-    cursor: &mut &[u8],
-    max_len: usize,
-    label: &str,
-) -> Result<Vec<u8>, EngineError> {
-    let (len, prefix_len) = decode_quic_varint(cursor)
-        .map_err(|e| EngineError::Serialize(format!("{label} length decode failed: {e}")))?;
-    let len = usize::try_from(len)
-        .map_err(|_| EngineError::Serialize(format!("{label} length is too large")))?;
-    if len > max_len {
-        return Err(EngineError::Serialize(format!(
-            "{label} exceeds maximum length"
-        )));
-    }
-    let end = prefix_len
-        .checked_add(len)
-        .ok_or_else(|| EngineError::Serialize(format!("{label} length overflow")))?;
-    if cursor.len() < end {
-        return Err(EngineError::Serialize(format!("{label} is truncated")));
-    }
-    let bytes = cursor[prefix_len..end].to_vec();
-    *cursor = &cursor[end..];
-    Ok(bytes)
+fn validate_encrypted_media_policy_v2(bytes: &[u8]) -> Result<(), EngineError> {
+    decode_encrypted_media_policy_v2(bytes)
+        .map(|_| ())
+        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media V2 component: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cgka_traits::app_components::default_group_components;
+    use openmls::extensions::RequiredCapabilitiesExtension;
+
+    fn current_profile_extensions(
+        required_components: impl IntoIterator<Item = AppComponentId>,
+        include_admin_state: bool,
+        include_leaf_only_proof_state: bool,
+        required_extensions: &[ExtensionType],
+        required_proposals: &[ProposalType],
+    ) -> Extensions<GroupContext> {
+        let required_components = required_components.into_iter().collect();
+        let mut dictionary = AppDataDictionary::new();
+        dictionary.insert(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(&required_components),
+        );
+        if include_admin_state {
+            dictionary.insert(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                encode_admin_policy(&[[1; 32]]).unwrap(),
+            );
+        }
+        if include_leaf_only_proof_state {
+            dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, vec![0; 104]);
+        }
+        Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                required_extensions,
+                required_proposals,
+                &[],
+            )),
+            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+        ])
+        .unwrap()
+    }
 
     /// Build the group-creation `app_data_dictionary` for `required` with no
     /// initial component bytes, then assert that every entry the engine writes
@@ -888,6 +1853,7 @@ mod tests {
             description: "desc".to_string(),
             admins: vec![[7u8; 32]],
             app_components: Vec::new(),
+            optional_app_components: Vec::new(),
         };
         let ext = app_data_dictionary_extension_for_group(&required, &initial)
             .expect("creation dictionary should build");
@@ -935,7 +1901,7 @@ mod tests {
         let mut supported = AppComponentSet::from(default_group_components());
         supported.insert(NOSTR_ROUTING_COMPONENT_ID);
 
-        let ext = leaf_app_components_extension(&supported).unwrap();
+        let ext = leaf_app_components_extension(&supported, None).unwrap();
         let Extension::AppDataDictionary(ext) = ext else {
             panic!("expected an AppDataDictionary extension");
         };
@@ -972,6 +1938,7 @@ mod tests {
             description: "desc".to_string(),
             admins: vec![[7u8; 32]],
             app_components: Vec::new(),
+            optional_app_components: Vec::new(),
         };
 
         let ext = app_data_dictionary_extension_for_group(&required, &initial)
@@ -998,6 +1965,31 @@ mod tests {
     }
 
     #[test]
+    fn blossom_image_requires_canonical_media_type() {
+        let component = |media_type: &[u8]| {
+            encode_component_vectors(&[&[1u8; 32], &[2u8; 32], &[3u8; 12], &[4u8; 32], media_type])
+        };
+
+        for canonical in [b"image/png".as_slice(), b"image/jpeg".as_slice()] {
+            validate_group_image(&component(canonical)).expect("canonical media type");
+        }
+        for non_canonical in [
+            b"Image/PNG".as_slice(),
+            b"image/png; charset=utf-8".as_slice(),
+            b"image/jpg".as_slice(),
+            b" image/png ".as_slice(),
+            b"image/png/extra".as_slice(),
+            b"image/(png)".as_slice(),
+        ] {
+            assert!(
+                validate_group_image(&component(non_canonical)).is_err(),
+                "non-canonical media type {:?} must be rejected",
+                String::from_utf8_lossy(non_canonical)
+            );
+        }
+    }
+
+    #[test]
     fn absent_blossom_image_is_five_empty_fields() {
         // The canonical absent encoding is five zero-length var-bytes fields:
         // 5 bytes of 0x00, not an empty Vec.
@@ -1014,5 +2006,273 @@ mod tests {
         assert_eq!(decode_message_retention(&42u64.to_be_bytes()).unwrap(), 42);
         assert_eq!(decode_message_retention(&0u64.to_be_bytes()).unwrap(), 0);
         assert!(decode_message_retention(&[0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn admin_policy_validation_error_does_not_display_group_id() {
+        let secret_group_id = GroupId::new(vec![0xA5; 32]);
+        let error = reject_admins_without_member_accounts(
+            &[[0x11; 32]],
+            &BTreeSet::new(),
+            &secret_group_id,
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().contains(&hex::encode([0xA5; 32])));
+    }
+
+    #[test]
+    fn app_data_update_batch_rejects_duplicate_component_operations() {
+        let updates = [
+            AppDataUpdateProposal::update(GROUP_PROFILE_COMPONENT_ID, vec![0, 0]),
+            AppDataUpdateProposal::remove(GROUP_PROFILE_COMPONENT_ID),
+        ];
+
+        let error =
+            validate_app_data_update_batch_against(AppComponentSet::default(), updates.iter())
+                .expect_err("one operation per component id");
+
+        assert!(error.to_string().contains("multiple AppDataUpdate"));
+    }
+
+    #[test]
+    fn app_data_update_batch_allows_atomic_unrequire_and_remove() {
+        let initial = AppComponentSet::new([
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ]);
+        let resulting = [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID]
+            .into_iter()
+            .collect();
+        let updates = [
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&resulting),
+            ),
+            AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
+        ];
+
+        validate_app_data_update_batch_against(initial, updates.iter())
+            .expect("the component is optional in the resulting epoch");
+    }
+
+    #[test]
+    fn standalone_app_data_remove_defers_batch_dependent_requirement_check() {
+        let optional_remove = AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        validate_standalone_app_data_update(&optional_remove)
+            .expect("a later commit may atomically unrequire and remove the component");
+
+        let intrinsic_remove = AppDataUpdateProposal::remove(APP_COMPONENTS_COMPONENT_ID);
+        validate_standalone_app_data_update(&intrinsic_remove)
+            .expect_err("app_components can never be removed");
+    }
+
+    #[test]
+    fn app_data_update_batch_rejects_removing_resulting_required_component() {
+        let initial = AppComponentSet::new([
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ]);
+        let updates = [AppDataUpdateProposal::remove(
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        )];
+
+        let error = validate_app_data_update_batch_against(initial, updates.iter())
+            .expect_err("required state must remain present");
+
+        assert!(error.to_string().contains("required Marmot app components"));
+    }
+
+    #[test]
+    fn current_profile_group_context_requires_the_complete_mandatory_set() {
+        struct Case {
+            label: &'static str,
+            components: Vec<AppComponentId>,
+            admin_state: bool,
+            proof_state: bool,
+            extensions: Vec<ExtensionType>,
+            proposals: Vec<ProposalType>,
+            expected_error: &'static str,
+        }
+        let mandatory = vec![
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ];
+        let cases = [
+            Case {
+                label: "missing admin requirement",
+                components: vec![ACCOUNT_IDENTITY_PROOF_COMPONENT_ID],
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "0x8003",
+            },
+            Case {
+                label: "missing proof requirement",
+                components: vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "0x8009",
+            },
+            Case {
+                label: "missing admin state",
+                components: mandatory.clone(),
+                admin_state: false,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "has no GroupContext state",
+            },
+            Case {
+                label: "proof incorrectly in GroupContext",
+                components: mandatory.clone(),
+                admin_state: true,
+                proof_state: true,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "leaf-only account proof",
+            },
+            Case {
+                label: "unknown required component",
+                components: vec![
+                    GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+                    0xF301,
+                ],
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "unsupported required component 0xf301",
+            },
+            Case {
+                label: "missing dictionary capability",
+                components: mandatory.clone(),
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "not a required extension",
+            },
+            Case {
+                label: "missing update capability",
+                components: mandatory,
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![],
+                expected_error: "not a required proposal",
+            },
+        ];
+
+        for case in cases {
+            let extensions = current_profile_extensions(
+                case.components,
+                case.admin_state,
+                case.proof_state,
+                &case.extensions,
+                &case.proposals,
+            );
+            let error = validate_current_profile_group_context(&extensions, case.label)
+                .expect_err(case.label);
+            assert!(
+                error.to_string().contains(case.expected_error),
+                "{}: {error}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn current_profile_group_context_preserves_unknown_optional_state() {
+        let mut extensions = current_profile_extensions(
+            [
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+            ],
+            true,
+            false,
+            &[ExtensionType::AppDataDictionary],
+            &[ProposalType::AppDataUpdate],
+        );
+        let mut dictionary = extensions
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .clone();
+        dictionary.insert(0xF301, vec![0xde, 0xad, 0xbe, 0xef]);
+        extensions = Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(extensions.required_capabilities().unwrap().clone()),
+            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+        ])
+        .unwrap();
+
+        validate_current_profile_group_context(&extensions, "test")
+            .expect("unknown optional component state is opaque");
+    }
+
+    #[test]
+    fn current_profile_rejects_frozen_encrypted_media_v1() {
+        let extensions = current_profile_extensions(
+            [
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            ],
+            true,
+            false,
+            &[ExtensionType::AppDataDictionary],
+            &[ProposalType::AppDataUpdate],
+        );
+        let error = validate_current_profile_group_context(&extensions, "test").unwrap_err();
+        assert!(
+            error.to_string().contains("encrypted-media V1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn encrypted_media_component_ids_do_not_reinterpret_each_others_bytes() {
+        let v1 = cgka_traits::app_components::EncryptedMediaPolicyV1::blossom_default(
+            ["https://blossom.primal.net".to_owned()],
+            false,
+        )
+        .unwrap();
+        let v1 = cgka_traits::app_components::encode_encrypted_media_policy_v1(&v1).unwrap();
+        let v2 = cgka_traits::app_components::EncryptedMediaPolicyV2::blossom_default([
+            "https://blossom.primal.net".to_owned(),
+        ])
+        .unwrap();
+        let v2 = cgka_traits::app_components::encode_encrypted_media_policy_v2(&v2).unwrap();
+
+        validate_initial_app_component(&AppComponentData {
+            component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            data: v1.clone(),
+        })
+        .unwrap();
+        validate_initial_app_component(&AppComponentData {
+            component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            data: v2.clone(),
+        })
+        .unwrap();
+        assert!(
+            validate_initial_app_component(&AppComponentData {
+                component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                data: v2,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_initial_app_component(&AppComponentData {
+                component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                data: v1,
+            })
+            .is_err()
+        );
     }
 }

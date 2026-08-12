@@ -123,7 +123,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker
 
 - **Module:** `account_identity_proof.rs`
-  - **Owns:** the Marmot account identity-proof LeafNode extension binding the account key to the MLS signature key
+  - **Owns:** legacy account identity-proof LeafNode extension plus the current app-data component; proof
+    construction/validation and strict legacy/current profile classification (including mixed-profile rejection)
 
 - **Module:** `app_payload.rs`
   - **Owns:** `validate_app_payload_for_sender` — `MarmotAppEvent` sender validation for application messages
@@ -136,6 +137,15 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 
 - **Module:** `convergence.rs`
   - **Owns:** the candidate-state-graph deterministic branch-selection policy
+
+- **Module:** `convergence_input.rs`
+  - **Owns:** role-aware convergence scheduling classification that distinguishes commit edges, proposal
+    dependencies, and potential application-message witnesses for pass opening, quiescence, and outbound gating
+
+- **Module:** `conformance_snapshot.rs` (feature `test-conformance-snapshot`)
+  - **Owns:** privacy-safe exact canonical-state (live MLS state or authenticated terminal disband tombstone) and
+    aggregate pending-work projections consumed only by the conformance simulator. Terminal equality excludes
+    device-local authorship metadata. These diagnostics never feed protocol selection or production telemetry.
 
 - **Module:** `distributed_convergence.rs`
   - **Owns:** the engine entry point for stored-message distributed convergence
@@ -159,10 +169,12 @@ These are the load-bearing departures from the original plan. Each is also docum
    mechanical churn with zero functional value. Site: `crates/traits/src/storage.rs` (`StorageProvider` aggregate with
    `type Mls` / `fn mls_storage`).
 
-2. **`SendResult::GroupCreated { welcomes, pending }` is its own variant.** `GroupEvolution` carries a
-   `msg: TransportMessage` that has no consumer at create-time (every other initial member arrives via welcome with
-   post-commit state). Splitting the variant also eliminates a welcome-before-commit `AlreadyAtEpoch` bounce at
-   creation. Site: `crates/traits/src/engine.rs::SendResult`.
+2. **Founding creation never invents a group-message publication.** Current-profile creation returns
+   `SendResult::FoundingGroupCreated { welcomes }`: the epoch-0 group and optional founding Add are already canonical,
+   and each Welcome is an independent delivery obligation. The temporary explicit-legacy path retains
+   `SendResult::GroupCreated { welcomes, pending }`. Neither variant carries a `msg: TransportMessage`, because every
+   initial invitee arrives through a Welcome containing the post-Add state. Site:
+   `crates/traits/src/engine.rs::SendResult`.
 
 3. **`CreateGroupRequest::initial_admins: Vec<MemberId>`.** Bootstraps multi-admin groups so admins can subsequently
    self-remove (MIP-03 §149's "not the last admin" constraint). Creator is implicitly an admin; `initial_admins` adds
@@ -203,11 +215,12 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     group id into an 8-byte digest instead of hex-encoding the full id.
   - **Test:** `tests/snapshot_privacy.rs`
 
-- **Item:** **S2** `Resolving` convergence status emission
-  - **What changed:** `canonicalization::convergence_status_for_result` now emits `Resolving` when the input window has
-    closed but a pending message did not receive a disposition this pass (e.g. a child commit waiting for its parent).
-    `Settled` strictly requires fixed-point.
-  - **Test:** `quiescence_with_orphan_commit_in_input_is_resolving` in
+- **Item:** **S2** Explicit frozen-batch deferral
+  - **What changed:** every admitted message receives a current disposition. A child commit missing its parent from the
+    frozen batch is explicitly `deferred`, and the completed pass reaches its local fixed point instead of returning
+    `Resolving`. Deferred rows remain replayable when later evidence opens another pass, but do not immediately reopen
+    the unchanged completed pass.
+  - **Test:** `frozen_batch_defers_orphan_commit_and_settles_at_fixed_point` in
     `crates/cgka-conformance-simulator/tests/canonicalization_contract.rs`
 
 - **Item:** **S3** Unattributable application messages
@@ -236,11 +249,13 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     (`BeyondAnchor`, `LosingBranch`, `BeyondAppRetention`, dropped) and only `Buffered` for retryable cases
     (`UndecryptableInCanonicalState` for future-epoch app messages). The stored-convergence persistence path
     (`openmls_projection::persist_openmls_canonicalization_dispositions`) honours the same split: a
-    `UndecryptableInCanonicalState` app message is persisted `Retryable` (not terminal `EpochInvalidated`), and
-    `distributed_convergence` neither marks it seen nor emits `AppMessageInvalidated`, so it re-enters convergence
-    once the awaited commit advances the epoch (mdk#144).
+    future-epoch `UndecryptableInCanonicalState` app message is persisted `Retryable` (not terminal
+    `EpochInvalidated`), and `distributed_convergence` neither marks it seen nor emits `AppMessageInvalidated`, so it
+    re-enters convergence once the awaited commit advances the epoch (mdk#144). At or below the resulting tip, the
+    same reason is terminal and does emit the invalidation (mdk#995).
   - **Test:** covered by distributed-convergence integration tests, incl.
-    `future_epoch_app_message_stays_retryable_until_commit_arrives`
+    `future_epoch_app_message_stays_retryable_until_commit_arrives` and
+    `terminal_undecryptable_app_emits_invalidation_without_message_received`
 
 - **Item:** **Sm3** Capability-cache self-id assertion
   - **What changed:** `cache_self_capabilities` now errors with `EngineError::Backend` if `MlsGroup::own_leaf_node()`
@@ -298,11 +313,13 @@ Admin-policy and routing-component updates are deliberately out of scope. Tests 
 
 ### Done — Task 4.13 publish-before-apply (2026-04-25)
 
-`do_create_group` / `do_send_invite` / `do_upgrade_group_capabilities` / auto-commit stage their commits and defer merge
-until `CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` +
-Marmot re-derive from the still-unmerged group. The Marmot record holds _projected post-merge_ `members` so `members()`
-and `feature_status` reflect the pending group evolution during `PendingPublish`. See `tests/publish_lifecycle.rs` and
-`tests/invite_leave.rs` for the contract.
+`do_send_invite` / `do_upgrade_group_capabilities` / auto-commit stage their commits and defer merge until
+`CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` + Marmot
+re-derive from the still-unmerged group. Current-profile `do_create_group` is the founding exception: it atomically
+makes epoch 0 and the optional founding Add canonical locally, publishes no ordinary group commit, and persists each
+Welcome as independent retryable work. The temporary explicit-legacy create path retains the older pending behavior.
+For pending evolutions, the Marmot record holds _projected post-merge_ `members` so `members()` and `feature_status`
+reflect the pending change. See `tests/publish_lifecycle.rs`, `tests/group_creation.rs`, and `tests/invite_leave.rs`.
 
 OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>` (`mod.rs:353`),
 `StagedCommit::export_secret` (`staged_commit.rs:778`, identical signature to `MlsGroup::export_secret`),
@@ -333,6 +350,35 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   terminal disposition). Fork-recovery paths fail closed with typed errors (`EngineError::ForkedEpoch` / `Backend`) —
   never `unreachable!`/`panic!` — on attacker-influenced input. When you add a guard to one seam, add it to the shared
   helper (or all seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
+- **Never derive durable terminal group state from unauthenticated inbound bytes.** "Fail closed" means refuse the
+  input, not punish the group. The `WrongEpoch` arm in `message_processor/ingest.rs` is the sharp case: OpenMLS raises
+  it from `validate_framing`, the FIRST statement of `decrypt_message`, strictly upstream of membership-tag and
+  signature verification — so the message's claimed epoch is raw attacker input there, and for a *past* epoch it is
+  unverifiable in principle (the membership key and the serialized group context that would authenticate it live in the
+  epoch snapshot this arm has already found missing). A durable `unrecoverable` marker written from that claim let any
+  member freeze a group with one fire-and-forget datagram. Retention, an audit row, and a scheduled convergence pass are
+  the correct response; the terminal verdict belongs to a seam that has authenticated material, which for missing
+  recovery material is the convergence coordinator's `MissingRetainedAnchor` halt. The same rule applies to durable
+  *inputs*: a stored row keyed by an unverified claimed epoch steers a later pass just as effectively as a flag. If a
+  hard stop is ever wanted for a genuine local anchor gap, evaluate that gap on a seam that reads no inbound bytes —
+  session open / per-group full hydration — not here.
+- **The retained rival stays pass-opening, so the verified repair must retire it.** The corollary of the rule above:
+  because ingest leaves the rival in `Created` for the coordinator to adjudicate, and the pass seeder re-derives every
+  retained commit's source epoch from its own wire bytes, an anchor-less rival keeps steering
+  `openmls_projection::historical_replay_start_epoch` (the `min` over unresolved rows) back into
+  `MissingRetainedAnchor`. Exiting the halt without evicting that input just re-halts the group on the next drain. The
+  eviction belongs to the authenticated Welcome join, which already discards this device's live MLS copy: alongside
+  `delete_convergence_pass`, `do_join_welcome` calls
+  `openmls_projection::retire_commits_superseded_by_replacement_welcome` in the same transaction, terminalizing
+  unresolved *commits* below the new copy's own `MlsGroup::epoch()`. Bound that retirement by locally derived
+  authenticated epochs only, keep it to commits (application messages from the prior interval may still decrypt, which
+  is why a replacement Welcome records `join_epoch = 0`), and do not move it to a seam that reads inbound claims.
+- **Commit-derived group records and capability caches are atomic with the MLS apply.** Every durable projection of
+  an accepted commit must share the transaction that mutates OpenMLS state, and every projection read/write error
+  must propagate. This includes the Marmot group record, capabilities extracted from added KeyPackages, and the
+  post-path self-capability refresh. On a failed direct apply, release its unowned recovery snapshot and schedule the
+  retained commit for stored convergence; redelivery deduplicates against the retained content row and cannot itself
+  repair the apply.
 - **Hydration quarantine is enforced through `Engine::ensure_group_live`.** A quarantined group vanishes from every
   live surface (mdk#364 / #365): every public accessor that reads durable or MLS group state (`members`,
   `group_record`, `group_context`, `admin_pubkeys`, `app_component`, `feature_status`, capability queries, the
@@ -343,6 +389,35 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.
+- **Two-phase hydration (mdk#1161): session open seeds, full hydration promotes.**
+  `hydrate_stable_groups_from_storage` is the cheap seed pass: per stored group it reads only the durable record —
+  no MLS load, snapshot list, or message scan — seeds a provisional `Stable(record.epoch)` entry so `live_group_ids`
+  keeps listing the group, restores disband/unrecoverable terminal state, seeds the inbound routing index from the
+  durable `transport_group_routes` table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
+  through the same `ensure_group_live` chokepoint with the retryable `GroupNotHydrated` (never a partial view);
+  `&mut` entry points (send, ingest, convergence drains) call `ensure_hydrated` first, which retracts the provisional
+  seed, runs the full per-group hydration, and on failure quarantines with exact open-time parity (including removing
+  the epoch entry — a quarantined group must never hold one). `hydrate_all_stored_groups` is the eager compatibility
+  path (seed + drain-all) used by `AccountDeviceSession::open` until the app-layer background pipeline lands, and it
+  drains every seeded group — including unrecoverable ones, whose halt re-emits from full hydration exactly once per
+  open. Durable route rows carry a `source_epoch` stamp refreshed at every commit apply: the seed trusts a group's
+  route set only when a stamp matches the record epoch (a lagging stamp means a crash or write failure between the
+  commit and the route refresh), and stale/route-less groups sit in `route_backfill_pending`. Ingest probes at most
+  `ROUTE_BACKFILL_PROBES_PER_MISS` pending groups per unknown route (bounded per event — mdk#408's O(groups)
+  amplification stays closed), removing an id only on successful indexing or the terminal no-routing-component
+  disposition; MLS-load failures stay owned by hydration/quarantine. Route refreshes also retire durable rows the
+  retained-history window (pinned v1 `max_rewind_commits`) has moved past, per routing-v1's overlap rule.
+- **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
+  Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
+  MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the
+  transaction that merges the commit (`publish::do_confirm_published`, the inbound apply in `message_processor/ingest.rs`)
+  or compensate the in-memory transition explicitly (`stage_auto_commit_for_queued_proposals`). A swallowed mirror error
+  splits the two stores silently and the split resurfaces as a wrong epoch on the next session open. Undoing the apply
+  is only half the obligation: where the failing seam sits behind fork resolution — whose side effects (released
+  incumbent snapshot, `EpochInvalidated` incumbent commit) cannot be compensated — it must also release the recovery
+  snapshot it created and hand the still-retained winning commit back to stored convergence via
+  `schedule_pending_convergence_group`. Otherwise the group parks one epoch behind holding a durable winner nothing
+  will ever apply.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They

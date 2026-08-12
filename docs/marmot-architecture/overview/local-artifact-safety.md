@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-07-02
+updated: 2026-08-08
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -43,6 +43,38 @@ restrictive-by-construction posture with an on-disk mode test) instead of re-der
 `crates/marmot-account/src/io.rs` (`write_file_atomically` with `FileMode::Private`) is a compliant-equivalent
 implementation that predates the shared crate.
 
+## Releasing artifacts before host suspension
+
+Creation posture is not the only thing a shared container polices. On iOS the Marmot root lives in an App Group
+container shared with the Notification Service Extension, and a process suspended while holding **any** file lock
+there is killed with `RUNNINGBOARD 0xdead10cc`. Two artifacts hold such a lock by design:
+
+- every SQLite connection in WAL mode, which holds a shared lock on its `-shm` sidecar for its entire lifetime, and
+- the root runtime lease (`.marmot-runtime.lock`), an advisory lock held for as long as any app/runtime handle lives.
+
+So a host needs an operation that ends those at a known instant and can be awaited. Dropping handles is not that
+operation: the databases live behind `Arc`s reachable from the engine, the OpenMLS adapter, and app projections at
+once, so no host can observe or await the last clone going away, and `shutdown()` takes `&self` and therefore cannot
+drop anything.
+
+**The rules:**
+
+- **Close, don't drop.** Every long-lived SQLite handle is built on `storage_sqlite::CloseableConnection`, which takes
+  the connection out of its slot, checkpoints (`PRAGMA wal_checkpoint(TRUNCATE)`), and closes it. Surviving clones then
+  fail with `StorageError::Closed` rather than panicking or keeping the file locked.
+- **Closing is terminal, and nothing reopens.** `MarmotApp::close_storage` latches, and every database accessor
+  refuses afterwards. A late background read that transparently reopened would re-lock the container the host was just
+  told is clear — the exact failure the close exists to prevent. Hosts construct a fresh runtime on resume.
+- **Drain, then close.** `MarmotAppRuntime::shutdown_and_close` is the sequenced entry point: workers stop first, so
+  databases close under quiesced state. Closing under live work stays *safe* — SQLite rolls back any open transaction
+  as part of closing, so a write is all-or-nothing across the cut — but it is not the intended path.
+- **Bail out at engine-step boundaries, not inside them.** Shutdown checks belong between whole engine operations
+  (`RuntimeLifecycle::is_stopping()` in the account worker's per-group loops), where no snapshot guard is live.
+  Interrupting *inside* a step can leave a `SnapshotRollbackGuard`'s window half-applied, which is worse than the kill.
+
+`StorageError::Closed` is deliberately its own variant, and non-transient: work racing a close must be reportable as
+"we shut down" rather than as a storage fault the user is shown.
+
 ## Deliberate exception
 
 The application root directory's mode is left as-is when it already exists: retroactively chmod-ing the root of
@@ -50,7 +82,8 @@ existing installs is a behavior change outside this policy's scope. File-level 0
 
 ## Scope
 
-This policy covers *creation-time* posture (permissions, creation ordering, mode parsing, PRAGMA-at-open). Handling
+This policy covers *creation-time* posture (permissions, creation ordering, mode parsing, PRAGMA-at-open) and the
+*release* posture above (closing connections and locks before host suspension). Handling
 of secret contents in memory, logs, and FFI is tracked separately under the sensitive-material discipline; tracing
 rules live in [`observability.md`](./observability.md).
 

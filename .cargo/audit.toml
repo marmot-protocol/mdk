@@ -1,0 +1,8 @@
+# `instant` is a wasm32-only dependency of nostr 0.44.6. Upstream removed it in
+# 706f0b7fb9d914432286860bd7117a887fb17ba1, but nostr 0.45.0-alpha.7 also
+# removes the object-safe NostrSigner API and turns notification lag into a
+# skipped stream item. MDK relies on both for its signer boundary and lag
+# recovery. Remove this ignore when MDK can migrate those two boundaries to a
+# stable 0.45 release. This is an unmaintained notice, not a vulnerability.
+[advisories]
+ignore = ["RUSTSEC-2024-0384"]

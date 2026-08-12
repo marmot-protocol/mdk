@@ -25,7 +25,8 @@ relay auth, or transport-specific relay discovery.
 - `error.rs` — `AccountError`/`AccountHomeError` enums and the `AccountResult`/`AccountHomeResult` aliases.
 - `home.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
 - `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
-- `keyring.rs` — platform keyring store init (per-OS `#[cfg]` cascade) and keyring-error mapping.
+- `keyring.rs` — platform keyring entry construction, iOS service versioning and secret writes, store init (per-OS
+  `#[cfg]` cascade), and keyring-error mapping.
 - `io.rs` — JSON read/write helpers, private-file writes, and account-label validation.
 - `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.

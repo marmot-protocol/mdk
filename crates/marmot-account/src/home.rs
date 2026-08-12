@@ -9,13 +9,14 @@ use std::fs;
 use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
-use crate::io::{read_json, validate_account_label, write_json};
+use crate::io::{read_json, validate_account_label, write_json, write_secret_json};
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
     scrub_and_remove_local_secret_file,
 };
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
+const ACCOUNT_SETUP_STATE_FILE: &str = ".account-setup.json";
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
 /// byte, never key material, so it is written with public file permissions.
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
@@ -82,6 +83,60 @@ pub struct AccountSummary {
     /// clears this flag.
     #[serde(default)]
     pub signed_out: bool,
+}
+
+/// Provenance for a strict Nostr private-key import used by account setup.
+///
+/// A live account record is never treated as idempotent by this flow. The
+/// only reusable state is an exact account-id-keyed signing credential whose
+/// filesystem account record is absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrAccountImport {
+    account: AccountSummary,
+    reused_account_id_credential: bool,
+}
+
+/// Durable provenance and progress for an account setup that has not committed.
+///
+/// This file is created with the account record and removed only after the app
+/// runtime has completed setup. It makes task cancellation and process death
+/// recoverable without treating the mere existence of `session.sqlite` as evidence
+/// that a KeyPackage was previously published.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSetupState {
+    pub account_id_hex: String,
+    pub reused_account_id_credential: bool,
+    #[serde(default)]
+    pub kind: AccountSetupKind,
+    pub phase: AccountSetupPhase,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSetupKind {
+    #[default]
+    ImportedIdentity,
+    GeneratedIdentity,
+    PublicIdentity,
+    ExternalSigner,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSetupPhase {
+    #[default]
+    LocalStateCreated,
+    /// Set before entering KeyPackage preparation/publication. If the task is
+    /// cancelled after this point, the SQLCipher lifecycle is authoritative:
+    /// exact signed bytes are persisted there before the first network send.
+    KeyPackagePublicationStarted,
+    KeyPackagePublicationConfirmed,
+}
+
+impl NostrAccountImport {
+    pub fn account(&self) -> &AccountSummary {
+        &self.account
+    }
 }
 
 impl AccountSummary {
@@ -157,6 +212,97 @@ impl AccountHome {
         self.write_signing_account(&keys)
     }
 
+    /// Create a generated identity with its setup journal durable before the
+    /// account becomes visible. A restart can therefore resume the same
+    /// identity instead of minting another one.
+    pub fn create_nostr_account_for_setup(&self) -> AccountHomeResult<AccountSummary> {
+        let keys = nostr::Keys::generate();
+        let account = AccountSummary {
+            label: keys.public_key().to_hex(),
+            account_id_hex: keys.public_key().to_hex(),
+            local_signing: true,
+            external_signing: false,
+            signed_out: false,
+        };
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_account_label(&account.label)?;
+        if self.account_record_path(&account.label).exists() {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        self.begin_account_setup_with(
+            &account,
+            false,
+            AccountSetupKind::GeneratedIdentity,
+            AccountSetupPhase::LocalStateCreated,
+        )?;
+        if let Err(err) = self.secret_store.write_secret(&account, &keys) {
+            let _ = self.secret_store.remove_secret(&account);
+            let _ = fs::remove_dir_all(self.account_dir(&account.label));
+            return Err(err);
+        }
+        if let Err(err) = self.write_account_record(&account) {
+            let _ = self.secret_store.remove_secret(&account);
+            let _ = fs::remove_dir_all(self.account_dir(&account.label));
+            return Err(err);
+        }
+        Ok(account)
+    }
+
+    /// Recover the one generated setup that did not yet remove its journal.
+    pub fn resumable_generated_account_setup(&self) -> AccountHomeResult<Option<AccountSummary>> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = self.accounts_dir();
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let mut entries = fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let Some(label) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(state) = self.raw_account_setup_state(&label)? else {
+                continue;
+            };
+            if state.kind != AccountSetupKind::GeneratedIdentity {
+                continue;
+            }
+            let account = AccountSummary {
+                label: label.clone(),
+                account_id_hex: state.account_id_hex,
+                local_signing: true,
+                external_signing: false,
+                signed_out: false,
+            };
+            if account.label != account.account_id_hex {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            if !self.account_record_path(&label).exists() {
+                let has_secret = self.secret_store.has_secret_for_label(&label)?
+                    || self
+                        .secret_store
+                        .has_secret_for_account_id(&account.account_id_hex)?;
+                if !has_secret {
+                    fs::remove_dir_all(self.account_dir(&label))?;
+                    continue;
+                }
+                self.write_account_record(&account)?;
+            }
+            let keys = self.secret_store.load_secret(&account)?;
+            if keys.public_key().to_hex() != account.account_id_hex {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            return Ok(Some(account));
+        }
+        Ok(None)
+    }
+
     pub fn import_account(
         &self,
         label: &str,
@@ -167,10 +313,280 @@ impl AccountHome {
         self.write_signing_account_for_label(label, &keys)
     }
 
+    /// Import a local signing identity, reusing or repairing an exact match.
+    ///
+    /// This is intended for repeatable bootstrap flows. It never creates a
+    /// second local-signing record for the same public key, and a retry can
+    /// finish an import interrupted after the account record was persisted but
+    /// before its secret was written.
+    pub fn import_account_idempotent(
+        &self,
+        label: &str,
+        secret_key: &str,
+    ) -> AccountHomeResult<AccountSummary> {
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_account_label(label)?;
+
+        let account_id_hex = keys.public_key().to_hex();
+        if self.account_record_path(label).exists() {
+            let account = self.account(label)?;
+            if account.account_id_hex != account_id_hex || !account.local_signing {
+                return Err(AccountHomeError::AccountExists(label.to_owned()));
+            }
+            return self.reuse_or_repair_signing_account(account, &keys);
+        }
+
+        if let Some(account) = self
+            .accounts()?
+            .into_iter()
+            .find(|account| account.local_signing && account.account_id_hex == account_id_hex)
+        {
+            return self.reuse_or_repair_signing_account(account, &keys);
+        }
+
+        let account = AccountSummary {
+            label: label.to_owned(),
+            account_id_hex,
+            local_signing: true,
+            external_signing: false,
+            signed_out: false,
+        };
+
+        // Recover a credential left behind by the old secret-first import
+        // ordering (#822), or a same-label local-file secret whose record was
+        // interrupted. Verify that it is the requested identity before making
+        // the account visible again.
+        if self.secret_store.has_secret_for_label(label)?
+            || self
+                .secret_store
+                .has_secret_for_account_id(&account.account_id_hex)?
+        {
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key() != keys.public_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            self.write_account_record(&account)?;
+            return Ok(account);
+        }
+
+        self.write_new_signing_account(&account, &keys)
+    }
+
     pub fn import_nostr_account(&self, secret_key: &str) -> AccountHomeResult<AccountSummary> {
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
         self.write_signing_account(&keys)
+    }
+
+    /// Import a Nostr private key for runtime account setup, resuming only an
+    /// exact journaled setup or orphaned account-id-keyed credential.
+    ///
+    /// Committed account records remain duplicates and are rejected. This is
+    /// narrower than [`Self::import_account_idempotent`]: it also exists for
+    /// uninstall/reinstall recovery where an app's filesystem home was removed
+    /// while its Keychain entry survived.
+    pub fn import_nostr_account_idempotent(
+        &self,
+        secret_key: &str,
+    ) -> AccountHomeResult<NostrAccountImport> {
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let account_id_hex = keys.public_key().to_hex();
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_account_label(&account_id_hex)?;
+
+        if self.account_record_path(&account_id_hex).exists() {
+            let account = self.account(&account_id_hex)?;
+            let Some(setup) = self.account_setup_state(&account_id_hex)? else {
+                return Err(AccountHomeError::AccountExists(account.label));
+            };
+            if !account.local_signing || setup.account_id_hex != account.account_id_hex {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
+            }
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key() != keys.public_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            return Ok(NostrAccountImport {
+                account,
+                reused_account_id_credential: setup.reused_account_id_credential,
+            });
+        }
+        let account = AccountSummary {
+            label: account_id_hex.clone(),
+            account_id_hex,
+            local_signing: true,
+            external_signing: false,
+            signed_out: false,
+        };
+        if let Some(setup) = self.raw_account_setup_state(&account.label)? {
+            if setup.account_id_hex != account.account_id_hex
+                || setup.kind != AccountSetupKind::ImportedIdentity
+            {
+                return Err(AccountHomeError::AccountExists(account.label));
+            }
+            match self.secret_store.load_secret(&account) {
+                Ok(stored_keys) if stored_keys.public_key() == keys.public_key() => {}
+                Ok(_) => return Err(AccountHomeError::AccountIdMismatch),
+                Err(AccountHomeError::SecretNotFound(_)) => {
+                    self.secret_store.write_secret(&account, &keys)?;
+                }
+                Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    self.secret_store.write_secret(&account, &keys)?;
+                }
+                Err(err) => return Err(err),
+            }
+            self.write_account_record(&account)?;
+            return Ok(NostrAccountImport {
+                account,
+                reused_account_id_credential: setup.reused_account_id_credential,
+            });
+        }
+        if self.secret_store.has_secret_for_label(&account.label)? {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        if self.accounts()?.iter().any(|existing| {
+            existing.local_signing && existing.account_id_hex == account.account_id_hex
+        }) {
+            return Err(AccountHomeError::AccountIdInUse(account.account_id_hex));
+        }
+        let reused_account_id_credential = self
+            .secret_store
+            .has_secret_for_account_id(&account.account_id_hex)?;
+        let setup = AccountSetupState {
+            account_id_hex: account.account_id_hex.clone(),
+            reused_account_id_credential,
+            kind: AccountSetupKind::ImportedIdentity,
+            phase: AccountSetupPhase::LocalStateCreated,
+        };
+        self.write_account_setup_state(&account.label, &setup)?;
+        if reused_account_id_credential {
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key() != keys.public_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+        } else {
+            if let Err(err) = self.secret_store.write_secret(&account, &keys) {
+                let _ = fs::remove_dir_all(self.account_dir(&account.label));
+                return Err(err);
+            }
+        }
+        if let Err(err) = self.write_account_record(&account) {
+            if !reused_account_id_credential {
+                let _ = self.secret_store.remove_secret(&account);
+            }
+            let _ = fs::remove_dir_all(self.account_dir(&account.label));
+            return Err(err);
+        }
+
+        Ok(NostrAccountImport {
+            account,
+            reused_account_id_credential,
+        })
+    }
+
+    /// Create the durable setup journal for a newly-created account.
+    pub fn begin_account_setup(
+        &self,
+        account: &AccountSummary,
+        reused_account_id_credential: bool,
+    ) -> AccountHomeResult<AccountSetupState> {
+        self.begin_account_setup_with(
+            account,
+            reused_account_id_credential,
+            AccountSetupKind::ImportedIdentity,
+            AccountSetupPhase::LocalStateCreated,
+        )
+    }
+
+    pub fn begin_account_setup_with(
+        &self,
+        account: &AccountSummary,
+        reused_account_id_credential: bool,
+        kind: AccountSetupKind,
+        phase: AccountSetupPhase,
+    ) -> AccountHomeResult<AccountSetupState> {
+        let state = AccountSetupState {
+            account_id_hex: account.account_id_hex.clone(),
+            reused_account_id_credential,
+            kind,
+            phase,
+        };
+        self.write_account_setup_state(&account.label, &state)?;
+        Ok(state)
+    }
+
+    pub fn account_setup_state(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<AccountSetupState>> {
+        let account = self.account(account_ref)?;
+        self.raw_account_setup_state(&account.label)
+    }
+
+    fn raw_account_setup_state(&self, label: &str) -> AccountHomeResult<Option<AccountSetupState>> {
+        match read_json(self.account_setup_state_path(label)) {
+            Ok(state) => Ok(Some(state)),
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn set_account_setup_phase(
+        &self,
+        account_ref: &str,
+        phase: AccountSetupPhase,
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        let Some(mut state) = self.account_setup_state(&account.label)? else {
+            return Err(AccountHomeError::AccountSetupStateMissing);
+        };
+        if state.account_id_hex != account.account_id_hex {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        state.phase = phase;
+        write_secret_json(self.account_setup_state_path(&account.label), &state)
+    }
+
+    fn write_account_setup_state(
+        &self,
+        label: &str,
+        state: &AccountSetupState,
+    ) -> AccountHomeResult<()> {
+        validate_account_label(label)?;
+        write_secret_json(self.account_setup_state_path(label), state)
+    }
+
+    pub fn complete_account_setup(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        match fs::remove_file(self.account_setup_state_path(&account.label)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Remove an explicitly-authorized legacy incomplete setup while retaining
+    /// the matching account-id-keyed credential for the immediate retry.
+    pub fn reset_incomplete_setup_preserving_credential(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        let preserve = self
+            .secret_store
+            .has_secret_for_account_id(&account.account_id_hex)?;
+        self.remove_account_inner(account_ref, Some(&account), preserve)
     }
 
     pub fn add_public_account(&self, public_key: &str) -> AccountHomeResult<AccountSummary> {
@@ -346,6 +762,32 @@ impl AccountHome {
     /// live account, so the call still reports success rather than a forbidden
     /// partial-live state.
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
+        self.remove_account_inner(account_ref, None, false)
+    }
+
+    /// Roll back a runtime setup import using the provenance captured when the
+    /// account record was created.
+    ///
+    /// If the import recovered an account-id-keyed credential, the filesystem
+    /// account state is removed while that pre-existing credential is retained.
+    /// Newly created credentials are removed with the account as usual.
+    pub fn rollback_nostr_account_import(
+        &self,
+        imported: &NostrAccountImport,
+    ) -> AccountHomeResult<()> {
+        self.remove_account_inner(
+            &imported.account.label,
+            Some(&imported.account),
+            imported.reused_account_id_credential,
+        )
+    }
+
+    fn remove_account_inner(
+        &self,
+        account_ref: &str,
+        expected: Option<&AccountSummary>,
+        preserve_account_id_credential: bool,
+    ) -> AccountHomeResult<()> {
         // Hold the mutation lock across the shared-credential check and
         // the matching `remove_secret` call so two concurrent removals on
         // twin records cannot both observe the other as still present,
@@ -356,6 +798,23 @@ impl AccountHome {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let account = self.account(account_ref)?;
+        if expected.is_some_and(|expected| expected != &account) {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        if preserve_account_id_credential {
+            if !self
+                .secret_store
+                .has_secret_for_account_id(&account.account_id_hex)?
+            {
+                return Err(AccountHomeError::SecretNotFound(
+                    account.account_id_hex.clone(),
+                ));
+            }
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key().to_hex() != account.account_id_hex {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+        }
 
         // Commit point: atomically move the live account directory into the
         // tombstone namespace. After this returns Ok the account is no longer a
@@ -370,7 +829,7 @@ impl AccountHome {
         // a no-op (NotFound -> Ok); the tombstoned secret file is scrubbed below
         // before recursive directory deletion. For the keychain store the entry
         // is independent of the directory and is removed here.
-        if !self.secret_shared_with_other_record(&account)? {
+        if !preserve_account_id_credential && !self.secret_shared_with_other_record(&account)? {
             self.secret_store.remove_secret(&account)?;
         }
 
@@ -591,12 +1050,50 @@ impl AccountHome {
             external_signing: false,
             signed_out: false,
         };
-        self.secret_store.write_secret(&account, keys)?;
-        if let Err(err) = self.write_account_record(&account) {
-            let _ = self.secret_store.remove_secret(&account);
-            return Err(err);
+        self.write_new_signing_account(&account, keys)
+    }
+
+    fn reuse_or_repair_signing_account(
+        &self,
+        mut account: AccountSummary,
+        keys: &nostr::Keys,
+    ) -> AccountHomeResult<AccountSummary> {
+        match self.secret_store.load_secret(&account) {
+            Ok(stored_keys) => {
+                if stored_keys.public_key() != keys.public_key() {
+                    return Err(AccountHomeError::AccountIdMismatch);
+                }
+            }
+            Err(AccountHomeError::SecretNotFound(_)) => {
+                self.secret_store.write_secret(&account, keys)?;
+            }
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.secret_store.write_secret(&account, keys)?;
+            }
+            Err(err) => return Err(err),
+        }
+        if account.signed_out {
+            account.signed_out = false;
+            self.write_account_record(&account)?;
         }
         Ok(account)
+    }
+
+    fn write_new_signing_account(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::Keys,
+    ) -> AccountHomeResult<AccountSummary> {
+        // Record first so a crash cannot leave an invisible keychain credential
+        // that permanently blocks re-import. A record without a secret is
+        // visible/removable and `import_account_idempotent` repairs it on retry.
+        self.write_account_record(account)?;
+        if let Err(err) = self.secret_store.write_secret(account, keys) {
+            let _ = fs::remove_file(self.account_record_path(&account.label));
+            let _ = fs::remove_dir(self.account_dir(&account.label));
+            return Err(err);
+        }
+        Ok(account.clone())
     }
 
     fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
@@ -610,5 +1107,9 @@ impl AccountHome {
 
     fn account_record_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(ACCOUNT_RECORD_FILE)
+    }
+
+    fn account_setup_state_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(ACCOUNT_SETUP_STATE_FILE)
     }
 }

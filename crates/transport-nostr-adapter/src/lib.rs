@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_traits::MessageId;
@@ -24,9 +25,20 @@ use cgka_traits::{
 };
 use nostr::RelayUrl;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
-use transport_nostr_peeler::{KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrTransportEvent};
+use transport_nostr_peeler::{
+    KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrPeelerError, NostrTransportEvent,
+};
+
+fn map_inbound_event_error(error: NostrPeelerError) -> TransportAdapterError {
+    match error {
+        NostrPeelerError::InvalidSignature => TransportAdapterError::InvalidInboundSignature,
+        NostrPeelerError::Malformed(_)
+        | NostrPeelerError::UnsupportedKind(_)
+        | NostrPeelerError::MissingTag(_) => TransportAdapterError::InvalidInboundEncoding,
+    }
+}
 
 /// Build forensic wire metadata for an inbound relay event. The
 /// `transport_group_id` is read from the peeler-mapped envelope (the canonical
@@ -65,7 +77,8 @@ pub use key_package::{
 };
 pub use relay_list::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
-    NostrAccountRelayListPublication,
+    NostrAccountRelayListPublication, NostrNip65RelayListPublication, NostrNip65RelaySet,
+    parse_nip65_relay_set,
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
@@ -78,6 +91,14 @@ pub use telemetry::{
 };
 
 const DELIVERY_BUFFER: usize = 1024;
+
+fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrSubscription {
@@ -92,6 +113,16 @@ pub enum NostrSubscription {
         transport_group_id: Vec<u8>,
         endpoints: Vec<TransportEndpoint>,
         since: Option<Timestamp>,
+    },
+    /// Temporary full-history subscription used only by post-join maintenance.
+    ///
+    /// Its distinct id keeps it independent from the normal incremental group
+    /// subscription even though both route the same authenticated MLS events.
+    GroupMaintenance {
+        account_id: MemberId,
+        group_id: GroupId,
+        transport_group_id: Vec<u8>,
+        endpoints: Vec<TransportEndpoint>,
     },
 }
 
@@ -127,20 +158,41 @@ impl NostrSubscription {
                     ],
                 )
             }
+            Self::GroupMaintenance {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+            } => {
+                let h_tag = hex::encode(transport_group_id);
+                compact_subscription_id(
+                    "group-maintenance",
+                    &[
+                        account_id.as_slice(),
+                        group_id.as_slice(),
+                        h_tag.as_bytes(),
+                        endpoint_set_digest(endpoints).as_bytes(),
+                    ],
+                )
+            }
         }
     }
 
     /// Relay endpoints this subscription was issued to.
     pub fn endpoints(&self) -> &[TransportEndpoint] {
         match self {
-            Self::AccountInbox { endpoints, .. } | Self::Group { endpoints, .. } => endpoints,
+            Self::AccountInbox { endpoints, .. }
+            | Self::Group { endpoints, .. }
+            | Self::GroupMaintenance { endpoints, .. } => endpoints,
         }
     }
 
     /// Account this subscription belongs to.
     pub fn account_id(&self) -> &MemberId {
         match self {
-            Self::AccountInbox { account_id, .. } | Self::Group { account_id, .. } => account_id,
+            Self::AccountInbox { account_id, .. }
+            | Self::Group { account_id, .. }
+            | Self::GroupMaintenance { account_id, .. } => account_id,
         }
     }
 
@@ -166,6 +218,17 @@ impl NostrSubscription {
                 transport_group_id: transport_group_id.clone(),
                 endpoints: normalized_endpoints(endpoints),
             },
+            Self::GroupMaintenance {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+            } => NostrSubscriptionRouteKey::GroupMaintenance {
+                account_id: account_id.clone(),
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: normalized_endpoints(endpoints),
+            },
         }
     }
 }
@@ -177,6 +240,12 @@ enum NostrSubscriptionRouteKey {
         endpoints: Vec<TransportEndpoint>,
     },
     Group {
+        account_id: MemberId,
+        group_id: GroupId,
+        transport_group_id: Vec<u8>,
+        endpoints: Vec<TransportEndpoint>,
+    },
+    GroupMaintenance {
         account_id: MemberId,
         group_id: GroupId,
         transport_group_id: Vec<u8>,
@@ -194,8 +263,8 @@ pub struct NostrAdapterMetrics {
     pub active_group_subscriptions: usize,
     pub subscriptions_created: usize,
     pub subscriptions_removed: usize,
-    /// Gauge: relay unsubscribes that failed and await retry on a later group
-    /// sync. Routing state already reflects the removals.
+    /// Gauge: unconfirmed relay teardowns queued until an unsubscribe succeeds
+    /// or the route becomes live again. Routing state already reflects the removals.
     #[serde(default)]
     pub unsubscribe_retries_pending: usize,
     pub inbound_events_seen: usize,
@@ -230,6 +299,19 @@ impl NostrPublishOutcome {
     }
 }
 
+/// One event in an ordered relay publish batch.
+///
+/// Batch-capable relay clients may retain and connect the union of these
+/// endpoints for the duration of [`NostrRelayClient::publish_events`]. Results
+/// remain ordered one-for-one with requests so callers can preserve per-event
+/// partial-success reporting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrEventPublishRequest {
+    pub endpoints: Vec<TransportEndpoint>,
+    pub event: NostrTransportEvent,
+    pub required_acks: usize,
+}
+
 /// Relay event as observed by the Nostr relay client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrRelayEvent {
@@ -258,6 +340,25 @@ pub trait NostrRelayClient: Send + Sync {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError>;
+
+    /// Publish an ordered batch through one client lifecycle.
+    ///
+    /// The default preserves compatibility for injected relay clients. Socket
+    /// implementations should override this when they can safely retain scoped
+    /// write-only connections across the batch.
+    async fn publish_events(
+        &self,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                self.publish_event(&request.endpoints, &request.event, request.required_acks)
+                    .await,
+            );
+        }
+        outcomes
+    }
 }
 
 /// Nostr implementation of the shared transport adapter boundary.
@@ -347,6 +448,37 @@ impl NostrTransportAdapter {
         Ok(())
     }
 
+    /// Drain relay unsubscribes queued in `pending_unsubscribes`. A local
+    /// snapshot is iterated once; the authoritative queue is updated only on
+    /// confirmed relay teardown so cancellation cannot lose unresolved
+    /// cleanups.
+    async fn drain_pending_unsubscribes(&self) -> (usize, usize) {
+        let drain_snapshot = {
+            let mut state = self.state.write().await;
+            state.prune_live_pending_unsubscribes();
+            state.pending_unsubscribes.clone()
+        };
+
+        let mut confirmed = 0_usize;
+        let mut failed_count = 0_usize;
+        for subscription in drain_snapshot {
+            let subscription_id = subscription.subscription_id();
+            match self.relay_client.unsubscribe(subscription).await {
+                Ok(()) => {
+                    let mut state = self.state.write().await;
+                    if state.remove_pending_unsubscribe_by_id(&subscription_id) {
+                        state.record_confirmed_unsubscribes(1);
+                        confirmed += 1;
+                    }
+                }
+                Err(_) => {
+                    failed_count += 1;
+                }
+            }
+        }
+        (confirmed, failed_count)
+    }
+
     /// Aggregate cross-relay arrival-spread snapshot for diagnostics and
     /// quiescence tuning. Privacy-safe: counts and millisecond buckets only.
     pub async fn delivery_spread(&self) -> RelayDeliverySpread {
@@ -379,6 +511,59 @@ impl NostrTransportAdapter {
             .subscription_synced(subscription_id)
     }
 
+    /// Whether at least one relay has returned EOSE for a live subscription.
+    pub async fn subscription_any_eose(&self, subscription_id: &str) -> Option<bool> {
+        self.state
+            .read()
+            .await
+            .sync
+            .subscription_any_eose(subscription_id)
+    }
+
+    /// Install the temporary, full-history subscription used by the post-join
+    /// maintenance gate. The caller owns its eventual removal.
+    pub async fn install_group_maintenance_subscription(
+        &self,
+        account_id: &MemberId,
+        group: &TransportGroupSubscription,
+    ) -> Result<String, TransportAdapterError> {
+        let _subscription_guard = self.subscription_lock.lock().await;
+        let subscription = NostrSubscription::GroupMaintenance {
+            account_id: account_id.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+        };
+        let subscription_id = subscription.subscription_id();
+        let now_ms = self.now_ms();
+        self.state
+            .write()
+            .await
+            .record_subscription_starts(std::slice::from_ref(&subscription), now_ms);
+        if let Err(error) = self.relay_client.subscribe(subscription.clone()).await {
+            self.state
+                .write()
+                .await
+                .forget_subscription_starts(std::slice::from_ref(&subscription));
+            return Err(error);
+        }
+        Ok(subscription_id)
+    }
+
+    /// Remove a temporary post-join maintenance subscription.
+    pub async fn remove_group_maintenance_subscription(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        let _subscription_guard = self.subscription_lock.lock().await;
+        self.relay_client.unsubscribe(subscription.clone()).await?;
+        self.state
+            .write()
+            .await
+            .forget_subscription_starts(std::slice::from_ref(&subscription));
+        Ok(())
+    }
+
     /// Resolve opaque relay indices to relay endpoints for the opt-in export
     /// label boundary.
     ///
@@ -408,8 +593,8 @@ impl NostrTransportAdapter {
         let message = relay_event
             .event
             .to_transport_message()
-            .map_err(|e| TransportAdapterError::Backend(format!("Nostr event mapping: {e}")))?;
-        let now = Timestamp(relay_event.event.created_at);
+            .map_err(map_inbound_event_error)?;
+        let received_at = Timestamp(unix_now_seconds());
         let routes = {
             let state = self.state.read().await;
             state.routes_for(&message, &relay_event.endpoint)
@@ -422,7 +607,7 @@ impl NostrTransportAdapter {
                     account_id: route.account_id,
                     group_id_hint: route.group_id_hint,
                     message: message.clone(),
-                    received_at: now,
+                    received_at,
                     source: TransportDeliverySource {
                         transport: TransportSource(NOSTR_SOURCE.into()),
                         plane: route.plane,
@@ -523,30 +708,64 @@ impl TransportAdapter for NostrTransportAdapter {
             activation.inbox_endpoints.clone(),
             inbox_since(activation.since),
         ));
+        let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
         for group in &activation.group_subscriptions {
-            issued.push(group_subscription(&account_id, group, activation.since));
+            let route_key = group_subscription(&account_id, group, None).route_key();
+            let since = if prior_route_keys.contains(&route_key) {
+                None
+            } else {
+                activation.since
+            };
+            issued.push(group_subscription(&account_id, group, since));
         }
-        self.subscribe_all("activate_account", &issued).await?;
+        // Register routing/telemetry state BEFORE the relay REQs go out: a
+        // relay may stream stored events the moment it sees a subscription,
+        // and an event arriving before the routes exist is dropped as
+        // unroutable — stored catch-up history would be lost with nothing to
+        // re-request it.
+        {
+            let now_ms = self.now_ms();
+            let mut state = self.state.write().await;
+            // Reactivation replaces the account's routes; evict telemetry for
+            // the old subscription ids first (before recording the new starts,
+            // since unchanged endpoint sets reuse the same ids).
+            state.forget_account_subscription_starts(&account_id);
+            if replaced_count > 0 {
+                // The blanket `unsubscribe_account` above supersedes any queued
+                // per-subscription unsubscribes for this account.
+                state.clear_pending_unsubscribes_for_account(&account_id);
+            }
+            state.record_subscription_starts(&issued, now_ms);
+            state.activate(activation, replaced_count);
+        }
+
+        if let Err(error) = self.subscribe_all("activate_account", &issued).await {
+            // Some concurrent REQs may already have succeeded. Tear those
+            // down best-effort, then always remove the pre-registered local
+            // routes so callers never observe a half-active account.
+            let relay_cleanup_failed = self
+                .relay_client
+                .unsubscribe_account(&account_id)
+                .await
+                .is_err();
+            let mut state = self.state.write().await;
+            state.forget_account_subscription_starts(&account_id);
+            state.clear_pending_unsubscribes_for_account(&account_id);
+            state.deactivate(&account_id, issued.len());
+            tracing::warn!(
+                target: "transport_nostr_adapter::adapter",
+                method = "activate_account",
+                relay_cleanup_failed,
+                "rolled back transport account after subscription failure"
+            );
+            return Err(error);
+        }
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "activate_account",
             issued_count = issued.len(),
             "all transport subscriptions issued"
         );
-
-        let now_ms = self.now_ms();
-        let mut state = self.state.write().await;
-        // Reactivation replaces the account's routes; evict telemetry for the
-        // old subscription ids first (before recording the new starts, since
-        // unchanged endpoint sets reuse the same ids).
-        state.forget_account_subscription_starts(&account_id);
-        if replaced_count > 0 {
-            // The blanket `unsubscribe_account` above supersedes any queued
-            // per-subscription unsubscribes for this account.
-            state.clear_pending_unsubscribes_for_account(&account_id);
-        }
-        state.record_subscription_starts(&issued, now_ms);
-        state.activate(activation, replaced_count);
         Ok(())
     }
 
@@ -557,7 +776,7 @@ impl TransportAdapter for NostrTransportAdapter {
         // Serialize against other subscription-lifecycle operations so the
         // drain's live-route filter and its relay unsubscribes cannot race a
         // concurrent re-add of the same deterministic subscription id.
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let subscription_guard = self.subscription_lock.clone().lock_owned().await;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
@@ -588,34 +807,55 @@ impl TransportAdapter for NostrTransportAdapter {
             )
         };
 
-        // Additions stay fail-fast: on error the adapter state is untouched, a
-        // retry re-diffs against the old group set, and re-subscribing the same
-        // deterministic subscription id is idempotent.
-        self.subscribe_all("sync_account_groups", &to_add).await?;
+        // Stage new route coverage and a telemetry overlay BEFORE the relay REQs
+        // go out. Existing routes and committed telemetry remain live until the
+        // whole batch succeeds, while synchronous callbacks update the overlay.
+        let now_ms = self.now_ms();
+        {
+            let mut state = self.state.write().await;
+            state.stage_subscription_starts(&to_add, now_ms);
+            state.stage_group_routes(&to_add);
+        }
+        // Keep the lifecycle lock in a detached cleanup guard. If this future
+        // is cancelled at any later await, dropping the sender wakes the guard,
+        // which rolls back staged state before another lifecycle call can run.
+        let (staging_complete, staging_abandoned) = oneshot::channel();
+        let cleanup_state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let _subscription_guard = subscription_guard;
+            if staging_abandoned.await.is_err() {
+                let mut state = cleanup_state.write().await;
+                state.rollback_staged_subscription_starts();
+                state.rebuild_transport_group_index();
+            }
+        });
+
+        if let Err(error) = self.subscribe_all("sync_account_groups", &to_add).await {
+            // The authoritative routes and committed telemetry were never
+            // replaced. Discard only this batch's staged callbacks and rebuild
+            // the derived route index to remove its temporary coverage.
+            let mut state = self.state.write().await;
+            state.rollback_staged_subscription_starts();
+            state.rebuild_transport_group_index();
+            drop(state);
+            let _ = staging_complete.send(());
+            return Err(error);
+        }
 
         // Commit routing intent BEFORE relay teardown: a failed unsubscribe
         // must never leave the routing index serving the old group set.
         // Removals are queued and drained below (plus any left over from
         // earlier syncs); failures there are absorbed and retried, never
         // surfaced as an error.
-        let now_ms = self.now_ms();
-        let drainable = {
+        {
             let mut state = self.state.write().await;
+            state.commit_staged_subscription_starts();
             state.forget_subscription_starts(&to_remove);
-            state.record_subscription_starts(&to_add, now_ms);
             state.sync_groups(sync, to_add.len());
             state.queue_pending_unsubscribes(to_remove);
-            state.take_drainable_unsubscribes()
         };
 
-        let mut confirmed = 0_usize;
-        let mut requeue = Vec::new();
-        for subscription in drainable {
-            match self.relay_client.unsubscribe(subscription.clone()).await {
-                Ok(()) => confirmed += 1,
-                Err(_) => requeue.push(subscription),
-            }
-        }
+        let (confirmed, failed_unsubscribe_count) = self.drain_pending_unsubscribes().await;
 
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -624,19 +864,17 @@ impl TransportAdapter for NostrTransportAdapter {
             unsubscribes_confirmed = confirmed,
             "applied transport group subscription diff"
         );
-        let mut state = self.state.write().await;
-        state.record_confirmed_unsubscribes(confirmed);
-        if !requeue.is_empty() {
-            let failed_unsubscribe_count = requeue.len();
-            state.queue_pending_unsubscribes(requeue);
+        if failed_unsubscribe_count > 0 {
+            let pending_retry_total = self.state.read().await.pending_unsubscribes.len();
             tracing::warn!(
                 target: "transport_nostr_adapter::adapter",
                 method = "sync_account_groups",
                 failed_unsubscribe_count,
-                pending_retry_total = state.pending_unsubscribes.len(),
+                pending_retry_total,
                 "deferred relay unsubscribes; will retry on next group sync"
             );
         }
+        let _ = staging_complete.send(());
         Ok(())
     }
 
@@ -740,6 +978,7 @@ impl NostrTransportAdapter {
     ) -> Result<usize, TransportAdapterError> {
         let mut delivered = 0;
         let mut seen_routes = HashSet::new();
+        let received_at = Timestamp(unix_now_seconds());
         for endpoint in endpoints {
             let routes = {
                 let state = self.state.read().await;
@@ -759,7 +998,7 @@ impl NostrTransportAdapter {
                         account_id: route.account_id,
                         group_id_hint: route.group_id_hint,
                         message: message.clone(),
-                        received_at: message.timestamp,
+                        received_at,
                         source: TransportDeliverySource {
                             transport: TransportSource(NOSTR_SOURCE.into()),
                             plane: route.plane,
@@ -858,13 +1097,14 @@ struct AdapterState {
     /// `transport_group_id` to its candidate routes, so an inbound group event is
     /// resolved in O(matching groups) instead of scanning O(accounts × groups)
     /// every event (attacker-floodable). Rebuilt wholesale from `accounts` (the
-    /// authoritative signed-routing state) at every mutation
-    /// (activate/sync_groups/deactivate), so it can never drift.
+    /// authoritative signed-routing state) at every committed mutation. Group
+    /// sync may append only missing pre-REQ routes while a subscribe batch is in
+    /// flight; both success and failure rebuild the index before returning.
     by_transport_group: HashMap<Vec<u8>, Vec<GroupRouteEntry>>,
-    /// Relay unsubscribes that failed and await retry. Routing state
-    /// (`accounts`/`by_transport_group`) already reflects the removal; these
-    /// are relay-side cleanups only, drained on later `sync_account_groups`
-    /// calls (never a reason to fail a sync).
+    /// Unconfirmed relay unsubscribes retained until teardown succeeds.
+    /// Routing state (`accounts`/`by_transport_group`) already reflects the
+    /// removal; these are relay-side cleanups only, drained on later
+    /// `sync_account_groups` calls (never a reason to fail a sync).
     pending_unsubscribes: Vec<NostrSubscription>,
     metrics: NostrAdapterMetrics,
     relay_index: RelayIndexRegistry,
@@ -891,6 +1131,50 @@ impl AdapterState {
             }
         }
         self.by_transport_group = index;
+    }
+
+    /// Add the endpoint coverage needed by new group REQs without replacing
+    /// any live route. Existing coverage is skipped (including canonical URL
+    /// matches), preventing duplicate account deliveries during the staging
+    /// window. A later index rebuild commits or discards these entries.
+    fn stage_group_routes(&mut self, subscriptions: &[NostrSubscription]) {
+        for subscription in subscriptions {
+            let NostrSubscription::Group {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+                ..
+            } = subscription
+            else {
+                continue;
+            };
+            let entries = self
+                .by_transport_group
+                .entry(transport_group_id.clone())
+                .or_default();
+            let staged_endpoints = endpoints
+                .iter()
+                .filter(|endpoint| {
+                    let parsed_endpoint = RelayUrl::parse(endpoint.as_str()).ok();
+                    !entries.iter().any(|entry| {
+                        &entry.account_id == account_id
+                            && &entry.group_id == group_id
+                            && entry.endpoints.iter().any(|candidate| {
+                                candidate.matches(endpoint, parsed_endpoint.as_ref())
+                            })
+                    })
+                })
+                .map(CanonicalEndpoint::new)
+                .collect::<Vec<_>>();
+            if !staged_endpoints.is_empty() {
+                entries.push(GroupRouteEntry {
+                    account_id: account_id.clone(),
+                    group_id: group_id.clone(),
+                    endpoints: staged_endpoints,
+                });
+            }
+        }
     }
 
     fn activate(&mut self, activation: TransportAccountActivation, replaced: usize) {
@@ -935,21 +1219,30 @@ impl AdapterState {
         }
     }
 
-    /// Take the queued unsubscribes that are safe to replay against relays.
-    ///
-    /// Entries whose route key is live again are silently dropped, never
-    /// drained: subscription ids are deterministic content hashes, so a group
-    /// removed (unsubscribe failed, queued here) and then re-added mints the
-    /// SAME id, and replaying the stale entry would tear down the
-    /// just-re-established subscription. Only group subscriptions enter this
-    /// queue, so liveness is checked against every account's stored groups.
-    fn take_drainable_unsubscribes(&mut self) -> Vec<NostrSubscription> {
-        let queued = std::mem::take(&mut self.pending_unsubscribes);
-        if queued.is_empty() {
-            return queued;
+    /// Drop queued unsubscribes whose route key is live again so a stale relay
+    /// teardown cannot tear down a just-re-established subscription.
+    fn prune_live_pending_unsubscribes(&mut self) {
+        let live_route_keys = self.live_group_route_keys();
+        self.pending_unsubscribes
+            .retain(|subscription| !live_route_keys.contains(&subscription.route_key()));
+    }
+
+    fn remove_pending_unsubscribe_by_id(&mut self, subscription_id: &str) -> bool {
+        let index = self
+            .pending_unsubscribes
+            .iter()
+            .position(|subscription| subscription.subscription_id() == subscription_id);
+        match index {
+            Some(index) => {
+                self.pending_unsubscribes.remove(index);
+                true
+            }
+            None => false,
         }
-        let live_route_keys = self
-            .accounts
+    }
+
+    fn live_group_route_keys(&self) -> HashSet<NostrSubscriptionRouteKey> {
+        self.accounts
             .iter()
             .flat_map(|(account_id, routes)| {
                 routes
@@ -957,10 +1250,6 @@ impl AdapterState {
                     .iter()
                     .map(|group| group_subscription(account_id, group, None).route_key())
             })
-            .collect::<HashSet<_>>();
-        queued
-            .into_iter()
-            .filter(|subscription| !live_route_keys.contains(&subscription.route_key()))
             .collect()
     }
 
@@ -1009,6 +1298,27 @@ impl AdapterState {
             self.sync
                 .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
         }
+    }
+
+    fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
+        self.sync.begin_staged_subscription_starts();
+        for subscription in subscriptions {
+            let relays: Vec<RelayIndex> = subscription
+                .endpoints()
+                .iter()
+                .map(|endpoint| self.relay_index.index_for(endpoint))
+                .collect();
+            self.sync
+                .stage_subscription_start(&subscription.subscription_id(), &relays, now_ms);
+        }
+    }
+
+    fn commit_staged_subscription_starts(&mut self) {
+        self.sync.commit_staged_subscription_starts();
+    }
+
+    fn rollback_staged_subscription_starts(&mut self) {
+        self.sync.rollback_staged_subscription_starts();
     }
 
     /// Evict sync-telemetry progress for subscriptions being removed, so the
@@ -1189,9 +1499,19 @@ fn diff_group_subscriptions(
         .iter()
         .map(|group| group_subscription(account_id, group, None))
         .collect::<Vec<_>>();
+    let current_prior_keys = prior_group_route_keys(account_id, current);
+    let desired_prior_keys = prior_group_route_keys(account_id, desired);
     let desired_subscriptions = desired
         .iter()
-        .map(|group| group_subscription(account_id, group, since))
+        .map(|group| {
+            let route_key = group_subscription(account_id, group, None).route_key();
+            let since = if desired_prior_keys.contains(&route_key) {
+                None
+            } else {
+                since
+            };
+            group_subscription(account_id, group, since)
+        })
         .collect::<Vec<_>>();
     let current_keys = current_subscriptions
         .iter()
@@ -1204,7 +1524,12 @@ fn diff_group_subscriptions(
 
     let to_add = desired_subscriptions
         .into_iter()
-        .filter(|subscription| !current_keys.contains(&subscription.route_key()))
+        .filter(|subscription| {
+            let route_key = subscription.route_key();
+            !current_keys.contains(&route_key)
+                || (desired_prior_keys.contains(&route_key)
+                    && !current_prior_keys.contains(&route_key))
+        })
         .collect();
     let to_remove = current_subscriptions
         .into_iter()
@@ -1212,6 +1537,24 @@ fn diff_group_subscriptions(
         .collect();
 
     (to_add, to_remove)
+}
+
+/// Return route keys for retained prior addresses. App routing orders each
+/// group's current signed route first and its retained historical routes
+/// immediately afterward. Only those historical routes need an unbounded
+/// backfill; the current route keeps the account cursor.
+fn prior_group_route_keys(
+    account_id: &MemberId,
+    groups: &[TransportGroupSubscription],
+) -> HashSet<NostrSubscriptionRouteKey> {
+    let mut seen_groups = HashSet::new();
+    let mut prior_route_keys = HashSet::new();
+    for group in groups {
+        if !seen_groups.insert(group.group_id.clone()) {
+            prior_route_keys.insert(group_subscription(account_id, group, None).route_key());
+        }
+    }
+    prior_route_keys
 }
 
 fn normalized_endpoints(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoint> {

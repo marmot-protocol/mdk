@@ -1,4 +1,4 @@
-// TypeScript client for the `marmot.agent-control.v1` control protocol
+// TypeScript client for the `marmot.agent-control.v2` control protocol
 // (`crates/agent-control/src/lib.rs`). Newline-delimited JSON over a local Unix
 // socket. Faithful port of the Python `MarmotAgentControlClient`
 // (`integrations/hermes/marmot/adapter.py`): one connection per request with
@@ -11,7 +11,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 
-export const AGENT_CONTROL_PROTOCOL_V1 = "marmot.agent-control.v1";
+export const AGENT_CONTROL_PROTOCOL_V2 = "marmot.agent-control.v2";
 export const MAX_AGENT_CONTROL_FRAME_BYTES = 1024 * 1024;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -68,6 +68,7 @@ export interface AppEventSentResponse {
 export interface StreamBegunResponse {
   type: "stream_begun";
   stream_id_hex: string;
+  stream_capability: string;
   start_message_id_hex: string;
   quic_candidates: string[];
 }
@@ -138,6 +139,94 @@ export interface AgentControlMediaUpload {
   thumbhash?: string | null;
 }
 
+export interface AgentControlActor {
+  account_id_hex: string;
+  display_name?: string | null;
+  is_self: boolean;
+}
+
+export interface AgentControlMessage {
+  message_id_hex: string;
+  sender: AgentControlActor;
+  text: string;
+  recorded_at: number;
+  media?: AgentControlMediaRef[];
+}
+
+export interface AgentControlAttachmentSummary {
+  media_type: string;
+  file_name: string;
+  dim?: string | null;
+}
+
+export type AgentControlReferencedMessageAvailability =
+  | "available"
+  | "missing"
+  | "deleted"
+  | "invalidated";
+
+export interface AgentControlReferencedMessage {
+  message_id_hex: string;
+  availability: AgentControlReferencedMessageAvailability;
+  sender?: AgentControlActor | null;
+  recorded_at?: number | null;
+  text_excerpt?: string | null;
+  text_truncated: boolean;
+  attachments?: AgentControlAttachmentSummary[];
+  attachments_truncated: boolean;
+}
+
+export interface AgentControlTimelineCursor {
+  recorded_at: number;
+  message_id_hex: string;
+}
+
+export type AgentControlTimelineMessageAvailability =
+  | "available"
+  | "deleted"
+  | "invalidated";
+
+export interface AgentControlTimelineReaction {
+  reaction_message_id_hex: string;
+  actor: AgentControlActor;
+  emoji: string;
+  reacted_at: number;
+}
+
+export interface AgentControlTimelineMessage {
+  message_id_hex: string;
+  sender: AgentControlActor;
+  direction: string;
+  kind: number;
+  recorded_at: number;
+  observed_at: number;
+  availability: AgentControlTimelineMessageAvailability;
+  text?: string | null;
+  text_truncated: boolean;
+  reply_to_message_id_hex?: string | null;
+  attachments?: AgentControlAttachmentSummary[];
+  attachments_truncated: boolean;
+  reactions?: AgentControlTimelineReaction[];
+  reactions_truncated: boolean;
+}
+
+export interface TimelineMessageResponse {
+  type: "timeline_message";
+  account_id_hex: string;
+  group_id_hex: string;
+  message_id_hex: string;
+  message?: AgentControlTimelineMessage | null;
+}
+
+export interface TimelinePageResponse {
+  type: "timeline_page";
+  account_id_hex: string;
+  group_id_hex: string;
+  messages: AgentControlTimelineMessage[];
+  has_more_before: boolean;
+  has_more_after: boolean;
+}
+
 export interface MediaDownloadedResponse {
   type: "media_downloaded";
   /** Host-local path on the `wn-agent` machine where the plaintext was written. */
@@ -152,27 +241,57 @@ export type AgentControlEvent =
       type: "inbound_message";
       account_id_hex: string;
       group_id_hex: string;
-      message_id_hex: string;
-      sender_account_id_hex: string;
-      text: string;
+      message: AgentControlMessage;
       /**
        * True when the message addresses the agent via p-tag, nostr hex, or
        * visible npub mention.
        */
       mentions_self?: boolean;
-      /** The message id this message replies to (`e` tag), when present. */
-      reply_to_message_id_hex?: string | null;
-      /** Sender's directory display name, when resolvable. */
-      sender_display_name?: string | null;
-      /** Encrypted media references (`imeta` tags) on this message, if any. */
-      media?: AgentControlMediaRef[];
+      reply_to?: AgentControlReferencedMessage | null;
+    }
+  | {
+      type: "message_edited";
+      account_id_hex: string;
+      group_id_hex: string;
+      event_id_hex: string;
+      target_message_id_hex: string;
+      actor: AgentControlActor;
+      replacement_text: string;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
     }
   | {
       type: "message_deleted";
       account_id_hex: string;
       group_id_hex: string;
+      event_id_hex: string;
       target_message_id_hex: string;
-      sender_account_id_hex: string;
+      actor: AgentControlActor;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
+    }
+  | {
+      type: "reaction_added";
+      account_id_hex: string;
+      group_id_hex: string;
+      event_id_hex: string;
+      target_message_id_hex: string;
+      actor: AgentControlActor;
+      emoji: string;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
+    }
+  | {
+      type: "reaction_removed";
+      account_id_hex: string;
+      group_id_hex: string;
+      event_id_hex: string;
+      reaction_event_id_hex: string;
+      target_message_id_hex: string;
+      actor: AgentControlActor;
+      emoji: string;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
     }
   | {
       type: "group_state_changed";
@@ -180,7 +299,8 @@ export type AgentControlEvent =
       group_id_hex: string;
       /**
        * Coarse change kind: "member_added" | "member_removed" | "member_left" |
-       * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed".
+       * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed" |
+       * "disappearing_timer_changed".
        * Privacy: never carries a member pubkey.
        */
       change: string;
@@ -232,6 +352,99 @@ interface SubscribeInboundHooks {
 
 type Envelope = Record<string, unknown>;
 
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new AgentControlError(`${field} must be an object`, { code: "wrong_protocol" });
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireStringField(value: Record<string, unknown>, field: string): void {
+  if (typeof value[field] !== "string") {
+    throw new AgentControlError(`${field} must be a string`, { code: "wrong_protocol" });
+  }
+}
+
+function validateReferencedMessage(value: unknown, field: string): void {
+  const target = requireRecord(value, field);
+  requireStringField(target, "message_id_hex");
+  if (
+    target.availability !== "available" &&
+    target.availability !== "missing" &&
+    target.availability !== "deleted" &&
+    target.availability !== "invalidated"
+  ) {
+    throw new AgentControlError(`${field}.availability is invalid`, {
+      code: "wrong_protocol",
+    });
+  }
+  if (
+    typeof target.text_truncated !== "boolean" ||
+    typeof target.attachments_truncated !== "boolean"
+  ) {
+    throw new AgentControlError(`${field} has invalid truncation flags`, {
+      code: "wrong_protocol",
+    });
+  }
+  // The Rust producer owns the optional excerpt/attachment-summary shapes in
+  // this atomic in-repo protocol. Validate the routing and privacy-critical
+  // fields here; downstream renderers still treat all content as untrusted.
+}
+
+/**
+ * Validate the intentionally breaking rich-context portion of the v2 event
+ * wire before exposing it to the channel bridge. This deliberately rejects the
+ * removed flat inbound shape instead of maintaining a compatibility alias.
+ */
+export function decodeAgentControlEvent(frame: Envelope): AgentControlEvent {
+  const type = frame.type;
+  if (type === "inbound_message") {
+    requireStringField(frame, "account_id_hex");
+    requireStringField(frame, "group_id_hex");
+    const message = requireRecord(frame.message, "inbound_message.message");
+    const sender = requireRecord(message.sender, "inbound_message.message.sender");
+    requireStringField(message, "message_id_hex");
+    requireStringField(message, "text");
+    requireStringField(sender, "account_id_hex");
+    if (typeof message.recorded_at !== "number" || typeof sender.is_self !== "boolean") {
+      throw new AgentControlError("inbound_message has invalid rich context fields", {
+        code: "wrong_protocol",
+      });
+    }
+    if (frame.reply_to !== undefined && frame.reply_to !== null) {
+      validateReferencedMessage(frame.reply_to, "inbound_message.reply_to");
+    }
+  } else if (
+    type === "message_edited" ||
+    type === "message_deleted" ||
+    type === "reaction_added" ||
+    type === "reaction_removed"
+  ) {
+    requireStringField(frame, "account_id_hex");
+    requireStringField(frame, "group_id_hex");
+    const actor = requireRecord(frame.actor, `${type}.actor`);
+    validateReferencedMessage(frame.target, `${type}.target`);
+    requireStringField(frame, "event_id_hex");
+    requireStringField(frame, "target_message_id_hex");
+    requireStringField(actor, "account_id_hex");
+    if (typeof frame.recorded_at !== "number" || typeof actor.is_self !== "boolean") {
+      throw new AgentControlError(`${type} has invalid actor or timestamp`, {
+        code: "wrong_protocol",
+      });
+    }
+    if (type === "message_edited") {
+      requireStringField(frame, "replacement_text");
+    }
+    if (type === "reaction_added" || type === "reaction_removed") {
+      requireStringField(frame, "emoji");
+    }
+    if (type === "reaction_removed") {
+      requireStringField(frame, "reaction_event_id_hex");
+    }
+  }
+  return frame as unknown as AgentControlEvent;
+}
+
 /** Lowercase, strip an optional `0x`, and validate even-length hexadecimal. */
 export function normalizeHex(value: string | null | undefined, field = "hex"): string {
   let text = String(value ?? "").trim().toLowerCase();
@@ -254,6 +467,16 @@ function optionalHex(value: string | null | undefined, field = "hex"): string | 
   return normalizeHex(value, field);
 }
 
+function normalizeStreamCapability(value: string): string {
+  const capability = normalizeHex(value, "stream_capability");
+  if (capability.length !== 64) {
+    throw new AgentControlError("stream_capability must encode exactly 32 bytes", {
+      code: "invalid_stream_capability",
+    });
+  }
+  return capability;
+}
+
 export class MarmotAgentControlClient {
   readonly socketPath: string;
   private readonly authToken: string | null;
@@ -273,6 +496,75 @@ export class MarmotAgentControlClient {
 
   async accountList(): Promise<AccountListResponse> {
     return (await this.request({ type: "account_list" })) as unknown as AccountListResponse;
+  }
+
+  async timelineMessageGet(
+    accountIdHex: string,
+    groupIdHex: string,
+    messageIdHex: string,
+  ): Promise<TimelineMessageResponse> {
+    return (await this.request({
+      type: "timeline_message_get",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      message_id_hex: normalizeHex(messageIdHex, "message_id_hex"),
+    })) as unknown as TimelineMessageResponse;
+  }
+
+  async timelineList(
+    accountIdHex: string,
+    groupIdHex: string,
+    options: {
+      before?: AgentControlTimelineCursor | null;
+      after?: AgentControlTimelineCursor | null;
+      beforeInclusive?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<TimelinePageResponse> {
+    const normalizeCursor = (
+      cursor: AgentControlTimelineCursor | null | undefined,
+    ): AgentControlTimelineCursor | undefined =>
+      cursor
+        ? {
+            recorded_at: Math.max(0, Math.trunc(cursor.recorded_at)),
+            message_id_hex: normalizeHex(cursor.message_id_hex, "timeline cursor message_id_hex"),
+          }
+        : undefined;
+    return (await this.request({
+      type: "timeline_list",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      before: normalizeCursor(options.before),
+      after: normalizeCursor(options.after),
+      before_inclusive: options.beforeInclusive === true,
+      limit:
+        options.limit === undefined
+          ? undefined
+          : Math.max(1, Math.min(50, Math.trunc(options.limit))),
+    })) as unknown as TimelinePageResponse;
+  }
+
+  async accountLookupProfile(accountIdHex: string): Promise<{
+    type: "profile_lookup";
+    status: "profile_found" | "profile_not_found" | "indeterminate";
+    retryable: boolean;
+  }> {
+    const response = await this.request({
+      type: "account_profile_lookup",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+    });
+    if (
+      response.type !== "profile_lookup" ||
+      !["profile_found", "profile_not_found", "indeterminate"].includes(String(response.status)) ||
+      typeof response.retryable !== "boolean"
+    ) {
+      throw new Error("wn-agent returned invalid profile_lookup response");
+    }
+    return response as {
+      type: "profile_lookup";
+      status: "profile_found" | "profile_not_found" | "indeterminate";
+      retryable: boolean;
+    };
   }
 
   async accountPublishProfile(
@@ -302,7 +594,7 @@ export class MarmotAgentControlClient {
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       text: String(text ?? ""),
       reply_to_message_id_hex: optionalHex(replyToMessageIdHex, "reply_to_message_id_hex"),
-      // Additive, v1-compatible: only sent when supplied, so the connector dedups
+      // Optional on the wire: only sent when supplied, so the connector dedups
       // a retry that reuses the same key instead of double-posting.
       ...(key ? { idempotency_key: key } : {}),
     })) as unknown as FinalSentResponse;
@@ -325,50 +617,79 @@ export class MarmotAgentControlClient {
   async streamBegin(
     accountIdHex: string,
     groupIdHex: string,
-    options: { streamIdHex?: string | null; quicCandidates?: Iterable<string> } = {},
+    options: {
+      streamIdHex?: string | null;
+      parentMessageIdHex?: string | null;
+      quicCandidates?: Iterable<string>;
+      requestId?: string;
+    } = {},
   ): Promise<StreamBegunResponse> {
     const quicCandidates = [...(options.quicCandidates ?? [])]
       .map((candidate) => String(candidate).trim())
       .filter((candidate) => candidate.length > 0);
-    return (await this.request(
+    const parentMessageIdHex = optionalHex(
+      options.parentMessageIdHex,
+      "parent_message_id_hex",
+    );
+    const response = (await this.request(
       {
         type: "stream_begin",
         account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
         group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
         stream_id_hex: optionalHex(options.streamIdHex, "stream_id_hex"),
+        ...(parentMessageIdHex ? { parent_message_id_hex: parentMessageIdHex } : {}),
         quic_candidates: quicCandidates,
       },
-      { timeoutMs: this.previewRequestTimeoutMs },
+      { timeoutMs: this.previewRequestTimeoutMs, requestId: options.requestId },
     )) as unknown as StreamBegunResponse;
+    return {
+      ...response,
+      stream_capability: normalizeStreamCapability(response.stream_capability),
+    };
   }
 
-  async streamAppend(streamIdHex: string, appendText: string): Promise<Envelope> {
+  async streamAppend(
+    streamIdHex: string,
+    streamCapability: string,
+    appendText: string,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_append",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         append_text: String(appendText ?? ""),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );
   }
 
-  async streamStatus(streamIdHex: string, status: string): Promise<Envelope> {
+  async streamStatus(
+    streamIdHex: string,
+    streamCapability: string,
+    status: string,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_status",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         status: String(status ?? ""),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );
   }
 
-  async streamProgress(streamIdHex: string, text: string): Promise<Envelope> {
+  async streamProgress(
+    streamIdHex: string,
+    streamCapability: string,
+    text: string,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_progress",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         text: String(text ?? ""),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
@@ -377,6 +698,7 @@ export class MarmotAgentControlClient {
 
   async streamFinalize(
     streamIdHex: string,
+    streamCapability: string,
     finalText: string,
     transcriptHashHex: string,
     chunkCount: number,
@@ -388,6 +710,7 @@ export class MarmotAgentControlClient {
     return (await this.request({
       type: "stream_finalize",
       stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+      stream_capability: normalizeStreamCapability(streamCapability),
       final_text: String(finalText ?? ""),
       transcript_hash_hex: normalizeHex(transcriptHashHex, "transcript_hash_hex"),
       chunk_count: Math.trunc(chunkCount),
@@ -395,11 +718,16 @@ export class MarmotAgentControlClient {
     })) as unknown as StreamFinalizedResponse;
   }
 
-  async streamCancel(streamIdHex: string, reason?: string | null): Promise<Envelope> {
+  async streamCancel(
+    streamIdHex: string,
+    streamCapability: string,
+    reason?: string | null,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_cancel",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         reason: reason == null ? null : String(reason),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
@@ -578,7 +906,7 @@ export class MarmotAgentControlClient {
           hooks.onReady?.();
           continue;
         }
-        yield frame as unknown as AgentControlEvent;
+        yield decodeAgentControlEvent(frame);
       }
     } catch (err) {
       throw wrapSocketError(err);
@@ -655,7 +983,7 @@ export class MarmotAgentControlClient {
 
   private writeEnvelope(socket: Socket, requestId: string, payload: Envelope): Promise<void> {
     const envelope: Envelope = {
-      marmot_agent_control: AGENT_CONTROL_PROTOCOL_V1,
+      marmot_agent_control: AGENT_CONTROL_PROTOCOL_V2,
       id: requestId,
       ...payload,
     };
@@ -687,7 +1015,7 @@ export class MarmotAgentControlClient {
 }
 
 function validateEnvelope(frame: Envelope, requestId: string): void {
-  if (frame.marmot_agent_control !== AGENT_CONTROL_PROTOCOL_V1) {
+  if (frame.marmot_agent_control !== AGENT_CONTROL_PROTOCOL_V2) {
     throw new AgentControlError(
       `wrong agent control protocol: ${String(frame.marmot_agent_control)}`,
       { code: "wrong_protocol" },

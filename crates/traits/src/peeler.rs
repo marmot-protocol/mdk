@@ -65,30 +65,25 @@ impl GroupMessageMetadata {
     }
 
     /// Compute the transport-level expiration timestamp, if any.
-    pub fn expiration_timestamp(&self) -> Result<Option<u64>, GroupMessageMetadataError> {
+    pub fn expiration_timestamp(&self) -> Option<u64> {
         let Self::Application {
             inner_created_at,
             retention_seconds,
         } = self
         else {
-            return Ok(None);
+            return None;
         };
         let Some(retention_seconds) = retention_seconds else {
-            return Ok(None);
+            return None;
         };
         if *retention_seconds == 0 {
-            return Ok(None);
+            return None;
         }
-        inner_created_at
-            .checked_add(*retention_seconds)
-            .map(Some)
-            .ok_or(GroupMessageMetadataError::ExpirationTimestampOverflow)
+        // Expiration is only a transport hint. If the sum is not
+        // representable, the hint is undefined and must be omitted without
+        // rejecting the otherwise-valid application message.
+        inner_created_at.checked_add(*retention_seconds)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupMessageMetadataError {
-    ExpirationTimestampOverflow,
 }
 
 /// Unwrap and rewrap transport-layer envelopes. A single peeler typically
@@ -102,10 +97,12 @@ pub enum GroupMessageMetadataError {
 ///   when that hint is older than the supplied context; transports without
 ///   such a hint (e.g. the Nostr binding, whose kind-445 content is opaque
 ///   `base64(nonce || ciphertext)`) simply return `DecryptFailed`. The engine
-///   maps both to `StaleReason::PeelFailed`, choosing retry or terminal
-///   storage from the available epoch evidence.
+///   maps a potentially recoverable miss to
+///   `IngestOutcome::TransportDeferred`; authenticated epoch evidence can
+///   instead establish a terminal stale classification.
 /// - `peel_welcome` MUST fail cleanly for welcomes not addressed to the
-///   local identity — the engine maps that to `StaleReason::NotForThisClient`.
+///   local identity — the engine maps that to
+///   `InputRejectionCategory::WrongRecipient`.
 /// - `wrap_group_message` MUST be deterministic given the same input
 ///   (same `EncryptedPayload` + same `GroupContextSnapshot.epoch` →
 ///   reproducible wire bytes modulo outer-layer nonces/timestamps). The

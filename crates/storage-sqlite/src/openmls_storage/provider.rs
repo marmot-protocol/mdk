@@ -45,18 +45,20 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
     ) -> Result<(), Self::Error> {
         let group_key = Self::group_key(group_id)?;
         let proposal_key = serde_json::to_vec(&(group_id, proposal_ref))?;
-        self.write_entity(
-            QUEUED_PROPOSAL_LABEL,
-            proposal_key,
-            Some(group_key.clone()),
-            proposal,
-        )?;
-        self.append_entity(
-            PROPOSAL_QUEUE_REFS_LABEL,
-            group_key.clone(),
-            Some(group_key),
-            proposal_ref,
-        )
+        self.connection.with_transaction(|| {
+            self.write_entity(
+                QUEUED_PROPOSAL_LABEL,
+                proposal_key,
+                Some(group_key.clone()),
+                proposal,
+            )?;
+            self.append_entity(
+                PROPOSAL_QUEUE_REFS_LABEL,
+                group_key.clone(),
+                Some(group_key),
+                proposal_ref,
+            )
+        })
     }
 
     fn write_tree<
@@ -205,11 +207,11 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         leaf_index: u32,
         key_pairs: &[HpkeKeyPair],
     ) -> Result<(), Self::Error> {
-        self.write_value(
+        self.write_json(
             EPOCH_KEY_PAIRS_LABEL,
             epoch_key_pairs_id(group_id, epoch, leaf_index)?,
             Some(Self::group_key(group_id)?),
-            serde_json::to_vec(key_pairs)?,
+            key_pairs,
         )
     }
 
@@ -869,6 +871,45 @@ mod tests {
             read_after_delete,
             Vec::new(),
             "legacy row resurfaced after delete"
+        );
+    }
+
+    #[test]
+    fn queue_proposal_rolls_back_entity_when_ref_append_fails() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![1, 2, 3, 4]);
+        let proposal_ref = TestProposalRef(vec![0xAA]);
+        let proposal = TestQueuedProposal(vec![0xCC]);
+        let refs_label_hex = hex::encode_upper(PROPOSAL_QUEUE_REFS_LABEL.as_bytes());
+        mls.lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_proposal_ref_insert
+                 BEFORE INSERT ON openmls_values
+                 WHEN hex(NEW.label) = '{refs_label_hex}'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected proposal-ref failure');
+                 END;"
+            ))
+            .unwrap();
+
+        assert!(
+            mls.queue_proposal(&group_id, &proposal_ref, &proposal)
+                .is_err()
+        );
+        let queued_entity_count: i64 = mls
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM openmls_values WHERE label = ?1",
+                rusqlite::params![QUEUED_PROPOSAL_LABEL.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            queued_entity_count, 0,
+            "the proposal entity must roll back with the failed ref append"
         );
     }
 

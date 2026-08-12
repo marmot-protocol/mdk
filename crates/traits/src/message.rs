@@ -29,6 +29,31 @@ pub struct OwnCommitConvergenceStamp {
     pub priority: CommitOrderingPriority,
     /// Hex-encoded proposal references the commit consumed, in sorted order.
     pub consumed_proposal_refs: Vec<String>,
+    /// Immutable canonical-state checkpoint produced by this commit.  The id
+    /// is derived from the MLS wire commit digest rather than the epoch, so
+    /// sibling branches can never replace one another's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    /// Epoch authenticator of the checkpointed resulting state.  Restore
+    /// verifies this value before the checkpoint can realize an own commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_epoch_authenticator: Option<String>,
+}
+
+/// Branch provenance for an application message authored by this device.
+///
+/// MLS sender ratchets are encryption-only, so a device cannot later decrypt
+/// and authenticate its own private-message ciphertext during candidate
+/// replay. The send path therefore captures the authenticated local source
+/// state while it still owns it. Stored convergence may credit the message
+/// only to candidate states whose epoch authenticator matches this stamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnApplicationConvergenceStamp {
+    /// This device's authenticated Marmot member identity at send time.
+    pub sender: MemberId,
+    /// Hex-encoded MLS epoch authenticator of the state that encrypted the
+    /// application message.
+    pub source_epoch_authenticator: String,
 }
 
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].
@@ -39,9 +64,18 @@ pub struct OwnCommitConvergenceStamp {
 ///
 /// - `RawTransport`: original transport-wrapped message. Used when peeling is
 ///   deferred or the engine needs to retry with a different epoch context.
+/// - `OutboundWelcome`: a locally produced Welcome retained until its
+///   independent transport acknowledgement policy is satisfied. Keeping this
+///   distinct from historical `RawTransport` `Sent` rows lets cold-restart
+///   recovery find only delivery obligations created by versions that track
+///   their completion.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
-///   wire bytes. Only this variant and `OwnCommitWire` are eligible for
-///   OpenMLS projection and convergence replay.
+///   wire bytes. This variant, `SignedOpenMlsWire`, and `OwnCommitWire` are
+///   eligible for OpenMLS projection and convergence replay.
+/// - `SignedOpenMlsWire`: the exact signed outer transport message alongside
+///   the projection-friendly MLS wire message. This is the current outbound
+///   representation and supports byte-identical retry after restart. Locally
+///   authored applications also carry [`OwnApplicationConvergenceStamp`].
 /// - `OwnCommitWire`: an `OpenMlsWire` commit this device published and
 ///   confirmed, enriched with its [`OwnCommitConvergenceStamp`] so stored
 ///   convergence can treat it as a pre-validated candidate branch after a
@@ -50,7 +84,16 @@ pub struct OwnCommitConvergenceStamp {
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum StoredMessagePayload {
     RawTransport(TransportMessage),
+    OutboundWelcome(TransportMessage),
     OpenMlsWire(TransportMessage),
+    SignedOpenMlsWire {
+        exact_message: TransportMessage,
+        openmls_message: TransportMessage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stamp: Option<OwnCommitConvergenceStamp>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        own_application_stamp: Option<Box<OwnApplicationConvergenceStamp>>,
+    },
     OwnCommitWire {
         message: TransportMessage,
         stamp: OwnCommitConvergenceStamp,
@@ -62,8 +105,37 @@ impl StoredMessagePayload {
         Self::RawTransport(message)
     }
 
+    pub fn outbound_welcome(message: TransportMessage) -> Self {
+        Self::OutboundWelcome(message)
+    }
+
     pub fn openmls_wire(message: TransportMessage) -> Self {
         Self::OpenMlsWire(message)
+    }
+
+    pub fn signed_openmls_wire(
+        exact_message: TransportMessage,
+        openmls_message: TransportMessage,
+    ) -> Self {
+        Self::SignedOpenMlsWire {
+            exact_message,
+            openmls_message,
+            stamp: None,
+            own_application_stamp: None,
+        }
+    }
+
+    pub fn signed_openmls_application_wire(
+        exact_message: TransportMessage,
+        openmls_message: TransportMessage,
+        own_application_stamp: OwnApplicationConvergenceStamp,
+    ) -> Self {
+        Self::SignedOpenMlsWire {
+            exact_message,
+            openmls_message,
+            stamp: None,
+            own_application_stamp: Some(Box::new(own_application_stamp)),
+        }
     }
 
     pub fn own_commit_wire(message: TransportMessage, stamp: OwnCommitConvergenceStamp) -> Self {
@@ -87,14 +159,39 @@ impl StoredMessagePayload {
     pub fn as_raw_transport(&self) -> Option<&TransportMessage> {
         match self {
             Self::RawTransport(message) => Some(message),
-            Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
+            Self::OutboundWelcome(_)
+            | Self::OpenMlsWire(_)
+            | Self::SignedOpenMlsWire { .. }
+            | Self::OwnCommitWire { .. } => None,
+        }
+    }
+
+    pub fn as_outbound_welcome(&self) -> Option<&TransportMessage> {
+        match self {
+            Self::OutboundWelcome(message) => Some(message),
+            Self::RawTransport(_)
+            | Self::OpenMlsWire(_)
+            | Self::SignedOpenMlsWire { .. }
+            | Self::OwnCommitWire { .. } => None,
         }
     }
 
     pub fn as_openmls_wire(&self) -> Option<&TransportMessage> {
         match self {
-            Self::RawTransport(_) => None,
+            Self::RawTransport(_) | Self::OutboundWelcome(_) => None,
             Self::OpenMlsWire(message) | Self::OwnCommitWire { message, .. } => Some(message),
+            Self::SignedOpenMlsWire {
+                openmls_message, ..
+            } => Some(openmls_message),
+        }
+    }
+
+    /// Exact signed outer event retained for restart-safe retransmission.
+    pub fn as_exact_transport(&self) -> Option<&TransportMessage> {
+        match self {
+            Self::RawTransport(message) | Self::OutboundWelcome(message) => Some(message),
+            Self::SignedOpenMlsWire { exact_message, .. } => Some(exact_message),
+            Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
         }
     }
 
@@ -102,18 +199,61 @@ impl StoredMessagePayload {
     /// published-and-confirmed commit.
     pub fn own_commit_stamp(&self) -> Option<&OwnCommitConvergenceStamp> {
         match self {
-            Self::RawTransport(_) | Self::OpenMlsWire(_) => None,
+            Self::RawTransport(_) | Self::OutboundWelcome(_) | Self::OpenMlsWire(_) => None,
+            Self::SignedOpenMlsWire { stamp, .. } => stamp.as_ref(),
             Self::OwnCommitWire { stamp, .. } => Some(stamp),
+        }
+    }
+
+    /// Send-time branch provenance for a locally authored application message.
+    pub fn own_application_stamp(&self) -> Option<&OwnApplicationConvergenceStamp> {
+        match self {
+            Self::SignedOpenMlsWire {
+                own_application_stamp,
+                ..
+            } => own_application_stamp.as_deref(),
+            Self::RawTransport(_)
+            | Self::OutboundWelcome(_)
+            | Self::OpenMlsWire(_)
+            | Self::OwnCommitWire { .. } => None,
         }
     }
 
     pub fn into_message(self) -> TransportMessage {
         match self {
             Self::RawTransport(message)
+            | Self::OutboundWelcome(message)
             | Self::OpenMlsWire(message)
             | Self::OwnCommitWire { message, .. } => message,
+            Self::SignedOpenMlsWire {
+                openmls_message, ..
+            } => openmls_message,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredPeelLifecycle {
+    /// Wall-clock time when this account-device first retained the opaque
+    /// transport object. This is local resource metadata, never wire data.
+    pub first_observed_wall_ms: u64,
+    /// Greatest wall-clock observation persisted for this row. A later
+    /// backwards jump cannot erase already-observed residence.
+    pub wall_high_water_ms: u64,
+    /// Process-local convergence clock instance that owns
+    /// `residence_deadline_monotonic_ms`.
+    pub clock_instance_id: u64,
+    /// Live-process deadline. It is rebased from the durable wall deadline
+    /// after restart because monotonic clock values do not survive processes.
+    pub residence_deadline_monotonic_ms: u64,
+    /// Durable deadline used only to reconstruct the monotonic deadline after
+    /// restart. Backwards wall movement must never make this deadline earlier.
+    pub residence_deadline_wall_ms: u64,
+    /// Number of distinct peel contexts actually consumed by this row.
+    pub distinct_context_attempts: u32,
+    /// Last `(epoch, retained snapshot set)` fingerprint attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,18 +263,27 @@ pub struct MessageRecord {
     pub epoch: EpochId,
     pub state: MessageState,
     pub payload: Vec<u8>,
+    /// Durable local bookkeeping for raw transport objects in
+    /// [`MessageState::PeelDeferred`]. Older rows deserialize without it and
+    /// receive a fresh conservative residence window on first maintenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel: Option<DeferredPeelLifecycle>,
 }
 
 /// Per-message state.
 ///
 /// Transitions:
 ///   `Sent` → `Sent` (outbound message recorded for durable own-echo checks)
+///   `Sent` → `Processed` (a retained outbound Welcome met its delivery policy)
 ///   `Created` → `Processed` (happy path after successful ingest)
 ///   `Created` → `Failed` (terminal error — no retry)
 ///   `Created` → `Retryable` (transient error — can be re-tried later)
+///   `Created` → `ConvergenceDeferred` (retained for a later convergence pass)
 ///   `Created` → `PeelDeferred` (transport bytes retained for later peel)
 ///   `Retryable` → `Processed` (retry succeeded)
+///   `ConvergenceDeferred` → `Processed` (later evidence selects the input)
 ///   `PeelDeferred` → `Created` (peel succeeded and MLS bytes are buffered)
+///   `PeelDeferred` → deleted (local retry budget exhausted; redelivery remains eligible)
 ///   any → `EpochInvalidated` (group forked past; message will never apply)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageState {
@@ -143,13 +292,18 @@ pub enum MessageState {
     Sent,
     /// Stored but not yet processed.
     Created,
-    /// Successfully applied to the group state.
+    /// Successfully applied to the group state, or a retained outbound
+    /// Welcome whose independent delivery obligation completed.
     Processed,
     /// Terminal failure — do not retry.
     Failed,
     /// Transient failure — eligible for retry (e.g. awaiting out-of-order
     /// commit that hasn't arrived yet).
     Retryable,
+    /// The convergence engine evaluated this input but cannot give it a
+    /// terminal disposition in the completed pass. It remains graph input for
+    /// a later pass, but does not by itself reopen convergence or gate sends.
+    ConvergenceDeferred,
     /// Transport-wrapped bytes are stored, but no available epoch context has
     /// peeled them yet. The engine may retry when it learns or retains more
     /// group epoch state.

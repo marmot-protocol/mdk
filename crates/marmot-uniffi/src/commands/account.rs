@@ -2,8 +2,9 @@
 
 use cgka_traits::TransportEndpoint;
 use marmot_app::{AccountSetupRequest, UserProfileMetadata, default_directory_discovery_relays};
+use zeroize::Zeroizing;
 
-use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi};
+use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi, normalize_member_ref_ffi};
 use crate::errors::MarmotKitError;
 use crate::external_signer::{ExternalAccountSignerAdapter, ExternalAccountSignerFfi};
 use crate::{Marmot, conversions, endpoints};
@@ -83,8 +84,9 @@ impl Marmot {
     /// same identity can be signed back in from the account picker with its
     /// groups, message history, and drafts intact. The account ref stays valid
     /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
-    /// KeyPackage cleanup failures so the app can show a "will retry on next
-    /// sign-in" hint (mdk#477).
+    /// KeyPackage cleanup failures. These are the final best-effort results for
+    /// this call; the runtime does not persist a remote-deletion retry queue
+    /// (mdk#477).
     pub async fn sign_out(
         &self,
         account_ref: String,
@@ -97,7 +99,8 @@ impl Marmot {
     }
 
     /// Create a brand-new Nostr identity, store its secret in the platform
-    /// keychain, and publish initial relay lists + key package.
+    /// keychain, and publish initial relay lists, an empty follow list, and a
+    /// key package.
     pub async fn create_identity(
         &self,
         default_relays: Vec<String>,
@@ -105,6 +108,7 @@ impl Marmot {
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
+            import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             discovery_relays: ffi_discovery_relays(&bootstrap_relays),
@@ -131,15 +135,76 @@ impl Marmot {
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        let (public_identity, import_nsec) = if marmot_app::is_nostr_secret(&identity) {
+            (None, Some(Zeroizing::new(identity)))
+        } else {
+            (Some(identity), None)
+        };
         let request = AccountSetupRequest {
-            identity: None,
+            identity: public_identity,
+            import_nsec,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             discovery_relays: ffi_discovery_relays(&bootstrap_relays),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
-        let result = self.runtime.login(identity, request).await?;
+        let result = self.runtime.create_or_import_account(request).await?;
+        Ok(AccountSummaryFfi {
+            label: result.account.label,
+            account_id_hex: result.account.account_id_hex,
+            local_signing: result.account.local_signing,
+            external_signing: result.account.external_signing,
+            signed_out: result.account.signed_out,
+            running: true,
+        })
+    }
+
+    /// Remove only the legacy ambiguous partial-account shape so a subsequent
+    /// `login` with the same nsec can recreate it. The acknowledgement is
+    /// required because old local state cannot prove that no KeyPackage was
+    /// exposed before its stable slot was lost.
+    pub async fn reset_incomplete_account_setup(
+        &self,
+        nsec: String,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<(), MarmotKitError> {
+        let nsec = Zeroizing::new(nsec);
+        self.runtime
+            .reset_incomplete_account_setup(nsec.as_str(), acknowledge_possible_key_package_orphan)
+            .await?;
+        Ok(())
+    }
+
+    /// Consent-gated one-call recovery for installations stranded before MDK
+    /// had durable account-setup journals. This validates the same nsec,
+    /// removes only the recognized ambiguous partial shape, preserves an
+    /// existing account-id Keychain credential, and immediately retries login.
+    pub async fn login_recovering_incomplete_setup(
+        &self,
+        nsec: String,
+        default_relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        if !marmot_app::is_nostr_secret(&nsec) {
+            return Err(MarmotKitError::InvalidIdentity {
+                details: "incomplete setup recovery requires an nsec".into(),
+            });
+        }
+        let request = AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(Zeroizing::new(nsec)),
+            default_relays: endpoints(&default_relays),
+            bootstrap_relays: endpoints(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        };
+        let result = self
+            .runtime
+            .recover_incomplete_account_setup(request, acknowledge_possible_key_package_orphan)
+            .await?;
         Ok(AccountSummaryFfi {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
@@ -166,6 +231,7 @@ impl Marmot {
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
+            import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             discovery_relays: ffi_discovery_relays(&bootstrap_relays),
@@ -325,6 +391,67 @@ impl Marmot {
         Ok(status.into())
     }
 
+    // -----------------------------------------------------------------------
+    // Follows
+    // -----------------------------------------------------------------------
+
+    /// Return the complete locally cached kind-3 follow list for `account_ref`
+    /// as canonical lowercase public-key hex strings.
+    ///
+    /// This is a synchronous, network-free read intended for profile screens
+    /// and bulk membership checks. Follow/unfollow and directory refreshes
+    /// update the cache before returning.
+    pub fn account_follows(&self, account_ref: String) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self.runtime.account_follows(&account_ref)?)
+    }
+
+    /// Return whether `account_ref` currently follows `user_ref`, using the
+    /// same local cache as [`Self::account_follows`]. `user_ref` accepts npub,
+    /// hex, `nostr:npub…`, and Marmot profile links.
+    pub fn is_following(
+        &self,
+        account_ref: String,
+        user_ref: String,
+    ) -> Result<bool, MarmotKitError> {
+        let user = normalize_member_ref_ffi(&user_ref)?;
+        Ok(self
+            .runtime
+            .is_following(&account_ref, &user.account_id_hex)?)
+    }
+
+    /// Follow `user_ref` while preserving every other entry in the account's
+    /// current kind-3 contact list. Returns the complete updated list.
+    ///
+    /// This fetches the current replaceable event from the account's known
+    /// outbox/default relays before publishing. If no current event can be
+    /// established, it returns `FollowListUnavailable` rather than risking a
+    /// destructive replacement.
+    pub async fn follow_user(
+        &self,
+        account_ref: String,
+        user_ref: String,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        let user = normalize_member_ref_ffi(&user_ref)?;
+        Ok(self
+            .runtime
+            .follow_user(&account_ref, &user.account_id_hex)
+            .await?)
+    }
+
+    /// Unfollow `user_ref` while preserving every other entry in the account's
+    /// current kind-3 contact list. Returns the complete updated list.
+    pub async fn unfollow_user(
+        &self,
+        account_ref: String,
+        user_ref: String,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        let user = normalize_member_ref_ffi(&user_ref)?;
+        Ok(self
+            .runtime
+            .unfollow_user(&account_ref, &user.account_id_hex)
+            .await?)
+    }
+
     /// Export the active account's raw private key in canonical `nsec1...`
     /// bech32 form for an in-app key-backup display (mdk#543).
     ///
@@ -348,7 +475,9 @@ impl Marmot {
     /// `ncryptsec1...` bech32 backup string (mdk#544).
     ///
     /// SENSITIVE: the passphrase is accepted as an owned FFI string and zeroed
-    /// on return by the Rust boundary. The encrypted export is logged to the
+    /// on return by the Rust boundary. This cannot wipe the caller's original
+    /// host-language string, which remains a separate host-side responsibility
+    /// and should be kept transient. The encrypted export is logged to the
     /// per-account audit log, but unlike `reveal_nsec` it does not downgrade the
     /// account's NIP-49 KEY_SECURITY_BYTE because raw plaintext key material is
     /// not returned to the host app.
@@ -385,6 +514,31 @@ impl Marmot {
             .await?;
         Ok(pushed.into())
     }
+
+    /// Upload a public raster profile image to Blossom with the account's
+    /// signer. The returned HTTPS URL can be published as kind:0 `picture`.
+    pub async fn upload_profile_image(
+        &self,
+        account_ref: String,
+        data: Vec<u8>,
+        media_type: String,
+        blossom_server: Option<String>,
+    ) -> Result<String, MarmotKitError> {
+        Ok(self
+            .runtime
+            .upload_profile_image(&account_ref, data, &media_type, blossom_server.as_deref())
+            .await?)
+    }
+
+    /// Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe
+    /// HTTPS policy, address pinning, and bounded streaming.
+    pub async fn download_profile_image(
+        &self,
+        url: String,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, MarmotKitError> {
+        Ok(marmot_app::download_profile_image(url, max_bytes).await?)
+    }
 }
 
 fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {
@@ -395,4 +549,100 @@ fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {
         }
     }
     relays
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use marmot_account::AccountHome;
+    use marmot_app::{AccountRelayListBootstrap, MarmotApp, npub_for_account_id};
+    use nostr_relay_builder::MockRelay;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follow_bindings_preserve_the_list_and_refresh_fast_reads() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = AccountHome::open(root.path());
+        let alice = home.create_account("alice").expect("create alice");
+        let bob = home.create_account("bob").expect("create bob");
+        let carol = home.create_account("carol").expect("create carol");
+        let app = MarmotApp::with_relay(root.path(), relay_url.clone());
+        let endpoint = TransportEndpoint(relay_url);
+        let bootstrap =
+            AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint.clone()]);
+        app.publish_account_follow_list(&alice.label, &[bob.account_id_hex.as_str()], bootstrap)
+            .await
+            .expect("seed follow list");
+
+        // Kind-3 is replaceable at second granularity. Keep each update in a
+        // distinct timestamp so this test exercises deterministic relay state
+        // rather than the event-id tie-breaker.
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let bob_npub = npub_for_account_id(&bob.account_id_hex).expect("bob npub");
+        let carol_npub = npub_for_account_id(&carol.account_id_hex).expect("carol npub");
+
+        let followed = kit
+            .follow_user(alice.label.clone(), carol_npub)
+            .await
+            .expect("follow carol");
+        let mut expected_follows = vec![bob.account_id_hex.clone(), carol.account_id_hex.clone()];
+        expected_follows.sort();
+        assert_eq!(followed, expected_follows);
+        assert_eq!(
+            kit.account_follows(alice.label.clone())
+                .expect("cached follows"),
+            followed
+        );
+        assert!(
+            kit.is_following(alice.label.clone(), bob_npub.clone())
+                .expect("bob membership")
+        );
+        assert!(
+            kit.is_following(alice.label.clone(), carol.account_id_hex.clone())
+                .expect("carol membership")
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+
+        let remaining = kit
+            .unfollow_user(alice.label.clone(), bob_npub)
+            .await
+            .expect("unfollow bob");
+        assert_eq!(remaining, vec![carol.account_id_hex.clone()]);
+        assert_eq!(
+            kit.account_follows(alice.label.clone())
+                .expect("updated cached follows"),
+            remaining
+        );
+        assert!(
+            !kit.is_following(alice.label, bob.account_id_hex)
+                .expect("removed membership")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follow_binding_refuses_to_replace_an_unknown_list() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = AccountHome::open(root.path());
+        let alice = home.create_account("alice").expect("create alice");
+        let bob = home.create_account("bob").expect("create bob");
+        let app = MarmotApp::with_relay(root.path(), relay_url);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+
+        let error = kit
+            .follow_user(alice.label, bob.account_id_hex)
+            .await
+            .expect_err("missing current kind-3 must not be treated as empty");
+        assert!(matches!(error, MarmotKitError::FollowListUnavailable));
+    }
 }

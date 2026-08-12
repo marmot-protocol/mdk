@@ -12,7 +12,9 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::{GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason,
+};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
@@ -35,6 +37,7 @@ pub(crate) fn pending_kind_str(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::CreateGroup => "create_group",
         PendingKind::GroupEvolution => "group_evolution",
+        PendingKind::Disband => "disband",
     }
 }
 
@@ -65,10 +68,16 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
+        IngestOutcome::Ignored { .. } => "ignored",
+        IngestOutcome::LocalState { .. } => "local_state",
+        IngestOutcome::TransportDeferred { .. } => "transport_deferred",
+        IngestOutcome::ResourceRefused { .. } => "resource_refused",
         IngestOutcome::Stale { .. } => "stale",
+        IngestOutcome::Rejected { .. } => "rejected",
     }
 }
 
+#[allow(deprecated)]
 pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
     match reason {
         StaleReason::AlreadySeen => "already_seen",
@@ -76,7 +85,12 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::NotForThisClient => "not_for_this_client",
         StaleReason::UnknownGroup => "unknown_group",
         StaleReason::OwnEcho => "own_echo",
-        StaleReason::PeelFailed => "peel_failed",
+        StaleReason::PreMembership => "pre_membership",
+        StaleReason::BeyondAnchor => "beyond_anchor",
+        StaleReason::BeyondRollbackHorizon => "beyond_rollback_horizon",
+        StaleReason::BeyondAppRetention => "beyond_app_retention",
+        StaleReason::LosingBranch => "losing_branch",
+        StaleReason::InvalidAgainstCanonicalState => "invalid_against_canonical_state",
         StaleReason::SelfEvicted => "self_evicted",
         StaleReason::Quarantined => "quarantined",
     }
@@ -94,7 +108,9 @@ pub(crate) fn ingest_outcome_epoch(outcome: &IngestOutcome) -> Option<u64> {
 
 pub(crate) fn ingest_outcome_group_ref(outcome: &IngestOutcome) -> Option<String> {
     match outcome {
-        IngestOutcome::Buffered { group_id, .. } => Some(hex::encode(group_id.as_slice())),
+        IngestOutcome::Buffered { group_id, .. }
+        | IngestOutcome::TransportDeferred { group_id }
+        | IngestOutcome::ResourceRefused { group_id, .. } => Some(hex::encode(group_id.as_slice())),
         _ => None,
     }
 }
@@ -105,8 +121,11 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::Invite { .. } => "invite",
         SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::Leave { .. } => "leave",
+        SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
+        SendIntent::EnableDisbanding { .. } => "enable_disbanding",
+        SendIntent::Disband { .. } => "disband",
     }
 }
 
@@ -121,18 +140,25 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
+        | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => group_id.clone(),
+        | SendIntent::UpdateGroupData { group_id, .. }
+        | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::Disband { group_id } => group_id.clone(),
     }
 }
 
 pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
     match result {
+        SendResult::NoChange { .. } => "no_change",
+        SendResult::DisbandRequested { .. } => "disband_requested",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
         SendResult::GroupEvolution { .. } => "group_evolution",
-        SendResult::GroupCreated { .. } => "group_created",
+        SendResult::GroupCreated { .. } | SendResult::FoundingGroupCreated { .. } => {
+            "group_created"
+        }
     }
 }
 
@@ -143,6 +169,7 @@ pub(crate) fn message_state_str(state: MessageState) -> &'static str {
         MessageState::Processed => "processed",
         MessageState::Failed => "failed",
         MessageState::Retryable => "retryable",
+        MessageState::ConvergenceDeferred => "convergence_deferred",
         MessageState::PeelDeferred => "peel_deferred",
         MessageState::EpochInvalidated => "epoch_invalidated",
     }
@@ -155,6 +182,7 @@ pub(crate) fn epoch_state_name_str(name: &str) -> &'static str {
         "Merging" => "merging",
         "Recovering" => "recovering",
         "Unrecoverable" => "unrecoverable",
+        "Disbanded" => "disbanded",
         _ => "unknown",
     }
 }
@@ -184,6 +212,7 @@ pub(crate) fn group_state_change_kind_str(change: &GroupStateChange) -> &'static
         GroupStateChange::GroupRenamed { .. } => "group_renamed",
         GroupStateChange::GroupAvatarChanged => "group_avatar_changed",
         GroupStateChange::MessageRetentionChanged { .. } => "message_retention_changed",
+        GroupStateChange::GroupDisbanded => "group_disbanded",
     }
 }
 
@@ -197,6 +226,7 @@ fn group_state_change_fields(change: &GroupStateChange) -> Vec<String> {
         GroupStateChange::GroupRenamed { .. } => &["name"],
         GroupStateChange::GroupAvatarChanged => &["avatar"],
         GroupStateChange::MessageRetentionChanged { .. } => &["message_retention"],
+        GroupStateChange::GroupDisbanded => &["lifecycle"],
     };
     fields.iter().map(|field| (*field).to_string()).collect()
 }
@@ -214,6 +244,12 @@ fn group_state_change_component_ids(change: &GroupStateChange) -> Vec<u16> {
         GroupStateChange::MessageRetentionChanged { .. } => {
             vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID]
         }
+        GroupStateChange::GroupDisbanded => {
+            vec![
+                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ]
+        }
         GroupStateChange::MemberAdded { .. }
         | GroupStateChange::MemberRemoved { .. }
         | GroupStateChange::MemberLeft { .. } => Vec::new(),
@@ -229,7 +265,8 @@ fn group_state_subject_member(change: &GroupStateChange) -> Option<&MemberId> {
         | GroupStateChange::AdminRemoved { member } => Some(member),
         GroupStateChange::GroupRenamed { .. }
         | GroupStateChange::GroupAvatarChanged
-        | GroupStateChange::MessageRetentionChanged { .. } => None,
+        | GroupStateChange::MessageRetentionChanged { .. }
+        | GroupStateChange::GroupDisbanded => None,
     }
 }
 
@@ -434,6 +471,46 @@ pub(crate) fn ingest_outcome_event(
         outcome_kind: ingest_outcome_kind_str(outcome).to_string(),
         stale_reason: match outcome {
             IngestOutcome::Stale { reason } => Some(stale_reason_str(reason).to_string()),
+            IngestOutcome::Ignored { category } => Some(
+                match category {
+                    InputRejectionCategory::Duplicate => "duplicate",
+                    InputRejectionCategory::OwnEcho => "own_echo",
+                    InputRejectionCategory::WrongRecipient => "wrong_recipient",
+                    InputRejectionCategory::UnknownGroup => "unknown_group",
+                    InputRejectionCategory::InvalidEncoding => "invalid_encoding",
+                    InputRejectionCategory::InvalidSignature => "invalid_signature",
+                    InputRejectionCategory::UnsupportedRequiredFeature => {
+                        "unsupported_required_feature"
+                    }
+                    InputRejectionCategory::AuthorizationFailed => "authorization_failed",
+                }
+                .to_string(),
+            ),
+            IngestOutcome::LocalState { state } => Some(
+                match state {
+                    LocalIngestState::Removed => "removed",
+                    LocalIngestState::Quarantined => "quarantined",
+                }
+                .to_string(),
+            ),
+            IngestOutcome::Rejected { category } => {
+                Some(crate::app_components::proposal_rejection_category_tag(*category).to_string())
+            }
+            IngestOutcome::TransportDeferred { .. } => Some("transport_deferred".to_string()),
+            IngestOutcome::ResourceRefused { resource, .. } => Some(
+                match resource {
+                    InboundResourceLimit::TransportDeferredCapacity => {
+                        "resource_refused_deferred_capacity"
+                    }
+                    InboundResourceLimit::TransportDeferredRetryBudget => {
+                        "resource_refused_retry_budget"
+                    }
+                    InboundResourceLimit::TransportDeferredResidenceBudget => {
+                        "resource_refused_residence_budget"
+                    }
+                }
+                .to_string(),
+            ),
             _ => None,
         },
         epoch: ingest_outcome_epoch(outcome),
@@ -454,7 +531,7 @@ pub(crate) fn message_state_changed_event(
         epoch: None,
         reason: reason.to_string(),
         retry_count: None,
-        sweeps_waited: None,
+        residence_ms: None,
     }
 }
 
@@ -473,30 +550,31 @@ pub(crate) fn message_state_transition_event(
         epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
         retry_count: None,
-        sweeps_waited: None,
+        residence_ms: None,
     }
 }
 
-/// Terminal transition of a deferred-peel row, carrying the lifecycle's
-/// per-row telemetry: how many re-peel attempts it consumed and how many
-/// retry sweeps it waited between first attempt and this transition
-/// (mdk#339).
-pub(crate) fn deferred_peel_terminal_event(
+/// Resource-refusal release of a deferred-peel row, carrying the lifecycle's
+/// per-row telemetry: how many re-peel attempts it consumed and how long it
+/// resided locally before release (mdk#339). `released` deliberately does not
+/// claim a terminal message state; the row no longer exists and same-id
+/// redelivery remains eligible.
+pub(crate) fn deferred_peel_resource_refused_event(
     msg_id_hex: MessageRefHex,
     epoch: Option<EpochId>,
     reason: &str,
     retry_count: u64,
-    sweeps_waited: u64,
+    residence_ms: u64,
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
         artifact_kind: None,
         previous_state: Some(message_state_str(MessageState::PeelDeferred).to_string()),
-        new_state: message_state_str(MessageState::Failed).to_string(),
+        new_state: "released".to_string(),
         epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
         retry_count: Some(retry_count),
-        sweeps_waited: Some(sweeps_waited),
+        residence_ms: Some(residence_ms),
     }
 }
 
@@ -517,7 +595,8 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
     }
     let mut messages = Vec::new();
     match result {
-        SendResult::ApplicationMessage { msg } => {
+        SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
+        SendResult::ApplicationMessage { msg, .. } => {
             messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
         }
         SendResult::Proposal { msg } => {
@@ -531,7 +610,8 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
                     .map(|w| outbound(w, MessageArtifactKind::Welcome)),
             );
         }
-        SendResult::GroupCreated { welcomes, .. } => {
+        SendResult::GroupCreated { welcomes, .. }
+        | SendResult::FoundingGroupCreated { welcomes } => {
             messages.extend(
                 welcomes
                     .iter()
@@ -562,23 +642,30 @@ pub(crate) fn create_group_outcome_event(result: &SendResult) -> AuditEventKind 
 pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
     match err {
         EngineError::UnknownGroup(_) => "unknown_group",
+        EngineError::GroupNotHydrated(_) => "group_not_hydrated",
         EngineError::UnknownPending => "unknown_pending",
         EngineError::NotAMember { .. } => "not_a_member",
         EngineError::NotGroupAdmin { .. } => "not_group_admin",
         EngineError::UnknownMember { .. } => "unknown_member",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
+        EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
         EngineError::AdminDepletion { .. } => "admin_depletion",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+        EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
+        EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
         EngineError::ForkedEpoch { .. } => "forked_epoch",
+        EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::Storage(_) => "storage",
         EngineError::Peeler(_) => "peeler",
         EngineError::Serialize(_) => "serialize",
+        EngineError::InvalidWelcome => "invalid_welcome",
+        EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::Backend(_) => "backend",
         EngineError::Other(_) => "other",
     }
@@ -591,6 +678,8 @@ pub(crate) fn engine_error_detail(err: &EngineError) -> Option<String> {
 pub(crate) fn peeler_error_kind(err: &PeelerError) -> &'static str {
     match err {
         PeelerError::Malformed(_) => "malformed",
+        PeelerError::InvalidSignature => "invalid_signature",
+        PeelerError::WrongRecipient => "wrong_recipient",
         PeelerError::DecryptFailed => "decrypt_failed",
         PeelerError::StaleEpoch { .. } => "stale_epoch",
         PeelerError::MissingContext { .. } => "missing_context",

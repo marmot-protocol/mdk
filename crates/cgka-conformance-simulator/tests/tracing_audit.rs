@@ -161,7 +161,7 @@ fn production_library_sources_do_not_write_direct_output() {
 
     for root in production_source_roots(&repo) {
         for file in rust_source_files(&root) {
-            if is_cli_binary(&file) {
+            if is_cli_binary(&file) || is_feature_gated_test_support(&file) {
                 continue;
             }
 
@@ -188,6 +188,10 @@ fn production_library_sources_do_not_write_direct_output() {
         "direct output audit failed:\n{}",
         failures.join("\n")
     );
+}
+
+fn is_feature_gated_test_support(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("test_support.rs")
 }
 
 #[derive(Debug)]

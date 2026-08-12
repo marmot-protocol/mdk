@@ -1,6 +1,5 @@
 //! `media` command namespace handlers and media-attachment helpers.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use cgka_traits::GroupId;
@@ -105,7 +104,11 @@ pub(crate) async fn media_command_with_runtime(
                     limit: None,
                 },
             )?;
-            let reference = media_attachment_for_hash(messages, &file_hash_hex)?;
+            let reference = media_attachment_for_hash(
+                messages,
+                &file_hash_hex,
+                app.allow_loopback_blob_endpoints(),
+            )?;
             let output_path = media_output_path(output, &reference.file_name);
             let download = runtime
                 .download_media(&account.account_id_hex, &group_id, reference.clone())
@@ -135,7 +138,7 @@ pub(crate) async fn media_command_with_runtime(
                     limit: None,
                 },
             )?;
-            let media = media_records_json(messages)?;
+            let media = media_records_json(messages, app.allow_loopback_blob_endpoints());
             Ok(CommandOutput {
                 plain: if media.is_empty() {
                     "no media".to_owned()
@@ -157,13 +160,14 @@ pub(crate) async fn media_command_with_runtime(
     }
 }
 
-fn media_records_json(messages: Vec<AppMessageRecord>) -> Result<Vec<Value>, WnError> {
+fn media_records_json(messages: Vec<AppMessageRecord>, allow_loopback_http: bool) -> Vec<Value> {
     let mut records = Vec::new();
     for message in messages {
         let caption = (!message.plaintext.is_empty()).then(|| message.plaintext.clone());
-        for (attachment_index, reference) in media_attachments_from_message(&message)?
-            .into_iter()
-            .enumerate()
+        for (attachment_index, reference) in
+            media_attachments_from_message(&message, allow_loopback_http)
+                .into_iter()
+                .enumerate()
         {
             records.push(json!({
                 "message_id": message.message_id_hex,
@@ -188,7 +192,7 @@ fn media_records_json(messages: Vec<AppMessageRecord>) -> Result<Vec<Value>, WnE
             }));
         }
     }
-    Ok(records)
+    records
 }
 
 fn media_upload_attachment_json(attachment: &marmot_app::MediaUploadAttachmentResult) -> Value {
@@ -229,15 +233,17 @@ fn send_summary_json(summary: marmot_app::SendSummary) -> Value {
     json!({
         "published": summary.published,
         "message_ids": summary.message_ids,
+        "maintenance_disposition": summary.maintenance_disposition,
     })
 }
 
 fn media_attachment_for_hash(
     messages: Vec<AppMessageRecord>,
     file_hash_hex: &str,
+    allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, WnError> {
     for message in messages {
-        for reference in media_attachments_from_message(&message)? {
+        for reference in media_attachments_from_message(&message, allow_loopback_http) {
             if reference.plaintext_sha256 == file_hash_hex {
                 return Ok(reference);
             }
@@ -248,59 +254,30 @@ fn media_attachment_for_hash(
 
 fn media_attachments_from_message(
     message: &AppMessageRecord,
-) -> Result<Vec<MediaAttachmentReference>, WnError> {
+    allow_loopback_http: bool,
+) -> Vec<MediaAttachmentReference> {
+    // Rejection is attachment-local: a malformed sibling must not abort list or
+    // download before a later valid reference is considered. Match the UniFFI
+    // `list_media` / timeline projection path, which uses `filter_map`.
     message
         .tags
         .iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch))
+        .filter_map(|tag| {
+            media_attachment_from_imeta_tag(tag, message.source_epoch, allow_loopback_http).ok()
+        })
         .collect()
 }
 
 fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
+    allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, WnError> {
-    let mut locators = Vec::new();
-    let mut fields = HashMap::new();
-    for field in tag.iter().skip(1) {
-        if field.starts_with("blurhash ") {
-            return Err(WnError::InvalidMediaAttachment("blurhash".to_owned()));
-        }
-        if let Some(rest) = field.strip_prefix("locator ") {
-            let (kind, value) = rest
-                .split_once(' ')
-                .ok_or_else(|| WnError::InvalidMediaAttachment("locator".to_owned()))?;
-            locators.push(MediaLocator {
-                kind: kind.to_owned(),
-                value: value.to_owned(),
-            });
-            continue;
-        }
-        if let Some((key, value)) = field.split_once(' ') {
-            fields.insert(key.to_owned(), value.to_owned());
-        }
-    }
-    let required = |key: &'static str| {
-        fields
-            .get(key)
-            .cloned()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(WnError::InvalidMediaAttachment(key.to_owned()))
-    };
-    Ok(MediaAttachmentReference {
-        locators,
-        ciphertext_sha256: required("ciphertext_sha256")?,
-        plaintext_sha256: required("plaintext_sha256")?,
-        nonce_hex: required("nonce")?,
-        file_name: required("filename")?,
-        media_type: required("m")?,
-        version: required("v")?,
-        source_epoch: source_epoch
-            .ok_or_else(|| WnError::InvalidMediaAttachment("source_epoch".to_owned()))?,
-        dim: fields.get("dim").cloned(),
-        thumbhash: fields.get("thumbhash").cloned(),
-    })
+    let source_epoch =
+        source_epoch.ok_or_else(|| WnError::InvalidMediaAttachment("source_epoch".to_owned()))?;
+    marmot_app::media_attachment_from_imeta_tag(tag, Some(source_epoch), allow_loopback_http)
+        .map_err(|error| WnError::InvalidMediaAttachment(error.to_string()))
 }
 
 fn normalize_sha256_hex(value: &str) -> Result<String, WnError> {
@@ -355,5 +332,133 @@ fn guess_media_type(path: &Path) -> &'static str {
         Some("txt") => "text/plain",
         Some("pdf") => "application/pdf",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared golden imeta fixtures also drive marmot-app and marmot-uniffi
+    /// agreement tests.
+    fn shared_media_fixture_cases(file: &str) -> Vec<Value> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/encrypted-media")
+            .join(file);
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read media fixture {}: {err}", path.display())),
+        )
+        .expect("media fixture file is valid JSON");
+        doc["cases"].as_array().expect("fixture cases").clone()
+    }
+
+    /// The CLI resolves inbound `imeta` tags through the same Rust parser as
+    /// app-core and the bindings; this locks the agreement on the shared
+    /// fixtures so a divergent CLI-side wrapper (the pre-#1080 hand-written
+    /// parser regressing) fails loudly.
+    #[test]
+    fn cli_media_validation_agrees_with_shared_golden_fixtures() {
+        for file in ["imeta-v1.json", "imeta-v2.json"] {
+            for case in shared_media_fixture_cases(file) {
+                let name = case["name"].as_str().expect("fixture case name");
+                let tag: Vec<String> = case["tag"]
+                    .as_array()
+                    .expect("fixture tag")
+                    .iter()
+                    .map(|field| field.as_str().expect("fixture tag field").to_owned())
+                    .collect();
+                let source_epoch = case["source_epoch"].as_u64().expect("fixture source_epoch");
+                let valid = case["valid"].as_bool().expect("fixture valid flag");
+                let result = media_attachment_from_imeta_tag(&tag, Some(source_epoch), false);
+                match result {
+                    Ok(reference) => {
+                        assert!(valid, "{file}/{name}: CLI accepted a rejection fixture");
+                        let expected = &case["expected"];
+                        assert_eq!(
+                            reference.version,
+                            expected["version"].as_str().unwrap(),
+                            "{file}/{name} version"
+                        );
+                        assert_eq!(
+                            reference.source_epoch, source_epoch,
+                            "{file}/{name} source_epoch"
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            !valid,
+                            "{file}/{name}: CLI rejected a golden fixture: {err}"
+                        );
+                        let needle = case["error_contains"].as_str().expect("error_contains");
+                        assert!(
+                            err.to_string().contains(needle),
+                            "{file}/{name} error must mention {needle:?}, got: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn sample_message(tags: Vec<Vec<String>>) -> AppMessageRecord {
+        AppMessageRecord {
+            message_id_hex: "aa".repeat(32),
+            direction: "incoming".to_owned(),
+            group_id_hex: "bb".repeat(32),
+            sender: "alice".to_owned(),
+            plaintext: "caption".to_owned(),
+            kind: 9,
+            tags,
+            source_epoch: Some(7),
+            retention: None,
+            recorded_at: 10,
+            received_at: 11,
+            insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
+        }
+    }
+
+    fn valid_cli_imeta_tag(byte: u8, file_name: &str) -> Vec<String> {
+        vec![
+            "imeta".to_owned(),
+            "v encrypted-media-v1".to_owned(),
+            format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([byte; 32])
+            ),
+            format!("ciphertext_sha256 {}", hex::encode([byte; 32])),
+            format!(
+                "plaintext_sha256 {}",
+                hex::encode([byte.wrapping_add(1); 32])
+            ),
+            format!("nonce {}", hex::encode([byte; 12])),
+            "m image/png".to_owned(),
+            format!("filename {file_name}"),
+        ]
+    }
+
+    #[test]
+    fn cli_media_list_keeps_valid_siblings_when_one_imeta_is_malformed() {
+        let malformed = vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()];
+        let message = sample_message(vec![
+            valid_cli_imeta_tag(0x11, "ok.png"),
+            malformed,
+            valid_cli_imeta_tag(0x22, "also-ok.png"),
+        ]);
+
+        let references = media_attachments_from_message(&message, false);
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.file_name.as_str())
+                .collect::<Vec<_>>(),
+            ["ok.png", "also-ok.png"]
+        );
+
+        let later = media_attachment_for_hash(vec![message], &hex::encode([0x23; 32]), false)
+            .expect("download lookup must reach the later valid sibling");
+        assert_eq!(later.file_name, "also-ok.png");
     }
 }

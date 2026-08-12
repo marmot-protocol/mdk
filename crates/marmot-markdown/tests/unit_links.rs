@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use marmot_markdown::{Block, Inline, parse};
+use marmot_markdown::{Block, Inline, classify_link_destination, parse};
 
 mod common;
 use common::{parse_blocks, parse_inlines, t};
@@ -10,6 +10,7 @@ fn link(dest: &str, title: Option<&str>, children: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: title.map(|t| t.to_string()),
         children,
+        classification: classify_link_destination(dest),
     }
 }
 fn image(dest: &str, title: Option<&str>, alt: Vec<Inline>) -> Inline {
@@ -17,6 +18,7 @@ fn image(dest: &str, title: Option<&str>, alt: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: title.map(|t| t.to_string()),
         alt,
+        classification: classify_link_destination(dest),
     }
 }
 
@@ -107,6 +109,93 @@ fn inline_link_with_title() {
         parse_inlines("[foo](/url \"t\")"),
         vec![link("/url", Some("t"), vec![t("foo")])]
     );
+}
+
+#[test]
+fn explicit_destinations_are_preserved_and_classified() {
+    let cases = [
+        (
+            "[verify](javascript:alert(1))",
+            "javascript:alert(1)",
+            marmot_markdown::LinkDestinationKind::Dangerous,
+            false,
+        ),
+        (
+            "![key](nsec1qqqqqq)",
+            "nsec1qqqqqq",
+            marmot_markdown::LinkDestinationKind::Sensitive,
+            true,
+        ),
+    ];
+    for (input, expected_dest, expected_classification, is_image) in cases {
+        let parsed = parse_inlines(input);
+        match &parsed[0] {
+            Inline::Link {
+                dest,
+                classification,
+                ..
+            } if !is_image => {
+                assert_eq!(dest, expected_dest);
+                assert_eq!(*classification, expected_classification);
+            }
+            Inline::Image {
+                dest,
+                classification,
+                ..
+            } if is_image => {
+                assert_eq!(dest, expected_dest);
+                assert_eq!(*classification, expected_classification);
+            }
+            other => panic!("unexpected parsed destination for {input}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn reference_destination_is_preserved_and_classified() {
+    let blocks = parse_blocks("[verify][target]\n\n[target]: file:///etc/passwd");
+    let Block::Paragraph { inlines } = &blocks[0] else {
+        panic!("expected paragraph");
+    };
+    assert!(matches!(
+        &inlines[0],
+        Inline::Link {
+            dest,
+            classification: marmot_markdown::LinkDestinationKind::Dangerous,
+            ..
+        } if dest == "file:///etc/passwd"
+    ));
+}
+
+#[test]
+fn angle_bracket_destination_rejects_control_characters() {
+    for control in ['\u{0007}', '\u{001b}', '\u{007f}'] {
+        let input = format!("[x](<https://example.test/{control}payload>)");
+        assert!(
+            parse_inlines(&input)
+                .iter()
+                .all(|inline| !matches!(inline, Inline::Link { .. })),
+            "control character {control:?} must not reach a link destination"
+        );
+    }
+}
+
+#[test]
+fn link_and_image_titles_reject_control_characters() {
+    for control in ['\u{0007}', '\u{001b}', '\u{007f}', '\u{0085}', '\u{009f}'] {
+        for input in [
+            format!("[x](/url \"before{control}after\")"),
+            format!("![x](/url 'before{control}after')"),
+            format!("[x](/url (before{control}after))"),
+        ] {
+            assert!(
+                parse_inlines(&input)
+                    .iter()
+                    .all(|inline| !matches!(inline, Inline::Link { .. } | Inline::Image { .. })),
+                "control character {control:?} must not reach a link or image title"
+            );
+        }
+    }
 }
 
 #[test]
@@ -351,6 +440,19 @@ fn shortcut_ref_link() {
             inlines: vec![link("/url", None, vec![t("foo")])]
         }]
     );
+}
+
+#[test]
+fn shortcut_and_collapsed_reference_labels_over_999_bytes_do_not_resolve() {
+    let label = format!("{}foo", " ".repeat(997));
+    for suffix in ["", "[]"] {
+        let input = format!("[{label}]{suffix}\n\n[foo]: /url");
+        let blocks = parse_blocks(&input);
+        let Block::Paragraph { inlines } = &blocks[0] else {
+            panic!("overlong reference must remain a paragraph");
+        };
+        assert_eq!(count_links(inlines), 0);
+    }
 }
 
 #[test]

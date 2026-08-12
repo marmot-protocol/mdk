@@ -7,7 +7,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 
 - A thin, **control-plane-only** OpenClaw channel plugin. `wn-agent` owns the
   Marmot account, MLS state, Nostr transport, and QUIC previews; this plugin
-  only speaks `marmot.agent-control.v1` (NDJSON over a Unix socket).
+  only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
 - Keep transcript hashing byte-for-byte with the authoritative Rust
   `AgentTextStreamTranscriptV1` (`crates/traits/src/agent_text_stream.rs`).
 - No QUIC, crypto, relay, or MLS logic here.
@@ -21,7 +21,8 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/append-only.ts` — append-only suffix tracker for progressive updates.
 - `src/live.ts` — live-preview state machine → `stream_begin`/`append`/`finalize`/`cancel`.
 - `src/inbound.ts` — inbound subscription bridge (reconnect, dedupe, resync).
-- `src/inbound-runtime.ts` — `registerFull` wiring + the inbound→agent dispatch seam.
+- `src/gateway.ts` — OpenClaw-owned account lifecycle and inbound subscription.
+- `src/inbound-runtime.ts` — the inbound→agent dispatch seam.
 - `src/bounded-keyed-async-queue.ts` — per-group inbound dispatch with a depth cap.
 - `src/outbound.ts` — `defineChannelMessageAdapter` durable send → `send_final`.
 - `src/messaging.ts` — `messaging` target-resolution adapter so the shared `message` tool can resolve a Marmot conversation (group id hex).
@@ -37,7 +38,17 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - Regenerate `test/vectors/transcript-vectors.json` from the Rust
   `AgentTextStreamTranscriptV1` if the Rust transcript hashing ever changes.
 - Keep the `openclaw` dependency pinned; before bumping, verify the
-  `openclaw/plugin-sdk/*` subpath exports against the new version's types.
+  `openclaw/plugin-sdk/*` subpath exports against the new version's types, and
+  re-verify the deliberate test-only `dist/plugins/loader.js` import used by the
+  connector E2E (the pinned SDK exposes no supported plugin-loader subpath).
+- Keep `test/plugin-sdk-surface.test.ts` in sync when adding or removing a
+  runtime (non-type) `openclaw/plugin-sdk/*` import. A named import the host SDK
+  no longer exports is an ESM link error that fails the *whole* plugin load, not
+  just the feature using it, so the channel disappears from OpenClaw entirely.
+  Prefer subpaths that carry the symbol on both the `latest` and `beta` release
+  channels; the SDK's barrels get re-cut between them (2026.7.2-beta moved
+  `getDefaultLocalRoots` out of `plugin-sdk/media-runtime` and dropped
+  `assertLocalMediaAllowed` from the public surface altogether).
 - The inbound→agent and live-preview-pipeline seams use OpenClaw gateway runtime
   internals and are validated by the deterministic connector E2E plus the docker
   phone test, not the unit tests alone.
@@ -49,6 +60,10 @@ cd integrations/openclaw/marmot && pnpm install && pnpm typecheck && pnpm test
 integrations/openclaw/marmot/test/dev-scripts.sh
 # or from the repo root:
 just openclaw-dev-test
+just openclaw-host-compat-test
 just openclaw-dev-script-test
 just openclaw-dev-e2e-connector
 ```
+
+After changing OpenClaw plugin dependencies, regenerate the committed beta lock
+with `integrations/openclaw/marmot/test/openclaw-host-compat.sh --update-lock`.

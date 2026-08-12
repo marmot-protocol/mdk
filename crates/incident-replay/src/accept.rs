@@ -3,7 +3,7 @@
 use cgka_conformance_simulator::{VectorFixture, run_scenario_spec};
 
 use crate::convergence::RecoveredConvergence;
-use crate::fork::RecoveredFork;
+use crate::fork::{ForkCommitKind, RecoveredFork};
 use crate::synth::{WINNER_BRANCH, synthesize, synthesize_convergence};
 
 /// Why an accept attempt produced no vector (fail-closed).
@@ -19,13 +19,20 @@ pub enum AcceptError {
 /// orderings puts the designated winner's key below the loser's.
 const LABEL_ORDERINGS: [(&str, &str); 2] = [("alice", "bob"), ("bob", "alice")];
 
-/// Synthesize and verify a vector for a recovered fork.
-///
-/// Bounded label search: for each ordering, run the synthesized scenario and
-/// accept iff the full `RecoverySummary` (and convergence) expectations hold
-/// **and** the designated winner's branch is the one that survived. The summary
-/// is the gate; branch survival only selects the correct ordering.
+/// Synthesize and verify a vector for a recovered fork, dispatching on the
+/// commit kind (the two shapes verify differently).
 pub fn accept(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptError> {
+    match fork.commit {
+        ForkCommitKind::GroupData => accept_group_data_fork(fork, name),
+        ForkCommitKind::Membership => accept_membership_fork(fork, name),
+    }
+}
+
+/// Group-data fork: bounded label search. For each ordering, run the synthesized
+/// scenario and accept iff the full `RecoverySummary` expectations hold **and**
+/// the designated winner's branch (its group name) is the one that survived. The
+/// summary is the gate; branch survival only selects the correct ordering.
+fn accept_group_data_fork(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -49,6 +56,30 @@ pub fn accept(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptE
     Err(AcceptError::NotReproduced {
         tries: LABEL_ORDERINGS.len(),
     })
+}
+
+/// Membership fork: a single run-and-compare. The recovery is winner-agnostic —
+/// `member_count == 3` after recovery proves exactly one branch's invite
+/// survived — so there is no group-name to search label orderings for (unlike
+/// the group-data fork). Accept iff the synthesized scenario reproduces the
+/// recovery summary and the surviving-member count.
+fn accept_membership_fork(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|err| AcceptError::Run(err.to_string()))?;
+
+    let (winner, loser) = LABEL_ORDERINGS[0];
+    let vector = synthesize(fork, name, winner, loser);
+    let trace = runtime
+        .block_on(run_scenario_spec(&vector.scenario))
+        .map_err(|err| AcceptError::Run(err.to_string()))?;
+
+    if vector.compare_observed_trace(&trace).is_empty() {
+        Ok(vector)
+    } else {
+        Err(AcceptError::NotReproduced { tries: 1 })
+    }
 }
 
 /// Synthesize and verify a vector for a recovered convergence decision.

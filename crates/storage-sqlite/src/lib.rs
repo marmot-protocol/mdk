@@ -6,6 +6,7 @@
 //! layers.
 
 mod account_projection;
+mod agent_stream_sequences;
 mod chat_list;
 mod codec;
 mod connection;
@@ -21,18 +22,21 @@ mod timeline;
 
 pub use account_projection::{
     AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
-    AccountPushRegistration, AccountStoredPushRegistration, AppEventReplayCursor, SelfMembership,
-    StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppMessageQuery,
-    StoredAppMessageRecord, clamp_to_max_future_skew,
+    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountStoredPushRegistration,
+    AppEventReplayCursor, DeleteLocalGroupDataResult, SelfMembership, StoredAccountGroup,
+    StoredAccountGroupComponent, StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
+    StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use chat_list::{
-    AccountUnreadTotal, ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow,
+    AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
+    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,
+    ChatPinState,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{
-    SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteJournalMode,
-    SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
+    CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
+    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
     StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,
@@ -55,8 +59,12 @@ pub use timeline::{
     TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
 
+pub use agent_stream_sequences::{
+    AgentStreamPublisherReservation, AgentStreamPublisherReservationRequest,
+    AgentStreamPublisherState, MAX_AGENT_STREAM_PUBLISHER_CONTEXTS,
+};
 pub(crate) use codec::{
-    SqliteResultExt, bool_i64, created_at_to_i64, deserialize, epoch_to_i64, message_state_to_i64,
-    optional_u64_to_i64, serialize, tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds,
-    unix_now_seconds_i64, usize_to_i64,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteResultExt, bool_i64, created_at_to_i64, deserialize,
+    epoch_to_i64, i64_to_u64, i64_to_usize, message_state_to_i64, optional_u64_to_i64, serialize,
+    tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };

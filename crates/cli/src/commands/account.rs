@@ -9,10 +9,9 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::{
-    AccountCommand, CliRuntimeInfo, CommandOutput, SecretStoreKind, WnError,
-    account_selector_or_default, is_nostr_secret, npub_for_account_id, parse_public_key,
-    profile_display_name, relay_endpoints, relay_lists_json, resolve_account,
-    validate_materialized_secret_identity,
+    AccountCommand, CliRuntimeInfo, CommandOutput, ImportNsec, SecretStoreKind, WnError,
+    account_selector_or_default, npub_for_account_id, parse_public_key, profile_display_name,
+    relay_endpoints, relay_lists_json, resolve_account, validate_materialized_secret_identity,
 };
 
 pub(crate) async fn identity_create_command(
@@ -25,6 +24,7 @@ pub(crate) async fn identity_create_command(
     create_or_import_account_command(
         app,
         None,
+        None,
         default_relays,
         bootstrap_relays,
         false,
@@ -36,22 +36,25 @@ pub(crate) async fn identity_create_command(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn identity_login_command(
     app: &MarmotApp,
     runtime_info: CliRuntimeInfo,
     identity: Option<String>,
+    import_nsec: Option<ImportNsec>,
     nsec_stdin: bool,
     relay: Option<String>,
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
 ) -> Result<CommandOutput, WnError> {
     validate_materialized_secret_identity("login", &identity, nsec_stdin)?;
-    let Some(identity) = identity else {
+    if identity.is_none() && import_nsec.is_none() {
         return Err(WnError::MissingLoginIdentity);
-    };
+    }
     create_or_import_account_command(
         app,
-        Some(identity),
+        identity,
+        import_nsec,
         default_relays,
         bootstrap_relays,
         true,
@@ -143,6 +146,7 @@ pub(crate) fn export_nsec_command(_pubkey: String) -> Result<CommandOutput, WnEr
 pub(crate) async fn create_or_import_account_command(
     app: &MarmotApp,
     identity: Option<String>,
+    import_nsec: Option<ImportNsec>,
     mut default_relays: Vec<String>,
     mut bootstrap_relays: Vec<String>,
     publish_missing_relay_lists: bool,
@@ -154,11 +158,9 @@ pub(crate) async fn create_or_import_account_command(
     validate_materialized_secret_identity("account create", &identity, nsec_stdin)?;
     let global_relay_defaults =
         apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
-    let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
-    let creates_new_private_key = identity.is_none();
-    let adds_public_account = identity
-        .as_deref()
-        .is_some_and(|value| !is_nostr_secret(value));
+    let imports_private_key = import_nsec.is_some();
+    let creates_new_private_key = identity.is_none() && import_nsec.is_none();
+    let adds_public_account = identity.is_some() && import_nsec.is_none();
     if creates_new_private_key && default_relays.is_empty() {
         return Err(WnError::MissingRelay);
     }
@@ -179,6 +181,7 @@ pub(crate) async fn create_or_import_account_command(
         .runtime()
         .create_or_import_account(AccountSetupRequest {
             identity,
+            import_nsec: import_nsec.map(ImportNsec::into_inner),
             default_relays,
             bootstrap_relays,
             discovery_relays,
@@ -237,10 +240,14 @@ fn missing_relay_list_status(missing: Vec<MissingRelayListKind>) -> AccountRelay
         nip65: marmot_app::AccountRelayListState {
             kind: 10002,
             relays: Vec::new(),
+            read_relays: Vec::new(),
+            write_relays: Vec::new(),
         },
         inbox: marmot_app::AccountRelayListState {
             kind: 10050,
             relays: Vec::new(),
+            read_relays: Vec::new(),
+            write_relays: Vec::new(),
         },
     }
 }
@@ -252,6 +259,7 @@ pub(crate) async fn account_command(
     runtime_info: CliRuntimeInfo,
     account_flag: Option<String>,
     relay: Option<String>,
+    import_nsec: Option<ImportNsec>,
 ) -> Result<CommandOutput, WnError> {
     match command {
         AccountCommand::Create {
@@ -264,6 +272,7 @@ pub(crate) async fn account_command(
             create_or_import_account_command(
                 app,
                 identity,
+                import_nsec,
                 default_relays,
                 bootstrap_relays,
                 publish_missing_relay_lists,

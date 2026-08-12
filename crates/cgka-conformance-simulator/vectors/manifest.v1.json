@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-07-06",
+  "updated": "2026-08-11",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -60,9 +60,41 @@
       "coverage": [
         "group data update commit",
         "recipient epoch advance",
-        "stable member set across metadata update"
+        "stable member set across metadata update",
+        "requested name and preserved description projection"
       ],
-      "next": "Extend with explicit group profile state once ScenarioTrace carries component state."
+      "next": "Keep as the backward-compatible Scenario IR v2 name-only profile fixture."
+    },
+    {
+      "id": "group-profile-update/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "group-profile-update.v1.json",
+      "coverage": [
+        "Scenario IR v3 full group-profile update",
+        "requested name and description projection",
+        "partial-update preservation of omitted profile fields",
+        "exact canonical equivalence",
+        "active bidirectional decryptability",
+        "strict pending-work closure"
+      ],
+      "next": "Use as the canonical full-profile update fixture and mutation sentinel."
+    },
+    {
+      "id": "current-profile-required-set/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "current-profile-required-set.v1.json",
+      "coverage": [
+        "current application profile registry contract",
+        "required app_data_dictionary extension 0x0006",
+        "required app_data_update proposal 0x0008",
+        "mandatory admin-policy component 0x8003",
+        "mandatory LeafNode-only account-proof component 0x8009",
+        "canonical founding creation without ordinary commit publication",
+        "Welcome join and invitee first application message under the current profile"
+      ],
+      "next": "Keep registry ids synchronized with the adopted application profile."
     },
     {
       "id": "admin-policy-update/v1",
@@ -102,6 +134,22 @@
         "post-recovery member count"
       ],
       "next": "Extend the trace format so the selected branch member identity can be asserted portably."
+    },
+    {
+      "id": "cross-route-own-commit-recovery/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "cross-route-own-commit-recovery.v1.json",
+      "coverage": [
+        "four-participant same-source-epoch commit race",
+        "pairwise committer recovery versus observer-side stored convergence",
+        "ordering-key winner displaced by deeper branch growth",
+        "commit-addressed own-branch recovery after encrypted SQLite restart",
+        "exact canonical cryptographic agreement",
+        "active all-pairs application decryptability",
+        "durable accepted and invalidated commit dispositions"
+      ],
+      "next": "Run the same logical topology through app-runtime, process, container, and VM adapters with restart and delivery permutations."
     },
     {
       "id": "convergence-committer-selected/v1",
@@ -198,6 +246,19 @@
         "Goggles forensic export replayed as a conformance vector",
         "same-epoch group-data fork recovery",
         "designated-winner branch survival",
+        "full recovery-summary reproduction"
+      ],
+      "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
+    },
+    {
+      "id": "membership-fork-recovery-incident/v1",
+      "kind": "scenario_vector",
+      "status": "incident_replay",
+      "artifact": "incidents/membership-fork-recovery-incident.v1.json",
+      "coverage": [
+        "Goggles forensic export replayed as a conformance vector",
+        "same-epoch membership/admin fork recovery (competing-invite race)",
+        "winner-agnostic branch survival via post-recovery member count",
         "full recovery-summary reproduction"
       ],
       "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
@@ -323,6 +384,135 @@
         "duplicate relay rejection"
       ],
       "next": "Add unsorted, malformed URL, and oversized relay-list vectors."
+    },
+    {
+      "id": "conversation/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "conversation.v1.json",
+      "coverage": [
+        "multi-round turn-taking application traffic",
+        "exact per-client transcript completeness",
+        "no duplicate delivery across rounds",
+        "cross-client convergence with no pending work"
+      ],
+      "next": "Extend rounds or member count if turn-taking regressions appear."
+    },
+    {
+      "id": "latecomer-forward-secrecy/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "latecomer-forward-secrecy.v1.json",
+      "coverage": [
+        "mid-conversation invite",
+        "forward secrecy: latecomer never observes pre-join plaintext",
+        "pre-join ciphertext retained as deferred transport input",
+        "post-join transcript completeness for all members"
+      ],
+      "next": "Add a multi-epoch pre-join history variant once deferred-input expiry is modeled."
+    },
+    {
+      "id": "leaver-removal-secrecy/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "leaver-removal-secrecy.v1.json",
+      "coverage": [
+        "admin removal commit",
+        "post-removal secrecy: removed member receives and processes all post-removal ciphertext, decrypts none",
+        "self-leave witness commit",
+        "post-leave secrecy: departed member receives and processes all post-leave ciphertext, decrypts none"
+      ],
+      "next": "Keep as the departure-secrecy fixture; the removed-member re-add leg is covered by readd-after-eviction/v1."
+    },
+    {
+      "id": "incremental-growth/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "incremental-growth.v1.json",
+      "coverage": [
+        "one-member-at-a-time growth",
+        "group-data rename per growth phase",
+        "cohort-era forward secrecy: each joiner sees only its era onward",
+        "full-group convergence at final epoch"
+      ],
+      "next": "Scale the cohort schedule into a generated family for larger rosters."
+    },
+    {
+      "id": "multigroup-isolation/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "multigroup-isolation.v1.json",
+      "coverage": [
+        "first multi-group in_group vector",
+        "three live pairwise groups over three clients, one not created by alice",
+        "overlapping membership for every client",
+        "cross-group plaintext isolation via zero-count assertions on all six foreign edges"
+      ],
+      "next": "Add rename traffic per group if cross-group metadata bleed is suspected; scale the mesh in a generated family when quadratic growth is needed."
+    },
+    {
+      "id": "admin-handover/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "admin-handover.v1.json",
+      "coverage": [
+        "multi-hop admin promotion chain",
+        "renames by each newly promoted admin",
+        "demotion and post-demotion denial",
+        "exact cross-client equivalence after five commits"
+      ],
+      "next": "Add a competing-promotion race variant to the churn family."
+    },
+    {
+      "id": "deferred-tick-catchup/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "deferred-tick-catchup.v1.json",
+      "coverage": [
+        "member stops ticking across app traffic and a rename commit",
+        "single-tick catch-up spanning a missed epoch-advancing commit",
+        "full-group convergence including group name"
+      ],
+      "next": "Keep durable-relay offline recovery in the adversarial-reliability family; this vector models mailbox catch-up."
+    },
+    {
+      "id": "admin-churn/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "seeded sequential admin churn with per-round traffic",
+        "competing same-epoch admin-policy commits with seeded delivery order, post-race admin-set pinning, and non-admin rejection probes",
+        "restart between commit publish and delivery with post-restart traffic",
+        "latecomer joining in the same delivery flight as a rename commit, with pre-join mailbox-isolation zero-count assertions (ciphertext-exposure forward secrecy stays with latecomer-forward-secrecy/v1) and the joiner pinned to exactly its retained join commit"
+      ],
+      "next": "Promote a reviewed case into vectors/ once the joiner join-commit deferral is resolved."
+    },
+    {
+      "id": "readd-after-eviction/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "readd-after-eviction.v1.json",
+      "coverage": [
+        "admin removal of a member",
+        "re-invite of the removed member with a fresh KeyPackage",
+        "welcome rejoin over stale evicted local state",
+        "evicted-era retained snapshots skipped as peel sources",
+        "post-rejoin application traffic"
+      ],
+      "next": "Keep as the re-add regression fixture; extend leaver-removal-secrecy with its re-add leg separately."
+    },
+    {
+      "id": "late-welcome-backfill/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "late-welcome-backfill.v1.json",
+      "coverage": [
+        "commits delivered before the recipient's delayed Welcome",
+        "unknown-route drop without a durable record",
+        "post-join relay redelivery of the same events",
+        "late joiner catch-up to the group tip"
+      ],
+      "next": "Keep as the late-welcome recovery regression; unknown-route retention stays deliberately absent per the flood posture."
     }
   ]
 }

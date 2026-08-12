@@ -1,0 +1,212 @@
+[
+  {
+    "type": "inbound_message",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "message": {
+      "message_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sender": {
+        "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "display_name": "Casey",
+        "is_self": false
+      },
+      "text": "Can you inspect the quoted image?",
+      "recorded_at": 1785200000,
+      "media": []
+    },
+    "mentions_self": true,
+    "reply_to": {
+      "message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "availability": "available",
+      "sender": {
+        "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "display_name": "Marmot Agent",
+        "is_self": true
+      },
+      "recorded_at": 1785199900,
+      "text_excerpt": "Here is the original image.",
+      "text_truncated": false,
+      "attachments": [
+        {
+          "media_type": "image/png",
+          "file_name": "diagram.png",
+          "dim": "1200x800"
+        }
+      ],
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "inbound_message",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "message": {
+      "message_id_hex": "1212121212121212121212121212121212121212121212121212121212121212",
+      "sender": {
+        "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "is_self": false
+      },
+      "text": "The old message is not on this device.",
+      "recorded_at": 1785200001
+    },
+    "mentions_self": false,
+    "reply_to": {
+      "message_id_hex": "2323232323232323232323232323232323232323232323232323232323232323",
+      "availability": "missing",
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "inbound_message",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "message": {
+      "message_id_hex": "1313131313131313131313131313131313131313131313131313131313131313",
+      "sender": {
+        "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "is_self": false
+      },
+      "text": "Replying to a deleted message.",
+      "recorded_at": 1785200002
+    },
+    "mentions_self": false,
+    "reply_to": {
+      "message_id_hex": "2424242424242424242424242424242424242424242424242424242424242424",
+      "availability": "deleted",
+      "sender": {
+        "account_id_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "is_self": false
+      },
+      "recorded_at": 1785199800,
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "inbound_message",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "message": {
+      "message_id_hex": "1414141414141414141414141414141414141414141414141414141414141414",
+      "sender": {
+        "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "is_self": false
+      },
+      "text": "Replying across a losing branch.",
+      "recorded_at": 1785200003
+    },
+    "mentions_self": false,
+    "reply_to": {
+      "message_id_hex": "2525252525252525252525252525252525252525252525252525252525252525",
+      "availability": "invalidated",
+      "sender": {
+        "account_id_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "is_self": false
+      },
+      "recorded_at": 1785199700,
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "message_edited",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "event_id_hex": "3131313131313131313131313131313131313131313131313131313131313131",
+    "target_message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "actor": {
+      "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "is_self": false
+    },
+    "replacement_text": "Corrected text",
+    "recorded_at": 1785200100,
+    "target": {
+      "message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "availability": "available",
+      "sender": {
+        "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "is_self": false
+      },
+      "recorded_at": 1785199900,
+      "text_excerpt": "Original text",
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "message_deleted",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "event_id_hex": "3232323232323232323232323232323232323232323232323232323232323232",
+    "target_message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "actor": {
+      "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "is_self": false
+    },
+    "recorded_at": 1785200101,
+    "target": {
+      "message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "availability": "deleted",
+      "sender": {
+        "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "is_self": false
+      },
+      "recorded_at": 1785199900,
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "reaction_added",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "event_id_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "target_message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "actor": {
+      "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "display_name": "Casey",
+      "is_self": false
+    },
+    "emoji": "👍",
+    "recorded_at": 1785200102,
+    "target": {
+      "message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "availability": "available",
+      "sender": {
+        "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "is_self": true
+      },
+      "recorded_at": 1785199900,
+      "text_excerpt": "Original text",
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  },
+  {
+    "type": "reaction_removed",
+    "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "group_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "event_id_hex": "3434343434343434343434343434343434343434343434343434343434343434",
+    "reaction_event_id_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "target_message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "actor": {
+      "account_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "is_self": false
+    },
+    "emoji": "👍",
+    "recorded_at": 1785200103,
+    "target": {
+      "message_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "availability": "available",
+      "sender": {
+        "account_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "is_self": true
+      },
+      "recorded_at": 1785199900,
+      "text_excerpt": "Original text",
+      "text_truncated": false,
+      "attachments_truncated": false
+    }
+  }
+]

@@ -24,7 +24,7 @@ MESSAGE_ID_HEX = "33" * 32
 SENDER_ACCOUNT_ID_HEX = "44" * 32
 INBOUND_TEXT = "ping from connector"
 DETERMINISTIC_RESPONSE = f"marmot-e2e-ok: {INBOUND_TEXT}"
-PROTOCOL = "marmot.agent-control.v1"
+PROTOCOL = "marmot.agent-control.v2"
 CONNECTOR_START_TIMEOUT_SECONDS = float(os.environ.get("MARMOT_CONNECTOR_E2E_START_TIMEOUT", "120"))
 
 

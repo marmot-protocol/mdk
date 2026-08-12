@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use cgka_traits::{
     TransportEndpoint, TransportGroupSubscription, TransportGroupSync, TransportPublishRequest,
     TransportPublishTarget,
 };
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
     NostrTransportAdapter, RelayExportConsent, RelayIndex,
@@ -95,6 +95,135 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
 }
 
 #[derive(Default)]
+struct BlockingSubscribeRelayClient {
+    block_subscribes: AtomicBool,
+    started: Notify,
+}
+
+#[async_trait]
+impl NostrRelayClient for BlockingSubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.block_subscribes.load(Ordering::SeqCst) {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+/// Simulates a relay holding stored events: the moment it sees a group REQ it
+/// streams a matching stored event back through `handle_relay_event`, before
+/// `subscribe` returns — i.e. inside the activation's subscribe window. The
+/// adapter owns the relay client, so the back-reference used for the replay is
+/// attached after construction.
+#[derive(Default)]
+struct StoredReplayRelayClient {
+    adapter: Mutex<Option<NostrTransportAdapter>>,
+    additional_replay: Mutex<Option<NostrRelayEvent>>,
+    replayed_deliveries: AtomicUsize,
+}
+
+impl StoredReplayRelayClient {
+    fn attach(&self, adapter: &NostrTransportAdapter) {
+        *self.adapter.lock().unwrap() = Some(adapter.clone());
+    }
+
+    fn replay_alongside_next_subscribe(&self, relay_event: NostrRelayEvent) {
+        *self.additional_replay.lock().unwrap() = Some(relay_event);
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for StoredReplayRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let NostrSubscription::Group {
+            transport_group_id,
+            endpoints,
+            ..
+        } = &subscription
+        else {
+            return Ok(());
+        };
+        let adapter = self
+            .adapter
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("adapter attached before subscribe");
+        let endpoint = endpoints[0].clone();
+        let subscription_id = subscription.subscription_id();
+        let relay_event = NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(subscription_id.clone()),
+            event: group_event("30", transport_group_id),
+        };
+        adapter.observe_relay_event(relay_event.clone()).await;
+        let mut delivered = adapter.handle_relay_event(relay_event).await?;
+        let additional_replay = self.additional_replay.lock().unwrap().take();
+        if let Some(relay_event) = additional_replay {
+            adapter.observe_relay_event(relay_event.clone()).await;
+            delivered += adapter.handle_relay_event(relay_event).await?;
+        }
+        self.replayed_deliveries
+            .fetch_add(delivered, Ordering::SeqCst);
+        adapter.handle_relay_eose(endpoint, subscription_id).await;
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+#[derive(Default)]
 struct FakeRelayClient {
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
     unsubscribed: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
@@ -145,6 +274,65 @@ impl NostrRelayClient for FakeRelayClient {
     }
 }
 
+struct FlakySubscribeRelayClient {
+    fail_subscribes: AtomicBool,
+    subscriptions: Mutex<Vec<NostrSubscription>>,
+    unsubscribed_accounts: Mutex<Vec<MemberId>>,
+}
+
+impl Default for FlakySubscribeRelayClient {
+    fn default() -> Self {
+        Self {
+            fail_subscribes: AtomicBool::new(true),
+            subscriptions: Mutex::default(),
+            unsubscribed_accounts: Mutex::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for FlakySubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.fail_subscribes.load(Ordering::SeqCst) {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".into(),
+            ));
+        }
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.unsubscribed_accounts
+            .lock()
+            .unwrap()
+            .push(account_id.clone());
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
 /// Like [`FakeRelayClient`], but `unsubscribe` fails (without recording) while
 /// `fail_next_unsubscribes` decrements to zero, then records and succeeds.
 #[derive(Default)]
@@ -179,6 +367,74 @@ impl NostrRelayClient for FlakyUnsubscribeRelayClient {
             return Err(cgka_traits::TransportAdapterError::Subscription(
                 "injected unsubscribe failure".into(),
             ));
+        }
+        self.unsubscribed.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.unsubscribed_accounts
+            .lock()
+            .unwrap()
+            .push(account_id.clone());
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+/// Like [`FakeRelayClient`], but `unsubscribe` blocks on the call numbered by
+/// `block_on_call` (0 disables blocking). `unsubscribe_entered` increments when
+/// each `unsubscribe` call begins.
+#[derive(Default)]
+struct BlockingUnsubscribeRelayClient {
+    subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
+    unsubscribed: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
+    unsubscribed_accounts: Mutex<Vec<MemberId>>,
+    /// 1-based call index to block on; 0 means never block.
+    block_on_call: AtomicUsize,
+    unsubscribe_entered: AtomicUsize,
+    unsubscribe_release: Notify,
+}
+
+impl BlockingUnsubscribeRelayClient {
+    fn release_blocked_unsubscribe(&self) {
+        self.block_on_call.store(0, Ordering::SeqCst);
+        self.unsubscribe_release.notify_one();
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for BlockingUnsubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let call = self.unsubscribe_entered.fetch_add(1, Ordering::SeqCst) + 1;
+        loop {
+            let released = self.unsubscribe_release.notified();
+            if self.block_on_call.load(Ordering::SeqCst) != call {
+                break;
+            }
+            released.await;
         }
         self.unsubscribed.lock().unwrap().push(subscription);
         Ok(())
@@ -402,6 +658,10 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
     assert!(accounts.contains(&bob));
     assert_eq!(first.group_id_hint, Some(group_id.clone()));
     assert_eq!(second.group_id_hint, Some(group_id));
+    assert_eq!(first.message.timestamp, Timestamp(1_700_000_010));
+    assert_eq!(second.message.timestamp, Timestamp(1_700_000_010));
+    assert_eq!(first.received_at, second.received_at);
+    assert_ne!(first.received_at, first.message.timestamp);
 
     let replayed = adapter
         .handle_relay_event(NostrRelayEvent {
@@ -444,6 +704,45 @@ async fn activate_account_issues_inbox_and_group_subscriptions_concurrently() {
         .expect("activation subscriptions are issued concurrently");
 
     assert_eq!(relay.started.load(Ordering::SeqCst), 2);
+    assert_eq!(relay.subscriptions.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_activation_rolls_back_routes_and_can_retry() {
+    let relay = Arc::new(FlakySubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let activation = TransportAccountActivation {
+        account_id: account_id.clone(),
+        inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+        group_subscriptions: vec![TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        }],
+        since: None,
+    };
+
+    adapter
+        .activate_account(activation.clone())
+        .await
+        .expect_err("the first activation should fail");
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_accounts, 0);
+    assert_eq!(metrics.active_group_subscriptions, 0);
+    assert_eq!(
+        relay.unsubscribed_accounts.lock().unwrap().as_slice(),
+        &[account_id]
+    );
+
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .activate_account(activation)
+        .await
+        .expect("retry should activate the account cleanly");
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_accounts, 1);
+    assert_eq!(metrics.active_group_subscriptions, 1);
     assert_eq!(relay.subscriptions.lock().unwrap().len(), 2);
 }
 
@@ -542,6 +841,581 @@ async fn subscribed_group_event_becomes_account_scoped_delivery() {
         delivery.message.envelope,
         TransportEnvelope::GroupMessage { transport_group_id }
     );
+}
+
+// Regression for the cold-boot catch-up race: a relay may stream stored events
+// the moment a REQ is issued, so a stored group event can arrive inside
+// `activate_account`'s subscribe window. Routing state must already cover the
+// account by then; an event arriving before the routes exist is dropped as
+// unroutable, and that stored history is lost — nothing re-requests it.
+#[tokio::test]
+async fn stored_event_replayed_during_activation_subscribe_is_delivered() {
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("activation succeeds");
+
+    assert_eq!(
+        relay.replayed_deliveries.load(Ordering::SeqCst),
+        1,
+        "the stored event replayed during subscribe must route to the account"
+    );
+    let delivery = adapter
+        .receive()
+        .await
+        .expect("receive succeeds")
+        .expect("delivery available");
+    assert_eq!(delivery.account_id, account_id);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+    assert_eq!(delivery.source.plane, TransportDeliveryPlane::Group);
+    assert_eq!(delivery.source.endpoint, Some(endpoint));
+    assert_eq!(
+        delivery.message.envelope,
+        TransportEnvelope::GroupMessage { transport_group_id }
+    );
+}
+
+// Regression for mdk#910: group-sync REQs must not outrun routing and telemetry
+// registration. A relay can replay stored events synchronously from subscribe;
+// both the newly-added and still-live old routes must remain deliverable inside
+// that window, and the new route must contribute first-event timing.
+#[tokio::test]
+async fn stored_events_replayed_during_group_sync_subscribe_are_delivered() {
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let old_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: old_group_id.clone(),
+                transport_group_id: old_transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("initial group sync succeeds");
+    let initial_delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(initial_delivery.group_id_hint, Some(old_group_id.clone()));
+    relay.replayed_deliveries.store(0, Ordering::SeqCst);
+    relay.replay_alongside_next_subscribe(NostrRelayEvent {
+        endpoint: endpoint.clone(),
+        subscription_id: Some("still-live-old-group-sub".into()),
+        event: group_event("31", &old_transport_group_id),
+    });
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: new_group_id.clone(),
+                transport_group_id: new_transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_700_000_100)),
+        })
+        .await
+        .expect("replacement group sync succeeds");
+
+    assert_eq!(
+        relay.replayed_deliveries.load(Ordering::SeqCst),
+        2,
+        "new catch-up and still-live old-route events must both route during subscribe"
+    );
+    let new_delivery = adapter.receive().await.unwrap().unwrap();
+    let old_delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(new_delivery.account_id, account_id);
+    assert_eq!(new_delivery.group_id_hint, Some(new_group_id));
+    assert_eq!(new_delivery.source.plane, TransportDeliveryPlane::Group);
+    assert_eq!(new_delivery.source.endpoint, Some(endpoint.clone()));
+    assert_eq!(
+        new_delivery.message.envelope,
+        TransportEnvelope::GroupMessage {
+            transport_group_id: new_transport_group_id
+        }
+    );
+    assert_eq!(old_delivery.group_id_hint, Some(old_group_id));
+    assert_eq!(old_delivery.source.endpoint, Some(endpoint));
+    assert_eq!(
+        old_delivery.message.envelope,
+        TransportEnvelope::GroupMessage {
+            transport_group_id: old_transport_group_id
+        }
+    );
+    let sync = adapter.relay_sync().await;
+    assert_eq!(sync.tracked_subscriptions, 2);
+    assert_eq!(sync.first_event.sample_count(), 2);
+}
+
+#[tokio::test]
+async fn reissued_live_subscription_keeps_synchronous_callbacks() {
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_transport_group_id = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let old_group = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter.receive().await.unwrap().unwrap();
+    relay.replayed_deliveries.store(0, Ordering::SeqCst);
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: new_transport_group_id.clone(),
+                    endpoints: vec![endpoint.clone()],
+                },
+                old_group,
+            ],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("group sync succeeds");
+
+    let old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id,
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let new_subscription_id = NostrSubscription::Group {
+        account_id,
+        group_id,
+        transport_group_id: new_transport_group_id,
+        endpoints: vec![endpoint],
+        since: None,
+    }
+    .subscription_id();
+    assert_eq!(relay.replayed_deliveries.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        adapter.subscription_synced(&old_subscription_id).await,
+        Some(true),
+        "the reissued live id must retain EOSE observed before subscribe returned"
+    );
+    assert_eq!(
+        adapter.subscription_synced(&new_subscription_id).await,
+        Some(true)
+    );
+    let sync = adapter.relay_sync().await;
+    assert_eq!(sync.tracked_subscriptions, 3);
+    assert_eq!(sync.synced_subscriptions, 2);
+    assert_eq!(sync.first_event.sample_count(), 3);
+    assert_eq!(sync.eose.sample_count(), 3);
+}
+
+#[tokio::test]
+async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
+    let relay = Arc::new(FlakySubscribeRelayClient::default());
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let old_group = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+    let group_sync = TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![
+            TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: new_transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            old_group.clone(),
+        ],
+        since: None,
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    adapter
+        .handle_relay_eose(endpoint.clone(), old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter.subscription_synced(&old_subscription_id).await,
+        Some(true)
+    );
+    let relay_sync_before_failure = adapter.relay_sync().await;
+
+    relay.fail_subscribes.store(true, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(group_sync.clone())
+        .await
+        .expect_err("group sync fails when relay subscribe fails");
+
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_group_subscriptions, 1);
+    assert_eq!(metrics.subscriptions_created, 2);
+    assert_eq!(adapter.relay_sync().await, relay_sync_before_failure);
+    let old_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(old_subscription_id),
+            event: group_event("31", &old_transport_group_id),
+        })
+        .await
+        .expect("old relay event handled");
+    let failed_new_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("failed-new-group-sub".into()),
+            event: group_event("32", &new_transport_group_id),
+        })
+        .await
+        .expect("new relay event handled");
+    assert_eq!(old_delivered, 1, "failed sync must restore the old route");
+    assert_eq!(
+        failed_new_delivered, 0,
+        "failed sync must not leave the staged route"
+    );
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.group_id_hint, Some(group_id.clone()));
+
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(group_sync)
+        .await
+        .expect("retry succeeds from the prior group set");
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_group_subscriptions, 2);
+    assert_eq!(metrics.subscriptions_created, 4);
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 3);
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some("retried-group-sub".into()),
+            event: group_event("33", &new_transport_group_id),
+        })
+        .await
+        .expect("relay event handled");
+    assert_eq!(delivered, 1);
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.account_id, account_id);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+}
+
+#[tokio::test]
+async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
+    let relay = Arc::new(BlockingSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let old_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let old_group = TransportGroupSubscription {
+        group_id: old_group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let relay_sync_before = adapter.relay_sync().await;
+    let new_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: new_group_id.clone(),
+        transport_group_id: new_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    relay.block_subscribes.store(true, Ordering::SeqCst);
+    let cancelled_sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let account_id = account_id.clone();
+        let endpoint = endpoint.clone();
+        let new_group_id = new_group_id.clone();
+        let new_transport_group_id = new_transport_group_id.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id,
+                    group_subscriptions: vec![TransportGroupSubscription {
+                        group_id: new_group_id,
+                        transport_group_id: new_transport_group_id,
+                        endpoints: vec![endpoint],
+                    }],
+                    since: None,
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(concurrent_subscribe_timeout(), relay.started.notified())
+        .await
+        .expect("relay subscribe started");
+    let staged_event = NostrRelayEvent {
+        endpoint: endpoint.clone(),
+        subscription_id: Some(new_subscription_id.clone()),
+        event: group_event("34", &new_transport_group_id),
+    };
+    adapter.observe_relay_event(staged_event.clone()).await;
+    assert_eq!(adapter.handle_relay_event(staged_event).await.unwrap(), 1);
+    adapter.receive().await.unwrap().unwrap();
+
+    cancelled_sync.abort();
+    assert!(cancelled_sync.await.unwrap_err().is_cancelled());
+    relay.block_subscribes.store(false, Ordering::SeqCst);
+    // This call waits for the detached cancellation guard to finish cleanup,
+    // then proves no stale stage assertion/state survives into the next sync.
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![old_group],
+            since: None,
+        })
+        .await
+        .expect("sync after cancellation succeeds");
+
+    assert_eq!(adapter.relay_sync().await, relay_sync_before);
+    assert_eq!(
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("old-group-sub".into()),
+                event: group_event("35", &old_transport_group_id),
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint,
+                subscription_id: Some(new_subscription_id),
+                event: group_event("36", &new_transport_group_id),
+            })
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
+    let relay = Arc::new(BlockingSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let synced_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let unsynced_group_id = cgka_traits::GroupId::new(vec![0xB3; 32]);
+    let synced_old = TransportGroupSubscription {
+        group_id: synced_group_id.clone(),
+        transport_group_id: vec![0xC2; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let unsynced_old = TransportGroupSubscription {
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let synced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: synced_group_id.clone(),
+        transport_group_id: synced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let unsynced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: unsynced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![synced_old.clone(), unsynced_old.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter
+        .handle_relay_eose(endpoint.clone(), synced_old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(false)
+    );
+
+    relay.block_subscribes.store(true, Ordering::SeqCst);
+    let cancelled_sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let account_id = account_id.clone();
+        let endpoint = endpoint.clone();
+        let synced_group_id = synced_group_id.clone();
+        let unsynced_group_id = unsynced_group_id.clone();
+        let synced_old = synced_old.clone();
+        let unsynced_old = unsynced_old.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id,
+                    group_subscriptions: vec![
+                        TransportGroupSubscription {
+                            group_id: synced_group_id,
+                            transport_group_id: vec![0xD2; 32],
+                            endpoints: vec![endpoint.clone()],
+                        },
+                        synced_old,
+                        TransportGroupSubscription {
+                            group_id: unsynced_group_id,
+                            transport_group_id: vec![0xD3; 32],
+                            endpoints: vec![endpoint],
+                        },
+                        unsynced_old,
+                    ],
+                    since: Some(Timestamp(1_700_000_100)),
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(concurrent_subscribe_timeout(), relay.started.notified())
+        .await
+        .expect("reissued relay subscribe started");
+
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true),
+        "staging a replacement REQ must not regress an already-open live gate"
+    );
+    adapter
+        .handle_relay_eose(endpoint, unsynced_old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(false),
+        "an overlapping callback remains provisional until the batch outcome is known"
+    );
+
+    cancelled_sync.abort();
+    assert!(cancelled_sync.await.unwrap_err().is_cancelled());
+    relay.block_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![synced_old, unsynced_old],
+            since: None,
+        })
+        .await
+        .expect("follow-up sync waits for cancellation rollback");
+
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(true),
+        "EOSE observed during the failed reissue must open the retained live gate"
+    );
+    assert_eq!(adapter.relay_sync().await.eose.sample_count(), 2);
 }
 
 #[tokio::test]
@@ -667,7 +1541,7 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
     let mut forged = group_event("11", &transport_group_id);
     forged.id = "77".repeat(32);
 
-    adapter
+    let error = adapter
         .handle_relay_event(NostrRelayEvent {
             endpoint: endpoint.clone(),
             subscription_id: Some("group-sub".into()),
@@ -675,6 +1549,10 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
         })
         .await
         .expect_err("forged id must not map to a delivery");
+    assert!(matches!(
+        error,
+        cgka_traits::TransportAdapterError::InvalidInboundSignature
+    ));
 
     adapter
         .observe_relay_event(NostrRelayEvent {
@@ -687,6 +1565,39 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
     let spread = adapter.delivery_spread().await;
     assert_eq!(spread.observed, 0, "forged id must not enter telemetry");
     assert_eq!(spread.spread.sample_count(), 0);
+    assert_eq!(spread.per_relay.len(), 0);
+}
+
+#[tokio::test]
+async fn non_exact_kind_445_shape_is_typed_invalid_encoding() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let mut event = group_event("extra-tag", &[0xC3; 32]);
+    event.tags.push(vec!["e".into(), "11".repeat(32)]);
+    event.id = event.computed_id();
+
+    let error = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://group.example".into()),
+            subscription_id: Some("group-sub".into()),
+            event: event.clone(),
+        })
+        .await
+        .expect_err("extra kind-445 tag must fail before routing");
+    assert!(matches!(
+        error,
+        cgka_traits::TransportAdapterError::InvalidInboundEncoding
+    ));
+
+    adapter
+        .observe_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://group.example".into()),
+            subscription_id: Some("group-sub".into()),
+            event,
+        })
+        .await;
+    let spread = adapter.delivery_spread().await;
+    assert_eq!(spread.observed, 0);
     assert_eq!(spread.per_relay.len(), 0);
 }
 
@@ -826,6 +1737,165 @@ async fn synced_group_subscriptions_replace_old_routes() {
     );
 }
 
+#[tokio::test]
+async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let prior_transport_group_id = vec![0xC3; 32];
+    let current_transport_group_id = vec![0xD4; 32];
+    let prior_endpoint = TransportEndpoint("wss://prior.example".into());
+    let current_endpoint = TransportEndpoint("wss://current.example".into());
+
+    // A reopened account carries both the current and retained prior route.
+    // The global cursor is deliberately newer than the delayed event below;
+    // the retained route therefore must be subscribed without that cursor,
+    // while the already-current route keeps the bounded restart cursor.
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: current_transport_group_id,
+                    endpoints: vec![current_endpoint],
+                },
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: prior_transport_group_id.clone(),
+                    endpoints: vec![prior_endpoint.clone()],
+                },
+            ],
+            since: Some(Timestamp(1_800_000_000)),
+        })
+        .await
+        .expect("restart activation succeeds");
+
+    let group_subscriptions = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|subscription| match subscription {
+            NostrSubscription::Group { since, .. } => Some(*since),
+            NostrSubscription::AccountInbox { .. } | NostrSubscription::GroupMaintenance { .. } => {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        group_subscriptions,
+        vec![Some(Timestamp(1_800_000_000)), None]
+    );
+
+    let delayed = group_event("12", &prior_transport_group_id);
+    assert!(
+        delayed.created_at < 1_800_000_000,
+        "fixture must predate the global restart cursor"
+    );
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: prior_endpoint,
+            subscription_id: Some("retained-prior-route".into()),
+            event: delayed,
+        })
+        .await
+        .expect("delayed prior-route event is accepted");
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        adapter
+            .receive()
+            .await
+            .expect("receive succeeds")
+            .expect("delivery is present")
+            .group_id_hint,
+        Some(group_id)
+    );
+}
+
+#[tokio::test]
+async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_once() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let route_a = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![TransportEndpoint("wss://a.example".into())],
+    };
+    let route_b = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0xD4; 32],
+        endpoints: vec![TransportEndpoint("wss://b.example".into())],
+    };
+    let since = Some(Timestamp(1_800_000_000));
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![route_a.clone()],
+            since,
+        })
+        .await
+        .expect("initial activation succeeds");
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![route_b.clone(), route_a.clone()],
+            since,
+        })
+        .await
+        .expect("route rotation sync succeeds");
+
+    let issued_after_rotation = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        issued_after_rotation,
+        vec![
+            NostrSubscription::Group {
+                account_id: account_id.clone(),
+                group_id: group_id.clone(),
+                transport_group_id: route_b.transport_group_id.clone(),
+                endpoints: route_b.endpoints.clone(),
+                since,
+            },
+            NostrSubscription::Group {
+                account_id: account_id.clone(),
+                group_id: group_id.clone(),
+                transport_group_id: route_a.transport_group_id.clone(),
+                endpoints: route_a.endpoints.clone(),
+                since: None,
+            },
+        ],
+        "the new current route is bounded while the displaced route is reissued without a cursor"
+    );
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![route_b, route_a],
+            since,
+        })
+        .await
+        .expect("unchanged retained-route sync succeeds");
+    assert_eq!(
+        relay.subscriptions.lock().unwrap().len(),
+        4,
+        "an already-retained route is not repeatedly reissued"
+    );
+}
+
 // Regression for mdk#337: a failed relay unsubscribe must not fail the sync or
 // leave the routing index serving the old group set. The removal takes effect
 // in routing state immediately; the relay-side teardown is queued for retry.
@@ -960,6 +2030,172 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
     let metrics = adapter.metrics().await;
     assert_eq!(metrics.subscriptions_removed, 1);
     assert_eq!(metrics.unsubscribe_retries_pending, 0);
+}
+
+// Regression for mdk#1389: cancelling `sync_account_groups` during the
+// post-commit unsubscribe drain must retain confirmed progress and requeue only
+// unresolved relay teardowns.
+#[tokio::test]
+async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
+    let relay = Arc::new(BlockingUnsubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let old_group_a = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+    let old_group_b = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xB3; 32]),
+        transport_group_id: vec![0xC4; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+    let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let new_group = TransportGroupSubscription {
+        group_id: new_group_id.clone(),
+        transport_group_id: new_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+    let expected_unsubscribes = [
+        NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: old_group_a.group_id.clone(),
+            transport_group_id: old_group_a.transport_group_id.clone(),
+            endpoints: old_group_a.endpoints.clone(),
+            since: None,
+        },
+        NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: old_group_b.group_id.clone(),
+            transport_group_id: old_group_b.transport_group_id.clone(),
+            endpoints: old_group_b.endpoints.clone(),
+            since: None,
+        },
+    ];
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group_a.clone(), old_group_b.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    relay.block_on_call.store(2, Ordering::SeqCst);
+    let adapter_for_sync = adapter.clone();
+    let sync_account_id = account_id.clone();
+    let sync_group = new_group.clone();
+    let sync_task = tokio::spawn(async move {
+        adapter_for_sync
+            .sync_account_groups(TransportGroupSync {
+                account_id: sync_account_id,
+                group_subscriptions: vec![sync_group],
+                since: None,
+            })
+            .await
+    });
+
+    tokio::time::timeout(concurrent_subscribe_timeout(), async {
+        while relay.unsubscribe_entered.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sync must enter the second relay unsubscribe");
+    sync_task.abort();
+    let join_err = sync_task
+        .await
+        .expect_err("aborted sync must not complete successfully");
+    assert!(
+        join_err.is_cancelled(),
+        "aborted sync must be cancelled, got {join_err:?}"
+    );
+
+    let old_a_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("old-group-a-sub".into()),
+            event: group_event("24", &old_group_a.transport_group_id),
+        })
+        .await
+        .expect("old group-a relay event handled");
+    let old_b_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("old-group-b-sub".into()),
+            event: group_event("26", &old_group_b.transport_group_id),
+        })
+        .await
+        .expect("old group-b relay event handled");
+    let new_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some("new-group-sub".into()),
+            event: group_event("25", &new_transport_group_id),
+        })
+        .await
+        .expect("new relay event handled");
+    assert_eq!(old_a_delivered, 0, "removed route A must not deliver");
+    assert_eq!(old_b_delivered, 0, "removed route B must not deliver");
+    assert_eq!(new_delivered, 1);
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.group_id_hint, Some(new_group_id));
+
+    let metrics = adapter.metrics().await;
+    assert_eq!(
+        metrics.subscriptions_removed, 1,
+        "first unsubscribe must be confirmed before cancellation"
+    );
+    assert_eq!(
+        metrics.unsubscribe_retries_pending, 1,
+        "cancelled drain must retain only the unresolved relay unsubscribe"
+    );
+
+    relay.release_blocked_unsubscribe();
+    tokio::time::timeout(
+        concurrent_subscribe_timeout(),
+        adapter.sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![new_group.clone()],
+            since: None,
+        }),
+    )
+    .await
+    .expect("retry sync must complete before timeout")
+    .expect("retry sync succeeds");
+
+    {
+        let unsubscribed = relay.unsubscribed.lock().unwrap();
+        assert_eq!(
+            unsubscribed.as_slice(),
+            &expected_unsubscribes,
+            "both old subscription teardowns are recorded exactly once in vector order"
+        );
+    }
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.subscriptions_removed, 2);
+    assert_eq!(metrics.unsubscribe_retries_pending, 0);
+
+    tokio::time::timeout(
+        concurrent_subscribe_timeout(),
+        adapter.sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![new_group],
+            since: None,
+        }),
+    )
+    .await
+    .expect("follow-up sync must complete before timeout")
+    .expect("follow-up sync must not deadlock the lifecycle mutex");
+    assert_eq!(
+        adapter.metrics().await.subscriptions_removed,
+        2,
+        "follow-up sync must not double-count removals"
+    );
 }
 
 #[tokio::test]

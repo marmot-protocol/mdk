@@ -15,7 +15,8 @@ use marmot_uniffi::{
     AuditDataModeFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi,
     CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
+    MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayEndpointPolicyFfi,
+    RelayTelemetrySettingsFfi, TimelineMessageQueryFfi, parse_media_imeta_tag,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -152,6 +153,33 @@ async fn empty_kit_lifecycle() {
             .expect_err("start after shutdown should be refused"),
         MarmotKitError::RuntimeStopping
     ));
+}
+
+#[tokio::test]
+async fn root_lease_is_typed_busy_and_outlives_shutdown_until_handle_drop() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_string_lossy().into_owned();
+    let relays = vec!["wss://relay.invalid.test".to_string()];
+    let first = Marmot::new(root.clone(), relays.clone()).expect("open first kit");
+
+    assert!(matches!(
+        Marmot::new(root.clone(), relays.clone()),
+        Err(MarmotKitError::RuntimeBusy)
+    ));
+
+    // Shutdown closes active work, but the FFI object can still retain cached
+    // app/storage handles. Exclusive ownership therefore follows object
+    // lifetime rather than being released prematurely at shutdown return.
+    first.shutdown().await;
+    assert!(matches!(
+        Marmot::new(root.clone(), relays.clone()),
+        Err(MarmotKitError::RuntimeBusy)
+    ));
+
+    drop(first);
+    let reopened = Marmot::new(root, relays).expect("lease released after final handle drop");
+    drop(reopened);
 }
 
 #[tokio::test]
@@ -354,6 +382,115 @@ async fn delete_group_local_binding_is_public_and_validates_group_hex() {
 }
 
 #[tokio::test]
+async fn leave_group_binding_is_public_and_validates_group_hex() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    // Group-hex validation runs before the account lookup, so a malformed id
+    // never reaches the runtime.
+    let error = kit
+        .leave_group("alice".into(), "not-hex".into())
+        .await
+        .expect_err("invalid group hex should fail before the leave");
+    assert!(format!("{error}").contains("invalid hex"));
+
+    let error = kit
+        .leave_group("alice".into(), "11".repeat(16))
+        .await
+        .expect_err("a missing account cannot leave a group");
+    assert!(matches!(error, MarmotKitError::UnknownAccount { .. }));
+}
+
+#[tokio::test]
+async fn group_image_binding_methods_are_public_and_validate_inputs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let empty_upload = kit
+        .update_group_image(
+            "alice".into(),
+            "not-hex".into(),
+            Vec::new(),
+            "image/png".into(),
+        )
+        .await
+        .expect_err("empty image bytes should use the explicit clear method");
+    assert!(matches!(
+        empty_upload,
+        MarmotKitError::InvalidMediaReference { .. }
+    ));
+
+    let upload_error = kit
+        .update_group_image(
+            "alice".into(),
+            "not-hex".into(),
+            vec![0x89, b'P', b'N', b'G'],
+            "image/png".into(),
+        )
+        .await
+        .expect_err("invalid group hex should fail before upload");
+    assert!(format!("{upload_error}").contains("invalid hex"));
+
+    let clear_error = kit
+        .clear_group_image("alice".into(), "not-hex".into())
+        .await
+        .expect_err("invalid group hex should fail before clear");
+    assert!(format!("{clear_error}").contains("invalid hex"));
+}
+
+#[tokio::test]
+async fn profile_image_upload_binding_is_public_and_requires_a_known_account() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let error = kit
+        .upload_profile_image(
+            "missing-account".into(),
+            vec![0x89, b'P', b'N', b'G'],
+            "image/png".into(),
+            None,
+        )
+        .await
+        .expect_err("profile image upload must resolve the signing account");
+    assert!(format!("{error}").contains("account"));
+}
+
+#[tokio::test]
+async fn profile_image_download_binding_maps_invalid_url_to_typed_error() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let error = kit
+        .download_profile_image("https://127.0.0.1/avatar.png".into(), 1024)
+        .await
+        .expect_err("loopback profile URL must fail before dial");
+    assert!(
+        matches!(error, MarmotKitError::InvalidMediaReference { .. }),
+        "expected InvalidMediaReference, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -373,7 +510,7 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         nonce_hex: "bbbbbbbbbbbbbbbbbbbbbbbb".into(),
         file_name: "note.txt".into(),
         media_type: "text/plain".into(),
-        version: "encrypted-media-v1".into(),
+        version: marmot_uniffi::EncryptedMediaVersionFfi::V1,
         source_epoch: 0,
         dim: None,
         thumbhash: None,
@@ -403,16 +540,54 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     assert!(format!("{send_error}").contains("invalid hex"));
 
     let singular_send_error = kit
-        .send_media_reference("alice".into(), "not-hex".into(), reference, None)
+        .send_media_reference("alice".into(), "not-hex".into(), reference.clone(), None)
         .await
         .expect_err("singular compatibility helper should validate group hex");
     assert!(format!("{singular_send_error}").contains("invalid hex"));
+
+    let build_error = kit
+        .build_media_imeta_tag("alice".into(), "not-hex".into(), reference.clone())
+        .await
+        .expect_err("optimistic tag builder should validate group hex");
+    assert!(format!("{build_error}").contains("invalid hex"));
 
     let upload_error = kit
         .upload_media("alice".into(), "not-hex".into(), request)
         .await
         .expect_err("invalid group hex should fail before upload");
     assert!(format!("{upload_error}").contains("invalid hex"));
+
+    let tag = MessageTagFfi {
+        values: vec![
+            "imeta".into(),
+            "v encrypted-media-v1".into(),
+            format!(
+                "locator blossom-v1 https://blossom.example/{}",
+                "01".repeat(32)
+            ),
+            format!("ciphertext_sha256 {}", "01".repeat(32)),
+            format!("plaintext_sha256 {}", "02".repeat(32)),
+            format!("nonce {}", "03".repeat(12)),
+            "m text/plain".into(),
+            "filename note.txt".into(),
+        ],
+    };
+    let parsed = parse_media_imeta_tag(tag.clone(), 7).expect("valid V1 tag");
+    assert_eq!(parsed.version, marmot_uniffi::EncryptedMediaVersionFfi::V1);
+    assert_eq!(parsed.source_epoch, 7);
+
+    let mut v2 = tag;
+    v2.values[1] = "v encrypted-media-v2".into();
+    let parsed = parse_media_imeta_tag(v2.clone(), 8).expect("valid V2 tag");
+    assert_eq!(parsed.version, marmot_uniffi::EncryptedMediaVersionFfi::V2);
+    assert_eq!(parsed.source_epoch, 8);
+
+    v2.values[6] = "m Text/Plain".into();
+    let invalid = parse_media_imeta_tag(v2, 8).expect_err("noncanonical V2 type must fail");
+    assert!(matches!(
+        invalid,
+        MarmotKitError::InvalidMediaReference { .. }
+    ));
 }
 
 #[tokio::test]
@@ -437,6 +612,29 @@ async fn relay_list_binding_methods_are_public() {
         kit.set_account_inbox_relays("missing".into(), relays.clone(), relays)
             .await
             .is_err()
+    );
+
+    assert_eq!(
+        kit.retired_relay_hosts(),
+        vec!["relay.damus.io", "relay.nostr.band"]
+    );
+    let classifications = kit.classify_relay_endpoints(vec![
+        "wss://relay.example".into(),
+        "wss://relay.damus.io".into(),
+        "not a relay".into(),
+        "ws://relay.example".into(),
+    ]);
+    assert_eq!(
+        classifications
+            .iter()
+            .map(|result| result.policy)
+            .collect::<Vec<_>>(),
+        vec![
+            RelayEndpointPolicyFfi::Allowed,
+            RelayEndpointPolicyFfi::Retired,
+            RelayEndpointPolicyFfi::Invalid,
+            RelayEndpointPolicyFfi::Unsafe,
+        ]
     );
 }
 
@@ -511,9 +709,12 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
         .expect("empty frozen wake collection should be valid");
     assert!(collected.notifications.is_empty());
     kit.shutdown().await;
+    drop(kit);
 
     // The same store reopens under the default constructor (Advance): the
-    // policy is a per-construction posture, not persisted store state.
+    // policy is a per-construction posture, not persisted store state. The
+    // final runtime handle must be released before another process/runtime can
+    // acquire the root lease.
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
@@ -547,6 +748,8 @@ async fn relay_telemetry_settings_binding_round_trips() {
         .expect("set telemetry settings");
     assert!(stored.export_enabled);
     assert_eq!(stored.export_interval_seconds, 30);
+    kit.shutdown().await;
+    drop(kit);
 
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
@@ -589,6 +792,8 @@ async fn audit_log_settings_binding_round_trips() {
         .expect("set audit settings");
     assert!(stored.enabled);
     assert!(matches!(stored.data_mode, AuditDataModeFfi::FullData));
+    kit.shutdown().await;
+    drop(kit);
 
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
@@ -833,6 +1038,26 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
         .expect_err("invalid message hex should fail before account lookup");
     assert!(format!("{invalid_message}").contains("invalid hex"));
 
+    let invalid_manual_unread = kit
+        .set_chat_manually_unread("missing".into(), "not-hex".into(), true)
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_manual_unread}").contains("invalid hex"));
+
+    let invalid_mute_read = kit
+        .chat_notification_settings("missing".into(), "not-hex".into())
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_mute_read}").contains("invalid hex"));
+
+    let invalid_mute_set = kit
+        .set_chat_muted("missing".into(), "not-hex".into(), None)
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_mute_set}").contains("invalid hex"));
+
+    let invalid_mute_clear = kit
+        .clear_chat_muted("missing".into(), "not-hex".into())
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_mute_clear}").contains("invalid hex"));
+
     let subscribe_error = match kit.subscribe_chat_list("missing".into(), false).await {
         Ok(_) => panic!("missing account subscription should fail"),
         Err(err) => err,
@@ -945,5 +1170,22 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
         .retry_group_convergence("missing".into(), "ABCD".into())
         .await
         .expect_err("missing account should fail after hex validation");
+    assert!(format!("{missing_account}").contains("missing"));
+}
+
+#[tokio::test]
+async fn retention_sweep_binding_is_public_and_requires_a_known_account() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let missing_account = kit
+        .sweep_expired_retention("missing".into(), 1_750_000_000_000)
+        .await
+        .expect_err("missing account should fail at the runtime boundary");
     assert!(format!("{missing_account}").contains("missing"));
 }

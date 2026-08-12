@@ -19,9 +19,10 @@ mod tls;
 mod tests;
 
 pub use client::{
-    BrokerServerTrust, BrokerTextPublisher, OpenBrokerTextPublisher, PublishTextToBroker,
-    SubscribeTextFromBroker, publish_text_to_broker, subscribe_text_from_broker,
-    subscribe_text_from_broker_with_limits, subscribe_text_from_broker_with_updates,
+    BrokerServerTrust, BrokerTextPublisher, BrokerTextReceiverState, OpenBrokerTextPublisher,
+    PublishTextToBroker, SubscribeTextFromBroker, publish_text_to_broker,
+    subscribe_text_from_broker, subscribe_text_from_broker_with_limits,
+    subscribe_text_from_broker_with_resume, subscribe_text_from_broker_with_updates,
 };
 pub use config::{QuicBrokerConfig, QuicBrokerTlsConfig};
 pub use control::{BrokerStreamKey, QuicBrokerControlEnvelopeV1, QuicBrokerControlTypeV1};

@@ -18,6 +18,30 @@ use thiserror::Error;
 use crate::engine::GroupStateChange;
 use crate::types::{GroupId, MemberId};
 
+/// The normalized disappearing-message decision pinned when an MLS
+/// application message is accepted.
+///
+/// `retention_seconds == 0` means retention was disabled at the message's
+/// authenticated source epoch. A non-zero duration whose timestamp addition
+/// overflows is still a known decision, but has no finite `expires_at` and must
+/// never be pruned by a timestamp sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppMessageRetentionDecision {
+    pub retention_seconds: u64,
+    pub expires_at: Option<u64>,
+}
+
+impl AppMessageRetentionDecision {
+    pub fn new(recorded_at: u64, retention_seconds: u64) -> Self {
+        Self {
+            retention_seconds,
+            expires_at: (retention_seconds != 0)
+                .then(|| recorded_at.checked_add(retention_seconds))
+                .flatten(),
+        }
+    }
+}
+
 /// Nostr `kind` values used as Marmot inner app events.
 pub const MARMOT_APP_EVENT_KIND_DELETE: u64 = 5;
 pub const MARMOT_APP_EVENT_KIND_REACTION: u64 = 7;
@@ -57,6 +81,7 @@ pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
 /// Product-facing system row for the `marmot.group.message-retention.v1` app
 /// component changing (the app calls this the disappearing-message timer).
 pub const GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED: &str = "disappearing_timer_changed";
+pub const GROUP_SYSTEM_TYPE_GROUP_DISBANDED: &str = "group_disbanded";
 
 /// Human-readable fallback `text` for kind-1210 group system rows. These strings
 /// feed `content` → `id_preimage` → `canonical_event_id`, so they must stay in
@@ -69,6 +94,7 @@ pub const GROUP_SYSTEM_TEXT_ADMIN_REMOVED: &str = "Admin removed";
 pub const GROUP_SYSTEM_TEXT_GROUP_RENAMED: &str = "Group renamed";
 pub const GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED: &str = "Group avatar changed";
 pub const GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED: &str = "Disappearing timer changed";
+pub const GROUP_SYSTEM_TEXT_GROUP_DISBANDED: &str = "Group disbanded";
 
 /// Keys inside the kind-1210 `data` object. `actor`/`subject` are lowercase-hex
 /// pubkeys, `name` is UTF-8, and retention values are seconds where `0` means
@@ -120,6 +146,8 @@ pub enum MarmotAppEventError {
     IdMismatch { expected: String, found: String },
     #[error("marmot app event pubkey mismatch")]
     PubkeyMismatch { expected: String, found: String },
+    #[error("group-system event requires an authenticated actor")]
+    MissingAuthenticatedActor,
 }
 
 impl MarmotAppEvent {
@@ -381,6 +409,15 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             new_retention_seconds: Some(*new_seconds),
             text: GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED,
         },
+        GroupStateChange::GroupDisbanded => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_GROUP_DISBANDED,
+            subject: None,
+            name: None,
+            old_name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_GROUP_DISBANDED,
+        },
     }
 }
 
@@ -394,6 +431,9 @@ pub fn group_system_event_material(
     actor: Option<&MemberId>,
     change: &GroupStateChange,
 ) -> Result<GroupSystemEventMaterial, MarmotAppEventError> {
+    if matches!(change, GroupStateChange::GroupDisbanded) && actor.is_none() {
+        return Err(MarmotAppEventError::MissingAuthenticatedActor);
+    }
     let parts = group_system_projection_parts(change);
     let system_type = parts.system_type;
     let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
@@ -737,6 +777,18 @@ mod tests {
                 GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED.to_owned(),
             ]]
         );
+    }
+
+    #[test]
+    fn group_disbanded_material_requires_authenticated_actor() {
+        let error = group_system_event_material(
+            &GroupId::new(vec![0x22; 32]),
+            3,
+            None,
+            &GroupStateChange::GroupDisbanded,
+        )
+        .unwrap_err();
+        assert_eq!(error, MarmotAppEventError::MissingAuthenticatedActor);
     }
 
     #[test]

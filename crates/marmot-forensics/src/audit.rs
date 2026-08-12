@@ -214,6 +214,46 @@ pub enum ConvergencePhase {
     Unrecoverable,
 }
 
+/// What armed an epoch-gap backfill for one stalled group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochStallBackfillTrigger {
+    UndecryptableThreshold,
+    ResourceRefusal,
+}
+
+/// Worker seam that executed a pending epoch-gap backfill replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillExecutionSeam {
+    Startup,
+    Receive,
+    ExplicitCatchUp,
+    Maintenance,
+}
+
+/// Scope of the transport replay issued for epoch-gap recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillReplayScope {
+    AccountFullHistory,
+}
+
+/// Typed outcome of `activate_transport(None)` during epoch-gap recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillActivationOutcome {
+    Succeeded,
+    Failed,
+}
+
+/// Why a pending epoch-gap replay was not executed on this pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillDeferredReason {
+    GroupEpochUnavailable,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditHumanActionContext {
     pub action: String,
@@ -938,10 +978,10 @@ pub enum AuditEventKind {
         /// transition (deferred-peel lifecycle rows only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_count: Option<u64>,
-        /// How many retry sweeps elapsed between the row's first attempt and
-        /// this transition — the queue-wait clock for deferred rows.
+        /// How many wall-clock milliseconds elapsed between the row's durable
+        /// first observation and this transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        sweeps_waited: Option<u64>,
+        residence_ms: Option<u64>,
     },
     /// A message or intent was rejected with a structured reason.
     Rejection {
@@ -1002,6 +1042,115 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor_after_secs: Option<u64>,
     },
+    /// A group crossed the epoch-stall backfill threshold — enough distinct
+    /// undecryptable messages at one stalled epoch — and armed a full-history
+    /// epoch-gap backfill (commit-loss recovery). Emitted once per (group,
+    /// stalled epoch) at the arm decision, *before* the replay side effect runs,
+    /// so a field export reveals when and why full-history replays fire — the
+    /// evidence loop for tuning the empirical backfill threshold.
+    ///
+    /// Group-scoped: the stalled group's id is on the enclosing
+    /// [`AuditEvent::group_ref`], exactly as the `human_action` group rows carry
+    /// it; it is deliberately not duplicated into a field here. `stalled_epoch`
+    /// is the group epoch the device was stuck at when it armed — correlate it
+    /// against the group's live epoch (visible on `group_context` / `epoch_*`
+    /// rows) to read the size of the gap that triggered recovery. `threshold` is
+    /// the distinct-undecryptable count that armed the backfill, carried so an
+    /// export is self-describing when the constant is retuned across builds.
+    ///
+    /// Privacy: scalar counts plus a closed trigger enum only — no ids, relay
+    /// URLs, message ids, or payloads — so nothing here needs scrubbing in
+    /// either [`AuditDataMode`]. `trigger` is optional only so existing v2 rows
+    /// emitted before this field was added remain readable.
+    EpochStallBackfillArmed {
+        stalled_epoch: u64,
+        threshold: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<EpochStallBackfillTrigger>,
+    },
+    /// A pending epoch-gap backfill replay began executing. Account-scoped:
+    /// the replay is account-wide even when multiple groups armed it.
+    /// Correlated with the arm and terminal rows via `context.operation_id`.
+    EpochStallBackfillStarted {
+        seam: EpochBackfillExecutionSeam,
+        replay_scope: EpochBackfillReplayScope,
+        retry_ordinal: u64,
+    },
+    /// A pending epoch-gap backfill replay finished after activation and drain.
+    /// Group-scoped: `group_ref` is the armed group whose local epoch is
+    /// compared before and after the replay. `group_advanced` is true only when
+    /// that group's observed local epoch increased across the attempt.
+    EpochStallBackfillCompleted {
+        retry_ordinal: u64,
+        duration_ms: u64,
+        activation_outcome: EpochBackfillActivationOutcome,
+        deliveries: u64,
+        local_epoch_before: u64,
+        local_epoch_after: u64,
+        group_advanced: bool,
+    },
+    /// A pending epoch-gap backfill replay failed or could not recover the
+    /// armed group. Group-scoped for the same epoch observation semantics as
+    /// [`Self::EpochStallBackfillCompleted`]. Pending recovery is retained.
+    EpochStallBackfillFailed {
+        retry_ordinal: u64,
+        duration_ms: u64,
+        activation_outcome: EpochBackfillActivationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        deliveries: u64,
+        local_epoch_before: u64,
+        local_epoch_after: u64,
+        group_advanced: bool,
+    },
+    /// A pending epoch-gap backfill replay was not executed on this pass.
+    /// Account-scoped; does not clear pending recovery.
+    EpochStallBackfillDeferred {
+        reason: EpochBackfillDeferredReason,
+        retry_ordinal: u64,
+    },
+    /// A group armed `arms` epoch-gap backfills without ever passing cleanly
+    /// through an epoch: full-history replay keeps recovering some backlog while
+    /// the device stays behind the group. Emitted once per unrecovered run, at
+    /// the arm that reached `arm_threshold`, alongside that arm's
+    /// `epoch_stall_backfill_armed` row.
+    ///
+    /// This is the durable record of the escalation the runtime reports to the
+    /// app, which decides whether to run the stronger repair (key-package
+    /// rotation plus a full transport re-activation). The run counter is
+    /// in-memory, so a process restart can escalate the same group again; the row
+    /// is what makes each escalation permanent evidence, and the field-evidence
+    /// loop that tunes `arm_threshold`.
+    ///
+    /// Group-scoped: the group id is on the enclosing [`AuditEvent::group_ref`],
+    /// exactly as `epoch_stall_backfill_armed` carries it. `stalled_epoch` is the
+    /// epoch the device sat at when the escalating arm fired.
+    ///
+    /// Privacy: three scalar counts only — no ids, relay URLs, message ids, or
+    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
+    EpochStallBackfillEscalated {
+        stalled_epoch: u64,
+        arms: u64,
+        arm_threshold: u64,
+    },
+    /// A durable convergence pass whose base epoch disagreed with the device's
+    /// current tip was discarded, freeing convergence to reopen at the tip.
+    /// Non-terminal by construction: it records a repair, not a fault. The
+    /// disagreement is inherited scheduling state — an older binary stamped a
+    /// pass's base epoch from the durable group record while convergence compared
+    /// the epoch manager, and those two stores can split across a restart — so
+    /// `stale_base_epoch` may sit either behind or ahead of `current_tip_epoch`.
+    /// `generation` is the discarded pass's generation, so an export shows which
+    /// scheduling state was dropped.
+    ///
+    /// Group-scoped through the enclosing [`AuditEvent::group_ref`]; three scalar
+    /// epochs/counters only, so nothing here needs scrubbing in either
+    /// [`AuditDataMode`].
+    ConvergencePassDiscarded {
+        stale_base_epoch: u64,
+        current_tip_epoch: u64,
+        generation: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1052,6 +1201,13 @@ impl AuditEventKind {
             AuditEventKind::Rejection { .. } => "rejection",
             AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
             AuditEventKind::SyncDrain { .. } => "sync_drain",
+            AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
+            AuditEventKind::EpochStallBackfillStarted { .. } => "epoch_stall_backfill_started",
+            AuditEventKind::EpochStallBackfillCompleted { .. } => "epoch_stall_backfill_completed",
+            AuditEventKind::EpochStallBackfillFailed { .. } => "epoch_stall_backfill_failed",
+            AuditEventKind::EpochStallBackfillDeferred { .. } => "epoch_stall_backfill_deferred",
+            AuditEventKind::EpochStallBackfillEscalated { .. } => "epoch_stall_backfill_escalated",
+            AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
         }
     }
 }
@@ -1088,6 +1244,8 @@ pub enum PeelerOutcomeKind {
     DecryptFailed,
     StaleEpoch,
     Malformed,
+    InvalidSignature,
+    WrongRecipient,
     Other,
 }
 
@@ -1098,6 +1256,15 @@ pub enum PeelerOutcomeKind {
 /// (e.g. a `Mutex`-protected file handle).
 pub trait ForensicRecorder: Send + Sync {
     fn record(&self, record: AuditRecord);
+
+    /// Whether this recorder consumes audit events.
+    ///
+    /// Producers may use this to skip audit-only data loads on hot paths. The
+    /// default is enabled so custom recorders remain observable without code
+    /// changes; [`NoopRecorder`] is the sole disabled implementation.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 
     fn health_snapshot(&self) -> AuditRecorderHealthSnapshot {
         AuditRecorderHealthSnapshot::default()
@@ -1148,6 +1315,10 @@ pub struct NoopRecorder;
 
 impl ForensicRecorder for NoopRecorder {
     fn record(&self, _record: AuditRecord) {}
+
+    fn is_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// JSONL recorder. Appends one JSON line per event to the configured path.
@@ -1344,7 +1515,11 @@ fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditE
                 value.pubkeys_hex.clear();
             }
         }
-        AuditEventKind::ConvergenceDecision { candidates, .. } => {
+        AuditEventKind::ConvergenceDecision {
+            candidates,
+            rule_trace,
+            ..
+        } => {
             for candidate in candidates {
                 candidate.tip_committer_pubkey_hex = None;
                 if let Some(score) = candidate.score.as_mut() {
@@ -1354,6 +1529,11 @@ fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditE
                     witness.sender_pubkey_hex = None;
                 }
             }
+            // Rule inputs/results are intentionally free-form JSON, so the
+            // sink cannot prove that arbitrary future producer fields contain
+            // no full identities. Keep the typed, scrubbed candidate summary
+            // and omit the untyped trace in shareable obfuscated logs.
+            rule_trace.clear();
         }
         _ => {}
     }
