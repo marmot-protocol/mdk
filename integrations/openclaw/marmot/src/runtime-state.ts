@@ -1,9 +1,8 @@
 // Process-local runtime status for the Marmot channel subscription.
 //
-// OpenClaw's channel health policy evaluates `running` from the channel status
-// snapshot. The Marmot plugin owns its inbound subscription from registerFull
-// rather than a core-managed gateway adapter, so it records that lifecycle here
-// and exposes it through the status adapter in channel.ts.
+// Compatibility snapshot for status tests and hosts that do not surface the
+// gateway account status directly. The primary lifecycle owner is now
+// `gateway.startAccount`.
 
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
 
@@ -61,6 +60,25 @@ export function markMarmotInboundReceived(accountId?: string | null): void {
     ...inboundRuntime,
     accountId: accountIdOrDefault(accountId),
     lastInboundAt: Date.now(),
+  };
+}
+
+/** Record a durable outbound receipt for channel status/probe reporting. */
+export function markMarmotOutboundSent(
+  accountId?: string | null,
+  sentAt: number = Date.now(),
+): void {
+  const nextAccountId = accountIdOrDefault(accountId);
+  // This compatibility slot describes one active inbound account. An outbound
+  // send for another configured account must not replace that live status with
+  // a synthetic stopped snapshot; the host-owned per-account runtime remains
+  // authoritative for the other account.
+  if (inboundRuntime.accountId !== nextAccountId) {
+    return;
+  }
+  inboundRuntime = {
+    ...inboundRuntime,
+    lastOutboundAt: sentAt,
   };
 }
 

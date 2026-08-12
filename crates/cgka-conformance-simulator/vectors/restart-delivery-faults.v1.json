@@ -1,11 +1,11 @@
 {
   "scenario_name": "restart-delivery-faults/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.3",
+  "conformance_version": "0.9.11",
   "seed": null,
   "scenario": {
     "name": "restart-delivery-faults/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -24,9 +24,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -52,27 +53,27 @@
         "payload": "bob:restart-delivery"
       },
       {
-        "type": "delay_queued",
-        "index": 0,
-        "delayed": "restart-delayed"
+        "type": "withhold_message",
+        "selector": { "sender": "bob", "class": "application" },
+        "label": "restart-delayed"
       },
       {
         "type": "restart_client",
         "client": "alice"
       },
       {
-        "type": "release_delayed",
-        "delayed": "restart-delayed"
+        "type": "release_withheld",
+        "label": "restart-delayed"
       },
       {
-        "type": "duplicate_queued",
-        "index": 0
+        "type": "duplicate_message",
+        "selector": { "sender": "bob", "class": "application" }
       },
       {
-        "type": "reorder_queued",
+        "type": "reorder_messages",
         "order": [
-          1,
-          0
+          { "sender": "bob", "class": "application", "occurrence": 1 },
+          { "sender": "bob", "class": "application" }
         ]
       },
       {

@@ -9,39 +9,112 @@ const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
     option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
     option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
+pub(crate) const DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT: &str =
+    "https://ranking.vertexlab.io/search/pubkeys";
+pub(crate) const DEFAULT_OPEN_RANKING_PROFILE_RELAY: &str = "wss://relay.vertexlab.io";
+
+/// Policy for advancing the account's durable transport cursor
+/// (`last_transport_timestamp`) from ingested deliveries.
+///
+/// A runtime-construction policy, not a per-call switch: it is fixed on
+/// [`MarmotAppConfig`] and applies to every account client the resulting
+/// `MarmotApp`/`MarmotAppRuntime` opens for that construction's lifetime.
+///
+/// * [`Advance`](Self::Advance) — the default, normal posture: every ingested
+///   kind-445 advances the in-memory cursor (clamp-then-monotonic-max, see
+///   `client/sync.rs`) and `save_state` persists the advance.
+/// * [`Frozen`](Self::Frozen) — the wake-collection posture (iOS NSE,
+///   notification reply/mark-read actions: full runtimes with a sub-second
+///   drain budget on cold sockets). A `Frozen` pass still ingests, decrypts,
+///   and projects everything; it only cannot move the durable floor. The
+///   in-memory cursor never advances, so every `save_state` writes back the
+///   loaded value, and the save-time clamp-then-max merge in
+///   `storage_sqlite::save_account_projection_state` guarantees that write can
+///   never lower a cursor a concurrent `Advance` runtime has moved. The cursor
+///   is still *loaded* and still derives the subscription `since` floor —
+///   `Frozen` means "never advance", not "no cursor". Worst case is bounded
+///   redelivery on the next `Advance` catch-up, absorbed by seen-id dedup.
+///
+/// `Frozen` severs the cursor ratchet at the wake-collection trigger:
+/// a wake pass that drains for a fraction of a second on cold sockets must
+/// not persist a floor above events it never had time to receive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorPersistence {
+    /// Ingested deliveries advance the durable cursor (default).
+    #[default]
+    Advance,
+    /// The durable cursor never advances; the pass still ingests and projects.
+    Frozen,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
     pub directory_max_future_skew: Duration,
     pub service_endpoints: MarmotServiceEndpoints,
+    /// Durable transport-cursor persistence policy. Defaults to
+    /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
+    /// notification actions) opt in to [`CursorPersistence::Frozen`] at
+    /// construction. See the enum docs for the full semantics.
+    pub cursor_persistence: CursorPersistence,
     /// Dev/test gate for loopback-HTTP blob endpoints. A loopback-HTTP endpoint
     /// (e.g. `http://127.0.0.1:PORT`) is VALID component state for everyone, but
-    /// per group-encrypted-media-v1.md a client MUST NOT upload to or download
-    /// from one unless explicitly configured for dev/test. Defaults to `false`
-    /// so production builds treat such endpoints as unusable rather than issuing
-    /// requests to the local host. This does not affect component validity
-    /// (decode still accepts loopback endpoints).
+    /// local destination policy forbids contacting it unless explicitly
+    /// configured for dev/test. Defaults to `false` so production builds treat
+    /// such endpoints as unusable rather than issuing requests to the local
+    /// host. This does not affect V2 component validity; frozen V1 reference
+    /// validation retains its own legacy unsafe-host rule.
     pub allow_loopback_blob_endpoints: bool,
     /// Dev/test gate for loopback relay endpoints (e.g. `ws://127.0.0.1:PORT`,
     /// an in-process `MockRelay`). A loopback relay URL is VALID
     /// routing/relay-list state, but production MUST NOT open a socket to one;
     /// the relay-safety chokepoint rejects non-public relay hosts before they
-    /// reach the pool. This gate admits loopback only — private/link-local/CGNAT
+    /// reach the pool. Public relays always require `wss://`; this gate admits
+    /// `ws://` only for loopback — private/link-local/CGNAT and public plaintext
     /// relay hosts stay rejected even when it is set. Defaults to `false`; test
     /// harnesses set `true`. Mirrors `allow_loopback_blob_endpoints`; does not
-    /// affect routing-component validity (decode still accepts loopback
-    /// endpoints).
+    /// affect routing-component validity (decode still accepts `ws://`).
     pub allow_loopback_relay_endpoints: bool,
     /// Dev/test override for the convergence settlement quiescence window, in
     /// milliseconds. `None` (the default) uses the protocol-pinned value
-    /// (`settlement_quiescence_ms = 1000`); a client MUST NOT ship a non-default
-    /// value (spec/implementation-model.md, "Convergence Policy Overrides").
-    /// Test harnesses set `Some(0)` for deterministic, instant settlement.
+    /// (`settlement_quiescence_ms = 1000`). Honored only when the explicit
+    /// `test-policy-overrides` feature is enabled; normal debug and release
+    /// builds ignore it so hosts cannot fork the pinned v1 baseline (mdk#970).
     pub dev_settlement_quiescence_ms: Option<u64>,
+    /// Dev/test-only delay added after the engine-reported convergence cutoff
+    /// before the account worker runs scheduled convergence. `None` (the
+    /// default) adds no delay. Honored only with `test-policy-overrides`; this
+    /// lets integration tests hold the precise post-cutoff/pre-scheduler state
+    /// without changing protocol timing in normal builds.
+    pub dev_scheduled_convergence_delay_ms: Option<u64>,
+    /// Dev/test-only delay applied before each startup hydration-pipeline
+    /// batch (mdk#1161). `None` (the default) adds no delay. Honored only
+    /// with `test-policy-overrides`; this lets integration tests hold groups
+    /// in the seeded not-yet-hydrated state while asserting the persisted
+    /// chat projection and per-group read behavior, without changing startup
+    /// timing in normal builds. Commands are still served during the delay.
+    pub dev_startup_hydration_batch_delay_ms: Option<u64>,
+    /// Dev/test-only override that forces group-read snapshot capture to fail.
+    /// Honored only with `test-policy-overrides`; this exercises the account
+    /// worker's degraded catch-up path without corrupting a real database.
+    pub dev_force_group_read_snapshot_failure: bool,
+    /// Accounts to search outward from when the searcher's own web of trust is
+    /// empty, as pubkey hex.
+    ///
+    /// A brand-new account follows nobody and shares no group, so a
+    /// personalized search over it can only ever answer "nothing". Seeding a
+    /// well-connected account gives the traversal somewhere to start. Those
+    /// people are not close to the searcher in any measurable sense, so their
+    /// matches are reported at `OFF_GRAPH_SEARCH_RADIUS` rather than presented
+    /// as follows -- see that constant for why the distinction is load-bearing.
+    ///
+    /// Empty by default: whose network to fall back to is a deployment
+    /// decision, not protocol behaviour, and it is only consulted when the
+    /// searcher has no graph of their own.
+    pub directory_search_fallback_seeds: Vec<String>,
 }
 
-/// Compiled or app-level default service URLs for production telemetry export
-/// and forensic audit-log tracker uploads.
+/// Compiled or app-level default service URLs for production telemetry export,
+/// forensic audit-log tracker uploads, media, and optional user discovery.
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
 /// credentials at runtime, while the MDK/Marmot build owns stable
@@ -53,6 +126,16 @@ pub struct MarmotServiceEndpoints {
     pub relay_telemetry_otlp_endpoint: Option<String>,
     pub audit_log_tracker_endpoint: Option<String>,
     pub encrypted_media_blob_endpoints: Vec<String>,
+    /// Public, unencrypted profile-image upload endpoint. The resulting URL is
+    /// published in kind:0 metadata, so hosts with different privacy or
+    /// availability requirements should override the built-in service.
+    pub profile_image_blob_endpoint: Option<String>,
+    /// Optional ORE-05 pubkey search endpoint. `None` disables off-graph
+    /// provider discovery without affecting the personal graph search.
+    pub open_ranking_search_endpoint: Option<String>,
+    /// Relays used only to hydrate provider-returned pubkeys into signed kind-0
+    /// profiles. An empty list disables provider discovery.
+    pub open_ranking_profile_relays: Vec<String>,
 }
 
 impl Default for MarmotAppConfig {
@@ -60,9 +143,14 @@ impl Default for MarmotAppConfig {
         Self {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             service_endpoints: MarmotServiceEndpoints::compiled(),
+            cursor_persistence: CursorPersistence::Advance,
             allow_loopback_blob_endpoints: false,
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
+            dev_scheduled_convergence_delay_ms: None,
+            dev_startup_hydration_batch_delay_ms: None,
+            dev_force_group_read_snapshot_failure: false,
+            directory_search_fallback_seeds: Vec::new(),
         }
     }
 }
@@ -75,6 +163,16 @@ impl MarmotAppConfig {
 
     pub fn with_service_endpoints(mut self, endpoints: MarmotServiceEndpoints) -> Self {
         self.service_endpoints = endpoints.normalize();
+        self
+    }
+
+    /// Set the durable transport-cursor persistence policy. Defaults to
+    /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
+    /// notification actions) construct with [`CursorPersistence::Frozen`] so a
+    /// sub-second drain can never ratchet the durable `since` floor past
+    /// events it did not receive.
+    pub fn with_cursor_persistence(mut self, policy: CursorPersistence) -> Self {
+        self.cursor_persistence = policy;
         self
     }
 
@@ -94,11 +192,55 @@ impl MarmotAppConfig {
         self
     }
 
+    /// Set the accounts to fall back to when a searcher's own graph is empty.
+    /// See [`Self::directory_search_fallback_seeds`].
+    pub fn with_directory_search_fallback_seeds(mut self, seeds: Vec<String>) -> Self {
+        self.directory_search_fallback_seeds = seeds;
+        self
+    }
+
+    /// Configure or disable the optional Open Ranking discovery tier.
+    ///
+    /// Passing `None` or an empty relay list disables the tier. This is a
+    /// construction-time privacy/availability choice; personal graph search
+    /// remains available either way.
+    pub fn with_open_ranking_provider(
+        mut self,
+        search_endpoint: Option<String>,
+        profile_relays: Vec<String>,
+    ) -> Self {
+        self.service_endpoints.open_ranking_search_endpoint = search_endpoint;
+        self.service_endpoints.open_ranking_profile_relays = profile_relays;
+        self.service_endpoints = self.service_endpoints.normalize();
+        self
+    }
+
     /// Dev/test override for the convergence settlement quiescence window (ms).
-    /// Off by default (the protocol-pinned `1000` ms is used); production builds
-    /// must leave this unset. Test harnesses set `0` for instant settlement.
+    /// Off by default (the protocol-pinned `1000` ms is used). Normal builds
+    /// ignore this field; explicit test harnesses set `0` for instant settlement.
     pub fn with_dev_settlement_quiescence_ms(mut self, ms: u64) -> Self {
         self.dev_settlement_quiescence_ms = Some(ms);
+        self
+    }
+
+    /// Add a test-only delay between the engine cutoff and the account
+    /// worker's scheduled convergence pass. Normal builds ignore this field.
+    pub fn with_dev_scheduled_convergence_delay_ms(mut self, ms: u64) -> Self {
+        self.dev_scheduled_convergence_delay_ms = Some(ms);
+        self
+    }
+
+    /// Add a test-only delay before each startup hydration-pipeline batch
+    /// (mdk#1161). Normal builds ignore this field.
+    pub fn with_dev_startup_hydration_batch_delay_ms(mut self, ms: u64) -> Self {
+        self.dev_startup_hydration_batch_delay_ms = Some(ms);
+        self
+    }
+
+    /// Force group-read snapshot capture to fail in test-policy builds.
+    /// Normal builds ignore this field.
+    pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
+        self.dev_force_group_read_snapshot_failure = enabled;
         self
     }
 }
@@ -112,6 +254,11 @@ impl MarmotServiceEndpoints {
             encrypted_media_blob_endpoints: COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
                 .map(split_endpoint_list)
                 .unwrap_or_default(),
+            profile_image_blob_endpoint: Some(
+                crate::media::DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL.to_owned(),
+            ),
+            open_ranking_search_endpoint: Some(DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT.to_owned()),
+            open_ranking_profile_relays: vec![DEFAULT_OPEN_RANKING_PROFILE_RELAY.to_owned()],
         }
         .normalize()
     }
@@ -121,6 +268,10 @@ impl MarmotServiceEndpoints {
         self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
         self.encrypted_media_blob_endpoints =
             normalize_endpoint_list(self.encrypted_media_blob_endpoints);
+        self.profile_image_blob_endpoint = trim_optional(self.profile_image_blob_endpoint);
+        self.open_ranking_search_endpoint = trim_optional(self.open_ranking_search_endpoint);
+        self.open_ranking_profile_relays =
+            normalize_endpoint_list(self.open_ranking_profile_relays);
         self
     }
 }
@@ -518,6 +669,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cursor_persistence_defaults_to_advance_and_is_opt_in() {
+        // Only wake-collection runtimes (NSE, notification actions) may opt in
+        // to the frozen posture; every other construction must keep advancing
+        // the durable cursor or catch-up floors would stop tracking delivery.
+        assert_eq!(
+            MarmotAppConfig::default().cursor_persistence,
+            CursorPersistence::Advance
+        );
+        assert_eq!(
+            MarmotAppConfig::default()
+                .with_cursor_persistence(CursorPersistence::Frozen)
+                .cursor_persistence,
+            CursorPersistence::Frozen
+        );
+    }
+
+    #[test]
     fn allow_loopback_blob_endpoints_defaults_off_and_is_opt_in() {
         // Production builds must not act on loopback-HTTP blob endpoints unless a
         // host app explicitly opts in for dev/test.
@@ -526,6 +694,34 @@ mod tests {
             MarmotAppConfig::default()
                 .with_allow_loopback_blob_endpoints(true)
                 .allow_loopback_blob_endpoints
+        );
+    }
+
+    #[test]
+    fn open_ranking_provider_is_configurable_and_can_be_disabled() {
+        let default = MarmotAppConfig::default();
+        assert_eq!(
+            default
+                .service_endpoints
+                .open_ranking_search_endpoint
+                .as_deref(),
+            Some(DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT)
+        );
+        assert_eq!(
+            default.service_endpoints.open_ranking_profile_relays,
+            vec![DEFAULT_OPEN_RANKING_PROFILE_RELAY]
+        );
+
+        let disabled = default.with_open_ranking_provider(None, Vec::new());
+        assert_eq!(
+            disabled.service_endpoints.open_ranking_search_endpoint,
+            None
+        );
+        assert!(
+            disabled
+                .service_endpoints
+                .open_ranking_profile_relays
+                .is_empty()
         );
     }
 

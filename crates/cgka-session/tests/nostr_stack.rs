@@ -5,7 +5,7 @@ use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
 use cgka_traits::{
     EpochId, MessageId, TransportAdapterError, TransportEndpoint, TransportPublishReport,
 };
@@ -39,7 +39,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .await
         .unwrap();
     let app_message = match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => msg.clone(),
+        PublishWork::ApplicationMessage { msg, .. } => msg.clone(),
         other => panic!("expected application message publish work, got {other:?}"),
     };
     let app_report = stack
@@ -53,13 +53,23 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .await
         .expect("group delivery should reach bob");
     assert_eq!(received.outcome, IngestOutcome::Processed);
+    let [GroupEvent::MessageReceived { message_id, .. }] = received.effects.events.as_slice()
+    else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id: message_id.clone(),
             epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"hello through the nostr stack"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 }
@@ -156,13 +166,23 @@ async fn group_delivery_requires_synced_group_subscription() {
         .await
         .expect("synced group delivery should reach bob");
     assert_eq!(after_sync.outcome, IngestOutcome::Processed);
+    let [GroupEvent::MessageReceived { message_id, .. }] = after_sync.effects.events.as_slice()
+    else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
     assert_eq!(
         after_sync.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id: message_id.clone(),
             epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"sync gated"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 }
@@ -182,10 +202,12 @@ async fn duplicate_group_relay_delivery_is_idempotent_at_session_boundary() {
     )
     .await;
     stack.sync_group(&bob, &created.group_id).await;
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let app_message = send_app_message(&mut alice, &created.group_id, b"dedupe me").await;
     let report = stack
@@ -217,8 +239,8 @@ async fn duplicate_group_relay_delivery_is_idempotent_at_session_boundary() {
         .expect("duplicate delivery should still route to bob");
     assert!(matches!(
         duplicate.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(duplicate.effects.events.is_empty());
@@ -271,8 +293,8 @@ async fn reordered_and_duplicated_group_app_deliveries_preserve_valid_outputs() 
     assert_eq!(message_payloads(&middle), vec![b"one".to_vec()]);
     assert!(matches!(
         duplicate.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(duplicate.effects.events.is_empty());
@@ -339,10 +361,12 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
         .await
         .expect("commit delivery should reach bob");
     assert!(matches!(bob_commit.outcome, IngestOutcome::Buffered { .. }));
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     bob.session
         .advance_convergence(&created.group_id)
         .await
@@ -428,7 +452,7 @@ async fn send_app_message(
         .await
         .unwrap();
     match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => msg.clone(),
+        PublishWork::ApplicationMessage { msg, .. } => msg.clone(),
         other => panic!("expected application message publish work, got {other:?}"),
     }
 }

@@ -576,6 +576,7 @@ impl LegacyAccountProjectionDb {
                 source_epoch: row
                     .get::<_, Option<i64>>(7)?
                     .and_then(|value| value.try_into().ok()),
+                retention: None,
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
                 // Frozen legacy migration reader (the old `messages` table): its
@@ -583,6 +584,8 @@ impl LegacyAccountProjectionDb {
                 // the one-time migration and are never used as a replay cursor, so
                 // the value here is immaterial.
                 insert_order: 0,
+                invalidated: false,
+                moderation_grant: false,
             })
         };
         let rows = match (&query.group_id_hex, query.limit) {
@@ -906,32 +909,6 @@ impl LegacyAccountProjectionDb {
             params![group_id_hex, member_id_hex],
         )?;
         Ok(())
-    }
-
-    pub(crate) fn remove_stale_group_push_tokens(
-        &self,
-        group_id_hex: &str,
-        active_members: &[String],
-    ) -> Result<usize, AppError> {
-        if active_members.is_empty() {
-            let removed = self.conn.execute(
-                "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
-                params![group_id_hex],
-            )?;
-            return Ok(removed);
-        }
-        let active = active_members
-            .iter()
-            .map(|member| format!("'{}'", member.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "DELETE FROM group_push_tokens
-             WHERE group_id_hex = ?1
-               AND member_id_hex NOT IN ({active})"
-        );
-        let removed = self.conn.execute(&sql, params![group_id_hex])?;
-        Ok(removed)
     }
 
     pub(crate) fn prune_group_messages_before(

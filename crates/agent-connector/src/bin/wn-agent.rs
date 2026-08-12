@@ -1,14 +1,18 @@
+use std::future::Future;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use agent_connector::{
     AgentConnectorConfig, BootstrapOptions, BootstrapResult, ConnectorError,
-    DEFAULT_BOOTSTRAP_LABEL, MAX_CONTROL_CONNECTIONS, default_socket_path,
-    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
-    resolve_bootstrap_relays, resolve_bootstrap_socket, run_bootstrap, serve_socket,
+    DEFAULT_BOOTSTRAP_LABEL, MAX_CONTROL_CONNECTIONS, MAX_IDENTITY_BYTES, default_socket_path,
+    import_existing_identity_file, import_existing_identity_secret, read_bootstrap_auth_token,
+    resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
+    resolve_bootstrap_socket, run_bootstrap, serve_socket,
 };
 use clap::{Args, Parser, Subcommand};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +31,8 @@ struct Cli {
 enum Commands {
     /// Create or reuse a local agent account and print phone bootstrap details
     Bootstrap(BootstrapArgs),
+    /// Securely import an existing local-signing Nostr identity
+    ImportIdentity(ImportIdentityArgs),
 }
 
 #[derive(Debug, Args)]
@@ -48,15 +54,21 @@ struct ServeArgs {
     relay: Vec<String>,
     #[arg(
         long,
-        help = "Accept all welcome invites without consulting the allowlist"
+        help = "Dev/test only: accept invites from any authenticated welcomer; requires --debug-controls"
     )]
-    allow_any: bool,
+    dev_allow_any_invites: bool,
     #[arg(
         long,
         value_name = "PATH",
-        help = "Require this local control-plane bearer token file for every request"
+        help = "Require this full-control local bearer token file for every request"
     )]
     auth_token_file: Option<PathBuf>,
+    #[arg(
+        long = "media-allowed-root",
+        value_name = "PATH",
+        help = "Allow outbound media reads beneath this directory; may be repeated (default: deny all)"
+    )]
+    media_allowed_roots: Vec<PathBuf>,
     #[arg(
         long,
         value_name = "OCTAL",
@@ -120,9 +132,9 @@ struct BootstrapArgs {
         help = "Reuse this local signing account instead of selecting by label"
     )]
     account_id_hex: Option<String>,
-    #[arg(long, value_name = "TOKEN", help = "Control-plane auth token")]
+    #[arg(long, value_name = "TOKEN", help = "Full-control bearer token")]
     auth_token: Option<String>,
-    #[arg(long, value_name = "PATH", help = "Control-plane auth token file")]
+    #[arg(long, value_name = "PATH", help = "Full-control bearer token file")]
     auth_token_file: Option<PathBuf>,
     #[arg(
         long,
@@ -177,13 +189,283 @@ struct BootstrapArgs {
     request_timeout: f64,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+#[derive(Debug, Args)]
+struct ImportIdentityArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Use this Marmot agent home directory"
+    )]
+    home: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "LABEL",
+        default_value = DEFAULT_BOOTSTRAP_LABEL,
+        help = "Label for the imported local-signing account"
+    )]
+    label: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "prompt",
+        help = "Read the identity from this owner-only regular file"
+    )]
+    identity_file: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "identity_file",
+        help = "Read the identity with echo disabled from /dev/tty"
+    )]
+    prompt: bool,
+    #[arg(
+        long,
+        value_name = "NPUB_OR_HEX",
+        help = "Fail unless the imported key matches this public identity"
+    )]
+    expected_identity: Option<String>,
+    #[arg(long, help = "Print machine-readable JSON only")]
+    json: bool,
+}
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::Bootstrap(args)) => run_bootstrap_command(args).await,
-        None => run_serve_command(cli.serve).await,
+        Some(Commands::Bootstrap(args)) => run_async(run_bootstrap_command(args)),
+        Some(Commands::ImportIdentity(args)) => run_import_identity_command(args),
+        None => run_async(run_serve_command(cli.serve)),
     }
+}
+
+fn run_async(future: impl Future<Output = ExitCode>) -> ExitCode {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(future),
+        Err(error) => {
+            eprintln!("wn-agent: startup failed code=runtime_init detail={error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_import_identity_command(args: ImportIdentityArgs) -> ExitCode {
+    let home = resolve_bootstrap_home(args.home);
+    let expected_identity = args.expected_identity.as_deref();
+    let result = match (args.identity_file.as_deref(), args.prompt) {
+        (Some(identity_file), false) => {
+            import_existing_identity_file(&home, &args.label, identity_file, expected_identity)
+        }
+        (None, true) => match read_identity_from_tty() {
+            Ok(secret) => import_existing_identity_secret(
+                &home,
+                &args.label,
+                secret.as_str(),
+                expected_identity,
+            ),
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, false) => {
+            eprintln!("error: pass exactly one of --identity-file or --prompt");
+            return ExitCode::FAILURE;
+        }
+        (Some(_), true) => unreachable!("clap rejects conflicting identity sources"),
+    };
+
+    match result {
+        Ok(imported) => {
+            if args.json {
+                match serde_json::to_string_pretty(&imported) {
+                    Ok(json) => println!("{json}"),
+                    Err(error) => {
+                        eprintln!("error: failed to encode import result: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                println!("Existing Marmot identity imported");
+                println!("Agent label: {}", imported.label);
+                println!("Agent account hex: {}", imported.account_id_hex);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_identity_from_tty() -> Result<Zeroizing<String>, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    static PROMPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    extern "C" fn record_prompt_signal(signal: libc::c_int) {
+        PROMPT_SIGNAL.store(signal, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    struct JobControlMaskGuard {
+        previous: libc::sigset_t,
+    }
+    impl JobControlMaskGuard {
+        fn block() -> Result<Self, String> {
+            let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            unsafe {
+                libc::sigemptyset(blocked.as_mut_ptr());
+                let blocked = blocked.assume_init_mut();
+                libc::sigaddset(blocked, libc::SIGTTIN);
+                libc::sigaddset(blocked, libc::SIGTTOU);
+                if libc::pthread_sigmask(libc::SIG_BLOCK, blocked, previous.as_mut_ptr()) != 0 {
+                    return Err("could not protect masked /dev/tty prompt".to_owned());
+                }
+                Ok(Self {
+                    previous: previous.assume_init(),
+                })
+            }
+        }
+    }
+    impl Drop for JobControlMaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+            }
+        }
+    }
+
+    struct SignalHandlerGuard {
+        previous: Vec<(libc::c_int, libc::sigaction)>,
+    }
+    impl SignalHandlerGuard {
+        fn install() -> Result<Self, String> {
+            PROMPT_SIGNAL.store(0, std::sync::atomic::Ordering::Relaxed);
+            let mut guard = Self {
+                previous: Vec::new(),
+            };
+            for signal in [
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGTSTP,
+            ] {
+                let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+                action.sa_sigaction = record_prompt_signal as *const () as libc::sighandler_t;
+                unsafe { libc::sigemptyset(&mut action.sa_mask) };
+                let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+                if unsafe { libc::sigaction(signal, &action, previous.as_mut_ptr()) } != 0 {
+                    return Err("could not protect masked /dev/tty prompt".to_owned());
+                }
+                guard
+                    .previous
+                    .push((signal, unsafe { previous.assume_init() }));
+            }
+            Ok(guard)
+        }
+    }
+    impl Drop for SignalHandlerGuard {
+        fn drop(&mut self) {
+            for (signal, previous) in self.previous.iter().rev() {
+                unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+            }
+            let signal = PROMPT_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if signal != 0 {
+                unsafe { libc::raise(signal) };
+            }
+        }
+    }
+
+    // Blocking the job-control signals lets a backgrounded process restore
+    // termios instead of stopping with echo disabled. Other terminal interrupts
+    // become an interrupted read and are re-raised after echo is restored.
+    let job_control_guard = JobControlMaskGuard::block()?;
+    let signal_guard = SignalHandlerGuard::install()?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut tty = options
+        .open("/dev/tty")
+        .map_err(|error| format!("could not open /dev/tty ({:?})", error.kind()))?;
+    let fd = tty.as_raw_fd();
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+        return Err("could not inspect /dev/tty settings".to_owned());
+    }
+    // SAFETY: tcgetattr succeeded and initialized `original`.
+    let original = unsafe { original.assume_init() };
+    let mut hidden = original;
+    hidden.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &hidden) } != 0 {
+        return Err("could not disable /dev/tty echo".to_owned());
+    }
+    struct EchoGuard {
+        fd: libc::c_int,
+        original: libc::termios,
+    }
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
+            }
+        }
+    }
+    let guard = EchoGuard { fd, original };
+
+    tty.write_all(b"Existing Nostr identity (nsec or raw hex): ")
+        .map_err(|_| "could not write prompt to /dev/tty".to_owned())?;
+    tty.flush()
+        .map_err(|_| "could not flush /dev/tty prompt".to_owned())?;
+
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_IDENTITY_BYTES as usize + 1));
+    let mut byte = [0u8; 1];
+    let read_result = loop {
+        if PROMPT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            break Err("identity prompt interrupted".to_owned());
+        }
+        match tty.read(&mut byte) {
+            Ok(0) => break Ok(()),
+            Ok(_) if byte[0] == b'\n' => break Ok(()),
+            Ok(_) if byte[0] == b'\r' => {}
+            Ok(_) if bytes.len() as u64 == MAX_IDENTITY_BYTES => {
+                break Err(format!("identity input exceeds {MAX_IDENTITY_BYTES} bytes"));
+            }
+            Ok(_) => bytes.push(byte[0]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                break Err(format!(
+                    "could not read identity from /dev/tty ({:?})",
+                    error.kind()
+                ));
+            }
+        }
+    };
+    byte.fill(0);
+    drop(guard);
+    let _ = tty.write_all(b"\n");
+    drop(signal_guard);
+    drop(job_control_guard);
+    read_result?;
+
+    std::str::from_utf8(bytes.as_slice())
+        .map_err(|_| "identity input is not valid UTF-8".to_owned())?;
+    let bytes = std::mem::take(&mut *bytes);
+    // SAFETY: UTF-8 validity was checked immediately above.
+    Ok(Zeroizing::new(unsafe {
+        String::from_utf8_unchecked(bytes)
+    }))
+}
+
+#[cfg(not(unix))]
+fn read_identity_from_tty() -> Result<Zeroizing<String>, String> {
+    Err("masked identity prompts require a Unix /dev/tty".to_owned())
 }
 
 async fn run_serve_command(args: ServeArgs) -> ExitCode {
@@ -219,13 +501,19 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         socket_dir_mode,
         socket_mode,
         relays: args.relay,
-        allow_any: args.allow_any,
+        dev_allow_any_invites: args.dev_allow_any_invites,
         debug_controls: args.debug_controls,
         auth_token,
+        media_allowed_roots: args.media_allowed_roots,
         max_connections: args.max_connections,
         allow_insecure_local_broker: args.insecure_local_broker,
         allow_loopback_relays: args.allow_loopback_relays,
     };
+    if config.dev_allow_any_invites && config.debug_controls {
+        eprintln!(
+            "wn-agent: WARNING dev allow-any invite policy enabled; authenticated welcomers bypass the allowlist"
+        );
+    }
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

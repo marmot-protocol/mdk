@@ -8,6 +8,7 @@ publish.workspace = true
 [features]
 default = []
 otlp-export = ["marmot-app/otlp-export"]
+test-policy-overrides = ["marmot-app/test-policy-overrides"]
 
 [[bin]]
 name = "wn"
@@ -21,15 +22,18 @@ path = "src/bin/wnd.rs"
 agent-stream-compose.workspace = true
 cgka-traits.workspace = true
 cgka-session.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 fs-private.workspace = true
 hex.workspace = true
+image.workspace = true
 libc.workspace = true
 marmot-account.workspace = true
 marmot-app.workspace = true
 nostr.workspace = true
 ratatui.workspace = true
+ratatui-image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -37,8 +41,11 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
 unicode-properties.workspace = true
+unicode-segmentation.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true
+nostr-sdk.workspace = true
 tempfile.workspace = true

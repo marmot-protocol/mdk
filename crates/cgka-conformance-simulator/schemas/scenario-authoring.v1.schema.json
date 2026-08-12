@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marmot-protocol.org/schemas/scenario-authoring.v1.schema.json",
+  "title": "Marmot Scenario Authoring v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "authoring_version", "clients", "steps"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "authoring_version": { "const": "1" },
+    "clients": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "topology": { "$ref": "scenario-ir.v2.schema.json#/$defs/topology" },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/flow" }
+    }
+  },
+  "$defs": {
+    "flow": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow", "step"],
+          "properties": {
+            "flow": { "const": "action" },
+            "step": { "$ref": "scenario-ir.v3.schema.json#/$defs/step" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow", "count", "steps"],
+          "properties": {
+            "flow": { "const": "repeat" },
+            "count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "steps": { "type": "array", "items": { "$ref": "#/$defs/flow" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow", "lanes"],
+          "properties": {
+            "flow": { "const": "parallel" },
+            "lanes": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/lane" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow", "actions_per_second", "steps"],
+          "properties": {
+            "flow": { "const": "rate" },
+            "actions_per_second": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+            "steps": { "type": "array", "items": { "$ref": "#/$defs/flow" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow", "count", "every_ms", "steps"],
+          "properties": {
+            "flow": { "const": "burst" },
+            "count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "every_ms": { "type": "integer", "minimum": 0 },
+            "steps": { "type": "array", "items": { "$ref": "#/$defs/flow" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow", "name"],
+          "properties": {
+            "flow": { "const": "barrier" },
+            "name": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "lane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "steps"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/flow" } }
+      }
+    }
+  }
+}

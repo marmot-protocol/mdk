@@ -16,6 +16,40 @@ fn roundtrip_empty() {
 }
 
 #[test]
+fn legacy_ast_without_source_gaps_deserializes_with_empty_metadata() {
+    let document: Document = serde_json::from_str(r#"{"blocks":[]}"#).expect("deserialize");
+
+    assert!(document.blank_lines_before.is_empty());
+}
+
+#[test]
+fn legacy_nested_block_owners_deserialize_with_empty_metadata() {
+    let json = r#"{
+        "blocks": [
+            {"BlockQuote": {"blocks": []}},
+            {"List": {
+                "kind": {"Bullet": {"marker": 45}},
+                "tight": true,
+                "items": [{"blocks": [], "checked": null}]
+            }}
+        ]
+    }"#;
+    let document: Document = serde_json::from_str(json).expect("deserialize");
+    let marmot_markdown::Block::BlockQuote {
+        blank_lines_before, ..
+    } = &document.blocks[0]
+    else {
+        panic!("expected block quote");
+    };
+    let marmot_markdown::Block::List { items, .. } = &document.blocks[1] else {
+        panic!("expected list");
+    };
+
+    assert!(blank_lines_before.is_empty());
+    assert!(items[0].blank_lines_before.is_empty());
+}
+
+#[test]
 fn roundtrip_heading_and_paragraph() {
     roundtrip("# Title\n\nA paragraph with *em*, **strong**, and `code`.");
 }

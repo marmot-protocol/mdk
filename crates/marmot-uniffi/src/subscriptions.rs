@@ -13,6 +13,7 @@
 //! All inner state lives behind a `tokio::sync::Mutex` because UniFFI passes
 //! these objects via `Arc<Self>` and `recv()` requires `&mut`.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -20,6 +21,7 @@ use marmot_app::{
     RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
     RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
+    UserSearchSubscription as AppUserSearchSubscription,
 };
 use tokio::sync::Mutex;
 
@@ -27,7 +29,7 @@ use crate::MarmotKitError;
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
-    TimelinePageFfi, TimelineSubscriptionUpdateFfi,
+    TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -64,7 +66,12 @@ impl ChatsSubscription {
 #[derive(uniffi::Object)]
 pub struct ChatListSubscription {
     snapshot: StdMutex<Option<Vec<ChatListRowFfi>>>,
-    inner: Mutex<RuntimeChatListSubscription>,
+    state: Mutex<ChatListSubscriptionState>,
+}
+
+struct ChatListSubscriptionState {
+    inner: RuntimeChatListSubscription,
+    pending_rows: VecDeque<ChatListRowFfi>,
 }
 
 impl ChatListSubscription {
@@ -75,7 +82,10 @@ impl ChatListSubscription {
             .collect();
         Arc::new(Self {
             snapshot: StdMutex::new(Some(snapshot)),
-            inner: Mutex::new(inner),
+            state: Mutex::new(ChatListSubscriptionState {
+                inner,
+                pending_rows: VecDeque::new(),
+            }),
         })
     }
 }
@@ -86,19 +96,43 @@ impl ChatListSubscription {
         take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
+    /// Legacy row-only update stream.
+    ///
+    /// Atomic replacement snapshots are flattened into every visible row in
+    /// authoritative order so existing clients can observe changed pin fields.
+    /// This can yield many rows for one pin or archive operation and cannot
+    /// express the replacement boundary or removals. New clients that need
+    /// correct manual ordering and archive removals should use `next_update`.
+    ///
+    /// `next` and `next_update` consume the same stream and must not be mixed
+    /// for the lifetime of one subscription.
     pub async fn next(&self) -> Option<ChatListRowFfi> {
-        let mut inner = self.inner.lock().await;
+        let mut state = self.state.lock().await;
+        if let Some(row) = state.pending_rows.pop_front() {
+            return Some(row);
+        }
         loop {
-            match inner.recv().await? {
+            match state.inner.recv().await? {
                 marmot_app::RuntimeChatListUpdate::Row { row, .. } => return Some((*row).into()),
                 marmot_app::RuntimeChatListUpdate::RemoveRow { .. } => continue,
+                marmot_app::RuntimeChatListUpdate::Snapshot { rows, .. } => {
+                    state.pending_rows.extend(rows.into_iter().map(Into::into));
+                    if let Some(row) = state.pending_rows.pop_front() {
+                        return Some(row);
+                    }
+                }
             }
         }
     }
 
+    /// Typed update stream, including atomic full-list replacement snapshots.
+    ///
+    /// Do not mix this with `next` on the same subscription: both consume the
+    /// same underlying stream, while `next` may also hold flattened snapshot
+    /// rows in its compatibility buffer.
     pub async fn next_update(&self) -> Option<ChatListSubscriptionUpdateFfi> {
-        let mut inner = self.inner.lock().await;
-        inner.recv().await.map(Into::into)
+        let mut state = self.state.lock().await;
+        state.inner.recv().await.map(Into::into)
     }
 }
 
@@ -328,6 +362,36 @@ mod tests {
     // tested in `marmot-app` (`apply_projection_to_window`, `merge_timeline_window`,
     // `paginate_*`); the FFI no longer re-materializes the window, so its former
     // delta-application tests moved there.
+}
+
+/// A live user search. Dropping it cancels the traversal.
+///
+/// Unlike the runtime subscriptions above there is no `snapshot()`: a search
+/// has no initial state, only results that arrive as each radius resolves.
+#[derive(uniffi::Object)]
+pub struct UserSearchSubscription {
+    inner: Mutex<AppUserSearchSubscription>,
+}
+
+impl UserSearchSubscription {
+    pub(crate) fn new(inner: AppUserSearchSubscription) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl UserSearchSubscription {
+    /// Await the next step of the search, or `None` once it is over.
+    ///
+    /// `None` follows the `SearchCompleted` trigger, so a host can loop until
+    /// either signal. Dropping this object stops the traversal at its next
+    /// checkpoint.
+    pub async fn next_update(&self) -> Option<UserSearchUpdateFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.next_update().await.map(Into::into)
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]

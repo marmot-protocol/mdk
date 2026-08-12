@@ -21,6 +21,22 @@ Map for simulator tests.
 - **File:** `generated_policy_cases.rs`
   - **Owns:** Rust consumer for bounded policy cases shared with Tamarin generation.
 
+- **File:** `independent_reference_model.rs`
+  - **Owns:** Production-independent symbolic selector/canonicalizer differential tests, including small shrinkable
+    selector inputs, authentication/authorization, dependency closure, proposal expiry, and witness-free comparison.
+
+- **File:** `lifecycle_model.rs`
+  - **Owns:** Stateright lifecycle mirror, fair bounded progress, crash/resource recovery, stranded-joiner repair, and
+    stable-action-id counterexample-to-Scenario-IR validation.
+
+- **File:** `mutation_adequacy.rs`
+  - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable
+    verification-layer matrix.
+
+- **File:** `protocol_decision_gate.rs`
+  - **Owns:** Adopted protocol commit/value pin, exhaustive constant versioning classification, future required
+    component rule, and closed-input scheduler/resource non-interference.
+
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
 
@@ -28,11 +44,16 @@ Map for simulator tests.
   - **Owns:** Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior,
     generated send/leave histories, and delivery-profile convergence.
 
+- **File:** `process_campaign_runner.rs`
+  - **Owns:** Real child-process campaign execution, exact saved-input/report provenance, fixture/capsule artifacts, and
+    refusal to overwrite prior campaign evidence.
+
 - **File:** `report_runner.rs`
   - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
 
 - **File:** `sqlite_storage_modes.rs`
-  - **Owns:** Harness storage-mode coverage over temp file-backed SQLite.
+  - **Owns:** Harness storage-mode coverage over encrypted file-backed SQLite, including full close/reopen hydration,
+    production WAL defaults, encrypted headers, and busy-writer retry behavior.
 
 - **File:** `tracing_audit.rs`
   - **Owns:** Repo-wide production tracing privacy audit.

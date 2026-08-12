@@ -1,4 +1,5 @@
 use cgka_traits::{GroupId, TransportEndpoint};
+use std::collections::HashSet;
 
 use crate::AppError;
 use crate::messages::AppMessageIntent;
@@ -7,107 +8,418 @@ use crate::notifications;
 use super::AppClient;
 
 impl AppClient {
-    pub(crate) async fn share_push_registration(&mut self) -> Result<usize, AppError> {
+    pub(crate) async fn upsert_and_share_push_registration(
+        &mut self,
+        platform: notifications::PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
+        let registration = self.app.upsert_push_registration(
+            &self.state.label,
+            platform,
+            raw_token,
+            server_pubkey_hex,
+            relay_hint,
+        )?;
+        let share = self.share_push_registration().await?;
+        Ok(notifications::PushRegistrationSyncResult {
+            registration,
+            share,
+        })
+    }
+
+    pub(crate) async fn share_push_registration(
+        &mut self,
+    ) -> Result<notifications::PushRegistrationShareOutcome, AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
         let settings = self.app.notification_settings(&account.label)?;
-        let Some(registration) = self.app.stored_push_registration(&account.label)? else {
-            return Ok(0);
-        };
-        if !settings.native_push_enabled {
-            return Ok(0);
+        let registration = self.app.stored_push_registration(&account.label)?;
+        let pending_removals = self
+            .app
+            .pending_push_registration_removals(&account.label)?;
+        if registration.is_none() && pending_removals.is_empty() {
+            return Ok(notifications::PushRegistrationShareOutcome::from_counts(
+                0, 0, 0, 0,
+            ));
         }
         let signer = self.app.account_signer_for_summary(&account)?;
         let nostr_signer = signer.as_nostr_signer();
-        let mut shared = 0_usize;
-        for group in self.state.groups.clone() {
-            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+        let mut attempted_groups = HashSet::new();
+
+        for (group_id_hex, retired_registration) in pending_removals {
+            attempted_groups.insert(group_id_hex.clone());
+            self.app.mark_push_registration_removal_attempted(
+                &account.label,
+                &group_id_hex,
+                &retired_registration,
+                notifications::unix_now_ms(),
+            )?;
+            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "share_push_registration",
+                    skipped_groups = 1_u64,
+                    "push token removal skipped because its group id is invalid",
+                );
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
             let Ok((member_id_hex, leaf_index)) = self.local_member_leaf(&group_id) else {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "share_push_registration",
+                    skipped_groups = 1_u64,
+                    "push token removal skipped because the local member leaf is unavailable",
+                );
                 continue;
             };
-            let (payload, record) = notifications::local_token_gossip_payload(
-                group.group_id_hex.clone(),
+            let payload_and_record = notifications::local_token_removal_payload(
+                &group_id_hex,
                 member_id_hex,
                 leaf_index,
-                &registration,
+                &retired_registration,
                 nostr_signer.as_ref(),
             )
-            .await?;
-            self.app.upsert_group_push_token(&account.label, &record)?;
-            let content = serde_json::to_string(&payload)?;
-            match self
-                .send_app_event(&group_id, AppMessageIntent::PushTokenUpdate { content })
-                .await
-            {
-                Ok((_event, _summary)) => shared += 1,
+            .await;
+            let (payload, removal_record) = match payload_and_record {
+                Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
                         target: "marmot_app::notifications",
                         method = "share_push_registration",
                         error_kind = err.privacy_safe_kind(),
-                        "push token gossip publish failed",
+                        "push token removal gossip preparation failed",
+                    );
+                    continue;
+                }
+            };
+            let content = match serde_json::to_string(&payload) {
+                Ok(content) => content,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "share_push_registration",
+                        error_kind = AppError::from(err).privacy_safe_kind(),
+                        "push token removal gossip serialization failed",
+                    );
+                    continue;
+                }
+            };
+            match self
+                .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
+                .await
+            {
+                Ok((_event, _summary)) => {
+                    if let Err(err) = self.app.apply_local_push_removal(
+                        &account.label,
+                        &group_id_hex,
+                        &removal_record,
+                    ) {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            error_kind = err.privacy_safe_kind(),
+                            "push token removal local projection failed",
+                        );
+                        continue;
+                    }
+                    let _ = self.app.complete_push_registration_removal(
+                        &account.label,
+                        &group_id_hex,
+                        &retired_registration,
+                    )?;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "share_push_registration",
+                        error_kind = err.privacy_safe_kind(),
+                        "push token removal gossip publish failed",
                     );
                 }
             }
         }
-        if shared > 0 {
-            self.app
-                .mark_push_registration_shared(&account.label, notifications::unix_now_ms())?;
+
+        let mut pending_share_groups = Vec::new();
+        if settings.native_push_enabled
+            && let Some(registration) = &registration
+        {
+            pending_share_groups = self.app.pending_push_registration_shares(
+                &account.label,
+                &registration.registration.token_fingerprint,
+                registration.registration.updated_at_ms,
+            )?;
+            for group_id_hex in &pending_share_groups {
+                attempted_groups.insert(group_id_hex.clone());
+                self.app.mark_push_registration_share_attempted(
+                    &account.label,
+                    group_id_hex,
+                    &registration.registration.token_fingerprint,
+                    registration.registration.updated_at_ms,
+                    notifications::unix_now_ms(),
+                )?;
+                let Ok(group_id_bytes) = hex::decode(group_id_hex) else {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "share_push_registration",
+                        skipped_groups = 1_u64,
+                        "push token update skipped because its group id is invalid",
+                    );
+                    continue;
+                };
+                let group_id = GroupId::new(group_id_bytes);
+                let Ok((member_id_hex, leaf_index)) = self.local_member_leaf(&group_id) else {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "share_push_registration",
+                        skipped_groups = 1_u64,
+                        "push token update skipped because the local member leaf is unavailable",
+                    );
+                    continue;
+                };
+                let payload_and_record = notifications::local_token_gossip_payload(
+                    group_id_hex.clone(),
+                    member_id_hex,
+                    leaf_index,
+                    registration,
+                    nostr_signer.as_ref(),
+                )
+                .await;
+                let (payload, record) = match payload_and_record {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            error_kind = err.privacy_safe_kind(),
+                            "push token gossip preparation failed",
+                        );
+                        continue;
+                    }
+                };
+                let content = match serde_json::to_string(&payload) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            error_kind = AppError::from(err).privacy_safe_kind(),
+                            "push token gossip serialization failed",
+                        );
+                        continue;
+                    }
+                };
+                match self
+                    .send_app_event(&group_id, AppMessageIntent::PushTokenUpdate { content })
+                    .await
+                {
+                    Ok((_event, _summary)) => {
+                        if let Err(err) = self.app.upsert_group_push_token(&account.label, &record)
+                        {
+                            tracing::warn!(
+                                target: "marmot_app::notifications",
+                                method = "share_push_registration",
+                                error_kind = err.privacy_safe_kind(),
+                                "push token local projection failed",
+                            );
+                            continue;
+                        }
+                        let _ = self.app.complete_push_registration_share(
+                            &account.label,
+                            group_id_hex,
+                            &registration.registration.token_fingerprint,
+                            registration.registration.updated_at_ms,
+                        )?;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            error_kind = err.privacy_safe_kind(),
+                            "push token gossip publish failed",
+                        );
+                    }
+                }
+            }
         }
-        Ok(shared)
+
+        let remaining_share_groups = if let Some(registration) = &registration {
+            self.app.pending_push_registration_shares(
+                &account.label,
+                &registration.registration.token_fingerprint,
+                registration.registration.updated_at_ms,
+            )?
+        } else {
+            Vec::new()
+        };
+        if remaining_share_groups.is_empty()
+            && !pending_share_groups.is_empty()
+            && let Some(registration) = &registration
+        {
+            let _ = self.app.mark_push_registration_shared(
+                &account.label,
+                &registration.registration.token_fingerprint,
+                registration.registration.updated_at_ms,
+                notifications::unix_now_ms(),
+            )?;
+        }
+        let remaining_removal_groups = self
+            .app
+            .pending_push_registration_removals(&account.label)?
+            .into_iter()
+            .map(|(group_id_hex, _)| group_id_hex);
+        let pending_groups = remaining_share_groups
+            .into_iter()
+            .chain(remaining_removal_groups)
+            .collect::<HashSet<_>>();
+        let failed_groups = attempted_groups.intersection(&pending_groups).count();
+        let succeeded_groups = attempted_groups.len().saturating_sub(failed_groups);
+        Ok(notifications::PushRegistrationShareOutcome::from_counts(
+            attempted_groups.len(),
+            succeeded_groups,
+            failed_groups,
+            pending_groups.len(),
+        ))
+    }
+
+    pub(crate) async fn retry_pending_push_registration_shares_best_effort(&mut self) -> bool {
+        match self.share_push_registration().await {
+            Ok(outcome) if outcome.failed_groups > 0 => {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "retry_pending_push_registration_shares_best_effort",
+                    attempted_groups = outcome.attempted_groups,
+                    succeeded_groups = outcome.succeeded_groups,
+                    failed_groups = outcome.failed_groups,
+                    pending_groups = outcome.pending_groups,
+                    "push token gossip remains pending",
+                );
+                outcome.pending_groups > 0
+            }
+            Ok(outcome) => outcome.pending_groups > 0,
+            Err(err) => {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "retry_pending_push_registration_shares_best_effort",
+                    error_kind = err.privacy_safe_kind(),
+                    "push token gossip retry failed",
+                );
+                true
+            }
+        }
+    }
+
+    pub(crate) fn has_pending_push_registration_work(&self) -> bool {
+        match self
+            .app
+            .has_pending_push_registration_work(&self.state.label)
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "has_pending_push_registration_work",
+                    error_kind = err.privacy_safe_kind(),
+                    "push token gossip pending-state read failed",
+                );
+                true
+            }
+        }
+    }
+
+    pub(crate) fn queue_current_push_registration_removal_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::PushRegistration>, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let registration = self.app.push_registration(&self.state.label)?;
+        if let Some(registration) = &registration {
+            self.app.queue_push_registration_removal_for_group(
+                &self.state.label,
+                &group_id_hex,
+                registration,
+            )?;
+        }
+        Ok(registration)
+    }
+
+    pub(crate) async fn drain_push_registration_removal_before_departure(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::PushRegistration>, AppError> {
+        let registration = self.queue_current_push_registration_removal_for_group(group_id)?;
+        self.drain_existing_push_registration_removals_for_group(group_id)
+            .await?;
+        Ok(registration)
+    }
+
+    pub(crate) async fn drain_existing_push_registration_removals_for_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let had_pending_removal = self
+            .app
+            .pending_push_registration_removals(&self.state.label)?
+            .iter()
+            .any(|(pending_group_id, _)| pending_group_id == &group_id_hex);
+        if !had_pending_removal {
+            return Ok(());
+        }
+        let _ = self.share_push_registration().await?;
+        let remains_pending = self
+            .app
+            .pending_push_registration_removals(&self.state.label)?
+            .iter()
+            .any(|(pending_group_id, _)| pending_group_id == &group_id_hex);
+        if remains_pending {
+            return Err(AppError::Transport(
+                cgka_traits::TransportAdapterError::Publish(
+                    "push registration removal remains pending".to_owned(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compensate_group_push_registration_removal(
+        &self,
+        group_id: &GroupId,
+        registration: Option<&crate::PushRegistration>,
+    ) {
+        let Some(registration) = registration else {
+            return;
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if let Err(err) = self.app.queue_push_registration_share_for_group(
+            &self.state.label,
+            &group_id_hex,
+            registration,
+        ) {
+            tracing::warn!(
+                target: "marmot_app::notifications",
+                method = "compensate_group_push_registration_removal",
+                error_kind = err.privacy_safe_kind(),
+                "push token gossip compensation queue failed",
+            );
+        }
     }
 
     pub(crate) async fn remove_push_registration(
         &mut self,
         registration: crate::PushRegistration,
     ) -> Result<usize, AppError> {
-        let account = self.app.account_home().account(&self.state.label)?;
-        let signer = self.app.account_signer_for_summary(&account)?;
-        let nostr_signer = signer.as_nostr_signer();
-        let mut removed = 0_usize;
-        for group in self.state.groups.clone() {
-            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
-                continue;
-            };
-            let group_id = GroupId::new(group_id_bytes);
-            let Ok((member_id_hex, leaf_index)) = self.local_member_leaf(&group_id) else {
-                continue;
-            };
-            let (payload, removal_record) = notifications::local_token_removal_payload(
-                &group.group_id_hex,
-                member_id_hex,
-                leaf_index,
-                &registration,
-                nostr_signer.as_ref(),
-            )
-            .await?;
-            let content = serde_json::to_string(&payload)?;
-            match self
-                .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
-                .await
-            {
-                Ok((_event, _summary)) => removed += 1,
-                Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::notifications",
-                        method = "remove_push_registration",
-                        error_kind = err.privacy_safe_kind(),
-                        "push token removal gossip publish failed",
-                    );
-                }
-            }
-            // Tombstone our own record locally with the same owner-signed stamp, so
-            // a later stale kind 448 relaying our pre-removal record cannot
-            // resurrect it.
-            self.app.apply_local_push_removal(
-                &account.label,
-                &group.group_id_hex,
-                &removal_record,
-            )?;
-        }
-        Ok(removed)
+        self.app
+            .queue_push_registration_removals(&self.state.label, registration)?;
+        Ok(self.share_push_registration().await?.succeeded_groups as usize)
+    }
+
+    pub(crate) async fn clear_and_share_push_registration(
+        &mut self,
+    ) -> Result<notifications::PushRegistrationShareOutcome, AppError> {
+        self.app.clear_push_registration(&self.state.label)?;
+        self.share_push_registration().await
     }
 
     pub(crate) async fn publish_notification_trigger_best_effort(
@@ -146,20 +458,27 @@ impl AppClient {
                 .collect::<Vec<_>>();
             let endpoints =
                 self.notification_trigger_target_relays(&server_pubkey_hex, &records)?;
+            let endpoints = self
+                .relay_plane
+                .sanitize_relay_endpoints(endpoints, "notification trigger publish")
+                .map_err(|err| {
+                    AppError::Transport(cgka_traits::TransportAdapterError::Publish(err))
+                })?;
             if endpoints.is_empty() {
                 // No relay hint and no published kind-10050 inbox list for this
                 // server: it is unreachable, so skip it as the genuine last
                 // resort.
                 continue;
             }
-            let event =
-                notifications::build_notification_gift_wrap(&server_pubkey_hex, &encrypted_tokens)
-                    .await?;
-            self.app
-                .relay_client_for_endpoints(nostr_signer.clone(), &endpoints)
-                .publish_event(&endpoints, &event, 1)
-                .await
-                .map_err(AppError::Transport)?;
+            for chunk in notifications::notification_trigger_chunks(&encrypted_tokens) {
+                let event =
+                    notifications::build_notification_gift_wrap(&server_pubkey_hex, chunk).await?;
+                self.app
+                    .relay_client_for_endpoints(nostr_signer.clone(), &endpoints)
+                    .publish_event(&endpoints, &event, 1)
+                    .await
+                    .map_err(AppError::Transport)?;
+            }
         }
         Ok(())
     }
@@ -186,13 +505,16 @@ impl AppClient {
         } else {
             Vec::new()
         };
-        Ok(notifications::select_notification_trigger_relays(
-            &record_relay_hints,
-            &server_inbox_relays,
-        )
-        .into_iter()
-        .map(TransportEndpoint)
-        .collect())
+        Ok(self.app.retain_safe_discovered_endpoints(
+            notifications::select_notification_trigger_relays(
+                &record_relay_hints,
+                &server_inbox_relays,
+            )
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect(),
+            "notification trigger relay discovery",
+        ))
     }
 
     fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {

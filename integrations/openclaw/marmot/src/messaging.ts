@@ -21,7 +21,7 @@
 import type {
   ChannelMessagingAdapter,
   ChatType,
-} from "openclaw/plugin-sdk/channel-runtime";
+} from "openclaw/plugin-sdk/core";
 
 /** Explicit cross-channel target prefix, e.g. `marmot:<groupIdHex>`. */
 export const MARMOT_TARGET_PREFIX = "marmot";

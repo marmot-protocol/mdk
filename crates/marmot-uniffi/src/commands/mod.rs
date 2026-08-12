@@ -12,6 +12,7 @@ mod agent_stream;
 mod audit;
 mod chat_list;
 mod directory;
+mod draft;
 mod group;
 mod media;
 mod message;
@@ -19,4 +20,8 @@ mod notification;
 mod push;
 mod relay;
 mod subscription;
+mod telemetry;
 mod timeline;
+
+pub use group::InitialGroupImageFfi;
+pub use media::parse_media_imeta_tag;

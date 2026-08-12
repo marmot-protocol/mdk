@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::Backend;
 use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendResult,
+    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendIntent,
+    SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
@@ -13,15 +13,21 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
+    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
+    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
+use cgka_traits::{
+    Backend, OutboundFanout, TransportEndpoint, TransportPublishRequest, TransportPublishTarget,
+};
 use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,6 +142,7 @@ impl TransportPeeler for MockPeeler {
 
 fn build_engine(storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-hydration"))
         .account_identity_proof_signer(proof_signer(b"alice-hydration"))
         .peeler(Box::new(MockPeeler))
@@ -176,7 +183,10 @@ fn insert_marmot_group_without_openmls_state(
             members: Vec::new(),
             epoch: EpochId(epoch),
             required_capabilities: GroupCapabilities::default(),
+            protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
+            unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(0),
         })
         .expect("insert marmot group record without openmls state");
@@ -198,6 +208,7 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
     let audit_path = dir.path().join("audit.jsonl");
     let recorder = JsonlRecorder::open(&audit_path, "hydration-test-engine".to_string()).unwrap();
     let mut reopened = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-hydration"))
         .account_identity_proof_signer(proof_signer(b"alice-hydration"))
         .peeler(Box::new(MockPeeler))
@@ -206,7 +217,7 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
         .expect("build reopened engine");
 
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration skips bad group instead of aborting account open");
 
     assert_eq!(reopened.epoch(&healthy_group).unwrap(), healthy_epoch);
@@ -246,6 +257,38 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
 }
 
 #[tokio::test]
+async fn hydration_classifies_stored_wire_profile_mismatch_as_member_validation_failure() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    drop(initial);
+
+    let mut stored_group = storage.get_group(&group_id).expect("stored group");
+    assert_eq!(
+        stored_group.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy,
+        "test setup expects the legacy builder default"
+    );
+    stored_group.protocol_profile = cgka_traits::group::ProtocolProfile::Current;
+    storage
+        .put_group(&stored_group)
+        .expect("corrupt stored profile");
+
+    let mut reopened = build_engine(storage);
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("profile mismatch quarantines instead of aborting account open");
+
+    assert_eq!(
+        reopened.quarantined_groups(),
+        vec![(
+            group_id,
+            GroupHydrationQuarantineReason::MemberValidationFailed
+        )]
+    );
+}
+
+#[tokio::test]
 async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_group() {
     let storage = SqliteAccountStorage::in_memory().expect("storage");
     let broken_group = GroupId::new(vec![0]);
@@ -266,7 +309,7 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 
     let mut reopened = build_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration skips the first bad group and continues");
 
     assert_eq!(reopened.epoch(&healthy_group).unwrap(), healthy_epoch);
@@ -300,6 +343,8 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
     fail_get_group: Arc<AtomicBool>,
+    fail_disband_tombstone: Arc<AtomicBool>,
+    fail_list_queued_outbound_intents: Arc<AtomicBool>,
 }
 
 impl FlakyGroupRecordStorage {
@@ -307,11 +352,22 @@ impl FlakyGroupRecordStorage {
         Self {
             inner,
             fail_get_group: Arc::new(AtomicBool::new(false)),
+            fail_disband_tombstone: Arc::new(AtomicBool::new(false)),
+            fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn set_fail_get_group(&self, fail: bool) {
         self.fail_get_group.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_disband_tombstone(&self, fail: bool) {
+        self.fail_disband_tombstone.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_list_queued_outbound_intents(&self, fail: bool) {
+        self.fail_list_queued_outbound_intents
+            .store(fail, Ordering::SeqCst);
     }
 }
 
@@ -340,6 +396,9 @@ impl MessageStorage for FlakyGroupRecordStorage {
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
         self.inner.get_message(id)
     }
+    fn delete_message(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_message(id)
+    }
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
         self.inner.update_message_state(id, new_state)
     }
@@ -349,6 +408,26 @@ impl MessageStorage for FlakyGroupRecordStorage {
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
+    }
+    fn put_pending_application_event(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+    ) -> StorageResult<()> {
+        self.inner.put_pending_application_event(event)
+    }
+    fn list_pending_application_events(
+        &self,
+    ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
+        self.inner.list_pending_application_events()
+    }
+    fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
+        self.inner.delete_pending_application_events(ids)
+    }
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.put_ingress_dedup_marker(id)
+    }
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.inner.has_ingress_dedup_marker(id)
     }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
@@ -362,6 +441,36 @@ impl MessageStorage for FlakyGroupRecordStorage {
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.release_group_snapshot(group_id, name)
     }
+    fn create_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint: &GroupStateCheckpointRef,
+    ) -> StorageResult<()> {
+        self.inner
+            .create_group_state_checkpoint(group_id, checkpoint)
+    }
+    fn restore_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .restore_group_state_checkpoint(group_id, checkpoint_id)
+    }
+    fn list_group_state_checkpoints(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<GroupStateCheckpointRef>> {
+        self.inner.list_group_state_checkpoints(group_id)
+    }
+    fn release_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .release_group_state_checkpoint(group_id, checkpoint_id)
+    }
 }
 
 impl OutboundIntentStorage for FlakyGroupRecordStorage {
@@ -372,10 +481,39 @@ impl OutboundIntentStorage for FlakyGroupRecordStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        if self
+            .fail_list_queued_outbound_intents
+            .load(Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "injected queued-outbound-intent list failure".into(),
+            ));
+        }
         self.inner.list_queued_outbound_intents(group_id)
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl OutboundFanoutStorage for FlakyGroupRecordStorage {
+    fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()> {
+        self.inner.put_outbound_fanout(fanout)
+    }
+    fn outbound_fanout(&self, id: &MessageId) -> StorageResult<Option<OutboundFanout>> {
+        self.inner.outbound_fanout(id)
+    }
+    fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts()
+    }
+    fn list_outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts_for_group(group_id)
+    }
+    fn delete_outbound_fanout(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_outbound_fanout(id)
     }
 }
 
@@ -388,6 +526,63 @@ impl LeaveRequestStorage for FlakyGroupRecordStorage {
     }
     fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
         self.inner.clear_leave_request(group_id)
+    }
+}
+
+impl DisbandRequestStorage for FlakyGroupRecordStorage {
+    fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()> {
+        self.inner.put_disband_request(request)
+    }
+    fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>> {
+        self.inner.disband_request(group_id)
+    }
+    fn clear_disband_request(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_disband_request(group_id)
+    }
+}
+
+impl DisbandCandidateStorage for FlakyGroupRecordStorage {
+    fn put_disband_candidate(&self, candidate: &DisbandCandidate) -> StorageResult<()> {
+        self.inner.put_disband_candidate(candidate)
+    }
+    fn disband_candidate(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<DisbandCandidate>> {
+        self.inner.disband_candidate(group_id, commit_id)
+    }
+    fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        self.inner.list_disband_candidates(group_id)
+    }
+    fn clear_disband_candidates(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_disband_candidates(group_id)
+    }
+}
+
+impl DisbandTombstoneStorage for FlakyGroupRecordStorage {
+    fn put_disband_tombstone(
+        &self,
+        group_id: &GroupId,
+        tombstone: &cgka_traits::DisbandTombstone,
+    ) -> StorageResult<()> {
+        self.inner.put_disband_tombstone(group_id, tombstone)
+    }
+    fn disband_tombstone(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DisbandTombstone>> {
+        if self.fail_disband_tombstone.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected disband_tombstone failure".into(),
+            ));
+        }
+        self.inner.disband_tombstone(group_id)
+    }
+    fn list_disband_tombstones(
+        &self,
+    ) -> StorageResult<Vec<(GroupId, cgka_traits::DisbandTombstone)>> {
+        self.inner.list_disband_tombstones()
     }
 }
 
@@ -461,6 +656,40 @@ impl AccountDeviceSignerStorage for FlakyGroupRecordStorage {
     }
 }
 
+impl KeyPackageBundleStorage for FlakyGroupRecordStorage {
+    fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        self.inner.stored_key_package_bundles()
+    }
+
+    fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        self.inner.delete_stored_key_package_bundle(storage_key)
+    }
+}
+
+impl ConvergencePassStorage for FlakyGroupRecordStorage {
+    fn convergence_pass(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DurableConvergencePass>> {
+        self.inner.convergence_pass(group_id)
+    }
+
+    fn put_convergence_pass(
+        &self,
+        pass: &cgka_traits::DurableConvergencePass,
+    ) -> StorageResult<()> {
+        self.inner.put_convergence_pass(pass)
+    }
+
+    fn list_convergence_passes(&self) -> StorageResult<Vec<cgka_traits::DurableConvergencePass>> {
+        self.inner.list_convergence_passes()
+    }
+
+    fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_convergence_pass(group_id)
+    }
+}
+
 impl StorageProvider for FlakyGroupRecordStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 
@@ -475,11 +704,96 @@ impl StorageProvider for FlakyGroupRecordStorage {
 
 fn build_flaky_engine(storage: FlakyGroupRecordStorage) -> Engine<FlakyGroupRecordStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-hydration"))
         .account_identity_proof_signer(proof_signer(b"alice-hydration"))
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build flaky engine")
+}
+
+fn build_current_flaky_engine(
+    storage: FlakyGroupRecordStorage,
+    name: &[u8],
+) -> Engine<FlakyGroupRecordStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build current-profile flaky engine")
+}
+
+fn build_current_named_client(name: &[u8]) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().expect("storage"))
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build current-profile client")
+}
+
+#[tokio::test]
+async fn welcome_delivery_accessors_hide_quarantined_groups() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut alice = build_current_flaky_engine(storage.clone(), b"alice-quarantined-welcome");
+    let mut bob = build_current_named_client(b"bob-quarantined-welcome");
+    let bob_key_package = bob.fresh_key_package().await.expect("bob key package");
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "quarantined welcome".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect("create current-profile group");
+    let welcome_id = match result {
+        SendResult::FoundingGroupCreated { welcomes } => {
+            welcomes.into_iter().next().expect("founding Welcome").id
+        }
+        other => panic!("expected founding group creation, got {other:?}"),
+    };
+    assert_eq!(alice.outstanding_sent_welcomes().unwrap().len(), 1);
+    drop(alice);
+
+    storage.set_fail_get_group(true);
+    let mut engine = build_current_flaky_engine(storage.clone(), b"alice-quarantined-welcome");
+    engine
+        .hydrate_all_stored_groups()
+        .expect("unreadable group is quarantined");
+    assert_eq!(
+        engine.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed
+        )]
+    );
+
+    // Make the underlying record readable again without retrying hydration.
+    // The quarantine gate, rather than the transient storage failure, must
+    // continue to hide every delivery accessor until explicit recovery.
+    storage.set_fail_get_group(false);
+    assert!(matches!(
+        engine.stored_sent_welcome(&welcome_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(matches!(
+        engine.mark_sent_welcome_delivered(&welcome_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(
+        engine.outstanding_sent_welcomes().unwrap().is_empty(),
+        "quarantined groups must not contribute outstanding Welcome work"
+    );
+    assert!(
+        engine.tracked_outbound_welcome_ids().unwrap().is_empty(),
+        "quarantined groups must not contribute tracked Welcome ids"
+    );
 }
 
 async fn create_confirmed_group_flaky(engine: &mut Engine<FlakyGroupRecordStorage>) -> GroupId {
@@ -514,7 +828,7 @@ async fn retry_recovers_a_transiently_quarantined_group() {
     storage.set_fail_get_group(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the unreadable group, does not abort");
 
     assert!(matches!(
@@ -556,6 +870,158 @@ async fn retry_recovers_a_transiently_quarantined_group() {
 }
 
 #[tokio::test]
+async fn tombstone_read_failure_quarantines_instead_of_hydrating_live_state() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    drop(initial);
+
+    storage.set_fail_disband_tombstone(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("per-group tombstone failure is quarantined");
+
+    assert_eq!(
+        reopened.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed,
+        )]
+    );
+    assert!(reopened.epoch_state(&group_id).is_none());
+
+    storage.set_fail_disband_tombstone(false);
+    assert!(
+        reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("retry succeeds")
+    );
+}
+
+#[tokio::test]
+async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    let baseline_epoch = initial.epoch(&group_id).unwrap();
+    let staged = initial
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending fanout".into()),
+            description: None,
+        })
+        .await
+        .expect("stage update");
+    let (message, pending) = match staged {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected group evolution, got {other:?}"),
+    };
+    let transport_group_id = match &message.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
+        other => panic!("expected group message, got {other:?}"),
+    };
+    let fanout = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: initial.self_id(),
+            message,
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id,
+                endpoints: vec![TransportEndpoint("wss://hydrate.example".into())],
+            },
+            required_acks: 1,
+        },
+        Some(pending),
+        Some(group_id.clone()),
+        0,
+    )
+    .expect("stage frozen fanout");
+    initial
+        .put_outbound_fanout(&fanout)
+        .expect("persist frozen fanout");
+    drop(initial);
+
+    // Fail after the durable pending candidate has been fully validated. The
+    // group is quarantined, but no pending lifecycle may escape into memory.
+    storage.set_fail_list_queued_outbound_intents(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("per-group failure is quarantined");
+    assert!(matches!(
+        reopened.quarantined_groups().as_slice(),
+        [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
+    ));
+    assert!(
+        reopened.outbound_fanouts().unwrap().is_empty(),
+        "runtime fanout resumption must hide quarantined groups"
+    );
+    assert_eq!(
+        storage.list_outbound_fanouts().unwrap().len(),
+        1,
+        "quarantine must retain the durable fanout for a later retry"
+    );
+    assert!(matches!(
+        reopened.put_outbound_fanout(&fanout),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(matches!(
+        reopened.delete_outbound_fanout(fanout.message_id()),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    let mut confirm_candidate = fanout.clone();
+    assert!(matches!(
+        reopened
+            .confirm_published_fanout(pending, &mut confirm_candidate)
+            .await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    let mut rollback_candidate = fanout.clone();
+    assert!(matches!(
+        reopened
+            .publish_failed_fanout(pending, &mut rollback_candidate)
+            .await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+
+    // A clean retry restores the pending lifecycle exactly once. This would
+    // fail if the first hydration had already registered it before the later
+    // storage read failed.
+    storage.set_fail_list_queued_outbound_intents(false);
+    assert!(
+        reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("retry hydration"),
+        "healthy retry must recover the quarantined group"
+    );
+    assert_eq!(reopened.pending_group_id(pending).unwrap(), group_id);
+    let mut recovered_fanout = reopened
+        .outbound_fanouts()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("recovered durable fanout");
+    recovered_fanout
+        .mark_attempt_started(0)
+        .expect("start recovered attempt");
+    reopened
+        .put_outbound_fanout(&recovered_fanout)
+        .expect("persist recovered attempt");
+    recovered_fanout
+        .mark_target_failed(0)
+        .expect("fail recovered attempt");
+    reopened
+        .put_outbound_fanout(&recovered_fanout)
+        .expect("persist recovered failure");
+    reopened
+        .publish_failed_fanout(pending, &mut recovered_fanout)
+        .await
+        .expect("recovered pending can roll back");
+    assert_eq!(reopened.epoch(&group_id).unwrap(), baseline_epoch);
+}
+
+#[tokio::test]
 async fn retry_keeps_group_quarantined_when_still_unhealthy() {
     let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
@@ -565,7 +1031,7 @@ async fn retry_keeps_group_quarantined_when_still_unhealthy() {
     storage.set_fail_get_group(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the unreadable group");
     reopened.drain_events();
 
@@ -605,6 +1071,7 @@ async fn retry_for_unknown_group_errors() {
 fn build_named_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().expect("storage");
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(MockPeeler))
@@ -684,7 +1151,7 @@ async fn quarantined_alice_with_live_bob() -> (
     storage.set_fail_get_group(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the unreadable group");
     assert_eq!(
         reopened.quarantined_groups(),
@@ -735,8 +1202,8 @@ async fn quarantined_group_rejects_valid_inbound_commit_on_do_ingest() {
     assert!(
         matches!(
             outcome,
-            cgka_traits::ingest::IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::Quarantined
+            cgka_traits::ingest::IngestOutcome::LocalState {
+                state: cgka_traits::ingest::LocalIngestState::Quarantined
             }
         ),
         "expected Stale::Quarantined, got {outcome:?}"
@@ -776,7 +1243,7 @@ async fn quarantined_group_blocks_convergence_and_send() {
     ));
 
     let result = alice
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("quarantined convergence reports a blocked no-op run");
     assert_eq!(
         result.convergence_status,
@@ -817,6 +1284,10 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
 
     unknown(alice.members(&group_id).map(drop), "members");
     unknown(alice.epoch(&group_id).map(drop), "epoch");
+    assert!(
+        alice.epoch_state(&group_id).is_none(),
+        "epoch_state must hide quarantined groups"
+    );
     unknown(alice.group_record(&group_id).map(drop), "group_record");
     unknown(alice.admin_pubkeys(&group_id).map(drop), "admin_pubkeys");
     unknown(alice.group_context(&group_id).map(drop), "group_context");
@@ -833,6 +1304,10 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
     unknown(
         alice.upgradeable_capabilities(&group_id).map(drop),
         "upgradeable_capabilities",
+    );
+    unknown(
+        alice.disbanding_support_blockers(&group_id).map(drop),
+        "disbanding_support_blockers",
     );
     unknown(
         alice.upgrade_group_capabilities(&group_id).await.map(drop),
@@ -870,8 +1345,8 @@ async fn repair_replays_buffered_commit_and_group_catches_up() {
         .expect("ingest classifies");
     assert!(matches!(
         outcome,
-        cgka_traits::ingest::IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::Quarantined
+        cgka_traits::ingest::IngestOutcome::LocalState {
+            state: cgka_traits::ingest::LocalIngestState::Quarantined
         }
     ));
 
@@ -926,6 +1401,7 @@ async fn rejoin_welcome_clears_quarantine() {
 
     let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
     let mut alice = EngineBuilder::new(alice_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-rejoin"))
         .account_identity_proof_signer(proof_signer(b"alice-rejoin"))
         .peeler(Box::new(MockPeeler))
@@ -933,7 +1409,7 @@ async fn rejoin_welcome_clears_quarantine() {
         .expect("build alice");
     insert_marmot_group_without_openmls_state(&alice_storage, &group_id, "corrupted-copy", 1);
     alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the corrupted copy");
     assert_eq!(
         alice.quarantined_groups(),
@@ -1006,6 +1482,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
 
     let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
     let mut alice = EngineBuilder::new(alice_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-replay"))
         .account_identity_proof_signer(proof_signer(b"alice-replay"))
         .peeler(Box::new(MockPeeler))
@@ -1013,7 +1490,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
         .expect("build alice");
     insert_marmot_group_without_openmls_state(&alice_storage, &group_id, "corrupted-copy", 1);
     alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the corrupted copy");
     assert_eq!(alice.quarantined_groups().len(), 1);
     alice.drain_events();
@@ -1027,8 +1504,8 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
         .expect("quarantine gate classifies");
     assert!(matches!(
         outcome,
-        cgka_traits::ingest::IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::Quarantined
+        cgka_traits::ingest::IngestOutcome::LocalState {
+            state: cgka_traits::ingest::LocalIngestState::Quarantined
         }
     ));
     let deferred_before = alice_storage
@@ -1098,9 +1575,7 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
     );
 
     let mut first = build_engine(storage.clone());
-    first
-        .hydrate_stable_groups_from_storage()
-        .expect("first hydration");
+    first.hydrate_all_stored_groups().expect("first hydration");
     assert_eq!(first.epoch(&group).unwrap(), epoch);
 
     // First open validated the tree and persisted a marker.
@@ -1114,13 +1589,117 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
     // because the tree bytes are identical.
     let mut second = build_engine(storage.clone());
     second
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("second hydration of unchanged group");
     assert_eq!(second.epoch(&group).unwrap(), epoch);
     assert_eq!(
         storage.validated_tree_marker(&group).expect("read marker"),
         Some(marker),
         "marker for an unchanged group must be stable across opens"
+    );
+}
+
+// mdk#969: a crash after the retained-anchor probe durably rewinds the live
+// group leaves its pre-probe snapshot behind. Hydration must restore that
+// snapshot before it reads either the Marmot record or the OpenMLS group.
+#[tokio::test]
+async fn hydration_recovers_interrupted_retained_anchor_probe() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    let mut historical_group = live_group.clone();
+    historical_group.name = "historical anchor".into();
+    historical_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&historical_group)
+        .expect("plant historical group record");
+    storage
+        .create_group_snapshot(&group_id, "test-historical-anchor")
+        .expect("capture historical anchor");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_snapshot(&group_id, "openmls-retained-probe-test-crash")
+        .expect("capture pre-probe live state");
+    storage
+        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate committed probe rewind");
+    drop(initial);
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("rewound group"),
+        historical_group,
+        "fixture must start in the crash-stranded historical state"
+    );
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate recovers orphaned probe");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-probe live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-retained-probe-")),
+        "recovered probe snapshot must be released"
+    );
+}
+
+// mdk#968: the apply snapshot is released transactionally with a completed
+// branch apply. If one survives a crash, hydration must restore the captured
+// pre-apply live state rather than accepting a partially rewound projection.
+#[tokio::test]
+async fn hydration_recovers_interrupted_convergence_apply() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    storage
+        .create_group_snapshot(&group_id, "openmls-apply-test-crash")
+        .expect("capture pre-apply live state");
+    let mut partial_group = live_group.clone();
+    partial_group.name = "partial historical apply".into();
+    partial_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&partial_group)
+        .expect("simulate partial rewind");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate recovers interrupted apply");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-apply live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-apply-")),
+        "recovered apply snapshot must be released"
     );
 }
 
@@ -1142,7 +1721,7 @@ async fn stale_validation_marker_forces_revalidation_and_refresh() {
 
     let mut reopened = build_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration revalidates and accepts the healthy group");
     assert_eq!(reopened.epoch(&group).unwrap(), epoch);
 

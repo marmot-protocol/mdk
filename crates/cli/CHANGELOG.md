@@ -1,9 +1,950 @@
 # Changelog
 
-All notable changes to `wn-cli` (previously `darkmatter-cli`) are tracked here.
+All notable user-facing changes in the MDK compatibility cohort are tracked
+here, including `wn-cli` (previously `darkmatter-cli`), WN Agent, and generated
+MarmotKit bindings.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses semantic
 versioning through the workspace version in the root `Cargo.toml`.
+
+## [Unreleased]
+
+### Changed
+
+- Encrypted media and Hermes/WN Agent file delivery now accept blobs up to
+  512 MiB (including the 16-byte authentication tag), enabling APKs and other
+  artifacts above the previous 64 MiB ceiling. Encryption/decryption is
+  performed in place, Blossom fallback retries share the same immutable upload
+  body, and large blob transfers have a 15-minute request budget. Receivers must
+  upgrade to this compatibility cohort before downloading blobs above 64 MiB;
+  the active blob remains memory-resident and one media request is bounded to
+  512 MiB total.
+- App-runtime encrypted-media secret caching now skips the MLS group load,
+  exporter-secret derivation, and database write when the current epoch's
+  secret is already cached, and the cache sweep's `required` pre-check uses
+  the projected group record as a positive-only fast path, re-checking the
+  signed component only when the projection reports media disabled. Message
+  sends and group syncs no longer pay three MLS group loads per media group
+  per sweep.
+  ([#1396](https://github.com/marmot-protocol/mdk/pull/1396))
+
+### Fixed
+
+- OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the
+  routed agent id, and beta message sends bypass the delete-only action adapter
+  so they reach durable delivery.
+- Local-only group deletion now survives account restart and historical relay
+  replay. A per-group deletion frontier suppresses projection reconciliation
+  until a causally newer chat message arrives, while a durable engine-to-app
+  delivery outbox makes that first crossing chat recoverable after a crash and
+  does not affect other locally deleted groups.
+- Nostr group-sync unsubscribe draining now keeps unresolved relay teardowns
+  queued until teardown is confirmed, so cancelling a sync after routing
+  state commits retries pending unsubscribes and converges removal metrics
+  without double-counting.
+- OpenCode harness idle-timeout regression test now keeps the mock child alive
+  past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
+- Nostr group-subscription sync now registers new routes and telemetry before
+  issuing relay REQs, so immediate stored-event replay cannot be dropped as
+  unroutable; failed subscriptions roll the staged state back for clean retry.
+- Engine fork-detection integration tests now exercise the pinned v1
+  five-commit rewind horizon in normal builds instead of overriding
+  `max_rewind_commits` to one.
+- Runtime catch-up, key-package maintenance, and every other incremental sync
+  seam now execute an armed epoch-gap full-history replay immediately instead of
+  waiting for unrelated later relay traffic. Explicit full-history repair also
+  consumes a pending replay without issuing the same account-wide query twice.
+- KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
+  categories (for example `blocked` or `auth-required`) instead of repeating a
+  generic `relay rejected event` summary, while successful deletions still
+  clear only matching local KeyPackage publication metadata after at least one
+  relay acknowledgement.
+- Hermes Marmot `marmot_history` and `delete_marmot_message` tools now accept
+  Hermes ToolRegistry runtime keyword arguments (`task_id`, `session_id`, and
+  future dispatch metadata) instead of failing with `TypeError` during gateway
+  tool calls.
+- Leave-proposal persistence now commits the signed proposal, durable leave
+  request, and content-dedup marker atomically, so a storage failure cannot
+  strand a same-epoch leave retry without a publishable proposal.
+- The Nostr SDK failed-signature regression test now observes EOSE under one
+  bounded CI-safe window, avoiding sharded CI flakes without weakening
+  failed-event non-emission and non-caching assertions.
+
+## [0.9.11] - 2026-08-09
+
+### Added
+
+- Hermes Marmot delivery now batches up to 10 ordered local images into one
+  encrypted-media application message instead of sending one message per image.
+  The adapter pins approved source files before bounded staging, while the
+  connector independently enforces the attachment-count and byte limits. Album
+  sends apply the caption once, report every durable message id and attachment
+  outcome, wait up to 15 minutes for terminal upload completion, and return a
+  retryable timeout while cleaning staged files if the connector never finishes.
+  Transport retries reuse connector-persisted idempotency so they cannot
+  duplicate the album.
+
+- WN Agent releases now include the `wn-pi` terminal-harness connector and
+  installer for Linux and macOS. Pi runs in isolated JSON-mode sessions with
+  bounded working-directory access, persisted conversation state, streamed
+  assistant output, and the same hardened shared connector runtime now used by
+  `wn-opencode`.
+
+- Account-open startup is now stage-attributed in app telemetry: engine
+  session open, stored-group hydration, the shared startup profile load, and
+  the group-read-snapshot capture each get fixed-bucket duration metrics.
+  New `just bench-startup` scaling benchmarks separate
+  chat-projection readiness from full account-command readiness across
+  0/10/100/1000 stored groups.
+
+- Engine session open now uses two-phase hydration: a cheap seed pass reads
+  only durable group records (plus a new durable transport-route table) and
+  full per-group hydration — MLS load, validation, pending-commit recovery —
+  runs per group, on demand from send/ingest/convergence entry points or
+  eagerly via the compatibility path. Per-group hydration itself got cheaper:
+  one group-record read and one message scan replace the former three record
+  reads and four full message-table scans per group. Groups awaiting
+  hydration report a new retryable "not hydrated yet" state instead of
+  partial data.
+
+- Runtime account opens now defer full group hydration to a background
+  pipeline that runs after local readiness in chat-list recency order, so
+  cold-start readiness no longer scales with stored group count. Group reads
+  issued before a group hydrates wait for exactly that group; mutations and
+  catch-ups keep their existing startup deferral order — `start()` returning
+  therefore does NOT mean a subsequent send is unblocked: sends issued
+  before the initial catch-up completes are queued and replayed in arrival
+  order after it, covering any remaining hydration plus catch-up latency.
+  MarmotKit surfaces a new retryable `GroupHydrationPending` error, distinct
+  from `UnknownGroup`, for the remaining direct-read window.
+
+- After a receive-error transport reconnect, the managed account worker eagerly
+  drains every deferred stored group (including more than one hydration batch)
+  before resuming steady-state commands, so groups are not left gated until a
+  later read or send promotes them individually.
+
+- Repeated epoch-gap backfill stalls now emit a one-time typed escalation event
+  and durable forensic record with aggregate attempt and epoch information.
+  Successful progress resets the escalation state so a later independent stall
+  can be diagnosed separately.
+
+- `marmot-markdown` now recognizes bare `www.example.com/path` text as web
+  autolinks. The AST preserves the displayed `www.` source while exposing an
+  explicit `Www` autolink kind so renderers can synthesize `https://`
+  destinations without a second client-side URL parser.
+  
+- MarmotKit and the agent connector now acquire a nonblocking, kernel-released
+  exclusive lease on their root before opening shared state. MarmotKit exposes
+  typed `RuntimeBusy` contention so foreground apps can retry and notification
+  extensions can return bounded fallback content instead of creating a second
+  stateful writer.
+
+- MarmotKit exposes `groupRoster`, a single lightweight membership projection
+  with enriched roster rows, MLS epoch, caller self-membership or eviction
+  state, lifecycle state, and a monotonic revision covering MLS epoch plus
+  caller membership for cheap membership-screen change detection. Existing
+  `groupDetails`, `groupMlsState`, and `groupMembers` remain available for
+  compatibility.
+
+- MarmotKit exposes `groupMemberIdsPage`, a bounded identifier-only companion
+  read for chat-list consumers. A host can fetch membership for up to 100
+  groups in one account-worker command instead of issuing one `groupMembers`
+  or `groupRoster` command per chat. The page preserves input order, performs
+  no profile enrichment, and fails as a whole when any requested group is
+  unknown or quarantined
+  ([#1342](https://github.com/marmot-protocol/mdk/pull/1342)).
+  
+- MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
+  kind:0 profile `picture` URLs (HTTPS-only, proxy-disabled pinned public
+  resolution, bounded redirects, and streaming limits) so Android and Swift
+  hosts do not maintain a separate SSRF stack for public avatars
+  ([#1288](https://github.com/marmot-protocol/mdk/pull/1288)).
+
+- Outbound messages waiting in a group's durable queue are now bounded at 256
+  per group. The bound covers every reason a message waits: a group resolving a
+  stalled publication, convergence input that has not settled, and messages
+  queued while the account is offline. Past the bound a send is refused instead
+  of queued without limit — MarmotKit reports the typed `GroupSendQueueFull`
+  error, which is deliberately not retried automatically, so a host should tell
+  the user the message was not accepted and offer to resend once the group is
+  sending again. Nothing already queued is discarded; a slot frees only once its
+  message is accepted by a relay.
+
+- Freshly created local identities now publish an explicit empty Nostr contact
+  list, giving the first follow update a safe relay-visible baseline without
+  weakening anti-clobber handling for imported identities with a missing list.
+
+- The conformance suite now includes a permanent four-participant cross-route
+  recovery vector covering simultaneous privileged commits, pairwise and
+  observer-side resolution, branch-depth reversal, encrypted-SQLite restart,
+  exact canonical agreement, durable input dispositions, and all twelve
+  directed application-decryptability probes.
+  
+### Fixed
+
+- Group creation now performs member KeyPackage lookup and founding Welcome
+  publication with bounded concurrency, includes the initial description in the
+  founding MLS state, and returns once the founder projection is locally usable.
+  Repairable subscription refresh and broad catch-up continue in the background,
+  while privacy-safe stage histograms expose the remaining latency budget. A
+  completion-bookkeeping failure for one published Welcome no longer skips the
+  remaining recipients: every exposed publish is durably reconciled before the
+  first error surfaces, so a restart cannot republish an already-delivered
+  Welcome. Inbound membership changes now persist their app-state projection
+  (including a fresh join's pending invite) before any route-refresh network
+  work, closing a torn-write window where a fast-exiting process could strand
+  the durable engine join without its app-state row.
+
+- Existing-group invite commands now return after the required relay
+  acknowledgement and durable local refresh instead of waiting for an
+  all-account read-side catch-up. Account workers serve group projection reads
+  from a fresh local snapshot while detached catch-up runs, so overlapping
+  invites keep their immediate reads responsive without suppressing another
+  local account's incoming Welcome. Deferred account opens now finish
+  live-state projection repair after group hydration, preventing a committed
+  overlapping invite from failing worker readiness as not-yet-hydrated. The
+  work remains visible in the existing invite-stage telemetry
+  ([#1309](https://github.com/marmot-protocol/mdk/pull/1309)).
+
+- Account imports now journal setup progress and resume the exact persisted
+  KeyPackage publication after relay failure, cancellation, or restart instead
+  of minting a new stable slot. Ambiguous pre-journal state returns the typed,
+  consent-gated `AccountSetupRecoveryRequired` flow; setup interruptions also
+  have stable JSON recovery codes and repair hints instead of falling through
+  to the generic `command_failed` bucket.
+
+- Published NIP-65 and inbox lists containing retired relays no longer prevent
+  account activation or remote KeyPackage lookup. The original lists remain
+  cached and visible for settings UI, while unsafe endpoints are filtered only
+  from runtime routes and configured directory relays provide operational
+  fallback without rewriting or republishing the account's list.
+
+- MarmotKit root preparation now works in physical iOS App Group and Android
+  application sandboxes while retaining descriptor-relative creation and
+  symlink rejection for app-controlled paths. New iOS account secrets use the
+  device-only after-first-unlock Keychain policy, and legacy entries migrate
+  crash-safely after the next unlocked access so notification extensions and
+  background refresh can operate while the device is locked.
+
+- Hermes and OpenClaw now bound automatically attached timeline context to the
+  newest eight records and 16 KiB, dropping oldest or individually oversized
+  records first. The Hermes one-line installer no longer lets an interactive
+  child consume the remainder of `curl | bash`, and its guided sender allowlist
+  is collected in one explicit step.
+
+- Account projection storage types now redact encrypted group-image decryption
+  and Blossom upload keys from `Debug` output, including nested group
+  formatting. The TUI group diagnostics panel no longer retains or renders raw
+  group component `data_hex`, so blossom image key material cannot leak through
+  diagnostics `Debug` or on-screen lines.
+  
+- OpenMLS persistence now zeroizes temporary SQLite serialization,
+  deserialization, and rollback-snapshot buffers for MLS private keys, epoch and
+  message secrets, PSKs, pending group state, application-export state, and
+  stored key-package handoffs on success and error paths.
+  
+- `wn login --nsec-stdin` and `wn account create --nsec-stdin` now keep stdin
+  nsecs in a dedicated zeroizing sidecar instead of materializing them into the
+  generic `Cli` command tree. Daemon execute frames and `AccountSetupRequest`
+  use redacted `Debug`, avoid secret `Clone`, and wipe nsec-bearing request
+  framing buffers on the final owned request payload where the implementation
+  controls the buffer (`Zeroizing` encode/read paths). Transient allocator or
+  `BufReader` copies are not guaranteed wiped. When the daemon app runtime is
+  disabled (no `--relay`), account setup skips hosted validation and falls back
+  to local `wn` execution while keeping the stdin `nsec` sidecar owned. Uppercase
+  `NSEC…` argv identities are rejected at the same early gate as lowercase
+  `nsec…`.
+
+- `wn-agent serve` now exits when its control-socket path is removed or
+  replaced while the listener is still bound, instead of staying alive with an
+  unreachable Unix listener after the final hard link disappears.
+
+- The runtime-start local-readiness regression test now asserts startup-before-
+  subscription ordering directly while retaining a bounded hang deadline,
+  avoiding false failures when unrelated startup work is delayed under loaded
+  `nextest` shards.
+
+- Same-epoch commit races now converge every member onto the same branch. A
+  member that had committed from the contested epoch resolved the race through
+  pairwise fork recovery and invalidated the losing commit terminally, while
+  everyone else resolved it through distributed convergence, where a deeper
+  valid branch can win later — so honest members could keep different lineages
+  forever and silently lose every application message sent on the other side.
+  The pairwise loser is now parked reconsiderable (`ConvergenceDeferred`,
+  keyed by its source epoch) so a later convergence pass adopts the same
+  branch everywhere, and `fork_resolution` audit rows now record the kept
+  incumbent's commit digest so cross-member convergence is provable from
+  forensic logs. Because OpenMLS cannot process a device's own Commit from the
+  network, confirmation now atomically retains an immutable, commit-addressed
+  checkpoint of the canonical MLS/Marmot state. A later reorg can restore that
+  exact branch after restart, verify its epoch authenticator, and replay its
+  descendants even when an epoch-keyed rollback anchor has been replaced by a
+  rival branch. Checkpoints are pruned with the retained rewind horizon.
+  Displacing the losing branch is also a single durable transaction now, so an
+  interrupted resolution can no longer drop it without a trace.
+  ([#1285](https://github.com/marmot-protocol/mdk/pull/1285))
+
+- Locally authored messages now retain authenticated send-time branch
+  provenance through stored convergence and restart, preventing an accepted
+  own message from being misclassified as undecryptable merely because OpenMLS
+  cannot decrypt a sender's own private-message ciphertext during replay.
+
+- Inbound MLS commits now apply the epoch, roster, and capability projections
+  atomically with the OpenMLS merge. SQLite transaction boundaries retry
+  transient contention without rerunning application closures, pruning scales
+  without unbounded bind lists and preserves draft-owning groups, and secure
+  deletion retains a durable WAL-truncation intent until physical erasure can
+  complete.
+
+- Opaque transport objects that remain unpeelable now have a restart-safe,
+  bounded 30-day local residence. Expiry releases local resources without a
+  terminal protocol verdict and preserves exact-ID redelivery eligibility if
+  missing history later arrives.
+
+- Stored convergence passes whose durable base no longer matches the live tip
+  are discarded and reopened at the current epoch instead of halting the group
+  as unrecoverable. Eligible non-selected branches and missing-parent inputs
+  remain explicitly deferred for reconsideration rather than being
+  terminally invalidated.
+
+- The full-cohort release coordinator now fetches only immutable MDK,
+  WN Agent, and MarmotKit version tags, so an older local copy of the
+  intentionally moving `wn-agent-latest` installer alias no longer blocks a
+  release preflight with a tag-clobber error.
+
+- `MarmotApp` now permits only one live in-memory engine session per account
+  across direct clients and managed workers. Concurrent opens return the typed
+  `AccountSessionBusy` error, and worker reconnect drops the failed session
+  before reopening, preventing two engines over one session database from
+  staging conflicting epoch work. Failed account reconcile now shuts down every
+  worker it spawned before returning, including workers still opening locally,
+  so a contended startup does not leave unrelated account session guards held;
+  worker lifecycle transactions are serialized so a concurrent reconcile or
+  teardown cannot remove workers another successful caller relied on.
+
+- Group state changes settle promptly again when messages are queued for
+  sending: a queued ordinary message no longer delays the next convergence
+  pass (only an admin group-state change may briefly hold that boundary, as
+  the protocol requires), and busy groups are no longer demoted to retry
+  backoff while convergence is legitimately still collecting.
+
+- Runtime chat-list and group-state subscriptions now observe group state
+  changes (for example a group rename) that a member's own outbound send
+  applied by folding retained convergence commits. Previously those events were
+  dropped on the send path, so storage showed the new state while live
+  subscribers were never notified.
+
+### Security
+
+- NIP-49 encrypted private-key export now zeroizes its normalized passphrase,
+  scrypt-derived key, cipher-owned key copy, and plaintext decrypt buffer on
+  success and error paths.
+
+### Changed
+
+- Generated simulator failure fixtures now preserve the complete executed
+  scenario instead of substituting a diagnostic semantic reduction that may
+  reproduce only the failure class. Strict virtual-time coverage also accepts
+  either fixed-point quiescence or an exact no-pending-work observation after
+  an explicit time advance.
+
+- UniFFI was upgraded from 0.28.3 to 0.29.4. Generated Swift keeps the existing
+  Marmot-facing declarations while gaining the generator's current
+  `Sendable`/`Error` conformances; the dependency refresh also removes the
+  audited `bincode`, `paste`, and `proc-macro-error2` paths and incorporates the
+  `nostr` fix for RUSTSEC-2026-0219.
+
+- The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
+  providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset
+  corruption fix. Rust 1.95.0 is the minimum release that supports this
+  libsqlite3-sys build; the pinned toolchain moved on to 1.97.1 below.
+
+- The pinned Rust toolchain is now 1.97.1, and the convergence-campaign
+  builder image is digest-pinned to the matching `rust:1.97.1-bookworm`.
+  Rust 1.97's new `unneeded_wildcard_pattern` clippy lint required removing
+  two redundant field bindings in the campaign runner's fault validation.
+  ([#1305](https://github.com/marmot-protocol/mdk/pull/1305))
+
+## [0.9.10] - 2026-07-29
+
+### Added
+
+- MarmotKit now exposes streaming, bounded web-of-trust user search. Results
+  include typed match attribution and social distance, can include accepted
+  group co-members, resolve profiles through each author's NIP-65 write relays,
+  and remain in an un-promoted cache so discovering a stranger never creates a
+  live directory subscription. Empty personal graphs can optionally fall back
+  to configured seed accounts, reported at the explicit off-graph radius 255.
+- User discovery now supplements the personal graph with up to 20 ranked
+  pubkeys from Vertex's Open Ranking HTTP endpoint, bounded by a five-second
+  timeout. Existing graph members are deduplicated before the remaining
+  candidates are hydrated through configured relay endpoints. Hosts can
+  override or disable the provider at construction time, and discovery batches
+  use a dedicated stream trigger rather than reopening completed graph radii.
+- MarmotKit clients can retrieve the canonical retired-relay host list and
+  batch-classify arbitrary relay endpoints as `allowed`, `retired`, `invalid`,
+  or `unsafe`. Classification uses the relay plane's dial-safety policy,
+  preserves input order, and returns a normalized endpoint when parsing
+  succeeds, allowing NIP-65 and inbox relay screens to flag entries that users
+  should remove without exposing transient connection state.
+- MarmotKit Markdown documents now preserve a bounded count of authored blank
+  lines before blocks across document, block-quote, and list-item containers,
+  including through serialization and UniFFI, so clients can render source
+  spacing without reparsing message plaintext.
+- WN Agent now exposes exact-message and stable cursor-paginated materialized
+  timeline reads. OpenClaw and Hermes attach bounded recent history with durable
+  message ids to inbound turns and provide a `marmot_history` tool for older or
+  exact transcript lookup; complete referenced-message sender and text context
+  is preserved, including self-authored OpenClaw reply targets.
+
+### Changed
+
+- Relay bootstrap and policy defaults now use Vertex and no longer use the
+  retired `relay.damus.io` or `relay.nostr.band` hosts. Both retired hosts are
+  rejected by the same centralized policy applied before outbound relay dials.
+- `wn users search` now runs against the live bounded graph, supports opt-in
+  radius-2 follows-of-follows traversal, and reports timeout or candidate-cap
+  truncation as partial results rather than presenting a short list as
+  complete. Daemon-hosted searches include eligible group co-members.
+
+### Fixed
+
+- Pending sends are retained while account transport activation is still in
+  progress instead of being discarded before the relay plane becomes ready.
+- Relay notification forwarding is supervised and recovered after unexpected
+  receiver termination, preventing inbound delivery from silently stopping.
+- Importing an identity no longer leaves an orphaned Keychain secret when
+  account-home creation fails.
+
+## [0.9.9] - 2026-07-28
+
+### Added
+
+- MarmotKit now supports durable, device-local chat pinning. Chat-list rows
+  expose normalized pin state and position, new commands pin, unpin, and
+  transactionally replace the complete pinned order, and chat-list
+  subscriptions publish atomic snapshots when pin order changes.
+- MDK now implements lifecycle-v1 terminal group disbanding. Current-profile
+  groups can durably request and converge on an authenticated disband Commit,
+  transactionally erase live MLS state, retain a terminal tombstone and local
+  history, block later group activity, recover safely after restart, and expose
+  lifecycle, request, support, and management state through MarmotKit.
+- WN Agent inbound delivery now carries structured actor, message, media, reply,
+  edit, delete, and reaction context. Durable mutation events are normalized,
+  deduplicated, privacy-filtered, and delivered through the native OpenClaw and
+  Hermes context surfaces; OpenCode decodes the new schema while intentionally
+  ignoring ambient mutations.
+
+### Changed
+
+- The `marmot.agent-control.v2` inbound schema replaces the former flat message
+  shape. This is the final unversioned wire break: deploy the `0.9.9` WN Agent,
+  Hermes plugin, OpenClaw plugin, and OpenCode harness as one cohort. Future
+  breaking changes require a new protocol label or explicit negotiation.
+- Chat-list consumers must handle the new snapshot and pin-order subscription
+  cases and the required pin fields. Group consumers gain terminal lifecycle
+  and disband-request fields, typed disband errors, and disband commands.
+- The supported integration baselines are now Hermes Agent 0.19.0 and OpenClaw
+  2026.7.1. Release installers validate an existing host but never install or
+  upgrade Hermes or OpenClaw.
+
+### Fixed
+
+- WN Agent now preserves ambient edits, deletes, and reactions that arrive
+  while an agent turn is already in flight, so the bounded context is attached
+  to the next triggering message instead of being lost when the current turn
+  finishes.
+
+## [0.9.8] - 2026-07-27
+
+### Added
+
+- MarmotKit now exposes an engine-owned, per-account disappearing-message
+  retention sweep with a caller-supplied Unix-millisecond clock. The sweep
+  preserves the Android background policy's current-timer gating, five-second
+  skew tolerance, bounded timeline pagination, and unread-received deferral;
+  returns stable per-group prune, deferral, and privacy-safe failure outcomes;
+  and includes pruned media ciphertext hashes for host cache eviction.
+- MarmotKit timeline records now expose the authenticated `source_epoch` plus
+  the exact pinned `retention_seconds` and `retention_expires_at` decision for
+  each message. Legacy rows remain distinguishable from explicitly disabled
+  retention, and overflow-safe unbounded retention is not recomputed by hosts.
+- MarmotKit chat-list rows now expose durable semantic conversation/activity
+  timestamps, a manual-unread reminder, effective timed/indefinite MDK mute
+  state, current direct/group classification, bounded latest-message attachment
+  kind/count, and exact latest-message delivery state. New commands set/clear
+  manual unread and read/set/clear MDK chat mute state; chat-list subscriptions
+  publish these changes, including automatic finite-mute expiry. Manual unread
+  remains separate from the monotonic message read marker, MDK mute remains
+  separate from host notification modes such as all/mentions/nothing, and no
+  wire protocol changes are involved.
+- The Hermes and OpenClaw release installers can now securely import an existing
+  Nostr identity from an owner-only file, optionally pin it to an expected npub,
+  and bootstrap that exact account without creating a replacement identity.
+  Interactive installs also provide a masked `/dev/tty` identity prompt.
+- MarmotKit now exposes the durable pending leave intent, so a cold launch can
+  rediscover a leave whose request has not resolved yet — including one whose
+  publish failed. `ChatListRowFfi`, `AppGroupRecordFfi`, and
+  `GroupManagementStateFfi` carry `leave_request_pending` plus
+  `leave_requested_at_ms` (always equal to `leave_requested_at_ms != null`),
+  derived at read time from the engine-owned `cgka_leave_requests` rows rather
+  than a denormalized projection column, so the value cannot go stale when the
+  engine clears a request without notifying the app layer. The flag is
+  orthogonal to `self_membership`, which records the locally classified
+  departure: `Left` is written as soon as the SelfRemove proposal publishes, so
+  a pending request and `Left` routinely coexist while the group waits for a
+  member to commit the removal. `GroupManagementStateFfi.can_leave` is now
+  `false` while a leave is pending, and a repeat leave returns the new
+  `MarmotKitError::LeaveAlreadyRequested` instead of an opaque runtime error.
+  A failed leave now also publishes a group-state update, so subscribers see the
+  pending flag without waiting for an unrelated refresh. `chats list --json` /
+  `chat_list_row` rows gain a matching `leave_requested_at_ms` field; no other
+  JSON response shapes changed.
+- TUI: the daemon auto-starts at launch when it is down and the TUI holds a relay source to give it (the
+  `--discovery-relays`/`--default-account-relays` passthrough flags, a global `--relay`, or `WN_RELAY`) — exactly as
+  `/daemon start` would, but off the event loop, since `wn daemon start` blocks up to five seconds on its readiness
+  poll. The status line shows `starting daemon...` and then the outcome, the status-bar dot flips green when the start
+  lands, and the daemon-backed live subscriptions attach without any manual action. Without a relay source no start is
+  attempted (it would fail requiring a relay URL): one honest status says so and the login/main flow continues degraded
+  exactly as before. Deliberate divergence from the retired reference client, which killed its auto-started daemon on
+  exit: the TUI never stops the daemon, because other `wn` commands share it — stop it explicitly with `/daemon stop`.
+- TUI: `f`/`x` on a highlighted user-search result follow/unfollow that user directly — the same key letters as the
+  Profile screen's `f`/`x`, but acting directly on the highlighted result (Profile's go through popups) instead of a
+  round-trip through the Profile screen with a pasted pubkey. Both run
+  `follows add`/`follows remove` on the background worker with in-flight feedback, and the outcome folds into a
+  per-row `[following]` badge. Rows an account already follows are badged up front from a `follows list` snapshot (one
+  local directory read per search, not a `follows check` per row). A fold whose search screen was left, whose acting
+  account was switched, or whose user is no longer among the results is dropped rather than badging the wrong row; the
+  results-focus hints line and the help card name the new keys.
+- TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
+  loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn via `ratatui-image` as cell-exact
+  half-block glyphs (`▀` colored cells) on any image-capable terminal. The fidelity choice is deliberate: half-blocks
+  are ordinary colored cells rather than a native pixel image (iTerm2/Kitty/Sixel), so an image is bounded strictly to
+  its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
+  Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
+  `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
+  image full-size in a dismiss-on-any-key viewer, drawn with the terminal's native pixel protocol when it has one and
+  the same cell-exact rendering otherwise. Decrypted media is held in memory only; the downloaded artifact is removed
+  right after decode rather than cached on disk. No JSON response shapes changed (the existing `media download --json`
+  `output_path` is passed via `--output`).
+
+### Changed
+
+- `Marmot.start()` now returns when persisted account sessions and projections
+  are locally ready. Relay activation, subscriptions, directory sync, and
+  initial catch-up continue asynchronously; local reads remain available while
+  mutating commands are deferred and replayed in order. New privacy-safe host
+  performance telemetry separates local-ready and network-ready timing.
+- A leave request that already covers the current epoch is now reported as
+  `EngineError::LeaveAlreadyRequested` instead of
+  `EngineError::InvalidTransition`, which is documented as indicating an engine
+  bug and was flattened to an opaque error at the UniFFI boundary. A user
+  double-tapping Leave is routine input, and the classification is made inside
+  the engine — under the same lock as the durable read and write — so concurrent
+  leaves cannot race past a caller-side precheck and lose the reason. Forensic
+  audit records and conformance observations for this case change from
+  `invalid_transition` to `leave_already_requested`.
+- TUI polish bundle: `Esc` on the main view is now spatial back (Composer → Messages → Chats, a no-op from Chats)
+  after the armed-interaction clear, and never destroys a hand-typed draft. The messages-pane row highlight renders
+  when that pane holds focus or while an interaction is armed — arming `/react`/`/reply`/`/delete` moves focus to the
+  composer, but the target row stays lit so you can see what the action is aimed at; a flick-through preview (focus on
+  the chat list with nothing armed) still shows no stray highlight. The chat sidebar shrinks to at
+  most a third of the width on narrow terminals (was a fixed 36 columns). Color roles are split: cyan for
+  chrome/labels/focused borders/selected markers, green reserved strictly for your own messages and the
+  daemon-connection dot; the unread badge stays yellow. The login screen centers its brand/menu block as a focused
+  card.
+- TUI: loading and empty states are now centered and color-coded — yellow while a load is in flight
+  (`loading messages...`, `searching...`, and the group-detail/profile/relay-health screen loads), dark gray when
+  genuinely empty (`no chats yet`, `no messages yet`). The messages pane distinguishes its three cases: no chat loaded
+  ("select a chat to start messaging"), a load in flight, and a loaded-but-empty chat.
+- TUI: popups are now sized to their content in cells and centered exactly, instead of always covering 70% of the
+  screen — a short confirmation is a small box, not a full panel. Confirmation bodies render yellow, the irreversible
+  typed-token logout body renders red, the title shows as a cyan-bold ` Title ` on the cyan border, and the hint row is
+  centered at the bottom. Every popup's key/paste modality and purpose is unchanged (styling and geometry only); the
+  image viewer keeps its aspect-fit 80%×80% card.
+- TUI: the hints bar now renders each key as a keycap (bold white text on a dark-gray block) followed by a dim label,
+  instead of one uniform gray string. The armed-interaction hint keeps its priority over the keymap while a
+  `/react`/`/reply`/`/delete` prefill is held, and boxes its `Enter`/`Esc` key references the same way. Popup hint rows
+  color the bracketed `[key]` cyan with a gray description.
+- TUI: the bottom status bar is now a full-width bar with a green ● / red ○ daemon-connection dot, the account display
+  name styled distinctly from its shortened npub, gray `│` separators, and hide-when-zero badges — the unread count
+  (yellow) only shows when nonzero instead of a permanent `0 unread`. Our last-action/error status segment is kept as a
+  trailing bar segment, truncated to fit. Existing redactions (terminal-safe account label and status, no relay URLs)
+  are unchanged.
+- TUI: user-initiated actions no longer freeze the interface for a `wn` subprocess round-trip. Sending a message,
+  replying, reacting/unreacting, deleting, opening a chat, searching users, opening group detail, and listing invites
+  now run on a dedicated background worker and fold their result back into the view on the next frame, so typing,
+  scrolling, and input stay responsive while the command runs. The ambient chat-list re-read that a notification for a
+  non-selected chat triggers runs on that same worker (behind any queued mutations, so a re-read reflects a send that
+  preceded it), so a notification burst never blocks key handling either. Each shows honest in-flight feedback
+  (`sending...`, `loading chat...`, `searching...`, `loading invites...`, `loading group detail...`, and a
+  `loading chat...` placeholder in the message pane) and reports the outcome when it lands. User-initiated mutations
+  keep their submission order (a single worker drains a FIFO queue), optimistic send rows keep their by-id upsert
+  semantics, and a result whose target the user has already moved past — an open-chat load for a chat they left, a
+  search whose query changed, an invites list or a chat re-list whose account changed — is dropped instead of
+  clobbering the current view. A same-chat reload merges its page by id rather than replacing, so a live subscription
+  insert during the load window survives. Failures are still caught to the status line and never tear down the session.
+  Genuinely modal or rare flows (login/create-identity, logout, daemon start/stop, popup submits such as
+  rename/add-member/follow, profile, relay health, and stream compose) stay synchronous. No JSON response shapes
+  changed.
+- TUI: `j`/`k` in the chat list now live-previews the highlighted conversation while focus stays on the list
+  (flick-through browsing). The preview is debounced to ~150ms of quiet after the last movement, so racing through the
+  list loads only the chat you settle on rather than one load per row; a preview superseded by further movement is
+  dropped, and it marks the previewed chat read the same way opening it does (it is on screen — matching the reference
+  client's select-clears-unread precedent). The composer's send target follows the previewed chat (WYSIWYG), and the
+  messages-pane title now names the loaded chat (terminal-safe, shortened, falling back to "Messages"), keeping the
+  `[N older | M newer]` overflow annotation alongside — so the pane always shows which conversation you are reading and
+  sending to, whether it was opened or previewed. `Enter` is unchanged — it opens the highlighted chat and moves focus
+  to the message pane, cancelling any pending preview; opening the chat already settled in the pane is a focus move
+  only (no redundant reload). No JSON response shapes changed.
+- TUI: inline images are no longer pixelated, and `o` now shows the actual image on pixel-capable terminals. Inline
+  previews stay cell-exact half-blocks but downscale through a proper resampling filter (Lanczos3) instead of
+  `ratatui-image`'s nearest-neighbor default, so the 8-row preview reads as a legible thumbnail. On a terminal whose
+  startup capability query reported a real pixel protocol, the `o` full-size viewer draws the image with that native
+  protocol (inside an iTerm2 session the misdetected kitty answer is overridden to iTerm2's own inline-image
+  protocol); every popup close now forces a full terminal clear and repaint so a terminal-side image can never linger
+  after dismissal. Decoded images are capped to a 2100x1400 fit box at decode time — a general memory bound on every
+  decode, so neither the inline preview nor any retained copy ever holds an unbounded camera-photo pixel buffer.
+  Separately, viewer pixels are retained in memory only: at most four viewer copies are kept (oldest evicted first,
+  worst case ~47 MB), so the decrypted download artifact is still removed right after decode and nothing is written
+  back to disk. That ~47 MB bounds the viewer pool only. The inline image maps are decode-capped per image but not
+  bounded in aggregate: every image scrolled past keeps one decode-capped protocol (at most ~11.8 MB) alive for the
+  life of the session, so the session ceiling is ~47 MB plus that per-image cost times the images ever rendered, not
+  ~47 MB flat. LRU-bounding that inline retention needs re-download support (status un-tracking plus re-entrant
+  downloads) and is a deliberate follow-up, not this change. The Lanczos3 downscale runs synchronously on the render
+  thread and is cached per target size, so
+  scrolling never re-resizes; changing the terminal width does re-resize every visible image on that one frame, an
+  accepted cost of the sharper preview. Halfblock-only terminals, and evicted images, keep the cell-exact viewer popup.
+- TUI: unread badges are now runtime-backed instead of counted in the TUI. Each chat row's badge and the status
+  bar's `{u} unread` total derive from the `chats list` projection (`unread_count`), so they survive a TUI restart;
+  the TUI-local unread tally and its plain-`messages subscribe`-feed counting are gone (that feed now serves only
+  QUIC stream previews). Chat rows gained a wn-tui-style last-message preview line (sender plus truncated text, dark
+  gray; group-system rows render their summary, deleted rows a tombstone), and the chat list orders by last activity
+  (`last_message.timeline_at` descending; equal-activity chats keep the `chats list` order). Opening a chat clears
+  its badge immediately by calling `chats mark-read` and folding the returned projection (a failed mark-read leaves
+  the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
+  chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
+  `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
+  tick (notification events deduplicated by `notification_key`), run on the background worker rather than the event
+  loop. Group-invite notifications surface as a status-line notice. Background re-lists and reorders keep the
+  highlighted chat selected by group id. No JSON response shapes changed.
+
+### Security
+
+- `wn-agent import-identity` keeps secret material out of argv, environment,
+  output, and bootstrap/config artifacts; rejects symlinked, shared, or
+  non-regular credential files; verifies the expected public identity before
+  persistence; and makes duplicate or interrupted imports recoverable.
+
+### Fixed
+
+- OpenClaw inbound agent replies now travel through the registered message
+  adapter and are durably routed back to the source Marmot channel with reply
+  threading and idempotent retry. Inbound live previews are temporarily
+  final-only so durable delivery has a single owner.
+- Hermes setup now uses persisted gateway configuration for readiness, installs
+  the Marmot sender-authorization policy without losing rollback metadata, and
+  rejects ambiguous environment-only dry runs. Hermes and OpenClaw also detect
+  existing account profiles before onboarding instead of overwriting them when
+  relay lookup succeeds.
+- Hermes streaming previews now recognize and remove Markdown-balancing
+  backticks that Hermes appends after its streaming cursor, preserving the
+  append-only preview transcript instead of misclassifying the update as a
+  durable final.
+- TUI chat ordering now follows the durable `activity_sort_at` anchor exposed on
+  `chats list`/`subscribe`/`mark-read` rows (and timeline `chat_list_row`
+  updates) instead of re-sorting by `last_message.timeline_at`, so all-pruned
+  chats keep their storage position. Equal-activity rows tie-break on ascending
+  `group_id`, matching storage.
+- TUI: main-view keyboard accelerators now fire only on a plain keypress and ignore `Ctrl`/`Alt` chords. Previously
+  `Ctrl-U` in the message pane matched the bare `u` (unreact) accelerator and published an unconfirmed reaction
+  removal, and `Ctrl-Q` quit through the bare `q` accelerator. The whole accelerator family (`r`/`u`/`d`/`R`/`o`/`i`
+  and `g`/`G` in the message pane, `q`/`A`/`s`/`p`/`h`/`I` and `j`/`k` list navigation elsewhere) is now guarded, while
+  `Ctrl-U` stays the composer kill-line and `Ctrl-C` still quits. `Shift` is still tolerated, so the uppercase
+  accelerators keep working under the kitty keyboard protocol. No JSON response shapes changed.
+- TUI: logging out now reports the outcome faithfully when the follow-up account-list reload fails. Previously a reload
+  failure after a successful, irreversible wipe was reported with an `error:` prefix while the removed account and its
+  stale subscriptions lingered on screen. The logout is now reported as done and the status names `/refresh` to retry
+  the reload; a failure of the wipe itself is still reported as an error. No JSON response shapes changed.
+- TUI: a message-interaction command typed with a leading space now shows the armed-interaction hint and can be
+  cleared with `Esc`, matching how it submits. `parse_slash_command` already trims the composer text, so `/react`,
+  `/reply`, and `/delete` submit even with surrounding whitespace; the armed hint and the `Esc` escape hatch now trim
+  the same way instead of treating a space-prefixed command as an invisible, un-clearable armed state. Plain text with
+  a leading space is still a hand-typed draft and is preserved by `Esc`. No JSON response shapes changed.
+
+## [0.9.7] - 2026-07-26
+
+### Fixed
+
+- Agent text-stream QUIC starts now accept zero broker candidates for durable
+  final-message fallback, validate complete candidate values against the
+  adopted 512-byte authority rules, preserve ordered candidate failover, and
+  durably reserve encrypted publisher sequences so repeated `stream send`,
+  reconnect, or daemon reuse cannot restart at sequence 1 for one start.
+  Zero-candidate daemon compose returns a `streaming` payload with
+  `candidate: ""` for TUI and script consumers instead of failing the start.
+- KeyPackage deletion during sign-out, wipe, and explicit deletion now uses one
+  scoped, account-bound relay connection set for the complete batch instead of
+  cold-connecting a throwaway client for every deletion event. Relay
+  acknowledgement and local-cache removal remain tracked per event.
+- The Hermes plugin now maps explicitly non-final assistant commentary to
+  durable kind-1201 agent activity while retaining kind-9 delivery for final
+  answers and compatibility with Hermes versions that do not yet provide
+  delivery metadata.
+
+### Security
+
+- Updated `quinn-proto` and `crossbeam-epoch` to patched releases, clearing the
+  active RustSec vulnerabilities in the QUIC and OpenMLS dependency paths.
+  Also removed the remaining unsoundness and yanked-package findings without
+  adding audit ignores; unmaintained-only dependencies remain tracked in
+  issue #1116.
+
+## [0.9.6] - 2026-07-26
+
+### Added
+
+- MarmotKit now exposes account-signed public profile-image uploads to Blossom,
+  with validated raster content and returned HTTPS URLs.
+- MarmotKit profile metadata now includes an optional `banner` field while
+  preserving the existing banner when partial updates omit it.
+
+### Fixed
+
+- `keys list` now reports every durably device-owned KeyPackage, including
+  retained private material, and merges relay visibility without losing
+  distinct relay event ids.
+- MarmotKit key-package ownership now reflects durable, Welcome-usable private
+  material across manual publication, automatic maintenance, and runtime
+  restarts; matching relay events merge with their local record.
+
+## [0.9.5] - 2026-07-25
+
+### Changed
+
+- TUI: `a` on a user-search result now picks which chat the found user is added to. It opens a group picker over the
+  loaded chats list (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), one row per chat in the list's
+  order with the open chat preselected when one is loaded; `Enter` then opens the same confirm popup that guards the
+  add (`groups add-members`), naming both the user and the chosen chat. With no chats a status notice explains and
+  points at `c` (start a new chat with the found user). Previously the action targeted only the open chat and errored
+  without one. No JSON response shapes changed.
+- TUI: made the armed message-interaction state durable and guarded reaction content, fixing a field report where a
+  user armed `/react` (via `r`), did not register the prefill, typed a whole message, and published his prose as a
+  reaction. While the composer begins with `/react`, `/reply`, or `/delete`, the hints line now shows a persistent
+  hint recomputed each frame from the composer text and the selected row — `reacting to <sender>: <preview> — Enter
+  sends the reaction, Esc clears` — instead of a one-shot status a later event could overwrite. `Esc` clears an armed
+  interaction prefill (pristine or edited) as that escape hatch, while leaving a hand-typed draft intact; `Ctrl-U` is
+  the readline kill-line that clears the whole composer whatever it holds (armed prefill or hand-typed draft) and also
+  clears the masked nsec-entry field, so the idle composer hint reads `Enter send  Ctrl-U clear`. `/react` accepts
+  only one emoji — exactly one grapheme cluster carrying a non-ASCII scalar (real emoji, including ZWJ families, skin
+  tones, flags, and keycaps), or the NIP-25 `+`/`-` sentinels — and refuses anything else (multi-word prose,
+  plain-ASCII tokens, and non-Latin or accented words like `café`, `你好吗`, and `привет`) with `reactions are a single
+  emoji (Enter sends the default +); Esc clears`. The `messages react` CLI command stays protocol-faithful and is
+  unchanged. No JSON response shapes changed.
+- TUI: `R` on the selected message replies to it. It prefills `/reply` followed by a space in the composer
+  (draft-protected like the `r`
+  and `d` accelerators) and names the reply target on the status line; you type the reply and `Enter` sends it. Also
+  available as the `/reply <text>` slash command. The target resolves at submit against the selected row (a clear
+  status-line error when nothing is selected), the send runs `messages send --group <loaded-group> --reply-to
+  <selected-message-id> <text>` with `--reply-to` before the text as the guard requires, and the sent reply upserts
+  optimistically without a list reload.
+- TUI: added three full-view screens reached from the chat list — user search (`s` or `/users [query]`), your own
+  profile (`p`), and relay health (`h`) — each a one-shot load that returns to the main view on `Esc`. User search runs
+  `users search` (default radius `0..2`) over the cached follow graph; its two-region screen types the query in query
+  focus (`Enter` runs it) and navigates results in results focus, where `Enter` opens a profile card (`users show`),
+  `c` starts a new chat, and `a` adds the user to an existing chat (via the group picker described above) — both
+  return to the main view on the affected chat on success. Profile shows your
+  `profile show` fields (picture URL as literal text — no avatar fetch) and `follows list`; editing a field publishes
+  only that field via `profile update --<field>`, `f` follows (`follows add`) and `x` unfollows (`follows remove`), and
+  there is no nsec export. Relay health renders the redacted `relay-stats` snapshot — health summary, counters,
+  delivery spread with histogram p50/p99, sync timing, and per-relay first-deliverer/timing rows keyed by an opaque
+  device-local index — with no relay URLs shown (privacy decision); `r` refreshes and `j`/`k` scroll. The popup system
+  gained profile-field-edit, follow-by-pubkey, new-chat-name, unfollow, and add-to-chat purposes; help and the hints
+  lines cover the new screens. No JSON response shapes changed.
+- TUI: added a modal popup system and a group-detail screen. One `Option<Popup>` captures every key while open
+  (the screen behind it is inert), with text-entry, confirm, list-picker, and dismiss-on-any-key card variants; the
+  help overlay became a card, which fixes `q` under help quitting the app. `g` on the selected chat opens a
+  group-detail screen showing members (with admin and `(you)` badges), relays, and name/description loaded on entry
+  from `groups members`/`groups admins`/`groups relays`/`groups show`; from it `A` adds a member (`groups
+  add-members`), `x` removes one (`groups remove-members`), `P` promotes to admin (`groups promote`), `R` renames the
+  group (`groups rename`), and `L` leaves (`groups leave`) — an admin is blocked from leaving with a "Cannot Leave
+  Group" info card (sole-admin vs step-down message) while a non-admin gets a confirm, and `?` shows the help card.
+  `I` (from the chat list or group detail) opens a pending-invites picker over `groups invites`, accepting
+  (`groups accept`) or declining (`groups decline`) in place; the picker stays open across actions and closes only
+  once no invites remain, and accepting from the group-detail screen returns to the main view. The group-invite
+  status notice now prompts `I`. No JSON response shapes changed.
+- WN Agent control clients and the connector now speak the incompatible `marmot.agent-control.v2` protocol.
+  `stream_begin` returns a random per-stream bearer capability that every later stream operation must present; exact
+  request-id retries return the original begin receipt, and stream-id collisions no longer replace active sessions.
+- WN Agent documentation and command help now state that a configured control token replaces peer-UID authorization
+  and grants the full API for every hosted account. Separate trust domains require separate connector instances.
+- TUI: adopted a chat-first shell. A screen model replaces the fixed four-pane dashboard: a login/account-select
+  screen (create identity, nsec login, or pick from several accounts) opens when there is no single obvious account,
+  and the main view is the chat list plus the message timeline plus the composer, with the reclaimed space going to
+  the chat/messages row. The 12-row status panel and 3-row header collapse into a one-line status bar
+  (`{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`) and a per-focus hints line. Default
+  focus is the chat list, so `j`/`k` works immediately; `Enter` opens a chat and focuses the messages pane; `A`
+  reopens the account picker. Group MLS/component diagnostics move behind a new `/diagnostics` slash command that
+  toggles a diagnostics panel above the composer. An explicit `--account`/`WN_ACCOUNT` selection that resolves to a
+  loaded account opens the main view directly, even when several accounts exist. No JSON response shapes changed.
+- TUI: the messages pane now renders the materialized message timeline (`messages timeline list` /
+  `messages timeline subscribe`) with reactions, reply context, deletion tombstones, and `[img name]`/`[file name]`
+  media placeholders. Scrolling uses a
+  message-offset model — `j`/`k` select, `G`/`g` jump to newest/oldest, `PageUp`/`PageDown` page, and scrolling past
+  the oldest loaded message pages in older history; incoming messages hold your position unless you are pinned to the
+  bottom. Timestamps render in local wall-clock time. No JSON response shapes changed.
+- TUI: rewrote the composer with a cursor-editing input. `Left`/`Right`/`Home`/`End` move the cursor,
+  `Backspace`/`Delete` remove a character, and mid-string edits keep multi-byte characters intact. `Enter` still
+  submits and there is no keyboard newline; multi-line content arrives only by paste (bracketed paste keeps its
+  newlines). The composer auto-grows with its wrapped content up to 8 rows, taking the space from the messages pane.
+  The login nsec-entry field reuses this input's masked mode. No JSON response shapes changed.
+- TUI: unread badges are now runtime-backed instead of counted in the TUI. Each chat row's badge and the status
+  bar's `{u} unread` total derive from the `chats list` projection (`unread_count`), so they survive a TUI restart;
+  the TUI-local unread tally and its plain-`messages subscribe`-feed counting are gone (that feed now serves only
+  QUIC stream previews). Chat rows gained a wn-tui-style last-message preview line (sender plus truncated text, dark
+  gray; group-system rows render their summary, deleted rows a tombstone), and the chat list orders by last activity
+  (`last_message.timeline_at` descending; equal-activity chats keep the `chats list` order). Opening a chat clears
+  its badge immediately by calling `chats mark-read` and folding the returned projection (a failed mark-read leaves
+  the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
+  chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
+  `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
+  tick (notification events deduplicated by `notification_key`). Group-invite notifications surface as a status-line
+  notice. Background re-lists and reorders keep the highlighted chat selected by group id. No JSON response shapes
+  changed.
+
+### Added
+
+- Durable KeyPackage and group self-update maintenance. KeyPackages now rotate under one stable kind-30443 `d` slot
+  with exact signed-event retry, persisted lifetime/refresh/retry state, consumed-key retention until replacement
+  acknowledgement, and no routine kind-5 deletion. New `keys maintenance-status` and `groups maintenance-status`,
+  `schedule-self-update`, `maintenance-policy`, `pause-maintenance`, `resume-maintenance`, and `run-maintenance`
+  commands expose the lifecycle. New groups are periodically enrolled by default; existing groups remain manual-only.
+  Successful application-send JSON now includes `maintenance_disposition` without blocking sends while post-join
+  rotation is pending. ([#1103](https://github.com/marmot-protocol/mdk/pull/1103))
+- TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
+  account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
+  deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,
+  so it requires typing the literal word `logout` and pressing `Enter`; an empty or mismatched entry keeps the popup
+  open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A public-only account is
+  re-addable and keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). The confirmation body states the
+  consequences plainly, never softens the wording, tailors the irreversibility line to the account type (a public-only
+  account has no key to erase), and always shows the account npub so it is unambiguous which account is destroyed. On
+  confirmation the command runs, the account list reloads, and the TUI lands on a remaining account or drops back to the
+  login menu when the last account is removed — never left pointing at a removed account or a stale subscription. Listed
+  in the in-app help card and slash-command suggestions. No JSON response shapes changed.
+- TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
+  loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn via `ratatui-image` as cell-exact
+  half-block glyphs (`▀` colored cells) on any image-capable terminal. The fidelity choice is deliberate: half-blocks
+  are ordinary colored cells rather than a native pixel image (iTerm2/Kitty/Sixel), so an image is bounded strictly to
+  its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
+  Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
+  `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
+  image full-size (same cell-exact rendering) in a dismiss-on-any-key viewer. Decrypted files cache under the TUI home
+  in `tui-media-cache/`. No JSON response shapes changed (the existing `media download --json` `output_path` is passed
+  via `--output`).
+- TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
+  `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
+  accelerators `r` (prefills `/react` followed by a space), `u` (removes your reaction immediately), and `d`
+  (prefills `/delete`) drive
+  them from the messages pane. Reaction and deletion results fold in from the timeline projection, so the list is not
+  reloaded on success. `/delete` is refused for messages you did not send, and `/retry` takes an event id rather than
+  acting on the selection because timeline rows carry no per-message failed-send state. No JSON response shapes
+  changed.
+- Markdown autolinks now carry a renderer-facing destination classification across Rust and MarmotKit surfaces. The
+  original destination is preserved, while web, contact, app, public Nostr, relative, unknown, dangerous, and
+  sensitive targets are distinguished for client policy.
+- Explicit Markdown links and images now carry the same destination classification, including reference-style links,
+  so clients can independently decide whether to navigate to or fetch an untrusted target.
+- `wn tui` gained optional `--discovery-relays` and `--default-account-relays` flags (comma-separated, matching
+  `wn daemon start`). They are forwarded to the `daemon start` child and to `create-identity`/`login` account setup
+  so a first run with no relay configuration can supply relays without dead-ending. Flag passthrough only; no JSON
+  response shapes changed.
+- `wn messages send` (and the older `wn message send`) accept `--reply-to <message-id>` to send the text as a reply to
+  an existing message. The reply carries the same `q`/`e` reference tags other Marmot clients produce, so recipients'
+  timelines parse it into `reply_to_message_id` with a hydrated `reply_preview`. `--reply-to` is additive input only:
+  the JSON response shape is unchanged, pass the group with `--group` when replying, and a reply to a not-yet-synced
+  parent is still sent (its preview hydrates when the parent arrives). No new runtime API was needed; the CLI routes
+  reply sends through the existing `MarmotAppRuntime::reply_to_message`. Because the trailing message text is
+  hyphen-tolerant, a `--reply-to` placed *after* the text (either spelling: `--reply-to <id>` or `--reply-to=<id>`) is
+  read as literal text; rather than silently sending that stray flag as part of the body, the send now fails loudly with
+  error code `reply_to_after_message_text` (put `--reply-to` before the text with `--group`). Tradeoff: the guard
+  rejects any message whose text contains a bare `--reply-to` or `--reply-to=<id>` token anywhere (e.g.
+  `hello --reply-to friend`), so such text can no longer be sent this way.
+- `chats list`, `chats list-archived`, and the `chats subscribe`/`subscribe-archived` feeds now project the runtime's
+  durable per-chat state onto each chat row as additive JSON keys, so a chat list can render unread badges and a
+  last-message preview without a second query. New keys: `unread_count` (number), `has_unread` (bool), `last_message`
+  (`{ message_id_hex, sender, sender_display_name, plaintext, kind, timeline_at, deleted }` or `null`),
+  `last_read_message_id_hex` (string or `null`), and `last_read_timeline_at` (number or `null`). The names and the
+  `last_message` shape match the `chat_list_row` object already emitted on the `messages timeline subscribe` feed so
+  the two feeds agree; a chat with no messages or reads yet reports empty defaults (`0`/`false`/`null`) rather than
+  omitting the keys. All existing chat-row keys are unchanged.
+- `chats mark-read <group-hex> [<message-id-hex>]` advances a chat's read marker and clears its unread count, giving the
+  chat-list projection a CLI read path (previously unread cleared only when the account itself sent into the chat). With
+  no message id it marks the newest message read (the "clear on chat open" case); with an explicit message id it marks
+  read up to that message. The read marker is a forward-only high-water mark, so marking an older message leaves newer
+  ones unread and re-marking never moves it backward; a chat with no messages is a no-op success. The JSON response
+  carries `account_id`, `npub`, `group_id`, and the refreshed projection as the same five keys the chat rows expose
+  (`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
+### Fixed
+
+- `wn relays add/remove --type nip65` now round-trips the complete directional NIP-65 list instead of deleting
+  read-only relays or flattening existing role markers. Relay-list JSON adds `read_relays` and `write_relays` alongside
+  the existing write-target `relays` view.
+- Release builds now fail app startup with a clear error when `WN_DEV_SETTLEMENT_QUIESCENCE_MS` is set instead of
+  allowing it to override the protocol-pinned convergence window. Debug builds retain the override for local
+  development and integration tests.
+- `wnd` streaming subscription responses now have a 15-second whole-frame write deadline, including socket flush, so
+  a client that stops reading cannot retain a connection permit indefinitely.
+- `wnd` one-shot responses now apply the same deadline across write, flush, and socket shutdown, preventing a
+  non-reading local client from pinning status, stop, or command workers.
+- `wn-agent` now denies path-based media sends by default and accepts only regular, non-symlink files beneath explicit
+  repeatable `--media-allowed-root` directories. Bundled Hermes and OpenClaw launchers stage short-lived copies in a
+  dedicated approved directory and clean them up after each send.
+- `wn-agent` replaced the ambiguous `--allow-any` invite bypass with `--dev-allow-any-invites`, requires
+  `--debug-controls` alongside it, warns when the policy is active, and still rejects welcomes that lack an
+  MLS-authenticated author.
+- `wn-agent` now applies a 15-second whole-operation deadline to the initial unauthenticated control frame and to
+  request-scoped QUIC candidate DNS lookup, preventing silent or slow peers from pinning connection permits forever.
+- Every `wn-agent` control response and inbound-subscription event write now has the same 15-second whole-frame
+  deadline, including socket flush, so a non-reading client cannot retain a connection permit indefinitely.
+- `wnd` now caps long-lived subscriptions at 64 within its 256-connection global ceiling, preserving one-shot status,
+  shutdown, and command capacity. Quota rejection is reported as the typed `server_busy` protocol error instead of an
+  empty response that could be mistaken for a stopped daemon.
+- `wn-agent` now caps `SubscribeInbound` streams at 16 within its 64-connection global ceiling, and both quota
+  boundaries return a typed `server_busy` response so subscriptions cannot starve durable one-shot operations.
+- Public Nostr relay connections now require `wss://`; `ws://` is limited to loopback development relays behind
+  `WN_ALLOW_LOOPBACK_RELAYS`.
+- Received-message chronology and retention now use the MLS-authenticated inner app-event timestamp instead of the
+  replayable outer Nostr event timestamp. Runtime, daemon JSON, and MarmotKit surfaces expose that send time alongside
+  the device-local observation time.
+- WN Agent, Hermes, and OpenClaw now carry the triggering prompt message id on agent text-stream start events through
+  the protocol `parent` tag, preserving the durable reply chain after timeline reloads.
+- Encrypted media uploads now fail over, in order, across a default list of Blossom endpoints that accept opaque
+  `application/octet-stream` ciphertext, and encrypted group-image uploads use that list's primary endpoint, replacing
+  the media-only Primal default that returned HTTP 415. Blossom upload failures also retain bounded, privacy-filtered
+  server rejection reasons for actionable diagnostics. Group images store no endpoint in group state, so clients
+  compiled with different defaults resolve them against different endpoints until the group image is re-set on a
+  current build.
+
+### Security
+
+- TUI: inline media no longer leaves decrypted image files in the home directory. The decrypted download artifact is
+  removed immediately after it is decoded (on both the success and decode-failure paths) instead of accumulating under
+  `tui-media-cache/`, and any files a prior crashed session left behind are swept from that directory at startup. The
+  files had no reuse value — the viewer draws the in-memory image and a new session never reads them — so they were
+  decrypted plaintext at rest, outliving message deletion, with nothing to gain by keeping them.
+
+## [0.9.4] - 2026-07-10
+
+### Added
+
+- MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
+  and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
+  metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.
+- MarmotKit/UniFFI now exposes the cached Nostr Kind 0 `website` field through a read-only profile accessor so app
+  profile surfaces can display it without widening the writable profile record.
 
 ## [0.9.3] - 2026-07-07
 
@@ -464,6 +1405,15 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/marmot-protocol/mdk/compare/v0.9.10...v0.9.11
+[0.9.10]: https://github.com/marmot-protocol/mdk/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/marmot-protocol/mdk/compare/v0.9.8...v0.9.9
+[0.9.8]: https://github.com/marmot-protocol/mdk/compare/v0.9.7...v0.9.8
+[0.9.7]: https://github.com/marmot-protocol/mdk/compare/v0.9.6...v0.9.7
+[0.9.6]: https://github.com/marmot-protocol/mdk/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/marmot-protocol/mdk/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/marmot-protocol/mdk/compare/v0.9.3...v0.9.4
+[0.9.3]: https://github.com/marmot-protocol/mdk/releases/tag/v0.9.3
 [0.2.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.2.0
 [0.1.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.1.0

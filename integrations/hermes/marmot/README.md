@@ -4,6 +4,20 @@ This directory is a Hermes platform plugin for the local `wn-agent` connector.
 Hermes runs the agent and tools. `wn-agent` owns the Marmot account, MLS state,
 Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 
+For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
+materialized chat window and supplies Hermes with durable message ids, senders,
+timestamps, reply links, current reaction summaries, and
+delete/invalidation state. Reply context includes both Hermes's native reply
+fields and a complete structured referenced-message payload. The
+model-callable `marmot_history` tool can fetch one exact message id or page older
+messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
+lookup is best-effort and never drops the current inbound message if it fails.
+
+For live previews, the plugin retries `stream_begin` with one stable v2 request
+id and retains the returned stream capability in memory for subsequent append,
+status, finalize, and cancel calls. The capability is a bearer secret and must
+not be logged or persisted.
+
 For a real Hermes install, install it by copying or symlinking this directory to:
 
 ```sh
@@ -22,7 +36,8 @@ pre-releases.
 
 Prerequisites:
 
-- Hermes Agent installed and working locally
+- Hermes Agent **0.19.0 or newer** installed and working locally. The installer
+  validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
@@ -32,13 +47,63 @@ One-line install:
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
 ```
 
-For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
-an `npub` or raw hex public key:
+In guided setup, the allowed-message-sender prompt accepts one or more `npub` or
+raw hex public keys separated by commas. Leaving that prompt blank explicitly
+opens Marmot messaging to every sender by writing
+`MARMOT_ALLOW_ALL_USERS=true`.
+
+For repeatable noninteractive setup, pass the allowed inviter/welcomer and allowed
+message sender as either an `npub` or raw hex public key. `--allow-user` may be
+repeated or given a comma-separated list to authorize multiple senders:
 
 ```sh
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
+  bash -s -- --yes \
+    --allow-welcomer npub1... \
+    --allow-user npub1...,0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
+
+Generated-identity onboarding is the default (and can be selected explicitly
+with `--generate-identity`). To preserve an existing Nostr identity, place its
+`nsec` or raw secret hex in a regular file owned by the current user with mode
+`0600`, then use a pinned release URL:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.9/install-hermes-marmot.sh" | \
+  bash -s -- \
+    --yes \
+    --existing-identity-file "$HOME/.config/example/hermes-agent.nsec" \
+    --expected-npub npub1... \
+    --allow-welcomer npub1... \
+    --allow-user npub1...
+```
+
+The installer passes only the file path, never the secret, in process arguments.
+`wn-agent` rejects symlinks, non-regular files, files owned by another user, and
+files accessible by group/other users. It verifies `--expected-npub` before
+starting the connector or changing Hermes configuration, imports idempotently,
+then bootstraps the exact account with creation disabled. During interactive
+setup, the same identity can instead be entered through a masked `/dev/tty`
+prompt, which remains usable when the installer itself arrives through a pipe.
+The source credential file is read-only and is not rewritten or removed.
+The `--expected-npub` value must be a public `npub` or public-key hex, never an
+`nsec` or raw secret key.
+
+Hermes keeps its isolated default connector home. Reusing the same identity in
+another connector home, such as OpenClaw's, requires a separate explicit import;
+the installers never opt into shared home/socket state silently.
+
+To accept Marmot messages from any sender (explicit opt-in):
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
+  bash -s -- --yes --allow-all-users
+```
+
+Welcomer allowlist entries control which accounts may invite the Marmot agent
+through `wn-agent`. Message-sender allowlist entries control which Marmot senders
+Hermes accepts after gateway restart via `$HERMES_HOME/.env`
+(`MARMOT_ALLOWED_USERS` and `MARMOT_ALLOW_ALL_USERS`).
 
 Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
 
@@ -58,7 +123,8 @@ Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel
 Both install scripts verify SHA256 checksums for downloaded release assets.
 
 The installer prints restart guidance for your existing Hermes gateway. It does
-not restart Hermes automatically.
+not restart Hermes automatically. Restart a managed gateway with
+`hermes gateway restart`.
 
 Manual equivalent:
 
@@ -66,12 +132,19 @@ Manual equivalent:
 export MARMOT_HOME="$HOME/.marmot-agents/hermes"
 export PATH="$HOME/.local/bin:$PATH"
 
+wn-agent import-identity --json \
+  --home "$MARMOT_HOME" \
+  --label hermes-agent \
+  --identity-file "$HOME/.config/example/hermes-agent.nsec" \
+  --expected-identity npub1...
+
 wn-agent --home "$MARMOT_HOME" \
   --socket "$MARMOT_HOME/dev/wn-agent.sock" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
-wn-agent bootstrap --home "$MARMOT_HOME" --label hermes-agent --qr
+wn-agent bootstrap --home "$MARMOT_HOME" --label hermes-agent \
+  --no-create --account-id-hex <imported-account-hex> --qr
 hermes gateway run
 ```
 
@@ -88,6 +161,11 @@ just hermes-dev-setup --print-env
 source /tmp/hermes-marmot-test/env.sh
 ```
 
+Development, CI, and the phone-test image default to the repo-owned
+[`hermes-agent.lock`](hermes-agent.lock): Hermes `0.19.0`, release tag
+`v2026.7.20`, commit `3ef6bbd201263d354fd83ec55b3c306ded2eb72a`.
+Use `--hermes-ref` (or `HERMES_AGENT_REF`) only for deliberate upstream testing.
+
 The setup script creates these paths under that root:
 
 - `hermes-agent` for the isolated Hermes checkout.
@@ -95,7 +173,7 @@ The setup script creates these paths under that root:
 - `marmot-agent-home` for isolated `wn-agent` state.
 - `hermes-home/plugins/marmot` as a symlink back to this plugin directory.
 - helper scripts: `smoke-plugin.sh`, `e2e-deterministic.sh`,
-  `e2e-connector.sh`, `bootstrap-agent.sh`,
+  `e2e-connector.sh`, `verify-persisted-config.sh`, `bootstrap-agent.sh`,
   `run-wn-agent.sh`, `run-hermes-gateway.sh`, `start-wn-agent.sh`,
   `start-hermes-gateway.sh`, and `stop-dev-processes.sh`.
 
@@ -129,6 +207,22 @@ Smoke-test the plugin import against the isolated Hermes venv:
 ```sh
 just hermes-dev-smoke
 ```
+
+Verify Marmot loads from persisted Hermes config in a fresh Hermes subprocess
+with no inherited `MARMOT_*` environment (installer/configure + fresh subprocess
+probe):
+
+```sh
+just hermes-dev-setup --install-uv --print-env
+source /tmp/hermes-marmot-test/env.sh
+just hermes-verify-persisted-config
+```
+
+This uses the real Hermes checkout pinned by `hermes-agent.lock`, runs `configure_gateway.py` and
+`hermes plugins enable marmot`, then launches a fresh Python process with all
+`MARMOT_*` variables removed. The probe exercises Hermes plugin discovery,
+`load_gateway_config()`, and `platform_registry.create_adapter()` only. It does
+not start `hermes gateway run` or require a model provider.
 
 Run the deterministic adapter E2E:
 
@@ -224,8 +318,9 @@ Hermes in the first agent-stream start message. Run logs in another terminal whi
 just hermes-phone-test-logs
 ```
 
-For this manual test the container starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
-without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
+For this manual test the container starts `wn-agent` with `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1` and
+`MARMOT_AGENT_DEBUG_CONTROLS=1`, so the first invite from an authenticated phone can land without knowing the phone
+account id ahead of time. Use an explicit allowlist and omit both development options for a real deployment.
 
 In the phone-test container, `MARMOT_PROFILE_NAME_ONBOARDING=1` makes the Marmot Hermes adapter ask on the first
 encrypted chat message whether to publish a public Nostr profile name for the agent account. Reply with the name to
@@ -302,6 +397,11 @@ export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agents/hermes/control.token"
 `MARMOT_AGENT_AUTH_TOKEN_FILE` for shell and service-manager setups so the token
 does not appear in process environments by default.
 
+This is a full-control connector credential: it is not limited to the selected
+Hermes account or group. Any holder can subscribe to all plaintext and operate
+every account in that connector home. Do not share the connector/token with an
+untrusted plugin or tenant; give that boundary its own `wn-agent` instance.
+
 ### Group activation (multi-party groups)
 
 By default the adapter only runs an agent turn in a multi-party group when the
@@ -317,12 +417,50 @@ configured hex account ids into `wn-agent`'s welcomer allowlist so approved
 inviters are accepted. Non-hex entries are ignored. When unset, the adapter
 does not touch an allowlist managed directly on `wn-agent`.
 
+### Hermes message-sender authorization
+
+Hermes applies a separate sender gate before Marmot messages reach the agent.
+The installer persists this in `$HERMES_HOME/.env`, which Hermes loads at gateway
+startup:
+
+- `MARMOT_ALLOWED_USERS` — comma-separated lowercase hex Marmot account ids
+- `MARMOT_ALLOW_ALL_USERS` — explicit opt-in to accept any Marmot sender
+
+These variables are independent from the welcomer allowlist above. A phone user
+may be allowed to invite the agent without being allowed to message Hermes, and
+vice versa. Restart Hermes after changing either variable.
+
 ### Media trust model
 
 Inbound attachments are downloaded through `wn-agent`, re-staged under
 `$MARMOT_HOME/dev/inbound-media` (override with `MARMOT_INBOUND_MEDIA_DIR`),
-and the wn-agent temp file is removed. Outbound local-path sends must stay
-within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
+and the wn-agent temp file is removed. Outbound source paths must stay within
+`MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory). Hermes
+then stages a private copy under `MARMOT_OUTBOUND_MEDIA_DIR` (defaults to
+`$MARMOT_HOME/dev/outbound-media`), sends only that path, and removes it after
+the connector responds. `wn-agent` must independently allow that exact staging
+directory with `--media-allowed-root`; without one, path sends fail closed.
+
+Hermes multi-image responses are sent as one ordered Marmot media message, not
+as one message per image. The adapter accepts at most 10 attachments and caps
+both each plaintext and the full batch to the encrypted-blob limit (512 MiB
+minus authentication overhead). It validates every source before staging or
+uploading any of them, applies the first non-empty caption once, and removes all
+staged copies on success, error, timeout, or cancellation. Retryable control-
+plane failures reuse one idempotency key; `wn-agent` binds that key to the
+destination, caption, ordered attachment metadata, and plaintext hashes before
+uploading, then returns the original durable message ids on a matching retry.
+Reply-targeted media sends remain unsupported and fail before upload.
+
+Large encrypted-media blobs retain the existing wire format, but every receiver
+must run an MDK version with the matching 512 MiB receive bound; older receivers
+still reject blobs above 64 MiB. MDK encrypts and decrypts each blob in place and
+passes upload retries a shared immutable body, avoiding separate full-size
+plaintext, ciphertext, and HTTP-body copies. The active blob still resides in
+memory, and the connector reads the validated batch before upload, so the
+aggregate 512 MiB request cap is also a deliberate peak-memory bound. This is
+appropriate for release APK delivery on a suitably provisioned connector; it is
+not a disk-streaming or low-memory-mobile transfer mode.
 
 ## Behavior
 
@@ -330,12 +468,19 @@ within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
   the Marmot group id and `user_id` set to the sender account id.
 - Hermes progressive edits open at most one live preview per chat at a time. A
   newer preview cancels the previous stream for that chat.
+- Explicit Hermes delivery context routes non-final commentary to durable agent
+  activity (`kind: 1201`, `status: commentary`). Preview and draft frames remain
+  transient; sealing the segment cancels its preview and emits one activity.
+- Final answers and approvals remain durable `kind: 9` messages. Missing delivery
+  context keeps this legacy final behavior for compatibility with older Hermes
+  versions.
 - Durable message text is exactly what Hermes hands the adapter. The adapter
   never merges, splices, or reconstructs text across sends; fragmented or
   duplicated finals must be fixed in Hermes message segmentation.
-- A plain send while a preview is open finalizes that stream as one tagged
-  stream-final `kind: 9` when the final text is an append-only extension of the
-  streamed text. There is no duplicate plain `send_final` for the same text.
+- A final or legacy plain send while a preview is open finalizes that stream as
+  one tagged stream-final `kind: 9` when the final text is an append-only
+  extension of the streamed text. There is no duplicate plain `send_final` for
+  the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
 - Status records are included in the stream transcript hash and chunk count.

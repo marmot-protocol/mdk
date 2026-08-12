@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
-use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
+use nostr_sdk::prelude::{Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
@@ -195,7 +195,17 @@ impl DirectoryRelayPlane {
             let fetcher = self.fetcher.clone();
             let state = self.state.clone();
             tokio::spawn(async move {
-                let result = fetcher.fetch_directory_events(request).await;
+                // Keep ownership of the inflight entry in this supervisor.
+                // The child JoinHandle converts a fetcher panic into an error,
+                // so cleanup and waiter notification still run.
+                let result = match tokio::spawn(async move {
+                    fetcher.fetch_directory_events(request).await
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("directory fetch task failed".to_owned()),
+                };
                 let mut state = state.lock().await;
                 if result.is_ok() {
                     state.completed_fetches += 1;
@@ -314,6 +324,22 @@ impl NostrSdkDirectoryRelayFetcher {
     }
 }
 
+fn validated_directory_event(
+    event: &Event,
+    query: &DirectoryEventQuery,
+) -> Option<NostrTransportEvent> {
+    if event.verify().is_err()
+        || u64::from(event.kind.as_u16()) != query.kind
+        || !query
+            .authors
+            .iter()
+            .any(|author| author == &event.pubkey.to_hex())
+    {
+        return None;
+    }
+    NostrTransportEvent::from_nostr_event(event).ok()
+}
+
 #[async_trait]
 impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     async fn fetch_directory_events(
@@ -324,34 +350,33 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .endpoints
             .iter()
             .map(|endpoint| {
-                RelayUrl::parse(endpoint.as_str())
-                    .map_err(|e| format!("invalid relay URL {}: {e}", endpoint.as_str()))
+                RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
         for relay_url in &relay_urls {
             self.client
                 .add_relay(relay_url.clone())
                 .await
-                .map_err(|e| format!("add relay: {e}"))?;
+                .map_err(|_| "add relay failed".to_owned())?;
             timeout(
                 DIRECTORY_RELAY_CONNECT_WAIT,
                 self.client.connect_relay(relay_url.clone()),
             )
             .await
             .map_err(|_| "connect relay timed out".to_owned())?
-            .map_err(|e| format!("connect relay: {e}"))?;
+            .map_err(|_| "connect relay failed".to_owned())?;
         }
 
         let mut records = Vec::new();
         for query in request.queries {
+            let kind = u16::try_from(query.kind)
+                .map(Kind::from)
+                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
             let public_keys = query
                 .authors
                 .iter()
                 .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
                 .collect::<Result<Vec<_>, _>>()?;
-            let kind = u16::try_from(query.kind)
-                .map(Kind::from)
-                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
             let filter = Filter::new()
                 .authors(public_keys)
                 .kind(kind)
@@ -360,10 +385,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .client
                 .fetch_events_from(relay_urls.clone(), filter, DIRECTORY_RELAY_FETCH_WAIT)
                 .await
-                .map_err(|e| format!("fetch directory events: {e}"))?;
+                .map_err(|_| "fetch directory events failed".to_owned())?;
             for event in events {
-                let event = NostrTransportEvent::from_nostr_event(&event)
-                    .map_err(|e| format!("map directory event: {e}"))?;
+                let Some(event) = validated_directory_event(&event, &query) else {
+                    continue;
+                };
                 records.push(DirectoryRelayEventRecord {
                     endpoints: request.endpoints.clone(),
                     event,
@@ -371,5 +397,52 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             }
         }
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {
+        use nostr_sdk::prelude::{Event, EventBuilder, JsonUtil, Keys};
+
+        let expected = Keys::generate();
+        let wrong = Keys::generate();
+        let query = DirectoryEventQuery::new(0, vec![expected.public_key().to_hex()], 1);
+        let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"agent"}"#)
+            .sign_with_keys(&expected)
+            .unwrap();
+        assert!(validated_directory_event(&valid, &query).is_some());
+
+        let wrong_author = EventBuilder::new(Kind::Metadata, r#"{"name":"other"}"#)
+            .sign_with_keys(&wrong)
+            .unwrap();
+        assert!(validated_directory_event(&wrong_author, &query).is_none());
+
+        let mut tampered = serde_json::to_value(&valid).unwrap();
+        tampered["content"] = serde_json::Value::String(r#"{"name":"tampered"}"#.to_owned());
+        let tampered = Event::from_json(tampered.to_string()).unwrap();
+        assert!(tampered.verify().is_err());
+        assert!(validated_directory_event(&tampered, &query).is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_fetcher_errors_do_not_echo_invalid_relay_urls() {
+        let secret_url = "not-a-relay-with-secret-token";
+        let request = DirectoryFetchRequest::new(
+            vec![TransportEndpoint(secret_url.to_owned())],
+            vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 1)],
+        )
+        .unwrap();
+
+        let error = NostrSdkDirectoryRelayFetcher::standalone()
+            .fetch_directory_events(request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "invalid relay URL");
+        assert!(!error.contains(secret_url));
     }
 }

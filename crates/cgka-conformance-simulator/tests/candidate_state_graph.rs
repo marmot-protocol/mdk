@@ -234,6 +234,50 @@ fn digest_tiebreak_picks_lower_digest_after_commit_and_witness_ties() {
 }
 
 #[test]
+fn app_witness_score_beats_priority_after_depth_and_quorum_ties() {
+    let policy = ConvergencePolicy {
+        max_rewind_commits: 5,
+        witness_quorum_senders_per_epoch: 10,
+        witness_quorum_epochs: 2,
+        max_witness_override_depth: 2,
+    };
+    let witnessed_ordinary = BranchCandidate {
+        id: "witnessed-ordinary".into(),
+        fork_epoch: 1,
+        tip_epoch: 3,
+        tip_priority: CommitOrderingPriority::Ordinary,
+        tip_committer: b"z".to_vec(),
+        tip_digest: digest(0xff),
+        app_witnesses: vec![witness(2, "alice"), witness(2, "bob")],
+    };
+    let unwitnessed_privileged = BranchCandidate {
+        id: "unwitnessed-privileged".into(),
+        fork_epoch: 1,
+        tip_epoch: 3,
+        tip_priority: CommitOrderingPriority::Privileged,
+        tip_committer: b"a".to_vec(),
+        tip_digest: digest(0x00),
+        app_witnesses: vec![],
+    };
+    let witnessed_score = witnessed_ordinary.score(&policy);
+    let privileged_score = unwitnessed_privileged.score(&policy);
+    let candidates = [witnessed_ordinary.clone(), unwitnessed_privileged];
+
+    assert_eq!(witnessed_score.effective_commit_depth, 2);
+    assert_eq!(
+        witnessed_score.effective_commit_depth,
+        privileged_score.effective_commit_depth
+    );
+    assert!(!witnessed_score.witness_quorum_met);
+    assert!(!privileged_score.witness_quorum_met);
+    assert_eq!(witnessed_score.app_witness_score, 2);
+    assert_eq!(privileged_score.app_witness_score, 0);
+
+    let winner = select_canonical_branch(3, &candidates, &policy).expect("one branch should win");
+    assert_eq!(winner.id, witnessed_ordinary.id);
+}
+
+#[test]
 fn privileged_tiebreak_beats_digest_after_depth_and_witness_ties() {
     let policy = ConvergencePolicy {
         max_rewind_commits: 5,
@@ -371,6 +415,22 @@ fn traced_selection_records_decisive_rule_candidates_and_losers() {
     assert_eq!(decisive[0].rule_name, "effective_commit_depth");
     assert_eq!(decisive[0].winner_branch_id, "deeper");
     assert_eq!(decisive[0].other_branch_id, "shallower");
-    // All seven comparison rules are present.
-    assert_eq!(trace.rule_trace.len(), 7);
+    // All six adopted comparison rules are present. Raw commit depth remains
+    // diagnostic data, but is necessarily tied once effective depth and
+    // witness-quorum status tie, so it is not a separate selector step.
+    assert_eq!(
+        trace
+            .rule_trace
+            .iter()
+            .map(|rule| rule.rule_name)
+            .collect::<Vec<_>>(),
+        vec![
+            "effective_commit_depth",
+            "witness_quorum_met",
+            "app_witness_score",
+            "tip_priority",
+            "tip_committer",
+            "tip_digest",
+        ]
+    );
 }

@@ -1,20 +1,37 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+use storage_sqlite::{
+    CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher,
+};
 
 use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMetadata};
 
-#[derive(Clone)]
+/// How long a `kind:0` profile resolved by web-of-trust search stays usable
+/// before search re-fetches it.
+///
+/// Only profiles that were actually *found* are cached. A fetch that comes back
+/// empty is deliberately not recorded as "this account publishes no profile":
+/// the directory fetch cannot currently distinguish every relay cleanly
+/// answering "nothing here" from relays that failed to answer at all, so
+/// caching that ambiguity would make someone unfindable for a day after a
+/// transient outage. The price is re-querying accounts that genuinely have no
+/// profile; the alternative risks hiding accounts that do.
+pub(crate) const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
+
+/// Message carried by every storage error this cache raises after a close.
+const CLOSED_DETAIL: &str = "directory cache is closed";
+
+#[derive(Clone, Debug)]
 pub(crate) struct DirectoryCache {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<CloseableConnection>,
     #[cfg(test)]
     put_count: Arc<AtomicUsize>,
 }
@@ -53,7 +70,7 @@ impl DirectoryCache {
     fn from_connection(conn: Connection) -> Result<Self, AppError> {
         initialize_schema(&conn)?;
         let cache = Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
             #[cfg(test)]
             put_count: Arc::new(AtomicUsize::new(0)),
         };
@@ -71,17 +88,22 @@ impl DirectoryCache {
         self.put_count.store(0, Ordering::SeqCst);
     }
 
-    fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Close this cache's database, releasing its file handle and any locks.
+    /// Terminal and idempotent: later reads and writes fail with a closed
+    /// storage error and nothing reopens.
+    pub(crate) fn close(&self) -> Result<(), AppError> {
+        Ok(self.conn.close()?)
+    }
+
+    fn lock(&self) -> Result<ConnectionGuard<'_>, AppError> {
+        Ok(self.conn.lock()?)
     }
 
     pub(crate) fn entry(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let Some(row) = Self::directory_user_row(&conn, account_id_hex)? else {
             return Ok(None);
         };
@@ -89,7 +111,7 @@ impl DirectoryCache {
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
                     relay_lists_json, key_package_json
@@ -104,14 +126,22 @@ impl DirectoryCache {
         Ok(entries)
     }
 
+    /// Look an account up for search: the promoted directory tier first, then
+    /// the un-promoted search graph.
+    ///
+    /// `now` is Unix seconds and decides whether a cached search-graph profile
+    /// has expired. It is a parameter rather than read from the clock here so
+    /// one traversal resolves a whole layer against a single instant, and so
+    /// expiry is directly testable.
     pub(crate) fn search_record(
         &self,
         account_id_hex: &str,
+        now: i64,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         if let Some(record) = self.entry(account_id_hex)? {
             return Ok(Some(record));
         }
-        self.search_graph_record(account_id_hex)
+        self.search_graph_record(account_id_hex, now)
     }
 
     pub(crate) fn put(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
@@ -125,7 +155,7 @@ impl DirectoryCache {
     ) -> Result<(), AppError> {
         #[cfg(test)]
         self.put_count.fetch_add(1, Ordering::SeqCst);
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         Self::put_with_reason_locked(&tx, entry, reason)?;
         tx.commit()?;
@@ -218,14 +248,22 @@ impl DirectoryCache {
         })
     }
 
-    fn search_graph_record(
+    /// The un-promoted search-graph record for an account, ignoring the
+    /// promoted directory entirely.
+    ///
+    /// Callers that have already consulted the promoted tier want this rather
+    /// than [`Self::search_record`]: a promoted row exists for reasons that
+    /// carry no profile, and letting it answer would hide the profile cached
+    /// here.
+    pub(crate) fn search_graph_record(
         &self,
         account_id_hex: &str,
+        now: i64,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let Some(row) = conn
             .query_row(
-                "SELECT account_id_hex, npub, profile_json, follows_known
+                "SELECT account_id_hex, npub, profile_json, follows_known, metadata_expires_at
              FROM directory_search_graph_users
              WHERE account_id_hex = ?1",
                 [account_id_hex],
@@ -235,6 +273,7 @@ impl DirectoryCache {
                         npub: row.get(1)?,
                         profile_json: row.get(2)?,
                         follows_known: row.get::<_, i64>(3)? != 0,
+                        metadata_expires_at: row.get(4)?,
                     })
                 },
             )
@@ -247,11 +286,17 @@ impl DirectoryCache {
         } else {
             Vec::new()
         };
+        // Only the profile expires. Follow edges keep their own freshness, so a
+        // stale profile must not take the account's graph edges down with it.
+        let profile = match row.metadata_expires_at {
+            Some(expires_at) if expires_at <= now => None,
+            _ => optional_value(row.profile_json)?,
+        };
         Ok(Some(UserDirectoryRecord {
             account_id_hex: row.account_id_hex,
             npub: row.npub,
             local_account: None,
-            profile: optional_value(row.profile_json)?,
+            profile,
             follows,
             follow_source_relays: Vec::new(),
             relay_lists: AccountRelayListStatus::empty(),
@@ -270,7 +315,12 @@ impl DirectoryCache {
                 account_id_hex: entry.account_id_hex.clone(),
                 npub: entry.npub.clone(),
                 profile: entry.profile.clone(),
-                follows: Some(entry.follows.clone()),
+                // An empty `directory_users` follow list often means this
+                // promotion path has not observed a contact list. Do not let
+                // that absence erase independently discovered search-graph
+                // edges; an explicit `Some([])` from the graph writer still
+                // records a known-empty contact list.
+                follows: (!entry.follows.is_empty()).then(|| entry.follows.clone()),
                 metadata_updated_at: entry.profile.as_ref().map(|profile| profile.created_at),
                 metadata_expires_at: None,
             },
@@ -278,13 +328,44 @@ impl DirectoryCache {
         )
     }
 
-    #[cfg(test)]
+    /// Follow edges recorded for `account_id_hex` in the un-promoted search
+    /// graph.
+    ///
+    /// `None` means no contact list has been observed for them yet, which is
+    /// different from `Some(vec![])` -- an observed list that follows nobody.
+    /// Traversal needs the distinction: the first is a candidate to fetch, the
+    /// second is a settled dead end.
+    pub(crate) fn search_graph_follows(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let conn = self.lock()?;
+        let known = conn
+            .query_row(
+                "SELECT follows_known FROM directory_search_graph_users WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|known| known != 0);
+        if !known {
+            return Ok(None);
+        }
+        Self::follow_rows(&conn, "directory_search_graph_follows", account_id_hex).map(Some)
+    }
+
+    /// Record one account in the un-promoted search graph.
+    ///
+    /// The counterpart to [`Self::remember_search_graph_follows`] for profile
+    /// metadata: it never touches `directory_users`, so an account cached here
+    /// stays invisible to `directory_sync_plan` and can never become a live
+    /// per-author subscription (mdk#687).
     pub(crate) fn put_search_graph_record(
         &self,
         record: &DirectorySearchGraphRecord,
         now: i64,
     ) -> Result<(), AppError> {
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         Self::put_search_graph_record_locked(&tx, record, now)?;
         tx.commit()?;
@@ -305,7 +386,7 @@ impl DirectoryCache {
         follows: &[String],
     ) -> Result<(), AppError> {
         let now = unix_now_seconds() as i64;
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO directory_search_graph_users (
@@ -366,8 +447,14 @@ impl DirectoryCache {
                 profile_json = excluded.profile_json,
                 metadata_updated_at = excluded.metadata_updated_at,
                 metadata_expires_at = excluded.metadata_expires_at,
-                follows_known = excluded.follows_known,
-                follows_updated_at = excluded.follows_updated_at,
+                follows_known = CASE
+                    WHEN ?9 THEN excluded.follows_known
+                    ELSE directory_search_graph_users.follows_known
+                END,
+                follows_updated_at = CASE
+                    WHEN ?9 THEN excluded.follows_updated_at
+                    ELSE directory_search_graph_users.follows_updated_at
+                END,
                 updated_at = excluded.updated_at",
             params![
                 &record.account_id_hex,
@@ -378,6 +465,7 @@ impl DirectoryCache {
                 i64::from(follows_known),
                 follows_updated_at,
                 now,
+                follows_known,
             ],
         )?;
         if let Some(follows) = &record.follows {
@@ -387,14 +475,9 @@ impl DirectoryCache {
                 &record.account_id_hex,
                 follows,
                 now,
-            )
-        } else {
-            conn.execute(
-                "DELETE FROM directory_search_graph_follows WHERE account_id_hex = ?1",
-                [&record.account_id_hex],
             )?;
-            Ok(())
         }
+        Ok(())
     }
 
     fn replace_follow_rows(
@@ -517,7 +600,7 @@ impl DirectoryCache {
     }
 
     fn migrate_legacy_json_records(&self) -> Result<(), AppError> {
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         if !Self::table_exists_locked(&conn, "user_directory_records")? {
             return Ok(());
         }
@@ -542,7 +625,7 @@ impl DirectoryCache {
 
     #[cfg(test)]
     fn table_exists(&self, table: &str) -> Result<bool, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         Self::table_exists_locked(&conn, table)
     }
 
@@ -580,6 +663,7 @@ struct SearchGraphUserRow {
     npub: String,
     profile_json: Option<String>,
     follows_known: bool,
+    metadata_expires_at: Option<i64>,
 }
 
 pub(crate) struct DirectorySearchGraphRecord {
@@ -716,10 +800,12 @@ mod tests {
                 display_name: None,
                 about: None,
                 picture: None,
+                banner: None,
                 nip05: None,
                 lud16: None,
                 created_at: 1_700_000_001,
                 source_relays: vec!["wss://profiles.example".to_owned()],
+                extra: Default::default(),
             }),
             follows,
             follow_source_relays: vec!["wss://follows.example".to_owned()],
@@ -788,7 +874,7 @@ mod tests {
             .put(&directory_record(alice.clone(), vec![bob.clone()]))
             .unwrap();
 
-        let conn = cache.lock();
+        let conn = cache.lock().unwrap();
         let user_count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM directory_users WHERE account_id_hex = ?1",
@@ -828,10 +914,12 @@ mod tests {
                         display_name: None,
                         about: None,
                         picture: None,
+                        banner: None,
                         nip05: None,
                         lud16: None,
                         created_at: 1_700_000_002,
                         source_relays: Vec::new(),
+                        extra: Default::default(),
                     }),
                     follows: Some(vec![dave.clone()]),
                     metadata_updated_at: Some(1_700_000_002),
@@ -842,12 +930,125 @@ mod tests {
             .unwrap();
 
         assert!(cache.entry(&carol).unwrap().is_none());
-        let search_record = cache.search_record(&carol).unwrap().unwrap();
+        let search_record = cache.search_record(&carol, 1_700_000_003).unwrap().unwrap();
         assert_eq!(
             search_record.profile.and_then(|profile| profile.name),
             Some("carol".to_owned())
         );
         assert_eq!(search_record.follows, vec![dave]);
+    }
+
+    /// A profile the search graph resolved is usable until it expires, and
+    /// invisible afterwards, so a warm search never serves a stale profile and
+    /// a cold one re-fetches instead of trusting the cache forever.
+    #[test]
+    fn an_expired_search_graph_profile_stops_being_served() {
+        let (_dir, cache) = test_cache();
+        let carol = account_id(3);
+        let dave = account_id(4);
+        let cached_at = 1_700_000_000;
+        let expires_at = cached_at + SEARCH_GRAPH_PROFILE_TTL_SECONDS;
+
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    npub: npub_for_account_id_lossy(&carol),
+                    account_id_hex: carol.clone(),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("carol".to_owned()),
+                        created_at: cached_at as u64,
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: Some(vec![dave.clone()]),
+                    metadata_updated_at: Some(cached_at as u64),
+                    metadata_expires_at: Some(expires_at as u64),
+                },
+                cached_at,
+            )
+            .unwrap();
+
+        let fresh = cache
+            .search_record(&carol, expires_at - 1)
+            .unwrap()
+            .expect("a record cached inside its TTL is still known");
+        assert_eq!(
+            fresh.profile.and_then(|profile| profile.name),
+            Some("carol".to_owned())
+        );
+
+        let stale = cache
+            .search_record(&carol, expires_at + 1)
+            .unwrap()
+            .expect("expiry hides the profile, it does not erase the account");
+        assert!(
+            stale.profile.is_none(),
+            "an expired profile must fall through to a fresh fetch"
+        );
+        // Follow edges carry their own freshness and are not collateral of a
+        // profile expiring -- dropping them would silently shrink the graph.
+        assert_eq!(stale.follows, vec![dave]);
+    }
+
+    /// Traversal must tell "we have never seen this account's contact list"
+    /// from "we have, and they follow nobody". Collapsing the two either
+    /// re-fetches a known-empty list on every search, or treats a never-fetched
+    /// account as a dead end and silently truncates the graph.
+    #[test]
+    fn search_graph_follows_separate_unknown_from_known_empty() {
+        let (_dir, cache) = test_cache();
+        let never_seen = account_id(1);
+        let follows_nobody = account_id(2);
+        let follows_someone = account_id(3);
+        let friend = account_id(4);
+
+        cache
+            .remember_search_graph_follows(
+                &follows_nobody,
+                &npub_for_account_id_lossy(&follows_nobody),
+                &[],
+            )
+            .unwrap();
+        cache
+            .remember_search_graph_follows(
+                &follows_someone,
+                &npub_for_account_id_lossy(&follows_someone),
+                std::slice::from_ref(&friend),
+            )
+            .unwrap();
+
+        assert_eq!(cache.search_graph_follows(&never_seen).unwrap(), None);
+        assert_eq!(
+            cache.search_graph_follows(&follows_nobody).unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            cache.search_graph_follows(&follows_someone).unwrap(),
+            Some(vec![friend])
+        );
+    }
+
+    #[test]
+    fn directory_user_promotion_preserves_search_graph_only_follows() {
+        let (_dir, cache) = test_cache();
+        let alice = account_id(1);
+        let bob = account_id(2);
+
+        cache
+            .remember_search_graph_follows(
+                &alice,
+                &npub_for_account_id_lossy(&alice),
+                std::slice::from_ref(&bob),
+            )
+            .unwrap();
+        cache
+            .put(&directory_record(alice.clone(), Vec::new()))
+            .unwrap();
+
+        let graph_record = cache
+            .search_graph_record(&alice, unix_now_seconds() as i64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(graph_record.follows, vec![bob]);
     }
 
     #[test]
@@ -885,7 +1086,7 @@ mod tests {
 
         let cache = DirectoryCache::open(path, &key).unwrap();
         let entry = cache.entry(&alice).unwrap().unwrap();
-        let conn = cache.lock();
+        let conn = cache.lock().unwrap();
         let user_count: i64 = conn
             .query_row("SELECT count(*) FROM directory_users", [], |row| row.get(0))
             .unwrap();

@@ -2,7 +2,7 @@
 
 use agent_control::{
     AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
-    AgentControlResponse, read_envelope, write_frame,
+    AgentControlResponse, read_envelope,
 };
 use marmot_app::AppMessageQuery;
 use tokio::io::{AsyncBufRead, AsyncWrite};
@@ -10,11 +10,12 @@ use tokio::sync::broadcast;
 
 use crate::AgentConnector;
 use crate::DELIVERED_INBOUND_CURSOR_CAPACITY;
+use crate::connection::write_control_frame;
 use crate::error::ConnectorError;
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpEvent, control_event_from_debug_event,
-    control_event_from_runtime_event, inbound_message_event_from_record, resync_required_event,
-    runtime_replay_dedup_key,
+    control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
+    resync_required_event, runtime_replay_dedup_key,
 };
 use crate::validation::agent_control_request_type;
 
@@ -36,7 +37,7 @@ impl AgentConnector {
         let (mut catch_up_events, _catch_up_subscription) = self.inbound_catch_up.subscribe();
 
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
-        write_frame(writer, &response).await?;
+        write_control_frame(writer, &response).await?;
 
         // Request the initial catch-up without blocking this drain loop. catch_up_accounts() can
         // block for up to APP_RUNTIME_ACCOUNT_READY_WAIT per account and can itself emit many
@@ -67,7 +68,7 @@ impl AgentConnector {
                             request_id.clone(),
                             self.error_response("stream_inbound_events", &err),
                         );
-                        write_frame(writer, &response).await?;
+                        write_control_frame(writer, &response).await?;
                         return Ok(());
                     }
                     continue;
@@ -105,12 +106,38 @@ impl AgentConnector {
                     match event {
                         Ok(event) => {
                             let replay_id = runtime_replay_dedup_key(&event);
-                            control_event_from_runtime_event(
+                            match control_event_from_runtime_event_with_runtime(
+                                &self.runtime,
                                 event,
                                 account_id_hex.as_deref(),
                                 group_id_hex.as_deref(),
-                            )
-                            .map(|event| (event, replay_id))
+                            ) {
+                                Ok(event) => event.map(|event| (event, replay_id)),
+                                Err(err) => {
+                                    // Hydration reads are best-effort at this live boundary.
+                                    // A transient storage failure must not tear down the
+                                    // subscription and strand the client outside the adjacent
+                                    // lag-recovery path. Signal one undelivered event so the
+                                    // consumer reconnects and lets durable replay retry it.
+                                    let error_code =
+                                        ConnectorError::from(err).privacy_safe_code();
+                                    tracing::warn!(
+                                        target: "agent_connector",
+                                        method = "stream_inbound_events",
+                                        dropped_events = 1_u64,
+                                        error_code,
+                                        "live inbound projection failed; emitting resync_required"
+                                    );
+                                    Some((
+                                        resync_required_event(
+                                            account_id_hex.as_deref(),
+                                            group_id_hex.as_deref(),
+                                            1,
+                                        ),
+                                        None,
+                                    ))
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(dropped))
                             if dropped > crate::DELIVERED_INBOUND_CURSOR_CAPACITY as u64 =>
@@ -167,7 +194,7 @@ impl AgentConnector {
                                             request_id.clone(),
                                             replayed,
                                         );
-                                        write_frame(writer, &envelope).await?;
+                                        write_control_frame(writer, &envelope).await?;
                                     }
                                     continue;
                                 }
@@ -224,23 +251,26 @@ impl AgentConnector {
                     continue;
                 }
                 delivered.record(replay_id);
-            } else if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
-                if delivered.contains(message_id_hex) {
+            } else if let AgentControlEvent::InboundMessage { message, .. } = &event {
+                if delivered.contains(&message.message_id_hex) {
                     continue;
                 }
-                delivered.record(message_id_hex.clone());
+                delivered.record(message.message_id_hex.clone());
             } else {
                 debug_assert!(
                     !matches!(
                         &event,
-                        AgentControlEvent::MessageDeleted { .. }
+                        AgentControlEvent::MessageEdited { .. }
+                            | AgentControlEvent::MessageDeleted { .. }
+                            | AgentControlEvent::ReactionAdded { .. }
+                            | AgentControlEvent::ReactionRemoved { .. }
                             | AgentControlEvent::GroupStateChanged { .. }
                     ),
                     "debug-injected ambient events need a durable replay id before delivery"
                 );
             }
             let envelope = AgentControlEnvelope::new(request_id.clone(), event);
-            write_frame(writer, &envelope).await?;
+            write_control_frame(writer, &envelope).await?;
         }
     }
 
@@ -284,12 +314,15 @@ impl AgentConnector {
                 if delivered.contains(&replay_id) {
                     continue;
                 }
-                let Some(event) = inbound_message_event_from_record(
+                let Some(event) = inbound_message_event_from_record_with_runtime(
+                    &self.runtime,
+                    &account.label,
                     &account.account_id_hex,
                     record,
                     account_filter,
                     group_filter,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 delivered.record(replay_id);

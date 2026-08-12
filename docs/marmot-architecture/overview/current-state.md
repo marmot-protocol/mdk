@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-07-04
+updated: 2026-07-26
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -31,8 +31,13 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 - **MIP-01** — Group Construction
 - **MIP-02** — Welcomes
 - **MIP-03** — Group Messages and SelfRemove
-- **Encrypted Media V1** — `marmot.group.encrypted-media.v1`
+- **Encrypted Media V2** — `marmot.group.encrypted-media.v2`, with frozen V1 support for already-joined legacy groups
 - **MIP-05** — Push Notifications
+
+**Implemented engine contracts:**
+
+- **Distributed convergence** — deterministic branch selection for unordered transport input, including the durable
+  frozen-pass boundary, in [`../distributed-convergence.md`](../distributed-convergence.md)
 
 **In PR / design:**
 
@@ -41,11 +46,14 @@ CGKA engine/convergence workspace here is being shaped into spec text.
   [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
 - **CGKA engine canonicalization** — post-peeling commit/proposal/app-message contract in
   [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
-- **Distributed convergence** — deterministic branch selection for unordered transport input in
-  [`../distributed-convergence.md`](../distributed-convergence.md)
 
 The current spec pressure point is commit ordering. MLS wants one ordered commit log; Nostr and other transports may
 deliver unordered, duplicated, delayed input. The engine contract is where that mismatch gets resolved.
+
+MDK now persists a per-group frozen convergence pass around that selector. The pass closes at the earlier of the pinned
+one-second selection-relevant quiescence window and five-second absolute cap, resumes safely across restart, resolves
+only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
+another group.
 
 ## Protocol implementations
 
@@ -97,17 +105,21 @@ This repository now has the main engine candidate:
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` / `1059` events, kind `445` group envelope
   peeling, and NIP-59 welcome wrap/peel with injected local signer/decrypter.
 - `crates/transport-quic-stream` — raw QUIC transport binding for transient agent text stream previews over reliable
-  ordered QUIC streams, with transcript hashes tied to durable MLS start/final app-message payloads.
+  ordered QUIC streams, with transcript hashes tied to durable MLS start/final app-message payloads. Encrypted
+  publishers reserve the next sequence and transcript in the per-account SQLCipher database before writing records;
+  ambiguous crash state disables that start's live preview rather than risking nonce reuse.
 - `crates/transport-quic-broker` — memory-only QUIC pub/sub broker for forwarding live preview records by
   `stream_id + start_event_id` without account state, relay integration, or payload persistence.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
 - `crates/marmot-forensics` — opt-in JSONL forensic audit schema and recorder traits.
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
-- `crates/agent-control` — `marmot.agent-control.v1` DTOs and newline-delimited JSON framing for agent integrations.
+- `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.
 - `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.
 - `crates/agent-connector` — local `wn-agent` connector daemon bridging agent control, account runtime, and stream
-  composition; Hermes and OpenClaw plugins talk to it over a Unix socket.
+  composition; Hermes and OpenClaw plugins talk to it over a Unix socket. Version 2 stream sessions use random
+  per-stream bearer capabilities, reject active stream-id collisions, and replay the original begin receipt for an
+  identical request-id retry.
 - `integrations/hermes/marmot` and `integrations/openclaw/marmot` — thin control-plane-only agent plugins.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order robustness, lifecycle cases, and
   proof/test mapping.

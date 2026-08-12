@@ -148,6 +148,84 @@
     ]
   },
   {
+    "name": "priority_tie",
+    "scenario": "generated_priority_tie",
+    "current_tip_epoch": 2,
+    "policy": {
+      "max_rewind_commits": 5,
+      "witness_quorum_senders_per_epoch": 10,
+      "witness_quorum_epochs": 2,
+      "max_witness_override_depth": 0
+    },
+    "expected": {
+      "branch": "privileged",
+      "reason": "priority_tie"
+    },
+    "branches": [
+      {
+        "id": "privileged",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_priority": "privileged",
+        "tip_committer": "z",
+        "tip_digest": "ff",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      },
+      {
+        "id": "ordinary",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_priority": "ordinary",
+        "tip_committer": "a",
+        "tip_digest": "00",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "committer_tie",
+    "scenario": "generated_committer_tie",
+    "current_tip_epoch": 2,
+    "policy": {
+      "max_rewind_commits": 5,
+      "witness_quorum_senders_per_epoch": 10,
+      "witness_quorum_epochs": 2,
+      "max_witness_override_depth": 0
+    },
+    "expected": {
+      "branch": "lower_committer",
+      "reason": "committer_tie"
+    },
+    "branches": [
+      {
+        "id": "lower_committer",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_priority": "ordinary",
+        "tip_committer": "a",
+        "tip_digest": "ff",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      },
+      {
+        "id": "higher_committer",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_priority": "ordinary",
+        "tip_committer": "z",
+        "tip_digest": "00",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      }
+    ]
+  },
+  {
     "name": "digest_priority",
     "scenario": "generated_digest_priority",
     "current_tip_epoch": 2,

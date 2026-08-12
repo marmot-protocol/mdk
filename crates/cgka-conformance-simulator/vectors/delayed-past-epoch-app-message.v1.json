@@ -1,11 +1,11 @@
 {
   "scenario_name": "delayed-past-epoch-app-message/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.3",
+  "conformance_version": "0.9.11",
   "seed": null,
   "scenario": {
     "name": "delayed-past-epoch-app-message/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -25,9 +25,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -54,9 +55,9 @@
         "payload": "epoch-one-delayed"
       },
       {
-        "type": "delay_queued",
-        "index": 0,
-        "delayed": "old-app"
+        "type": "withhold_message",
+        "selector": { "sender": "bob", "class": "application" },
+        "label": "old-app"
       },
       {
         "type": "invite_members",
@@ -67,9 +68,10 @@
         "pending": "invite-david"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "invite-david"
+        "publication": "invite-david",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -82,8 +84,8 @@
         ]
       },
       {
-        "type": "release_delayed",
-        "delayed": "old-app"
+        "type": "release_withheld",
+        "label": "old-app"
       },
       {
         "type": "deliver_all"

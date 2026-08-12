@@ -1,16 +1,43 @@
+use crate::account_projection::chat_mute_is_effective;
+use crate::storage::disband_requests::{
+    disband_requests_by_group_hex_tx, disbanding_group_ids_hex_tx,
+    disbanding_group_ids_hex_with_requests_tx,
+};
+use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
-    SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, optional_u64_to_i64,
-    u64_to_i64, unix_now_seconds,
+    SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, i64_to_u64,
+    optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
-use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListQuery {
     pub include_archived: bool,
+}
+
+/// Authoritative device-local order of every currently pinned chat.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatPinState {
+    /// Group ids in normalized zero-based display order.
+    pub ordered_group_ids: Vec<String>,
+}
+
+/// Typed validation and persistence failures for local chat pin mutations.
+#[derive(Debug, thiserror::Error)]
+pub enum ChatPinError {
+    #[error(transparent)]
+    Storage(#[from] cgka_traits::storage::StorageError),
+    #[error("unknown local group")]
+    UnknownGroup(String),
+    #[error("archived chats cannot be pinned")]
+    ArchivedChat,
+    #[error("invalid pinned chat order: {0}")]
+    InvalidOrder(String),
 }
 
 /// Predicate deciding whether a timeline message (by plaintext + tag set)
@@ -31,9 +58,10 @@ pub struct AccountUnreadTotal {
 }
 
 impl AccountUnreadTotal {
-    /// Whether the account has any unread message at all.
+    /// Whether the account has any unread conversation, including a
+    /// manual-only reminder with no unread incoming messages.
     pub fn has_unread(&self) -> bool {
-        self.unread_count > 0
+        self.unread_conversations > 0
     }
 }
 
@@ -62,6 +90,55 @@ impl std::fmt::Debug for ChatListAvatar {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatConversationKind {
+    #[default]
+    Unknown,
+    Direct,
+    Group,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatListAttachmentKind {
+    Photo,
+    Video,
+    Audio,
+    File,
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatListMessageDeliveryState {
+    #[default]
+    NotApplicable,
+    Pending,
+    Delivered,
+    Failed,
+}
+
+impl ChatListMessageDeliveryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_storage(value: &str) -> Self {
+        match value {
+            "pending" => Self::Pending,
+            "delivered" => Self::Delivered,
+            "failed" => Self::Failed,
+            _ => Self::NotApplicable,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListMessagePreview {
     pub message_id_hex: String,
@@ -71,13 +148,40 @@ pub struct ChatListMessagePreview {
     pub kind: u64,
     pub timeline_at: u64,
     pub deleted: bool,
+    pub attachment_kind: Option<ChatListAttachmentKind>,
+    pub attachment_count: u32,
+    pub delivery_state: ChatListMessageDeliveryState,
+    /// Internal durable projection input. The app layer validates these tags
+    /// with the authoritative encrypted-media parser and populates the bounded
+    /// attachment fields above. Never serialized or exposed through bindings.
+    #[serde(skip)]
+    pub media_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListRow {
     pub group_id_hex: String,
+    /// Whether this row belongs to the device-local manually ordered section.
+    pub pinned: bool,
+    /// Normalized zero-based position in the pinned section. The stored
+    /// ordinal is internal and may contain gaps after an archive-triggered
+    /// deletion.
+    pub pinned_position: Option<u32>,
     pub archived: bool,
     pub pending_confirmation: bool,
+    /// Durable lifecycle classification. Ephemeral merge/publish states are
+    /// exposed by the live MLS-state API; the chat-list projection guarantees
+    /// terminal Disbanded survives restarts and local history deletion.
+    #[serde(default)]
+    pub lifecycle_state: cgka_traits::GroupLifecycleState,
+    /// Ordinary outbound group work is gated while a local disband request or
+    /// authenticated inbound disband candidate awaits convergence.
+    #[serde(default)]
+    pub disbanding: bool,
+    /// Local request outcome, when this account initiated disbanding. An
+    /// inbound candidate can set `disbanding` without creating this request.
+    #[serde(default)]
+    pub disband_request: Option<cgka_traits::DisbandRequest>,
     pub title: String,
     pub group_name: String,
     pub avatar_url: Option<String>,
@@ -85,15 +189,46 @@ pub struct ChatListRow {
     pub last_message: Option<ChatListMessagePreview>,
     pub unread_count: u64,
     pub has_unread: bool,
+    pub manually_marked_unread: bool,
     pub unread_mention_count: u64,
     pub has_unread_mention: bool,
     pub first_unread_message_id_hex: Option<String>,
     pub last_read_message_id_hex: Option<String>,
     pub last_read_timeline_at: Option<u64>,
+    /// Immutable local observation time for the conversation's creation.
+    pub conversation_created_at: u64,
+    /// Durable user-visible activity anchor. Projection maintenance never
+    /// advances this value.
+    pub activity_sort_at: u64,
     pub updated_at: u64,
     /// The local account's membership in this group (active member, left, or
     /// removed). Denormalized from `account_groups.self_membership`.
     pub self_membership: SelfMembership,
+    /// Current locally projected classification. `Unknown` is retained for
+    /// legacy groups until their live roster has been hydrated and persisted.
+    pub conversation_kind: ChatConversationKind,
+    /// Effective MDK timed/indefinite mute state at the time this row was read.
+    pub muted: bool,
+    /// Absolute Unix epoch milliseconds for a finite mute. `None` is either
+    /// unmuted (`muted == false`) or indefinite (`muted == true`).
+    pub muted_until_ms: Option<i64>,
+    /// When the local account asked to leave this group, if a durable leave
+    /// request is still outstanding.
+    ///
+    /// This is *not* a `chat_list_rows` column. It is derived at read time from
+    /// the engine-owned `cgka_leave_requests` table, which is the only source of
+    /// truth for unresolved intent.
+    ///
+    /// Orthogonal to [`Self::self_membership`], and the two combine freely.
+    /// `self_membership` records the locally *classified departure*: the leave
+    /// path writes `Left` as soon as the SelfRemove proposal publishes, without
+    /// waiting for another member to commit it. This field tracks whether the
+    /// request itself has *resolved*. So `Left` + `Some(..)` means the leave
+    /// published and is awaiting a committer, `Member` + `Some(..)` means the
+    /// publish failed (or the process died before the membership write), and
+    /// `None` means no leave is outstanding.
+    #[serde(default)]
+    pub leave_requested_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +239,7 @@ struct AccountGroupRow {
     profile_name: String,
     avatar_url: Option<String>,
     avatar: Option<ChatListAvatar>,
+    conversation_created_at: u64,
     self_membership: SelfMembership,
 }
 
@@ -112,6 +248,7 @@ struct ConversationReadState {
     last_read_message_id_hex: Option<String>,
     last_read_timeline_at: Option<u64>,
     initialized_at: u64,
+    manually_marked_unread: bool,
 }
 
 impl SqliteAccountStorage {
@@ -123,6 +260,101 @@ impl SqliteAccountStorage {
     pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_row_tx(&conn, group_id_hex)
+    }
+
+    /// Pin or unpin one unarchived local chat and return the complete
+    /// authoritative pin order after the transaction.
+    ///
+    /// A newly pinned chat is inserted at the top. Repeating the current state
+    /// is idempotent and does not move an existing pin.
+    pub fn set_chat_pinned(
+        &self,
+        group_id_hex: &str,
+        pinned: bool,
+    ) -> Result<ChatPinState, ChatPinError> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let archived = conn
+                .query_row(
+                    "SELECT archived FROM account_groups WHERE group_id_hex = ?1",
+                    params![group_id_hex],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .storage()?
+                .ok_or_else(|| ChatPinError::UnknownGroup(group_id_hex.to_owned()))?
+                != 0;
+            if pinned && archived {
+                return Err(ChatPinError::ArchivedChat);
+            }
+
+            let mut ordered_group_ids = pinned_chat_order_tx(&conn)?;
+            let existing = ordered_group_ids
+                .iter()
+                .position(|candidate| candidate == group_id_hex);
+            match (pinned, existing) {
+                (true, None) => {
+                    ordered_group_ids.insert(0, group_id_hex.to_owned());
+                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                }
+                (false, Some(position)) => {
+                    ordered_group_ids.remove(position);
+                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                }
+                _ => {}
+            }
+            Ok(ChatPinState { ordered_group_ids })
+        })
+    }
+
+    /// Replace the manual order of the complete current pinned set.
+    ///
+    /// `ordered_group_ids` must contain every currently pinned group exactly
+    /// once. This strict compare-and-set contract deliberately rejects stale
+    /// client orders with [`ChatPinError::InvalidOrder`] instead of silently
+    /// merging them. A client receiving that error should refresh its chat-list
+    /// snapshot and retry from the authoritative pinned set.
+    pub fn set_pinned_chat_order(
+        &self,
+        ordered_group_ids: &[String],
+    ) -> Result<ChatPinState, ChatPinError> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for group_id_hex in ordered_group_ids {
+                let exists = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM account_groups WHERE group_id_hex = ?1
+                         )",
+                        params![group_id_hex],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .storage()?;
+                if !exists {
+                    return Err(ChatPinError::UnknownGroup(group_id_hex.clone()));
+                }
+            }
+            if ordered_group_ids.iter().collect::<HashSet<_>>().len() != ordered_group_ids.len() {
+                return Err(ChatPinError::InvalidOrder(
+                    "group ids must not contain duplicates".to_owned(),
+                ));
+            }
+
+            let current = pinned_chat_order_tx(&conn)?;
+            let current_set = current.iter().collect::<HashSet<_>>();
+            let requested_set = ordered_group_ids.iter().collect::<HashSet<_>>();
+            if current_set != requested_set {
+                return Err(ChatPinError::InvalidOrder(
+                    "order must contain every currently pinned chat exactly once".to_owned(),
+                ));
+            }
+            if current != ordered_group_ids {
+                rewrite_pinned_chat_order_tx(&conn, ordered_group_ids)?;
+            }
+            Ok(ChatPinState {
+                ordered_group_ids: ordered_group_ids.to_vec(),
+            })
+        })
     }
 
     /// Cheap unread aggregate over the materialized `chat_list_rows`
@@ -137,11 +369,18 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT COALESCE(SUM(row.unread_count), 0),
-                    COUNT(CASE WHEN row.unread_count > 0 THEN 1 END)
+                    COUNT(CASE
+                        WHEN row.unread_count > 0 OR row.manually_marked_unread = 1
+                        THEN 1
+                    END)
              FROM chat_list_rows AS row
              LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
              WHERE row.archived = 0
-               AND COALESCE(ag.self_membership, 'member') NOT IN ('left', 'removed')",
+               AND COALESCE(ag.self_membership, 'member') NOT IN ('left', 'removed')
+               AND NOT EXISTS (
+                   SELECT 1 FROM cgka_disband_tombstones AS tomb
+                   WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
+               )",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -216,9 +455,9 @@ impl SqliteAccountStorage {
                 conn.execute(
                     "INSERT INTO conversation_read_state (
                         group_id_hex, last_read_message_id_hex, last_read_timeline_at,
-                        initialized_at, updated_at
+                        initialized_at, updated_at, manually_marked_unread
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0)",
                     params![
                         group_id_hex,
                         last_read_message_id_hex,
@@ -226,6 +465,69 @@ impl SqliteAccountStorage {
                         u64_to_i64(initialized_at)?,
                         u64_to_i64(unix_now_seconds())?
                     ],
+                )
+                .storage()?;
+            }
+            rebuild_chat_list_row_for_group_tx(
+                &conn,
+                local_account_id_hex,
+                group,
+                mention_classifier,
+            )?;
+            chat_list_row_tx(&conn, group_id_hex)
+        })
+    }
+
+    /// Set or clear the durable manual-unread reminder without moving the
+    /// monotonic message read marker.
+    pub fn set_chat_manually_unread(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        manually_unread: bool,
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<Option<ChatListRow>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let Some(group) = account_group_tx(&conn, group_id_hex)? else {
+                return Ok(None);
+            };
+            let now = unix_now_seconds();
+            if read_state_tx(&conn, group_id_hex)?.is_none() {
+                // Before a read-state row exists, retained history is implicitly
+                // read. Preserve that baseline when creating the manual flag so
+                // "mark unread" does not suddenly count the whole backlog.
+                let latest = latest_kind9_message_tx(&conn, group_id_hex)?;
+                let (last_read_message_id_hex, last_read_timeline_at) = latest
+                    .map(|message| (Some(message.message_id_hex), Some(message.timeline_at)))
+                    .unwrap_or((None, None));
+                // Match first-open semantics: with no retained kind-9 history
+                // there is no read anchor yet, so a subsequently recorded
+                // message must count even when its sender timestamp predates
+                // this local interaction.
+                let initialized_at = last_read_timeline_at.unwrap_or(0);
+                conn.execute(
+                    "INSERT INTO conversation_read_state (
+                        group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                        initialized_at, updated_at, manually_marked_unread
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        group_id_hex,
+                        last_read_message_id_hex,
+                        optional_u64_to_i64(last_read_timeline_at)?,
+                        u64_to_i64(initialized_at)?,
+                        u64_to_i64(now)?,
+                        bool_i64(manually_unread),
+                    ],
+                )
+                .storage()?;
+            } else {
+                conn.execute(
+                    "UPDATE conversation_read_state
+                     SET manually_marked_unread = ?2, updated_at = ?3
+                     WHERE group_id_hex = ?1",
+                    params![group_id_hex, bool_i64(manually_unread), u64_to_i64(now)?],
                 )
                 .storage()?;
             }
@@ -265,13 +567,14 @@ impl SqliteAccountStorage {
                     conn.execute(
                         "INSERT INTO conversation_read_state (
                             group_id_hex, last_read_message_id_hex, last_read_timeline_at,
-                            initialized_at, updated_at
+                            initialized_at, updated_at, manually_marked_unread
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?4)
+                         VALUES (?1, ?2, ?3, ?4, ?4, 0)
                          ON CONFLICT(group_id_hex) DO UPDATE SET
                             last_read_message_id_hex = excluded.last_read_message_id_hex,
                             last_read_timeline_at = excluded.last_read_timeline_at,
-                            updated_at = excluded.updated_at",
+                            updated_at = excluded.updated_at,
+                            manually_marked_unread = 0",
                         params![
                             group_id_hex,
                             &target.message_id_hex,
@@ -282,6 +585,15 @@ impl SqliteAccountStorage {
                     .storage()?;
                 }
             }
+            // Explicitly marking a message read clears a manual-only reminder
+            // even when the target does not advance the already-newer marker.
+            conn.execute(
+                "UPDATE conversation_read_state
+                 SET manually_marked_unread = 0, updated_at = ?2
+                 WHERE group_id_hex = ?1 AND manually_marked_unread != 0",
+                params![group_id_hex, u64_to_i64(unix_now_seconds())?],
+            )
+            .storage()?;
             refresh_chat_list_row_tx(
                 &conn,
                 local_account_id_hex,
@@ -292,16 +604,63 @@ impl SqliteAccountStorage {
     }
 }
 
+fn pinned_chat_order_tx(tx: &Connection) -> Result<Vec<String>, ChatPinError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT group_id_hex
+             FROM chat_pin_positions
+             ORDER BY ordinal ASC, group_id_hex ASC",
+        )
+        .storage()?;
+    statement
+        .query_map([], |row| row.get(0))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+        .map_err(Into::into)
+}
+
+fn rewrite_pinned_chat_order_tx(
+    tx: &Connection,
+    ordered_group_ids: &[String],
+) -> Result<(), ChatPinError> {
+    tx.execute("DELETE FROM chat_pin_positions", []).storage()?;
+    for (ordinal, group_id_hex) in ordered_group_ids.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
+             VALUES (?1, ?2)",
+            params![
+                group_id_hex,
+                i64::try_from(ordinal)
+                    .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?
+            ],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
 fn rebuild_all_chat_list_rows_tx(
     tx: &Connection,
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
-    tx.execute("DELETE FROM chat_list_rows", []).storage()?;
     let groups = account_groups_tx(tx)?;
     for group in groups {
         rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
     }
+    // Upsert in place so durable activity anchors survive a projection rebuild
+    // after their preview rows have been securely pruned. Remove only true
+    // orphans; normal account-group deletion already cascades this table.
+    tx.execute(
+        "DELETE FROM chat_list_rows
+         WHERE NOT EXISTS (
+             SELECT 1 FROM account_groups AS ag
+             WHERE ag.group_id_hex = chat_list_rows.group_id_hex
+         )",
+        [],
+    )
+    .storage()?;
     // #750: a full rebuild recomputes every mention count, so the projection is
     // current — advance the marker so warm-up completeness checks skip the
     // per-group recompute.
@@ -355,6 +714,10 @@ fn set_chat_list_mention_counts_version_tx(tx: &Connection, version: i64) -> Sto
     Ok(())
 }
 
+/// Deliberately does not consider pending-leave state.
+/// `ChatListRow::leave_requested_at_ms` is derived at read time rather than
+/// materialized, so there is no stored value that can drift out of date — and
+/// comparing a read-time-only field here would mark every row stale forever.
 fn chat_list_projection_complete_tx(
     tx: &Connection,
     local_account_id_hex: &str,
@@ -417,6 +780,7 @@ fn chat_list_projection_complete_tx(
                         WHEN 'removed' THEN 'removed'
                         ELSE 'member'
                       END
+                   OR row.conversation_created_at IS NOT ag.conversation_created_at
                    OR row.updated_at < COALESCE(avatar_url.updated_at, 0)
                    OR row.updated_at < ag.updated_at
              )",
@@ -433,6 +797,7 @@ fn chat_list_projection_complete_tx(
                     ON row.group_id_hex = read_state.group_id_hex
                 WHERE row.last_read_message_id_hex IS NOT read_state.last_read_message_id_hex
                    OR row.last_read_timeline_at IS NOT read_state.last_read_timeline_at
+                   OR row.manually_marked_unread IS NOT read_state.manually_marked_unread
                    OR row.updated_at < read_state.updated_at
              )",
         [],
@@ -456,7 +821,13 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -465,7 +836,13 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -474,7 +851,13 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -483,7 +866,13 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -492,7 +881,13 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
@@ -501,10 +896,75 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      ), 0)
+                   OR row.last_message_media_json IS NOT (
+                        SELECT mt.media_json
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
+                   OR row.last_message_delivery_state IS NOT COALESCE((
+                        SELECT CASE
+                            WHEN mt.direction != 'sent' THEN 'not_applicable'
+                            WHEN mt.invalidation_status = 'local_publish_failed' THEN 'failed'
+                            WHEN mt.source_message_id_hex IS NULL THEN 'pending'
+                            ELSE 'delivered'
+                        END
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                          AND (
+                              mt.invalidation_status IS NULL
+                              OR (
+                                  mt.direction = 'sent'
+                                  AND mt.invalidation_status = 'local_publish_failed'
+                              )
+                          )
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     ), 'not_applicable')
+                   OR row.activity_sort_at IS NOT MAX(
+                        row.retained_activity_sort_at,
+                        COALESCE((
+                            SELECT mt.timeline_at
+                            FROM message_timeline AS mt
+                            WHERE mt.group_id_hex = ag.group_id_hex
+                              AND mt.kind = ?1
+                              AND (
+                                  mt.invalidation_status IS NULL
+                                  OR (
+                                      mt.direction = 'sent'
+                                      AND mt.invalidation_status = 'local_publish_failed'
+                                  )
+                              )
+                            ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                            LIMIT 1
+                        ), 0),
+                        COALESCE((
+                            SELECT read_state.last_read_timeline_at
+                            FROM conversation_read_state AS read_state
+                            WHERE read_state.group_id_hex = ag.group_id_hex
+                        ), 0),
+                        ag.conversation_created_at
+                     )
              )",
         params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
     )? {
@@ -562,6 +1022,10 @@ fn projection_has_rows_tx<P: Params>(tx: &Connection, sql: &str, params: P) -> S
     Ok(exists != 0)
 }
 
+/// Deliberately writes no pending-leave state. `ChatListRow::leave_requested_at_ms`
+/// is derived from `cgka_leave_requests` when the row is *read*, so there is no
+/// column here to keep in sync and no rebuild to trigger when the engine clears a
+/// leave request behind the projection's back.
 fn rebuild_chat_list_row_for_group_tx(
     tx: &Connection,
     local_account_id_hex: &str,
@@ -577,6 +1041,16 @@ fn rebuild_chat_list_row_for_group_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
+    let activity_sort_at = latest
+        .as_ref()
+        .map(|message| message.timeline_at)
+        .into_iter()
+        .chain(
+            read_state
+                .as_ref()
+                .and_then(|state| state.last_read_timeline_at),
+        )
+        .fold(group.conversation_created_at, u64::max);
     let now = unix_now_seconds();
     tx.execute(
         "INSERT INTO chat_list_rows (
@@ -586,13 +1060,17 @@ fn rebuild_chat_list_row_for_group_tx(
             avatar_image_upload_key_hex, avatar_media_type,
             last_message_id_hex, last_message_sender, last_message_preview,
             last_message_kind, last_message_timeline_at, last_message_deleted,
-            unread_count, unread_mention_count, first_unread_message_id_hex,
-            last_read_message_id_hex, last_read_timeline_at, updated_at,
-            self_membership
+            last_message_media_json, last_message_delivery_state,
+            unread_count, manually_marked_unread, unread_mention_count,
+            first_unread_message_id_hex,
+            last_read_message_id_hex, last_read_timeline_at,
+            conversation_created_at, activity_sort_at, retained_activity_sort_at,
+            updated_at, self_membership
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -611,11 +1089,20 @@ fn rebuild_chat_list_row_for_group_tx(
             last_message_kind = excluded.last_message_kind,
             last_message_timeline_at = excluded.last_message_timeline_at,
             last_message_deleted = excluded.last_message_deleted,
+            last_message_media_json = excluded.last_message_media_json,
+            last_message_delivery_state = excluded.last_message_delivery_state,
             unread_count = excluded.unread_count,
+            manually_marked_unread = excluded.manually_marked_unread,
             unread_mention_count = excluded.unread_mention_count,
             first_unread_message_id_hex = excluded.first_unread_message_id_hex,
             last_read_message_id_hex = excluded.last_read_message_id_hex,
             last_read_timeline_at = excluded.last_read_timeline_at,
+            conversation_created_at = excluded.conversation_created_at,
+            activity_sort_at = MAX(
+                excluded.activity_sort_at,
+                chat_list_rows.retained_activity_sort_at
+            ),
+            retained_activity_sort_at = chat_list_rows.retained_activity_sort_at,
             updated_at = excluded.updated_at,
             self_membership = excluded.self_membership",
         params![
@@ -660,7 +1147,19 @@ fn rebuild_chat_list_row_for_group_tx(
                 .as_ref()
                 .map(|message| bool_i64(message.deleted))
                 .unwrap_or(0),
+            latest
+                .as_ref()
+                .and_then(|message| message.media_json.as_deref()),
+            latest
+                .as_ref()
+                .map(|message| message.delivery_state.as_str())
+                .unwrap_or_else(|| ChatListMessageDeliveryState::NotApplicable.as_str()),
             u64_to_i64(unread.count)?,
+            bool_i64(
+                read_state
+                    .as_ref()
+                    .is_some_and(|state| state.manually_marked_unread)
+            ),
             u64_to_i64(unread.mention_count)?,
             unread.first_message_id.as_deref(),
             read_state
@@ -671,6 +1170,8 @@ fn rebuild_chat_list_row_for_group_tx(
                     .as_ref()
                     .and_then(|state| state.last_read_timeline_at)
             )?,
+            u64_to_i64(group.conversation_created_at)?,
+            u64_to_i64(activity_sort_at)?,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
         ],
@@ -766,13 +1267,44 @@ fn unread_summary_tx(
     })
 }
 
+pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<()> {
+    let read_state = read_state_tx(tx, group_id_hex)?;
+    let unread = unread_summary_tx(
+        tx,
+        local_account_id_hex,
+        group_id_hex,
+        read_state.as_ref(),
+        mention_classifier,
+    )?;
+    tx.execute(
+        "UPDATE chat_list_rows
+         SET unread_count = ?2,
+             unread_mention_count = ?3,
+             first_unread_message_id_hex = ?4
+         WHERE group_id_hex = ?1",
+        params![
+            group_id_hex,
+            u64_to_i64(unread.count)?,
+            u64_to_i64(unread.mention_count)?,
+            unread.first_message_id
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
 fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
     let mut stmt = tx
         .prepare(
             "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                     image_hash_hex, image_key_hex, image_nonce_hex,
                     image_upload_key_hex, image_media_type, avatar_url.component_data_hex,
-                    ag.self_membership
+                    ag.conversation_created_at, ag.self_membership
              FROM account_groups AS ag
              LEFT JOIN account_group_app_components AS avatar_url
                 ON avatar_url.group_id_hex = ag.group_id_hex
@@ -793,7 +1325,7 @@ fn account_group_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
         "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                 image_hash_hex, image_key_hex, image_nonce_hex,
                 image_upload_key_hex, image_media_type, avatar_url.component_data_hex,
-                ag.self_membership
+                ag.conversation_created_at, ag.self_membership
          FROM account_groups AS ag
          LEFT JOIN account_group_app_components AS avatar_url
             ON avatar_url.group_id_hex = ag.group_id_hex
@@ -813,7 +1345,8 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
     let image_upload_key_hex: String = row.get(7)?;
     let media_type: Option<String> = row.get(8)?;
     let avatar_url_component_hex: Option<String> = row.get(9)?;
-    let self_membership: String = row.get(10)?;
+    let conversation_created_at = row.get::<_, i64>(10)?.try_into().unwrap_or_default();
+    let self_membership: String = row.get(11)?;
     let has_avatar = !image_hash_hex.is_empty()
         || !image_key_hex.is_empty()
         || !image_nonce_hex.is_empty()
@@ -832,6 +1365,7 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
             image_upload_key_hex,
             media_type,
         }),
+        conversation_created_at,
         self_membership: SelfMembership::from_storage(&self_membership),
     })
 }
@@ -841,10 +1375,14 @@ fn latest_kind9_message_tx(
     group_id_hex: &str,
 ) -> StorageResult<Option<ChatListMessagePreview>> {
     tx.query_row(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
+                media_json, direction, source_message_id_hex, invalidation_status
          FROM message_timeline
          WHERE group_id_hex = ?1 AND kind = ?2
-           AND invalidation_status IS NULL
+           AND (
+               invalidation_status IS NULL
+               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+           )
          ORDER BY timeline_at DESC, message_id_hex DESC
          LIMIT 1",
         params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
@@ -860,7 +1398,8 @@ fn timeline_message_for_read_marker_tx(
     message_id_hex: &str,
 ) -> StorageResult<Option<ChatListMessagePreview>> {
     tx.query_row(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
+                media_json, direction, source_message_id_hex, invalidation_status
          FROM message_timeline
          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind = ?3",
         params![
@@ -875,6 +1414,18 @@ fn timeline_message_for_read_marker_tx(
 }
 
 fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListMessagePreview> {
+    let direction = row.get::<_, String>(7)?;
+    let source_message_id_hex = row.get::<_, Option<String>>(8)?;
+    let invalidation_status = row.get::<_, Option<String>>(9)?;
+    let delivery_state = if direction != "sent" {
+        ChatListMessageDeliveryState::NotApplicable
+    } else if invalidation_status.as_deref() == Some("local_publish_failed") {
+        ChatListMessageDeliveryState::Failed
+    } else if source_message_id_hex.is_some() {
+        ChatListMessageDeliveryState::Delivered
+    } else {
+        ChatListMessageDeliveryState::Pending
+    };
     Ok(ChatListMessagePreview {
         message_id_hex: row.get(0)?,
         sender: row.get(1)?,
@@ -883,6 +1434,10 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
         timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
         deleted: row.get::<_, i64>(5)? != 0,
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state,
+        media_json: row.get(6)?,
     })
 }
 
@@ -891,7 +1446,8 @@ fn read_state_tx(
     group_id_hex: &str,
 ) -> StorageResult<Option<ConversationReadState>> {
     tx.query_row(
-        "SELECT last_read_message_id_hex, last_read_timeline_at, initialized_at
+        "SELECT last_read_message_id_hex, last_read_timeline_at, initialized_at,
+                manually_marked_unread
          FROM conversation_read_state
          WHERE group_id_hex = ?1",
         params![group_id_hex],
@@ -902,6 +1458,7 @@ fn read_state_tx(
                     .get::<_, Option<i64>>(1)?
                     .and_then(|value| value.try_into().ok()),
                 initialized_at: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
+                manually_marked_unread: row.get::<_, i64>(3)? != 0,
             })
         },
     )
@@ -911,59 +1468,106 @@ fn read_state_tx(
 
 fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
     let sql = if query.include_archived {
-        "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
-                avatar_url,
-                avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
-                avatar_image_upload_key_hex, avatar_media_type,
-                last_message_id_hex, last_message_sender, last_message_preview,
-                last_message_kind, last_message_timeline_at, last_message_deleted,
-                unread_count, unread_mention_count, first_unread_message_id_hex,
-                last_read_message_id_hex,
-                last_read_timeline_at, updated_at, self_membership
-         FROM chat_list_rows
-         ORDER BY last_message_timeline_at DESC, group_id_hex"
+        format!(
+            "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+             ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
+                      row.activity_sort_at DESC, row.group_id_hex"
+        )
     } else {
-        "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
-                avatar_url,
-                avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
-                avatar_image_upload_key_hex, avatar_media_type,
-                last_message_id_hex, last_message_sender, last_message_preview,
-                last_message_kind, last_message_timeline_at, last_message_deleted,
-                unread_count, unread_mention_count, first_unread_message_id_hex,
-                last_read_message_id_hex,
-                last_read_timeline_at, updated_at, self_membership
-         FROM chat_list_rows
-         WHERE archived = 0
-         ORDER BY last_message_timeline_at DESC, group_id_hex"
+        format!(
+            "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+             WHERE row.archived = 0
+             ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
+                      row.activity_sort_at DESC, row.group_id_hex"
+        )
     };
-    let mut stmt = tx.prepare(sql).storage()?;
-    stmt.query_map([], chat_list_row_from_row)
+    let now_ms = unix_now_ms();
+    let mut stmt = tx.prepare(&sql).storage()?;
+    let mut rows = stmt
+        .query_map([], |row| chat_list_row_from_row(row, now_ms))
         .storage()?
         .collect::<Result<Vec<_>, _>>()
-        .storage()
+        .storage()?;
+    // Derived at read time, inside the same transaction as the projection read,
+    // so the pending-leave stamp is always consistent with the row it rides on.
+    let pending = pending_leave_requests_by_group_hex_tx(tx)?;
+    if !pending.is_empty() {
+        for row in &mut rows {
+            row.leave_requested_at_ms = pending.get(&row.group_id_hex).copied();
+        }
+    }
+    let disbanding = disbanding_group_ids_hex_tx(tx)?;
+    let disband_requests = disband_requests_by_group_hex_tx(tx)?;
+    for row in &mut rows {
+        row.disbanding = disbanding.contains(&row.group_id_hex);
+        row.disband_request = disband_requests.get(&row.group_id_hex).cloned();
+    }
+    Ok(rows)
 }
 
 fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
-    tx.query_row(
-        "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
-                avatar_url,
-                avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
-                avatar_image_upload_key_hex, avatar_media_type,
-                last_message_id_hex, last_message_sender, last_message_preview,
-                last_message_kind, last_message_timeline_at, last_message_deleted,
-                unread_count, unread_mention_count, first_unread_message_id_hex,
-                last_read_message_id_hex,
-                last_read_timeline_at, updated_at, self_membership
-         FROM chat_list_rows
-         WHERE group_id_hex = ?1",
-        params![group_id_hex],
-        chat_list_row_from_row,
-    )
+    let now_ms = unix_now_ms();
+    let sql = format!(
+        "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+         WHERE row.group_id_hex = ?1"
+    );
+    tx.query_row(&sql, params![group_id_hex], |row| {
+        chat_list_row_from_row(row, now_ms)
+    })
     .optional()
-    .storage()
+    .storage()?
+    .map(|mut row| {
+        // Same read-time derivation as `chat_list_rows_tx`; see there.
+        row.leave_requested_at_ms = pending_leave_requests_by_group_hex_tx(tx)?
+            .get(&row.group_id_hex)
+            .copied();
+        let disband_requests = disband_requests_by_group_hex_tx(tx)?;
+        row.disbanding = disbanding_group_ids_hex_with_requests_tx(tx, &disband_requests)?
+            .contains(&row.group_id_hex);
+        row.disband_request = disband_requests.get(&row.group_id_hex).cloned();
+        Ok(row)
+    })
+    .transpose()
 }
 
-fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListRow> {
+// Keep this projection in one place: `chat_list_row_from_row` decodes it by
+// index, so list and single-row queries must never drift in column order.
+const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
+    "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
+            row.title, row.group_name, row.avatar_url,
+            row.avatar_image_hash_hex, row.avatar_image_key_hex,
+            row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
+            row.avatar_media_type, row.last_message_id_hex,
+            row.last_message_sender, row.last_message_preview,
+            row.last_message_kind, row.last_message_timeline_at,
+            row.last_message_deleted, row.last_message_media_json,
+            row.last_message_delivery_state, row.unread_count,
+            row.manually_marked_unread, row.unread_mention_count,
+            row.first_unread_message_id_hex, row.last_read_message_id_hex,
+            row.last_read_timeline_at, row.conversation_created_at,
+            row.activity_sort_at, row.updated_at, row.self_membership,
+            ag.member_count,
+            mute.group_id_hex IS NOT NULL,
+            mute.muted_until_ms,
+            EXISTS (
+                SELECT 1 FROM cgka_disband_tombstones AS tomb
+                WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
+            ),
+            pin.group_id_hex IS NOT NULL,
+            CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
+                SELECT COUNT(*)
+                FROM chat_pin_positions AS earlier_pin
+                WHERE earlier_pin.ordinal < pin.ordinal
+            ) END
+     FROM chat_list_rows AS row
+     LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
+     LEFT JOIN chat_notification_settings AS mute
+        ON mute.group_id_hex = row.group_id_hex
+     LEFT JOIN chat_pin_positions AS pin
+        ON pin.group_id_hex = row.group_id_hex";
+
+fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Result<ChatListRow> {
+    let group_name: String = row.get(4)?;
     let avatar_url: Option<String> = row.get(5)?;
     let image_hash_hex: String = row.get(6)?;
     let image_key_hex: String = row.get(7)?;
@@ -992,21 +1596,48 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
         deleted: row.get::<_, i64>(16).unwrap_or_default() != 0,
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state: ChatListMessageDeliveryState::from_storage(
+            &row.get::<_, String>(18).unwrap_or_default(),
+        ),
+        media_json: row.get(17).unwrap_or_default(),
     });
-    let raw_unread_count = row.get::<_, i64>(17)?;
+    let raw_unread_count = row.get::<_, i64>(19)?;
     let unread_count = raw_unread_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(17, raw_unread_count))?;
-    let raw_unread_mention_count = row.get::<_, i64>(18)?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(19, raw_unread_count))?;
+    let manually_marked_unread = row.get::<_, i64>(20)? != 0;
+    let raw_unread_mention_count = row.get::<_, i64>(21)?;
     let unread_mention_count = raw_unread_mention_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(18, raw_unread_mention_count))?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, raw_unread_mention_count))?;
+    let member_count = row
+        .get::<_, Option<i64>>(29)?
+        .and_then(|value| u64::try_from(value).ok());
+    let mute_row_exists = row.get::<_, i64>(30)? != 0;
+    let stored_muted_until_ms = row.get::<_, Option<i64>>(31)?;
+    let lifecycle_state = if row.get::<_, i64>(32)? != 0 {
+        cgka_traits::GroupLifecycleState::Disbanded
+    } else {
+        cgka_traits::GroupLifecycleState::Stable
+    };
+    let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
+    let pinned = row.get::<_, i64>(33)? != 0;
+    let pinned_position = row
+        .get::<_, Option<i64>>(34)?
+        .and_then(|value| u32::try_from(value).ok());
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
+        pinned,
+        pinned_position,
         archived: row.get::<_, i64>(1)? != 0,
         pending_confirmation: row.get::<_, i64>(2)? != 0,
+        lifecycle_state,
+        disbanding: false,
+        disband_request: None,
         title: row.get(3)?,
-        group_name: row.get(4)?,
+        group_name: group_name.clone(),
         avatar_url,
         avatar: has_avatar.then_some(ChatListAvatar {
             image_hash_hex,
@@ -1017,17 +1648,37 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         }),
         last_message,
         unread_count,
-        has_unread: unread_count > 0,
+        has_unread: unread_count > 0 || manually_marked_unread,
+        manually_marked_unread,
         unread_mention_count,
         has_unread_mention: unread_mention_count > 0,
-        first_unread_message_id_hex: row.get(19)?,
-        last_read_message_id_hex: row.get(20)?,
+        first_unread_message_id_hex: row.get(22)?,
+        last_read_message_id_hex: row.get(23)?,
         last_read_timeline_at: row
-            .get::<_, Option<i64>>(21)?
+            .get::<_, Option<i64>>(24)?
             .and_then(|value| value.try_into().ok()),
-        updated_at: row.get::<_, i64>(22)?.try_into().unwrap_or_default(),
-        self_membership: SelfMembership::from_storage(&row.get::<_, String>(23)?),
+        conversation_created_at: row.get::<_, i64>(25)?.try_into().unwrap_or_default(),
+        activity_sort_at: row.get::<_, i64>(26)?.try_into().unwrap_or_default(),
+        updated_at: row.get::<_, i64>(27)?.try_into().unwrap_or_default(),
+        self_membership: SelfMembership::from_storage(&row.get::<_, String>(28)?),
+        conversation_kind: conversation_kind(&group_name, member_count),
+        muted,
+        muted_until_ms: muted.then_some(stored_muted_until_ms).flatten(),
+        // Not a `chat_list_rows` column; the callers above stamp it from
+        // `cgka_leave_requests` after the row is decoded.
+        leave_requested_at_ms: None,
     })
+}
+
+fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
+    if !group_name.trim().is_empty() {
+        return ChatConversationKind::Group;
+    }
+    match member_count {
+        Some(2) => ChatConversationKind::Direct,
+        Some(_) => ChatConversationKind::Group,
+        None => ChatConversationKind::Unknown,
+    }
 }
 
 fn chat_title(group: &AccountGroupRow) -> &str {
@@ -1046,11 +1697,6 @@ fn decoded_avatar_url(component_data_hex: Option<&str>) -> Option<String> {
 
 fn timeline_tuple_after(left_at: u64, left_id: &str, right_at: u64, right_id: &str) -> bool {
     left_at > right_at || (left_at == right_at && left_id > right_id)
-}
-
-fn i64_to_u64(value: i64) -> StorageResult<u64> {
-    u64::try_from(value)
-        .map_err(|_| StorageError::Serialization(format!("value does not fit in u64: {value}")))
 }
 
 #[cfg(test)]

@@ -13,25 +13,34 @@
 //!    `EngineError::UnknownPending`.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP;
+use cgka_engine::{EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
+use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::maintenance::{
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupMaintenanceState,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, PeriodicMaintenancePolicy,
+};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
+    DisbandRequest, DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage,
+    GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
+    LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage, MessageStorage,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
+    StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -223,8 +232,21 @@ fn build(id: &[u8]) -> impl CgkaEngine {
     build_with_peeler(id, Box::new(MockPeeler))
 }
 
+fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(Arc::new(clock))
+        .build()
+        .unwrap()
+}
+
 fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
@@ -239,6 +261,7 @@ fn build_with_peeler_and_storage(
     storage: SqliteAccountStorage,
 ) -> impl CgkaEngine {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
@@ -252,6 +275,7 @@ fn build_engine_with_storage(
     storage: SqliteAccountStorage,
 ) -> cgka_engine::Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
@@ -272,6 +296,140 @@ fn fork_snapshot_names(
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+#[tokio::test]
+async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "self-update".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let result = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (message, pending) = match result {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected self-update evolution, got {other:?}"),
+    };
+
+    let record = storage.get_message(&message.id).unwrap();
+    let payload = StoredMessagePayload::decode(&record.payload).unwrap();
+    assert_eq!(payload.as_exact_transport(), Some(&message));
+    assert!(payload.as_openmls_wire().is_some());
+    let evolutions = storage.list_group_evolutions().unwrap();
+    assert_eq!(evolutions.len(), 1);
+    assert_eq!(evolutions[0].signed_message_id.as_ref(), Some(&message.id));
+    assert_eq!(evolutions[0].phase, GroupEvolutionPhase::Prepared);
+
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        storage.list_group_evolutions().unwrap()[0].phase,
+        GroupEvolutionPhase::Confirmed
+    );
+}
+
+#[tokio::test]
+async fn current_group_creation_persists_automatic_maintenance_enrollment() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"current-alice"))
+        .account_identity_proof_signer(proof_signer(b"current-alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "current-maintenance".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let state = storage
+        .group_maintenance(&group_id)
+        .unwrap()
+        .expect("current group creation must enroll maintenance");
+    assert!(state.periodic_enrolled);
+    assert!(state.enrolled_at.is_some());
+    assert!(state.last_own_leaf_rotation_at.is_some());
+}
+
+#[tokio::test]
+async fn self_update_restart_republishes_the_identical_signed_event() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "self-update-restart".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let prepared = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let original = match prepared {
+        SendResult::GroupEvolution { msg, .. } => msg,
+        other => panic!("expected self-update evolution, got {other:?}"),
+    };
+    drop(alice);
+
+    let mut restarted = build_engine_with_storage(b"alice", storage);
+    restarted.hydrate_all_stored_groups().unwrap();
+    let recovered = restarted.drain_auto_publish();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].msg, original);
+    assert_eq!(recovered[0].msg.id, original.id);
+
+    restarted
+        .confirm_published(recovered[0].pending)
+        .await
+        .unwrap();
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(1));
 }
 
 // ── 1. Invite + publish_failed → projected member rolls back ───────────────
@@ -805,6 +963,9 @@ impl ProcessedFault {
 struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: ProcessedFault,
+    lifecycle_fault: ProcessedFault,
+    disband_request_fault: ProcessedFault,
+    queued_intent_list_fault: ProcessedFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -832,6 +993,9 @@ impl MessageStorage for FaultStorage {
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
         self.inner.get_message(id)
     }
+    fn delete_message(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_message(id)
+    }
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
         if new_state == MessageState::Processed && self.fault.should_fail() {
             return Err(StorageError::Busy("injected confirm-path lock".into()));
@@ -845,6 +1009,26 @@ impl MessageStorage for FaultStorage {
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
     }
+    fn put_pending_application_event(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+    ) -> StorageResult<()> {
+        self.inner.put_pending_application_event(event)
+    }
+    fn list_pending_application_events(
+        &self,
+    ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
+        self.inner.list_pending_application_events()
+    }
+    fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
+        self.inner.delete_pending_application_events(ids)
+    }
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.put_ingress_dedup_marker(id)
+    }
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.inner.has_ingress_dedup_marker(id)
+    }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
     }
@@ -857,6 +1041,36 @@ impl MessageStorage for FaultStorage {
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.release_group_snapshot(group_id, name)
     }
+    fn create_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint: &GroupStateCheckpointRef,
+    ) -> StorageResult<()> {
+        self.inner
+            .create_group_state_checkpoint(group_id, checkpoint)
+    }
+    fn restore_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .restore_group_state_checkpoint(group_id, checkpoint_id)
+    }
+    fn list_group_state_checkpoints(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<GroupStateCheckpointRef>> {
+        self.inner.list_group_state_checkpoints(group_id)
+    }
+    fn release_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .release_group_state_checkpoint(group_id, checkpoint_id)
+    }
 }
 
 impl OutboundIntentStorage for FaultStorage {
@@ -867,10 +1081,36 @@ impl OutboundIntentStorage for FaultStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        if self.queued_intent_list_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected retained-intent read lock".into(),
+            ));
+        }
         self.inner.list_queued_outbound_intents(group_id)
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl OutboundFanoutStorage for FaultStorage {
+    fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()> {
+        self.inner.put_outbound_fanout(fanout)
+    }
+    fn outbound_fanout(&self, id: &MessageId) -> StorageResult<Option<OutboundFanout>> {
+        self.inner.outbound_fanout(id)
+    }
+    fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts()
+    }
+    fn list_outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts_for_group(group_id)
+    }
+    fn delete_outbound_fanout(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_outbound_fanout(id)
     }
 }
 
@@ -883,6 +1123,66 @@ impl LeaveRequestStorage for FaultStorage {
     }
     fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
         self.inner.clear_leave_request(group_id)
+    }
+}
+
+impl DisbandRequestStorage for FaultStorage {
+    fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()> {
+        if request.status == DisbandRequestStatus::Pending
+            && request.last_prepared_epoch.is_none()
+            && self.disband_request_fault.should_fail()
+        {
+            return Err(StorageError::Busy(
+                "injected disband rollback reconciliation lock".into(),
+            ));
+        }
+        self.inner.put_disband_request(request)
+    }
+    fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>> {
+        self.inner.disband_request(group_id)
+    }
+    fn clear_disband_request(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_disband_request(group_id)
+    }
+}
+
+impl DisbandCandidateStorage for FaultStorage {
+    fn put_disband_candidate(&self, candidate: &DisbandCandidate) -> StorageResult<()> {
+        self.inner.put_disband_candidate(candidate)
+    }
+    fn disband_candidate(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<DisbandCandidate>> {
+        self.inner.disband_candidate(group_id, commit_id)
+    }
+    fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        self.inner.list_disband_candidates(group_id)
+    }
+    fn clear_disband_candidates(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_disband_candidates(group_id)
+    }
+}
+
+impl DisbandTombstoneStorage for FaultStorage {
+    fn put_disband_tombstone(
+        &self,
+        group_id: &GroupId,
+        tombstone: &cgka_traits::DisbandTombstone,
+    ) -> StorageResult<()> {
+        self.inner.put_disband_tombstone(group_id, tombstone)
+    }
+    fn disband_tombstone(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DisbandTombstone>> {
+        self.inner.disband_tombstone(group_id)
+    }
+    fn list_disband_tombstones(
+        &self,
+    ) -> StorageResult<Vec<(GroupId, cgka_traits::DisbandTombstone)>> {
+        self.inner.list_disband_tombstones()
     }
 }
 
@@ -956,11 +1256,155 @@ impl AccountDeviceSignerStorage for FaultStorage {
     }
 }
 
+impl KeyPackageBundleStorage for FaultStorage {
+    fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        self.inner.stored_key_package_bundles()
+    }
+
+    fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        self.inner.delete_stored_key_package_bundle(storage_key)
+    }
+}
+
+impl MaintenanceStorage for FaultStorage {
+    fn key_package_lifecycle(&self) -> StorageResult<Option<KeyPackageLifecycleState>> {
+        self.inner.key_package_lifecycle()
+    }
+
+    fn put_key_package_lifecycle(&self, state: &KeyPackageLifecycleState) -> StorageResult<()> {
+        if self.lifecycle_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected lifecycle-intent write failure".into(),
+            ));
+        }
+        self.inner.put_key_package_lifecycle(state)
+    }
+
+    fn group_maintenance(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<GroupMaintenanceState>> {
+        self.inner.group_maintenance(group_id)
+    }
+
+    fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> StorageResult<()> {
+        self.inner.put_group_maintenance(state)
+    }
+
+    fn delete_group_maintenance(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_group_maintenance(group_id)
+    }
+
+    fn put_maintenance_obligation(&self, record: &MaintenanceObligation) -> StorageResult<()> {
+        self.inner.put_maintenance_obligation(record)
+    }
+
+    fn maintenance_obligation(
+        &self,
+        id: &MessageId,
+    ) -> StorageResult<Option<MaintenanceObligation>> {
+        self.inner.maintenance_obligation(id)
+    }
+
+    fn list_maintenance_obligations(&self) -> StorageResult<Vec<MaintenanceObligation>> {
+        self.inner.list_maintenance_obligations()
+    }
+
+    fn list_maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<MaintenanceObligation>> {
+        self.inner.list_maintenance_obligations_for_group(group_id)
+    }
+
+    fn delete_maintenance_obligation(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_maintenance_obligation(id)
+    }
+
+    fn put_group_evolution(&self, record: &DurableGroupEvolution) -> StorageResult<()> {
+        self.inner.put_group_evolution(record)
+    }
+
+    fn group_evolution(&self, id: &MessageId) -> StorageResult<Option<DurableGroupEvolution>> {
+        self.inner.group_evolution(id)
+    }
+
+    fn list_group_evolutions(&self) -> StorageResult<Vec<DurableGroupEvolution>> {
+        self.inner.list_group_evolutions()
+    }
+
+    fn list_group_evolutions_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DurableGroupEvolution>> {
+        self.inner.list_group_evolutions_for_group(group_id)
+    }
+
+    fn delete_group_evolution(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_group_evolution(id)
+    }
+
+    fn put_transport_fanout(&self, record: &DurableTransportFanout) -> StorageResult<()> {
+        self.inner.put_transport_fanout(record)
+    }
+
+    fn transport_fanout(&self, id: &MessageId) -> StorageResult<Option<DurableTransportFanout>> {
+        self.inner.transport_fanout(id)
+    }
+
+    fn list_transport_fanouts(&self) -> StorageResult<Vec<DurableTransportFanout>> {
+        self.inner.list_transport_fanouts()
+    }
+
+    fn delete_transport_fanout(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_transport_fanout(id)
+    }
+
+    fn periodic_maintenance_policy(&self) -> StorageResult<PeriodicMaintenancePolicy> {
+        self.inner.periodic_maintenance_policy()
+    }
+
+    fn put_periodic_maintenance_policy(
+        &self,
+        policy: PeriodicMaintenancePolicy,
+    ) -> StorageResult<()> {
+        self.inner.put_periodic_maintenance_policy(policy)
+    }
+}
+
+impl ConvergencePassStorage for FaultStorage {
+    fn convergence_pass(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DurableConvergencePass>> {
+        self.inner.convergence_pass(group_id)
+    }
+
+    fn put_convergence_pass(
+        &self,
+        pass: &cgka_traits::DurableConvergencePass,
+    ) -> StorageResult<()> {
+        self.inner.put_convergence_pass(pass)
+    }
+
+    fn list_convergence_passes(&self) -> StorageResult<Vec<cgka_traits::DurableConvergencePass>> {
+        self.inner.list_convergence_passes()
+    }
+
+    fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_convergence_pass(group_id)
+    }
+}
+
 impl StorageProvider for FaultStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 
     fn mls_storage(&self) -> &Self::Mls {
         self.inner.mls_storage()
+    }
+
+    fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
+        Some(self)
     }
 
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
@@ -989,14 +1433,159 @@ fn build_fault_engine(
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
     let inner = SqliteAccountStorage::in_memory().unwrap();
     let handle = inner.clone();
-    let engine = EngineBuilder::new(FaultStorage { inner, fault })
-        .identity(pad32(id))
-        .account_identity_proof_signer(proof_signer(id))
-        .feature_registry(registry_with_reactions())
-        .peeler(Box::new(MockPeeler))
-        .build()
-        .unwrap();
+    let engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault,
+        lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: ProcessedFault::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(id))
+    .account_identity_proof_signer(proof_signer(id))
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
     (engine, handle)
+}
+
+#[tokio::test]
+async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let disband_request_fault = ProcessedFault::default();
+    let mut alice = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: ProcessedFault::default(),
+        lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: disband_request_fault.clone(),
+        queued_intent_list_fault: ProcessedFault::default(),
+    })
+    .identity(pad32(b"alice-disband-rollback"))
+    .account_identity_proof_signer(proof_signer(b"alice-disband-rollback"))
+    .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "terminal rollback".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
+
+    assert!(matches!(
+        alice
+            .send(SendIntent::Disband {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        SendResult::DisbandRequested { .. }
+    ));
+    let prepared = alice.advance_convergence(&group_id).await.unwrap();
+    let pending = match prepared.as_slice() {
+        [SendResult::GroupEvolution { pending, .. }] => *pending,
+        other => panic!("expected prepared disband commit, got {other:?}"),
+    };
+    assert!(
+        handle
+            .disband_request(&group_id)
+            .unwrap()
+            .unwrap()
+            .last_prepared_epoch
+            .is_some()
+    );
+
+    disband_request_fault.arm(1);
+    let error = alice.publish_failed(pending).await.unwrap_err();
+    assert!(error.is_transient(), "unexpected rollback error: {error:?}");
+    assert!(matches!(
+        alice.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
+    assert!(
+        handle
+            .disband_request(&group_id)
+            .unwrap()
+            .unwrap()
+            .last_prepared_epoch
+            .is_some(),
+        "failed transaction must retain the prepared request state"
+    );
+
+    alice
+        .publish_failed(pending)
+        .await
+        .expect("same pending slot remains retryable");
+    let request = handle.disband_request(&group_id).unwrap().unwrap();
+    assert_eq!(request.status, DisbandRequestStatus::Pending);
+    assert_eq!(request.last_prepared_epoch, None);
+    assert!(matches!(
+        alice.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+}
+
+#[test]
+fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let lifecycle_fault = ProcessedFault::default();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: ProcessedFault::default(),
+        lifecycle_fault: lifecycle_fault.clone(),
+        disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: ProcessedFault::default(),
+    })
+    .identity(pad32(b"alice-maintenance"))
+    .account_identity_proof_signer(proof_signer(b"alice-maintenance"))
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let mut state = KeyPackageLifecycleState {
+        stable_slot_id: "stable-slot".into(),
+        phase: MaintenancePhase::Complete,
+        current_key_package: None,
+        current_key_package_ref: None,
+        current_not_before: None,
+        current_not_after: None,
+        authored_event_id: None,
+        authored_event_created_at: None,
+        authored_signed_event: None,
+        publication_targets: Vec::new(),
+        refresh_at: None,
+        upgrade_rotation_recorded: false,
+        last_consumed_key_package_ref: None,
+        last_consumed_at: None,
+        retained_private_material: Vec::new(),
+        pending_replacement: None,
+    };
+
+    lifecycle_fault.arm(1);
+    engine
+        .stage_key_package_replacement(&mut state, Timestamp(10_000), 60, Vec::new())
+        .expect_err("the injected lifecycle write must abort the transaction");
+
+    assert!(
+        handle.stored_key_package_bundles().unwrap().is_empty(),
+        "a failed lifecycle-intent write must not orphan private init-key material"
+    );
+    assert!(handle.key_package_lifecycle().unwrap().is_none());
+    assert!(state.pending_replacement.is_none());
 }
 
 #[tokio::test]
@@ -1086,4 +1675,420 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
     // The slot is now genuinely consumed: a further confirm is UnknownPending.
     let third = alice.confirm_published(inv_pending).await;
     assert!(matches!(third, Err(EngineError::UnknownPending)));
+}
+
+// ── Retained app messages across a temporary non-stable state ────────────────
+
+/// A chat payload the engine's app-payload validation accepts from `engine`.
+fn app_payload_for(engine: &impl CgkaEngine, body: &str) -> Vec<u8> {
+    cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        body.to_string(),
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+async fn group_with_bob(
+    alice: &mut impl CgkaEngine,
+    bob: &mut impl CgkaEngine,
+) -> cgka_traits::types::GroupId {
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "retained".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("expected a staged group creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    for welcome in welcomes {
+        bob.join_welcome(welcome).await.unwrap();
+    }
+    group_id
+}
+
+#[tokio::test]
+async fn app_message_is_retained_while_a_publish_is_pending() {
+    let mut alice = build(b"alice");
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+    // Stage a self-update. The group is now `PendingPublish` — a temporary
+    // state whose exit is a publish outcome the transport still owes us.
+    let staged = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(staged, SendResult::GroupEvolution { .. }));
+
+    // A user typing during that window must not lose their message: the
+    // engine retains the intent durably instead of refusing the send.
+    let payload = app_payload_for(&alice, "typed while the publish was stalled");
+    let queued = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .expect("a temporary non-stable state must retain an app message, not reject it");
+    assert!(
+        matches!(queued, SendResult::Queued { .. }),
+        "expected durable retention, got {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn retained_app_message_encrypts_under_the_drain_time_epoch() {
+    // The whole point of retaining an *intent* rather than ciphertext: the
+    // group's epoch can advance while the message waits. If the engine froze
+    // the wire bytes at queue time, the message would be sealed under the
+    // pre-commit epoch and every recipient that already applied the commit
+    // would have to reach back through its retained history to read it.
+    let bob_clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build(b"alice");
+    let mut bob = build_with_clock(b"bob", bob_clock.clone());
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    let queue_time_epoch = alice.epoch(&group_id).unwrap();
+
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+
+    let payload = app_payload_for(&alice, "written before the epoch moved");
+    assert!(matches!(
+        alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+
+    // The publish finally lands and the group advances while the message waits.
+    alice.confirm_published(pending).await.unwrap();
+    let drain_time_epoch = alice.epoch(&group_id).unwrap();
+    assert_eq!(
+        drain_time_epoch.0,
+        queue_time_epoch.0 + 1,
+        "the confirmed self-update must advance the epoch while the message waited"
+    );
+
+    let mut drained = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected exactly the retained message, got {drained:?}"
+    );
+    let SendResult::ApplicationMessage {
+        msg, source_epoch, ..
+    } = drained.remove(0)
+    else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert_eq!(
+        source_epoch, drain_time_epoch,
+        "the retained intent must be encrypted under the epoch it drains at, not the one it was queued at"
+    );
+
+    // And that is not bookkeeping: bob, who has applied the commit and is
+    // therefore *at* the drain-time epoch, decrypts it.
+    bob.ingest(commit).await.unwrap();
+    bob_clock.advance_ms(1_000);
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        drain_time_epoch,
+        "bob must have applied the self-update before reading the retained message"
+    );
+    let outcome = bob.ingest(msg).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Processed),
+        "bob at the drain-time epoch must decrypt the retained message; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn resolving_a_publish_schedules_the_drain_for_retained_app_messages() {
+    // Retention is only half a fix. Nothing in the engine drains itself: the
+    // runtime drains the groups the engine reports through
+    // `drain_pending_convergence_groups`. If a publish outcome does not put the
+    // group on that list, a retained message sits until some unrelated event
+    // happens to schedule the group — which is exactly the "message never
+    // sent" symptom retention was meant to remove.
+    for resolve_by_confirming in [true, false] {
+        let mut alice = build(b"alice");
+        let mut bob = build(b"bob");
+        let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+        let SendResult::GroupEvolution { pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("self-update stages a group evolution")
+        };
+        let payload = app_payload_for(&alice, "retained across the publish");
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+        // Staging and retention alone must not claim the group is drainable —
+        // it is still PendingPublish, so a drain now would do nothing and burn
+        // the schedule.
+        assert!(
+            !alice.drain_pending_convergence_groups().contains(&group_id),
+            "a group awaiting a publish outcome is not drainable yet"
+        );
+
+        if resolve_by_confirming {
+            alice.confirm_published(pending).await.unwrap();
+        } else {
+            alice.publish_failed(pending).await.unwrap();
+        }
+
+        assert!(
+            alice.drain_pending_convergence_groups().contains(&group_id),
+            "resolving the publish (confirmed = {resolve_by_confirming}) must schedule the drain \
+             for the retained app message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_intent_queue_still_schedules_the_drain() {
+    // The drain scheduling above is driven by a read of the durable intent
+    // queue, and that read can fail transiently. A failed read cannot prove
+    // the queue is empty — and no other trigger exists in a running process,
+    // so a group skipped here holds its retained payload until unrelated
+    // traffic touches it or the process restarts. Unknown must therefore be
+    // treated as retained.
+    for resolve_by_confirming in [true, false] {
+        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let queued_intent_list_fault = ProcessedFault::default();
+        let mut alice = EngineBuilder::new(FaultStorage {
+            inner,
+            fault: ProcessedFault::default(),
+            lifecycle_fault: ProcessedFault::default(),
+            disband_request_fault: ProcessedFault::default(),
+            queued_intent_list_fault: queued_intent_list_fault.clone(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+        let mut bob = build(b"bob");
+        let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+        let SendResult::GroupEvolution { pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("self-update stages a group evolution")
+        };
+        let payload = app_payload_for(&alice, "retained behind a locked queue read");
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+        // Clear anything the setup scheduled, so the assertion below can only
+        // observe a schedule the publish outcome itself made.
+        let _ = alice.drain_pending_convergence_groups();
+
+        // Arm only after the send: queueing the intent reads the queue too.
+        queued_intent_list_fault.arm(1);
+        if resolve_by_confirming {
+            alice
+                .confirm_published(pending)
+                .await
+                .expect("a failed retained-intent read must not fail a durable confirm");
+        } else {
+            alice
+                .publish_failed(pending)
+                .await
+                .expect("a failed retained-intent read must not fail a durable rollback");
+        }
+
+        assert!(
+            alice.drain_pending_convergence_groups().contains(&group_id),
+            "an unreadable intent queue (confirmed = {resolve_by_confirming}) must schedule the \
+             drain anyway; nothing else will"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unresolved() {
+    // Retention has no deadline, and that is deliberate: a publication whose
+    // exposure is ambiguous must never be rolled back. So the state that holds
+    // the queue can hold forever — modelled here by staging a publication and
+    // never resolving it, exactly as the engine sees an ambiguous publish for
+    // which neither `confirm_published` nor `publish_failed` is ever called.
+    // Without a cap, a sender looping into that group grows the durable store
+    // without bound while every call still reports `Queued`.
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+    // The precondition the cap exists for, stated rather than inferred: the
+    // group owes a publish outcome, so it is not drainable and nothing below
+    // will release the queue. `Queued` alone would not prove this — a `Stable`
+    // group with unsettled convergence input answers `Queued` too.
+    assert!(
+        !alice.drain_pending_convergence_groups().contains(&group_id),
+        "the staged publication must still be unresolved while the queue fills"
+    );
+
+    // Up to the cap, every send is accepted and retained.
+    for i in 0..MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+        let payload = app_payload_for(&alice, &format!("retained {i}"));
+        let queued = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("send {i} below the cap must be retained: {error:?}"));
+        assert!(
+            matches!(queued, SendResult::Queued { .. }),
+            "send {i} below the cap must be retained, got {queued:?}"
+        );
+    }
+
+    // One past it, the caller is told the message was not accepted.
+    let payload = app_payload_for(&alice, "one past the cap");
+    let refused = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .expect_err("a send past the retention cap must be refused, not silently retained");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::QueuedOutboundAtCapacity { group_id: refused_group }
+                if refused_group == &group_id
+        ),
+        "expected a typed capacity refusal naming the group, got {refused:?}"
+    );
+    // Not transient: `is_transient` drives automatic retry loops, and this
+    // condition cannot clear until the group resolves.
+    assert!(
+        !refused.is_transient(),
+        "a full retention queue must not be retried automatically"
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP,
+        "the refusal must persist nothing and disturb nothing already retained"
+    );
+
+    // The cap refuses new work without endangering work already accepted: once
+    // the publication resolves, the whole retained backlog drains at the
+    // post-resolution epoch and the group accepts sends again.
+    alice.confirm_published(pending).await.unwrap();
+    let drain_time_epoch = alice.epoch(&group_id).unwrap();
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        drained.len(),
+        MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP,
+        "every retained intent must drain"
+    );
+    for result in drained {
+        let SendResult::ApplicationMessage {
+            msg, source_epoch, ..
+        } = result
+        else {
+            panic!("retained app-message intents drain as application messages, got {result:?}")
+        };
+        assert_eq!(
+            source_epoch, drain_time_epoch,
+            "a retained intent must be encrypted under the epoch it drains at"
+        );
+        // Capacity is reclaimed the same way it is anywhere else: the caller
+        // reports that the regenerated message reached the transport. Until
+        // then the row is still owed a delivery, so it still occupies the cap.
+        let (_, intent_id) = alice
+            .take_regenerated_queued_intent_for_message(&msg.id)
+            .expect("a drained retained intent must be attributable to its durable row");
+        alice.confirm_queued_outbound_intent(&intent_id).unwrap();
+    }
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "confirming every drained publication must clear the retention queue"
+    );
+
+    let payload = app_payload_for(&alice, "after the group recovered");
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .expect("a recovered group must accept sends again");
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "expected a direct send once the group is stable again, got {sent:?}"
+    );
 }

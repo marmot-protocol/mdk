@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/marmot-protocol/mdk/cgka-conformance-simulator/failure-capsule.v1.schema.json",
+  "title": "MDK convergence failure capsule v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sensitivity",
+    "seeds",
+    "expanded_schedule",
+    "binary_version",
+    "policy",
+    "report",
+    "resources",
+    "failure"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "sensitivity": {
+      "enum": ["synthetic_shareable", "sensitive_local"]
+    },
+    "seeds": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "expanded_schedule": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/expanded_action" }
+    },
+    "adapter": {
+      "oneOf": [{ "type": "null" }, { "type": "object" }]
+    },
+    "binary_version": { "type": "string", "minLength": 1 },
+    "policy": {
+      "type": "object",
+      "required": ["canonicalization", "quiescence_by_action", "engine_constants"],
+      "properties": {
+        "canonicalization": { "type": "object" },
+        "quiescence_by_action": {
+          "type": "object",
+          "additionalProperties": { "type": "object" }
+        },
+        "engine_constants": {
+          "type": "object",
+          "required": ["schema_version", "values"],
+          "properties": {
+            "schema_version": { "const": "1" },
+            "values": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "captured_transport_artifacts": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "required": ["sequence", "sender", "message"],
+        "properties": {
+          "sequence": { "type": "integer", "minimum": 0 },
+          "sender": { "type": "string" },
+          "message": { "type": "object" }
+        }
+      }
+    },
+    "report": { "type": "object" },
+    "resources": {
+      "type": "object",
+      "required": ["counters"],
+      "properties": {
+        "counters": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "failure": { "$ref": "#/$defs/fingerprint" },
+    "byte_replay": { "$ref": "#/$defs/byte_replay" },
+    "minimized_reproducer": { "$ref": "#/$defs/scenario" }
+  },
+  "$defs": {
+    "scenario": {
+      "type": "object",
+      "required": ["name", "spec_version", "clients", "steps"],
+      "properties": {
+        "name": { "type": "string" },
+        "spec_version": { "const": "2" },
+        "clients": { "type": "array", "items": { "type": "string" } },
+        "steps": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "expanded_action": {
+      "type": "object",
+      "required": ["action_id", "step_index", "action_type", "virtual_time_ms", "status"],
+      "properties": {
+        "action_id": { "type": "string" },
+        "step_index": { "type": "integer", "minimum": 0 },
+        "action_type": { "type": "string" },
+        "virtual_time_ms": { "type": "integer", "minimum": 0 },
+        "status": { "oneOf": [{ "type": "null" }, { "type": "object" }] }
+      }
+    },
+    "fingerprint": {
+      "type": "object",
+      "required": ["version", "digest", "classification", "failure_kind", "normalized_state_digest"],
+      "properties": {
+        "version": { "const": "1" },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "classification": {
+          "enum": [
+            "converged",
+            "expected_refusal",
+            "retryable_block",
+            "terminal_protocol_failure",
+            "resource_failure",
+            "environment_failure",
+            "timeout",
+            "oracle_violation"
+          ]
+        },
+        "first_failing_action_id": { "type": "string" },
+        "failure_kind": { "type": "string" },
+        "normalized_state_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "byte_replay": {
+      "type": "object",
+      "required": [
+        "client_label",
+        "identity_seed",
+        "protocol_profile",
+        "group_id",
+        "sensitive_checkpoint",
+        "captured_deliveries",
+        "checkpoint_monotonic_ms",
+        "checkpoint_wall_ms",
+        "virtual_time_tick_enabled",
+        "expected_fingerprint"
+      ],
+      "properties": {
+        "client_label": { "type": "string" },
+        "identity_seed": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "protocol_profile": {},
+        "group_id": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "sensitive_checkpoint": { "type": "array", "maxItems": 16777216, "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "captured_deliveries": { "type": "array", "maxItems": 256, "items": { "type": "object" } },
+        "checkpoint_monotonic_ms": { "type": "integer", "minimum": 0 },
+        "checkpoint_wall_ms": { "type": "integer", "minimum": 0 },
+        "virtual_time_tick_enabled": { "type": "boolean" },
+        "expected_fingerprint": { "$ref": "#/$defs/fingerprint" }
+      }
+    }
+  }
+}

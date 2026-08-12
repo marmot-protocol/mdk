@@ -1,8 +1,9 @@
 //! Relay telemetry, relay-list, and relay-health FFI conversions.
 
 use marmot_app::{
-    AccountRelayListState, AccountRelayListStatus, MissingRelayListKind, RelayPlaneHealth,
-    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AccountRelayListState, AccountRelayListStatus, MissingRelayListKind,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -147,6 +148,44 @@ impl From<AccountRelayListStatus> for AccountRelayListsFfi {
     }
 }
 
+/// Stable relay-policy result for settings and remediation UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayEndpointPolicyFfi {
+    Allowed,
+    Retired,
+    Invalid,
+    Unsafe,
+}
+
+impl From<RelayEndpointPolicy> for RelayEndpointPolicyFfi {
+    fn from(value: RelayEndpointPolicy) -> Self {
+        match value {
+            RelayEndpointPolicy::Allowed => Self::Allowed,
+            RelayEndpointPolicy::Retired => Self::Retired,
+            RelayEndpointPolicy::Invalid => Self::Invalid,
+            RelayEndpointPolicy::Unsafe => Self::Unsafe,
+        }
+    }
+}
+
+/// Policy classification for one caller-supplied relay endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RelayEndpointClassificationFfi {
+    pub endpoint: String,
+    pub normalized_endpoint: Option<String>,
+    pub policy: RelayEndpointPolicyFfi,
+}
+
+impl From<RelayEndpointClassification> for RelayEndpointClassificationFfi {
+    fn from(value: RelayEndpointClassification) -> Self {
+        Self {
+            endpoint: value.endpoint,
+            normalized_endpoint: value.normalized_endpoint,
+            policy: value.policy.into(),
+        }
+    }
+}
+
 /// Live relay-plane connection health for the diagnostics view.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RelayHealthFfi {
@@ -162,23 +201,36 @@ pub struct RelayHealthFfi {
     pub sleeping: u32,
     pub connection_attempts: u32,
     pub connection_successes: u32,
+    pub notification_forwarder_running: bool,
+    pub notification_forwarder_restarts: u64,
+    pub notification_forwarder_lag_incidents: u64,
+    pub notification_forwarder_lagged_notifications: u64,
+    pub notification_forwarder_panics: u64,
+    pub notification_forwarder_unexpected_exits: u64,
 }
 
 impl From<RelayPlaneHealth> for RelayHealthFfi {
     fn from(value: RelayPlaneHealth) -> Self {
         Self {
             sdk_backed: value.sdk_backed,
-            total_relays: value.total_relays as u32,
-            initialized: value.initialized as u32,
-            pending: value.pending as u32,
-            connecting: value.connecting as u32,
-            connected: value.connected as u32,
-            disconnected: value.disconnected as u32,
-            terminated: value.terminated as u32,
-            banned: value.banned as u32,
-            sleeping: value.sleeping as u32,
-            connection_attempts: value.connection_attempts as u32,
-            connection_successes: value.connection_successes as u32,
+            total_relays: super::saturating_u32(value.total_relays),
+            initialized: super::saturating_u32(value.initialized),
+            pending: super::saturating_u32(value.pending),
+            connecting: super::saturating_u32(value.connecting),
+            connected: super::saturating_u32(value.connected),
+            disconnected: super::saturating_u32(value.disconnected),
+            terminated: super::saturating_u32(value.terminated),
+            banned: super::saturating_u32(value.banned),
+            sleeping: super::saturating_u32(value.sleeping),
+            connection_attempts: super::saturating_u32(value.connection_attempts),
+            connection_successes: super::saturating_u32(value.connection_successes),
+            notification_forwarder_running: value.notification_forwarder_running,
+            notification_forwarder_restarts: value.notification_forwarder_restarts,
+            notification_forwarder_lag_incidents: value.notification_forwarder_lag_incidents,
+            notification_forwarder_lagged_notifications: value
+                .notification_forwarder_lagged_notifications,
+            notification_forwarder_panics: value.notification_forwarder_panics,
+            notification_forwarder_unexpected_exits: value.notification_forwarder_unexpected_exits,
         }
     }
 }
@@ -198,5 +250,21 @@ mod tests {
         assert!(!rendered.contains("super-secret-otlp-token"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("otlp.example"), "{rendered}");
+    }
+
+    #[test]
+    fn relay_endpoint_classification_preserves_typed_policy() {
+        let ffi = RelayEndpointClassificationFfi::from(RelayEndpointClassification {
+            endpoint: "wss://relay.example".to_owned(),
+            normalized_endpoint: Some("wss://relay.example/".to_owned()),
+            policy: RelayEndpointPolicy::Retired,
+        });
+
+        assert_eq!(ffi.endpoint, "wss://relay.example");
+        assert_eq!(
+            ffi.normalized_endpoint.as_deref(),
+            Some("wss://relay.example/")
+        );
+        assert_eq!(ffi.policy, RelayEndpointPolicyFfi::Retired);
     }
 }

@@ -1,5 +1,5 @@
 use cgka_traits::app_event::MarmotAppEventError;
-use cgka_traits::error::EngineError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::transport_adapter::TransportAdapterError;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 
@@ -11,6 +11,7 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
     let member_hex = hex::encode(member_id.as_slice());
     let errors = [
         EngineError::UnknownGroup(group_id.clone()).to_string(),
+        EngineError::GroupNotHydrated(group_id.clone()).to_string(),
         EngineError::NotAMember {
             group_id: group_id.clone(),
         }
@@ -29,6 +30,14 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
         }
         .to_string(),
         EngineError::AdminDepletion {
+            group_id: group_id.clone(),
+        }
+        .to_string(),
+        EngineError::DisbandingNotEnabled {
+            group_id: group_id.clone(),
+        }
+        .to_string(),
+        EngineError::QueuedOutboundAtCapacity {
             group_id: group_id.clone(),
         }
         .to_string(),
@@ -58,6 +67,26 @@ fn transport_adapter_error_display_passes_reasons_through_verbatim() {
     assert_eq!(err.to_string(), "publish failed: connect relay failed");
     let err = TransportAdapterError::Subscription("add relay failed".to_owned());
     assert_eq!(err.to_string(), "subscription failed: add relay failed");
+}
+
+#[test]
+fn typed_inbound_rejection_display_is_fixed_and_privacy_safe() {
+    assert_eq!(
+        PeelerError::InvalidSignature.to_string(),
+        "invalid transport signature"
+    );
+    assert_eq!(
+        PeelerError::WrongRecipient.to_string(),
+        "transport input is addressed to another recipient"
+    );
+    assert_eq!(
+        TransportAdapterError::InvalidInboundEncoding.to_string(),
+        "invalid inbound transport encoding"
+    );
+    assert_eq!(
+        TransportAdapterError::InvalidInboundSignature.to_string(),
+        "invalid inbound transport signature"
+    );
 }
 
 #[test]

@@ -180,8 +180,8 @@ GitHub-generated source archives are the downloadable artifacts.
 
 Use this for the White Noise agent connector entry point. The release publishes `wn-agent` binaries for supported
 platforms plus adapter/harness install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, the OpenClaw
-Marmot channel plugin + `install-openclaw-marmot.sh`, and the `wn-opencode` harness +
-`install-opencode-marmot.sh`. The track can grow other agent-system assets later.
+Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-opencode` harness +
+`install-opencode-marmot.sh`, and the `wn-pi` harness + `install-pi-marmot.sh`.
 
 The workflow lives at:
 
@@ -197,11 +197,24 @@ Before a WN Agent release, run the normal preflight plus:
 
 ```sh
 cargo test -p agent-connector
+cargo test -p marmot-terminal-harness
 cargo test -p wn-opencode
+cargo test -p wn-pi
 bash scripts/install-hermes-marmot.sh --dry-run --yes
 bash scripts/install-openclaw-marmot.sh --dry-run --yes
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
 ```
+
+Bridge and control logs for both terminal harnesses now use the
+`marmot_terminal_harness` tracing target. Include
+`marmot_terminal_harness=debug` in `RUST_LOG`. The former `wn_opencode` target
+no longer emits events, so existing filters that reference it must be updated.
+
+The terminal-harness installer now keeps prompt senders separate from invite
+authorization. Existing OpenCode automation must pass at least one explicit
+`--allow-welcomer`; `WN_OPENCODE_ALLOWED_SENDERS_HEX` configures prompt senders
+only and no longer satisfies the bootstrap welcomer requirement.
 
 Cut the release tag from the current `origin/master` commit:
 
@@ -239,6 +252,14 @@ The release job creates these assets:
 - `wn-opencode-darwin-aarch64-<version>.tar.gz.sha256`
 - `wn-opencode-darwin-x86_64-<version>.tar.gz`
 - `wn-opencode-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-pi-linux-x86_64-<version>.tar.gz`
+- `wn-pi-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-pi-linux-aarch64-<version>.tar.gz`
+- `wn-pi-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-pi-darwin-aarch64-<version>.tar.gz`
+- `wn-pi-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-pi-darwin-x86_64-<version>.tar.gz`
+- `wn-pi-darwin-x86_64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
 - `openclaw-marmot-plugin-<version>.tgz`
@@ -246,6 +267,7 @@ The release job creates these assets:
 - `install-hermes-marmot.sh`
 - `install-openclaw-marmot.sh`
 - `install-opencode-marmot.sh`
+- `install-pi-marmot.sh`
 
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
@@ -262,6 +284,8 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-lat
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
 # OpenCode terminal harness
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
+# Pi terminal harness
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh | bash
 ```
 
 Use the versioned `wn-agent-v<version>` release URLs instead when you need a pinned install for repeatable testing or
@@ -283,8 +307,9 @@ The workflow lives at:
 .github/workflows/bindings.yaml
 ```
 
-It runs only when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
-`marmotkit-v0.9.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
+It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
+`marmotkit-v0.9.0`, builds both binding bundles, and creates the matching immutable GitHub Release. It can also be
+dispatched with a full commit SHA reachable from `master` to create an immutable iOS-only TestFlight snapshot.
 
 Create the tag:
 
@@ -298,10 +323,20 @@ For releases that should include the matching MDK source and WN Agent tracks, pr
 
 The release job creates these assets:
 
+- `MarmotKitFFI-<version>.xcframework.zip`
+- `MarmotKitFFI-<version>.xcframework.zip.sha256`
+- `MarmotKitFFI-<version>.xcframework.zip.swiftpm-checksum`
+- `MarmotKit-<version>.swift`
+- `marmotkit-ios-<version>.manifest.json`
+- `marmotkit-ios-<version>.checksums.txt`
 - `marmotkit-ios-<version>.zip`
 - `marmotkit-ios-<version>.zip.sha256`
 - `marmotkit-android-<version>.zip`
 - `marmotkit-android-<version>.zip.sha256`
+
+Snapshot assets use `snapshot-<full-sha>` in place of `<version>` and are published under the exact
+`marmotkit-snapshot-<full-sha>` release tag. The binary-only ZIP contains `MarmotKit.xcframework` at its archive root
+for SwiftPM. See `crates/marmot-uniffi/DISTRIBUTION.md` for URL and consumer examples.
 
 The iOS zip contains:
 
@@ -315,8 +350,10 @@ The Android zip contains:
 - `jniLibs/<abi>/libmarmot_uniffi.so` for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`
 - `manifest.json`
 
-Each manifest records the release tag, source commit, workspace version, `Cargo.lock` hash, Rust toolchain versions,
-and package contents. App repos should pin a tag and verify the `.sha256` file before vendoring the bundle.
+Each manifest records the release identifier, exact source commit, workflow builder commit, workspace version, `Cargo.lock` hash, Rust
+toolchain versions, enabled features, targets, deployment target, effective release profile, and artifact hashes. App
+repos must pin an exact tag, update generated Swift and binary references together, and verify the ordinary SHA-256
+and SwiftPM checksum. Existing release assets and snapshot tags are never overwritten.
 
 ## Marmot C Binding Release
 
@@ -391,7 +428,11 @@ install_root="$(mktemp -d)"
 cargo install --path crates/cli --locked --bins --root "$install_root" --force
 "$install_root/bin/wn" --help
 "$install_root/bin/wnd" --help
-WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file "$install_root/bin/wn" account create
+release_smoke_relay="${WN_RELEASE_SMOKE_RELAY:?set WN_RELEASE_SMOKE_RELAY to a disposable test relay}"
+WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file "$install_root/bin/wn" account create \
+  --bootstrap-relays "$release_smoke_relay" \
+  --default-relays "$release_smoke_relay" \
+  --publish-missing-relay-lists
 ```
 
 Homebrew release notes live in:
@@ -416,15 +457,17 @@ git push origin wn-agent-v0.9.0
 
 If a release has already been consumed, create a new patch version instead.
 
-If the workflow succeeds but an uploaded asset is wrong, rerun the workflow from the same tag only when the source commit
-is correct and the failure was packaging-only. The release job uploads assets with `--clobber`, so a rerun can replace
-assets on the same GitHub Release.
+The MarmotKit release job uploads and verifies assets while the release is still a draft, then publishes it. A failed
+pre-publication run may be retried: the workflow deletes only its incomplete draft and starts again. If remote URL,
+size, digest, SwiftPM checksum, or consumer validation fails after publication, do not replace the immutable assets.
+Publish a new formal patch version or snapshot source SHA instead. Deleting an immutable release does not make its tag
+name reusable.
 
 ## Current Limits
 
 - The workspace is not published to crates.io.
 - The whole-workspace release is tag- and source-archive-based.
-- MarmotKit releases are zipped generated files, not SwiftPM or Maven packages.
+- MarmotKit does not publish a Swift package manifest or Maven package. Its binary-target ZIP is SwiftPM-compatible.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
 - The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the
   MarmotKit binding release.

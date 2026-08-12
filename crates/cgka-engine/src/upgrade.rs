@@ -158,8 +158,9 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             "pre_upgrade_commit",
         );
-        self.epoch_manager
-            .record_committed_from(group_id, pre_commit_epoch);
+        // `committed_from` is recorded atomically by `begin_pending` after
+        // staging succeeds — never here, where a staging failure would leave
+        // a phantom entry behind (see do_send_invite).
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -167,6 +168,15 @@ impl<S: StorageProvider> Engine<S> {
         // do NOT call `merge_pending_commit` here — the merge + Marmot
         // record's required capability update both defer to
         // `do_confirm_published` (which reads the post-merge group state).
+        crate::app_components::validate_app_data_update_batch(
+            &mls_group,
+            app_component_updates
+                .iter()
+                .filter_map(|proposal| match proposal {
+                    Proposal::AppDataUpdate(update) => Some(update.as_ref()),
+                    _ => None,
+                }),
+        )?;
         let mut commit_builder = mls_group.commit_builder();
         if let Some(new_extensions) = new_extensions {
             commit_builder = commit_builder
@@ -218,6 +228,17 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
                 group_id,
                 staged_commit,
+            )?;
+            crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                staged_commit,
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
+            crate::app_components::validate_current_profile_invariants_for_staged_commit(
+                &mls_group,
+                staged_commit,
+                mls_group.own_leaf_index(),
             )?;
         }
         let commit_bytes = commit_out

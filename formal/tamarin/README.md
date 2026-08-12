@@ -35,8 +35,9 @@ read that file.
 
 ## Targets
 
-- `just tamarin` runs Tamarin on the model and requires `tamarin-prover` on `PATH`. Successful runs print only Tamarin's
-  `summary of summaries`; failing runs print the full prover output.
+- `just tamarin` runs Tamarin on the model with `--quit-on-warning` and an explicit 60-second derivation-check timeout,
+  and requires `tamarin-prover` on `PATH`. Successful runs print only Tamarin's `summary of summaries`; prover errors,
+  warnings, derivation-check timeouts, or a missing summary print the full output and fail the target.
 - `just tamarin-interactive` opens the model in Tamarin's interactive UI and requires `tamarin-prover` on `PATH`.
 - `just policy-casegen` emits Tamarin seed rules and executable lemmas from `policy_cases.json`.
 
@@ -46,6 +47,12 @@ Install Tamarin separately, then run:
 
 ```sh
 just tamarin
+```
+
+To raise the derivation-check timeout on a slower machine without weakening the warning gate:
+
+```sh
+make -C formal/tamarin prove DERIVCHECK_TIMEOUT=120
 ```
 
 To inspect generated policy-case output:
@@ -109,6 +116,12 @@ visible or invalidated output disposition
 That maps to the generated `convergence-e2e-delivery/v1` variants. Tamarin proves the abstract delivery contract; the
 Rust variants check that queued delivery permutations preserve the real end-to-end group events.
 
+The agreement lemmas explicitly premise the initializer's `SameInputSet` action facts and one run-scoped
+`PolicyLoaded` action fact. Policy is global to a model run, so the latter is the model's same-policy premise for both
+clients. This makes the theorem boundary visible, but it does not turn v0 into a parametric arbitrary-set proof:
+candidate sets and policies are still supplied by the bounded initializer rules. Unequal input sets, policy mismatch,
+clock/restart behavior, and liveness remain outside this Tamarin model.
+
 The current welcome/commit handoff proof slice is:
 
 ```text
@@ -124,12 +137,16 @@ The current proposal proof slice is:
 
 ```text
 applied canonical branch + consumed proposal relation => accepted proposal;
-proposal on losing branch => dropped proposal;
-dropped proposal => never accepted
+proposal on an eligible losing branch => deferred proposal;
+deferred proposal => retained eligibility and a different applied branch;
+proposal on a permanently ineligible branch => dropped proposal;
+dropped proposal => stale losing branch and never accepted
 ```
 
-That maps to canonicalization's `accepted_proposals` and `dropped_messages` dispositions, with OpenMLS supplying the
-consumed-proposal relation during replay.
+That maps to canonicalization's accepted, deferred, and dropped proposal dispositions, with OpenMLS supplying the
+consumed-proposal relation during replay. A deferred proposal can be accepted by a later pass, so the model does not
+assert terminal rejection merely because it lost one selection. A proposal is dropped only when its consuming branch
+is permanently ineligible.
 
 The v0 model now uses bounded symbolic score classes instead of an opaque `ScoreCase` fact:
 
@@ -137,6 +154,8 @@ The v0 model now uses bounded symbolic score classes instead of an opaque `Score
 dN       commit-depth or effective-depth class
 wN       app-witness score class
 qyes/qno witness quorum class
+p0/p1    commit-priority rank class, where lower wins
+cHEX     authenticated-committer rank class, where lower wins
 g00/gff  digest rank class, where lower wins final ties
 ```
 
@@ -144,9 +163,13 @@ The derivation rules mirror the selector order:
 
 1. higher effective depth,
 2. quorum tie,
-3. higher raw commit depth,
-4. higher app-witness score,
-5. lower digest rank.
+3. higher app-witness score,
+4. lower/preferred commit-priority rank,
+5. lexicographically lower authenticated-committer rank,
+6. lower digest rank.
+
+Raw commit depth remains an input to effective depth and a diagnostic score field. It has no separate selector step:
+once effective depth and quorum status tie, raw depth is necessarily tied as well.
 
 ## How Proofs Map To Tests
 
@@ -156,6 +179,21 @@ structures, OpenMLS objects, storage, and scenario harnesses.
 
 If behavior is outside the model, Tamarin says nothing about it. That behavior can still be specified in prose and
 tested in Rust, but it has no formal proof until the model includes it.
+
+## Proof Inventory
+
+Every v0 lemma belongs to exactly one verification category:
+
+| Category | Lemmas |
+| --- | --- |
+| Agreement and selector safety | `same_input_set_converges`, `selected_branches_are_eligible`, `selected_branches_require_loaded_policy`, `effective_depth_selection_requires_score_order`, `quorum_tie_selection_requires_quorum_and_bound`, `witness_score_selection_requires_score_order`, `priority_tie_selection_requires_preceding_equality_and_lower_priority`, `committer_tie_selection_requires_preceding_equality_and_lower_committer`, `digest_tie_selection_requires_lower_digest`, `opponent_ineligible_selection_requires_stale_opponent`, `duplicate_witness_dedupe_selection_uses_distinct_sender_epochs`, `three_branch_selection_requires_dominance`, `generated_bounded_case_selection_matches_expected_reason`, `no_conflicting_better_for_same_run` |
+| Lifecycle and application-output safety | `applied_branch_requires_prior_selection`, `accepted_app_output_requires_applied_branch`, `application_visible_requires_accepted_app_output`, `losing_app_invalidation_requires_applied_different_branch`, `invalidated_apps_are_never_application_visible`, `app_invalidation_disposition_requires_invalidation`, `invalidated_dispositions_are_never_application_visible`, `accepted_app_output_once_per_client_app`, `app_invalidation_disposition_once_per_app`, `welcome_acceptance_requires_matching_commit_context`, `commit_after_welcome_requires_prior_welcome`, `welcome_replayed_commit_does_not_select_branch`, `welcome_replayed_commit_does_not_detect_fork`, `fork_detection_requires_prior_local_commit`, `accepted_proposal_requires_applied_consuming_branch`, `deferred_proposal_requires_applied_different_branch`, `deferred_proposal_requires_eligible_losing_branch`, `dropped_proposal_requires_applied_ineligible_branch`, `dropped_proposals_are_never_accepted`, `queued_outbound_requires_syncing`, `released_queued_outbound_requires_prior_queue`, `syncing_outbound_is_never_published_directly`, `settled_publish_requires_lifecycle_stable_state` |
+| Delivery safety | `released_delayed_input_requires_prior_delay`, `delivery_pending_input_requires_delivery_observation`, `delivery_pending_input_is_deduplicated`, `duplicate_delivery_requires_prior_pending_input`, `delivery_reordered_clients_select_same_branch`, `delivery_losing_app_never_application_visible` |
+| Retained-history safety | `computed_anchor_requires_loaded_policy_rewind`, `retained_anchor_replay_requires_available_anchor_and_policy`, `missing_retained_anchor_requires_missing_snapshot_and_policy`, `missing_retained_anchor_does_not_apply`, `beyond_anchor_invalidation_requires_source_before_anchor`, `beyond_anchor_invalidated_commits_are_never_selected`, `beyond_anchor_invalidated_commits_are_never_applied`, `stale_rewind_is_derived_from_anchor_and_distance`, `stale_branches_are_never_selected`, `late_withheld_rejection_requires_publish_after_anchor_and_stale` |
+| Executability and bounded-case coverage | `quorum_override_executable`, `raw_depth_lead_executable`, `witness_score_tie_executable`, `digest_tie_executable`, `stale_rewind_executable`, `duplicate_witness_dedupe_executable`, `outbound_queue_release_executable`, `outbound_settled_publish_executable`, `three_branch_permutation_executable`, `withheld_published_after_anchor_executable`, `retained_anchor_within_horizon_executable`, `missing_retained_anchor_executable`, `beyond_anchor_invalidated_executable`, `commit_application_app_output_executable`, `welcome_before_commit_handoff_executable`, `own_commit_fork_handoff_executable`, `proposal_canonical_consumption_executable`, `delivery_order_robustness_executable`, `generated_quorum_override_executable`, `generated_quorum_capped_by_depth_executable`, `generated_depth_priority_executable`, `generated_witness_priority_executable`, `generated_priority_tie_executable`, `generated_committer_tie_executable`, `generated_digest_priority_executable` |
+
+The inventory classifies proof scope; it is not a coverage claim for clocks, restart, durable pass generations,
+fairness, resource exhaustion, or unbounded self-update traffic.
 
 - **Tamarin artifact:** `Init_*` rule
   - **What it means:** A named abstract scenario.
@@ -202,6 +240,13 @@ For bounded policy seeds, update `policy_cases.json` first. Then check both cons
 cargo test -p cgka-conformance-simulator --test generated_policy_cases
 cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
 ```
+
+The six-rule adjacency cases stay grep-aligned across both consumers:
+
+- `generated_priority_tie` / `generated_priority_tie_executable` /
+  `generated_priority_tie_matches_selector_before_digest`
+- `generated_committer_tie` / `generated_committer_tie_executable` /
+  `generated_committer_tie_matches_selector_before_digest`
 
 Use the executable lemmas as a fixture catalog. Each one says "this situation exists and the system must handle it." Use
 the universal lemmas as property-test targets. For example, `same_input_set_converges` maps to generated branch sets fed

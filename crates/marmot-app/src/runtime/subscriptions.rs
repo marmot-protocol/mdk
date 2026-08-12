@@ -2,7 +2,9 @@
 //! [`MarmotAppRuntime`] builders that spawn their fan-out tasks.
 
 use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::{GroupId, MessageId};
@@ -523,6 +525,15 @@ pub enum RuntimeChatListUpdate {
         trigger: ChatListUpdateTrigger,
         group_id_hex: String,
     },
+    /// Full replacement for this subscription's visible chat list.
+    ///
+    /// Consumers must atomically replace their locally held rows with `rows`;
+    /// any previously held row absent from this value has left the subscribed
+    /// list and must be removed.
+    Snapshot {
+        trigger: ChatListUpdateTrigger,
+        rows: Vec<ChatListRow>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +545,11 @@ pub enum ChatListUpdateTrigger {
     PendingConfirmationChanged,
     MembershipChanged,
     UnreadChanged,
+    ManualUnreadChanged,
+    MuteChanged,
+    ConversationKindChanged,
+    LatestMessageDeliveryChanged,
+    PinOrderChanged,
     #[default]
     SnapshotRefresh,
     Removed,
@@ -541,6 +557,17 @@ pub enum ChatListUpdateTrigger {
 
 impl ChatListUpdateTrigger {
     pub(crate) fn from_timeline_changes(changes: &[TimelineMessageChange]) -> Self {
+        if changes.iter().any(|change| {
+            matches!(
+                change,
+                TimelineMessageChange::Upsert {
+                    trigger: TimelineUpdateTrigger::DeliveryOrSendStateChanged,
+                    ..
+                }
+            )
+        }) {
+            return Self::LatestMessageDeliveryChanged;
+        }
         if changes.iter().any(|change| {
             matches!(
                 change,
@@ -830,7 +857,7 @@ impl MarmotAppRuntime {
                                 continue;
                             }
                             let message_id = message.message_id_hex.clone();
-                            if !message_id.is_empty() && !seen_message_ids.insert(message_id) {
+                            if !seen_message_ids.should_emit(message_id) {
                                 continue;
                             }
                             if updates_tx.send(update).await.is_err() {
@@ -854,7 +881,8 @@ impl MarmotAppRuntime {
                 {
                     continue;
                 }
-                if !seen_message_ids.insert(message.message_id_hex.clone()) {
+                let message_id = message.message_id_hex.clone();
+                if !seen_message_ids.should_emit(message_id) {
                     continue;
                 }
                 if updates_tx.send(update).await.is_err() {
@@ -1074,12 +1102,77 @@ impl MarmotAppRuntime {
             .iter()
             .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row)))
             .collect::<HashMap<_, _>>();
+        let mut mute_expiries = chat_list_mute_expiries(&snapshot);
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
+                let next_mute_expiry = mute_expiries.values().copied().min();
+                let expiry_wait = async {
+                    let Some(until_ms) = next_mute_expiry else {
+                        pending::<()>().await;
+                        return;
+                    };
+                    let delay_ms = until_ms.saturating_sub(notifications::unix_now_ms());
+                    tokio::time::sleep(Duration::from_millis(
+                        u64::try_from(delay_ms).unwrap_or_default(),
+                    ))
+                    .await;
+                };
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                    event = events.recv() => event,
+                    event = events.recv() => Some(event),
+                    _ = expiry_wait => None,
+                };
+                let Some(event) = event else {
+                    let now_ms = notifications::unix_now_ms();
+                    let expired = mute_expiries
+                        .iter()
+                        .filter(|(_, until_ms)| **until_ms <= now_ms)
+                        .map(|(group_id_hex, _)| group_id_hex.clone())
+                        .collect::<Vec<_>>();
+                    for group_id_hex in expired {
+                        mute_expiries.remove(&group_id_hex);
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let group_id_hex_for_lookup = group_id_hex.clone();
+                        let row = match blocking_app_task(move || {
+                            app_for_lookup.refresh_chat_list_row(
+                                &account_label_for_lookup,
+                                &group_id_hex_for_lookup,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(row) => row,
+                            Err(_) => {
+                                // A transient storage failure must not leave a
+                                // subscriber permanently showing an expired
+                                // mute. Retry shortly without spinning on an
+                                // already-past deadline.
+                                mute_expiries.insert(group_id_hex, now_ms.saturating_add(1_000));
+                                continue;
+                            }
+                        };
+                        let Some(row) = row else {
+                            continue;
+                        };
+                        remember_chat_list_mute_expiry(&mut mute_expiries, &row);
+                        if !include_archived && row.archived {
+                            mute_expiries.remove(&row.group_id_hex);
+                            continue;
+                        }
+                        if !send_chat_list_row_update(
+                            &updates_tx,
+                            &mut row_fingerprints,
+                            ChatListUpdateTrigger::MuteChanged,
+                            row,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    continue;
                 };
                 let event = match event {
                     Ok(event) => event,
@@ -1094,6 +1187,7 @@ impl MarmotAppRuntime {
                             Ok(rows) => rows,
                             Err(_) => continue,
                         };
+                        mute_expiries = chat_list_mute_expiries(&rows);
                         if !reconcile_chat_list_snapshot(
                             &updates_tx,
                             &mut row_fingerprints,
@@ -1111,7 +1205,36 @@ impl MarmotAppRuntime {
                 if let Some(update) = projection_update_from_event(&event)
                     && update.account_id_hex == account_id_hex
                 {
+                    if matches!(
+                        update.update.chat_list_trigger,
+                        ChatListUpdateTrigger::PinOrderChanged
+                            | ChatListUpdateTrigger::ArchiveChanged
+                    ) {
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let rows = match blocking_app_task(move || {
+                            app_for_lookup.chat_list(&account_label_for_lookup, include_archived)
+                        })
+                        .await
+                        {
+                            Ok(rows) => rows,
+                            Err(_) => continue,
+                        };
+                        mute_expiries = chat_list_mute_expiries(&rows);
+                        if !send_atomic_chat_list_snapshot(
+                            &updates_tx,
+                            &mut row_fingerprints,
+                            update.update.chat_list_trigger,
+                            rows,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let Some(row) = update.update.chat_list_row.clone() else {
+                        mute_expiries.remove(&update.update.group_id_hex);
                         if !send_chat_list_remove_update(
                             &updates_tx,
                             &mut row_fingerprints,
@@ -1124,7 +1247,9 @@ impl MarmotAppRuntime {
                         }
                         continue;
                     };
+                    remember_chat_list_mute_expiry(&mut mute_expiries, &row);
                     if !include_archived && row.archived {
+                        mute_expiries.remove(&row.group_id_hex);
                         if !send_chat_list_remove_update(
                             &updates_tx,
                             &mut row_fingerprints,
@@ -1172,6 +1297,7 @@ impl MarmotAppRuntime {
                     Err(_) => continue,
                 };
                 let Some(row) = row else {
+                    mute_expiries.remove(&group_id_hex);
                     if !send_chat_list_remove_update(
                         &updates_tx,
                         &mut row_fingerprints,
@@ -1184,7 +1310,9 @@ impl MarmotAppRuntime {
                     }
                     continue;
                 };
+                remember_chat_list_mute_expiry(&mut mute_expiries, &row);
                 if !include_archived && row.archived {
+                    mute_expiries.remove(&row.group_id_hex);
                     if !send_chat_list_remove_update(
                         &updates_tx,
                         &mut row_fingerprints,
@@ -1432,10 +1560,12 @@ pub(crate) fn received_message_update_from_record(
         sender_display_name,
         group_id,
         source_epoch: record.source_epoch.unwrap_or(0),
+        retention: record.retention,
         plaintext: record.plaintext,
         kind: record.kind,
         tags: record.tags,
         recorded_at: record.recorded_at,
+        received_at: record.received_at,
     };
     let received = RuntimeMessageReceived {
         account_id_hex: account_id_hex.to_owned(),
@@ -1463,6 +1593,28 @@ pub(crate) fn chat_list_row_fingerprint(row: &ChatListRow) -> String {
     let mut stable = row.clone();
     stable.updated_at = 0;
     serde_json::to_string(&stable).unwrap_or_else(|_| row.group_id_hex.clone())
+}
+
+pub(crate) fn chat_list_mute_expiries(rows: &[ChatListRow]) -> HashMap<String, i64> {
+    let mut expiries = HashMap::new();
+    for row in rows {
+        remember_chat_list_mute_expiry(&mut expiries, row);
+    }
+    expiries
+}
+
+pub(crate) fn remember_chat_list_mute_expiry(
+    expiries: &mut HashMap<String, i64>,
+    row: &ChatListRow,
+) {
+    match (row.muted, row.muted_until_ms) {
+        (true, Some(until_ms)) => {
+            expiries.insert(row.group_id_hex.clone(), until_ms);
+        }
+        _ => {
+            expiries.remove(&row.group_id_hex);
+        }
+    }
 }
 
 async fn send_chat_list_row_update(
@@ -1530,4 +1682,21 @@ pub(crate) async fn reconcile_chat_list_snapshot(
         }
     }
     true
+}
+
+pub(crate) async fn send_atomic_chat_list_snapshot(
+    updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
+    row_fingerprints: &mut HashMap<String, String>,
+    trigger: ChatListUpdateTrigger,
+    rows: Vec<ChatListRow>,
+) -> bool {
+    row_fingerprints.clear();
+    row_fingerprints.extend(
+        rows.iter()
+            .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row))),
+    );
+    updates_tx
+        .send(RuntimeChatListUpdate::Snapshot { trigger, rows })
+        .await
+        .is_ok()
 }

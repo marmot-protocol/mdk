@@ -132,6 +132,7 @@ write_env_file() {
         printf 'export OPENCLAW_HOME=%q\n' "$OPENCLAW_HOME"
         printf 'export MARMOT_HOME=%q\n' "$MARMOT_HOME"
         printf 'export MARMOT_AGENT_SOCKET=%q\n' "$SOCKET_PATH"
+        printf 'export MARMOT_OUTBOUND_MEDIA_DIR=%q\n' "$MARMOT_HOME/dev/outbound-media"
         printf 'export MARMOT_AGENT_AUTH_TOKEN_FILE=%q\n' "$AUTH_TOKEN_FILE"
         printf 'export MARMOT_AGENT_SOCKET_DIR_MODE=%q\n' "$SOCKET_DIR_MODE"
         printf 'export MARMOT_AGENT_SOCKET_MODE=%q\n' "$SOCKET_MODE"
@@ -163,10 +164,13 @@ set -euo pipefail
 dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$dev_root/env.sh"
 cd "$MDK_REPO"
+mkdir -p "$MARMOT_OUTBOUND_MEDIA_DIR"
+chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
 wn_agent_control_args=(
     --socket "$MARMOT_AGENT_SOCKET"
     --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0700}"
     --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0600}"
+    --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR"
 )
 if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
     wn_agent_control_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")

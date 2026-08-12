@@ -6,6 +6,7 @@ import type {
   MarmotAgentControlClient,
 } from "../src/client.js";
 import {
+  resetMarmotInboundAccountsForTests,
   startMarmotInbound,
   syncMarmotAllowlist,
   type InboundPluginApi,
@@ -47,9 +48,13 @@ function inboundEvent(groupByte: string, idByte: string): InboundMessageEvent {
     type: "inbound_message",
     account_id_hex: HEX32("aa"),
     group_id_hex: HEX32(groupByte),
-    message_id_hex: HEX32(idByte),
-    sender_account_id_hex: HEX32("bb"),
-    text: "hello agent",
+    message: {
+      message_id_hex: HEX32(idByte),
+      sender: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      text: "hello agent",
+      recorded_at: 123,
+      media: [],
+    },
   };
 }
 
@@ -77,6 +82,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
 }
 
 afterEach(() => {
+  resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
 });
 
@@ -104,12 +110,7 @@ describe("startMarmotInbound", () => {
         clientFactory: () =>
           inboundStubClient([
             {
-              type: "inbound_message",
-              account_id_hex: HEX32("aa"),
-              group_id_hex: HEX32("cc"),
-              message_id_hex: HEX32("dd"),
-              sender_account_id_hex: HEX32("bb"),
-              text: "hello agent",
+              ...inboundEvent("cc", "dd"),
             },
           ]),
       },
@@ -155,22 +156,27 @@ describe("startMarmotInbound", () => {
           inboundStubClient([
             {
               ...inboundEvent("cc", "d1"),
-              text: "",
+              message: { ...inboundEvent("cc", "d1").message, text: "", media: [mediaA] },
               mentions_self: true,
-              reply_to_message_id_hex: HEX32("e1"),
-              media: [mediaA],
+              reply_to: {
+                message_id_hex: HEX32("e1"),
+                availability: "missing",
+                text_truncated: false,
+                attachments_truncated: false,
+              },
             },
             {
               ...inboundEvent("cc", "d2"),
-              text: "",
-              media: [{ ...mediaA, file_name: "a-duplicate.png" }, mediaB],
+              message: {
+                ...inboundEvent("cc", "d2").message,
+                text: "",
+                media: [{ ...mediaA, file_name: "a-duplicate.png" }, mediaB],
+              },
             },
             {
               ...inboundEvent("cc", "d3"),
-              text: "what is this?",
+              message: { ...inboundEvent("cc", "d3").message, text: "what is this?", media: [] },
               mentions_self: false,
-              reply_to_message_id_hex: null,
-              media: [],
             },
           ]),
       },
@@ -190,45 +196,341 @@ describe("startMarmotInbound", () => {
     expect(dispatched[0]?.media).toEqual([mediaA, mediaB]);
   });
 
-  it("surfaces a message deletion to the ambient surfacer with a stable contextKey", async () => {
-    const surfaced: { groupIdHex: string; text: string; contextKey?: string }[] = [];
+  it("buffers every mutation type and attaches them to the next triggering message", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
       config: { channels: { marmot: { profileNameOnboarding: false } } },
       logger: noopLogger,
     };
-    const stop = startMarmotInbound(api, () => {}, {
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
       clientFactory: () =>
         inboundStubClient([
+          {
+            type: "message_edited",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e1"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            replacement_text: "edited",
+            recorded_at: 122,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          {
+            type: "reaction_added",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e2"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            emoji: "👍",
+            recorded_at: 123,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          {
+            type: "reaction_removed",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e3"),
+            reaction_event_id_hex: HEX32("e2"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            emoji: "👍",
+            recorded_at: 124,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
           {
             type: "message_deleted",
             account_id_hex: HEX32("aa"),
             group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("ee"),
             target_message_id_hex: HEX32("dd"),
-            sender_account_id_hex: HEX32("bb"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            recorded_at: 125,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "deleted",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
           },
+          inboundEvent("cc", "ff"),
         ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
     });
 
-    await waitFor(() => surfaced.length > 0);
+    await waitFor(() => dispatched.length > 0);
     stop();
 
-    expect(surfaced[0]).toMatchObject({
-      groupIdHex: HEX32("cc"),
-      text: "A message was deleted.",
-      contextKey: `marmot:message_deleted:${HEX32("cc")}:${HEX32("dd")}`,
-    });
+    expect(dispatched[0]?.ambientContext?.map((event) => event.type)).toEqual([
+      "message_edited",
+      "reaction_added",
+      "reaction_removed",
+      "message_deleted",
+    ]);
   });
 
-  it("surfaces a group rename with the new name and a change-scoped contextKey", async () => {
-    const surfaced: { groupIdHex: string; text: string; contextKey?: string }[] = [];
+  it("keeps ambient context when a non-triggering message is gated out", async () => {
+    const attempted: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
       config: { channels: { marmot: { profileNameOnboarding: false } } },
       logger: noopLogger,
     };
-    const stop = startMarmotInbound(api, () => {}, {
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        attempted.push(message);
+        return attempted.length > 1;
+      },
+      {
+        clientFactory: () =>
+          inboundStubClient([
+            {
+              type: "reaction_added",
+              account_id_hex: HEX32("aa"),
+              group_id_hex: HEX32("cc"),
+              event_id_hex: HEX32("e1"),
+              target_message_id_hex: HEX32("dd"),
+              actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+              emoji: "👍",
+              recorded_at: 124,
+              target: {
+                message_id_hex: HEX32("dd"),
+                availability: "available",
+                text_excerpt: "target",
+                text_truncated: false,
+                attachments_truncated: false,
+              },
+            },
+            inboundEvent("cc", "f1"),
+            inboundEvent("cc", "f2"),
+          ]),
+      },
+    );
+
+    await waitFor(() => attempted.length === 2);
+    stop();
+
+    expect(attempted[0]?.ambientContext).toHaveLength(1);
+    expect(attempted[1]?.ambientContext).toHaveLength(1);
+    expect(attempted[1]?.ambientContext?.[0]).toMatchObject({
+      type: "reaction_added",
+      event_id_hex: HEX32("e1"),
+    });
+  });
+
+  it("bounds pending ambient facts per account and group", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const mutations = Array.from({ length: 20 }, (_, index) => ({
+      type: "message_edited" as const,
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      event_id_hex: index.toString(16).padStart(64, "0"),
+      target_message_id_hex: HEX32("dd"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      replacement_text: `edit-${index}`,
+      recorded_at: 124 + index,
+      target: {
+        message_id_hex: HEX32("dd"),
+        availability: "available" as const,
+        text_excerpt: "target",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    }));
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message);
+      },
+      {
+        clientFactory: () => inboundStubClient([...mutations, inboundEvent("cc", "ff")]),
+      },
+    );
+
+    await waitFor(() => dispatched.length === 1);
+    stop();
+
+    expect(dispatched[0]?.ambientContext).toHaveLength(16);
+    expect(dispatched[0]?.ambientContext?.[0]).toMatchObject({ replacement_text: "edit-4" });
+    expect(dispatched[0]?.ambientContext?.at(-1)).toMatchObject({
+      replacement_text: "edit-19",
+    });
+  });
+
+  it("preserves ambient facts that arrive while a full batch is in flight", async () => {
+    const groupIdHex = HEX32("cc");
+    const oldMutations: AgentControlEvent[] = Array.from({ length: 16 }, (_, index) => ({
+      type: "message_edited",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupIdHex,
+      event_id_hex: index.toString(16).padStart(64, "0"),
+      target_message_id_hex: HEX32("dd"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      replacement_text: `old-${index}`,
+      recorded_at: 124 + index,
+      target: {
+        message_id_hex: HEX32("dd"),
+        availability: "available",
+        text_excerpt: "target",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    }));
+    const lateMutation: AgentControlEvent = {
+      type: "reaction_added",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupIdHex,
+      event_id_hex: HEX32("e9"),
+      target_message_id_hex: HEX32("dd"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      emoji: "🔥",
+      recorded_at: 999,
+      target: {
+        message_id_hex: HEX32("dd"),
+        availability: "available",
+        text_excerpt: "target",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    };
+    let markTurnStarted: () => void = () => {};
+    let releaseTurn: () => void = () => {};
+    let markLateProcessed: () => void = () => {};
+    const turnStarted = new Promise<void>((resolve) => {
+      markTurnStarted = resolve;
+    });
+    const turnRelease = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const lateProcessed = new Promise<void>((resolve) => {
+      markLateProcessed = resolve;
+    });
+    const client = {
+      async accountList() {
+        return {
+          type: "account_list",
+          accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+        };
+      },
+      async *subscribeInbound(
+        _filter?: unknown,
+        _signal?: AbortSignal,
+        hooks?: { onReady?: () => void },
+      ): AsyncGenerator<AgentControlEvent> {
+        hooks?.onReady?.();
+        for (const event of oldMutations) {
+          yield event;
+        }
+        yield inboundEvent("cc", "f1");
+        await turnStarted;
+        yield lateMutation;
+        // Reaching the next pull proves the bridge processed lateMutation.
+        markLateProcessed();
+        await turnRelease;
+        yield inboundEvent("cc", "f2");
+      },
+    } as unknown as MarmotAgentControlClient;
+    const dispatched: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      async (message) => {
+        dispatched.push(message);
+        if (dispatched.length === 1) {
+          markTurnStarted();
+          await turnRelease;
+        }
+        return true;
+      },
+      { clientFactory: () => client },
+    );
+
+    await turnStarted;
+    await lateProcessed;
+    releaseTurn();
+    await waitFor(() => dispatched.length === 2);
+    stop();
+
+    expect(dispatched[0]?.ambientContext).toHaveLength(16);
+    expect(dispatched[1]?.ambientContext).toEqual([lateMutation]);
+  });
+
+  it("bounds the number of groups holding pending ambient context", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const groupIds = Array.from({ length: 257 }, (_, index) =>
+      index.toString(16).padStart(64, "0"),
+    );
+    const mutations = groupIds.map((groupId, index) => ({
+      type: "group_state_changed" as const,
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupId,
+      change: "group_renamed",
+      detail: `group-${index}`,
+    }));
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message);
+      },
+      {
+        clientFactory: () =>
+          inboundStubClient([
+            ...mutations,
+            { ...inboundEvent("cc", "f1"), group_id_hex: groupIds[0]! },
+            { ...inboundEvent("cc", "f2"), group_id_hex: groupIds.at(-1)! },
+          ]),
+      },
+    );
+
+    await waitFor(() => dispatched.length === 2);
+    stop();
+
+    const oldest = dispatched.find((message) => message.groupIdHex === groupIds[0]);
+    const newest = dispatched.find((message) => message.groupIdHex === groupIds.at(-1));
+    expect(oldest?.ambientContext).toHaveLength(0);
+    expect(newest?.ambientContext).toHaveLength(1);
+  });
+
+  it("buffers group state as structured next-turn context", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
       clientFactory: () =>
         inboundStubClient([
           {
@@ -238,48 +540,18 @@ describe("startMarmotInbound", () => {
             change: "group_renamed",
             detail: "Project Marmot",
           },
+          inboundEvent("cc", "ff"),
         ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
     });
 
-    await waitFor(() => surfaced.length > 0);
+    await waitFor(() => dispatched.length > 0);
     stop();
 
-    expect(surfaced[0]).toMatchObject({
-      groupIdHex: HEX32("cc"),
-      text: 'The group was renamed to "Project Marmot".',
-      contextKey: `marmot:group_state_changed:${HEX32("cc")}:group_renamed`,
+    expect(dispatched[0]?.ambientContext?.[0]).toMatchObject({
+      type: "group_state_changed",
+      change: "group_renamed",
+      detail: "Project Marmot",
     });
-  });
-
-  it("surfaces a membership change without any member detail", async () => {
-    const surfaced: { text: string }[] = [];
-    const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
-      logger: noopLogger,
-    };
-    const stop = startMarmotInbound(api, () => {}, {
-      clientFactory: () =>
-        inboundStubClient([
-          {
-            type: "group_state_changed",
-            account_id_hex: HEX32("aa"),
-            group_id_hex: HEX32("cc"),
-            change: "member_added",
-            detail: null,
-          },
-        ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
-    });
-
-    await waitFor(() => surfaced.length > 0);
-    stop();
-
-    expect(surfaced[0]?.text).toBe("A member was added to the group.");
   });
 
   it("invalidates the dispatcher's group-activation cache on a group_state_changed event", async () => {

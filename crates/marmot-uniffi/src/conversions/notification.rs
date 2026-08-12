@@ -1,9 +1,38 @@
-//! Notification settings, triggers, users, and update FFI conversions.
+//! Notification settings, triggers, users, and update FFI conversions —
+//! plus the wake-path cursor-persistence policy.
 
 use marmot_app::{
-    NotificationCollectionStatus, NotificationSettings, NotificationTrigger, NotificationUpdate,
-    NotificationUser, NotificationWakeSource,
+    CursorPersistence, NotificationCollectionStatus, NotificationSettings,
+    NotificationTrafficClass, NotificationTrigger, NotificationUpdate, NotificationUser,
+    NotificationWakeSource,
 };
+
+/// Durable transport-cursor persistence policy, chosen at [`crate::Marmot`]
+/// construction (`Marmot::new_with_cursor_persistence`).
+///
+/// `Frozen` is the wake-collection posture for runtimes with a sub-second
+/// drain budget on cold sockets — the iOS NSE (one runtime per push around
+/// `collect_notifications_after_wake`) and the notification reply/mark-read
+/// action paths. A `Frozen` pass still ingests, decrypts, and projects
+/// everything; it only cannot move the durable `since` floor, so a wake that
+/// drained for a fraction of a second can never make events permanently
+/// unfetchable. Worst case is bounded redelivery on the next `Advance`
+/// catch-up, absorbed by seen-id dedup. Foreground app runtimes must keep the
+/// default `Advance`. Full semantics: `marmot_app::CursorPersistence`.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum CursorPersistenceFfi {
+    Advance,
+    Frozen,
+}
+
+impl From<CursorPersistenceFfi> for CursorPersistence {
+    fn from(value: CursorPersistenceFfi) -> Self {
+        match value {
+            CursorPersistenceFfi::Advance => Self::Advance,
+            CursorPersistenceFfi::Frozen => Self::Frozen,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum NotificationWakeSourceFfi {
@@ -56,6 +85,21 @@ impl From<NotificationTrigger> for NotificationTriggerFfi {
     }
 }
 
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum NotificationTrafficClassFfi {
+    Standard,
+    AgentActivity,
+}
+
+impl From<NotificationTrafficClass> for NotificationTrafficClassFfi {
+    fn from(value: NotificationTrafficClass) -> Self {
+        match value {
+            NotificationTrafficClass::Standard => Self::Standard,
+            NotificationTrafficClass::AgentActivity => Self::AgentActivity,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NotificationSettingsFfi {
     pub account_ref: String,
@@ -97,6 +141,7 @@ pub struct NotificationUpdateFfi {
     pub notification_key: String,
     pub conversation_key: String,
     pub trigger: NotificationTriggerFfi,
+    pub traffic_class: NotificationTrafficClassFfi,
     pub account_ref: String,
     pub account_id_hex: String,
     pub group_id_hex: String,
@@ -119,6 +164,7 @@ impl From<NotificationUpdate> for NotificationUpdateFfi {
             notification_key: value.notification_key,
             conversation_key: value.conversation_key,
             trigger: value.trigger.into(),
+            traffic_class: value.traffic_class.into(),
             account_ref: value.account_ref,
             account_id_hex: value.account_id_hex,
             group_id_hex: value.group_id_hex,
@@ -151,5 +197,18 @@ impl From<marmot_app::BackgroundNotificationCollection> for BackgroundNotificati
             notifications: value.notifications.into_iter().map(Into::into).collect(),
             error: value.error,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_activity_traffic_class_crosses_the_ffi_boundary() {
+        assert!(matches!(
+            NotificationTrafficClassFfi::from(marmot_app::NotificationTrafficClass::AgentActivity,),
+            NotificationTrafficClassFfi::AgentActivity,
+        ));
     }
 }

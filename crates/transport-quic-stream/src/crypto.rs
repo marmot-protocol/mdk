@@ -1,6 +1,8 @@
 //! Per-stream AEAD: the `AgentTextStreamCrypto` key material, record
 //! seal/open, and the HKDF key/nonce and AAD derivations vectors pin.
 
+use std::sync::Arc;
+
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_VERSION,
     AGENT_TEXT_STREAM_START_EVENT_ID_LEN, AgentTextStreamKeyContextV1, AgentTextStreamRecordV1,
@@ -19,6 +21,7 @@ use crate::protocol::{AEAD_TAG_LEN, AGENT_TEXT_STREAM_SECRET_LEN};
 pub struct AgentTextStreamCrypto {
     pub stream_secret: SecretBytes,
     pub context: AgentTextStreamKeyContextV1,
+    publisher_sequence_store: Option<Arc<dyn crate::PublisherSequenceStore>>,
 }
 
 impl AgentTextStreamCrypto {
@@ -26,7 +29,22 @@ impl AgentTextStreamCrypto {
         Self {
             stream_secret,
             context,
+            publisher_sequence_store: None,
         }
+    }
+
+    pub fn with_publisher_sequence_store(
+        mut self,
+        store: Arc<dyn crate::PublisherSequenceStore>,
+    ) -> Self {
+        self.publisher_sequence_store = Some(store);
+        self
+    }
+
+    pub(crate) fn publisher_sequence_store(
+        &self,
+    ) -> Option<Arc<dyn crate::PublisherSequenceStore>> {
+        self.publisher_sequence_store.clone()
     }
 }
 

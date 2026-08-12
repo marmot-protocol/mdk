@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,7 +51,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    fs_private::create_dir_all_private(parent)?;
 
     let (mut file, temp_path) = create_temp_file(parent, path, mode)?;
     let result = (|| -> AccountHomeResult<()> {
@@ -69,16 +69,81 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         file.sync_all()?;
         drop(file);
 
+        let mut replaced_private_file = if mode == FileMode::Private {
+            match open_file_for_zero_overwrite(path) {
+                Ok(file) => Some(file),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            None
+        };
         replace_file(&temp_path, path)?;
+        // The handle still refers to the replaced inode after the atomic rename,
+        // so scrub it without creating a window where the live secret path is
+        // zeroed if replacement fails. Best-effort, matching secret deletion.
+        if let Some(file) = &mut replaced_private_file {
+            let _ = overwrite_open_file_with_zeros(file);
+        }
         sync_directory(parent)?;
         Ok(())
     })();
 
     if result.is_err() {
+        if mode == FileMode::Private {
+            let _ = overwrite_file_with_zeros(&temp_path);
+        }
         let _ = fs::remove_file(&temp_path);
     }
 
     result
+}
+
+/// Best-effort in-place zero overwrite used before unlinking files that may
+/// contain plaintext key material.
+pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
+    let mut file = open_file_for_zero_overwrite(path)?;
+    overwrite_open_file_with_zeros(&mut file)
+}
+
+fn open_file_for_zero_overwrite(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secret scrub target must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secret scrub target must have exactly one hard link",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn overwrite_open_file_with_zeros(file: &mut File) -> io::Result<()> {
+    let len = file.metadata()?.len();
+    if len > 0 {
+        let zeros = vec![0u8; len as usize];
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&zeros)?;
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 fn create_temp_file(
@@ -155,8 +220,65 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
         || label.contains('/')
         || label.contains('\\')
         || label.contains(':')
+        || label.chars().any(char::is_control)
     {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn secret_write_creates_account_directory_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+        let account_dir = root.path().join("accounts").join("alice");
+        let secret_path = account_dir.join("secret.json");
+
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "test" })).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&account_dir), 0o700);
+        assert_eq!(mode(&secret_path), 0o600);
+    }
+
+    #[test]
+    fn failed_private_atomic_write_scrubs_temp_before_unlink() {
+        let source = include_str!("io.rs");
+        let cleanup = source
+            .split("if result.is_err()")
+            .nth(1)
+            .unwrap()
+            .split("result\n}")
+            .next()
+            .unwrap();
+
+        assert!(
+            cleanup.find("overwrite_file_with_zeros").unwrap()
+                < cleanup.find("remove_file").unwrap()
+        );
+    }
+
+    #[test]
+    fn replacing_secret_scrubs_the_replaced_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+        let mut old_inode = File::open(&secret_path).unwrap();
+
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "new-key" })).unwrap();
+
+        let mut replaced_bytes = Vec::new();
+        old_inode.read_to_end(&mut replaced_bytes).unwrap();
+        assert!(replaced_bytes.iter().all(|byte| *byte == 0));
+        assert!(
+            fs::read_to_string(&secret_path)
+                .unwrap()
+                .contains("new-key")
+        );
+    }
 }

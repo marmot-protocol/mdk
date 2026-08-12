@@ -9,19 +9,24 @@ publish.workspace = true
 async-trait.workspace = true
 cgka-session.workspace = true
 cgka-traits.workspace = true
+fs-private.workspace = true
+futures.workspace = true
 hex.workspace = true
 keyring-core.workspace = true
+libc.workspace = true
 marmot-forensics.workspace = true
 nostr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 cgka-engine.workspace = true
-sha2.workspace = true
+rusqlite.workspace = true
 storage-sqlite.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

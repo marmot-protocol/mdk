@@ -938,15 +938,130 @@ pub enum AuditEventKind {
         /// transition (deferred-peel lifecycle rows only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_count: Option<u64>,
-        /// How many retry sweeps elapsed between the row's first attempt and
-        /// this transition — the queue-wait clock for deferred rows.
+        /// How many wall-clock milliseconds elapsed between the row's durable
+        /// first observation and this transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        sweeps_waited: Option<u64>,
+        residence_ms: Option<u64>,
     },
     /// A message or intent was rejected with a structured reason.
     Rejection {
         msg_id: MessageRefHex,
         reason: String,
+    },
+    /// The account's Nostr subscription plane was rebuilt with a `since` floor.
+    /// Records the floor actually requested (`since_secs`; `None` means a
+    /// full-history replay because the durable cursor was absent or detectably
+    /// corrupt), the lookback subtracted from the durable cursor to derive it
+    /// (`lookback_secs`), and the per-relay registration outcome
+    /// (`relay_results`). Together with [`AuditEventKind::SyncDrain`] these rows
+    /// let an analyzer reconstruct the decisive
+    /// persisted-cursor-vs-missed-`created_at` evidence from any export,
+    /// including NSE wake sessions.
+    ///
+    /// Units: the durable transport cursor is advanced from inbound event
+    /// `created_at`, which is Nostr second-granular, so the derived floor and
+    /// lookback are `_secs` — deliberately not the `_ms` used by wall-clock
+    /// rows elsewhere in this schema.
+    ///
+    /// Privacy: `relay_results` carries relay URLs. This is deliberate and
+    /// mirrors the existing publish-path kinds — [`AuditEventKind::PublishAttempt`]
+    /// and [`AuditEventKind::PublishOutcome`] already carry `relay_url` /
+    /// `relay_urls` / `accepted_relay_urls`, and [`scrub_full_data_fields`]
+    /// leaves those relay fields untouched even in obfuscated mode. The forensic
+    /// audit channel is a consented, sensitivity-classified surface, distinct
+    /// from the tracing/logging invariant that forbids relay URLs in logs; so
+    /// rebuild rows carry the same relay identifiers the publish rows already do
+    /// rather than being the odd kind out. The URLs are caller-supplied
+    /// subscription endpoints, never a new identity minted at the transport
+    /// boundary.
+    SubscriptionRebuild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relay_results: Vec<RelayRegistration>,
+    },
+    /// The transport drain loop (`sync_sdk_relay`) finished draining inbound
+    /// deliveries and is about to persist state. Records how long the drain ran
+    /// (`duration_ms`, true wall-clock), how many deliveries it ingested
+    /// (`deliveries`), and the durable transport cursor immediately before and
+    /// after the drain (`cursor_before_secs` / `cursor_after_secs`; `None`
+    /// before any delivery has ever advanced the cursor).
+    ///
+    /// Units: the cursor is a Nostr second-granular timestamp, so those fields
+    /// are `_secs`; `duration_ms` is a genuine millisecond wall-clock duration.
+    ///
+    /// Privacy: scalar counts and timestamps only — no relay URLs, ids, or
+    /// payloads — so nothing here needs scrubbing in either data mode.
+    SyncDrain {
+        duration_ms: u64,
+        deliveries: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_before_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_after_secs: Option<u64>,
+    },
+    /// A group crossed the epoch-stall backfill threshold — enough distinct
+    /// undecryptable messages at one stalled epoch — and armed a full-history
+    /// epoch-gap backfill (commit-loss recovery). Emitted once per (group,
+    /// stalled epoch) at the arm decision, *before* the replay side effect runs,
+    /// so a field export reveals when and why full-history replays fire — the
+    /// evidence loop for tuning the empirical backfill threshold.
+    ///
+    /// Group-scoped: the stalled group's id is on the enclosing
+    /// [`AuditEvent::group_ref`], exactly as the `human_action` group rows carry
+    /// it; it is deliberately not duplicated into a field here. `stalled_epoch`
+    /// is the group epoch the device was stuck at when it armed — correlate it
+    /// against the group's live epoch (visible on `group_context` / `epoch_*`
+    /// rows) to read the size of the gap that triggered recovery. `threshold` is
+    /// the distinct-undecryptable count that armed the backfill, carried so an
+    /// export is self-describing when the constant is retuned across builds.
+    ///
+    /// Privacy: two scalar counts only — no ids, relay URLs, message ids, or
+    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
+    EpochStallBackfillArmed { stalled_epoch: u64, threshold: u64 },
+    /// A group armed `arms` epoch-gap backfills without ever passing cleanly
+    /// through an epoch: full-history replay keeps recovering some backlog while
+    /// the device stays behind the group. Emitted once per unrecovered run, at
+    /// the arm that reached `arm_threshold`, alongside that arm's
+    /// `epoch_stall_backfill_armed` row.
+    ///
+    /// This is the durable record of the escalation the runtime reports to the
+    /// app, which decides whether to run the stronger repair (key-package
+    /// rotation plus a full transport re-activation). The run counter is
+    /// in-memory, so a process restart can escalate the same group again; the row
+    /// is what makes each escalation permanent evidence, and the field-evidence
+    /// loop that tunes `arm_threshold`.
+    ///
+    /// Group-scoped: the group id is on the enclosing [`AuditEvent::group_ref`],
+    /// exactly as `epoch_stall_backfill_armed` carries it. `stalled_epoch` is the
+    /// epoch the device sat at when the escalating arm fired.
+    ///
+    /// Privacy: three scalar counts only — no ids, relay URLs, message ids, or
+    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
+    EpochStallBackfillEscalated {
+        stalled_epoch: u64,
+        arms: u64,
+        arm_threshold: u64,
+    },
+    /// A durable convergence pass whose base epoch disagreed with the device's
+    /// current tip was discarded, freeing convergence to reopen at the tip.
+    /// Non-terminal by construction: it records a repair, not a fault. The
+    /// disagreement is inherited scheduling state — an older binary stamped a
+    /// pass's base epoch from the durable group record while convergence compared
+    /// the epoch manager, and those two stores can split across a restart — so
+    /// `stale_base_epoch` may sit either behind or ahead of `current_tip_epoch`.
+    /// `generation` is the discarded pass's generation, so an export shows which
+    /// scheduling state was dropped.
+    ///
+    /// Group-scoped through the enclosing [`AuditEvent::group_ref`]; three scalar
+    /// epochs/counters only, so nothing here needs scrubbing in either
+    /// [`AuditDataMode`].
+    ConvergencePassDiscarded {
+        stale_base_epoch: u64,
+        current_tip_epoch: u64,
+        generation: u64,
     },
 }
 
@@ -996,6 +1111,11 @@ impl AuditEventKind {
             AuditEventKind::AutoCommitDecision { .. } => "auto_commit_decision",
             AuditEventKind::MessageStateChanged { .. } => "message_state_changed",
             AuditEventKind::Rejection { .. } => "rejection",
+            AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
+            AuditEventKind::SyncDrain { .. } => "sync_drain",
+            AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
+            AuditEventKind::EpochStallBackfillEscalated { .. } => "epoch_stall_backfill_escalated",
+            AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
         }
     }
 }
@@ -1014,6 +1134,17 @@ pub struct PublishRelayFailure {
     pub reason: String,
 }
 
+/// One relay's registration outcome during a subscription rebuild, on
+/// [`AuditEventKind::SubscriptionRebuild`]. `relay_url` is the caller-supplied
+/// subscription endpoint; `accepted` is whether the relay acknowledged the
+/// subscription registration. See the kind doc for why the relay URL is carried
+/// here (publish-kind precedent, not scrubbed in obfuscated mode).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRegistration {
+    pub relay_url: String,
+    pub accepted: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeelerOutcomeKind {
@@ -1021,6 +1152,8 @@ pub enum PeelerOutcomeKind {
     DecryptFailed,
     StaleEpoch,
     Malformed,
+    InvalidSignature,
+    WrongRecipient,
     Other,
 }
 
@@ -1031,6 +1164,15 @@ pub enum PeelerOutcomeKind {
 /// (e.g. a `Mutex`-protected file handle).
 pub trait ForensicRecorder: Send + Sync {
     fn record(&self, record: AuditRecord);
+
+    /// Whether this recorder consumes audit events.
+    ///
+    /// Producers may use this to skip audit-only data loads on hot paths. The
+    /// default is enabled so custom recorders remain observable without code
+    /// changes; [`NoopRecorder`] is the sole disabled implementation.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 
     fn health_snapshot(&self) -> AuditRecorderHealthSnapshot {
         AuditRecorderHealthSnapshot::default()
@@ -1081,6 +1223,10 @@ pub struct NoopRecorder;
 
 impl ForensicRecorder for NoopRecorder {
     fn record(&self, _record: AuditRecord) {}
+
+    fn is_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// JSONL recorder. Appends one JSON line per event to the configured path.
@@ -1277,7 +1423,11 @@ fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditE
                 value.pubkeys_hex.clear();
             }
         }
-        AuditEventKind::ConvergenceDecision { candidates, .. } => {
+        AuditEventKind::ConvergenceDecision {
+            candidates,
+            rule_trace,
+            ..
+        } => {
             for candidate in candidates {
                 candidate.tip_committer_pubkey_hex = None;
                 if let Some(score) = candidate.score.as_mut() {
@@ -1287,6 +1437,11 @@ fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditE
                     witness.sender_pubkey_hex = None;
                 }
             }
+            // Rule inputs/results are intentionally free-form JSON, so the
+            // sink cannot prove that arbitrary future producer fields contain
+            // no full identities. Keep the typed, scrubbed candidate summary
+            // and omit the untyped trace in shareable obfuscated logs.
+            rule_trace.clear();
         }
         _ => {}
     }

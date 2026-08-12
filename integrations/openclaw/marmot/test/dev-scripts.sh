@@ -103,6 +103,7 @@ source "$default_root/env.sh"
 [ ! -e "$default_root" ]
 
 [ -x "$repo_root/scripts/install-openclaw-marmot.sh" ]
+"$repo_root/integrations/test_installer_systemd_service.sh" openclaw
 installer_dry_run="$(
     env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
         WN_AGENT_SHA="9.9.9" \
@@ -115,6 +116,25 @@ installer_stdin_dry_run="$(
         MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     bash -s -- --dry-run --yes < "$repo_root/scripts/install-openclaw-marmot.sh"
 )"
+identity_secret="nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99"
+identity_file="$tmp_parent/openclaw-agent.nsec"
+printf '%s\n' "$identity_secret" > "$identity_file"
+chmod 0600 "$identity_file"
+expected_identity="$(printf '11%.0s' {1..32})"
+installer_existing_identity_dry_run="$(
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    "$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes \
+        --existing-identity-file "$identity_file" \
+        --expected-npub "$expected_identity"
+)"
+installer_generated_identity_dry_run="$(
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    "$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes --generate-identity
+)"
 installer_bad_welcomer_status=0
 env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     WN_AGENT_SHA="9.9.9" \
@@ -122,6 +142,14 @@ env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     "$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
     >/dev/null 2>&1 || installer_bad_welcomer_status=$?
 [ "$installer_bad_welcomer_status" -ne 0 ]
+installer_identity_conflict_status=0
+"$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes --generate-identity \
+    --existing-identity-file "$identity_file" >/dev/null 2>&1 || installer_identity_conflict_status=$?
+[ "$installer_identity_conflict_status" -ne 0 ]
+installer_expected_without_source_status=0
+"$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes --expected-npub "$expected_identity" \
+    >/dev/null 2>&1 || installer_expected_without_source_status=$?
+[ "$installer_expected_without_source_status" -ne 0 ]
 case "$installer_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "OpenClaw installer dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -150,6 +178,12 @@ case "$installer_dry_run" in
     *"wn-agent-openclaw.service"* | *"org.marmot.wn-agent.openclaw.plist"* ) ;;
     *) echo "OpenClaw installer dry-run did not use the OpenClaw-specific service identity" >&2; exit 1;;
 esac
+if [ "$(uname -s)" = Linux ]; then
+    case "$installer_dry_run" in
+        *"would enable/start, or restart if already active, systemd user service: wn-agent-openclaw.service"* ) ;;
+        *) echo "OpenClaw installer dry-run did not describe active-service upgrade behavior" >&2; exit 1;;
+    esac
+fi
 case "$installer_stdin_dry_run" in
     *"openclaw-marmot-plugin-9.9.9.tgz"* ) ;;
     *) echo "OpenClaw installer stdin dry-run did not use expected plugin asset" >&2; exit 1;;
@@ -169,6 +203,22 @@ esac
 case "$installer_stdin_dry_run" in
     *"--label openclaw-agent"* ) ;;
     *) echo "OpenClaw installer stdin dry-run did not pass the OpenClaw bootstrap label" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"import-identity"*"--identity-file"*"$identity_file"*"--expected-identity"*"$expected_identity"* ) ;;
+    *) echo "OpenClaw installer did not use the shared secure identity-import command" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"bootstrap"*"--no-create"*"--account-id-hex"* ) ;;
+    *) echo "OpenClaw installer did not bootstrap the imported account with creation disabled" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"$identity_secret"* ) echo "OpenClaw installer output exposed identity secret material" >&2; exit 1;;
+    *) ;;
+esac
+case "$installer_generated_identity_dry_run" in
+    *"import-identity"* | *"--no-create"* ) echo "OpenClaw generated-identity path used existing-identity flags" >&2; exit 1;;
+    *) ;;
 esac
 
 echo "OpenClaw dev script test passed"

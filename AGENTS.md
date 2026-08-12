@@ -21,6 +21,7 @@ This repo owns the Rust implementation workspace for Marmot:
 - C ABI bindings for the app runtime,
 - CLI surface, daemon, and TUI,
 - conformance simulator and vector fixtures,
+- Goggles-incident replay adapter (agent-state export parse + classify),
 - Tamarin models for distributed convergence,
 - architecture notes and CGKA contracts.
 
@@ -53,6 +54,8 @@ The canonical protocol specification lives in
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
+| Container/VM convergence campaigns | `crates/convergence-campaign-runner/AGENTS.md` |
+| Goggles incident replay adapter | `crates/incident-replay/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 
@@ -72,14 +75,22 @@ The canonical protocol specification lives in
   account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. See
   `docs/marmot-architecture/overview/observability.md`.
 - Create local files, sockets, and databases restrictive-by-construction via `crates/fs-private` (or equivalent
-  posture with an on-disk mode test); see `docs/marmot-architecture/overview/local-artifact-safety.md`.
+  posture with an on-disk mode test), and release their file locks explicitly before a host suspends
+  (`MarmotAppRuntime::shutdown_and_close`); see `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Route every outbound connection through the host-safety dial discipline: validate each resolved address with
   `cgka_traits::app_components::reject_non_public_ip`, pin the validated address, choose TLS trust from config (never a
   resolved IP), apply a connect timeout, and gate loopback behind an explicit dev flag. See
   `docs/marmot-architecture/overview/dial-safety.md`.
+- Never dial or adopt hosts on the centralized retired-relay denylist. Retired
+  relays must not be used for discovery, bootstrap, examples, or runtime
+  traffic; keep exact endpoint literals confined to the denylist and rejection
+  regression tests.
 - Keep multi-step state changes torn-write-free: validate before mutating, compensate every applied step on the error
   path, record intent before external side effects, and never confirm work that reached no one. See
   `docs/marmot-architecture/overview/multi-step-state-changes.md`.
+- Treat workspace and conformance-fixture version bumps as manual release operations. Never change the root workspace
+  version, workspace package versions in `Cargo.lock`, or vector `conformance_version` values during feature, fix,
+  binding, or review-feedback work unless the user explicitly requests that version bump.
 - Title GitHub Releases with the version first so release lists group by cohort: whole-workspace `v<version> - MDK`,
   WN Agent `v<version> - wn-agent`, and MarmotKit `v<version> - MarmotKit`.
 - Prefer `just release-all <version>` for a full MDK/WN Agent/MarmotKit cohort release, or

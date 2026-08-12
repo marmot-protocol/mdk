@@ -48,6 +48,44 @@ mod migration_0023_chat_list_projection_version;
 mod migration_0024_pending_welcome_delivery;
 #[path = "migrations/0025_chat_notification_settings.rs"]
 mod migration_0025_chat_notification_settings;
+#[path = "migrations/0026_message_drafts.rs"]
+mod migration_0026_message_drafts;
+#[path = "migrations/0027_app_event_moderation_grant.rs"]
+mod migration_0027_app_event_moderation_grant;
+#[path = "migrations/0028_ingress_dedup.rs"]
+mod migration_0028_ingress_dedup;
+#[path = "migrations/0029_app_event_retention_decision.rs"]
+mod migration_0029_app_event_retention_decision;
+#[path = "migrations/0030_prior_nostr_routes.rs"]
+mod migration_0030_prior_nostr_routes;
+#[path = "migrations/0031_outbound_fanout.rs"]
+mod migration_0031_outbound_fanout;
+#[path = "migrations/0032_encrypted_media_secret_references.rs"]
+mod migration_0032_encrypted_media_secret_references;
+#[path = "migrations/0033_push_registration_gossip_outbox.rs"]
+mod migration_0033_push_registration_gossip_outbox;
+#[path = "migrations/0034_maintenance_publication.rs"]
+mod migration_0034_maintenance_publication;
+#[path = "migrations/0035_durable_convergence_passes.rs"]
+mod migration_0035_durable_convergence_passes;
+#[path = "migrations/0036_agent_stream_publisher_sequences.rs"]
+mod migration_0036_agent_stream_publisher_sequences;
+#[path = "migrations/0037_chat_list_semantic_timestamps.rs"]
+mod migration_0037_chat_list_semantic_timestamps;
+#[path = "migrations/0038_chat_list_interaction_state.rs"]
+mod migration_0038_chat_list_interaction_state;
+#[path = "migrations/0039_chat_pin_positions.rs"]
+mod migration_0039_chat_pin_positions;
+#[path = "migrations/0040_disband_requests.rs"]
+mod migration_0040_disband_requests;
+#[path = "migrations/0041_secure_delete_checkpoint_intents.rs"]
+mod migration_0041_secure_delete_checkpoint_intents;
+#[path = "migrations/0042_group_state_checkpoints.rs"]
+mod migration_0042_group_state_checkpoints;
+#[path = "migrations/0043_transport_group_routes.rs"]
+mod migration_0043_transport_group_routes;
+#[path = "migrations/0044_local_group_deletion_frontiers.rs"]
+mod migration_0044_local_group_deletion_frontiers;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -184,6 +222,101 @@ const MIGRATIONS: &[Migration] = &[
         version: 25,
         name: "0025_chat_notification_settings",
         apply: migration_0025_chat_notification_settings::apply,
+    },
+    Migration {
+        version: 26,
+        name: "0026_message_drafts",
+        apply: migration_0026_message_drafts::apply,
+    },
+    Migration {
+        version: 27,
+        name: "0027_app_event_moderation_grant",
+        apply: migration_0027_app_event_moderation_grant::apply,
+    },
+    Migration {
+        version: 28,
+        name: "0028_ingress_dedup",
+        apply: migration_0028_ingress_dedup::apply,
+    },
+    Migration {
+        version: 29,
+        name: "0029_app_event_retention_decision",
+        apply: migration_0029_app_event_retention_decision::apply,
+    },
+    Migration {
+        version: 30,
+        name: "0030_prior_nostr_routes",
+        apply: migration_0030_prior_nostr_routes::apply,
+    },
+    Migration {
+        version: 31,
+        name: "0031_outbound_fanout",
+        apply: migration_0031_outbound_fanout::apply,
+    },
+    Migration {
+        version: 32,
+        name: "0032_encrypted_media_secret_references",
+        apply: migration_0032_encrypted_media_secret_references::apply,
+    },
+    Migration {
+        version: 33,
+        name: "0033_push_registration_gossip_outbox",
+        apply: migration_0033_push_registration_gossip_outbox::apply,
+    },
+    Migration {
+        version: 34,
+        name: "0034_maintenance_publication",
+        apply: migration_0034_maintenance_publication::apply,
+    },
+    Migration {
+        version: 35,
+        name: "0035_durable_convergence_passes",
+        apply: migration_0035_durable_convergence_passes::apply,
+    },
+    Migration {
+        version: 36,
+        name: "0036_agent_stream_publisher_sequences",
+        apply: migration_0036_agent_stream_publisher_sequences::apply,
+    },
+    Migration {
+        version: 37,
+        name: "0037_chat_list_semantic_timestamps",
+        apply: migration_0037_chat_list_semantic_timestamps::apply,
+    },
+    Migration {
+        version: 38,
+        name: "0038_chat_list_interaction_state",
+        apply: migration_0038_chat_list_interaction_state::apply,
+    },
+    Migration {
+        version: 39,
+        name: "0039_chat_pin_positions",
+        apply: migration_0039_chat_pin_positions::apply,
+    },
+    Migration {
+        version: 40,
+        name: "0040_disband_requests",
+        apply: migration_0040_disband_requests::apply,
+    },
+    Migration {
+        version: 41,
+        name: "0041_secure_delete_checkpoint_intents",
+        apply: migration_0041_secure_delete_checkpoint_intents::apply,
+    },
+    Migration {
+        version: 42,
+        name: "0042_group_state_checkpoints",
+        apply: migration_0042_group_state_checkpoints::apply,
+    },
+    Migration {
+        version: 43,
+        name: "0043_transport_group_routes",
+        apply: migration_0043_transport_group_routes::apply,
+    },
+    Migration {
+        version: 44,
+        name: "0044_local_group_deletion_frontiers",
+        apply: migration_0044_local_group_deletion_frontiers::apply,
     },
 ];
 
@@ -384,10 +517,297 @@ mod tests {
             .collect()
     }
 
+    fn semantic_chat_list_timestamps(store: &SqliteAccountStorage) -> Vec<(String, u64, u64)> {
+        let mut rows = store
+            .chat_list_rows(crate::ChatListQuery {
+                include_archived: true,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.group_id_hex,
+                    row.conversation_created_at,
+                    row.activity_sort_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+        false
+    }
+
     #[test]
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn local_group_deletion_frontier_migration_preserves_absent_live_groups() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..43]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, ?2)",
+                params![&[0xaa_u8], &[0_u8]],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 0, 0, ?3)",
+                params![&[1_u8], &[0xaa_u8], &[0_u8]],
+            )
+            .unwrap();
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let frontier: i64 = connection
+            .query_row(
+                "SELECT message_insert_order
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frontier, 1);
+        let retained_routes: String = connection
+            .query_row(
+                "SELECT prior_nostr_routes_json
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_routes, "[]");
+        let pending_application_event_columns = connection
+            .prepare("PRAGMA table_info(pending_application_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            pending_application_event_columns,
+            vec!["message_id", "group_id", "message_insert_order", "record"],
+            "serialized application events follow the storage record-blob convention",
+        );
+    }
+
+    #[test]
+    fn media_secret_reference_migration_backfills_known_rows_conservatively() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..28]).unwrap();
+        let media_tags =
+            serde_json::to_string(&[vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()]])
+                .unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_events (
+                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
+                     direction, sender, plaintext, kind, tags_json, recorded_at, received_at
+                 ) VALUES ('aa', 'media', 'source-media', 7, 'received', 'sender', '', 9, ?1, 10, 10)",
+                params![media_tags],
+            )
+            .unwrap();
+        for (epoch, secret) in [(7_i64, vec![1_u8, 2, 3]), (8, vec![4_u8, 5, 6])] {
+            connection
+                .execute(
+                    "INSERT INTO encrypted_media_epoch_secrets (
+                         group_id_hex, component_id, source_epoch, secret,
+                         created_at_unix_seconds
+                     ) VALUES ('aa', 32776, ?1, ?2, 10)",
+                    params![epoch, secret],
+                )
+                .unwrap();
+        }
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let references: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM encrypted_media_epoch_secret_references
+                 WHERE group_id_hex = 'aa' AND message_id_hex = 'media'
+                   AND component_id = 32776 AND source_epoch = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(references, 1);
+        let managed = connection
+            .prepare(
+                "SELECT source_epoch, retention_managed
+                 FROM encrypted_media_epoch_secrets
+                 ORDER BY source_epoch",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(managed, vec![(7, 1), (8, 0)]);
+    }
+
+    #[test]
+    fn chat_list_semantic_timestamps_backfill_from_durable_history() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..35]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+             VALUES ('never-messaged', 'relay', 100),
+                    ('active', 'relay', 200),
+                    ('pruned-read', 'relay', 300),
+                    ('zero-updated', 'relay', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, recorded_at, received_at
+             ) VALUES ('active', 'origin', 'received', 'sender', 'origin', 9, '[]', 140, 140)",
+            [],
+        )
+        .unwrap();
+        // `zero-updated` exercises the `ag.updated_at = 0` sentinel branch: the
+        // group has app events but no persisted group timestamp, so
+        // `conversation_created_at` must fall back to the earliest event time
+        // (250) rather than collapsing to `MIN(0, 250) = 0`.
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, recorded_at, received_at
+             ) VALUES
+                ('zero-updated', 'first', 'received', 'sender', 'first', 9, '[]', 250, 250),
+                ('zero-updated', 'later', 'received', 'sender', 'later', 9, '[]', 275, 275)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json
+             ) VALUES ('active', 'latest', 'received', 'sender', 'latest', 9, '[]', 150, 150, '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json, invalidation_status
+             ) VALUES (
+                'active', 'invalidated', 'received', 'sender', 'losing branch',
+                9, '[]', 160, 160, '[]', 'LosingBranch'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_read_state (
+                group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                initialized_at, updated_at
+             ) VALUES ('pruned-read', 'pruned-message', 350, 0, 400)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json
+             ) VALUES (
+                'pruned-read', 'older-survivor', 'received', 'sender', 'older',
+                9, '[]', 310, 310, '[]'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_list_rows (group_id_hex, updated_at)
+             VALUES ('never-messaged', 500), ('active', 500), ('pruned-read', 500),
+                    ('zero-updated', 500)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let rows = conn
+            .prepare(
+                "SELECT group_id_hex, conversation_created_at, activity_sort_at
+                 FROM chat_list_rows ORDER BY group_id_hex",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("active".to_owned(), 140, 150),
+                ("never-messaged".to_owned(), 100, 100),
+                ("pruned-read".to_owned(), 300, 350),
+                ("zero-updated".to_owned(), 250, 250),
+            ]
+        );
+
+        run(&mut conn, MIGRATIONS).unwrap();
+        let after_second_run: Vec<(String, i64, i64)> = conn
+            .prepare(
+                "SELECT group_id_hex, conversation_created_at, activity_sort_at
+                 FROM chat_list_rows ORDER BY group_id_hex",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(after_second_run, rows);
+
+        let store = SqliteAccountStorage::from_connection_with_options(
+            conn,
+            crate::SqliteStorageOptions::default(),
+        )
+        .unwrap();
+        let expected = rows
+            .into_iter()
+            .map(|(group_id, created_at, activity_at)| {
+                (
+                    group_id,
+                    u64::try_from(created_at).unwrap(),
+                    u64::try_from(activity_at).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        store
+            .refresh_chat_list_rows("local-account", &no_mentions)
+            .unwrap();
+        assert_eq!(semantic_chat_list_timestamps(&store), expected);
+
+        store
+            .refresh_chat_list_rows("local-account", &no_mentions)
+            .unwrap();
+        assert_eq!(semantic_chat_list_timestamps(&store), expected);
     }
 
     #[test]
@@ -415,6 +835,141 @@ mod tests {
             "chat_notification_settings",
             "muted_until_ms"
         ));
+    }
+
+    #[test]
+    fn chat_pin_positions_are_migrated_with_archive_cleanup() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..38]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups
+                (group_id_hex, endpoint, archived, updated_at)
+             VALUES ('existing-group', 'wss://relay.example', 0, 1)",
+            [],
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert!(connection_has_column(
+            &conn,
+            "chat_pin_positions",
+            "ordinal"
+        ));
+        assert_eq!(
+            foreign_key(&conn, "chat_pin_positions", "group_id_hex"),
+            Some(("account_groups".to_owned(), "CASCADE".to_owned()))
+        );
+        assert!(connection_has_index(
+            &conn,
+            "chat_pin_positions",
+            "idx_chat_pin_positions_order"
+        ));
+        let trigger_exists = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'trigger' AND name = 'unpin_chat_when_archived'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(trigger_exists);
+
+        conn.execute(
+            "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
+             VALUES ('existing-group', 7)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE account_groups SET archived = 1 WHERE group_id_hex = 'existing-group'",
+            [],
+        )
+        .unwrap();
+        let pin_count = conn
+            .query_row("SELECT COUNT(*) FROM chat_pin_positions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(pin_count, 0);
+    }
+
+    #[test]
+    fn chat_list_interaction_state_columns_are_migrated_with_safe_defaults() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        assert_eq!(
+            column_default(&conn, "conversation_read_state", "manually_marked_unread").as_deref(),
+            Some("0")
+        );
+        assert!(connection_has_column(
+            &conn,
+            "account_groups",
+            "member_count"
+        ));
+        assert_eq!(
+            column_default(&conn, "chat_list_rows", "manually_marked_unread").as_deref(),
+            Some("0")
+        );
+        assert!(connection_has_column(
+            &conn,
+            "chat_list_rows",
+            "last_message_media_json"
+        ));
+        assert_eq!(
+            column_default(&conn, "chat_list_rows", "last_message_delivery_state").as_deref(),
+            Some("'not_applicable'")
+        );
+    }
+
+    #[test]
+    fn message_drafts_tables_are_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        assert!(connection_has_column(&conn, "message_drafts", "content"));
+        assert!(connection_has_column(
+            &conn,
+            "message_draft_attachments",
+            "plaintext"
+        ));
+    }
+
+    #[test]
+    fn secure_delete_checkpoint_intents_table_is_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'secure_delete_checkpoint_intents'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        let columns = conn
+            .prepare("PRAGMA table_info(secure_delete_checkpoint_intents)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "intent_nonce"));
+        assert!(!columns.iter().any(|column| column == "generation"));
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "checkpoint_completed")
+        );
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "created_at_unix_seconds")
+        );
     }
 
     #[test]
@@ -541,6 +1096,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_membership, "member");
+    }
+
+    #[test]
+    fn prior_nostr_routes_migration_defaults_existing_groups_to_empty_history() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..29]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+             VALUES ('11', 'relay', 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            column_default(&conn, "account_groups", "prior_nostr_routes_json").as_deref(),
+            Some("'[]'")
+        );
+        assert_eq!(
+            column_default(&conn, "account_groups", "nostr_routing_last_epoch").as_deref(),
+            Some("0")
+        );
+        let history: String = conn
+            .query_row(
+                "SELECT prior_nostr_routes_json FROM account_groups WHERE group_id_hex = '11'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, "[]");
     }
 
     #[test]
@@ -804,6 +1391,7 @@ mod tests {
             ("cgka_convergence_policies", "group_id"),
             ("cgka_member_validation_cache", "group_id"),
             ("cgka_group_snapshots", "group_id"),
+            ("cgka_group_state_checkpoints", "group_id"),
         ] {
             assert_eq!(
                 foreign_key(&conn, table, column),
@@ -811,6 +1399,125 @@ mod tests {
                 "{table}.{column} should cascade when a group is deleted"
             );
         }
+        assert_eq!(
+            foreign_key(&conn, "pending_push_registration_shares", "group_id_hex"),
+            Some(("account_groups".to_owned(), "CASCADE".to_owned())),
+            "pending shares should cascade when a projection group is deleted"
+        );
+        assert_eq!(
+            foreign_key(&conn, "pending_push_registration_removals", "group_id_hex"),
+            None,
+            "durable removal intent must survive projection group deletion"
+        );
+    }
+
+    #[test]
+    fn retention_migration_keeps_legacy_app_events_unknown_and_safe() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..28]).unwrap();
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext,
+                kind, tags_json, recorded_at, received_at
+             ) VALUES ('aa', 'legacy', 'received', 'sender', 'plaintext',
+                       9, '[]', 10, 11)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let decision = conn
+            .query_row(
+                "SELECT retention_seconds, retention_expires_at
+                 FROM app_events
+                 WHERE group_id_hex = 'aa' AND message_id_hex = 'legacy'",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(decision, (None, None));
+        assert!(connection_has_index(
+            &conn,
+            "app_events",
+            "idx_app_events_group_retention_expiry"
+        ));
+    }
+
+    #[test]
+    fn push_registration_gossip_outbox_migration_backfills_joined_groups() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..32]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (
+                group_id_hex, endpoint, self_membership, updated_at
+             ) VALUES ('joined', 'relay', 'member', 1),
+                      ('left', 'relay', 'left', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO push_registration (
+                account_label, account_id_hex, platform, token_fingerprint,
+                token_bytes, server_pubkey_hex, created_at_ms, updated_at_ms,
+                last_shared_at_ms
+             ) VALUES ('alice', 'aa', 1, 'fingerprint', X'01', 'bb', 10, 11, 12)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO push_registration (
+                account_label, account_id_hex, platform, token_fingerprint,
+                token_bytes, server_pubkey_hex, created_at_ms, updated_at_ms,
+                last_shared_at_ms
+             ) VALUES (
+                'stale-label', 'cc', 1, 'stale-fingerprint',
+                X'02', 'dd', 8, 9, 10
+             )",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let pending = conn
+            .query_row(
+                "SELECT group_id_hex, token_fingerprint, registration_updated_at_ms,
+                        queued_at_ms
+                 FROM pending_push_registration_shares",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pending,
+            ("joined".to_owned(), "fingerprint".to_owned(), 11, 11)
+        );
+        let last_shared_at_ms: Option<i64> = conn
+            .query_row(
+                "SELECT last_shared_at_ms FROM push_registration WHERE account_label = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_shared_at_ms, None);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pending_push_registration_removals",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -824,6 +1531,23 @@ mod tests {
              VALUES (?1, ?2, 0, 0, ?3)",
             params![vec![0x01_u8; 4], orphan_group, vec![0xAA_u8]],
         ));
+        assert_foreign_key_error(conn.execute(
+            "INSERT INTO pending_push_registration_shares (
+                group_id_hex, token_fingerprint, registration_updated_at_ms,
+                queued_at_ms
+             ) VALUES ('orphan', 'fingerprint', 1, 1)",
+            [],
+        ));
+        conn.execute(
+            "INSERT INTO pending_push_registration_removals (
+                group_id_hex, account_label, account_id_hex, platform,
+                token_fingerprint, server_pubkey_hex,
+                registration_created_at_ms, registration_updated_at_ms,
+                queued_at_ms
+             ) VALUES ('orphan', 'alice', 'aa', 1, 'fingerprint', 'bb', 1, 1, 1)",
+            [],
+        )
+        .expect("removal intent must not depend on a projection group row");
         assert_foreign_key_error(conn.execute(
             "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
              VALUES (?1, ?2, 0, ?3)",

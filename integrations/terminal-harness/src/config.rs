@@ -1,0 +1,336 @@
+use std::collections::HashSet;
+use std::fmt;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::{Config, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING, Result};
+
+const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_BACKEND_IDLE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MAX_PENDING_PER_GROUP: usize = 4;
+const MIN_REPLY_BYTES: usize = 4;
+
+/// Connector-specific names and defaults used by the shared environment parser.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigSpec {
+    /// Connector environment prefix, such as `WN_PI`.
+    pub env_prefix: &'static str,
+    /// Directory name below `$HOME/.marmot-agents`.
+    pub default_home_name: &'static str,
+    /// Backend command used when no override is configured.
+    pub default_bin: &'static str,
+    /// Lowercase backend name for user-visible failures.
+    pub display_name: &'static str,
+    /// Harness identity for replies and control request ids.
+    pub reply_prefix: &'static str,
+    /// Backend binary environment variable.
+    pub bin_env_name: &'static str,
+    /// Account environment variable.
+    pub account_env_name: &'static str,
+    /// Optional historical sender-list alias.
+    pub legacy_allowed_senders_env: Option<&'static str>,
+}
+
+/// Shared configuration plus backend values needed by a connector crate.
+#[derive(Clone)]
+pub struct LoadedConfig {
+    /// Validated shared bridge configuration.
+    pub harness: Config,
+    /// Connector's Marmot home.
+    pub home: PathBuf,
+    /// Backend command or absolute binary path.
+    pub bin: String,
+}
+
+impl fmt::Debug for LoadedConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedConfig")
+            .field("harness", &self.harness)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Loads shared connector configuration from a caller-provided lookup function.
+pub fn load_config_with(
+    spec: ConfigSpec,
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<LoadedConfig> {
+    let env_name = |suffix: &str| format!("{}_{}", spec.env_prefix, suffix);
+    let user_home = lookup("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| config_error("$HOME is not set"))?;
+    let home = lookup("MARMOT_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        user_home
+            .clone()
+            .join(".marmot-agents")
+            .join(spec.default_home_name)
+    });
+    let socket = lookup("MARMOT_AGENT_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("dev").join("wn-agent.sock"));
+    let auth_token = match lookup("MARMOT_AGENT_AUTH_TOKEN_FILE") {
+        Some(path) => {
+            let token = fs::read_to_string(path)
+                .map_err(|err| config_error(format!("failed to read auth token file: {err}")))?
+                .trim()
+                .to_owned();
+            if token.is_empty() {
+                return Err(config_error("auth token file is empty"));
+            }
+            Some(token)
+        }
+        None => lookup("MARMOT_AGENT_AUTH_TOKEN"),
+    };
+
+    let allowed_name = env_name("ALLOWED_SENDERS_HEX");
+    let allowed_raw = lookup(&allowed_name)
+        .or_else(|| spec.legacy_allowed_senders_env.and_then(&mut *lookup))
+        .ok_or_else(|| {
+            config_error(format!(
+                "{allowed_name} must contain at least one 64-character hex sender id"
+            ))
+        })?;
+    let allowed_senders = parse_hex_csv(&allowed_name, &allowed_raw)?;
+
+    let account_name = env_name("ACCOUNT_ID_HEX");
+    let account_id_hex = lookup(&account_name)
+        .map(|value| (account_name.as_str(), value))
+        .or_else(|| lookup("MARMOT_ACCOUNT_ID_HEX").map(|value| ("MARMOT_ACCOUNT_ID_HEX", value)))
+        .map(|(name, value)| normalize_hex(name, &value))
+        .transpose()?;
+
+    let activation_name = env_name("ACTIVATION");
+    if lookup(&activation_name)
+        .as_deref()
+        .unwrap_or("always")
+        .trim()
+        != "always"
+    {
+        return Err(config_error(format!(
+            "{activation_name} currently supports only `always`"
+        )));
+    }
+
+    let bin = lookup(spec.bin_env_name).unwrap_or_else(|| spec.default_bin.to_owned());
+    if bin.trim().is_empty() {
+        return Err(config_error(format!(
+            "{} must not be empty",
+            spec.bin_env_name
+        )));
+    }
+
+    let backend_timeout = parse_positive_duration(
+        lookup,
+        &env_name("TIMEOUT_SECS"),
+        DEFAULT_BACKEND_TIMEOUT_SECS,
+    )?;
+    let backend_idle_timeout = parse_positive_duration(
+        lookup,
+        &env_name("IDLE_TIMEOUT_SECS"),
+        DEFAULT_BACKEND_IDLE_TIMEOUT_SECS,
+    )?;
+    let request_timeout = parse_positive_duration(
+        lookup,
+        &env_name("REQUEST_TIMEOUT_SECS"),
+        DEFAULT_REQUEST_TIMEOUT_SECS,
+    )?;
+    let max_reply_name = env_name("MAX_REPLY_BYTES");
+    let max_reply_bytes = parse_usize(
+        lookup(&max_reply_name),
+        DEFAULT_MAX_REPLY_BYTES,
+        &max_reply_name,
+    )?;
+    if !(MIN_REPLY_BYTES..=MARMOT_MESSAGE_BYTES_CEILING).contains(&max_reply_bytes) {
+        return Err(config_error(format!(
+            "{max_reply_name} must be between {MIN_REPLY_BYTES} and {MARMOT_MESSAGE_BYTES_CEILING}"
+        )));
+    }
+    let max_pending_name = env_name("MAX_PENDING_PER_GROUP");
+    let max_pending_per_group = parse_usize(
+        lookup(&max_pending_name),
+        DEFAULT_MAX_PENDING_PER_GROUP,
+        &max_pending_name,
+    )?;
+    if max_pending_per_group == 0 {
+        return Err(config_error(format!(
+            "{max_pending_name} must be greater than zero"
+        )));
+    }
+
+    let state_name = env_name("STATE_PATH");
+    let state_path = lookup(&state_name).map(PathBuf::from).unwrap_or_else(|| {
+        lookup("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home.join(".local").join("state"))
+            .join(spec.reply_prefix)
+            .join("sessions.json")
+    });
+
+    Ok(LoadedConfig {
+        harness: Config {
+            socket,
+            auth_token,
+            allowed_senders,
+            account_id_hex,
+            request_timeout,
+            max_reply_bytes,
+            max_pending_per_group,
+            state_path,
+            backend_timeout,
+            backend_idle_timeout,
+            spec,
+        },
+        home,
+        bin,
+    })
+}
+
+fn parse_positive_duration(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+) -> Result<Duration> {
+    let seconds = parse_u64(lookup(name), default, name)?;
+    if seconds == 0 {
+        return Err(config_error(format!("{name} must be greater than zero")));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn parse_hex_csv(name: &str, raw: &str) -> Result<HashSet<String>> {
+    let values = raw
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| normalize_hex(name, value))
+        .collect::<Result<HashSet<_>>>()?;
+    if values.is_empty() {
+        return Err(config_error(format!("{name} contains no sender ids")));
+    }
+    Ok(values)
+}
+
+fn normalize_hex(name: &str, value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(normalized)
+    } else {
+        Err(config_error(format!(
+            "{name} entries must be 64-character hex ids"
+        )))
+    }
+}
+
+fn parse_u64(raw: Option<String>, default: u64, name: &str) -> Result<u64> {
+    raw.map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| config_error(format!("{name} must be an integer")))
+    })
+}
+
+fn parse_usize(raw: Option<String>, default: usize, name: &str) -> Result<usize> {
+    raw.map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| config_error(format!("{name} must be an integer")))
+    })
+}
+
+fn config_error(message: impl Into<String>) -> HarnessError {
+    HarnessError::Config(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    const SENDER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SPEC: ConfigSpec = ConfigSpec {
+        env_prefix: "WN_TEST",
+        default_home_name: "test",
+        default_bin: "test-agent",
+        display_name: "test",
+        reply_prefix: "wn-test",
+        bin_env_name: "WN_TEST_BIN",
+        account_env_name: "WN_TEST_ACCOUNT_ID_HEX",
+        legacy_allowed_senders_env: None,
+    };
+
+    fn load(pairs: &[(&str, &str)]) -> Result<LoadedConfig> {
+        let map: HashMap<&str, &str> = pairs.iter().copied().collect();
+        load_config_with(SPEC, &mut |name| {
+            map.get(name).map(|value| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn shared_config_loads_defaults_and_prefixes() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+        ])
+        .unwrap();
+        assert_eq!(loaded.bin, "test-agent");
+        assert_eq!(loaded.home, PathBuf::from("/home/test/.marmot-agents/test"));
+        assert_eq!(loaded.harness.backend_timeout, Duration::from_secs(3600));
+        assert_eq!(loaded.harness.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn shared_config_rejects_zero_timeouts_and_missing_home() {
+        assert!(load(&[("WN_TEST_ALLOWED_SENDERS_HEX", SENDER)]).is_err());
+        assert!(
+            load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("WN_TEST_IDLE_TIMEOUT_SECS", "0"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_config_reports_account_source_name() {
+        let error = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("MARMOT_ACCOUNT_ID_HEX", "invalid"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("MARMOT_ACCOUNT_ID_HEX"));
+    }
+
+    #[test]
+    fn shared_config_trims_activation_for_compatibility() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ACTIVATION", " always\n"),
+        ])
+        .unwrap();
+        assert_eq!(loaded.harness.spec.env_prefix, "WN_TEST");
+    }
+
+    #[test]
+    fn loaded_config_debug_redacts_paths_binary_and_credentials() {
+        let loaded = load(&[
+            ("HOME", "/secret/home"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ACCOUNT_ID_HEX", SENDER),
+            ("WN_TEST_BIN", "/secret/bin/test-agent"),
+            ("MARMOT_AGENT_AUTH_TOKEN", "secret-token"),
+        ])
+        .unwrap();
+        let debug = format!("{loaded:?}");
+        for secret in ["/secret", "secret-token", SENDER] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("auth_token_present: true"));
+        assert!(debug.contains("account_id_present: true"));
+    }
+}

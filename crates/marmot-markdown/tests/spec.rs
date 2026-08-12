@@ -88,6 +88,22 @@ fn email_autolink() {
     );
 }
 
+#[test]
+fn bare_www_autolink() {
+    check(
+        "www.example.com/path",
+        "<p><a href=\"https://www.example.com/path\">www.example.com/path</a></p>\n",
+    );
+}
+
+#[test]
+fn bare_www_autolink_strips_sentence_period() {
+    check(
+        "See www.example.com/path.",
+        "<p>See <a href=\"https://www.example.com/path\">www.example.com/path</a>.</p>\n",
+    );
+}
+
 // ----- Block quote + lists ----------------------------------------------
 
 #[test]

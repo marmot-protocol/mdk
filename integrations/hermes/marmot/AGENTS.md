@@ -6,7 +6,7 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first
 ## Scope
 
 - A thin, **control-plane-only** Hermes platform plugin. `wn-agent` owns the Marmot account, MLS state, Nostr
-  transport, and QUIC previews; this plugin only speaks `marmot.agent-control.v1` (NDJSON over a Unix socket).
+  transport, and QUIC previews; this plugin only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
 - Keep transcript hashing and stream chunking byte-for-byte with the authoritative Rust
   `AgentTextStreamTranscriptV1` (`crates/traits/src/agent_text_stream.rs`).
 - No QUIC, crypto, relay, or MLS logic here.

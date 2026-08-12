@@ -23,15 +23,18 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # step fails with missing __chkstk_darwin and friends.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
 
-CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
+TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Keep production release behavior and debug-symbol policy in one source of truth.
+source "$TOOL_DIR/marmotkit-release-profile.env"
+WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
+CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 TARGET_DIR="$WORKSPACE_DIR/target"
 BUILD_DIR="$CRATE_DIR/build"
 OUT_DIR="$CRATE_DIR/output"
 
 # Set public first-party endpoint defaults for values compiled via option_env!.
 # Tokens remain host-app runtime configuration.
-source "$CRATE_DIR/marmotkit-endpoints.env"
+source "$TOOL_DIR/marmotkit-endpoints.env"
 
 CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"
@@ -54,13 +57,13 @@ rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"
-cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
+cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Building iOS device target (aarch64-apple-ios)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios "${FEATURE_ARGS[@]}"
+cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Building iOS simulator target (aarch64-apple-ios-sim)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim "${FEATURE_ARGS[@]}"
+cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Generating Swift bindings"
 cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \

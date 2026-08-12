@@ -10,30 +10,43 @@ description = "In-process multi-client simulator and fixtures for the CGKA engin
 # Long-running property-based tests (1000+ iterations). Quick CI runs the
 # default profile; nightly CI runs with this feature enabled.
 conformance-slow = []
+# Full-engine A/B campaigns that disable only application-message witness
+# admission. This is a simulator experiment, not a supported wire policy.
+test-policy-overrides = ["cgka-engine/test-policy-overrides"]
 
 [dependencies]
 cgka-traits.workspace = true
-cgka-engine.workspace = true
-storage-sqlite.workspace = true
+cgka-engine = { workspace = true, features = ["test-conformance-snapshot"] }
+marmot-app.workspace = true
+marmot-account.workspace = true
+marmot-forensics.workspace = true
+storage-sqlite = { workspace = true, features = ["test-conformance-replay"] }
+fs-private.workspace = true
 transport-nostr-peeler.workspace = true
 openmls.workspace = true
+openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 rand.workspace = true
 nostr.workspace = true
+nostr-relay-builder.workspace = true
 proptest.workspace = true
 hex.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 # Byte-level conformance vectors for the agent text stream QUIC feature pin
 # the transport crates' key derivation, AAD, and broker control bytes.
 transport-quic-stream.workspace = true
 transport-quic-broker.workspace = true
+rusqlite.workspace = true
+stateright.workspace = true

@@ -1,12 +1,61 @@
 use super::*;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread;
 
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use url::Url;
 
-use super::blossom::{MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body};
+use super::blossom::{
+    MAX_BLOSSOM_DESCRIPTOR_BYTES, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body,
+};
 use super::host_safety::validate_blossom_fetch_url;
+
+#[test]
+fn encrypted_media_blob_limit_supports_large_application_artifacts() {
+    assert_eq!(MAX_ENCRYPTED_MEDIA_BLOB_BYTES, 512 * 1024 * 1024);
+}
+
+#[test]
+fn media_plaintext_limit_accounts_for_the_aead_tag_without_allocating_the_boundary() {
+    let max_plaintext = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    assert!(validate_media_plaintext_len(max_plaintext).is_ok());
+    assert!(validate_media_plaintext_len(max_plaintext + 1).is_err());
+}
+
+#[test]
+fn media_upload_batch_enforces_the_same_aggregate_bound_as_the_connector() {
+    let max_plaintext = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    assert!(validate_media_upload_batch_lengths([max_plaintext]).is_ok());
+    assert!(validate_media_upload_batch_lengths([max_plaintext - 3, 3]).is_ok());
+    assert!(validate_media_upload_batch_lengths([max_plaintext, 1]).is_err());
+    assert!(validate_media_upload_batch_lengths([u64::MAX, 1]).is_err());
+}
+
+#[test]
+fn in_place_encryption_is_wire_identical_to_the_previous_allocating_api() {
+    let key = [0x11_u8; 32];
+    let nonce = [0x22_u8; 12];
+    let aad = b"encrypted-media compatibility";
+    let plaintext = b"same key nonce aad and plaintext";
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let expected = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .unwrap();
+    let mut actual = plaintext.to_vec();
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce), aad, &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+}
 
 fn valid_imeta_tag() -> Vec<String> {
     vec![
@@ -26,6 +75,219 @@ fn valid_imeta_tag() -> Vec<String> {
 
 fn valid_hash() -> String {
     "11".repeat(32)
+}
+
+#[test]
+fn chat_list_attachment_projection_is_bounded_and_typed() {
+    let image = valid_imeta_tag();
+    let mut video = valid_imeta_tag();
+    video[6] = "m video/mp4".to_owned();
+    video[7] = "filename clip.mp4".to_owned();
+    let raw = serde_json::json!({ "imeta": [image, video] }).to_string();
+
+    assert_eq!(
+        classify_chat_list_attachments(Some(&raw)),
+        (Some(ChatListAttachmentKind::Mixed), 2)
+    );
+}
+
+#[test]
+fn chat_list_attachment_projection_drops_malformed_siblings_safely() {
+    let valid = valid_imeta_tag();
+    let malformed = vec!["imeta".to_owned(), "m audio/mpeg".to_owned()];
+    let raw = serde_json::json!({ "imeta": [malformed, valid] }).to_string();
+
+    assert_eq!(
+        classify_chat_list_attachments(Some(&raw)),
+        (Some(ChatListAttachmentKind::Photo), 1)
+    );
+    assert_eq!(classify_chat_list_attachments(Some("{not-json")), (None, 0));
+}
+
+#[test]
+fn encrypted_media_integrity_accepts_uppercase_hex() {
+    let encrypted = b"encrypted media bytes";
+    let uppercase_hash = hex::encode(Sha256::digest(encrypted)).to_ascii_uppercase();
+
+    assert!(encrypted_media_hash_matches(encrypted, &uppercase_hash));
+}
+
+fn valid_v2_imeta_tag() -> Vec<String> {
+    let mut tag = valid_imeta_tag();
+    tag[1] = "v encrypted-media-v2".to_owned();
+    tag
+}
+
+#[test]
+fn encrypted_media_v2_media_type_profile_is_exact() {
+    assert_eq!(
+        canonical_media_type_v2("\t\n\u{000c}\r IMAGE/JPG ; charset=utf-8 ")
+            .expect("the exact V2 trim set and alias are valid"),
+        "image/jpeg"
+    );
+    assert!(canonical_media_type_v2("\u{000b}image/png").is_err());
+    assert!(canonical_media_type_v2("\u{00a0}image/png").is_err());
+    assert!(canonical_media_type_v2("image/png/extra").is_err());
+    assert!(canonical_media_type_v2("image").is_err());
+    assert!(canonical_media_type_v2(&format!("{}/{}", "a".repeat(64), "b".repeat(64))).is_err());
+    assert_eq!(
+        canonical_media_type_v2("application/vnd.test+json").unwrap(),
+        "application/vnd.test+json"
+    );
+}
+
+#[test]
+fn encrypted_media_v2_reference_validation_is_version_specific() {
+    let mut v2 = valid_v2_imeta_tag();
+    v2[2] = "locator blossom-v1 http://10.0.0.1/blob".to_owned();
+    media_attachment_from_imeta_tag(&v2, Some(7), false)
+        .expect("V2 locator validity is independent of local destination policy");
+
+    let mut noncanonical_m = v2.clone();
+    noncanonical_m[6] = "m Image/JPG".to_owned();
+    assert!(media_attachment_from_imeta_tag(&noncanonical_m, Some(7), false).is_err());
+
+    let mut exact_filename = v2.clone();
+    exact_filename[7] = "filename  ".to_owned();
+    assert_eq!(
+        media_attachment_from_imeta_tag(&exact_filename, Some(7), false)
+            .expect("a nonempty V2 filename is preserved exactly")
+            .file_name,
+        " "
+    );
+
+    let mut too_long = v2.clone();
+    too_long[7] = format!("filename {}", "a".repeat(256));
+    assert!(media_attachment_from_imeta_tag(&too_long, Some(7), false).is_err());
+    let mut nul = v2;
+    nul[7] = "filename bad\0name".to_owned();
+    assert!(media_attachment_from_imeta_tag(&nul, Some(7), false).is_err());
+}
+
+#[test]
+fn outbound_media_never_crosses_group_version() {
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(1), false).unwrap();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    assert!(
+        v1.validate_outbound(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v1.build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+}
+
+#[test]
+fn checked_v1_builder_rejects_noncanonical_media_type_while_ingest_stays_tolerant() {
+    let mut noncanonical = valid_imeta_tag();
+    noncanonical[6] = "m Image/JPG; charset=utf-8".to_owned();
+    let reference = media_attachment_from_imeta_tag(&noncanonical, Some(1), false)
+        .expect("legacy V1 ingest still accepts a noncanonical m field");
+    assert_eq!(reference.media_type, "Image/JPG; charset=utf-8");
+
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = reference
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .expect_err("checked outbound V1 builder must reject noncanonical m");
+    assert!(
+        err.to_string()
+            .contains("media type is not canonical for encrypted-media-v1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn retained_media_version_selects_its_historical_component_cache() {
+    assert_eq!(
+        EncryptedMediaVersion::V1.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
+    );
+    assert_eq!(
+        EncryptedMediaVersion::V2.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+    );
+}
+
+#[test]
+fn checked_imeta_builder_preserves_version_and_present_empty_optional_fields() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v1_tag = v1
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .unwrap();
+    assert!(v1_tag.iter().any(|field| field == "v encrypted-media-v1"));
+
+    let mut v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(2), false).unwrap();
+    v2.dim = Some(String::new());
+    v2.thumbhash = Some(" ".to_owned());
+    let v2_tag = v2
+        .build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+        .unwrap();
+    assert!(v2_tag.iter().any(|field| field == "v encrypted-media-v2"));
+    assert!(v2_tag.iter().any(|field| field == "dim "));
+    assert!(v2_tag.iter().any(|field| field == "thumbhash  "));
+
+    let round_trip = media_attachment_from_imeta_tag(&v2_tag, Some(2), false).unwrap();
+    assert_eq!(round_trip.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(round_trip.dim.as_deref(), Some(""));
+    assert_eq!(round_trip.thumbhash.as_deref(), Some(" "));
+}
+
+#[test]
+fn encrypted_media_v2_kdf_and_aad_are_independent_from_v1() {
+    let secret = [7_u8; 32];
+    let hash = [0x22_u8; 32];
+    let v1_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V1,
+        &hash,
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    let v2_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V2,
+        &hash,
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    assert_ne!(v1_key, v2_key);
+    assert_eq!(
+        hex::encode(v2_key),
+        "5fcb5672b9cb2b3ac7915fd9c97697877837f7fb1312034486f400f601cd16b5"
+    );
+    assert_eq!(
+        hex::encode(media_aad(
+            EncryptedMediaVersion::V2,
+            &hash,
+            "image/jpeg",
+            " Photo.JPG "
+        )),
+        "656e637279707465642d6d656469612d763200222222222222222222222222222222222222222222222222222222222222222200696d6167652f6a706567002050686f746f2e4a504720"
+    );
+}
+
+#[test]
+fn invalid_media_attachment_is_local_to_that_attachment() {
+    let mut invalid = valid_v2_imeta_tag();
+    invalid.retain(|field| !field.starts_with("nonce "));
+    assert!(media_attachment_from_imeta_tag(&invalid, None, false).is_err());
+    assert!(media_imeta_tags_are_valid(
+        &[invalid, valid_v2_imeta_tag()],
+        false
+    ));
 }
 
 fn tag_with_locator(locator: String) -> Vec<String> {
@@ -63,7 +325,7 @@ fn imeta_parser_rejects_duplicate_single_occurrence_field() {
     assert!(media_attachment_from_imeta_tag(&multi, None, false).is_ok());
 }
 
-fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
+pub(super) fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("test server addr");
     thread::spawn(move || {
@@ -78,18 +340,112 @@ fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
     format!("http://{addr}")
 }
 
-fn spawn_http_response(response: Vec<u8>) -> String {
+pub(super) fn spawn_http_response(response: Vec<u8>) -> String {
     spawn_http_responses(vec![response])
 }
 
-fn http_redirect_response(location: &str) -> Vec<u8> {
+fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
+    let addr = listener.local_addr().expect("upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut remaining = content_length;
+        let mut body = Vec::with_capacity(content_length as usize);
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            stream
+                .read_exact(&mut buffer[..take])
+                .expect("read complete upload body");
+            body.extend_from_slice(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        let digest = hex::encode(Sha256::digest(&body));
+        stream
+            .get_mut()
+            .write_all(&http_json_response("{}"))
+            .expect("write upload descriptor");
+        drop(stream);
+        let (mut download, _) = listener.accept().expect("accept download");
+        let mut request = [0_u8; 4096];
+        let _ = download.read(&mut request).expect("read download request");
+        download
+            .write_all(&http_ok_response(&body))
+            .expect("write encrypted blob");
+        tx.send((content_length, digest))
+            .expect("report upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn spawn_hashing_upload_response(response: Vec<u8>) -> (String, mpsc::Receiver<(u64, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
+    let addr = listener.local_addr().expect("upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut remaining = content_length;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            stream
+                .read_exact(&mut buffer[..take])
+                .expect("read complete upload body");
+            hash.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        stream
+            .get_mut()
+            .write_all(&response)
+            .expect("write upload response");
+        tx.send((content_length, hex::encode(hash.finalize())))
+            .expect("report upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+pub(super) fn http_redirect_response(location: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .into_bytes()
 }
 
-fn http_ok_response(body: &[u8]) -> Vec<u8> {
+pub(super) fn http_ok_response(body: &[u8]) -> Vec<u8> {
     let mut response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -113,10 +469,36 @@ fn http_status_response(status: u16, reason: &str) -> Vec<u8> {
         .into_bytes()
 }
 
-fn blossom_endpoint(base_url: String) -> BlobStoreEndpointV1 {
-    BlobStoreEndpointV1 {
+fn http_error_response(status: u16, reason: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn blossom_endpoint(base_url: String) -> crate::AppBlobEndpoint {
+    crate::AppBlobEndpoint {
         locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
         base_url,
+    }
+}
+
+fn operation_policy<'a>(
+    version: EncryptedMediaVersion,
+    endpoints: &'a [crate::AppBlobEndpoint],
+    allowed_locator_kinds: &'a [String],
+    allow_loopback_http: bool,
+) -> MediaOperationPolicy<'a> {
+    MediaOperationPolicy {
+        version,
+        default_endpoints: endpoints,
+        allowed_locator_kinds,
+        allow_loopback_http,
     }
 }
 
@@ -164,9 +546,7 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &allowed,
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
     )
     .await
     .expect("second Blossom endpoint should absorb first endpoint failure");
@@ -181,6 +561,247 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
     assert!(
         !locator.value.starts_with(&failing),
         "upload must not use the failed server locator"
+    );
+}
+
+#[tokio::test]
+async fn blossom_fallback_reuses_the_identical_encrypted_body() {
+    let (failing, first_body) =
+        spawn_hashing_upload_response(http_status_response(500, "Internal Server Error"));
+    let (succeeding, second_body) = spawn_hashing_upload_response(http_json_response("{}"));
+    let endpoints = [blossom_endpoint(failing), blossom_endpoint(succeeding)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("second Blossom endpoint should accept the retry body");
+
+    assert_eq!(first_body.recv().unwrap(), second_body.recv().unwrap());
+}
+
+#[tokio::test]
+async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
+    let (server, received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+    let plaintext_len = 64 * 1024 * 1024 + 1;
+    let request = MediaUploadRequest {
+        attachments: vec![MediaUploadAttachmentRequest {
+            file_name: "release.apk".to_owned(),
+            media_type: "application/vnd.android.package-archive".to_owned(),
+            plaintext: vec![0x5a; plaintext_len],
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server: None,
+    };
+
+    let result = upload_encrypted_media(
+        request,
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("payload above the previous limit should upload");
+
+    let attachment = &result.attachments[0];
+    let downloaded = download_encrypted_media(
+        attachment.reference.clone(),
+        &secret,
+        &endpoints,
+        &allowed,
+        true,
+    )
+    .await
+    .expect("payload above the previous limit should download and decrypt");
+    let (received_len, received_hash) = received.recv().expect("upload body report");
+    assert_eq!(received_len, plaintext_len as u64 + 16);
+    assert_eq!(attachment.encrypted_size_bytes, received_len);
+    assert_eq!(attachment.reference.ciphertext_sha256, received_hash);
+    assert_eq!(downloaded.plaintext, vec![0x5a; plaintext_len]);
+}
+
+#[tokio::test]
+async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
+    let server = spawn_http_responses(vec![http_json_response("{}"), http_json_response("{}")]);
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+    let mut request = media_upload_request(None);
+    request.attachments[0].file_name = " Diagram.PNG ".to_owned();
+    request.attachments[0].media_type = " IMAGE/JPG ; charset=utf-8".to_owned();
+
+    let first = upload_encrypted_media(
+        request.clone(),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .unwrap();
+    let second = upload_encrypted_media(
+        request,
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .unwrap();
+    let first = &first.attachments[0].reference;
+    let second = &second.attachments[0].reference;
+    assert_eq!(first.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(first.media_type, "image/jpeg");
+    assert_eq!(first.file_name, " Diagram.PNG ");
+    assert_ne!(first.nonce_hex, second.nonce_hex);
+    assert_ne!(first.ciphertext_sha256, second.ciphertext_sha256);
+}
+
+#[tokio::test]
+async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_BLOSSOM_DESCRIPTOR_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let encrypted = b"encrypted bytes";
+    let encrypted_hash = hex::encode(Sha256::digest(encrypted));
+
+    let error = upload_blossom_blob(
+        &server,
+        bytes::Bytes::from_static(encrypted),
+        &encrypted_hash,
+        &signing_keys(),
+        true,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload descriptor exceeds size limit"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_network() {
+    let signer = signing_keys();
+    let svg = upload_profile_image(
+        b"<svg/>",
+        "image/svg+xml",
+        Some("https://blossom.example"),
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        svg.to_string(),
+        "blob store request failed: profile image must be JPEG, PNG, WebP, or GIF"
+    );
+
+    let oversized = vec![0_u8; MAX_PROFILE_IMAGE_BYTES + 1];
+    let error = upload_profile_image(
+        &oversized,
+        "image/png",
+        Some("https://blossom.example"),
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image exceeds 10 MiB limit"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_empty_inputs_before_network() {
+    let error = upload_profile_image(
+        &[],
+        "image/jpeg",
+        Some("https://blossom.example"),
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image cannot be empty"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_mismatched_raster_bytes_before_network() {
+    let error = upload_profile_image(
+        b"<svg/>",
+        "image/png",
+        Some("https://blossom.example"),
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image bytes do not match the declared media type"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_uses_media_extension_and_accepts_test_loopback_policy() {
+    let png_header = b"\x89PNG\r\n\x1a\n";
+    let server = spawn_http_response(http_json_response("{}"));
+    let url = upload_profile_image_with_policy(
+        png_header,
+        " IMAGE/PNG ; charset=binary",
+        Some(&server),
+        &signing_keys(),
+        true,
+    )
+    .await
+    .expect("profile upload should accept the explicit test loopback policy");
+
+    assert!(url.ends_with(".png"), "unexpected profile image URL: {url}");
+    assert!(!url.ends_with(".bin"));
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_cross_site_descriptor_url() {
+    let png_header = b"\x89PNG\r\n\x1a\n";
+    let hash = hex::encode(Sha256::digest(png_header));
+    let descriptor = serde_json::json!({
+        "url": format!("https://attacker.example/{hash}.png"),
+        "sha256": hash,
+    });
+    let server = spawn_http_response(http_json_response(&descriptor.to_string()));
+    let error = upload_profile_image_with_policy(
+        png_header,
+        "image/png",
+        Some(&server),
+        &signing_keys(),
+        true,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("unsafe upload descriptor host"),
+        "unexpected error: {error}"
     );
 }
 
@@ -200,9 +821,7 @@ async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("all failing endpoints should aggregate their failures");
@@ -223,6 +842,168 @@ async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
 }
 
 #[tokio::test]
+async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        415,
+        "Unsupported Media Type",
+        &[],
+        "upload rejected: unsupported media type application/octet-stream",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload failed for all Blossom servers: server 1: upload returned HTTP 415: upload rejected: unsupported media type application/octet-stream"
+    );
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
+    let secret_value = "11".repeat(32);
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[(
+            "X-Reason",
+            &format!("blob https://media.example/{secret_value} is forbidden"),
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("media.example"));
+    assert!(!message.contains(&secret_value));
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
+    let secret_value = "11".repeat(32);
+    let rejecting = spawn_http_response(http_error_response(
+        409,
+        "Conflict",
+        &[(
+            "X-Reason",
+            &format!("duplicate-blob-{secret_value}-already-exists"),
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 409"));
+    assert!(!message.contains(&secret_value));
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_drops_uuid_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[(
+            "X-Reason",
+            "upload id 123e4567-e89b-12d3-a456-426614174000 already used",
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("123e4567"));
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[("X-Reason", "denied, use relay wss://relay.example instead")],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("relay.example"));
+}
+
+#[test]
+fn built_in_blossom_endpoints_are_ciphertext_compatible_fallbacks() {
+    assert_eq!(DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS[0]);
+    assert_eq!(
+        DEFAULT_BLOSSOM_SERVER_URLS,
+        [
+            "https://blossom.divine.video",
+            "https://blossom.ditto.pub",
+            "https://cdn.hzrd149.com",
+        ]
+    );
+    assert!(!DEFAULT_BLOSSOM_SERVER_URLS.contains(&"https://blossom.primal.net"));
+}
+
+#[tokio::test]
 async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
     let override_server = spawn_http_response(http_status_response(500, "Internal Server Error"));
     let default_server = spawn_http_response(http_json_response("{}"));
@@ -235,9 +1016,7 @@ async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("explicit override must remain a single-server bypass");
@@ -345,6 +1124,25 @@ fn blossom_reference() -> MediaAttachmentReference {
 }
 
 #[test]
+fn media_fetch_candidates_deduplicate_non_adjacent_fallback_urls() {
+    let mut reference = blossom_reference();
+    let duplicate_url = reference.locators[0].value.clone();
+    reference.locators.push(MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("https://other.example/{}.bin", reference.ciphertext_sha256),
+    });
+    let fallback = [crate::AppBlobEndpoint {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url: "https://media.example".to_owned(),
+    }];
+
+    let candidates = encrypted_media_fetch_candidates(&reference, &fallback);
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0], duplicate_url);
+}
+
+#[test]
 fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom() {
     // PR #328 review Finding 1: the sender MUST NOT emit a `blossom-v1`
     // reference to a group whose policy does not allow `blossom-v1`, since
@@ -353,21 +1151,23 @@ fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom()
     let reference = blossom_reference();
     let allowed = vec!["ipfs-v1".to_owned()];
     assert!(
-        reference.validate_outbound(&allowed, false).is_err(),
+        reference
+            .validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err(),
         "a blossom reference must be rejected when the policy omits blossom-v1"
     );
     // The same reference is valid against a policy that does allow blossom-v1.
     let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     reference
-        .validate_outbound(&allowed, false)
+        .validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
         .expect("a blossom reference is valid when the policy allows blossom-v1");
 }
 
 #[test]
 fn canonical_media_type_trims_ascii_whitespace_only() {
-    // ASCII whitespace on the edges is stripped per the spec algorithm.
+    // ASCII whitespace on the edges is stripped per the V1 algorithm.
     assert_eq!(
-        canonical_media_type("  image/png \t").expect("ascii-trimmed type is valid"),
+        canonical_media_type_v1("  image/png \t").expect("ascii-trimmed type is valid"),
         "image/png",
     );
 
@@ -375,7 +1175,7 @@ fn canonical_media_type_trims_ascii_whitespace_only() {
     // ASCII whitespace, so it MUST be preserved: trimming it would derive a
     // different file_key/AAD than a spec-conformant peer that keeps it.
     let canonical =
-        canonical_media_type("\u{00A0}image/png").expect("non-empty MIME type is valid");
+        canonical_media_type_v1("\u{00A0}image/png").expect("non-empty MIME type is valid");
     assert_eq!(canonical, "\u{00A0}image/png");
     assert!(canonical.starts_with('\u{00A0}'));
 }
@@ -480,7 +1280,7 @@ async fn loopback_fallback_endpoint_is_skipped_in_production() {
         kind: "ipfs-v1".to_owned(),
         value: "ipfs://bafyexample".to_owned(),
     });
-    let fallback = [BlobStoreEndpointV1 {
+    let fallback = [crate::AppBlobEndpoint {
         locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
         base_url: "http://127.0.0.1:8080".to_owned(),
     }];
@@ -750,4 +1550,141 @@ async fn limited_body_reader_rejects_chunked_body_over_cap() {
     let err = read_limited_blossom_body(response, 5).await.unwrap_err();
 
     assert!(err.to_string().contains("download exceeds 5 bytes"));
+}
+
+/// Load the shared golden imeta fixture file used by marmot-app, marmot-uniffi,
+/// and wn-cli agreement tests.
+fn shared_media_fixture_cases(file: &str) -> Vec<serde_json::Value> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/encrypted-media")
+        .join(file);
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read media fixture {}: {err}", path.display())),
+    )
+    .expect("media fixture file is valid JSON");
+    doc["cases"].as_array().expect("fixture cases").clone()
+}
+
+fn fixture_tag(case: &serde_json::Value) -> Vec<String> {
+    case["tag"]
+        .as_array()
+        .expect("fixture tag")
+        .iter()
+        .map(|field| field.as_str().expect("fixture tag field").to_owned())
+        .collect()
+}
+
+/// `null`/absent means the optional wire field is absent; `""` (or any string)
+/// means it is present with exactly that value. The distinction is part of the
+/// fixture contract because build -> parse must not collapse it.
+fn fixture_optional(value: &serde_json::Value, key: &str) -> Option<String> {
+    match &value[key] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => panic!("fixture optional field {key} must be null or string, got {other}"),
+    }
+}
+
+fn assert_shared_media_fixture_file(file: &str) {
+    let cases = shared_media_fixture_cases(file);
+    assert!(!cases.is_empty(), "{file} must contain cases");
+    for case in cases {
+        let name = case["name"].as_str().expect("fixture case name");
+        let tag = fixture_tag(&case);
+        let source_epoch = case["source_epoch"].as_u64().expect("fixture source_epoch");
+        let result = media_attachment_from_imeta_tag(&tag, Some(source_epoch), false);
+        if case["valid"].as_bool().expect("fixture valid flag") {
+            let reference = result
+                .unwrap_or_else(|err| panic!("{file}/{name} must parse as a valid tag: {err}"));
+            let expected = &case["expected"];
+            assert_eq!(
+                reference.version,
+                expected["version"].as_str().unwrap(),
+                "{file}/{name} version"
+            );
+            let expected_locators: Vec<MediaLocator> = expected["locators"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|locator| MediaLocator {
+                    kind: locator["kind"].as_str().unwrap().to_owned(),
+                    value: locator["value"].as_str().unwrap().to_owned(),
+                })
+                .collect();
+            assert_eq!(
+                reference.locators, expected_locators,
+                "{file}/{name} locators"
+            );
+            assert_eq!(
+                reference.ciphertext_sha256,
+                expected["ciphertext_sha256"].as_str().unwrap(),
+                "{file}/{name} ciphertext_sha256"
+            );
+            assert_eq!(
+                reference.plaintext_sha256,
+                expected["plaintext_sha256"].as_str().unwrap(),
+                "{file}/{name} plaintext_sha256"
+            );
+            assert_eq!(
+                reference.nonce_hex,
+                expected["nonce_hex"].as_str().unwrap(),
+                "{file}/{name} nonce_hex"
+            );
+            assert_eq!(
+                reference.media_type,
+                expected["media_type"].as_str().unwrap(),
+                "{file}/{name} media_type"
+            );
+            assert_eq!(
+                reference.file_name,
+                expected["file_name"].as_str().unwrap(),
+                "{file}/{name} file_name"
+            );
+            assert_eq!(
+                reference.source_epoch, source_epoch,
+                "{file}/{name} source_epoch"
+            );
+            assert_eq!(
+                reference.dim,
+                fixture_optional(expected, "dim"),
+                "{file}/{name} dim absent-vs-present-empty"
+            );
+            assert_eq!(
+                reference.thumbhash,
+                fixture_optional(expected, "thumbhash"),
+                "{file}/{name} thumbhash absent-vs-present-empty"
+            );
+            // Exact wire round-trip through the checked outbound builder: the
+            // group-version gate and locator policy accept the reference, and
+            // the rebuilt tag is byte-identical to the golden fixture.
+            let version = EncryptedMediaVersion::parse(&reference.version).unwrap();
+            let allowed: Vec<String> = reference
+                .locators
+                .iter()
+                .map(|locator| locator.kind.clone())
+                .collect();
+            let rebuilt = reference
+                .build_imeta_tag(version, &allowed, false)
+                .unwrap_or_else(|err| panic!("{file}/{name} must rebuild: {err}"));
+            assert_eq!(rebuilt, tag, "{file}/{name} exact round-trip");
+        } else {
+            let err = result.expect_err(&format!("{file}/{name} must be rejected"));
+            let needle = case["error_contains"].as_str().expect("error_contains");
+            assert!(
+                err.to_string().contains(needle),
+                "{file}/{name} error must mention {needle:?}, got: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_golden_v1_fixtures_parse_validate_and_round_trip_exactly() {
+    assert_shared_media_fixture_file("imeta-v1.json");
+}
+
+#[test]
+fn shared_golden_v2_fixtures_parse_validate_and_round_trip_exactly() {
+    assert_shared_media_fixture_file("imeta-v2.json");
 }

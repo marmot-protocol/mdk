@@ -1,11 +1,11 @@
 {
   "scenario_name": "three-client-message-exchange/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.3",
+  "conformance_version": "0.9.11",
   "seed": null,
   "scenario": {
     "name": "three-client-message-exchange/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -24,9 +24,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"

@@ -9,20 +9,23 @@
 //! convergence, and capability logic live in focused sibling modules.
 
 use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
+use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
+use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
-    GroupStateChange, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent,
+    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
-use cgka_traits::engine_state::PendingStateRef;
+use cgka_traits::engine_state::{PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
@@ -38,15 +41,54 @@ use openmls::prelude::{
 };
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
-use tls_codec::Deserialize as _;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tls_codec::{Deserialize as _, Serialize as _};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+#[derive(Clone, Copy)]
+enum SendAcceptance {
+    Prepare,
+    QueueAppMessage,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn now(&self) -> cgka_traits::Timestamp {
+        cgka_traits::Timestamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    }
+
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Debug, Default)]
+struct OsMaintenanceRandom;
+
+impl MaintenanceRandom for OsMaintenanceRandom {
+    fn next_u64(&self) -> u64 {
+        rand::rngs::OsRng.next_u64()
+    }
+}
 
 fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'static str {
     match reason {
@@ -65,6 +107,30 @@ pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
     hasher.update(b"marmot-hydration-quarantine-group/v1");
     hasher.update(group_id.as_slice());
     hex::encode(hasher.finalize())
+}
+
+fn newest_fork_snapshot(
+    names: impl IntoIterator<Item = String>,
+    prefix: &str,
+) -> Result<Option<String>, ()> {
+    let mut newest: Option<(u64, String)> = None;
+    for name in names {
+        let Some(suffix) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let (counter, digest) = suffix.split_once('-').ok_or(())?;
+        if digest.is_empty() {
+            return Err(());
+        }
+        let counter = counter.parse::<u64>().map_err(|_| ())?;
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_counter, _)| counter > *newest_counter)
+        {
+            newest = Some((counter, name));
+        }
+    }
+    Ok(newest.map(|(_, name)| name))
 }
 
 /// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
@@ -92,9 +158,14 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
     pub(crate) supported_app_components: AppComponentSet,
+    /// Profile emitted by newly created KeyPackages and groups. Existing
+    /// groups retain their independently persisted/wire-classified profile.
+    pub(crate) new_protocol_profile: ProtocolProfile,
     pub(crate) peeler: Box<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
     pub(crate) max_past_epochs: usize,
+    pub(crate) wall_clock: Arc<dyn WallClock>,
+    pub(crate) maintenance_random: Arc<dyn MaintenanceRandom>,
 
     /// Per-group state-machine owner. Every transition, pending-ref
     /// allocation, and fork-detection marker flows through this struct.
@@ -108,6 +179,10 @@ pub struct Engine<S: StorageProvider> {
     /// Standalone proposal messages produced by engine-maintained lifecycle
     /// work. Unlike `auto_publish_buf`, these do not have a pending commit ref.
     pub(crate) auto_proposal_buf: VecDeque<TransportMessage>,
+    /// Authenticated standalone proposals accepted during ingest. This
+    /// internal signal lets the account scheduler reset its quiet window
+    /// without exposing proposals as user-visible group events.
+    pub(crate) valid_proposal_groups: HashSet<GroupId>,
     /// Group-state changes effected by a locally staged commit, with the actor
     /// to attribute each to. Buffered here because publish-before-apply defers
     /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
@@ -115,15 +190,20 @@ pub struct Engine<S: StorageProvider> {
     /// and dropped in `do_publish_failed`.
     pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
 
-    /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
+    /// MessageIds the engine has ingested. Backs the typed duplicate exclusion.
     ///
     /// Bounded hot-process cache in front of the authoritative durable
     /// `MessageRecord` store (checked first in `do_ingest`), so an id that ages
     /// out of the cap is still classified by storage.
     pub(crate) seen_message_ids: BoundedIdSet<MessageId>,
 
+    /// One-shot marker for a cap-dropped, unpersisted ingest. The outer
+    /// `do_ingest` epilogue must not promote that retryable id into the
+    /// terminal `seen_message_ids` cache.
+    pub(crate) retryable_unpersisted_ingest_id: Option<MessageId>,
+
     /// MessageIds this engine has produced via `send` or `create_group` /
-    /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
+    /// `invite`. Backs the typed own-echo exclusion when a message we produced
     /// bounces back via ingest before we filter it client-side.
     ///
     /// Bounded hot-process cache; see `seen_message_ids` above.
@@ -150,9 +230,33 @@ pub struct Engine<S: StorageProvider> {
     /// `IngestOutcome::Buffered`.
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
+    /// Queued intents regenerated into standalone publish work. The session
+    /// consumes these associations when it builds `PublishWork`, then deletes
+    /// the durable intent only after the transport reports acceptance.
+    pub(crate) queued_intent_by_message: HashMap<MessageId, (GroupId, MessageId)>,
+
+    /// Queued group evolutions stay associated with their pending publish so
+    /// confirm can delete the durable intent in the same transaction as the
+    /// MLS merge. Publish failure drops only this in-memory association and
+    /// leaves the intent queued for retry.
+    pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
+
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
-    pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
-    pub(crate) convergence_clock_started_at: Instant,
+    /// Test-only selection experiment switch. It is always true in production;
+    /// only the feature-gated builder method can disable witness admission.
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) admit_app_witnesses: bool,
+    /// Optional hard replay-probe ceiling for explicit exhaustion campaigns.
+    /// Production construction cannot set it.
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) replay_probe_budget_override: Option<u64>,
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub(crate) conformance_replay_probe_count: u64,
+    pub(crate) convergence_clock: Arc<dyn ConvergenceClock>,
+    /// Identifies the process-local monotonic clock domain persisted in active
+    /// convergence passes. A mismatch on hydration forces deadline rebasing
+    /// from the required millisecond wall clock.
+    pub(crate) convergence_clock_instance_id: u64,
 
     /// Diagnostic post-settle reorg telemetry. Recorded at the convergence
     /// apply site and exposed via [`Engine::engine_metrics`]. Never an input to
@@ -180,6 +284,25 @@ pub struct Engine<S: StorageProvider> {
     /// added by [`Self::quarantine_stored_group_on_hydrate`] and removed by a
     /// successful [`Self::retry_hydrate_quarantined_group`].
     pub(crate) quarantined_groups: HashMap<GroupId, GroupHydrationQuarantineReason>,
+
+    /// Groups seeded by the session-open cheap pass whose full per-group
+    /// hydration (MLS load, validation, pending-commit recovery) has not run
+    /// yet (mdk#1161). The seed grants each group a provisional
+    /// `Stable(record.epoch)` epoch entry — so `live_group_ids` and the app
+    /// projection keep listing it — while [`Self::ensure_group_live`] fails
+    /// closed with [`EngineError::GroupNotHydrated`] on every gated surface.
+    /// Membership leaves this set only through [`Self::ensure_hydrated`]:
+    /// success promotes the group to live, failure moves it to
+    /// [`Self::quarantined_groups`] exactly like an open-time quarantine.
+    pub(crate) unhydrated_groups: HashSet<GroupId>,
+
+    /// Seeded, non-disbanded groups with no durable transport-route row yet
+    /// (records predating migration 0043, or a provider without a route
+    /// store). While non-empty, a routing-index miss cannot be trusted:
+    /// ingest backfills these groups' routes on demand — each group leaves
+    /// this set permanently after one MLS load, preserving mdk#740's
+    /// attacker-paced-scan bound in amortized form.
+    pub(crate) route_backfill_pending: HashSet<GroupId>,
 
     /// Authoritative `transport_group_id -> GroupId` resolver for inbound
     /// routing (#740). A Nostr-routed group's `transport_group_id`
@@ -212,18 +335,18 @@ pub struct Engine<S: StorageProvider> {
     /// this rebuilds only when the set actually changed. `None` until first use.
     pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
 
-    /// Per-group deferred-peel retry lifecycle state (mdk#339):
-    /// context-fingerprint sweep gate, per-row attempt/first-seen bookkeeping,
-    /// bounded-sweep cursor, and the cached `PeelDeferred` row count backing
-    /// the per-group flood cap. In-memory by design — a restart costs one free
-    /// re-sweep and a count rescan; terminal decisions are durable via
-    /// `MessageState::Failed`.
+    /// Per-group deferred-peel performance state: context-fingerprint sweep
+    /// gate, bounded-sweep cursor, and cached row count. Correctness-critical
+    /// per-row attempt/residence bookkeeping lives durably on MessageRecord.
     pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
 
-    /// Retry budget before a `PeelDeferred` row transitions to terminal
-    /// `Failed` (`permanently_undecryptable`). Field (not a const) so tests
+    /// Retry budget before a `PeelDeferred` row is resource-refused and
+    /// released without terminal deduplication. Field (not a const) so tests
     /// can exhaust it quickly via [`Self::set_deferred_peel_retry_budget`].
     pub(crate) deferred_peel_retry_budget: u32,
+    /// Durable local residence budget for a `PeelDeferred` row. Field (not a
+    /// const) so deterministic tests can advance a short deadline.
+    pub(crate) deferred_peel_residence_ms: u64,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -236,9 +359,18 @@ pub struct EngineBuilder<S: StorageProvider> {
         Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    new_protocol_profile: ProtocolProfile,
+    allow_legacy_compatibility_profile: bool,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
+    wall_clock: Arc<dyn WallClock>,
+    maintenance_random: Arc<dyn MaintenanceRandom>,
+    convergence_clock: Arc<dyn ConvergenceClock>,
+    #[cfg(feature = "test-policy-overrides")]
+    admit_app_witnesses: bool,
+    #[cfg(feature = "test-policy-overrides")]
+    replay_probe_budget_override: Option<u64>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
@@ -250,9 +382,18 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            new_protocol_profile: ProtocolProfile::Current,
+            allow_legacy_compatibility_profile: false,
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
+            wall_clock: Arc::new(SystemWallClock),
+            maintenance_random: Arc::new(OsMaintenanceRandom),
+            convergence_clock: Arc::new(SystemConvergenceClock::default()),
+            #[cfg(feature = "test-policy-overrides")]
+            admit_app_witnesses: true,
+            #[cfg(feature = "test-policy-overrides")]
+            replay_probe_budget_override: None,
             recorder: None,
         }
     }
@@ -283,6 +424,25 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    /// Select the profile emitted by fresh KeyPackages and newly created
+    /// groups. Defaults to current after the coordinated strict cutover.
+    /// Passing legacy is rejected by [`Self::build`]; only the explicitly
+    /// named compatibility-fixture seam can construct legacy artifacts.
+    pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
+        self.new_protocol_profile = protocol_profile;
+        self.allow_legacy_compatibility_profile = false;
+        self
+    }
+
+    /// Construct legacy artifacts only for compatibility fixtures and
+    /// conformance coverage. This surface is absent from release builds.
+    #[cfg(debug_assertions)]
+    pub fn legacy_compatibility_profile(mut self) -> Self {
+        self.new_protocol_profile = ProtocolProfile::Legacy;
+        self.allow_legacy_compatibility_profile = true;
+        self
+    }
+
     pub fn peeler(mut self, peeler: Box<dyn TransportPeeler>) -> Self {
         self.peeler = Some(peeler);
         self
@@ -298,6 +458,45 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    pub fn maintenance_sources(
+        mut self,
+        wall_clock: Arc<dyn WallClock>,
+        maintenance_random: Arc<dyn MaintenanceRandom>,
+    ) -> Self {
+        self.wall_clock = wall_clock;
+        self.maintenance_random = maintenance_random;
+        self
+    }
+
+    /// Install the convergence-only dual clock.
+    ///
+    /// This does not affect protocol, identity, transport-event, or
+    /// maintenance timestamps.
+    pub fn convergence_clock(mut self, clock: Arc<dyn ConvergenceClock>) -> Self {
+        self.convergence_clock = clock;
+        self
+    }
+
+    /// Disable application-message witnesses for a full-engine comparison.
+    ///
+    /// This does not define or negotiate another Marmot convergence policy.
+    /// It exists only in explicit test-policy builds so campaigns can measure
+    /// whether the v1 witness term changes outcomes enough to justify itself.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn without_app_witnesses_for_tests(mut self) -> Self {
+        self.admit_app_witnesses = false;
+        self
+    }
+
+    /// Override the per-pass OpenMLS replay-probe ceiling for fail-closed
+    /// resource campaigns. A zero limit deterministically fails the first
+    /// probe; `None` restores the production-derived budget.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn replay_probe_budget_for_tests(mut self, limit: Option<u64>) -> Self {
+        self.replay_probe_budget_override = limit;
+        self
+    }
+
     /// Install a forensic audit-log recorder. Without this call the engine
     /// uses [`NoopRecorder`] and emits no audit events.
     pub fn recorder(mut self, recorder: Box<dyn ForensicRecorder>) -> Self {
@@ -306,6 +505,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
     }
 
     pub fn build(self) -> Result<Engine<S>, EngineError> {
+        if self.new_protocol_profile == ProtocolProfile::Legacy
+            && !self.allow_legacy_compatibility_profile
+        {
+            return Err(EngineError::Other(
+                "strict cutover forbids creating a legacy-profile engine".into(),
+            ));
+        }
         // spec/foundation/mls-protocol.md:11-15 — Marmot has a single
         // mandatory-to-implement ciphersuite. Reject any other ciphersuite at
         // construction so no group can ever be created off-spec.
@@ -314,6 +520,15 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 got: u16::from(self.ciphersuite),
                 required: u16::from(DEFAULT_CIPHERSUITE),
             });
+        }
+        // Normal builds keep the MLS past-epoch window pinned to the v1
+        // app-message horizon. Only explicit test harness builds may shrink it
+        // for decrypt-window probes (mdk#970).
+        #[cfg(not(feature = "test-policy-overrides"))]
+        if self.max_past_epochs != crate::wire_format::DEFAULT_MAX_PAST_EPOCHS {
+            return Err(EngineError::Other(
+                "max_past_epochs must equal the pinned v1 app-message window".into(),
+            ));
         }
         let identity_bytes = self
             .identity_bytes
@@ -329,9 +544,12 @@ impl<S: StorageProvider> EngineBuilder<S> {
             self.ciphersuite,
             identity_bytes,
             &self.storage,
+            self.new_protocol_profile,
             proof_signer.as_ref(),
         )
         .map_err(EngineError::Other)?;
+
+        let pending_application_events = self.storage.list_pending_application_events()?;
 
         Ok(Engine {
             storage: self.storage,
@@ -339,38 +557,281 @@ impl<S: StorageProvider> EngineBuilder<S> {
             identity,
             registry: self.registry,
             supported_app_components: self.supported_app_components,
+            new_protocol_profile: self.new_protocol_profile,
             peeler,
             ciphersuite: self.ciphersuite,
             max_past_epochs: self.max_past_epochs,
+            wall_clock: self.wall_clock,
+            maintenance_random: self.maintenance_random,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
-            events_buf: VecDeque::new(),
+            events_buf: pending_application_events.into(),
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
+            valid_proposal_groups: HashSet::new(),
             pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
+            retryable_unpersisted_ingest_id: None,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),
             pending_convergence_groups: HashSet::new(),
-            convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
-            last_convergence_relevant_input_ms: HashMap::new(),
-            convergence_clock_started_at: Instant::now(),
+            queued_intent_by_message: HashMap::new(),
+            queued_intent_by_pending: HashMap::new(),
+            // Keep the in-memory app-message window aligned with MLS
+            // `max_past_epochs` from construction so the two knobs cannot drift
+            // before the first `set_convergence_policy` call.
+            convergence_policy: crate::canonicalization::CanonicalizationPolicy {
+                app_message_past_epoch_limit: self.max_past_epochs as u64,
+                ..crate::canonicalization::CanonicalizationPolicy::default()
+            },
+            #[cfg(feature = "test-policy-overrides")]
+            admit_app_witnesses: self.admit_app_witnesses,
+            #[cfg(feature = "test-policy-overrides")]
+            replay_probe_budget_override: self.replay_probe_budget_override,
+            #[cfg(feature = "test-conformance-snapshot")]
+            conformance_replay_probe_count: 0,
+            convergence_clock: self.convergence_clock,
+            convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
+            unhydrated_groups: HashSet::new(),
+            route_backfill_pending: HashSet::new(),
             transport_group_id_index: HashMap::new(),
             seen_message_ids_hex_cache: None,
             deferred_peel: HashMap::new(),
             deferred_peel_retry_budget: crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS,
+            deferred_peel_residence_ms: crate::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS,
         })
     }
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Change the explicit replay-probe ceiling for a running exhaustion
+    /// campaign. Production builds do not expose this method.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
+        self.replay_probe_budget_override = limit;
+    }
+
+    pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
+        if self.ensure_group_live(group_id).is_err() {
+            return None;
+        }
+        self.epoch_manager.state(group_id).cloned()
+    }
+
+    /// Capture the adopted Marmot conformance projection for one live group.
+    ///
+    /// This synthetic-test interface is deliberately feature-gated. It returns
+    /// public protocol state and a domain-separated exporter commitment, never
+    /// the raw exporter secret. Production telemetry and app surfaces must not
+    /// enable `test-conformance-snapshot`.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_group_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformanceGroupSnapshot, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let epoch_state = self
+            .epoch_manager
+            .state(group_id)
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        crate::conformance_snapshot::capture_group_snapshot(
+            &self.storage,
+            &self.crypto,
+            group_id,
+            epoch_state,
+        )
+    }
+
+    /// Capture exact canonical state for either a live group or an
+    /// authenticated terminal disband tombstone.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_canonical_state_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformanceCanonicalStateSnapshot, EngineError> {
+        self.ensure_group_live(group_id)?;
+        if let Some(tombstone) = self.storage.disband_tombstone(group_id)? {
+            return Ok(
+                crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Disbanded(
+                    crate::conformance_snapshot::capture_disbanded_group_snapshot(
+                        group_id, &tombstone,
+                    ),
+                ),
+            );
+        }
+        self.conformance_group_snapshot(group_id)
+            .map(Box::new)
+            .map(crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Live)
+    }
+
+    /// Capture aggregate outstanding work for the synthetic conformance
+    /// simulator. This is an oracle diagnostic only and never affects engine
+    /// scheduling or protocol decisions.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_pending_work_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformancePendingWorkSnapshot, EngineError> {
+        crate::conformance_snapshot::capture_pending_work_snapshot(self, group_id)
+    }
+
+    /// Capture sanitized structural work and scheduling state for a black-box
+    /// conformance runner. This read-only surface cannot influence selection.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_structural_progress_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformanceStructuralProgressSnapshot, EngineError>
+    {
+        crate::conformance_snapshot::capture_structural_progress_snapshot(self, group_id)
+    }
+
+    /// Read the durable state of one synthetic scenario input under either its
+    /// transport or content-derived id.
+    ///
+    /// The simulator supplies both aliases because outbound and inbound copies
+    /// of the same MLS bytes can use different storage keys. This observation is
+    /// feature-gated, exposes no payload bytes, and never affects processing.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_message_state(
+        &self,
+        aliases: &[MessageId],
+    ) -> Result<Option<cgka_traits::MessageState>, EngineError> {
+        for alias in aliases {
+            match self.storage.get_message(alias) {
+                Ok(record) => return Ok(Some(record.state)),
+                Err(cgka_traits::storage::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Cumulative candidate replay probes since this engine process opened.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_replay_probe_count(&self) -> u64 {
+        self.conformance_replay_probe_count
+    }
+
+    /// Return the transport and content-derived ids for a durable synthetic
+    /// scenario input without exposing its wire bytes.
+    ///
+    /// Locally produced OpenMLS messages are retained under the exact
+    /// transport id and a content marker. The simulator needs both aliases to
+    /// correlate a re-wrapped inbound copy and later invalidation events, but
+    /// must not re-peel a commit after the sender has already advanced state.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_message_aliases(
+        &self,
+        transport_id: &MessageId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        let record = self.storage.get_message(transport_id)?;
+        let mut aliases = vec![transport_id.clone()];
+        if let Ok(payload) = StoredMessagePayload::decode(&record.payload)
+            && let Some(openmls_message) = payload.as_openmls_wire()
+        {
+            let content_id =
+                MessageId::new(Sha256::digest(openmls_message.payload.as_slice()).to_vec());
+            if content_id != *transport_id {
+                aliases.push(content_id);
+            }
+        }
+        Ok(aliases)
+    }
+
+    /// Persist a frozen transport fanout before or after one lifecycle edge.
+    pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.storage.put_outbound_fanout(fanout)?;
+        Ok(())
+    }
+
+    /// Read all frozen fanouts in original staging order.
+    pub fn outbound_fanouts(&self) -> Result<Vec<OutboundFanout>, EngineError> {
+        Ok(self
+            .storage
+            .list_outbound_fanouts()?
+            .into_iter()
+            .filter(|fanout| {
+                fanout.group_id().is_none_or(|group_id| {
+                    // Unhydrated groups' fanouts stay frozen until full
+                    // hydration restores their pending lifecycle (mdk#1161);
+                    // quarantined groups' fanouts are hidden as before.
+                    !self.quarantined_groups.contains_key(group_id)
+                        && !self.unhydrated_groups.contains(group_id)
+                })
+            })
+            .collect())
+    }
+
+    /// Delete a terminal fanout after its outcome has been returned.
+    pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> Result<(), EngineError> {
+        if let Some(group_id) = self
+            .storage
+            .outbound_fanout(message_id)?
+            .as_ref()
+            .and_then(OutboundFanout::group_id)
+        {
+            self.ensure_group_live(group_id)?;
+        }
+        self.storage.delete_outbound_fanout(message_id)?;
+        Ok(())
+    }
+
+    /// Resolve the group owning a live pending reference without exposing
+    /// epoch-manager internals across the session/runtime boundary.
+    pub fn pending_group_id(&self, pending: PendingStateRef) -> Result<GroupId, EngineError> {
+        let group_id = self
+            .epoch_manager
+            .group_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+        self.ensure_group_live(&group_id)?;
+        Ok(group_id)
+    }
+
+    /// Confirm MLS and persist the matching fanout's terminal MLS edge in the
+    /// same backend transaction.
+    pub async fn confirm_published_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> Result<GroupEvent, EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
+        self.do_confirm_published_with_fanout(pending, Some(fanout))
+            .await
+    }
+
+    /// Roll back MLS and persist the matching all-failed fanout edge in the
+    /// same backend transaction.
+    pub async fn publish_failed_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
+        self.do_publish_failed_with_fanout(pending, Some(fanout))
+            .await
+    }
+
+    pub fn drain_valid_proposal_groups(&mut self) -> Vec<GroupId> {
+        self.valid_proposal_groups.drain().collect()
+    }
+
     pub async fn ingest_with_audit_context(
         &mut self,
         msg: TransportMessage,
@@ -437,6 +898,30 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
         context: Option<AuditEventContext>,
     ) -> Result<SendResult, EngineError> {
+        self.accept_send_with_audit_context(intent, context, SendAcceptance::Prepare)
+            .await
+    }
+
+    pub async fn queue_app_message_with_audit_context(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+        context: Option<AuditEventContext>,
+    ) -> Result<SendResult, EngineError> {
+        self.accept_send_with_audit_context(
+            SendIntent::AppMessage { group_id, payload },
+            context,
+            SendAcceptance::QueueAppMessage,
+        )
+        .await
+    }
+
+    async fn accept_send_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: Option<AuditEventContext>,
+        acceptance: SendAcceptance,
+    ) -> Result<SendResult, EngineError> {
         let operation_id = self.next_audit_operation_id();
         let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
         let group_ref = crate::audit_helpers::send_intent_group_ref(&intent);
@@ -451,7 +936,15 @@ impl<S: StorageProvider> Engine<S> {
             },
         });
         self.current_audit_context = Some(context.clone());
-        let result = self.do_send(intent).await;
+        let result = match acceptance {
+            SendAcceptance::Prepare => self.do_send(intent).await,
+            SendAcceptance::QueueAppMessage => {
+                let SendIntent::AppMessage { group_id, payload } = intent else {
+                    unreachable!("queue app-message acceptance constructs an AppMessage intent")
+                };
+                self.do_queue_app_message(group_id, payload)
+            }
+        };
         self.current_audit_context = None;
         match &result {
             Ok(send_result) => {
@@ -493,6 +986,16 @@ impl<S: StorageProvider> Engine<S> {
         req: CreateGroupRequest,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_with_optional_app_components_and_audit_context(req, Vec::new(), context)
+            .await
+    }
+
+    pub async fn create_group_with_optional_app_components_and_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        context: Option<AuditEventContext>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
         let operation_id = self.next_audit_operation_id();
         let mut context = context.unwrap_or_default();
         context.operation_id = Some(operation_id);
@@ -503,12 +1006,13 @@ impl<S: StorageProvider> Engine<S> {
             AuditEventKind::CreateGroupEntry {
                 member_count: req.members.len() as u64,
                 required_feature_count: req.required_features.len() as u64,
-                app_component_count: req.app_components.len() as u64,
+                app_component_count: (req.app_components.len() + optional_app_components.len())
+                    as u64,
                 initial_admin_count: req.initial_admins.len() as u64,
             },
         );
         self.current_audit_context = Some(context.clone());
-        let result = self.do_create_group(req).await;
+        let result = self.do_create_group(req, optional_app_components).await;
         match &result {
             Ok((group_id, send_result)) => {
                 let mut outcome_context = context.clone();
@@ -571,12 +1075,15 @@ impl<S: StorageProvider> Engine<S> {
         let mut rows = Vec::new();
 
         let main = match result {
-            SendResult::ApplicationMessage { msg } => {
+            SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => None,
+            SendResult::ApplicationMessage { msg, .. } => {
                 Some((msg, MessageArtifactKind::ApplicationMessage))
             }
             SendResult::Proposal { msg } => Some((msg, MessageArtifactKind::Proposal)),
             SendResult::GroupEvolution { msg, .. } => Some((msg, MessageArtifactKind::Commit)),
-            SendResult::GroupCreated { .. } | SendResult::Queued { .. } => None,
+            SendResult::GroupCreated { .. }
+            | SendResult::FoundingGroupCreated { .. }
+            | SendResult::Queued { .. } => None,
         };
         if let Some((msg, artifact_kind)) = main {
             let self_id = self.identity.self_id();
@@ -610,7 +1117,8 @@ impl<S: StorageProvider> Engine<S> {
 
         let welcomes = match result {
             SendResult::GroupEvolution { welcomes, .. }
-            | SendResult::GroupCreated { welcomes, .. } => welcomes.as_slice(),
+            | SendResult::GroupCreated { welcomes, .. }
+            | SendResult::FoundingGroupCreated { welcomes } => welcomes.as_slice(),
             _ => [].as_slice(),
         };
         for welcome in welcomes {
@@ -649,40 +1157,43 @@ impl<S: StorageProvider> Engine<S> {
         rows
     }
 
-    /// Restore stable epoch state for groups already present in storage.
+    /// Insert one transport route into the in-memory resolver AND the durable
+    /// route table (mdk#1161), stamped with the group epoch that observed the
+    /// route as current, then retire durable rows the retained-history window
+    /// has moved past (routing-v1: a prior address is accepted only until no
+    /// epoch using it remains in either retained window).
     ///
-    /// This is used by production session startup after opening durable
-    /// storage. The application is expected to resolve publish success/failure
-    /// (`confirm_published` / `publish_failed`) before shutdown, but a *crash*
-    /// between transport publish and that resolution violates the
-    /// precondition: OpenMLS durably persists the staged commit
-    /// (`MlsGroupState::PendingCommit`) and `MlsGroup::load` restores it, while
-    /// the in-memory `PendingStateRef` that `confirm_published` /
-    /// `publish_failed` require is gone (the `EpochManager` starts empty on
-    /// every open). Left untouched, the group is stranded: every subsequent
-    /// commit-creating operation fails with a pending-commit error forever.
-    ///
-    /// So at hydrate time we detect a surviving pending commit and clear it,
-    /// treating an unresolved pending publish as publish-failed (the same
-    /// rewind `do_publish_failed` performs). The MLS group returns to its
-    /// pre-stage epoch, we re-derive the Marmot record from that cleared
-    /// state, and we surface a typed `PendingCommitRecovered` event so the
-    /// application can run a recovery / resync path — if relays accepted the
-    /// commit before the crash, this device is now behind and must catch up.
-    ///
-    /// **Member-removing commits are deliberately left untouched.** A surviving
-    /// pending commit is NOT a reliable crash signal on its own: a deferred
-    /// SelfRemove-only commit (the MIP-03 leave path) legitimately persists a
-    /// staged commit across process boundaries — a remaining member stages the
-    /// commit, projects the departing member out of the Marmot record
-    /// *forward*, and a later run publishes + confirms it. Rolling that
-    /// back re-derives the record from the pre-stage MLS state and so re-adds a
-    /// member who already left, forking convergence (the remaining members
-    /// advance past the leave while this device silently rewinds it). Clearing
-    /// an additive (invite) commit is safe — it only drops an invitee who never
-    /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
-    /// scope crash-recovery to staged commits that remove no members, matching
-    /// the prior (pre-recovery) behaviour for removal-bearing commits.
+    /// The durable writes are best-effort with the same policy as every route
+    /// refresh: a failure only forfeits the next cold-start route seed, never
+    /// routing correctness — the in-memory insert stays authoritative for
+    /// this session, and the session-open seed detects the resulting stale
+    /// epoch stamp and schedules a backfill repair.
+    pub(crate) fn index_transport_group_route(
+        &mut self,
+        transport_group_id: Vec<u8>,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+    ) {
+        self.transport_group_id_index
+            .insert(transport_group_id.clone(), group_id.clone());
+        let _ = self
+            .storage
+            .put_transport_group_route(&transport_group_id, group_id, source_epoch);
+        // Durable retirement: rows last observed current before the retained
+        // horizon can no longer carry acceptable traffic. (The in-memory map
+        // stays session-scoped; its growth is tracked separately as #896.)
+        if let Ok(policy) = self.convergence_policy_for_group_ungated(group_id) {
+            let cutoff = EpochId(
+                source_epoch
+                    .0
+                    .saturating_sub(policy.convergence.max_rewind_commits),
+            );
+            let _ = self
+                .storage
+                .delete_transport_group_routes_below_epoch(group_id, cutoff);
+        }
+    }
+
     /// Additively refresh a group's `transport_group_id_index` entry from live
     /// MLS state after a commit that may have changed the Nostr routing
     /// component (#740 rotation). Inserts the group's CURRENT `transport_group_id`;
@@ -694,7 +1205,10 @@ impl<S: StorageProvider> Engine<S> {
     /// only fire on commit application, not per app message, so the extra
     /// `MlsGroup::load` is cost-appropriate. Best-effort: a load / routing-read
     /// failure just forfeits the fast path for this group (inbound would fall to
-    /// the unknown-group disposition), never fails the merge.
+    /// the unknown-group disposition), never fails the merge — and because this
+    /// runs after the commit transaction, the durable route row can lag the
+    /// record epoch; the session-open seed treats that lag as a stale route
+    /// set and schedules a backfill repair (mdk#1161).
     pub(crate) fn reindex_transport_group_id(&mut self, group_id: &GroupId) {
         let mls_group = {
             let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -715,35 +1229,320 @@ impl<S: StorageProvider> Engine<S> {
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
+            let current_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, group_id, current_epoch);
         }
     }
 
+    /// Session-open cheap pass (mdk#1161): seed every stored group's epoch
+    /// entry, terminal markers, and transport route from durable records —
+    /// without loading MLS state, listing snapshots, or scanning messages —
+    /// so open cost stays flat in stored group count.
+    ///
+    /// Seeded groups enter [`Self::unhydrated_groups`] and fail closed with
+    /// [`EngineError::GroupNotHydrated`] on every gated surface until
+    /// [`Self::ensure_hydrated`] runs their full hydration (on demand from a
+    /// `&mut` entry point, or from the embedder's background pipeline over
+    /// [`Self::unhydrated_group_ids`]). Disbanded and unrecoverable groups
+    /// restore their terminal state here exactly as before, including the
+    /// every-open `GroupUnrecoverable` re-emit. Idempotent: groups that
+    /// already hold an epoch entry or a quarantine entry are left untouched,
+    /// so a second call never demotes a live group.
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
-        for group_id in self.storage.list_groups()? {
-            if let Err(reason) = self.hydrate_one_stored_group(&group_id) {
-                self.quarantine_stored_group_on_hydrate(&group_id, reason);
+        // One unreadable record must quarantine that one group, never abort
+        // the whole account open (mdk#151 / #417). The bulk read is the fast
+        // path; if it fails, re-read per group and carry each failure as the
+        // group id it belongs to.
+        let records: Vec<Result<Group, GroupId>> = match self.storage.list_group_records() {
+            Ok(records) => records.into_iter().map(Ok).collect(),
+            Err(_) => self
+                .storage
+                .list_groups()?
+                .into_iter()
+                .map(|group_id| self.storage.get_group(&group_id).map_err(|_| group_id))
+                .collect(),
+        };
+        let mut tombstones: HashMap<GroupId, cgka_traits::DisbandTombstone> = self
+            .storage
+            .list_disband_tombstones()?
+            .into_iter()
+            .collect();
+        let mut stored_group_ids = HashSet::with_capacity(records.len());
+        let mut seeded_group_epochs: HashMap<GroupId, EpochId> = HashMap::new();
+        for record in records {
+            let group = match record {
+                Ok(group) => group,
+                Err(group_id) => {
+                    stored_group_ids.insert(group_id.clone());
+                    if self.epoch_manager.state(&group_id).is_none()
+                        && !self.quarantined_groups.contains_key(&group_id)
+                    {
+                        self.quarantine_stored_group_on_hydrate(
+                            &group_id,
+                            GroupHydrationQuarantineReason::GroupRecordLoadFailed,
+                        );
+                    }
+                    continue;
+                }
+            };
+            stored_group_ids.insert(group.id.clone());
+            if self.epoch_manager.state(&group.id).is_some()
+                || self.quarantined_groups.contains_key(&group.id)
+            {
+                continue;
             }
+            let tombstone = group
+                .disbanded
+                .clone()
+                .or_else(|| tombstones.remove(&group.id));
+            if let Some(tombstone) = tombstone {
+                // Reconcile the single deterministic system row after a
+                // crash. The application projection canonicalizes this event,
+                // so replaying it on open is idempotent.
+                self.restore_disband_tombstone(group.id, tombstone)?;
+                continue;
+            }
+            if group.unrecoverable {
+                // mdk#971: a durable Unrecoverable halt must survive process
+                // restart. Seed the halted epoch entry so every convergence /
+                // ingest gate observes it immediately, and queue the group
+                // for full hydration like any other seeded group: an
+                // unrecoverable group still needs its per-group hydration
+                // work (route indexing, interrupted probe/apply recovery,
+                // leave-request restore) — the pre-mdk#1161 open always ran
+                // it, and `hydrate_all_stored_groups` must stay
+                // behavior-preserving. `hydrate_one_stored_group` restores
+                // the halt and re-emits the application-facing
+                // `GroupUnrecoverable` event when it runs, so the event
+                // stays once-per-open on the eager path and arrives with the
+                // group's promotion on the deferred path.
+                self.epoch_manager
+                    .restore_unrecoverable(group.id.clone(), group.epoch);
+                self.audit_group(
+                    &group.id,
+                    crate::audit_helpers::epoch_state_changed_event(
+                        None,
+                        "unrecoverable",
+                        group.epoch,
+                        "hydrate_unrecoverable_group",
+                        None,
+                        None,
+                    ),
+                );
+                self.unhydrated_groups.insert(group.id.clone());
+                seeded_group_epochs.insert(group.id, group.epoch);
+                continue;
+            }
+            // Provisional seed: the durable record's epoch mirror keeps
+            // `live_group_ids` and the app projection listing this group
+            // while full hydration is outstanding. A crash mid-probe may
+            // have left the record rewound; the interrupted-probe rollback
+            // runs inside `ensure_hydrated` before any gated read, and the
+            // only pre-rollback reads are these display-provisional record
+            // fields, which full hydration re-derives.
+            self.epoch_manager.set_stable(group.id.clone(), group.epoch);
+            self.audit_group(
+                &group.id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    None,
+                    "seeded",
+                    group.epoch,
+                    "hydrate_seed_group",
+                    None,
+                    None,
+                ),
+            );
+            self.unhydrated_groups.insert(group.id.clone());
+            seeded_group_epochs.insert(group.id, group.epoch);
+        }
+
+        // Seed inbound routing from the durable route table so unhydrated
+        // groups still resolve (mdk#740 semantics preserved: many-to-one,
+        // rotation overlap retained). A group's route set is trusted only if
+        // some row was stamped at the record's current epoch: every commit
+        // apply refreshes the current route's epoch stamp, so a lagging stamp
+        // means the last commit (which may have rotated the route) was not
+        // followed by a route write — a crash or write failure — and current
+        // traffic could miss the index. Untrusted and route-less groups —
+        // including records predating migration 0043 or providers without a
+        // route store — go to the backfill set: ingest re-derives their
+        // current route from one MLS load on demand, and the background
+        // pipeline orders them first. Stale rows still seed the index so
+        // overlap-window traffic keeps resolving.
+        let mut current_routed_group_ids = HashSet::new();
+        for route in self.storage.list_transport_group_routes()? {
+            if !stored_group_ids.contains(&route.group_id) {
+                continue;
+            }
+            if seeded_group_epochs
+                .get(&route.group_id)
+                .is_some_and(|epoch| route.source_epoch >= *epoch)
+            {
+                current_routed_group_ids.insert(route.group_id.clone());
+            }
+            self.transport_group_id_index
+                .insert(route.transport_group_id, route.group_id);
+        }
+        for group_id in seeded_group_epochs.into_keys() {
+            if !current_routed_group_ids.contains(&group_id) {
+                self.route_backfill_pending.insert(group_id);
+            }
+        }
+
+        for (group_id, tombstone) in tombstones {
+            if !stored_group_ids.contains(&group_id)
+                && self.epoch_manager.state(&group_id).is_none()
+            {
+                self.restore_disband_tombstone(group_id, tombstone)?;
+            }
+        }
+        let stored_group_count = stored_group_ids.len();
+        tracing::debug!(
+            target: "cgka_engine::hydrate",
+            method = "hydrate_stable_groups_from_storage",
+            stored_groups = stored_group_count,
+            unhydrated_groups = self.unhydrated_groups.len(),
+            route_backfill_pending = self.route_backfill_pending.len(),
+            "seeded stored groups without full hydration"
+        );
+        Ok(())
+    }
+
+    /// Eager-compatibility hydration: run the cheap pass, then drain every
+    /// seeded group through full hydration immediately, swallowing per-group
+    /// quarantines exactly like the pre-mdk#1161 all-groups open loop. For
+    /// tests and embedders that want every group live (or quarantined) before
+    /// the session serves work.
+    pub fn hydrate_all_stored_groups(&mut self) -> Result<(), EngineError> {
+        self.hydrate_stable_groups_from_storage()?;
+        for group_id in self.unhydrated_group_ids() {
+            // A failed hydration quarantines the group inside
+            // `ensure_hydrated`; the rest of the account still opens.
+            let _ = self.ensure_hydrated(&group_id);
         }
         Ok(())
     }
 
+    /// Group ids that successfully hydrated into this live engine session.
+    /// Stored records quarantined during open are intentionally omitted: they
+    /// use the separate recovery surface and must not be projected as healthy.
+    pub fn live_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
+        Ok(self
+            .storage
+            .list_groups()?
+            .into_iter()
+            .filter(|group_id| {
+                self.epoch_manager.state(group_id).is_some_and(|state| {
+                    !matches!(state, cgka_traits::engine_state::EpochState::Disbanded(_))
+                })
+            })
+            .collect())
+    }
+
+    fn restore_disband_tombstone(
+        &mut self,
+        group_id: GroupId,
+        tombstone: cgka_traits::DisbandTombstone,
+    ) -> Result<(), EngineError> {
+        self.epoch_manager
+            .restore_disbanded(group_id.clone(), tombstone.epoch)?;
+        self.events_buf.push_back(GroupEvent::GroupStateChanged {
+            group_id,
+            epoch: tombstone.epoch,
+            actor: Some(tombstone.actor),
+            change: GroupStateChange::GroupDisbanded,
+            origin_commit_id: tombstone.origin_commit_id,
+        });
+        Ok(())
+    }
+
+    /// Full per-group hydration: load and validate one stored group's MLS and
+    /// Marmot state, run its crash recovery, and restore its live epoch entry.
+    ///
+    /// The application is expected to resolve publish success/failure
+    /// (`confirm_published` / `publish_failed`) before shutdown, but a *crash*
+    /// between transport publish and that resolution violates the
+    /// precondition: OpenMLS durably persists the staged commit
+    /// (`MlsGroupState::PendingCommit`) and `MlsGroup::load` restores it, while
+    /// the in-memory `PendingStateRef` that `confirm_published` /
+    /// `publish_failed` require is gone (the `EpochManager` starts empty on
+    /// every open). Left untouched, the group is stranded: every subsequent
+    /// commit-creating operation fails with a pending-commit error forever.
+    ///
+    /// So hydration detects a surviving pending commit and clears it,
+    /// treating an unresolved pending publish as publish-failed (the same
+    /// rewind `do_publish_failed` performs). The MLS group returns to its
+    /// pre-stage epoch, we re-derive the Marmot record from that cleared
+    /// state, and we surface a typed `PendingCommitRecovered` event so the
+    /// application can run a recovery / resync path — if relays accepted the
+    /// commit before the crash, this device is now behind and must catch up.
+    ///
+    /// **Member-removing commits are deliberately left untouched.** A surviving
+    /// pending commit is NOT a reliable crash signal on its own: a deferred
+    /// SelfRemove-only commit (the MIP-03 leave path) legitimately persists a
+    /// staged commit across process boundaries — a remaining member stages the
+    /// commit, projects the departing member out of the Marmot record
+    /// *forward*, and a later run publishes + confirms it. Rolling that
+    /// back re-derives the record from the pre-stage MLS state and so re-adds a
+    /// member who already left, forking convergence (the remaining members
+    /// advance past the leave while this device silently rewinds it). Clearing
+    /// an additive (invite) commit is safe — it only drops an invitee who never
+    /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
+    /// scope crash-recovery to staged commits that remove no members, matching
+    /// the prior (pre-recovery) behaviour for removal-bearing commits.
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
+        // A retained-anchor convergence probe durably rewinds the group while
+        // it explores historical candidates. Process termination cannot run
+        // the in-process rollback guard, so restore its pre-probe live snapshot
+        // before loading any MLS or Marmot state — including the group record
+        // read below, whose epoch seeds the epoch manager.
+        crate::openmls_projection::recover_interrupted_retained_anchor_probe(
+            &self.storage,
+            group_id,
         )
-        .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
-        .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?;
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
+        // The one group-record read for this hydration (mdk#1161): every later
+        // consumer (tombstone check, profile mirror check, pending-commit
+        // recovery, epoch seeding) shares this post-recovery record.
+        let mut group = self
+            .storage
+            .get_group(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        let tombstone = match group.disbanded.clone() {
+            Some(tombstone) => Some(tombstone),
+            None => self
+                .storage
+                .disband_tombstone(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?,
+        };
+        if let Some(tombstone) = tombstone {
+            // Reconcile the single deterministic system row after a crash. The
+            // application projection canonicalizes this event, so replaying it
+            // on open is idempotent.
+            let epoch = tombstone.epoch;
+            self.restore_disband_tombstone(group_id.clone(), tombstone)
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+            return Ok(epoch);
+        }
+
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut mls_group = {
+            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                &self.crypto,
+                self.storage.mls_storage(),
+            );
+            let provider_storage =
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider);
+            openmls::group::MlsGroup::load(provider_storage, &mls_gid)
+                .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
+                .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?
+        };
 
         // Record the transport routing id as soon as the MLS state loads —
         // before any validation that can quarantine the group — so inbound
@@ -753,9 +1552,15 @@ impl<S: StorageProvider> Engine<S> {
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
+            let current_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, group_id, current_epoch);
         }
+        self.route_backfill_pending.remove(group_id);
+        let wire_protocol_profile =
+            crate::account_identity_proof::protocol_profile_of_group(&mls_group)
+                .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
+        crate::app_components::validate_current_profile_group_invariants(&mls_group)
+            .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
 
         // Member-credential + account-identity-proof validation runs one
         // BIP-340 schnorr verification per leaf. All of this state was already
@@ -799,10 +1604,86 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
-        let mut group = self
+        if group.protocol_profile != wire_protocol_profile {
+            return Err(GroupHydrationQuarantineReason::MemberValidationFailed);
+        }
+
+        // OpenMLS persists sender-ratchet policy per group. Groups created
+        // while MDK accidentally inherited OpenMLS's 5-message default would
+        // therefore remain fragile after merely changing the creation/join
+        // presets. Validate the profile and member invariants before mutating
+        // the group, then write the pinned engine config through in place
+        // before any new traffic can be processed. The migration is
+        // intentionally triggered only by sender-ratchet drift:
+        // `set_configuration` does not resize the live past-epoch secret store.
+        // Construction tests separately assert that create and Welcome paths
+        // persist the same full join config. This cannot restore secrets
+        // already pruned, but it protects all future within-epoch application
+        // traffic.
+        let required_config = crate::wire_format::join_config(self.max_past_epochs);
+        if mls_group.configuration().sender_ratchet_configuration()
+            != required_config.sender_ratchet_configuration()
+        {
+            mls_group
+                .set_configuration(self.storage.mls_storage(), &required_config)
+                .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?;
+        }
+
+        let durable_pending_fanout = self
             .storage
-            .get_group(group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+            .list_outbound_fanouts_for_group(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .into_iter()
+            .find(|fanout| {
+                fanout.group_id() == Some(group_id)
+                    && matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+            });
+        let pending_recovery = if mls_group.pending_commit().is_some()
+            && let Some(fanout) = durable_pending_fanout.as_ref()
+        {
+            let pending_ref = fanout
+                .pending_ref()
+                .expect("pending fanout state retains its pending ref");
+            let prior_epoch = EpochId(mls_group.epoch().as_u64());
+            let stored = self
+                .storage
+                .get_message(fanout.message_id())
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let payload = StoredMessagePayload::decode(&stored.payload)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let commit_bytes = payload
+                .as_openmls_wire()
+                .map(|message| message.payload.as_slice())
+                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let priority = crate::app_components::commit_ordering_priority_for_staged(
+                mls_group
+                    .pending_commit()
+                    .expect("pending commit presence checked above"),
+            );
+            let snapshot_prefix = format!("fork-{}-", prior_epoch.0);
+            let snapshots = self
+                .storage
+                .list_group_snapshots(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let snapshot_name = newest_fork_snapshot(snapshots, &snapshot_prefix)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
+                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            Some((
+                pending_ref,
+                prior_epoch,
+                fanout.message_id().clone(),
+                CommitOrderingKey::from_commit_bytes(
+                    prior_epoch,
+                    priority,
+                    self.identity.self_id().clone(),
+                    commit_bytes,
+                ),
+                snapshot_name,
+            ))
+        } else {
+            None
+        };
+        let restored_pending = pending_recovery.is_some();
 
         // A staged commit that survived process restart *may* mean the
         // application crashed mid-publish. Clear it (treat as
@@ -825,7 +1706,17 @@ impl<S: StorageProvider> Engine<S> {
                 )
             })
         });
-        if mls_group.pending_commit().is_some() && !staged_removes_member {
+        let restored_durable_evolution =
+            if mls_group.pending_commit().is_some() && !restored_pending {
+                self.restore_durable_group_evolution_on_hydrate(group_id, &mls_group)?
+            } else {
+                false
+            };
+        if mls_group.pending_commit().is_some()
+            && !staged_removes_member
+            && !restored_pending
+            && !restored_durable_evolution
+        {
             // Clear the staged commit transactionally (preserves the #421
             // crash-safety fix): the MLS storage mutation must be atomic so a
             // crash mid-clear cannot leave torn group state.
@@ -864,10 +1755,87 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
 
-        if let Some(request) = self
-            .leave_request_to_restore_on_hydrate(group_id, &mut mls_group, &group, &provider)
+        // The one full message scan for this hydration (mdk#1161): the
+        // leave-request probe, the convergence-input gate, the deferred-peel
+        // check, and the self-remove schedule restore below all classify
+        // subsets of the same rows, so they share this fetch instead of each
+        // re-reading the whole group message table.
+        let stored_message_records = self
+            .storage
+            .list_messages(group_id, EpochId(0))
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let leave_request = self
+            .leave_request_to_restore_on_hydrate(
+                group_id,
+                &mut mls_group,
+                &group,
+                &provider,
+                &stored_message_records,
+            )
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
+        // Startup must recreate the in-memory scheduling edge for durable
+        // convergence work. Otherwise queued user sends and stored branch
+        // inputs remain asleep after a process restart until unrelated traffic
+        // happens to touch the group.
+        let has_queued_intents = !self
+            .storage
+            .list_queued_outbound_intents(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .is_empty();
+        let has_convergence_inputs = self
+            .has_unresolved_convergence_inputs_in_records(group_id, &group, &stored_message_records)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        let has_deferred_peels = stored_message_records
+            .iter()
+            .any(|record| record.state == MessageState::PeelDeferred);
+
+        // Do not expose any recovered pending state until every fallible
+        // hydration read and validation above has succeeded. If a later step
+        // quarantines the group, neither runtime fanout resumption nor direct
+        // pending access may observe a half-hydrated lifecycle.
+        // mdk#971: a durable Unrecoverable halt must survive process restart.
+        // Do not restore PendingPublish or silently `set_stable` over an
+        // unrepaired base — keep ingest/convergence blocked until a verified
+        // repair path clears the marker.
+        let (hydrate_state, hydrate_reason) = if group.unrecoverable {
+            self.epoch_manager
+                .restore_unrecoverable(group_id.clone(), group.epoch);
+            ("unrecoverable", "hydrate_unrecoverable_group")
+        } else if let Some((pending_ref, prior_epoch, message_id, ordering_key, snapshot_name)) =
+            pending_recovery
         {
+            self.epoch_manager
+                .restore_pending(
+                    group_id.clone(),
+                    prior_epoch,
+                    EpochId(prior_epoch.0.saturating_add(1)),
+                    StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+                    pending_ref,
+                    crate::epoch_manager::PendingKind::GroupEvolution,
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            self.fork_recovery.record_pending(
+                pending_ref,
+                group_id.clone(),
+                prior_epoch,
+                message_id,
+                ordering_key,
+                snapshot_name,
+            );
+            ("pending_publish", "hydrate_stable_group")
+        } else if restored_durable_evolution {
+            ("pending_publish", "hydrate_stable_group")
+        } else {
+            self.epoch_manager.set_stable(group_id.clone(), group.epoch);
+            ("stable", "hydrate_stable_group")
+        };
+        if let Some(request) = leave_request {
             self.leave_requests.insert(group_id.clone(), request);
             self.leaving_groups.insert(group_id.clone());
         } else {
@@ -879,20 +1847,173 @@ impl<S: StorageProvider> Engine<S> {
         // MLS load above (kept pre-validation so quarantined groups resolve
         // too); nothing on this path changes it.
 
-        self.epoch_manager.set_stable(group_id.clone(), group.epoch);
         self.audit_group(
             group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 None,
-                "stable",
+                hydrate_state,
                 group.epoch,
-                "hydrate_stable_group",
+                hydrate_reason,
                 None,
                 None,
             ),
         );
-        self.audit_group_context(group_id, "hydrate_stable_group");
+        self.audit_group_context(group_id, hydrate_reason);
+        if group.unrecoverable {
+            // The durable lifecycle marker is also an application-facing
+            // repair requirement. Re-emit it on every session open because the
+            // original transition event belonged to the prior process.
+            self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
+                group_id: group_id.clone(),
+            });
+        }
+
+        let restored_self_remove_work = self
+            .restore_self_remove_auto_commit_schedules_in_records(
+                group_id,
+                group.epoch,
+                self.convergence_now_ms(),
+                &stored_message_records,
+            )
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if has_queued_intents
+            || has_convergence_inputs
+            || has_deferred_peels
+            || restored_self_remove_work
+        {
+            self.schedule_pending_convergence_group(group_id);
+        }
         Ok(group.epoch)
+    }
+
+    /// Restore a prepared/attempted evolution from its exact signed transport
+    /// record instead of clearing the surviving OpenMLS pending commit.
+    ///
+    /// Returns `Ok(false)` for legacy staged commits that predate durable
+    /// evolution records; the caller keeps the existing compatibility
+    /// recovery for those.
+    fn restore_durable_group_evolution_on_hydrate(
+        &mut self,
+        group_id: &GroupId,
+        mls_group: &openmls::group::MlsGroup,
+    ) -> Result<bool, GroupHydrationQuarantineReason> {
+        use cgka_traits::maintenance::GroupEvolutionPhase;
+        use cgka_traits::message::StoredMessagePayload;
+
+        let Some(maintenance) = self.storage.maintenance_storage() else {
+            return Ok(false);
+        };
+        let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let own_leaf_hash = mls_group
+            .own_leaf_node()
+            .and_then(|leaf| leaf.tls_serialize_detached().ok())
+            .map(|leaf| Sha256::digest(leaf).to_vec());
+        let evolution = maintenance
+            .list_group_evolutions_for_group(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
+            .into_iter()
+            .rev()
+            .find(|evolution| {
+                evolution.source_epoch == source_epoch
+                    && evolution.own_leaf_before_hash == own_leaf_hash
+                    && matches!(
+                        evolution.phase,
+                        GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                    )
+            });
+        let Some(evolution) = evolution else {
+            return Ok(false);
+        };
+        let Some(message_id) = evolution.signed_message_id.clone() else {
+            return Ok(false);
+        };
+        let recovery_failed = || {
+            tracing::warn!(
+                target: "cgka_engine::maintenance",
+                method = "restore_durable_group_evolution_on_hydrate",
+                "durable evolution was incomplete; using compatibility recovery"
+            );
+            Ok(false)
+        };
+        let record = match self.storage.get_message(&message_id) {
+            Ok(record) => record,
+            Err(_) => return recovery_failed(),
+        };
+        let payload = match StoredMessagePayload::decode(&record.payload) {
+            Ok(payload) => payload,
+            Err(_) => return recovery_failed(),
+        };
+        let Some(exact_message) = payload.as_exact_transport().cloned() else {
+            return recovery_failed();
+        };
+        let Some(openmls_message) = payload.as_openmls_wire() else {
+            return recovery_failed();
+        };
+        let Some(staged_commit) = mls_group.pending_commit() else {
+            return recovery_failed();
+        };
+        let commit_priority =
+            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
+        let Some(snapshot) = evolution.recovery_snapshot.clone() else {
+            return recovery_failed();
+        };
+
+        self.epoch_manager
+            .set_stable(group_id.clone(), source_epoch);
+        let pending = self.epoch_manager.next_pending_ref();
+        let mut evolution = evolution;
+        evolution.pending_ref = Some(pending);
+        if maintenance.put_group_evolution(&evolution).is_err() {
+            return recovery_failed();
+        }
+        if self
+            .epoch_manager
+            .begin_pending(
+                group_id.clone(),
+                source_epoch,
+                evolution.target_epoch,
+                cgka_traits::engine_state::StagedCommitHandle::from_bytes(
+                    group_id.as_slice().to_vec(),
+                ),
+                pending,
+                crate::epoch_manager::PendingKind::GroupEvolution,
+                None,
+            )
+            .is_err()
+        {
+            evolution.pending_ref = None;
+            let _ = maintenance.put_group_evolution(&evolution);
+            return recovery_failed();
+        }
+        self.track_pending_commit_for_recovery(
+            pending,
+            group_id.clone(),
+            source_epoch,
+            message_id,
+            cgka_traits::engine::CommitOrderingKey::from_commit_bytes(
+                source_epoch,
+                commit_priority,
+                self.identity.self_id().clone(),
+                &openmls_message.payload,
+            ),
+            snapshot,
+        );
+        self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
+            msg: exact_message,
+            pending,
+        });
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                None,
+                "pending_publish",
+                evolution.target_epoch,
+                "hydrate_durable_group_evolution",
+                Some(pending),
+                Some("group_evolution"),
+            ),
+        );
+        Ok(true)
     }
 
     fn leave_request_to_restore_on_hydrate(
@@ -901,6 +2022,7 @@ impl<S: StorageProvider> Engine<S> {
         mls_group: &mut openmls::group::MlsGroup,
         group: &Group,
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
+        stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<Option<LeaveRequest>, StorageError> {
         let self_is_still_member = group
             .members
@@ -914,7 +2036,11 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(mut request) = self.storage.leave_request(group_id)? {
             if request.last_proposed_epoch.is_none()
                 && self.sent_self_remove_leaving_gate_should_restore(
-                    group_id, mls_group, group, provider,
+                    group_id,
+                    mls_group,
+                    group,
+                    provider,
+                    stored_message_records,
                 )?
             {
                 request.last_proposed_epoch = Some(group.epoch);
@@ -923,9 +2049,13 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Some(request));
         }
 
-        if self
-            .sent_self_remove_leaving_gate_should_restore(group_id, mls_group, group, provider)?
-        {
+        if self.sent_self_remove_leaving_gate_should_restore(
+            group_id,
+            mls_group,
+            group,
+            provider,
+            stored_message_records,
+        )? {
             let request = LeaveRequest {
                 group_id: group_id.clone(),
                 requested_at_ms: self.convergence_now_ms(),
@@ -986,18 +2116,43 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// Ensure a durable `Unrecoverable` halt is reflected in the in-memory
+    /// epoch map (mdk#971). Returns `true` when the group is halted. Used as
+    /// defense-in-depth on paths that may run before or without session-open
+    /// hydration so a persisted marker cannot be skipped by a bare
+    /// `set_stable` overwrite.
+    pub(crate) fn sync_unrecoverable_halt_from_storage(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if self.epoch_manager.is_unrecoverable(group_id) {
+            return Ok(true);
+        }
+        let group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(err) => return Err(EngineError::Storage(err)),
+        };
+        if !group.unrecoverable {
+            return Ok(false);
+        }
+        self.epoch_manager
+            .restore_unrecoverable(group_id.clone(), group.epoch);
+        Ok(true)
+    }
+
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
     /// retained artifact in place.
     ///
-    /// Called when the local member is removed from a group (the inbound
-    /// removal-commit apply paths). It deletes the OpenMLS-owned rows for the
-    /// group — ratchet tree, group context, epoch/message secrets, resumption
-    /// PSKs, own-leaf index/nodes, group state/config, the proposal queue, and
-    /// the current-epoch encryption key pairs — via `MlsGroup::delete`. That is
-    /// enough to stop a later re-add Welcome from failing with
-    /// `GroupAlreadyExists` when OpenMLS stages the fresh join, and to keep
-    /// OpenMLS from stacking the re-join on stale epoch keypairs / message
-    /// secrets / own-leaf index (mdk#557).
+    /// Called inside the authenticated re-join transaction when a removed
+    /// local member receives a fresh Welcome. It deletes the OpenMLS-owned rows
+    /// for the group — ratchet tree, group context, epoch/message secrets,
+    /// resumption PSKs, own-leaf index/nodes, group state/config, the proposal
+    /// queue, and the current-epoch encryption key pairs — via
+    /// `MlsGroup::delete`. That is enough to stop the re-add Welcome from
+    /// failing with `GroupAlreadyExists` when OpenMLS stages the fresh join,
+    /// and to keep OpenMLS from stacking the re-join on stale epoch keypairs /
+    /// message secrets / own-leaf index (mdk#557).
     ///
     /// Crucially it does NOT delete the Marmot `cgka_groups` record, the retained
     /// anchor snapshots, the stored commit/message history, or the convergence
@@ -1015,13 +2170,14 @@ impl<S: StorageProvider> Engine<S> {
     /// group, and the bookkeeping is reset when the group is re-joined.
     ///
     /// No identifiers are logged (observability.md privacy rule).
-    pub(crate) fn clear_live_openmls_group(
-        &mut self,
+    pub(crate) fn clear_live_openmls_group_on_storage(
+        &self,
+        storage_provider: &S,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
-            self.storage.mls_storage(),
+            storage_provider.mls_storage(),
         );
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
@@ -1043,6 +2199,7 @@ impl<S: StorageProvider> Engine<S> {
         mls_group: &mut openmls::group::MlsGroup,
         group: &Group,
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
+        stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<bool, cgka_traits::storage::StorageError> {
         if !group
             .members
@@ -1052,7 +2209,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         }
 
-        for record in self.storage.list_messages(group_id, EpochId(0))? {
+        for record in stored_message_records {
             if record.state != MessageState::Sent {
                 continue;
             }
@@ -1096,6 +2253,7 @@ impl<S: StorageProvider> Engine<S> {
             };
             if let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
                 && matches!(queued.proposal(), Proposal::SelfRemove)
+                && crate::app_components::authorize_standalone_proposal(mls_group, &queued).is_ok()
             {
                 return Ok(true);
             }
@@ -1121,6 +2279,11 @@ impl<S: StorageProvider> Engine<S> {
             group_digest,
             reason: reason_tag.to_string(),
         });
+        // A quarantined group must not retain an epoch entry: the cheap-pass
+        // seed (and any partial transition applied before the failure) would
+        // otherwise keep it listed in `live_group_ids` while every accessor
+        // rejects it (mdk#1161).
+        self.epoch_manager.clear_group_state(group_id);
         self.quarantined_groups.insert(group_id.clone(), reason);
         self.events_buf
             .push_back(GroupEvent::GroupHydrationQuarantined {
@@ -1176,7 +2339,68 @@ impl<S: StorageProvider> Engine<S> {
         if self.quarantined_groups.contains_key(group_id) {
             return Err(EngineError::UnknownGroup(group_id.clone()));
         }
+        // Seeded-but-unhydrated groups fail closed with the retryable variant
+        // (mdk#1161): full hydration has not validated this group yet, so no
+        // accessor, send, or convergence path may treat it as live. `&mut`
+        // entry points call [`Self::ensure_hydrated`] first to promote the
+        // group instead of failing.
+        if self.unhydrated_groups.contains(group_id) {
+            return Err(EngineError::GroupNotHydrated(group_id.clone()));
+        }
         Ok(())
+    }
+
+    /// Run full per-group hydration for a group the session-open cheap pass
+    /// only seeded (mdk#1161). No-op for live, quarantined, disbanded, or
+    /// unknown groups — callers keep their existing handling for those.
+    ///
+    /// On success the group is promoted to live: its recovery events
+    /// (`PendingCommitRecovered`, leave-request restore) and convergence
+    /// scheduling fire now. On failure the group moves to the quarantine
+    /// surface exactly as an open-time hydration failure would, and the
+    /// caller observes `UnknownGroup` — the same view a quarantined group
+    /// has always presented.
+    pub fn ensure_hydrated(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
+        if !self.unhydrated_groups.contains(group_id) {
+            return Ok(());
+        }
+        self.unhydrated_groups.remove(group_id);
+        // Retract the provisional seed so full hydration derives the real
+        // epoch entry from the same entry-absent conditions the open-time
+        // loop always had. The record's epoch mirror is projected forward
+        // over a pending evolution, so leaving the seed in place would hand
+        // `restore_pending` a wrong `begin_pending` base.
+        self.epoch_manager.clear_group_state(group_id);
+        match self.hydrate_one_stored_group(group_id) {
+            Ok(_epoch) => {
+                self.route_backfill_pending.remove(group_id);
+                Ok(())
+            }
+            Err(reason) => {
+                self.route_backfill_pending.remove(group_id);
+                self.quarantine_stored_group_on_hydrate(group_id, reason);
+                Err(EngineError::UnknownGroup(group_id.clone()))
+            }
+        }
+    }
+
+    /// Group ids still awaiting full hydration, route-backfill-pending groups
+    /// first (they also block trust in routing-index misses, so a background
+    /// pipeline should clear them earliest).
+    pub fn unhydrated_group_ids(&self) -> Vec<GroupId> {
+        let mut ids: Vec<GroupId> = self
+            .route_backfill_pending
+            .iter()
+            .filter(|group_id| self.unhydrated_groups.contains(*group_id))
+            .cloned()
+            .collect();
+        ids.extend(
+            self.unhydrated_groups
+                .iter()
+                .filter(|group_id| !self.route_backfill_pending.contains(*group_id))
+                .cloned(),
+        );
+        ids
     }
 
     /// Re-attempt hydration of a single quarantined group.
@@ -1259,12 +2483,12 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    pub(crate) fn convergence_now(&self) -> ConvergenceTime {
+        self.convergence_clock.now()
+    }
+
     pub(crate) fn convergence_now_ms(&self) -> u64 {
-        self.convergence_clock_started_at
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
+        self.convergence_now().monotonic_ms
     }
 
     /// Aggregate, privacy-safe snapshot of engine diagnostic telemetry.
@@ -1363,11 +2587,18 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Override the deferred-peel retry budget (mdk#339). Rows that
-    /// exceed it without ever peeling transition to terminal `Failed`
-    /// (`permanently_undecryptable`). Exposed so tests can exhaust the budget
+    /// exceed it without ever peeling are resource-refused and released.
+    /// Exposed so tests can exhaust the budget
     /// quickly; production uses the default.
     pub fn set_deferred_peel_retry_budget(&mut self, budget: u32) {
         self.deferred_peel_retry_budget = budget.max(1);
+    }
+
+    /// Override the durable deferred-peel residence budget. Production uses
+    /// the conservative default; tests use this to advance expiry without
+    /// sleeping.
+    pub fn set_deferred_peel_residence_ms(&mut self, residence_ms: u64) {
+        self.deferred_peel_residence_ms = residence_ms.max(1);
     }
 
     /// Replace the installed forensic recorder on a live engine. Dropping the
@@ -1466,18 +2697,24 @@ impl<S: StorageProvider> Engine<S> {
         Ok(self.storage.get_group(group_id)?)
     }
 
+    /// Profile selected for newly emitted KeyPackages and newly created groups.
+    pub fn new_protocol_profile(&self) -> ProtocolProfile {
+        self.new_protocol_profile
+    }
+
     /// Return the stored outbound welcome for `id` along with its group.
     ///
-    /// Wrapped welcomes are persisted at wrap time as `Sent` raw-transport
-    /// records, so a welcome whose publish failed after the commit was already
-    /// confirmed can be re-delivered from storage without re-committing
-    /// (mdk#352). Errors if the id does not resolve to a sent raw-transport
-    /// welcome record.
+    /// New wrapped welcomes are persisted at wrap time as delivery-aware
+    /// `OutboundWelcome` records. Historical `Sent` raw-transport Welcome
+    /// records remain directly re-deliverable by a known id for compatibility,
+    /// but are not rediscovered as outstanding after an upgrade because older
+    /// versions did not persist acknowledgement completion (mdk#352).
     pub fn stored_sent_welcome(
         &self,
         id: &MessageId,
     ) -> Result<(GroupId, TransportMessage), EngineError> {
         let record = self.storage.get_message(id)?;
+        self.ensure_group_live(&record.group_id)?;
         if record.state != MessageState::Sent {
             return Err(EngineError::Backend(
                 "stored message is not an outbound sent record".into(),
@@ -1485,15 +2722,88 @@ impl<S: StorageProvider> Engine<S> {
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
-        let message = payload.as_raw_transport().ok_or_else(|| {
-            EngineError::Backend("stored message is not a raw transport record".into())
-        })?;
+        let message = payload
+            .as_outbound_welcome()
+            .or_else(|| payload.as_raw_transport())
+            .ok_or_else(|| {
+                EngineError::Backend(
+                    "stored message is not an outbound Welcome transport record".into(),
+                )
+            })?;
         if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
             return Err(EngineError::Backend(
                 "stored message is not a welcome".into(),
             ));
         }
         Ok((record.group_id.clone(), message.clone()))
+    }
+
+    /// Return every retained outbound Welcome whose delivery policy has not
+    /// yet been acknowledged.
+    ///
+    /// Founding creation persists delivery-aware `OutboundWelcome` records in
+    /// the same transaction that makes the group canonical. This scan is
+    /// therefore the authoritative cold-restart recovery index even if a
+    /// higher-layer pending-delivery projection was not written before process
+    /// termination. Historical raw `Sent` Welcome rows are deliberately
+    /// excluded because their acknowledgement state is unknowable.
+    pub fn outstanding_sent_welcomes(
+        &self,
+    ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
+        let mut welcomes = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
+            for record in self.storage.list_messages(&group_id, EpochId(0))? {
+                if record.state != MessageState::Sent {
+                    continue;
+                }
+                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                    continue;
+                };
+                let Some(message) = payload.as_outbound_welcome() else {
+                    continue;
+                };
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+                    welcomes.push((group_id.clone(), message.clone()));
+                }
+            }
+        }
+        Ok(welcomes)
+    }
+
+    /// IDs of every delivery-aware outbound Welcome retained by this engine,
+    /// including completed obligations.
+    ///
+    /// Higher layers use this to distinguish their founding-Welcome projection
+    /// rows from older pending-delivery rows that are intentionally backed by
+    /// historical raw `Sent` payloads.
+    pub fn tracked_outbound_welcome_ids(&self) -> Result<Vec<MessageId>, EngineError> {
+        let mut ids = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
+            for record in self.storage.list_messages(&group_id, EpochId(0))? {
+                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                    continue;
+                };
+                if payload.as_outbound_welcome().is_some() {
+                    ids.push(record.id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Mark one retained outbound Welcome's independent delivery obligation
+    /// complete. The canonical group lifecycle is unaffected.
+    pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> Result<(), EngineError> {
+        // Validate the exact retained artifact before using `Processed` as its
+        // terminal delivery state.
+        let _ = self.stored_sent_welcome(id)?;
+        self.update_stored_message_state(id, MessageState::Processed)
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS
@@ -1627,8 +2937,25 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.pending_convergence_groups.drain().collect()
     }
 
+    fn prepare_convergence_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError> {
+        Engine::prepare_convergence_cutoff_delay_ms(self, group_id)
+            .map_err(|error| EngineError::Backend(format!("load convergence cutoff: {error}")))
+    }
+
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         self.send_with_audit_context(intent, None).await
+    }
+
+    async fn queue_app_message(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        self.queue_app_message_with_audit_context(group_id, payload, None)
+            .await
     }
 
     async fn advance_convergence(
@@ -1638,6 +2965,14 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         let now_ms = self.convergence_now_ms();
         self.converge_and_drain_queued_outbound_intents(group_id, now_ms)
             .await
+    }
+
+    fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError> {
+        self.confirm_regenerated_queued_intent(intent_id)
+    }
+
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId) {
+        self.retry_regenerated_queued_intent(group_id);
     }
 
     async fn confirm_published(
@@ -1656,6 +2991,19 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         req: CreateGroupRequest,
     ) -> Result<(GroupId, SendResult), EngineError> {
         self.create_group_with_audit_context(req, None).await
+    }
+
+    async fn create_group_with_optional_app_components(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_with_optional_app_components_and_audit_context(
+            req,
+            optional_app_components,
+            None,
+        )
+        .await
     }
 
     async fn join_welcome(
@@ -1854,6 +3202,11 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {
+        // Gate explicitly: a seeded-but-unhydrated group HOLDS a provisional
+        // epoch entry (mdk#1161), so the entry-presence check below no longer
+        // implies the group is live the way it did when quarantined groups
+        // were simply absent.
+        self.ensure_group_live(group_id)?;
         self.epoch_manager
             .epoch(group_id)
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
@@ -1869,5 +3222,31 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     async fn delete_key_package(&mut self, key_package: &KeyPackage) -> Result<(), EngineError> {
         self.do_delete_key_package(key_package)
+    }
+}
+
+#[cfg(test)]
+mod frozen_fanout_recovery_tests {
+    use super::newest_fork_snapshot;
+
+    #[test]
+    fn recovery_snapshot_selection_compares_numeric_counters() {
+        let names = vec![
+            "fork-7-9-old".to_string(),
+            "fork-7-10-new".to_string(),
+            "fork-6-99-other-epoch".to_string(),
+        ];
+        assert_eq!(
+            newest_fork_snapshot(names, "fork-7-").unwrap().as_deref(),
+            Some("fork-7-10-new")
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_selection_rejects_malformed_matching_names() {
+        assert!(
+            newest_fork_snapshot(vec!["fork-7-not-a-counter-digest".to_string()], "fork-7-")
+                .is_err()
+        );
     }
 }

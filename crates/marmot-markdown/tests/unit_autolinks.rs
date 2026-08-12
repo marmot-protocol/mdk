@@ -1,4 +1,4 @@
-use marmot_markdown::{AutolinkKind, Inline, NostrHrp};
+use marmot_markdown::{AutolinkKind, Inline, LinkDestinationKind, NostrHrp};
 
 mod common;
 use common::{parse_inlines, t};
@@ -7,12 +7,21 @@ fn uri(url: &str) -> Inline {
     Inline::Autolink {
         url: url.to_string(),
         kind: AutolinkKind::Uri,
+        classification: marmot_markdown::classify_link_destination(url),
     }
 }
 fn email(addr: &str) -> Inline {
     Inline::Autolink {
         url: addr.to_string(),
         kind: AutolinkKind::Email,
+        classification: LinkDestinationKind::Contact,
+    }
+}
+fn www(url: &str) -> Inline {
+    Inline::Autolink {
+        url: url.to_string(),
+        kind: AutolinkKind::Www,
+        classification: LinkDestinationKind::Web,
     }
 }
 
@@ -121,7 +130,65 @@ fn nostr_inside_uri_autolink_stays_text() {
     assert_eq!(parse_inlines(s), vec![t("x "), uri(&s[3..s.len() - 1])]);
 }
 
+#[test]
+fn sensitive_uri_autolinks_are_preserved_and_classified() {
+    for input in ["x <nostr:nsec1qqqqqq>", "x <web+nostr:nsec1qqqqqq>"] {
+        let url = &input[3..input.len() - 1];
+        assert_eq!(
+            parse_inlines(input),
+            vec![
+                t("x "),
+                Inline::Autolink {
+                    url: url.to_owned(),
+                    kind: AutolinkKind::Uri,
+                    classification: LinkDestinationKind::Sensitive,
+                },
+            ]
+        );
+    }
+}
+
+#[test]
+fn dangerous_uri_autolinks_are_preserved_and_classified() {
+    for input in [
+        "<javascript:alert(1)>",
+        "<data:text/plain,payload>",
+        "<vbscript:msgbox(1)>",
+        "<file:///etc/passwd>",
+    ] {
+        let parsed = parse_inlines(input);
+        let [
+            Inline::Autolink {
+                url,
+                classification,
+                ..
+            },
+        ] = parsed.as_slice()
+        else {
+            panic!("expected a classified autolink for {input}");
+        };
+        assert_eq!(url, &input[1..input.len() - 1]);
+        assert_eq!(*classification, LinkDestinationKind::Dangerous);
+    }
+}
+
 // ----- Bare URLs (GFM-style extended autolinks) ------------------------
+
+#[test]
+fn bare_www() {
+    assert_eq!(
+        parse_inlines("www.example.com/path"),
+        vec![www("www.example.com/path")]
+    );
+}
+
+#[test]
+fn bare_www_strips_trailing_period() {
+    assert_eq!(
+        parse_inlines("See www.example.com/path."),
+        vec![t("See "), www("www.example.com/path"), t(".")]
+    );
+}
 
 #[test]
 fn bare_https() {

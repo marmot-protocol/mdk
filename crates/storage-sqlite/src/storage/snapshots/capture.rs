@@ -1,22 +1,62 @@
 use super::rows::{
-    MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
-    Snapshot,
+    GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
+    OrderedQueuedOutbound, Snapshot,
 };
+#[cfg(feature = "test-conformance-replay")]
+use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
-use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
+#[cfg(feature = "test-conformance-replay")]
+use crate::serialize;
+use crate::{
+    SqliteAccountStorage, SqliteResultExt,
+    codec::{SensitiveBytes, serialize_sensitive},
+    connection::retry_on_busy,
+    deserialize,
+};
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 pub(super) fn create(
     store: &SqliteAccountStorage,
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    if store.connection.is_current_thread_transaction_owner() {
+        let conn = store.lock()?;
+        return create_on_connection(&conn, group_id, name);
+    }
+
+    retry_on_busy(|| {
+        let mut conn = store.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        create_on_connection(&tx, group_id, name)?;
+        tx.commit().storage()?;
+        Ok(())
+    })
+}
+
+fn create_on_connection(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
+    let snapshot = capture_snapshot(conn, group_id)?;
+    let snapshot_blob = serialize_sensitive(&snapshot)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
+             VALUES (?1, ?2, ?3)",
+        params![group_id.as_slice(), name, snapshot_blob.as_slice()],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn capture_snapshot(conn: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Snapshot> {
     let mls_group_key = mls_group_key(group_id)?;
-    let mut conn = store.lock()?;
-    let tx = conn.transaction().storage()?;
-    let group_blob: Vec<u8> = tx
+    let group_blob: Vec<u8> = conn
         .query_row(
             "SELECT record FROM cgka_groups WHERE id = ?1",
             params![group_id.as_slice()],
@@ -26,14 +66,14 @@ pub(super) fn create(
         .storage()?
         .ok_or(StorageError::NotFound)?;
     let group = deserialize(&group_blob)?;
-    let messages = messages(&tx, group_id)?;
-    let queued_outbound = queued_outbound(&tx, group_id)?;
-    let member_caps = member_capabilities(&tx, group_id)?;
-    let convergence_policy = convergence_policy(&tx, group_id)?;
-    let validated_tree_marker = validated_tree_marker(&tx, group_id)?;
-    let openmls_values = openmls_values(&tx, &mls_group_key)?;
+    let messages = messages(conn, group_id)?;
+    let queued_outbound = queued_outbound(conn, group_id)?;
+    let member_caps = member_capabilities(conn, group_id)?;
+    let convergence_policy = convergence_policy(conn, group_id)?;
+    let validated_tree_marker = validated_tree_marker(conn, group_id)?;
+    let openmls_values = openmls_values(conn, &mls_group_key)?;
 
-    let snapshot = Snapshot {
+    Ok(Snapshot {
         group,
         messages,
         queued_outbound,
@@ -41,21 +81,53 @@ pub(super) fn create(
         convergence_policy,
         validated_tree_marker,
         openmls_values,
-    };
-    tx.execute(
-        "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
-             VALUES (?1, ?2, ?3)",
-        params![group_id.as_slice(), name, serialize(&snapshot)?],
-    )
-    .storage()?;
-    tx.commit().storage()?;
-    Ok(())
+    })
 }
 
-fn messages(
-    tx: &rusqlite::Transaction<'_>,
+pub(super) fn capture_group_state(
+    conn: &rusqlite::Connection,
     group_id: &GroupId,
-) -> StorageResult<Vec<OrderedMessage>> {
+) -> StorageResult<GroupStateCheckpoint> {
+    let mls_group_key = mls_group_key(group_id)?;
+    let group_blob: Vec<u8> = conn
+        .query_row(
+            "SELECT record FROM cgka_groups WHERE id = ?1",
+            params![group_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?
+        .ok_or(StorageError::NotFound)?;
+
+    Ok(GroupStateCheckpoint {
+        group: deserialize(&group_blob)?,
+        member_caps: member_capabilities(conn, group_id)?,
+        validated_tree_marker: validated_tree_marker(conn, group_id)?,
+        openmls_values: openmls_values(conn, &mls_group_key)?,
+    })
+}
+
+#[cfg(feature = "test-conformance-replay")]
+pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<u8>> {
+    let conn = store.lock()?;
+    let convergence_pass = conn
+        .query_row(
+            "SELECT record FROM cgka_convergence_passes WHERE group_id = ?1",
+            params![group_id.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .storage()?
+        .map(|record| deserialize(&record))
+        .transpose()?;
+    serialize(&ReplaySnapshot {
+        version: REPLAY_SNAPSHOT_VERSION,
+        group: capture_snapshot(&conn, group_id)?,
+        convergence_pass,
+    })
+}
+
+fn messages(tx: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Vec<OrderedMessage>> {
     let mut stmt = tx
         .prepare(
             "SELECT insert_order, record FROM cgka_messages
@@ -81,7 +153,7 @@ fn messages(
 }
 
 fn queued_outbound(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Vec<OrderedQueuedOutbound>> {
     let mut stmt = tx
@@ -109,13 +181,14 @@ fn queued_outbound(
 }
 
 fn member_capabilities(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Vec<MemberCapabilitiesSnapshot>> {
     let mut stmt = tx
         .prepare(
             "SELECT member_id, capabilities FROM cgka_member_capabilities
-             WHERE group_id = ?1",
+             WHERE group_id = ?1
+             ORDER BY member_id",
         )
         .storage()?;
     let rows = stmt
@@ -136,7 +209,7 @@ fn member_capabilities(
 }
 
 fn convergence_policy(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Option<Vec<u8>>> {
     tx.query_row(
@@ -149,7 +222,7 @@ fn convergence_policy(
 }
 
 fn validated_tree_marker(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Option<Vec<u8>>> {
     tx.query_row(
@@ -162,7 +235,7 @@ fn validated_tree_marker(
 }
 
 fn openmls_values(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     mls_group_key: &[u8],
 ) -> StorageResult<Vec<OpenMlsValueSnapshot>> {
     let mut stmt = tx
@@ -179,7 +252,7 @@ fn openmls_values(
                 label: row.get(0)?,
                 storage_key: row.get(1)?,
                 group_key: row.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
-                value: row.get(3)?,
+                value: SensitiveBytes::new(row.get(3)?),
             })
         },
     )

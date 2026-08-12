@@ -12,6 +12,7 @@ use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
+use cgka_traits::message::OwnApplicationConvergenceStamp;
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
@@ -27,6 +28,16 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
+        let group_id = super::send_intent_group_id(&intent).clone();
+        if self.storage.disband_tombstone(&group_id)?.is_some() {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanded",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "Disbanded is terminal",
+                },
+            ));
+        }
         // A local copy marked removed is terminal for outbound work: the spec
         // forbids preparing/publishing anything for it (member-departure.md,
         // "Realizing removal"), and the underlying OpenMLS state would only
@@ -34,12 +45,36 @@ impl<S: StorageProvider> Engine<S> {
         // here (not just `do_send`) so queued-intent drains hit the same
         // deterministic terminal error. Every intent kind is blocked,
         // including `Leave` — there is nothing left to leave.
-        if self.group_record_is_removed(super::send_intent_group_id(&intent))? {
+        if self.group_record_is_removed(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Removed",
                     to: crate::audit_helpers::send_intent_kind_str(&intent),
                     reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
+        // Queued drains call this method directly, bypassing `do_send`.
+        // Recheck the durable lifecycle marker here so no outbound work can
+        // escape an `Unrecoverable` halt after restart.
+        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Unrecoverable",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "group is Unrecoverable pending verified repair",
+                },
+            ));
+        }
+        // Queued-intent drains call this method directly. A disband request or
+        // inbound terminal candidate can arrive after an ordinary intent was
+        // queued, so the durable gate must be repeated here before dispatch.
+        if self.disbanding_in_progress(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanding",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "disband requested or awaiting convergence",
                 },
             ));
         }
@@ -55,6 +90,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_remove_members(group_id, members).await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
+            SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
             SendIntent::UpdateAppComponents { group_id, updates } => {
                 self.do_send_update_app_components(group_id, updates).await
             }
@@ -66,6 +102,10 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_update_group_data(group_id, name, description)
                     .await
             }
+            SendIntent::EnableDisbanding { group_id } => {
+                self.do_enable_group_disbanding(group_id).await
+            }
+            SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         }
     }
 
@@ -105,6 +145,17 @@ impl<S: StorageProvider> Engine<S> {
         // agent-text-stream-quic-v1.md): a client MUST NOT invite a member whose
         // KeyPackage does not advertise every required role capability.
         let existing = self.storage.get_group(&group_id)?;
+        if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && existing.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "LegacyProfile",
+                    to: "Invite",
+                    reason: "strict cutover forbids adding members to legacy groups",
+                },
+            ));
+        }
         let mut required = existing.required_capabilities.clone();
         merge_capabilities(
             &mut required,
@@ -113,6 +164,12 @@ impl<S: StorageProvider> Engine<S> {
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
         for kp in &key_packages {
             let parsed = self.parse_key_package(kp)?;
+            if kp.protocol_profile != existing.protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "cannot invite a {:?} KeyPackage into a {:?} group",
+                    kp.protocol_profile, existing.protocol_profile
+                )));
+            }
             let had = crate::capabilities::capabilities_of_key_package(&parsed);
             let missing = required.missing_from(&had);
             if !missing.is_empty() {
@@ -124,8 +181,16 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
 
-        // Record the pre-commit epoch so a later same-epoch commit can be
-        // compared against this locally produced branch.
+        // The pre-commit epoch is the commit origin for fork detection.
+        // `committed_from` bookkeeping is deliberately NOT recorded here: it
+        // happens atomically inside `begin_pending` below, after staging
+        // succeeds. Recording it earlier left a phantom "we committed from
+        // this epoch" entry behind when staging failed (the cleanup guard
+        // clears the OpenMLS commit but nothing prunes `committed_from`),
+        // which later mis-routed legitimate sibling commits into
+        // fail-closed fork recovery. The post-staging counterpart —
+        // `publish_failed` after a successful `begin_pending` — is handled by
+        // `rollback_publish`, which removes the provisional entry again.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         // Arm the cleanup guard before creating the snapshot so the snapshot is
         // released on early return / cancellation even before a pending commit
@@ -142,8 +207,6 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             "pre_invite_commit",
         );
-        self.epoch_manager
-            .record_committed_from(&group_id, pre_commit_epoch);
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -156,6 +219,21 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, welcome_out, _gi) = mls_group
             .add_members(&provider, &self.identity.signer, &parsed_kps)
             .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+        let own_leaf_index = mls_group.own_leaf_index();
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            own_leaf_index,
+        )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -219,12 +297,7 @@ impl<S: StorageProvider> Engine<S> {
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::cache_from_key_packages(
-            &self.storage,
-            &group_id,
-            &parsed_kps,
-            self.ciphersuite,
-        )?;
+        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
         let mut group_record = existing;
         group_record.members =
             crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
@@ -462,10 +535,19 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             staged_commit,
         )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            mls_group.own_leaf_index(),
+        )?;
         let commit_priority =
             crate::app_components::commit_ordering_priority_for_staged(staged_commit);
-        self.epoch_manager
-            .record_committed_from(&group_id, pre_commit_epoch);
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -584,13 +666,16 @@ impl<S: StorageProvider> Engine<S> {
             == Some(current_epoch)
         {
             self.leaving_groups.insert(group_id.clone());
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: "Leaving",
-                    to: "Leave",
-                    reason: "leave already requested for current epoch",
-                },
-            ));
+            // Authoritative classification for "already leaving". Decided here
+            // rather than by a caller-side precheck because this read and the
+            // durable write below happen under the same lock: two concurrent
+            // leaves can both observe "not pending" above this layer, and the
+            // loser has to learn the real reason from here. Typed rather than
+            // `InvalidTransition` (an engine-bug signal) so it can cross the FFI
+            // boundary as a named error instead of an opaque runtime failure.
+            return Err(EngineError::LeaveAlreadyRequested {
+                group_id: group_id.clone(),
+            });
         }
 
         let (msg, proposal_bytes, proposed_epoch) =
@@ -767,10 +852,19 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
-        let wrap_metadata = GroupMessageMetadata::application(
+        let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let own_application_stamp = OwnApplicationConvergenceStamp {
+            sender: self.identity.self_id().clone(),
+            source_epoch_authenticator: hex::encode(mls_group.epoch_authenticator().as_slice()),
+        };
+        let source_retention_seconds =
+            crate::app_components::message_retention_seconds_of_group(&mls_group)?;
+        let retention = cgka_traits::app_event::AppMessageRetentionDecision::new(
             app_event.created_at,
-            crate::app_components::message_retention_seconds_of_group(&mls_group)?,
+            source_retention_seconds.unwrap_or(0),
         );
+        let wrap_metadata =
+            GroupMessageMetadata::application(app_event.created_at, source_retention_seconds);
 
         let out: MlsMessageOut = mls_group
             .create_message(&provider, &self.identity.signer, &payload)
@@ -794,14 +888,21 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
 
         let wrapped = route_wrapped_group_message(wrapped, &ctx);
-        self.record_sent_openmls_message(
+        self.record_sent_openmls_application_message(
             &wrapped,
             out_bytes.as_slice(),
             &group_id,
-            EpochId(mls_group.epoch().as_u64()),
+            source_epoch,
+            own_application_stamp,
         )?;
 
-        Ok(SendResult::ApplicationMessage { msg: wrapped })
+        Ok(SendResult::ApplicationMessage {
+            msg: wrapped,
+            group_id,
+            app_event_id: app_event.id,
+            source_epoch,
+            retention,
+        })
     }
 }
 

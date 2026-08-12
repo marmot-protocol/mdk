@@ -4,7 +4,7 @@ use cgka_traits::app_components::{BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPO
 pub(crate) use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
 use url::{Host, Url};
 
-use super::MediaLocator;
+use super::{EncryptedMediaVersion, MediaLocator};
 use crate::AppError;
 
 /// Structurally validate one locator. Per encrypted-media.md Validation a
@@ -16,6 +16,7 @@ use crate::AppError;
 /// NOT invalidate the reference or drop the containing message here.
 pub(crate) fn validate_locator(
     locator: &MediaLocator,
+    version: EncryptedMediaVersion,
     allow_loopback_http: bool,
 ) -> Result<(), AppError> {
     if locator.kind.trim().is_empty() || locator.value.trim().is_empty() {
@@ -36,11 +37,71 @@ pub(crate) fn validate_locator(
     // fetched (`fetch_encrypted_media_blob` filters to them), so a non-Blossom
     // locator skips this check — it is unfetchable-by-this-client, not unsafe.
     if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
-        validate_blossom_fetch_url(&url, allow_loopback_http).map_err(|err| {
-            AppError::InvalidAppMessagePayload(format!("media locator URL is unsafe: {err}"))
-        })?;
+        match version {
+            EncryptedMediaVersion::V1 => {
+                validate_blossom_fetch_url(&url, allow_loopback_http).map_err(|err| {
+                    AppError::InvalidAppMessagePayload(format!(
+                        "media locator URL is unsafe: {err}"
+                    ))
+                })?;
+            }
+            EncryptedMediaVersion::V2 if !matches!(url.scheme(), "http" | "https") => {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "Blossom media locator URL scheme must be http or https".into(),
+                ));
+            }
+            EncryptedMediaVersion::V2 => {}
+        }
     }
     Ok(())
+}
+
+/// HTTPS-only profile-image fetch URLs: default port 443, no credentials or
+/// fragments, and no loopback/private/special-use literal hosts. Unlike Blossom
+/// media locators, explicit non-default HTTPS ports are rejected.
+pub(crate) fn validate_profile_image_fetch_url(url: &Url) -> Result<(), String> {
+    validate_blossom_fetch_url(url, false)?;
+    if let Some(port) = url.port()
+        && port != 443
+    {
+        return Err("URL must use the default HTTPS port".into());
+    }
+    Ok(())
+}
+
+/// Trim and bound-check the raw profile-image URL before WHATWG parse
+/// normalization can collapse an over-limit dot-segment path.
+pub(crate) fn parse_profile_image_fetch_url(raw: &str) -> Result<Url, String> {
+    if raw.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+        return Err(format!(
+            "profile image URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+        ));
+    }
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("profile image URL must not be empty".into());
+    }
+    let url = Url::parse(raw).map_err(|e| format!("profile image URL is invalid: {e}"))?;
+    validate_profile_image_fetch_url(&url)?;
+    Ok(url)
+}
+
+/// Resolve one profile-image redirect only after bounding its raw `Location`.
+pub(crate) fn parse_profile_image_redirect_url(
+    current: &Url,
+    raw_location: &str,
+) -> Result<Url, String> {
+    if raw_location.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+        return Err(format!(
+            "profile image redirect URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+        ));
+    }
+    let raw_location = raw_location.trim();
+    let url = current
+        .join(raw_location)
+        .map_err(|e| format!("profile image redirect URL is invalid: {e}"))?;
+    validate_profile_image_fetch_url(&url)?;
+    Ok(url)
 }
 
 pub(crate) fn validate_blossom_fetch_url(

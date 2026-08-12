@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety"
 created: 2026-07-04
-updated: 2026-07-04
+updated: 2026-07-22
 tags: [marmot, overview, security, network, ssrf, transport]
 status: overview
 ---
@@ -33,6 +33,9 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
   set (`MarmotAppConfig::allow_loopback_relay_endpoints` / `allow_loopback_blob_endpoints`, `WN_ALLOW_LOOPBACK_RELAYS` /
   `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`, `wn --insecure-local`, `wn-agent --insecure-local-broker`). The flag opens
   loopback only; private/link-local/CGNAT ranges stay rejected even in dev mode. Production leaves every flag unset.
+- **Public Nostr relays require TLS.** Runtime relay connections use `wss://`. Plaintext `ws://` remains structurally
+  valid signed routing data, but local policy admits it only for a literal loopback/`localhost` endpoint behind
+  `allow_loopback_relay_endpoints`; the flag never admits public or private-network plaintext relays.
 - **A connect timeout on every dial.** A hung handshake to a black-holed target must not park indefinitely (media 5s,
   Nostr relay 5s, QUIC broker 5s).
 
@@ -60,8 +63,8 @@ routing through this discipline is a contract violation — the transport crates
 
 ## Accepted residual
 
-Nostr relays are the one path that cannot pin: nostr-sdk owns DNS resolution and the WebSocket, so a **domain** relay
-host is accepted after `RelayUrl` scheme/format validation and only its **literal**-IP form (and `localhost`) is
-rejected at `sanitize_endpoints`. A public-looking hostname that resolves to a private address at the SDK's connect
-time is a TOCTOU residual, rated LOW (relay URLs come from signed routing state and the `ws`/`wss` scheme restriction
-bounds it). A resolve-time pre-check inside the adapter is a possible future complement, not a close condition.
+Nostr relays are the one path that cannot pin: nostr-sdk owns DNS resolution and the WebSocket, so a public-looking
+`wss://` domain is accepted after scheme/format validation and only its literal-IP form (and `localhost`) can be
+classified before the SDK connects. A hostname that resolves to a private address at connect time is a TOCTOU
+residual, rated LOW. Public plaintext `ws://` is rejected before this residual is reachable. A resolve-time pre-check
+inside the adapter is a possible future complement, not a close condition.

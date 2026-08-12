@@ -43,7 +43,7 @@ fn max_inline_depth(doc: &marmot_markdown::Document) -> usize {
                 inline_stack.push((inlines.as_slice(), 0, 1));
                 walk_inlines(&mut inline_stack, &mut max);
             }
-            Block::BlockQuote { blocks } => block_stack.push((blocks.as_slice(), 0)),
+            Block::BlockQuote { blocks, .. } => block_stack.push((blocks.as_slice(), 0)),
             Block::List { items, .. } => {
                 for item in items {
                     block_stack.push((item.blocks.as_slice(), 0));

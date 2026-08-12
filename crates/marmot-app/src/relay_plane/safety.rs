@@ -6,9 +6,41 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use nostr_sdk::prelude::RelayUrl;
+use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
+const RETIRED_RELAY_HOSTS: &[&str] = &["relay.damus.io", "relay.nostr.band"];
+
+/// The policy decision for one caller-supplied Nostr relay endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayEndpointPolicy {
+    Allowed,
+    Retired,
+    Invalid,
+    Unsafe,
+}
+
+/// One endpoint's normalized relay URL and policy decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayEndpointClassification {
+    /// The caller-supplied value, preserved so batch callers can associate the
+    /// decision with their input without relying on positional matching.
+    pub endpoint: String,
+    /// Canonical relay URL when parsing succeeded, including for retired or
+    /// unsafe endpoints. Invalid inputs have no normalized representation.
+    pub normalized_endpoint: Option<String>,
+    pub policy: RelayEndpointPolicy,
+}
+
+/// Hostnames that the relay plane will never dial or adopt.
+pub fn retired_relay_hosts() -> Vec<String> {
+    RETIRED_RELAY_HOSTS
+        .iter()
+        .map(|host| (*host).to_owned())
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RelaySafetyPolicy {
@@ -34,6 +66,37 @@ impl RelaySafetyPolicy {
         Self {
             allow_loopback,
             ..Self::default()
+        }
+    }
+
+    pub(crate) fn classify_endpoints(
+        &self,
+        endpoints: Vec<String>,
+    ) -> Vec<RelayEndpointClassification> {
+        endpoints
+            .into_iter()
+            .map(|endpoint| self.classify_endpoint(endpoint))
+            .collect()
+    }
+
+    fn classify_endpoint(&self, endpoint: String) -> RelayEndpointClassification {
+        let raw = endpoint.trim();
+        let Ok(relay_url) = RelayUrl::parse(raw) else {
+            return RelayEndpointClassification {
+                endpoint,
+                normalized_endpoint: None,
+                policy: RelayEndpointPolicy::Invalid,
+            };
+        };
+        let normalized_endpoint = Some(relay_url.to_string());
+        let policy = match evaluate_relay_url(&relay_url, self.allow_loopback) {
+            Ok(()) => RelayEndpointPolicy::Allowed,
+            Err(rejection) => rejection.policy(),
+        };
+        RelayEndpointClassification {
+            endpoint,
+            normalized_endpoint,
+            policy,
         }
     }
 
@@ -74,6 +137,54 @@ impl RelaySafetyPolicy {
         Ok(request)
     }
 
+    /// Keep the endpoints that pass the host-safety rule and drop the rest.
+    ///
+    /// The counterpart to [`Self::sanitize_endpoints`] for endpoints that were
+    /// *discovered* rather than configured — a relay list published by another
+    /// account, say. Sanitizing is fail-closed because a configured relay set
+    /// is the operator's stated intent, and one bad entry there is a mistake
+    /// worth surfacing. A published list is untrusted input: rejecting all of
+    /// it over one bad entry would let anyone make themselves unresolvable by
+    /// appending a single loopback URL. Every endpoint is checked against the
+    /// same rule; only the response to a rejection differs.
+    ///
+    /// The result still passes through [`Self::sanitize_endpoints`] at the
+    /// dial chokepoint, so this narrows what is offered rather than replacing
+    /// the check.
+    pub(crate) fn retain_safe_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        let offered = endpoints.len();
+        let mut kept: Vec<TransportEndpoint> = Vec::new();
+        for endpoint in endpoints {
+            let Ok(relay_url) = RelayUrl::parse(endpoint.as_str().trim()) else {
+                continue;
+            };
+            if reject_unsafe_relay_host(&relay_url, self.allow_loopback).is_err() {
+                continue;
+            }
+            let endpoint = TransportEndpoint(relay_url.to_string());
+            if !kept.contains(&endpoint) {
+                kept.push(endpoint);
+            }
+        }
+        if kept.len() != offered {
+            // Aggregate counts only: a rejected relay URL is somebody's
+            // published data and never reaches a log line.
+            tracing::debug!(
+                target: "marmot_app::relay_plane",
+                method = "retain_safe_endpoints",
+                context = context,
+                offered = offered,
+                kept = kept.len(),
+                "dropped discovered relay endpoints that failed the host-safety rule"
+            );
+        }
+        kept
+    }
+
     pub(crate) fn sanitize_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -105,29 +216,88 @@ impl RelaySafetyPolicy {
     }
 }
 
-/// Reject a relay endpoint whose LITERAL host is loopback or any other
-/// non-public IP, unless the dev/test loopback opt-in is set (which admits
-/// loopback only — private/link-local/CGNAT literals stay rejected). Relay
+/// Require TLS for every public relay. Plaintext `ws://` is admitted only for
+/// an explicitly enabled loopback host; private/link-local/CGNAT and public
+/// plaintext endpoints stay rejected even with the dev flag. Relay
 /// endpoints arrive from signed routing components and relay-list events, so a
 /// poisoned record must not steer the relay pool at internal services (SSRF;
-/// see `docs/marmot-architecture/overview/dial-safety.md`). A DOMAIN host is
-/// accepted here: nostr-sdk owns DNS resolution and the WebSocket, so
+/// see `docs/marmot-architecture/overview/dial-safety.md`). A `wss://` DOMAIN
+/// host is accepted here: nostr-sdk owns DNS resolution and the WebSocket, so
 /// resolve-time validation cannot be pinned at this layer — an accepted LOW
 /// residual, per the dial-safety note. Error strings stay URL-free.
 fn reject_unsafe_relay_host(url: &RelayUrl, allow_loopback: bool) -> Result<(), String> {
-    let parsed = Url::parse(url.as_str()).map_err(|_| "invalid relay endpoint".to_owned())?;
-    match parsed.host() {
-        Some(Host::Ipv4(addr)) => reject_non_public_ip(IpAddr::V4(addr), allow_loopback)
-            .map_err(|_| "relay endpoint host is not a public address".to_owned()),
-        Some(Host::Ipv6(addr)) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
-            .map_err(|_| "relay endpoint host is not a public address".to_owned()),
-        Some(Host::Domain(domain)) => {
+    evaluate_relay_url(url, allow_loopback).map_err(|rejection| rejection.reason().to_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayEndpointRejection {
+    Invalid,
+    Retired,
+    PlaintextPublic,
+    NonPublicAddress,
+    Localhost,
+}
+
+impl RelayEndpointRejection {
+    fn policy(self) -> RelayEndpointPolicy {
+        match self {
+            Self::Invalid => RelayEndpointPolicy::Invalid,
+            Self::Retired => RelayEndpointPolicy::Retired,
+            Self::PlaintextPublic | Self::NonPublicAddress | Self::Localhost => {
+                RelayEndpointPolicy::Unsafe
+            }
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid relay endpoint",
+            Self::Retired => "relay endpoint host is retired",
+            Self::PlaintextPublic => {
+                "plaintext relay endpoints are allowed only for loopback in dev mode"
+            }
+            Self::NonPublicAddress => "relay endpoint host is not a public address",
+            Self::Localhost => "relay endpoint host must not be localhost",
+        }
+    }
+}
+
+fn evaluate_relay_url(url: &RelayUrl, allow_loopback: bool) -> Result<(), RelayEndpointRejection> {
+    let parsed = Url::parse(url.as_str()).map_err(|_| RelayEndpointRejection::Invalid)?;
+    let host = parsed.host().ok_or(RelayEndpointRejection::Invalid)?;
+    if is_retired_relay_host(&host) {
+        return Err(RelayEndpointRejection::Retired);
+    }
+    if parsed.scheme() == "ws" {
+        return if allow_loopback && is_loopback_host(host) {
+            Ok(())
+        } else {
+            Err(RelayEndpointRejection::PlaintextPublic)
+        };
+    }
+    match host {
+        Host::Ipv4(addr) => reject_non_public_ip(IpAddr::V4(addr), allow_loopback)
+            .map_err(|_| RelayEndpointRejection::NonPublicAddress),
+        Host::Ipv6(addr) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
+            .map_err(|_| RelayEndpointRejection::NonPublicAddress),
+        Host::Domain(domain) => {
             if is_loopback_host(Host::Domain(domain)) && !allow_loopback {
-                return Err("relay endpoint host must not be localhost".to_owned());
+                return Err(RelayEndpointRejection::Localhost);
             }
             Ok(())
         }
-        None => Err("relay endpoint is missing a host".to_owned()),
+    }
+}
+
+fn is_retired_relay_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            RETIRED_RELAY_HOSTS
+                .iter()
+                .any(|retired| domain.eq_ignore_ascii_case(retired))
+        }
+        Host::Ipv4(_) | Host::Ipv6(_) => false,
     }
 }
 
@@ -139,6 +309,125 @@ mod tests {
         urls.iter()
             .map(|url| TransportEndpoint((*url).to_owned()))
             .collect()
+    }
+
+    /// Relay lists published by other accounts are input, not configuration.
+    /// One hostile or malformed entry in somebody's NIP-65 list must not deny
+    /// every other relay they publish -- otherwise anyone could make themselves
+    /// unresolvable, or take the outbox path down for everyone, by adding a
+    /// single bad URL. The host rule applied to each entry is the same one
+    /// `sanitize_endpoints` enforces; only the answer to a rejection differs.
+    #[test]
+    fn discovered_endpoints_drop_the_unsafe_and_keep_the_rest() {
+        let policy = RelaySafetyPolicy::default();
+
+        let kept = policy.retain_safe_endpoints(
+            endpoints(&[
+                "wss://good.example",
+                "ws://127.0.0.1:8080",
+                "not a url",
+                "wss://also-good.example",
+                "ws://169.254.169.254",
+            ]),
+            "test",
+        );
+
+        assert_eq!(
+            kept,
+            endpoints(&["wss://good.example", "wss://also-good.example"])
+        );
+    }
+
+    #[test]
+    fn discovered_endpoints_are_deduplicated() {
+        let policy = RelaySafetyPolicy::default();
+
+        let kept = policy.retain_safe_endpoints(
+            endpoints(&["wss://relay.example", "wss://relay.example"]),
+            "test",
+        );
+
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn retired_relay_hosts_are_rejected_at_the_relay_plane_boundary() {
+        let policy = RelaySafetyPolicy::default();
+        for endpoint in [
+            "wss://relay.damus.io",
+            "wss://relay.nostr.band",
+            "wss://RELAY.DAMUS.IO./path",
+        ] {
+            let offered = endpoints(&[endpoint, "wss://good.example"]);
+            assert!(
+                policy.sanitize_endpoints(offered.clone(), "test").is_err(),
+                "configured routes must fail closed when they contain a retired relay"
+            );
+            assert_eq!(
+                policy.retain_safe_endpoints(offered, "test"),
+                endpoints(&["wss://good.example"]),
+                "discovered routes must drop retired relays and keep safe siblings"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_endpoint_classifier_uses_the_dial_policy() {
+        let policy = RelaySafetyPolicy::default();
+        let classified = policy.classify_endpoints(vec![
+            " wss://relay.example ".to_owned(),
+            "wss://RELAY.DAMUS.IO./path".to_owned(),
+            "not a relay".to_owned(),
+            "ws://relay.example".to_owned(),
+            "wss://127.0.0.1".to_owned(),
+        ]);
+
+        assert_eq!(
+            classified
+                .iter()
+                .map(|result| result.policy)
+                .collect::<Vec<_>>(),
+            vec![
+                RelayEndpointPolicy::Allowed,
+                RelayEndpointPolicy::Retired,
+                RelayEndpointPolicy::Invalid,
+                RelayEndpointPolicy::Unsafe,
+                RelayEndpointPolicy::Unsafe,
+            ]
+        );
+        assert_eq!(classified[0].endpoint, " wss://relay.example ");
+        assert!(classified[0].normalized_endpoint.is_some());
+        assert!(classified[1].normalized_endpoint.is_some());
+        assert_eq!(classified[2].normalized_endpoint, None);
+    }
+
+    #[test]
+    fn relay_endpoint_classifier_respects_the_loopback_dev_opt_in() {
+        let classified = RelaySafetyPolicy::with_allow_loopback(true)
+            .classify_endpoints(vec!["ws://localhost:8080".to_owned()]);
+
+        assert_eq!(classified[0].policy, RelayEndpointPolicy::Allowed);
+    }
+
+    #[test]
+    fn retired_relay_host_list_is_stable_and_scheme_free() {
+        assert_eq!(
+            retired_relay_hosts(),
+            vec!["relay.damus.io", "relay.nostr.band"]
+        );
+    }
+
+    /// A published list of only unsafe hosts yields nothing, rather than
+    /// falling back to anything the caller did not ask for.
+    #[test]
+    fn discovered_endpoints_can_all_be_dropped() {
+        let policy = RelaySafetyPolicy::default();
+
+        assert!(
+            policy
+                .retain_safe_endpoints(endpoints(&["ws://127.0.0.1", "ws://10.0.0.1"]), "test")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -175,6 +464,23 @@ mod tests {
                 .sanitize_endpoints(endpoints(&["wss://relay.example"]), "test")
                 .expect("public relay accepted");
             assert_eq!(sanitized.len(), 1);
+        }
+    }
+
+    #[test]
+    fn rejects_public_plaintext_relays_even_with_dev_opt_in() {
+        for policy in [
+            RelaySafetyPolicy::default(),
+            RelaySafetyPolicy::with_allow_loopback(true),
+        ] {
+            for url in ["ws://relay.example", "ws://8.8.8.8"] {
+                assert!(
+                    policy
+                        .sanitize_endpoints(endpoints(&[url]), "test")
+                        .is_err(),
+                    "{url} must require TLS"
+                );
+            }
         }
     }
 

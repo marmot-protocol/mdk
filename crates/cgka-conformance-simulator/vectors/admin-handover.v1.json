@@ -1,0 +1,358 @@
+{
+  "scenario_name": "admin-handover/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.11",
+  "seed": null,
+  "scenario": {
+    "name": "admin-handover/v1",
+    "spec_version": "2",
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "handover",
+        "invitees": [
+          "bob",
+          "carol"
+        ],
+        "required_features": [],
+        "initial_admins": [
+          "alice"
+        ],
+        "pending": "create"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "update_admin_policy",
+        "client": "alice",
+        "admins": [
+          "alice",
+          "bob"
+        ],
+        "pending": "promote-bob"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "promote-bob",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "bob",
+        "name": "handover-bob",
+        "pending": "rename-bob"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "rename-bob",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "carol"
+        ]
+      },
+      {
+        "type": "update_admin_policy",
+        "client": "bob",
+        "admins": [
+          "alice",
+          "bob",
+          "carol"
+        ],
+        "pending": "promote-carol"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "promote-carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "carol"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "carol",
+        "name": "handover-carol",
+        "pending": "rename-carol"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "carol",
+        "publication": "rename-carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "update_admin_policy",
+        "client": "alice",
+        "admins": [
+          "alice",
+          "carol"
+        ],
+        "pending": "demote-bob"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "demote-bob",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "expect_update_admin_policy_error",
+        "client": "bob",
+        "admins": [
+          "alice",
+          "bob"
+        ],
+        "error": "not_group_admin"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "alice",
+        "payload": "handover:final:alice"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "handover:final:bob"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "carol",
+        "payload": "handover:final:carol"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "observe_admin_policy",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 6,
+      "client": "alice",
+      "pending": "promote-bob",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 10,
+      "client": "bob",
+      "pending": "rename-bob",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 14,
+      "client": "bob",
+      "pending": "promote-carol",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 18,
+      "client": "carol",
+      "pending": "rename-carol",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 22,
+      "client": "alice",
+      "pending": "demote-bob",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "admin_policy",
+      "client": "alice",
+      "admins": [
+        "carol",
+        "alice"
+      ]
+    },
+    {
+      "type": "admin_policy",
+      "client": "bob",
+      "admins": [
+        "carol",
+        "alice"
+      ]
+    },
+    {
+      "type": "admin_policy",
+      "client": "carol",
+      "admins": [
+        "carol",
+        "alice"
+      ]
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 6,
+      "member_count": 3,
+      "received_payloads": [
+        "handover:final:bob",
+        "handover:final:carol"
+      ]
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 6,
+      "member_count": 3,
+      "received_payloads": [
+        "handover:final:alice",
+        "handover:final:carol"
+      ]
+    },
+    {
+      "type": "client_state",
+      "client": "carol",
+      "epoch": 6,
+      "member_count": 3,
+      "received_payloads": [
+        "handover:final:alice",
+        "handover:final:bob"
+      ]
+    },
+    {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "handover-carol",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "handover-carol",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "carol",
+      "name": "handover-carol",
+      "description": ""
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "alice",
+        "bob",
+        "carol"
+      ]
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "alice",
+        "bob",
+        "carol"
+      ]
+    }
+  ]
+}

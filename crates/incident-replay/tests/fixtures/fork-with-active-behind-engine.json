@@ -1,0 +1,30 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    {
+      "engine_id": "engine-a",
+      "wall_time_ms": 1000000000000,
+      "kind": { "type": "message_state_changed", "epoch": 31, "new_state": "processed" }
+    },
+    {
+      "engine_id": "engine-a",
+      "wall_time_ms": 1000000000000,
+      "kind": {
+        "type": "fork_resolution",
+        "source_epoch": 22,
+        "invalidated_msg_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "winner": "candidate"
+      }
+    },
+    {
+      "engine_id": "engine-b",
+      "wall_time_ms": 1000000000000,
+      "kind": { "type": "message_state_changed", "epoch": 19, "new_state": "processed" }
+    },
+    {
+      "engine_id": "engine-b",
+      "wall_time_ms": 1000007200000,
+      "kind": { "type": "message_state_changed", "epoch": 19, "new_state": "processed" }
+    }
+  ]
+}

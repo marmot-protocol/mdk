@@ -22,21 +22,20 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::directory::records::{
     DirectoryKeyPackage, FetchedFollowList, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    field_rank, follow_list_from_record, latest_follow_list_from_records,
-    latest_fresh_profiles_from_records, match_quality_rank, profile_content_json,
-    profile_from_record, public_directory_user_record, select_newer_directory_entry,
-    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
-    user_record_match,
+    follow_list_from_record, latest_follow_list_from_records, latest_fresh_profiles_from_records,
+    profile_content_json, profile_from_record, public_directory_user_record,
+    select_newer_directory_entry, source_relays_from_record, upsert_newer_directory_entry,
+    user_directory_record_from_public, user_record_match,
 };
-use crate::directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
+use crate::directory::{
+    DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
+};
 use crate::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
 };
 use crate::key_package_records::{
-    fill_missing_relay_lists_from_cached, fresh_or_cached_key_package,
-    fresh_relay_list_status_from_records, key_package_from_record,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
     latest_fresh_key_package_from_records, publish_endpoints_from_bootstrap, relay_list_queries,
-    relay_lists_have_any_relays,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
@@ -44,7 +43,7 @@ use crate::{
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
-    push_unique_strings, relays_from_relay_list_event, remove_sqlite_file_set,
+    push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
 
 impl MarmotApp {
@@ -92,18 +91,28 @@ impl MarmotApp {
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let observed_nip65 = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_NIP65_RELAY_LIST
+                && freshness.accepts(record)
+        });
+        let observed_inbox = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST
+                && freshness.accepts(record)
+        });
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
-        if selection.rejected_future || !relay_lists_have_any_relays(&status) {
+        if !observed_nip65 || !observed_inbox {
             let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
-            if relay_lists_have_any_relays(&cached) {
-                if !relay_lists_have_any_relays(&status) {
-                    return Ok(cached);
-                }
-                if selection.rejected_future {
-                    fill_missing_relay_lists_from_cached(&mut status, &cached);
-                }
+            if !observed_nip65 {
+                status.nip65 = cached.nip65;
             }
+            if !observed_inbox {
+                status.inbox = cached.inbox;
+            }
+            push_unique_strings(&mut status.bootstrap_relays, cached.bootstrap_relays);
+            status.refresh();
         }
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = bootstrap_relays
@@ -217,7 +226,7 @@ impl MarmotApp {
         let Some(profile) = profiles.get(&account_id_hex).cloned() else {
             return Ok(None);
         };
-        self.remember_directory_profile(&account_id_hex, &profile)?;
+        self.remember_directory_profile_if_newer(&account_id_hex, &profile)?;
         Ok(Some(profile))
     }
 
@@ -253,19 +262,24 @@ impl MarmotApp {
             }
         }
         self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
-        if relay_lists.nip65.relays.is_empty() {
+        let mut source_relays = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "key package directory fetch",
+        );
+        if source_relays.is_empty() {
+            source_relays = self.directory_source_relays(&[]);
+        }
+        if source_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
         let records = self
             .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
             .await?;
@@ -370,14 +384,14 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        let tags = follows
+        let cached_follows =
+            normalize_account_ids(follows.iter().map(|follow| (*follow).to_owned()).collect())?;
+        let tags = cached_follows
             .iter()
-            .map(|follow| {
-                parse_account_id_hex(follow).map(|account_id| vec!["p".to_owned(), account_id])
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|account_id| vec!["p".to_owned(), account_id.clone()])
+            .collect();
         let event = NostrTransportEvent::new_unsigned(
-            account.account_id_hex,
+            account.account_id_hex.clone(),
             KIND_NOSTR_CONTACT_LIST,
             tags,
             String::new(),
@@ -385,6 +399,26 @@ impl MarmotApp {
         self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
             .publish_event(&endpoints, &event, 1)
             .await?;
+        // Publishing a local kind-3 list must make its own cached edge set
+        // immediately available to the bindings, without admitting every
+        // followed account as a watched directory entry.
+        if let Err(error) = self.remember_directory_follow_edges_for_search(
+            &account.account_id_hex,
+            &FetchedFollowList {
+                follows: cached_follows,
+                source_relays: endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
+            },
+        ) {
+            tracing::warn!(
+                target: "marmot_app::directory",
+                method = "publish_account_follow_list",
+                error_kind = error.privacy_safe_kind(),
+                "follow list published but local cache update failed"
+            );
+        }
         Ok(())
     }
 
@@ -414,18 +448,11 @@ impl MarmotApp {
                 radius,
                 matched_field: search_match.field,
                 match_quality: search_match.quality,
+                provider_rank: None,
                 profile: record.profile.clone(),
             });
         }
-        results.sort_by(|a, b| {
-            a.radius
-                .cmp(&b.radius)
-                .then_with(|| {
-                    match_quality_rank(&a.match_quality).cmp(&match_quality_rank(&b.match_quality))
-                })
-                .then_with(|| field_rank(&a.matched_field).cmp(&field_rank(&b.matched_field)))
-                .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
-        });
+        sort_user_search_results(&mut results);
         if let Some(limit) = search.limit {
             results.truncate(limit);
         }
@@ -455,6 +482,16 @@ impl MarmotApp {
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
     ) -> Result<Vec<RelayEventRecord>, AppError> {
+        self.fetch_key_package_events_for_account_id_with_limit(account_id_hex, source_relays, 12)
+            .await
+    }
+
+    pub(crate) async fn fetch_key_package_events_for_account_id_with_limit(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+        limit: usize,
+    ) -> Result<Vec<RelayEventRecord>, AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let source_relays = self.directory_source_relays(source_relays);
@@ -464,14 +501,14 @@ impl MarmotApp {
                 vec![DirectoryEventQuery::new(
                     KIND_MARMOT_KEY_PACKAGE,
                     vec![public_key.to_hex()],
-                    12,
+                    limit,
                 )],
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))
     }
 
-    async fn fetch_follow_list_for_account_id(
+    pub(crate) async fn fetch_follow_list_for_account_id(
         &self,
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
@@ -488,21 +525,13 @@ impl MarmotApp {
         if let Some(follow_list) = selection.value {
             return Ok(follow_list);
         }
-        if selection.rejected_future
-            && let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
-        {
-            return Ok(FetchedFollowList {
-                follows: entry.follows,
-                source_relays: entry.follow_source_relays,
-            });
-        }
-        Ok(FetchedFollowList {
-            follows: Vec::new(),
-            source_relays: source_relays
-                .iter()
-                .map(|endpoint| endpoint.0.clone())
-                .collect(),
-        })
+        // No event on this relay set means "unknown", not "the account
+        // follows nobody". Preserve any cached edges whether the candidates
+        // were absent or rejected as future-dated.
+        Ok(cached_or_unknown_follow_list(
+            self.directory_entry_for_account_id(account_id_hex)?,
+            source_relays,
+        ))
     }
 
     pub async fn fetch_current_follow_list_for_account_id(
@@ -545,7 +574,7 @@ impl MarmotApp {
             self.remember_directory_user(account_id)?;
         }
         for (account_id, profile) in &profiles {
-            self.remember_directory_profile(account_id, profile)?;
+            self.remember_directory_profile_if_newer(account_id, profile)?;
         }
         Ok(profiles.len())
     }
@@ -564,7 +593,7 @@ impl MarmotApp {
         Ok(())
     }
 
-    async fn fetch_events_for_account_ids(
+    pub(crate) async fn fetch_events_for_account_ids(
         &self,
         account_ids: &[String],
         kind: u64,
@@ -587,6 +616,29 @@ impl MarmotApp {
 
     pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
         DirectoryFreshness::from_now(self.config.directory_max_future_skew)
+    }
+
+    /// Accounts to fall back to when a searcher's own web of trust is empty.
+    /// See [`MarmotAppConfig::directory_search_fallback_seeds`].
+    pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
+        &self.config.directory_search_fallback_seeds
+    }
+
+    /// Narrow network-sourced relay-list endpoints to the ones this device is
+    /// willing to dial, whether the list belongs to this device's local account
+    /// or to another account. Published data remains untrusted in both cases;
+    /// filtering affects only the operation's route and never rewrites the list.
+    ///
+    /// Routes to the same host-safety rule configured endpoints face; see
+    /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
+    /// filters rather than fails.
+    pub(crate) fn retain_safe_discovered_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        self.relay_plane
+            .retain_safe_discovered_endpoints(endpoints, context)
     }
 
     pub(crate) fn directory_source_relays(
@@ -647,6 +699,9 @@ impl MarmotApp {
         let mut seen = HashSet::new();
         let mut frontier = vec![parse_account_id_hex(searcher_account_id_hex)?];
         let caches = self.directory_caches()?;
+        // One instant for the whole traversal: a layer must not disagree with
+        // itself about whether a cached profile has expired.
+        let now = crate::unix_now_seconds() as i64;
 
         for radius in 0..=radius_end {
             let mut next = Vec::new();
@@ -661,7 +716,8 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) = Self::directory_search_record_from_caches(&caches, &account_id)?
+                let Some(record) =
+                    Self::directory_search_record_from_caches(&caches, &account_id, now)?
                 else {
                     continue;
                 };
@@ -715,9 +771,10 @@ impl MarmotApp {
     fn directory_search_record_from_caches(
         caches: &[DirectoryCache],
         account_id_hex: &str,
+        now: i64,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         for cache in caches {
-            if let Some(entry) = cache.search_record(account_id_hex)? {
+            if let Some(entry) = cache.search_record(account_id_hex, now)? {
                 return Ok(Some(entry));
             }
         }
@@ -878,16 +935,15 @@ impl MarmotApp {
         account_id_hex: &str,
         record: &RelayEventRecord,
     ) -> Result<(), AppError> {
-        let relays = relays_from_relay_list_event(&record.event);
-        if relays.is_empty() {
+        let Some(state) = relay_list_state_from_event(&record.event) else {
             return Ok(());
-        }
+        };
         let mut entry = self
             .directory_entry_for_account_id(account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
         match record.event.kind {
-            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65.relays = relays,
-            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox.relays = relays,
+            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65 = state,
+            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox = state,
             _ => return Ok(()),
         }
         push_unique_strings(
@@ -1010,6 +1066,7 @@ impl MarmotApp {
         &self,
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
+        self.ensure_storage_open("directory cache")?;
         self.clean_future_dated_directory_caches_for_all_accounts_once()?;
         if let Some(cache) = self
             .directory_caches
@@ -1020,6 +1077,7 @@ impl MarmotApp {
         {
             return Ok(cache);
         }
+        let _lifecycle = self.begin_storage_open("directory cache")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::directory",
             "directory_cache_handle_open",
@@ -1047,6 +1105,8 @@ impl MarmotApp {
         #[cfg(test)]
         self.directory_cache_open_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Publishing under `_lifecycle` is what keeps this cache reachable by a
+        // later `close_storage`; see `MarmotApp::begin_storage_open`.
         let mut caches = self
             .directory_caches
             .lock()
@@ -1158,7 +1218,7 @@ impl MarmotApp {
         self.clean_future_dated_directory_caches_once(&accounts)
     }
 
-    fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         UserDirectoryRecord {
             account_id_hex: account_id_hex.to_owned(),
             npub: npub_for_account_id_lossy(account_id_hex),
@@ -1201,5 +1261,24 @@ impl MarmotApp {
                 label: account.label,
                 local_signing: account.local_signing,
             })
+    }
+}
+
+pub(crate) fn cached_or_unknown_follow_list(
+    cached: Option<UserDirectoryRecord>,
+    source_relays: &[TransportEndpoint],
+) -> FetchedFollowList {
+    if let Some(entry) = cached {
+        return FetchedFollowList {
+            follows: entry.follows,
+            source_relays: entry.follow_source_relays,
+        };
+    }
+    FetchedFollowList {
+        follows: Vec::new(),
+        source_relays: source_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect(),
     }
 }

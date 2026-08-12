@@ -16,12 +16,13 @@ between engine, peeler, storage, and caller imports from here.
 - `EpochState`, `WelcomeState`, `IngestOutcome`, `StaleReason`, `EngineError` — the typed state-machine + error
   vocabulary.
 - `MessageRecord`, `MessageState`, `StoredMessagePayload` — durable message state plus the typed envelope that
-  distinguishes raw transport bytes from peeled OpenMLS wire bytes.
+  distinguishes raw transport bytes, delivery-aware outbound Welcomes, and peeled OpenMLS wire bytes.
 - All cross-boundary value types: `TransportMessage`, `TransportEnvelope`, `TransportAccountActivation`,
   `TransportPublishRequest`, `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`,
   `AutoPublish`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
 - App-component value types: `AppComponentSet`, `AppComponentData`, and the typed component states
-  (`NostrRoutingV1`, `BlobStoreEndpointV1`, `EncryptedMediaPolicyV1`, `GroupAvatarUrlV1`).
+  (`NostrRoutingV1`, frozen `BlobStoreEndpointV1` / `EncryptedMediaPolicyV1`,
+  current `BlobStoreEndpointV2` / `EncryptedMediaPolicyV2`, `GroupAvatarUrlV1`).
 - `MarmotAppEvent` — the typed application-message event (in `app_event.rs`).
 - Capability negotiation types: `Capability`, `Feature`, `RequirementLevel`, `CapabilityRequirement`,
   `GroupCapabilities`, `FeatureStatus`.

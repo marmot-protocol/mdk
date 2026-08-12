@@ -13,8 +13,8 @@ use marmot_app::{
 };
 use serde_json::{Value, json};
 use transport_quic_broker::{
-    BrokerServerTrust, PublishTextToBroker, SubscribeTextFromBroker, publish_text_to_broker,
-    subscribe_text_from_broker_with_limits,
+    BrokerServerTrust, BrokerTextReceiverState, PublishTextToBroker, SubscribeTextFromBroker,
+    publish_text_to_broker, subscribe_text_from_broker_with_resume,
 };
 use transport_quic_stream::{
     AgentTextStreamReceiveLimits, QuicTextStreamReceiver, SendTextStream, ServerTrust,
@@ -224,6 +224,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     "stream_id": hex::encode(stream_id),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                     "agent_text_stream": agent_text_stream,
                 }),
             })
@@ -404,6 +405,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     "stream_id": hex::encode(stream_id),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                     "agent_text_stream": agent_text_stream,
                 }),
             })
@@ -523,16 +525,6 @@ where
             stream_route_label(&start_payload.route).to_owned(),
         ));
     }
-    let candidate = start_payload
-        .quic_candidates
-        .iter()
-        .find(|candidate| candidate.trim().starts_with("quic://"))
-        .ok_or(WnError::MissingQuicCandidate)?;
-    let candidate = parse_quic_candidate(candidate)?;
-    // Only an explicit local `--insecure-local` opt-in may resolve to a
-    // local/private endpoint; otherwise reject unsafe sender-provided candidates.
-    let candidate_addr = resolve_quic_candidate_addr(&candidate, insecure_local).await?;
-    let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
     let (stream_id, crypto, policy_max_plaintext_frame_len) = stream_crypto_for_start_event(
@@ -552,29 +544,73 @@ where
     let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
     let delta_group_id = group_id_hex.clone();
     let delta_stream_id = stream_id_hex.clone();
-    let received = subscribe_text_from_broker_with_limits(
-        SubscribeTextFromBroker {
-            broker_addr: candidate_addr,
-            server_name: candidate.server_name.clone(),
-            trust: trust.clone(),
-            stream_id,
-            start_event_id,
-            crypto,
-        },
-        limits,
-        |chunk| {
-            on_delta(AgentStreamDelta {
-                account: delta_account.clone(),
-                group_id: delta_group_id.clone(),
-                stream_id: delta_stream_id.clone(),
-                seq: chunk.seq,
-                record_type: chunk.record_type,
-                flags: chunk.flags,
-                text: chunk.text.clone(),
-            });
-        },
-    )
-    .await?;
+    let mut receiver_state =
+        BrokerTextReceiverState::new(stream_id.clone(), start_event_id.clone(), limits);
+    let mut last_error = None;
+    let mut selected = None;
+    let mut received = None;
+    for candidate_value in &start_payload.quic_candidates {
+        let candidate = match parse_quic_candidate(candidate_value) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let candidate_addr = match resolve_quic_candidate_addr(&candidate, insecure_local).await {
+            Ok(addr) => addr,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let trust = match broker_trust_for_candidate(
+            &candidate.server_name,
+            candidate_addr,
+            server_cert_der_hex.clone(),
+            insecure_local,
+        ) {
+            Ok(trust) => trust,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let result = subscribe_text_from_broker_with_resume(
+            SubscribeTextFromBroker {
+                broker_addr: candidate_addr,
+                server_name: candidate.server_name.clone(),
+                trust: trust.clone(),
+                stream_id: stream_id.clone(),
+                start_event_id: start_event_id.clone(),
+                crypto: crypto.clone(),
+            },
+            &mut receiver_state,
+            |chunk| {
+                on_delta(AgentStreamDelta {
+                    account: delta_account.clone(),
+                    group_id: delta_group_id.clone(),
+                    stream_id: delta_stream_id.clone(),
+                    seq: chunk.seq,
+                    record_type: chunk.record_type,
+                    flags: chunk.flags,
+                    text: chunk.text.clone(),
+                });
+            },
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                selected = Some((candidate, candidate_addr, trust));
+                received = Some(value);
+                break;
+            }
+            Err(err) => last_error = Some(err.into()),
+        }
+    }
+    let received = received.ok_or_else(|| last_error.unwrap_or(WnError::MissingQuicCandidate))?;
+    let (candidate, candidate_addr, trust) =
+        selected.expect("a received stream always has a selected candidate");
     Ok(CommandOutput {
         plain: format!(
             "received brokered stream {} chunks={}\n{}",
@@ -687,29 +723,13 @@ pub(crate) struct ParsedQuicCandidate {
     pub(crate) server_name: String,
 }
 
-/// Extract the `host:port` (or `[ipv6]:port`) authority from a `quic://` URL
-/// remainder, ignoring any path, query, or fragment after it. Per
-/// `transports/quic.md` the authority ends at the first `/`, `?`, or `#`. Shared
-/// by both quic-candidate parsers below (and mirrors `marmot_app`'s
-/// `parse_quic_candidate`) so the rule cannot drift.
-fn quic_authority(rest: &str) -> &str {
-    rest.split(['/', '?', '#']).next().unwrap_or(rest)
-}
-
 pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, WnError> {
-    let trimmed = candidate.trim();
-    let Some(rest) = trimmed.strip_prefix("quic://") else {
-        return Err(WnError::InvalidQuicCandidate(trimmed.to_owned()));
-    };
-    let authority = quic_authority(rest);
-    if authority.is_empty() {
-        return Err(WnError::InvalidQuicCandidate(trimmed.to_owned()));
-    }
-    let server_name = candidate_server_name(authority)?;
+    let parsed = transport_quic_stream::QuicCandidate::parse(candidate)
+        .map_err(|_| WnError::InvalidQuicCandidate(candidate.to_owned()))?;
     Ok(ParsedQuicCandidate {
-        original: trimmed.to_owned(),
-        authority: authority.to_owned(),
-        server_name,
+        original: parsed.original().to_owned(),
+        authority: parsed.authority().to_owned(),
+        server_name: parsed.host().to_owned(),
     })
 }
 
@@ -752,38 +772,18 @@ fn socket_addr_is_unsafe(addr: SocketAddr) -> bool {
     !is_public_ip(addr.ip())
 }
 
-fn candidate_server_name(authority: &str) -> Result<String, WnError> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let Some((host, _)) = rest.split_once(']') else {
-            return Err(WnError::InvalidQuicCandidate(authority.to_owned()));
-        };
-        return Ok(host.to_owned());
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| WnError::InvalidQuicCandidate(authority.to_owned()))
-}
-
 pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
     candidates
         .iter()
-        .find(|candidate| candidate.trim().starts_with("quic://"))
+        .find(|candidate| transport_quic_stream::QuicCandidate::parse(candidate).is_ok())
         .and_then(|candidate| quic_candidate_host(candidate))
         .is_some_and(|host| quic_host_is_loopback(&host))
 }
 
 pub(crate) fn quic_candidate_host(candidate: &str) -> Option<String> {
-    let rest = candidate.trim().strip_prefix("quic://")?;
-    let authority = quic_authority(rest);
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host.to_owned());
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .filter(|host| !host.is_empty())
+    transport_quic_stream::QuicCandidate::parse(candidate)
+        .ok()
+        .map(|candidate| candidate.host().to_owned())
 }
 
 fn quic_host_is_loopback(host: &str) -> bool {
@@ -824,6 +824,21 @@ pub(crate) fn broker_trust(
         .transpose()
         .map(|trust| trust.unwrap_or(BrokerServerTrust::Platform))
         .map_err(Into::into)
+}
+
+pub(crate) fn broker_trust_for_candidate(
+    candidate_host: &str,
+    server_addr: SocketAddr,
+    server_cert_der_hex: Option<String>,
+    insecure_local: bool,
+) -> Result<BrokerServerTrust, WnError> {
+    if insecure_local && server_cert_der_hex.is_some() {
+        return Err(WnError::ConflictingStreamTrust);
+    }
+    if insecure_local && !quic_host_is_loopback(candidate_host) {
+        return broker_trust(server_addr, server_cert_der_hex, false);
+    }
+    broker_trust(server_addr, server_cert_der_hex, insecure_local)
 }
 
 fn broker_trust_name(trust: &BrokerServerTrust) -> &'static str {

@@ -1,6 +1,7 @@
 //! App-runtime hosting glue: reconciliation, event bridge, and hosted command dispatch.
 
 use super::*;
+use crate::ImportNsec;
 
 #[derive(Debug)]
 pub(crate) struct DaemonState {
@@ -72,25 +73,27 @@ pub(crate) async fn reconcile_and_clone_runtime(
 
 pub(crate) async fn handle_app_runtime_account_setup_request(
     cli: &Cli,
+    import_nsec: &mut Option<crate::ImportNsec>,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     workers: &SharedDaemonWorkers,
 ) -> Option<CliOutput> {
-    let request = match app_runtime_account_setup_request(cli) {
+    if !app_runtime_enabled(defaults) {
+        return None;
+    }
+    let mut request = match app_runtime_account_setup_request(cli, import_nsec.as_ref()) {
         Ok(Some(request)) => request,
         Ok(None) => return None,
         Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
     };
-    if !app_runtime_enabled(defaults) {
-        return None;
-    }
     let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::WnError::MissingRelay),
         ));
     };
+    request.import_nsec = import_nsec.take().map(ImportNsec::into_inner);
     // create_or_import_account drives relay I/O through the cloned runtime handle (internally
     // synchronized), so it runs off the workers lock.
     let output = runtime
@@ -163,11 +166,14 @@ async fn dispatch_hosted_runtime_command(
             Ok(account_home) => account_home,
             Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
         };
-    let app = crate::app_for(
+    let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
         account_home.clone(),
-    );
+    ) {
+        Ok(app) => app,
+        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
+    };
 
     let output = match cli.command.clone() {
         crate::Command::Group { command } => {
@@ -263,6 +269,16 @@ async fn dispatch_hosted_runtime_command(
             )
             .await
         }
+        crate::Command::Users { command } => {
+            crate::commands::users::users_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
         crate::Command::Media { command } => {
             crate::commands::media::media_command_with_runtime(
                 &account_home,
@@ -306,6 +322,7 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
         | crate::Command::Profile { .. }
         | crate::Command::Relays { .. }
         | crate::Command::RelayStats
+        | crate::Command::Users { .. }
         | crate::Command::Media { .. } => true,
         _ => false,
     }
@@ -313,14 +330,19 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
 
 pub(crate) fn app_runtime_account_setup_request(
     cli: &Cli,
+    import_nsec: Option<&crate::ImportNsec>,
 ) -> Result<Option<marmot_app::AccountSetupRequest>, crate::WnError> {
     match &cli.command {
         crate::Command::CreateIdentity => {
+            if import_nsec.is_some() {
+                return Err(crate::WnError::InvalidPublicKey);
+            }
             if cli.daemon_default_account_relays.is_empty() {
                 return Err(crate::WnError::MissingRelay);
             }
             Ok(Some(marmot_app::AccountSetupRequest {
                 identity: None,
+                import_nsec: None,
                 default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
@@ -334,14 +356,15 @@ pub(crate) fn app_runtime_account_setup_request(
             ..
         } => {
             crate::validate_materialized_secret_identity("login", identity, *nsec_stdin)?;
-            let Some(identity) = identity.clone() else {
+            if identity.is_none() && import_nsec.is_none() {
                 return Err(crate::WnError::MissingLoginIdentity);
-            };
-            if crate::is_nostr_secret(&identity) && cli.daemon_default_account_relays.is_empty() {
+            }
+            if import_nsec.is_some() && cli.daemon_default_account_relays.is_empty() {
                 return Err(crate::WnError::MissingRelay);
             }
             Ok(Some(marmot_app::AccountSetupRequest {
-                identity: Some(identity),
+                identity: identity.clone(),
+                import_nsec: None,
                 default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
@@ -372,6 +395,7 @@ pub(crate) fn app_runtime_account_setup_request(
             crate::validate_materialized_secret_identity("account create", identity, *nsec_stdin)?;
             Ok(Some(marmot_app::AccountSetupRequest {
                 identity: identity.clone(),
+                import_nsec: None,
                 default_relays: crate::relay_endpoints(default_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
@@ -539,7 +563,7 @@ pub(crate) fn open_app_runtime(
     let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
     let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
     let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-    let app = crate::app_for(defaults.home.clone(), defaults.relay.clone(), account_home);
+    let app = crate::app_for(defaults.home.clone(), defaults.relay.clone(), account_home)?;
     Ok(app.runtime())
 }
 
@@ -667,6 +691,12 @@ pub(crate) async fn handle_app_runtime_event(
         // The durable record + `redeliver_welcome` handle the repair; this
         // daemon activity path has no runtime-summary shape to record for it.
         marmot_app::MarmotAppEvent::WelcomeDeliveryPending { .. } => {}
+        // A group's epoch-gap backfill kept arming without catching up. Like the
+        // welcome-repair signal above, this reports a repair need rather than
+        // runtime activity, so there is no summary shape to record: it reaches
+        // operators through the runtime event stream and the group's forensic
+        // `epoch_stall_backfill_escalated` row.
+        marmot_app::MarmotAppEvent::EpochStallEscalated { .. } => {}
     }
 }
 
@@ -688,11 +718,14 @@ pub(crate) async fn auto_watch_agent_stream_starts(
             Ok(account_home) => account_home,
             Err(_) => return,
         };
-    let app = crate::app_for(
+    let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
         account_home.clone(),
-    );
+    ) {
+        Ok(app) => app,
+        Err(_) => return,
+    };
     for message in &summary.messages {
         let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {
@@ -842,5 +875,59 @@ pub(crate) fn apply_default_account_relays(cli: &mut Cli, defaults: &DaemonDefau
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli(argv: &[&str]) -> Cli {
+        Cli::try_parse_from(argv.iter().copied()).expect("argv parses")
+    }
+
+    /// This predicate decides whether the daemon answers a command with its
+    /// live app runtime or falls through to a runtime-less local run. Getting
+    /// it wrong is silent: the command still succeeds, just without whatever
+    /// the runtime knows.
+    #[test]
+    fn user_search_is_answered_with_the_daemons_runtime() {
+        // Group co-members are live MLS state only the runtime holds, so a
+        // search dispatched without it silently loses them.
+        assert!(is_hosted_runtime_command(&cli(&[
+            "wn", "users", "search", "alice"
+        ])));
+    }
+
+    #[test]
+    fn user_show_is_answered_with_the_daemons_runtime() {
+        assert!(is_hosted_runtime_command(&cli(&[
+            "wn",
+            "users",
+            "show",
+            &"aa".repeat(32)
+        ])));
+    }
+
+    /// Commands that touch no runtime state must keep falling through, so the
+    /// daemon does not reconcile accounts to answer a local question.
+    #[test]
+    fn purely_local_commands_are_not_hosted() {
+        assert!(!is_hosted_runtime_command(&cli(&[
+            "wn", "settings", "show"
+        ])));
+        assert!(!is_hosted_runtime_command(&cli(&["wn", "whoami"])));
+    }
+
+    /// Streaming subscriptions have their own socket entry points; routing them
+    /// through the one-shot hosted path would answer once and hang up.
+    #[test]
+    fn streaming_subscriptions_are_not_hosted() {
+        assert!(!is_hosted_runtime_command(&cli(&[
+            "wn",
+            "chats",
+            "subscribe"
+        ])));
     }
 }

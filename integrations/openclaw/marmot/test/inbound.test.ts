@@ -14,9 +14,13 @@ function inboundMessage(messageId: string): AgentControlEvent {
     type: "inbound_message",
     account_id_hex: HEX32("aa"),
     group_id_hex: HEX32("cc"),
-    message_id_hex: messageId,
-    sender_account_id_hex: HEX32("bb"),
-    text: "hello agent",
+    message: {
+      message_id_hex: messageId,
+      sender: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      text: "hello agent",
+      recorded_at: 123,
+      media: [],
+    },
   };
 }
 
@@ -107,13 +111,21 @@ describe("MarmotInboundBridge", () => {
     expect(calls).toBeGreaterThanOrEqual(2);
   });
 
-  it("routes a message_deleted event to onMessageDeleted", async () => {
+  it("routes a message_deleted event as ambient context", async () => {
     const deletion: AgentControlEvent = {
       type: "message_deleted",
       account_id_hex: HEX32("aa"),
       group_id_hex: HEX32("cc"),
+      event_id_hex: HEX32("e9"),
       target_message_id_hex: HEX32("d9"),
-      sender_account_id_hex: HEX32("bb"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      recorded_at: 124,
+      target: {
+        message_id_hex: HEX32("d9"),
+        availability: "deleted",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
     };
     const { client } = makeClient([deletion]);
     let deletedTarget = "";
@@ -121,8 +133,10 @@ describe("MarmotInboundBridge", () => {
     const bridge = new MarmotInboundBridge(client, {
       reconnectDelayMs: 1,
       onMessage: () => {},
-      onMessageDeleted: ({ targetMessageIdHex }) => {
-        deletedTarget = targetMessageIdHex;
+      onAmbientEvent: (event) => {
+        if (event.type === "message_deleted") {
+          deletedTarget = event.target_message_id_hex;
+        }
         controller.abort();
       },
     });
@@ -131,7 +145,7 @@ describe("MarmotInboundBridge", () => {
     expect(deletedTarget).toBe(HEX32("d9"));
   });
 
-  it("routes a group_state_changed event to onGroupStateChanged", async () => {
+  it("routes a group_state_changed event as ambient context", async () => {
     const renamed: AgentControlEvent = {
       type: "group_state_changed",
       account_id_hex: HEX32("aa"),
@@ -146,9 +160,11 @@ describe("MarmotInboundBridge", () => {
     const bridge = new MarmotInboundBridge(client, {
       reconnectDelayMs: 1,
       onMessage: () => {},
-      onGroupStateChanged: ({ change, detail }) => {
-        observedChange = change;
-        observedDetail = detail ?? null;
+      onAmbientEvent: (event) => {
+        if (event.type === "group_state_changed") {
+          observedChange = event.change;
+          observedDetail = event.detail ?? null;
+        }
         controller.abort();
       },
     });

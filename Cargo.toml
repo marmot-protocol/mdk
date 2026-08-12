@@ -7,6 +7,8 @@ members = [
     "crates/cgka-session",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
+    "crates/convergence-campaign-runner",
+    "crates/incident-replay",
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
     "crates/transport-quic-stream",
@@ -21,23 +23,28 @@ members = [
     "crates/marmot-uniffi",
     "crates/marmot-c",
     "crates/cli",
+    "integrations/terminal-harness",
     "integrations/opencode/marmot",
+    "integrations/pi/marmot",
 ]
 
 [workspace.package]
 edition = "2024"
-version = "0.9.3"
+version = "0.9.11"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# OpenMLS family — tilde-pinned to avoid silent companion-crate skew.
-openmls = { version = "~0.8.1", features = ["extensions-draft-08"] }
-openmls_basic_credential = "~0.5"
-openmls_memory_storage = { version = "~0.5", features = ["extensions-draft-08"] }
-openmls_rust_crypto = "~0.5"
-openmls_traits = { version = "~0.5", features = ["extensions-draft-08"] }
-tls_codec = "~0.4"
+# OpenMLS family — exact-pinned to the draft-10 last-resort KeyPackage fix.
+# Keep every companion crate on the same repository commit to prevent source skew.
+# Migration: once an upstream OpenMLS release contains this fix, replace all five
+# git entries together with one matching upstream release series and remove the fork pin.
+openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
+openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
+openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+tls_codec = "~0.5"
 
 # async
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
@@ -46,6 +53,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 # utils
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -54,13 +62,23 @@ libc = "0.2"
 hkdf = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 clap = { version = "4.6", features = ["derive"] }
 # unstable-rendered-line-info exposes Paragraph::line_count for wrap-aware TUI scroll math.
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
+# Inbound-media rendering in the TUI. `default-features = false` is load-bearing:
+# ratatui-image's defaults pull `chafa-dyn`, which needs the system libchafa C
+# library and would break CI and packaging.
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # General-category lookups for the terminal untrusted-text sanitizer (drop the
 # whole Cf format class instead of a drifting hardcoded denylist).
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# Extended grapheme-cluster segmentation for the TUI /react guard (one cluster ==
+# one emoji). Already in the tree via ratatui; declared here so wn-cli can depend
+# on it directly at the workspace-consistent version.
+unicode-segmentation = "1"
 unicode-normalization = "0.1"
 rand = "0.8"
 sha2 = "0.10"
@@ -68,6 +86,7 @@ url = "2"
 psl = "2"
 bech32 = "0.11"
 chacha20poly1305 = "0.10"
+bytes = "1"
 scrypt = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"
@@ -75,11 +94,10 @@ keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 # Already in the graph through quinn's platform-verifier feature; direct dep so
 # the broker can build ALPN-carrying rustls client configs with platform trust.
 rustls-platform-verifier = "0.6"
-nostr = { version = "0.44.2", default-features = false, features = ["std", "nip49", "nip59"] }
+nostr = { version = "0.44.8", default-features = false, features = ["std", "nip49", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
@@ -87,12 +105,13 @@ nostr-relay-builder = "0.44"
 # reqwest/rustls stack, so the SDK's record-time histogram API is not needed.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "metrics"] }
 prost = "0.14"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
 tempfile = "3"
 
 # test
 proptest = "1"
 insta = { version = "1", features = ["json"] }
+stateright = "0.31.0"
 test-log = { version = "0.2", features = ["trace"] }
 
 # workspace-internal
@@ -102,6 +121,7 @@ cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
+convergence-campaign-runner = { path = "crates/convergence-campaign-runner" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
@@ -116,3 +136,10 @@ marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 marmot-c = { path = "crates/marmot-c" }
 wn-cli = { path = "crates/cli" }
+marmot-terminal-harness = { path = "integrations/terminal-harness" }
+
+# hax-lib-macros 0.3.7 still declares the unmaintained proc-macro-error2
+# dependency under cfg(hax). Pin the upstream removal until the next hax
+# release contains it, then remove this patch and update the libcrux path.
+[patch.crates-io]
+hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }

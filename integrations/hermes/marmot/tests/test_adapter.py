@@ -15,6 +15,32 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
 
 
+def wire_event(event):
+    """Build the intentionally breaking structured v2 inbound shape for tests."""
+    if event.get("type") != "inbound_message" or "message" in event:
+        return event
+    flat = dict(event)
+    message = {
+        "message_id_hex": flat.pop("message_id_hex"),
+        "sender": {
+            "account_id_hex": flat.pop("sender_account_id_hex", "44" * 32),
+            "display_name": flat.pop("sender_display_name", None),
+            "is_self": False,
+        },
+        "text": flat.pop("text", ""),
+        "recorded_at": flat.pop("recorded_at", 0),
+        "media": flat.pop("media", []),
+    }
+    reply_to_message_id_hex = flat.pop("reply_to_message_id_hex", None)
+    flat["message"] = message
+    if reply_to_message_id_hex:
+        flat["reply_to"] = {
+            "message_id_hex": reply_to_message_id_hex,
+            "availability": "missing",
+        }
+    return flat
+
+
 def install_fake_hermes_modules():
     gateway = types.ModuleType("gateway")
     gateway_platforms = types.ModuleType("gateway.platforms")
@@ -51,8 +77,14 @@ def install_fake_hermes_modules():
         source: object = None
         raw_message: object = None
         message_id: str | None = None
+        timestamp: object = None
         media_urls: list = field(default_factory=list)
         media_types: list = field(default_factory=list)
+        reply_to_message_id: str | None = None
+        reply_to_text: str | None = None
+        reply_to_author_id: str | None = None
+        reply_to_author_name: str | None = None
+        reply_to_is_own_message: bool = False
         # Quiet next-turn context prepended to the trigger text by the runner;
         # never a trigger itself. Mirrors gateway.platforms.base.MessageEvent.
         channel_context: str | None = None
@@ -77,6 +109,8 @@ def install_fake_hermes_modules():
             self.platform = platform
             self._running = False
             self.events = []
+            self._message_handler = None
+            self._session_tasks = {}
 
         @property
         def enforces_own_access_policy(self):
@@ -88,11 +122,24 @@ def install_fake_hermes_modules():
         def _mark_disconnected(self):
             self._running = False
 
+        async def connect(self, *, is_reconnect: bool = False) -> bool:
+            # Mirrors hermes-agent's keyword-only base signature; the gateway
+            # always calls connect(is_reconnect=...), so overrides must accept
+            # the keyword even when they ignore it (#836).
+            raise NotImplementedError
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
         async def handle_message(self, event):
             self.events.append(event)
+
+        def _start_session_processing(self, event, session_key, *, interrupt_event=None):
+            if self._message_handler is None:
+                return False
+            task = asyncio.create_task(self._message_handler(event))
+            self._session_tasks[session_key] = task
+            return True
 
     gateway_base.BasePlatformAdapter = BasePlatformAdapter
     gateway_base.MessageEvent = MessageEvent
@@ -115,6 +162,7 @@ def load_adapter_module():
         "gateway.platforms",
         "gateway.platforms.base",
         "gateway.config",
+        "gateway.stream_events",
     ]:
         sys.modules.pop(name, None)
     install_fake_hermes_modules()
@@ -160,7 +208,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "final_sent",
                     "message_ids_hex": ["aa", "bb"],
@@ -180,13 +228,12 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["type"], "final_sent")
         self.assertEqual(response["message_ids_hex"], ["aa", "bb"])
-        self.assertEqual(requests[0]["marmot_agent_control"], "marmot.agent-control.v1")
+        self.assertEqual(requests[0]["marmot_agent_control"], "marmot.agent-control.v2")
         self.assertEqual(requests[0]["type"], "send_final")
         self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
         self.assertEqual(requests[0]["group_id_hex"], "22" * 32)
         self.assertEqual(requests[0]["reply_to_message_id_hex"], "33" * 32)
-        # Additive, v1-compatible: the key is omitted from the wire when not
-        # supplied so an old connector's frame stays byte-identical.
+        # Optional on the wire: the key is omitted when not supplied.
         self.assertNotIn("idempotency_key", requests[0])
 
     async def test_send_final_includes_idempotency_key_only_when_supplied(self):
@@ -198,7 +245,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "final_sent",
                     "message_ids_hex": ["aa"],
@@ -218,6 +265,196 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_send_media_includes_idempotency_key_only_when_supplied(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["44" * 32],
+                    "maintenance_disposition": "not_required",
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
+
+        await client.send_media("11" * 32, "22" * 32, attachment, idempotency_key="media-key-1")
+        await client.send_media("11" * 32, "22" * 32, attachment, idempotency_key="  ")
+        await client.send_media("11" * 32, "22" * 32, attachment)
+
+        self.assertEqual(requests[0]["idempotency_key"], "media-key-1")
+        self.assertNotIn("idempotency_key", requests[1])
+        self.assertNotIn("idempotency_key", requests[2])
+
+    async def test_send_media_waits_for_terminal_response_beyond_generic_timeout(self):
+        publishes = 0
+
+        async def handler(reader, writer):
+            nonlocal publishes
+            request = await read_json_line(reader)
+            self.assertEqual(request["type"], "send_media")
+            await asyncio.sleep(0.05)
+            publishes += 1
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["44" * 32],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+
+        response = await client.send_media(
+            "11" * 32,
+            "22" * 32,
+            [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}],
+            idempotency_key="media-key-1",
+        )
+
+        self.assertEqual(response["message_ids_hex"], ["44" * 32])
+        self.assertEqual(publishes, 1)
+
+    async def test_send_media_times_out_when_connector_never_responds(self):
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            self.assertEqual(request["type"], "send_media")
+            await reader.read()
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
+
+        with unittest.mock.patch.object(
+            self.adapter,
+            "SEND_MEDIA_COMPLETION_TIMEOUT_S",
+            0.01,
+        ):
+            with self.assertRaises(self.adapter.AgentControlError) as raised:
+                await client.send_media(
+                    "11" * 32,
+                    "22" * 32,
+                    attachment,
+                    idempotency_key="media-key-1",
+                )
+
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
+
+    def test_send_in_progress_error_remains_retryable(self):
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            self.adapter.MarmotAgentControlClient._raise_if_error(
+                {
+                    "type": "error",
+                    "code": "send_in_progress",
+                    "message": "matching send is still in progress",
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "send_in_progress")
+        self.assertTrue(raised.exception.retryable)
+
+    async def test_timeline_reads_write_exact_message_and_cursor_requests(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            if request["type"] == "timeline_message_get":
+                response = {
+                    "type": "timeline_message",
+                    "account_id_hex": request["account_id_hex"],
+                    "group_id_hex": request["group_id_hex"],
+                    "message_id_hex": request["message_id_hex"],
+                    "message": None,
+                }
+            else:
+                response = {
+                    "type": "timeline_page",
+                    "account_id_hex": request["account_id_hex"],
+                    "group_id_hex": request["group_id_hex"],
+                    "messages": [],
+                    "has_more_before": False,
+                    "has_more_after": False,
+                }
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    **response,
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        await client.timeline_message_get("11" * 32, "22" * 32, "33" * 32)
+        await client.timeline_list(
+            "11" * 32,
+            "22" * 32,
+            before={"recorded_at": 42, "message_id_hex": "44" * 32},
+            limit=500,
+        )
+
+        self.assertEqual(requests[0]["type"], "timeline_message_get")
+        self.assertEqual(requests[0]["message_id_hex"], "33" * 32)
+        self.assertEqual(requests[1]["type"], "timeline_list")
+        self.assertEqual(
+            requests[1]["before"],
+            {"recorded_at": 42, "message_id_hex": "44" * 32},
+        )
+        self.assertIsNone(requests[1]["after"])
+        self.assertFalse(requests[1]["before_inclusive"])
+        self.assertEqual(requests[1]["limit"], 50)
+
+    async def test_stream_begin_includes_parent_message_id_only_when_supplied(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": [],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.stream_begin(
+            "11" * 32,
+            "22" * 32,
+            parent_message_id_hex="33" * 32,
+        )
+        await client.stream_begin("11" * 32, "22" * 32)
+
+        self.assertEqual(requests[0]["parent_message_id_hex"], "33" * 32)
+        self.assertNotIn("parent_message_id_hex", requests[1])
+
     async def test_stream_finalize_includes_idempotency_key_only_when_supplied(self):
         requests = []
 
@@ -227,7 +464,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "stream_finalized",
                     "stream_id_hex": request["stream_id_hex"],
@@ -239,13 +476,14 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         await self.start_server(handler)
         client = self.adapter.MarmotAgentControlClient(self.socket_path)
 
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1, idempotency_key="key-1")
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1)
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="key-1")
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
 
         self.assertEqual(requests[0]["idempotency_key"], "key-1")
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
+        self.assertTrue(all(request["stream_capability"] == "33" * 32 for request in requests))
 
     async def test_auth_token_is_written_when_configured(self):
         requests = []
@@ -256,7 +494,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "account_list",
                     "accounts": [],
@@ -272,6 +510,33 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["type"], "account_list")
         self.assertEqual(requests[0]["auth_token"], "test-token")
 
+    async def test_account_lookup_profile_writes_typed_lookup_request(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "profile_lookup",
+                    "account_id_hex": request["account_id_hex"],
+                    "status": "profile_found",
+                    "retryable": False,
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.account_lookup_profile("11" * 32)
+
+        self.assertEqual(response["status"], "profile_found")
+        self.assertEqual(requests[0]["type"], "account_profile_lookup")
+        self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
+
     async def test_account_publish_profile_writes_public_profile_request(self):
         requests = []
 
@@ -281,7 +546,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "profile_published",
                     "account_id_hex": request["account_id_hex"],
@@ -311,7 +576,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "app_event_sent",
                     "message_ids_hex": ["22" * 32],
@@ -356,7 +621,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "ack",
                 },
@@ -364,7 +629,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "inbound_message",
                     "account_id_hex": "11" * 32,
@@ -388,6 +653,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["text"], "ping")
 
     async def test_inbound_subscription_waits_without_request_timeout_after_ack(self):
+        ack_sent = asyncio.Event()
         release_event = asyncio.Event()
 
         async def handler(reader, writer):
@@ -395,16 +661,18 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "ack",
                 },
             )
+            await writer.drain()
+            ack_sent.set()
             await release_event.wait()
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "inbound_message",
                     "account_id_hex": "11" * 32,
@@ -418,12 +686,17 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
 
         await self.start_server(handler)
-        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+        request_timeout = 0.1
+        client = self.adapter.MarmotAgentControlClient(
+            self.socket_path,
+            request_timeout=request_timeout,
+        )
         events = client.inbound_events(account_id_hex="11" * 32)
 
         pending_event = asyncio.create_task(anext(events))
         try:
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(ack_sent.wait(), timeout=1.0)
+            await asyncio.sleep(request_timeout * 2)
             self.assertFalse(pending_event.done())
 
             release_event.set()
@@ -578,6 +851,17 @@ class TranscriptTests(unittest.TestCase):
 
     def test_plain_two_word_message_is_not_legacy_tool_progress(self):
         self.assertEqual(self.adapter._tool_events_from_progress_text("hello world"), [])
+
+
+class MediaLimitConfigurationTests(unittest.TestCase):
+    def test_defaults_support_large_application_artifacts(self):
+        adapter = load_adapter_module()
+        self.assertEqual(adapter.MAX_OUTBOUND_MEDIA_FILE_BYTES, 512 * 1024 * 1024 - 16)
+        self.assertEqual(
+            adapter.MAX_OUTBOUND_MEDIA_BATCH_BYTES,
+            adapter.MAX_OUTBOUND_MEDIA_FILE_BYTES,
+        )
+        self.assertGreater(adapter.MAX_OUTBOUND_MEDIA_FILE_BYTES, 250 * 1024 * 1024)
 
 
 class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -812,6 +1096,30 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._tool_progress_events, {})
         self.assertEqual(adapter._tool_progress_replies, {})
 
+    async def test_connect_accepts_gateway_is_reconnect_keyword(self):
+        # hermes-agent's gateway connects adapters via connect(is_reconnect=...)
+        # on cold boot and reconnect alike, so a signature without the
+        # keyword-only argument raises TypeError before the platform ever
+        # comes up (#836).
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                await asyncio.Event().wait()
+                yield {}  # unreachable: marks this as an async generator
+
+        for is_reconnect in (False, True):
+            with self.subTest(is_reconnect=is_reconnect):
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}),
+                    client=FakeClient(),
+                )
+                try:
+                    self.assertTrue(await adapter.connect(is_reconnect=is_reconnect))
+                    self.assertTrue(adapter._running)
+                    self.assertIsNotNone(adapter._listener_task)
+                finally:
+                    await adapter.disconnect()
+                self.assertIsNone(adapter._listener_task)
+
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
             {
@@ -828,7 +1136,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
@@ -867,7 +1175,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
@@ -903,7 +1211,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "dropped_events": 3,
                     }
                 elif attempts["n"] == 2:
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": "22" * 32,
@@ -911,7 +1219,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "recovered after resync",
                         "mentions_self": True,
-                    }
+                    })
                 else:
                     # No further events; idle so the loop parks instead of busy-spinning.
                     await asyncio.sleep(3600)
@@ -971,7 +1279,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
                 # Keep the subscription open after yielding so the consume loop parks on the
                 # next event instead of draining the queue (which would serialize the turns).
                 await asyncio.sleep(3600)
@@ -1058,7 +1366,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
@@ -1110,7 +1418,10 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
+
+            async def account_lookup_profile(self, account_id_hex):
+                return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
 
             async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
@@ -1139,6 +1450,107 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("public Nostr profile", text)
         self.assertEqual(reply_to, "33" * 32)
 
+    async def test_existing_public_profile_suppresses_prompt_and_persists_state(self):
+        account_id = "11" * 32
+        group_id = "22" * 32
+
+        class FakeClient:
+            def __init__(self):
+                self.lookup_calls = 0
+                self.final_sends = []
+
+            async def account_lookup_profile(self, requested_account_id):
+                self.lookup_calls += 1
+                self.asserted_account = requested_account_id
+                return {"type": "profile_lookup", "status": "profile_found", "retryable": False}
+
+            async def send_final(self, *args, **kwargs):
+                self.final_sends.append((args, kwargs))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            state_path = Path(tempdir) / "profile-state.json"
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account_id,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(state_path),
+                    }
+                ),
+                client=fake_client,
+            )
+            event = {
+                "type": "inbound_message",
+                "account_id_hex": account_id,
+                "group_id_hex": group_id,
+                "message_id_hex": "33" * 32,
+                "text": "hello",
+            }
+
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertEqual(fake_client.lookup_calls, 1)
+            self.assertEqual(fake_client.final_sends, [])
+            self.assertEqual((await adapter.profile_name_onboarding.get(account_id)).get("status"), "profile_exists")
+
+            reopened = self.adapter_module.ProfileNameOnboardingStore(state_path)
+            self.assertEqual((await reopened.get(account_id)).get("status"), "profile_exists")
+
+    async def test_indeterminate_profile_lookup_backs_off_without_prompting_then_retries(self):
+        account_id = "11" * 32
+        group_id = "22" * 32
+        now = [100.0]
+
+        class FakeClient:
+            def __init__(self):
+                self.lookup_calls = 0
+                self.final_sends = []
+
+            async def account_lookup_profile(self, requested_account_id):
+                self.lookup_calls += 1
+                status = "indeterminate" if self.lookup_calls == 1 else "profile_not_found"
+                return {"type": "profile_lookup", "status": status, "retryable": status == "indeterminate"}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account_id,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(Path(tempdir) / "profile-state.json"),
+                    }
+                ),
+                client=fake_client,
+            )
+            adapter._profile_lookup_gate = self.adapter_module.ProfileLookupGate(
+                now=lambda: now[0], backoff_seconds=(1.0, 5.0)
+            )
+            event = {
+                "type": "inbound_message",
+                "account_id_hex": account_id,
+                "group_id_hex": group_id,
+                "message_id_hex": "33" * 32,
+                "text": "hello",
+            }
+
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertEqual(fake_client.lookup_calls, 1)
+            self.assertEqual(fake_client.final_sends, [])
+            self.assertEqual(await adapter.profile_name_onboarding.get(account_id), {})
+
+            now[0] += 1.0
+            self.assertTrue(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertEqual(fake_client.lookup_calls, 2)
+            self.assertEqual(len(fake_client.final_sends), 1)
+
     async def test_profile_name_reply_publishes_profile_and_acknowledges(self):
         account_id = "11" * 32
         group_id = "22" * 32
@@ -1161,7 +1573,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
             async def account_publish_profile(self, account_id_hex, name, display_name=None):
                 self.published_profiles.append((account_id_hex, name, display_name))
@@ -1216,7 +1628,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
                     # First subscription: a slow/hung group-A turn, then a resync forces reconnect.
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": group_a,
@@ -1224,7 +1636,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "slow group A",
                         "mentions_self": True,
-                    }
+                    })
                     yield {
                         "type": "resync_required",
                         "account_id_hex": "11" * 32,
@@ -1233,7 +1645,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     }
                 elif attempts["n"] == 2:
                     # Fresh subscription after resync delivers group B's message.
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": group_b,
@@ -1241,7 +1653,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "fast group B",
                         "mentions_self": True,
-                    }
+                    })
                 else:
                     await asyncio.sleep(3600)
                     return
@@ -1325,12 +1737,21 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             def __init__(self):
                 self.final_sends = []
+                self.lookup_calls = 0
+                self._lookup_started = asyncio.Event()
+                self._release_lookup = asyncio.Event()
                 self._prompt_started = asyncio.Event()
                 self._release = asyncio.Event()
 
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
+
+            async def account_lookup_profile(self, account_id_hex):
+                self.lookup_calls += 1
+                self._lookup_started.set()
+                await self._release_lookup.wait()
+                return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
 
             async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 # Make the first prompt-send slow so both groups are in flight concurrently:
@@ -1370,7 +1791,12 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 group_b, lambda: adapter._dispatch_inbound_message(make_event(group_b, "02" * 32, "hi from B"))
             )
 
-            # Let both dispatch tasks reach the prompt-claim/send seam, then release the slow send.
+            # Let both groups share the same in-flight lookup, then release the slow prompt send.
+            for _ in range(200):
+                if fake_client._lookup_started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            fake_client._release_lookup.set()
             for _ in range(200):
                 if fake_client._prompt_started.is_set():
                     break
@@ -1378,6 +1804,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             fake_client._release.set()
             await adapter._inbound_queue.join()
 
+        self.assertEqual(fake_client.lookup_calls, 1, "concurrent groups must share one profile lookup")
         # Exactly one prompt was sent (the claim winner); the loser did NOT also prompt.
         self.assertEqual(
             len(fake_client.final_sends), 1, f"expected exactly one prompt, got {fake_client.final_sends}"
@@ -1406,6 +1833,9 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
+
+            async def account_lookup_profile(self, account_id_hex):
+                return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
 
             async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.calls += 1
@@ -1451,6 +1881,90 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(fake_client.final_sends), 1)
             self.assertEqual((await store.get(account)).get("status"), "prompted")
 
+    async def test_inbound_turn_parent_reaches_draft_stream_without_state_leak(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_begin_parents = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                self.stream_begin_parents.append(parent_message_id_hex)
+                index = len(self.stream_begin_parents)
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": f"{index:02x}" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": f"{index + 16:02x}" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                return {"type": "ack"}
+
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
+                return {"type": "ack"}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                    "group_activation": "always",
+                }
+            ),
+            client=fake_client,
+        )
+        next_draft_id = 0
+
+        async def message_handler(event):
+            nonlocal next_draft_id
+            next_draft_id += 1
+            result = await adapter.send_draft(
+                event.source.chat_id,
+                next_draft_id,
+                "hello",
+            )
+            self.assertTrue(result.success)
+
+        adapter._message_handler = message_handler
+
+        def turn_event(message_id_hex):
+            source = adapter.build_source(
+                chat_id="22" * 32,
+                chat_type="group",
+                user_id="44" * 32,
+                message_id=message_id_hex,
+            )
+            return self.adapter_module.MessageEvent(
+                text="hello",
+                source=source,
+                message_id=message_id_hex,
+            )
+
+        for index, parent_message_id_hex in enumerate(("33" * 32, "34" * 32, None)):
+            session_key = f"session-{index}"
+            started = adapter._start_session_processing(
+                turn_event(parent_message_id_hex),
+                session_key,
+            )
+            self.assertTrue(started)
+            await adapter._session_tasks[session_key]
+
+        self.assertEqual(
+            fake_client.stream_begin_parents,
+            ["33" * 32, "34" * 32, None],
+        )
+        self.assertIsNone(self.adapter_module._TURN_PARENT_MESSAGE_ID_HEX.get())
+
     async def test_progressive_edit_stream_finalizes_then_sends_durable_message(self):
         class FakeClient:
             def __init__(self):
@@ -1458,20 +1972,35 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
-                self.stream_begin_args = (account_id_hex, group_id_hex, tuple(quic_candidates))
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                self.stream_begin_args = (
+                    account_id_hex,
+                    group_id_hex,
+                    parent_message_id_hex,
+                    tuple(quic_candidates),
+                )
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {
                     "type": "stream_finalized",
@@ -1497,9 +2026,13 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             client=fake_client,
         )
 
-        first = await adapter.send("22" * 32, "hel\u2589")
+        first = await adapter.send("22" * 32, "hel\u2589", reply_to="33" * 32)
         self.assertTrue(first.success)
         self.assertEqual(first.message_id, "marmot-stream:" + "55" * 32)
+        self.assertEqual(
+            fake_client.stream_begin_args,
+            ("11" * 32, "22" * 32, "33" * 32, ("quic://127.0.0.1:4433",)),
+        )
 
         edited = await adapter.edit_message("22" * 32, first.message_id, "hello\u2589")
         self.assertTrue(edited.success)
@@ -1524,20 +2057,21 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                     "policy_max_plaintext_frame_len": 4,
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {
                     "type": "stream_finalized",
@@ -1577,16 +2111,17 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_begins = []
                 self.stream_appends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 self.stream_begins.append((account_id_hex, group_id_hex, tuple(quic_candidates)))
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -1613,19 +2148,20 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends = []
                 self.stream_cancels = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1656,22 +2192,23 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends = []
                 self.stream_cancels = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 self.next_stream += 1
                 stream_byte = f"{0x54 + self.next_stream:02x}"
                 start_byte = f"{0x64 + self.next_stream:02x}"
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": stream_byte * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": start_byte * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1703,21 +2240,22 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.next_stream = 0
                 self.stream_cancels = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 self.next_stream += 1
                 stream_byte = f"{0x54 + self.next_stream:02x}"
                 start_byte = f"{0x64 + self.next_stream:02x}"
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": stream_byte * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": start_byte * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1750,19 +2288,20 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {
                     "type": "stream_finalized",
@@ -1798,25 +2337,44 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             "Based on my research, here's the answer",
         )
 
-    async def test_whitespace_mismatched_final_replaces_preview_without_duplication(self):
+    async def test_markdown_balancers_after_cursor_stay_a_preview(self):
         class FakeClient:
             def __init__(self):
+                self.stream_appends = []
                 self.stream_finalizes = []
-                self.stream_cancels = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(
+                self,
+                stream_id_hex,
+                stream_capability,
+                final_text,
+                transcript_hash_hex,
+                chunk_count,
+                idempotency_key=None,
+            ):
                 self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
@@ -1824,7 +2382,103 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "message_ids_hex": ["77" * 32],
                 }
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def send_final(
+                self,
+                account_id_hex,
+                group_id_hex,
+                text,
+                reply_to_message_id_hex=None,
+                idempotency_key=None,
+            ):
+                self.final_sends.append((account_id_hex, group_id_hex, text))
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        # Hermes balances an open inline-code span after adding its cursor. The
+        # trailing backtick is display-only and must not hide the preview marker.
+        preview = await adapter.send("22" * 32, "Result: `partial \u2589`")
+        final = await adapter.send("22" * 32, "Result: `partial value`")
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_appends[0][1], "Result: `partial ")
+        self.assertEqual(
+            fake_client.stream_finalizes,
+            [("55" * 32, "Result: `partial value`")],
+        )
+
+        # Fenced blocks are balanced with a newline plus three backticks.
+        append_offset = len(fake_client.stream_appends)
+        finalize_offset = len(fake_client.stream_finalizes)
+        fenced_preview = await adapter.send("22" * 32, "```text\npartial \u2589\n```")
+        fenced_final = await adapter.send("22" * 32, "```text\npartial value\n```")
+
+        self.assertTrue(fenced_preview.success)
+        self.assertTrue(fenced_final.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_appends[append_offset][1], "```text\npartial ")
+        self.assertEqual(len(fake_client.stream_finalizes), finalize_offset + 1)
+        self.assertEqual(
+            fake_client.stream_finalizes[finalize_offset],
+            ("55" * 32, "```text\npartial value\n```"),
+        )
+
+        both_balancers = "`outside\n```text\npartial \u2589\n````"
+        self.assertTrue(adapter._looks_like_stream_preview(both_balancers))
+        self.assertEqual(
+            adapter._strip_streaming_cursor(both_balancers),
+            "`outside\n```text\npartial ",
+        )
+
+        # Whitespace after the cursor is part of the visible snapshot. Preserve
+        # its exact bytes so later append-only comparisons see the same text.
+        for trailing_whitespace in (" ", "\t", "\r\n", " \t\r\n"):
+            with self.subTest(trailing_whitespace=repr(trailing_whitespace)):
+                preview_with_whitespace = "partial \u2589`" + trailing_whitespace
+                self.assertEqual(
+                    adapter._split_stream_preview(preview_with_whitespace),
+                    ("partial " + trailing_whitespace, True),
+                )
+
+    async def test_whitespace_mismatched_final_replaces_preview_without_duplication(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_finalizes = []
+                self.stream_cancels = []
+                self.final_sends = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                return {"type": "ack"}
+
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
+                return {
+                    "type": "stream_finalized",
+                    "stream_id_hex": stream_id_hex,
+                    "message_ids_hex": ["77" * 32],
+                }
+
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1868,23 +2522,24 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {"type": "stream_finalized", "stream_id_hex": stream_id_hex}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1918,6 +2573,504 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             fake_client.final_sends,
             [("11" * 32, "22" * 32, "Based on my search", None)],
         )
+
+
+class _DeliveryRoutingFakeClient:
+    def __init__(self):
+        self.activities = []
+        self.tool_events = []
+        self.final_sends = []
+        self.stream_begins = []
+        self.stream_appends = []
+        self.stream_finalizes = []
+        self.stream_cancels = []
+        self.activity_attempts = 0
+        self.fail_next_activity = False
+        self.activity_response = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["aa" * 32],
+        }
+
+    async def send_agent_activity(self, account_id_hex, group_id_hex, **kwargs):
+        self.activity_attempts += 1
+        if self.fail_next_activity:
+            self.fail_next_activity = False
+            raise OSError("temporary activity failure")
+        self.activities.append((account_id_hex, group_id_hex, kwargs))
+        return self.activity_response
+
+    async def send_agent_operation_event(self, account_id_hex, group_id_hex, **kwargs):
+        self.tool_events.append((account_id_hex, group_id_hex, kwargs))
+        return {"type": "app_event_sent", "message_ids_hex": ["bb" * 32]}
+
+    async def send_final(
+        self,
+        account_id_hex,
+        group_id_hex,
+        text,
+        reply_to_message_id_hex=None,
+        idempotency_key=None,
+    ):
+        self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+        return {"type": "final_sent", "message_ids_hex": ["cc" * 32]}
+
+    async def stream_begin(
+        self,
+        account_id_hex,
+        group_id_hex,
+        *,
+        stream_id_hex=None,
+        quic_candidates=(),
+        request_id=None,
+        parent_message_id_hex=None,
+    ):
+        self.stream_begins.append((account_id_hex, group_id_hex, parent_message_id_hex))
+        return {
+            "type": "stream_begun",
+            "stream_id_hex": "55" * 32,
+            "stream_capability": "33" * 32,
+            "start_message_id_hex": "66" * 32,
+            "quic_candidates": list(quic_candidates),
+        }
+
+    async def stream_append(self, stream_id_hex, stream_capability, append_text):
+        self.stream_appends.append((stream_id_hex, append_text))
+        return {"type": "ack"}
+
+    async def stream_finalize(
+        self,
+        stream_id_hex,
+        stream_capability,
+        final_text,
+        transcript_hash_hex,
+        chunk_count,
+        idempotency_key=None,
+    ):
+        self.stream_finalizes.append((stream_id_hex, final_text))
+        return {
+            "type": "stream_finalized",
+            "stream_id_hex": stream_id_hex,
+            "message_ids_hex": ["77" * 32],
+        }
+
+    async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
+        self.stream_cancels.append((stream_id_hex, reason))
+        return {"type": "ack"}
+
+
+class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
+    NON_FINAL_COMMENTARY = {"is_turn_final": False, "delivery_class": "commentary"}
+
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def _adapter(self, fake_client, *, quic_candidates=None):
+        extra = {"account_id_hex": "11" * 32}
+        if quic_candidates is not None:
+            extra["quic_candidates"] = quic_candidates
+        return self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=extra),
+            client=fake_client,
+        )
+
+    async def test_direct_commentary_metadata_variants_map_to_activity(self):
+        cases = [
+            ("is_turn_final canonical", {"is_turn_final": False}),
+            ("turn_final alias", {"turn_final": False}),
+            ("delivery_context container", {"delivery_context": {"is_turn_final": False}}),
+            ("delivery container", {"delivery": {"delivery_class": "commentary"}}),
+        ]
+        for label, metadata in cases:
+            with self.subTest(label=label):
+                fake_client = _DeliveryRoutingFakeClient()
+                adapter = self._adapter(fake_client)
+                result = await adapter.send(
+                    chat_id="22" * 32,
+                    content="I'll check that now.",
+                    reply_to="33" * 32,
+                    metadata=metadata,
+                )
+                self.assertTrue(result.success, label)
+                self.assertEqual(result.message_id, "aa" * 32, label)
+                self.assertEqual(len(fake_client.activities), 1, label)
+                self.assertEqual(fake_client.final_sends, [], label)
+                self.assertEqual(fake_client.activities[0][2]["status"], "commentary", label)
+                self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32, label)
+
+    async def test_explicit_non_final_overrides_every_delivery_class(self):
+        delivery_classes = ("final", "approval", "commentary", "operation", "notice", "mystery")
+        for finality_key in ("is_turn_final", "turn_final"):
+            for delivery_class in delivery_classes:
+                with self.subTest(finality_key=finality_key, delivery_class=delivery_class):
+                    fake_client = _DeliveryRoutingFakeClient()
+                    adapter = self._adapter(fake_client)
+                    result = await adapter.send(
+                        chat_id="22" * 32,
+                        content="Still working.",
+                        metadata={"delivery_class": delivery_class, finality_key: False},
+                    )
+                    self.assertTrue(result.success)
+                    self.assertEqual(len(fake_client.activities), 1)
+                    self.assertEqual(fake_client.final_sends, [])
+                    self.assertEqual(fake_client.activities[0][2]["status"], "commentary")
+
+    async def test_explicit_turn_final_overrides_every_delivery_class(self):
+        delivery_classes = ("final", "approval", "commentary", "operation", "notice", "mystery")
+        for finality_key in ("is_turn_final", "turn_final"):
+            for delivery_class in delivery_classes:
+                with self.subTest(finality_key=finality_key, delivery_class=delivery_class):
+                    fake_client = _DeliveryRoutingFakeClient()
+                    adapter = self._adapter(fake_client)
+                    result = await adapter.send(
+                        chat_id="22" * 32,
+                        content="Authoritative answer.",
+                        metadata={"delivery_class": delivery_class, finality_key: True},
+                    )
+                    self.assertTrue(result.success)
+                    self.assertEqual(fake_client.activities, [])
+                    self.assertEqual(len(fake_client.final_sends), 1)
+
+    async def test_delivery_class_applies_only_when_finality_is_missing(self):
+        cases = (
+            ("commentary", True),
+            ("final", False),
+            ("approval", False),
+            ("operation", False),
+            ("notice", False),
+            ("mystery", False),
+        )
+        for delivery_class, expect_activity in cases:
+            with self.subTest(delivery_class=delivery_class):
+                fake_client = _DeliveryRoutingFakeClient()
+                adapter = self._adapter(fake_client)
+                result = await adapter.send(
+                    chat_id="22" * 32,
+                    content="Classified by delivery class.",
+                    metadata={"delivery_class": delivery_class},
+                )
+                self.assertTrue(result.success)
+                self.assertEqual(len(fake_client.activities), int(expect_activity))
+                self.assertEqual(len(fake_client.final_sends), int(not expect_activity))
+
+    async def test_commentary_rejects_activity_response_without_message_ids(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        fake_client.activity_response = {"type": "ack"}
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(
+            chat_id="22" * 32,
+            content="I'll check that.",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_commentary_before_tool_sends_one_activity_zero_finals(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        commentary = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me search for that.",
+            reply_to="33" * 32,
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+        tool = await adapter.send(
+            chat_id="22" * 32,
+            content='* search: "titanium prices"',
+            reply_to="33" * 32,
+        )
+
+        self.assertTrue(commentary.success)
+        self.assertTrue(tool.success)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(len(fake_client.tool_events), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search for that.")
+
+    async def test_final_answer_after_commentary_sends_exactly_one_kind_9(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        commentary = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me look that up.",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+        final = await adapter.send(
+            chat_id="22" * 32,
+            content="Here is the answer.",
+            metadata={"is_turn_final": True, "delivery_class": "final"},
+        )
+
+        self.assertTrue(commentary.success)
+        self.assertTrue(final.success)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(fake_client.final_sends[0][2], "Here is the answer.")
+
+    async def test_missing_metadata_preserves_final_behavior(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(chat_id="22" * 32, content="pong", reply_to="33" * 32)
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(fake_client.final_sends[0][2], "pong")
+
+    async def test_same_text_across_two_turns_emits_two_activities(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        first = await adapter.send(
+            chat_id="22" * 32,
+            content="Checking...",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+        second = await adapter.send(
+            chat_id="22" * 32,
+            content="Checking...",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(len(fake_client.activities), 2)
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_reply_parent_metadata_survives_direct_activity_mapping(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        await adapter.send(
+            chat_id="22" * 32,
+            content="One moment.",
+            metadata={
+                **self.NON_FINAL_COMMENTARY,
+                "reply_to_message_id": "33" * 32,
+            },
+        )
+
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+
+    async def test_non_final_preview_stream_lifecycle_emits_one_activity(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+        metadata = self.NON_FINAL_COMMENTARY
+
+        preview = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me search\u2589",
+            reply_to="33" * 32,
+            metadata=metadata,
+        )
+        self.assertTrue(preview.success)
+        self.assertEqual(len(fake_client.stream_begins), 1)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+        edited = await adapter.edit_message(
+            "22" * 32,
+            preview.message_id,
+            "Let me search the docs\u2589",
+            metadata=metadata,
+        )
+        self.assertTrue(edited.success)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+        result = await adapter.edit_message(
+            "22" * 32,
+            preview.message_id,
+            "Let me search the docs",
+            finalize=True,
+            metadata=metadata,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "aa" * 32)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_non_final_draft_frames_then_sealed_send_emits_one_activity(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+        metadata = self.NON_FINAL_COMMENTARY
+
+        first = await adapter.send_draft(
+            "22" * 32,
+            1,
+            "Let me search",
+            metadata={
+                **metadata,
+                "parent_message_id_hex": "33" * 32,
+            },
+        )
+        second = await adapter.send_draft(
+            "22" * 32,
+            1,
+            "Let me search the docs",
+            metadata=metadata,
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(len(fake_client.stream_begins), 1)
+        self.assertEqual(len(fake_client.stream_appends), 2)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+        result = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me search the docs",
+            metadata=metadata,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_commentary_finalize_retryable_failure_preserves_stream_for_same_message_id(
+        self,
+    ):
+        fake_client = _DeliveryRoutingFakeClient()
+        fake_client.fail_next_activity = True
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+        metadata = self.NON_FINAL_COMMENTARY
+        chat_id = "22" * 32
+
+        preview = await adapter.send(
+            chat_id=chat_id,
+            content="Let me search\u2589",
+            reply_to="33" * 32,
+            metadata=metadata,
+        )
+        self.assertTrue(preview.success)
+        message_id = preview.message_id
+        self.assertIn(message_id, adapter._active_streams)
+
+        first = await adapter.edit_message(
+            chat_id,
+            message_id,
+            "Let me search the docs",
+            finalize=True,
+            metadata=metadata,
+        )
+        self.assertFalse(first.success)
+        self.assertTrue(first.retryable)
+        self.assertEqual(fake_client.activity_attempts, 1)
+        self.assertEqual(len(fake_client.activities), 0)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.stream_cancels, [])
+        self.assertIn(message_id, adapter._active_streams)
+
+        second = await adapter.edit_message(
+            chat_id,
+            message_id,
+            "Let me search the docs",
+            finalize=True,
+            metadata=metadata,
+        )
+        self.assertTrue(second.success)
+        self.assertEqual(second.message_id, "aa" * 32)
+        self.assertEqual(fake_client.activity_attempts, 2)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "non-final commentary")])
+        self.assertNotIn(message_id, adapter._active_streams)
+
+    async def test_turn_final_true_streaming_path_still_finalizes_kind_9(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+
+        preview = await adapter.send("22" * 32, "Based on my research\u2589")
+        final = await adapter.send(
+            "22" * 32,
+            "Based on my research, here's the answer",
+            metadata={"is_turn_final": True, "delivery_class": "final"},
+        )
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(len(fake_client.stream_finalizes), 1)
+        self.assertEqual(fake_client.final_sends, [])
+
+
+def _install_stream_events_module():
+    stream_events = types.ModuleType("gateway.stream_events")
+
+    @dataclass
+    class Commentary:
+        text: str = ""
+
+    @dataclass
+    class MessageChunk:
+        text: str = ""
+
+    @dataclass
+    class MessageStop:
+        final: bool = True
+
+    stream_events.Commentary = Commentary
+    stream_events.MessageChunk = MessageChunk
+    stream_events.MessageStop = MessageStop
+    sys.modules["gateway.stream_events"] = stream_events
+    return stream_events
+
+
+class CommentaryRendererTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def test_render_message_event_commentary_schedules_one_activity(self):
+        stream_events = _install_stream_events_module()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=_DeliveryRoutingFakeClient(),
+        )
+        scheduled = []
+
+        def track_schedule(chat_id, *, status, text, reply_to_message_id_hex=None):
+            scheduled.append(
+                {
+                    "chat_id": chat_id,
+                    "status": status,
+                    "text": text,
+                    "reply_to_message_id_hex": reply_to_message_id_hex,
+                }
+            )
+
+        adapter._schedule_agent_activity = track_schedule
+
+        class Sink:
+            chat_id = "22" * 32
+            _initial_reply_to_id = "33" * 32
+
+        adapter.render_message_event(
+            stream_events.Commentary(text="Checking sources."),
+            Sink(),
+        )
+
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0]["status"], "commentary")
+        self.assertEqual(scheduled[0]["text"], "Checking sources.")
+        self.assertEqual(scheduled[0]["reply_to_message_id_hex"], "33" * 32)
 
 
 class SendFinalIdempotencyRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -2029,6 +3182,137 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             client=client,
         )
 
+    async def _render_inbound_timeline(self, messages):
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message": {
+                "message_id_hex": "33" * 32,
+                "sender": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "text": "ping",
+                "recorded_at": 1_721_000_000,
+                "media": [],
+            },
+            "mentions_self": True,
+        }
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                yield wire_event(event)
+
+            async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
+                return {
+                    "type": "timeline_page",
+                    "account_id_hex": account_id_hex,
+                    "group_id_hex": group_id_hex,
+                    "messages": messages,
+                    "has_more_before": False,
+                    "has_more_after": False,
+                }
+
+        adapter = self._adapter(FakeClient())
+        await adapter._consume_inbound_once(drain=True)
+        self.assertEqual(len(adapter.events), 1)
+        return adapter.events[0].channel_context.splitlines()[0]
+
+    async def test_timeline_context_small_page_needs_no_truncation(self):
+        messages = [{"message_id_hex": str(i), "text": f"message-{i}"} for i in range(3)]
+
+        rendered = await self._render_inbound_timeline(messages)
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], messages)
+        self.assertNotIn("messages_truncated", fact)
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")),
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT,
+        )
+
+    async def test_timeline_context_omits_one_oversized_record(self):
+        rendered = await self._render_inbound_timeline(
+            [{"message_id_hex": "newest", "text": "🙂" * 10_000}]
+        )
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], [])
+        self.assertEqual(fact["omitted_message_count"], 1)
+        self.assertEqual(fact["oversized_message_count"], 1)
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")),
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT,
+        )
+
+    async def test_timeline_context_counts_multiple_oversized_records(self):
+        rendered = await self._render_inbound_timeline(
+            [
+                {"message_id_hex": "old-1", "text": "🙂" * 10_000},
+                {"message_id_hex": "old-2", "text": "🙂" * 10_000},
+                {"message_id_hex": "newest", "text": "kept"},
+            ]
+        )
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(
+            [message["message_id_hex"] for message in fact["messages"]],
+            ["newest"],
+        )
+        self.assertEqual(fact["omitted_message_count"], 2)
+        self.assertEqual(fact["oversized_message_count"], 2)
+        self.assertNotIn("old-1", rendered)
+        self.assertNotIn("old-2", rendered)
+
+    async def test_timeline_context_counts_oversized_records_outside_count_window(self):
+        rendered = await self._render_inbound_timeline(
+            [{"message_id_hex": str(i), "text": "🙂" * 10_000} for i in range(9)]
+        )
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], [])
+        self.assertEqual(fact["omitted_message_count"], 9)
+        self.assertEqual(fact["oversized_message_count"], 9)
+
+    async def test_timeline_context_does_not_misclassify_metadata_displaced_record(self):
+        final_message = {"message_id_hex": "final", "text": ""}
+        single_fact = {
+            "type": "chat_window",
+            "order": "chronological",
+            "relation": "before_current_message",
+            "messages": [final_message],
+            "messages_truncated": True,
+            "omitted_message_count": 1,
+        }
+        base_bytes = len(
+            f"{self.adapter_module._TIMELINE_CONTEXT_PREFIX}{json.dumps(single_fact, separators=(',', ':'))}".encode("utf-8")
+        )
+        final_message["text"] = "x" * (
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT - base_bytes
+        )
+        self.assertFalse(
+            self.adapter_module._timeline_message_exceeds_byte_limit(final_message)
+        )
+
+        messages = (
+            [{"message_id_hex": "oversized", "text": "🙂" * 10_000}]
+            + [{"message_id_hex": f"small-{i}", "text": ""} for i in range(7)]
+            + [final_message]
+        )
+        rendered = await self._render_inbound_timeline(messages)
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], [])
+        self.assertEqual(fact["omitted_message_count"], 9)
+        self.assertEqual(fact["oversized_message_count"], 1)
+
     # --- Behavior 1: append-only commits only after a successful append --------
     async def test_append_only_state_consistent_after_failed_stream_append(self):
         class FakeClient:
@@ -2036,15 +3320,16 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.appends = []
                 self.fail_next = True
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.appends.append((stream_id_hex, append_text))
                 if self.fail_next:
                     self.fail_next = False
@@ -2098,7 +3383,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in (event, dict(event)):
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -2131,12 +3416,12 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await original(message)
 
         adapter.handle_message = slow_handle
-        first = asyncio.create_task(adapter._handle_control_event(dict(event)))
+        first = asyncio.create_task(adapter._handle_control_event(wire_event(event)))
         await asyncio.sleep(0)
         # Let the per-group queue start the first turn so it is in-flight.
         await asyncio.sleep(0)
         # Duplicate arrives while the first turn is still in-flight.
-        await adapter._handle_control_event(dict(event))
+        await adapter._handle_control_event(wire_event(event))
         gate.set()
         await first
         # Drain the per-group queue so the dispatched turn(s) complete before asserting.
@@ -2154,7 +3439,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": requests[-1]["id"],
                     "type": "ack",
                 },
@@ -2168,7 +3453,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 client = self.adapter_module.MarmotAgentControlClient(socket_path)
                 # The dead stream_tool method is gone; stream_progress exists.
                 self.assertFalse(hasattr(client, "stream_tool"))
-                response = await client.stream_progress("55" * 32, "Working...")
+                response = await client.stream_progress("55" * 32, "33" * 32, "Working...")
             finally:
                 server.close()
                 await server.wait_closed()
@@ -2184,17 +3469,66 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "type": "inbound_message",
             "account_id_hex": "11" * 32,
             "group_id_hex": "22" * 32,
-            "message_id_hex": "33" * 32,
-            "sender_account_id_hex": "44" * 32,
-            "text": "ping",
+            "message": {
+                "message_id_hex": "33" * 32,
+                "sender": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "text": "ping",
+                "recorded_at": 1_721_000_000,
+                "media": [],
+            },
             "mentions_self": True,
-            "sender_display_name": "Alice",
-            "reply_to_message_id_hex": "99" * 32,
+            "reply_to": {
+                "message_id_hex": "99" * 32,
+                "availability": "available",
+                "sender": {
+                    "account_id_hex": "11" * 32,
+                    "display_name": "Hermes Agent",
+                    "is_self": True,
+                },
+                "recorded_at": 1_720_999_900,
+                "text_excerpt": "earlier answer",
+                "text_truncated": False,
+                "attachments": [],
+                "attachments_truncated": False,
+            },
         }
 
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
-                yield event
+                yield wire_event(event)
+
+            async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
+                return {
+                    "type": "timeline_page",
+                    "account_id_hex": account_id_hex,
+                    "group_id_hex": group_id_hex,
+                    "messages": [
+                        {
+                            "message_id_hex": f"{index:064x}",
+                            "sender": {
+                                "account_id_hex": "44" * 32,
+                                "display_name": "Alice",
+                                "is_self": False,
+                            },
+                            "direction": "received",
+                            "kind": 9,
+                            "recorded_at": 1_720_999_800 + index,
+                            "observed_at": 1_720_999_801 + index,
+                            "availability": "available",
+                            "text": "x" * 1_500,
+                            "text_truncated": False,
+                            "attachments_truncated": False,
+                            "reactions_truncated": False,
+                        }
+                        for index in range(20)
+                    ],
+                    "has_more_before": False,
+                    "has_more_after": False,
+                }
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -2206,8 +3540,30 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # Reply threads to the inbound message id (source.message_id).
         self.assertEqual(delivered.source.message_id, "33" * 32)
         self.assertEqual(delivered.message_id, "33" * 32)
-        # Raw reply_to carried for downstream use.
+        self.assertEqual(delivered.timestamp.timestamp(), 1_721_000_000)
+        self.assertEqual(delivered.reply_to_message_id, "99" * 32)
+        self.assertEqual(delivered.reply_to_text, "earlier answer")
+        self.assertEqual(delivered.reply_to_author_id, "11" * 32)
+        self.assertEqual(delivered.reply_to_author_name, "Hermes Agent")
+        self.assertTrue(delivered.reply_to_is_own_message)
+        # The internal normalized shape retains the routing id as well.
         self.assertEqual(delivered.raw_message.get("reply_to_message_id_hex"), "99" * 32)
+        self.assertIn('"type":"chat_window"', delivered.channel_context)
+        timeline_context = delivered.channel_context.splitlines()[0]
+        timeline_prefix = "Marmot conversation history (untrusted): "
+        timeline_fact = json.loads(timeline_context[len(timeline_prefix):])
+        self.assertEqual(
+            [message["message_id_hex"] for message in timeline_fact["messages"]],
+            [f"{index:064x}" for index in range(12, 20)],
+        )
+        self.assertEqual(timeline_fact["omitted_message_count"], 12)
+        self.assertLessEqual(
+            len(timeline_context.encode("utf-8")),
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT,
+        )
+        self.assertIn('"type":"referenced_message"', delivered.channel_context)
+        self.assertIn('"text_excerpt":"earlier answer"', delivered.channel_context)
+        self.assertIn('"display_name":"Hermes Agent"', delivered.channel_context)
 
     async def test_inbound_falls_back_to_marmot_name_without_display_name(self):
         event = {
@@ -2223,7 +3579,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
-                yield event
+                yield wire_event(event)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -2241,6 +3597,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sentence("group_renamed", "Crew"), 'The group was renamed to "Crew".')
         self.assertEqual(sentence("group_renamed", "  "), "The group was renamed.")
         self.assertEqual(sentence("group_avatar_changed"), "The group avatar was changed.")
+        self.assertEqual(
+            sentence("disappearing_timer_changed"),
+            "The disappearing-message timer was changed.",
+        )
         self.assertEqual(sentence("something_else"), "The group state changed.")
 
     async def test_ambient_events_are_quiet_and_attach_to_next_inbound(self):
@@ -2253,15 +3613,90 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "type": "message_deleted",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
+                "event_id_hex": "d1" * 32,
                 "target_message_id_hex": "33" * 32,
-                "sender_account_id_hex": "44" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "recorded_at": 1_721_000_000,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "deleted",
+                },
             },
             {
                 "type": "message_deleted",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
+                "event_id_hex": "d1" * 32,
                 "target_message_id_hex": "33" * 32,
-                "sender_account_id_hex": "44" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "recorded_at": 1_721_000_000,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "deleted",
+                },
+            },
+            {
+                "type": "message_edited",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "e1" * 32,
+                "target_message_id_hex": "33" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "replacement_text": "edited",
+                "recorded_at": 1_721_000_001,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "available",
+                },
+            },
+            {
+                "type": "reaction_added",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "e2" * 32,
+                "target_message_id_hex": "33" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "emoji": "👍",
+                "recorded_at": 1_721_000_002,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "available",
+                },
+            },
+            {
+                "type": "reaction_removed",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "e3" * 32,
+                "reaction_event_id_hex": "e2" * 32,
+                "target_message_id_hex": "33" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "emoji": "👍",
+                "recorded_at": 1_721_000_003,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "available",
+                },
             },
             {
                 "type": "group_state_changed",
@@ -2284,13 +3719,13 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in events:
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
 
         # Only the real inbound message reached handle_message (one agent turn);
-        # the three ambient events did NOT trigger turns of their own.
+        # the ambient events did NOT trigger turns of their own.
         self.assertEqual(len(adapter.events), 1)
         triggered = adapter.events[0]
         self.assertEqual(triggered.text, "hello there")
@@ -2298,11 +3733,15 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # event is a normal inbound_message, never an ambient flag.
         self.assertEqual(triggered.raw_message.get("type"), "inbound_message")
         self.assertNotIn("marmot_ambient", triggered.raw_message)
-        # The two distinct ambient facts (deletion deduped to one, rename) are
+        # The distinct ambient facts (deletion deduped to one, mutations, rename) are
         # carried as quiet channel_context on the next inbound turn, in order.
-        self.assertEqual(
-            triggered.channel_context,
-            'A message was deleted.\nThe group was renamed to "Crew".',
+        self.assertIn('"type":"message_deleted"', triggered.channel_context)
+        self.assertEqual(triggered.channel_context.count('"type":"message_deleted"'), 1)
+        self.assertIn('"type":"message_edited"', triggered.channel_context)
+        self.assertIn('"type":"reaction_added"', triggered.channel_context)
+        self.assertIn('"type":"reaction_removed"', triggered.channel_context)
+        self.assertTrue(
+            triggered.channel_context.endswith('The group was renamed to "Crew".')
         )
         # Buffer was drained: a second message in the group carries no stale context.
         self.assertEqual(adapter._take_pending_ambient_context("22" * 32), None)
@@ -2319,8 +3758,18 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "type": "message_deleted",
                     "account_id_hex": "11" * 32,
                     "group_id_hex": "22" * 32,
+                    "event_id_hex": "d1" * 32,
                     "target_message_id_hex": "33" * 32,
-                    "sender_account_id_hex": "44" * 32,
+                    "actor": {
+                        "account_id_hex": "44" * 32,
+                        "display_name": None,
+                        "is_self": False,
+                    },
+                    "recorded_at": 1_721_000_000,
+                    "target": {
+                        "message_id_hex": "33" * 32,
+                        "availability": "deleted",
+                    },
                 }
 
         adapter = self._adapter(FakeClient())
@@ -2333,10 +3782,90 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handler_calls, [], "ambient event must not invoke handle_message")
         # The fact is buffered for a later real message rather than dropped.
-        self.assertEqual(
-            adapter._take_pending_ambient_context("22" * 32),
-            "A message was deleted.",
+        context = adapter._take_pending_ambient_context("22" * 32)
+        self.assertIn('"type":"message_deleted"', context)
+        self.assertNotIn("plaintext", context)
+
+    async def test_ambient_context_is_bounded_and_survives_failed_turn(self):
+        class FakeClient:
+            pass
+
+        adapter = self._adapter(FakeClient())
+        group_id = "22" * 32
+        for index in range(20):
+            adapter._append_pending_ambient_context(group_id, f"fact-{index}")
+
+        pending_facts = list(adapter._pending_ambient_context[group_id])
+        pending = "\n".join(pending_facts)
+        self.assertEqual(len(pending_facts), 16)
+        self.assertNotIn("fact-3\n", pending)
+        self.assertTrue(pending.startswith("fact-4\n"))
+        self.assertTrue(pending.endswith("fact-19"))
+
+        async def fail_turn(event):
+            adapter._append_pending_ambient_context(group_id, "fact-new-on-failure")
+            raise RuntimeError("synthetic turn failure")
+
+        adapter.handle_message = fail_turn  # type: ignore[assignment]
+        await adapter._dispatch_inbound_message(
+            self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": "a1" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "hello",
+                        "mentions_self": True,
+                    }
+                )
+            )
         )
+        retained = adapter._pending_ambient_context[group_id]
+        self.assertEqual(len(retained), 16)
+        self.assertNotIn("fact-4", retained)
+        self.assertEqual(retained[-1], "fact-new-on-failure")
+
+        adapter._pending_ambient_context[group_id] = [
+            f"success-fact-{index}" for index in range(16)
+        ]
+        delivered_context = []
+
+        async def successful_turn(event):
+            delivered_context.append(event.channel_context)
+            adapter._append_pending_ambient_context(group_id, "fact-new-on-success")
+
+        adapter.handle_message = successful_turn  # type: ignore[assignment]
+        await adapter._dispatch_inbound_message(
+            self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": "a2" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "hello again",
+                        "mentions_self": True,
+                    }
+                )
+            )
+        )
+        self.assertIn("success-fact-0", delivered_context[0])
+        self.assertEqual(
+            adapter._pending_ambient_context[group_id],
+            ["fact-new-on-success"],
+        )
+
+        for index in range(257):
+            adapter._append_pending_ambient_context(
+                f"{index:064x}",
+                f"group-fact-{index}",
+            )
+        self.assertEqual(len(adapter._pending_ambient_context), 256)
+        self.assertNotIn(f"{0:064x}", adapter._pending_ambient_context)
+        self.assertIn(f"{256:064x}", adapter._pending_ambient_context)
 
     # --- Behavior 6: optional debounce coalescing preserves mentions+media ----
     async def test_debounce_coalesces_and_preserves_mentions_and_media(self):
@@ -2375,7 +3904,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in events:
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient(), {"debounce_ms": 5})
         await adapter._consume_inbound_once()
@@ -2426,7 +3955,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in events:
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient())  # debounce disabled by default
         await adapter._consume_inbound_once(drain=True)
@@ -2468,7 +3997,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
                     # Healthy: yields one message, then raises -> reconnect.
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": "22" * 32,
@@ -2476,7 +4005,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "healthy",
                         "mentions_self": True,
-                    }
+                    })
                     raise RuntimeError("dropped after healthy")
                 else:
                     await asyncio.sleep(3600)
@@ -2578,7 +4107,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         seen = []
 
         class TimeoutRecordingClient(self.adapter_module.MarmotAgentControlClient):
-            async def request(self, payload, *, request_id=None, timeout=None):
+            async def request(
+                self,
+                payload,
+                *,
+                request_id=None,
+                timeout=None,
+                response_timeout=self.adapter_module._DEFAULT_READ_TIMEOUT,
+            ):
                 seen.append((payload.get("type"), timeout))
                 return {"type": "ack", "message_ids_hex": ["77" * 32], "stream_id_hex": "55" * 32, "start_message_id_hex": "66" * 32, "quic_candidates": []}
 
@@ -2590,11 +4126,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.preview_request_timeout, 8.0)
 
         await client.stream_begin("11" * 32, "22" * 32, quic_candidates=["quic://x"])
-        await client.stream_append("55" * 32, "hi")
-        await client.stream_status("55" * 32, "thinking")
-        await client.stream_progress("55" * 32, "Working...")
-        await client.stream_cancel("55" * 32, "done")
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1)
+        await client.stream_append("55" * 32, "33" * 32, "hi")
+        await client.stream_status("55" * 32, "33" * 32, "thinking")
+        await client.stream_progress("55" * 32, "33" * 32, "Working...")
+        await client.stream_cancel("55" * 32, "33" * 32, "done")
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
         await client.send_final("11" * 32, "22" * 32, "durable")
 
         by_type = dict(seen)
@@ -2610,6 +4146,51 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
+    async def test_stream_begin_retries_with_the_same_request_id(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.request_ids = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                self.request_ids.append(request_id)
+                if len(self.request_ids) == 1:
+                    raise adapter_module.AgentControlError(
+                        "timed out waiting for stream begin",
+                        code="timeout",
+                        retryable=True,
+                    )
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+        client = FakeClient()
+        stream = await adapter_module.MarmotLiveStream.begin(
+            client=client,
+            account_id_hex="11" * 32,
+            group_id_hex="22" * 32,
+            quic_candidates=(),
+            chunk_bytes=1024,
+        )
+
+        self.assertTrue(client.request_ids[0])
+        self.assertEqual(client.request_ids[1], client.request_ids[0])
+        self.assertEqual(stream.stream_capability, "33" * 32)
+
     async def test_stream_finalize_retries_retryable_failure_with_same_idempotency_key(self):
         adapter_module = self.adapter_module
 
@@ -2618,20 +4199,22 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
             async def stream_finalize(
                 self,
                 stream_id_hex,
+                stream_capability,
                 final_text,
                 transcript_hash_hex,
                 chunk_count,
@@ -2685,24 +4268,25 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 raise adapter_module.AgentControlError(
                     "transcript hash mismatch",
                     code="stream_finalize_rejected",
                 )
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -2736,19 +4320,26 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
-    async def test_inbound_media_download_populates_message_event(self):
+    async def test_inbound_media_download_populates_ordered_message_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "inbound.png"
-            source.write_bytes(b"png")
+            first_source = Path(tmpdir) / "inbound.png"
+            second_source = Path(tmpdir) / "inbound.jpg"
+            first_source.write_bytes(b"png")
+            second_source.write_bytes(b"jpg")
+            sources = {
+                "inbound.png": (first_source, "image/png"),
+                "inbound.jpg": (second_source, "image/jpeg"),
+            }
 
             class FakeClient:
                 async def download_media(self, account_id_hex, group_id_hex, media):
+                    source, media_type = sources[media["file_name"]]
                     return {
                         "type": "media_downloaded",
                         "path": str(source),
-                        "media_type": "image/png",
-                        "file_name": "inbound.png",
-                        "size_bytes": 12,
+                        "media_type": media_type,
+                        "file_name": media["file_name"],
+                        "size_bytes": source.stat().st_size,
                     }
 
             adapter = self.adapter_module.MarmotPlatformAdapter(
@@ -2757,23 +4348,36 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             )
             adapter.handle_message = unittest.mock.AsyncMock()
 
+            base_media = {
+                "ciphertext_sha256": "aa",
+                "plaintext_sha256": "bb",
+                "nonce_hex": "cc",
+                "version": "1",
+                "source_epoch": 1,
+                "locators": [],
+            }
             event = {
                 "type": "inbound_message",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
                 "message_id_hex": "33" * 32,
                 "sender_account_id_hex": "44" * 32,
-                "text": "photo",
+                "text": "photo album",
                 "mentions_self": True,
-                "media": [{"file_name": "inbound.png", "media_type": "image/png", "ciphertext_sha256": "aa", "plaintext_sha256": "bb", "nonce_hex": "cc", "version": "1", "source_epoch": 1, "locators": []}],
+                "media": [
+                    {**base_media, "file_name": "inbound.png", "media_type": "image/png"},
+                    {**base_media, "file_name": "inbound.jpg", "media_type": "image/jpeg"},
+                ],
             }
             await adapter._dispatch_inbound_message(event)
 
             dispatched = adapter.handle_message.await_args.args[0]
             staged_root = str(Path(tmpdir) / "dev" / "inbound-media")
-            self.assertTrue(dispatched.media_urls[0].startswith(staged_root))
-            self.assertEqual(dispatched.media_types, ["image/png"])
-            self.assertFalse(source.exists())
+            self.assertEqual(len(dispatched.media_urls), 2)
+            self.assertTrue(all(url.startswith(staged_root) for url in dispatched.media_urls))
+            self.assertEqual(dispatched.media_types, ["image/png", "image/jpeg"])
+            self.assertFalse(first_source.exists())
+            self.assertFalse(second_source.exists())
 
     async def test_outbound_send_image_file_routes_to_send_media(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2786,8 +4390,20 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self):
                     self.media_sends = []
 
-                async def send_media(self, account_id_hex, group_id_hex, attachments, *, caption=None, reply_to_message_id_hex=None):
-                    self.media_sends.append((account_id_hex, group_id_hex, attachments, caption))
+                async def send_media(
+                    self,
+                    account_id_hex,
+                    group_id_hex,
+                    attachments,
+                    *,
+                    caption=None,
+                    idempotency_key=None,
+                    response_timeout=None,
+                ):
+                    self.assert_staged = Path(attachments[0]["path"]).read_bytes()
+                    self.media_sends.append(
+                        (account_id_hex, group_id_hex, attachments, caption, idempotency_key)
+                    )
                     return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
 
             fake_client = FakeClient()
@@ -2799,8 +4415,655 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(len(fake_client.media_sends), 1)
-            self.assertEqual(fake_client.media_sends[0][2][0]["path"], str(image_path))
+            staged_path = Path(fake_client.media_sends[0][2][0]["path"])
+            self.assertEqual(fake_client.assert_staged, b"png")
+            self.assertTrue(str(staged_path).startswith(str(Path(tmpdir) / "dev" / "outbound-media")))
+            self.assertNotEqual(staged_path, image_path)
+            self.assertFalse(staged_path.exists())
+            self.assertTrue(image_path.exists())
             self.assertEqual(fake_client.media_sends[0][3], "look")
+
+    async def test_outbound_send_multiple_images_routes_one_ordered_batch_to_send_media(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = Path(tmpdir) / "dev" / "inbound-media"
+            media_dir.mkdir(parents=True)
+            first_path = media_dir / "first.png"
+            second_path = media_dir / "second.jpg"
+            first_path.write_bytes(b"first")
+            second_path.write_bytes(b"second")
+
+            class FakeClient:
+                def __init__(self):
+                    self.media_sends = []
+                    self.staged_bytes = []
+
+                async def send_media(
+                    self,
+                    account_id_hex,
+                    group_id_hex,
+                    attachments,
+                    *,
+                    caption=None,
+                    idempotency_key=None,
+                    response_timeout=None,
+                ):
+                    self.staged_bytes = [Path(item["path"]).read_bytes() for item in attachments]
+                    self.media_sends.append(
+                        (account_id_hex, group_id_hex, attachments, caption, idempotency_key)
+                    )
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
+                client=fake_client,
+            )
+            result = await adapter.send_multiple_images(
+                "22" * 32,
+                [(f"file://{first_path}", "album caption"), (f"file://{second_path}", "")],
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(len(fake_client.media_sends), 1)
+            sent = fake_client.media_sends[0]
+            self.assertEqual(fake_client.staged_bytes, [b"first", b"second"])
+            self.assertEqual(
+                [(item["file_name"], item["media_type"]) for item in sent[2]],
+                [("first.png", "image/png"), ("second.jpg", "image/jpeg")],
+            )
+            self.assertEqual(sent[3], "album caption")
+            self.assertTrue(sent[4])
+            self.assertTrue(all(not Path(item["path"]).exists() for item in sent[2]))
+            self.assertTrue(first_path.exists())
+            self.assertTrue(second_path.exists())
+
+    async def test_multiple_images_preflight_rejects_mixed_valid_and_invalid_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            valid = root / "valid.png"
+            valid.write_bytes(b"valid")
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = 0
+
+                async def send_media(self, *args, **kwargs):
+                    self.calls += 1
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with self.assertRaisesRegex(self.adapter_module.AgentControlError, "not a readable file"):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(valid.as_uri(), "caption"), ((root / "missing.png").as_uri(), "")],
+                )
+
+            self.assertEqual(fake_client.calls, 0)
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_preflight_oserror_redacts_local_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "private.png"
+            image.write_bytes(b"private")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=unittest.mock.AsyncMock(),
+            )
+            private_error = OSError(f"stat failed for {image}")
+
+            with (
+                unittest.mock.patch.object(self.adapter_module.Path, "stat", side_effect=private_error),
+                unittest.mock.patch.object(self.adapter_module.logger, "debug") as debug_log,
+                self.assertRaises(self.adapter_module.AgentControlError) as raised,
+            ):
+                await adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+
+            self.assertEqual(str(raised.exception), "Marmot media preflight failed")
+            self.assertNotIn(str(image), str(raised.exception))
+            self.assertNotIn(str(image), repr(debug_log.call_args_list))
+
+    async def test_multiple_images_preserves_duplicate_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "same.png"
+            image.write_bytes(b"same")
+
+            class FakeClient:
+                def __init__(self):
+                    self.attachments = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.attachments = attachments
+                    self.asserted_bytes = [Path(item["path"]).read_bytes() for item in attachments]
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            await adapter.send_multiple_images(
+                "22" * 32,
+                [(image.as_uri(), "caption"), (image.as_uri(), "")],
+            )
+
+            self.assertEqual([item["file_name"] for item in fake_client.attachments], ["same.png", "same.png"])
+            self.assertEqual(fake_client.asserted_bytes, [b"same", b"same"])
+            self.assertNotEqual(fake_client.attachments[0]["path"], fake_client.attachments[1]["path"])
+
+    async def test_multiple_images_count_and_byte_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = []
+            for index in range(4):
+                path = root / f"{index}.png"
+                path.write_bytes(b"1234")
+                paths.append(path)
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.calls.append(attachments)
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with (
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_ATTACHMENTS", 3),
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_FILE_BYTES", 4),
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_BATCH_BYTES", 12),
+            ):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(path.as_uri(), "") for path in paths[:3]],
+                )
+                with self.assertRaisesRegex(self.adapter_module.AgentControlError, "at most 3"):
+                    await adapter.send_multiple_images(
+                        "22" * 32,
+                        [(path.as_uri(), "") for path in paths],
+                    )
+                oversize = root / "oversize.png"
+                oversize.write_bytes(b"12345")
+                with self.assertRaisesRegex(self.adapter_module.AgentControlError, "blob size limit"):
+                    await adapter.send_multiple_images("22" * 32, [(oversize.as_uri(), "")])
+                with unittest.mock.patch.object(
+                    self.adapter_module,
+                    "MAX_OUTBOUND_MEDIA_BATCH_BYTES",
+                    7,
+                ):
+                    with self.assertRaisesRegex(self.adapter_module.AgentControlError, "total size limit"):
+                        await adapter.send_multiple_images(
+                            "22" * 32,
+                            [(path.as_uri(), "") for path in paths[:2]],
+                        )
+
+            self.assertEqual(len(fake_client.calls), 1)
+
+    async def test_multiple_images_pins_open_source_across_ancestor_symlink_replacement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            allowed = base / "allowed"
+            album = allowed / "album"
+            album.mkdir(parents=True)
+            image = album / "image.png"
+            image.write_bytes(b"approved")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "image.png").write_bytes(b"private")
+
+            class FakeClient:
+                staged_bytes = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.staged_bytes = [Path(item["path"]).read_bytes() for item in attachments]
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(allowed)],
+                    }
+                ),
+                client=fake_client,
+            )
+            real_stage = self.adapter_module.stage_outbound_media_file
+            replaced = False
+
+            def replace_parent_then_stage(source, staging_root, **kwargs):
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    album.rename(allowed / "album-original")
+                    album.symlink_to(outside, target_is_directory=True)
+                return real_stage(source, staging_root, **kwargs)
+
+            with unittest.mock.patch.object(
+                self.adapter_module,
+                "stage_outbound_media_file",
+                side_effect=replace_parent_then_stage,
+            ):
+                await adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+
+            self.assertEqual(fake_client.staged_bytes, [b"approved"])
+
+    async def test_pinned_media_root_rejects_root_path_replaced_by_outside_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            image = allowed / "image.png"
+            image.write_bytes(b"approved")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "image.png").write_bytes(b"private")
+            pinned_roots = self.adapter_module.pin_allowed_media_roots([allowed])
+            allowed.rename(base / "allowed-original")
+            allowed.symlink_to(outside, target_is_directory=True)
+
+            try:
+                with self.assertRaisesRegex(
+                    self.adapter_module.AgentControlError,
+                    "outside allowed local roots",
+                ):
+                    self.adapter_module.open_outbound_media_source(image, pinned_roots)
+            finally:
+                for _, directory_fd in pinned_roots:
+                    self.adapter_module.os.close(directory_fd)
+
+    async def test_multiple_images_enforces_limit_against_bytes_copied_after_growth(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "growing.png"
+            image.write_bytes(b"1234")
+            client = unittest.mock.AsyncMock()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=client,
+            )
+            real_stage = self.adapter_module.stage_outbound_media_file
+
+            def grow_then_stage(source, staging_root, **kwargs):
+                source.write_bytes(b"12345")
+                return real_stage(source, staging_root, **kwargs)
+
+            with (
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_FILE_BYTES", 4),
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_BATCH_BYTES", 8),
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "stage_outbound_media_file",
+                    side_effect=grow_then_stage,
+                ),
+                self.assertRaisesRegex(self.adapter_module.AgentControlError, "blob size limit"),
+            ):
+                await adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+
+            client.send_media.assert_not_awaited()
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_partial_upload_failure_is_all_error_and_cleans_staging(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first.png"
+            second = root / "second.jpg"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = 0
+                    self.staged_paths = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.calls += 1
+                    self.staged_paths = [Path(item["path"]) for item in attachments]
+                    self.asserted_bytes = [path.read_bytes() for path in self.staged_paths]
+                    raise self_error(
+                        f"second upload failed at {self.staged_paths[1]}",
+                        retryable=False,
+                    )
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs:
+                with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+                    await adapter.send_multiple_images(
+                        "22" * 32,
+                        [(first.as_uri(), "caption"), (second.as_uri(), "")],
+                    )
+
+            self.assertEqual(str(raised.exception), "Marmot media send failed")
+            self.assertNotIn(str(adapter._outbound_media_dir), str(raised.exception))
+            self.assertNotIn(str(adapter._outbound_media_dir), "\n".join(logs.output))
+            self.assertEqual(fake_client.calls, 1)
+            self.assertEqual(fake_client.asserted_bytes, [b"one", b"two"])
+            self.assertTrue(all(not path.exists() for path in fake_client.staged_paths))
+
+    async def test_outbound_media_staging_failure_redacts_local_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "private.png"
+            image.write_bytes(b"private")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=object(),
+            )
+            staged_path = adapter._outbound_media_dir / "private-staged.png"
+
+            with (
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "stage_outbound_media_file",
+                    side_effect=OSError(f"could not stage {staged_path}"),
+                ),
+                self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs,
+            ):
+                result = await adapter.send_image_file("22" * 32, str(image))
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.error, "Marmot outbound media staging failed")
+            self.assertNotIn(str(staged_path), "\n".join(logs.output))
+
+    async def test_multiple_images_retry_reuses_staged_paths_and_idempotency_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first.png"
+            second = root / "second.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.calls.append(
+                        ([item["path"] for item in attachments], kwargs["idempotency_key"])
+                    )
+                    if len(self.calls) == 1:
+                        raise self_error(
+                            "timed out",
+                            code="request_timed_out",
+                            retryable=True,
+                        )
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with unittest.mock.patch.object(
+                self.adapter_module,
+                "SEND_MEDIA_RETRY_BACKOFF_S",
+                (0.0,),
+            ):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(first.as_uri(), "caption"), (second.as_uri(), "")],
+                )
+
+            self.assertEqual(len(fake_client.calls), 2)
+            self.assertEqual(fake_client.calls[0], fake_client.calls[1])
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_waits_past_retry_budget_for_in_progress_send(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "image.png"
+            image.write_bytes(b"image")
+
+            class FakeClient:
+                def __init__(self):
+                    self.idempotency_keys = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.idempotency_keys.append(kwargs["idempotency_key"])
+                    if len(self.idempotency_keys) <= 4:
+                        raise self_error(
+                            "send remains in progress",
+                            code="send_in_progress",
+                            retryable=True,
+                        )
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with unittest.mock.patch.object(
+                self.adapter_module,
+                "SEND_MEDIA_RETRY_BACKOFF_S",
+                (0.0,),
+            ):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(image.as_uri(), "caption")],
+                )
+
+            self.assertEqual(len(fake_client.idempotency_keys), 5)
+            self.assertEqual(len(set(fake_client.idempotency_keys)), 1)
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_times_out_when_send_stays_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "image.png"
+            image.write_bytes(b"image")
+
+            class FakeClient:
+                def __init__(self):
+                    self.idempotency_keys = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.idempotency_keys.append(kwargs["idempotency_key"])
+                    raise self_error(
+                        "send remains in progress",
+                        code="send_in_progress",
+                        retryable=True,
+                    )
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with (
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "SEND_MEDIA_COMPLETION_TIMEOUT_S",
+                    0.02,
+                ),
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "SEND_MEDIA_RETRY_BACKOFF_S",
+                    (0.005,),
+                ),
+            ):
+                result = await adapter._send_media_batch(
+                    "22" * 32,
+                    [{"path": str(image), "media_type": "image/png", "file_name": image.name}],
+                )
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.error, "Marmot media send timed out")
+            self.assertTrue(result.retryable)
+            self.assertGreater(len(fake_client.idempotency_keys), 1)
+            self.assertEqual(len(set(fake_client.idempotency_keys)), 1)
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_cancellation_cleans_staged_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "cancel.png"
+            image.write_bytes(b"cancel")
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            class FakeClient:
+                async def send_media(self, account, group, attachments, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=FakeClient(),
+            )
+            task = asyncio.create_task(
+                adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_reply_metadata_remains_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "reply.png"
+            image.write_bytes(b"reply")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=object(),
+            )
+            with self.assertRaisesRegex(self.adapter_module.AgentControlError, "reply threading"):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(image.as_uri(), "caption")],
+                    metadata={"reply_to_message_id_hex": "33" * 32},
+                )
+
+    async def test_standalone_media_files_use_one_batch_send(self):
+        class FakeAdapter:
+            def __init__(self):
+                self.batches = []
+
+            async def _send_media_batch(self, chat_id, attachments, *, caption=None, reply_to=None):
+                self.batches.append((chat_id, attachments, caption, reply_to))
+                return self_module.SendResult(
+                    success=True,
+                    message_id="99" * 32,
+                    continuation_message_ids=("88" * 32,),
+                    raw_response={
+                        "attachment_outcomes": [
+                            {"file_name": item["file_name"], "status": "sent"}
+                            for item in attachments
+                        ]
+                    },
+                )
+
+        self_module = self.adapter_module
+        fake_adapter = FakeAdapter()
+        with unittest.mock.patch.object(
+            self.adapter_module,
+            "MarmotPlatformAdapter",
+            return_value=fake_adapter,
+        ):
+            response = await self.adapter_module._standalone_send(
+                object(),
+                "22" * 32,
+                " one caption ",
+                media_files=["first.png", "second.jpg"],
+            )
+            blank_response = await self.adapter_module._standalone_send(
+                object(),
+                "22" * 32,
+                "   ",
+                media_files=["first.png"],
+            )
+
+        self.assertEqual(len(fake_adapter.batches), 2)
+        batch = fake_adapter.batches[0]
+        self.assertEqual(batch[0], "22" * 32)
+        self.assertEqual([item["file_name"] for item in batch[1]], ["first.png", "second.jpg"])
+        self.assertEqual(batch[2], " one caption ")
+        self.assertEqual(response["message_ids"], ["88" * 32, "99" * 32])
+        self.assertEqual(len(response["attachment_outcomes"]), 2)
+        self.assertIsNone(fake_adapter.batches[1][2])
+        self.assertTrue(blank_response["success"])
 
     async def test_outbound_media_outside_allowlist_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2971,7 +5234,20 @@ class CoalesceInboundTests(unittest.TestCase):
                 {
                     "type": "inbound_message",
                     "message_id_hex": "22" * 32,
-                    "reply_to_message_id_hex": "bb" * 32,
+                    "reply_to": {
+                        "message_id_hex": "bb" * 32,
+                        "availability": "available",
+                        "sender": {
+                            "account_id_hex": "44" * 32,
+                            "display_name": "Alice",
+                            "is_self": False,
+                        },
+                        "recorded_at": 123,
+                        "text_excerpt": "rich quoted context",
+                        "text_truncated": False,
+                        "attachments": [],
+                        "attachments_truncated": False,
+                    },
                     "text": "two",
                     "media": [dict(ref)],
                 },
@@ -2979,8 +5255,34 @@ class CoalesceInboundTests(unittest.TestCase):
         )
         self.assertEqual(merged["message_id_hex"], "22" * 32)
         self.assertEqual(merged["reply_to_message_id_hex"], "bb" * 32)
+        self.assertEqual(
+            merged["reply_to"]["text_excerpt"],
+            "rich quoted context",
+        )
         self.assertEqual(merged["text"], "one\ntwo")
         self.assertEqual(len(merged["media"]), 1)
+
+    def test_normalization_rejects_missing_routing_ids_consistently(self):
+        with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+            self.adapter_module._normalize_inbound_message_event(
+                {
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "",
+                    "message": {
+                        "message_id_hex": "22" * 32,
+                        "sender": {
+                            "account_id_hex": "44" * 32,
+                            "is_self": False,
+                        },
+                        "text": "hello",
+                        "recorded_at": 1,
+                        "media": [],
+                    },
+                    "mentions_self": False,
+                }
+            )
+        self.assertEqual(raised.exception.code, "wrong_protocol")
 
 
 class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):
@@ -3009,6 +5311,47 @@ class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["removed"], ["44" * 32])
         self.assertEqual(sorted(current), sorted(["22" * 32, "33" * 32]))
 
+    async def test_sync_allowlist_decodes_npub(self):
+        current = []
+
+        class FakeClient:
+            async def allowlist_list(self, account_id_hex):
+                return {"type": "allowlist", "welcomer_account_ids_hex": list(current)}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                current.append(welcomer_account_id_hex)
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                current.remove(welcomer_account_id_hex)
+
+        result = await self.adapter_module.sync_allowlist(
+            FakeClient(),
+            "11" * 32,
+            ["npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"],
+        )
+        expected = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4"
+        self.assertEqual(result, {"added": [expected], "removed": []})
+        self.assertEqual(current, [expected])
+
+    async def test_sync_allowlist_does_not_wipe_on_invalid_nonempty_config(self):
+        current = ["33" * 32]
+
+        class FakeClient:
+            async def allowlist_list(self, account_id_hex):
+                return {"type": "allowlist", "welcomer_account_ids_hex": list(current)}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                current.append(welcomer_account_id_hex)
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                current.remove(welcomer_account_id_hex)
+
+        result = await self.adapter_module.sync_allowlist(
+            FakeClient(), "11" * 32, ["npub1invalid"]
+        )
+        self.assertEqual(result, {"added": [], "removed": []})
+        self.assertEqual(current, ["33" * 32])
+
 
 class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -3020,6 +5363,9 @@ class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
             state_path = Path(tmpdir) / "profile-onboarding.json"
 
             class FakeClient:
+                async def account_lookup_profile(self, account_id_hex):
+                    return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
+
                 async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                     self.last = (account_id_hex, group_id_hex, text, reply_to_message_id_hex)
                     return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
@@ -3062,6 +5408,82 @@ class ProfilePromptTests(unittest.TestCase):
         action, name, _ = self.adapter_module.parse_profile_name_reply("yes")
         self.assertEqual(action, "affirm")
         self.assertIsNone(name)
+
+
+class PluginRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+
+    def test_register_exposes_marmot_history_as_a_platform_tool(self):
+        class FakeContext:
+            def __init__(self):
+                self.platforms = []
+                self.tools = []
+
+            def register_platform(self, **kwargs):
+                self.platforms.append(kwargs)
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
+
+        ctx = FakeContext()
+        self.adapter_module.register(ctx)
+
+        self.assertEqual([platform["name"] for platform in ctx.platforms], ["marmot"])
+        history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
+        self.assertEqual(history["toolset"], "platform")
+        self.assertEqual(history["schema"]["required"], ["group_id_hex"])
+        self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
+
+    def test_marmot_history_fetches_one_exact_materialized_message(self):
+        calls = []
+
+        class FakeClient:
+            async def timeline_message_get(
+                self, account_id_hex, group_id_hex, message_id_hex
+            ):
+                calls.append((account_id_hex, group_id_hex, message_id_hex))
+                return {
+                    "type": "timeline_message",
+                    "message_id_hex": message_id_hex,
+                    "message": None,
+                }
+
+        class FakeAdapter:
+            client = FakeClient()
+
+            async def _ensure_account_id(self):
+                return "11" * 32
+
+        class AdapterMap:
+            def get(self, _platform):
+                return FakeAdapter()
+
+        gateway_run = types.ModuleType("gateway.run")
+        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
+            adapters=AdapterMap()
+        )
+        model_tools = types.ModuleType("model_tools")
+        model_tools._run_async = asyncio.run
+        sys.modules["gateway.run"] = gateway_run
+        sys.modules["model_tools"] = model_tools
+
+        try:
+            result = json.loads(
+                self.adapter_module._marmot_history_tool(
+                    {
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                    }
+                )
+            )
+        finally:
+            sys.modules.pop("gateway.run", None)
+            sys.modules.pop("model_tools", None)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["type"], "timeline_message")
+        self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
 
 
 class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):

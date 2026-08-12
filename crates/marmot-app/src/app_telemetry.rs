@@ -6,7 +6,7 @@
 //! key material.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use transport_nostr_adapter::{DurationHistogramSnapshot, HistogramBucket};
@@ -22,9 +22,25 @@ pub(crate) enum AppPerformanceOperation {
     DirectorySubscriptionSync,
     AccountReconcile,
     AccountOpen,
+    AccountSessionOpen,
+    AccountGroupHydration,
+    AccountProfileLoad,
+    AccountGroupReadSnapshot,
+    AccountTransportActivation,
+    AccountSubscriptionRegistration,
     AccountCatchUp,
     AccountSync,
+    AccountSetupAdvisoryStep,
     OutboundMessageSend,
+    GroupCreateQueueWait,
+    GroupCreateKeyPackageLookup,
+    GroupCreateImageUpload,
+    GroupCreateMlsPreparePersist,
+    GroupCreateWelcomePublish,
+    GroupCreateLocalProjectionSave,
+    GroupCreateSubscriptionRefresh,
+    GroupCreatePostMutationCatchUp,
+    GroupCreateTotalCallerLatency,
     GroupInviteMembers,
     GroupInviteKeyPackageLookup,
     GroupInviteRoutingRefresh,
@@ -36,8 +52,28 @@ pub(crate) enum AppPerformanceOperation {
     GroupPromoteAdmin,
     GroupDetailsRead,
     GroupMlsStateRead,
+    GroupRosterRead,
     MediaUpload,
     MediaDownload,
+    HostSplashReady,
+    HostForegroundLocalReady,
+}
+
+/// Host-app milestones accepted by [`AppPerformanceTelemetry::record_host_performance`].
+///
+/// This is deliberately a closed enum rather than a caller-supplied metric or
+/// label name. Adding an operation therefore requires an MDK review and cannot
+/// silently create unbounded Prometheus cardinality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPerformanceOperation {
+    SplashReady,
+    ForegroundLocalReady,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPerformanceOutcome {
+    Success,
+    Failure,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,9 +94,40 @@ pub struct AppPerformanceSnapshot {
     pub directory_subscription_sync: AppPerformanceOperationSnapshot,
     pub account_reconcile: AppPerformanceOperationSnapshot,
     pub account_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_session_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_group_hydration: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_profile_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_group_read_snapshot: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_transport_activation: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_subscription_registration: AppPerformanceOperationSnapshot,
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
+    pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_queue_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_key_package_lookup: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_image_upload: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_mls_prepare_persist: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_welcome_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_local_projection_save: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_subscription_refresh: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_post_mutation_catch_up: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_total_caller_latency: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_invite_members: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -83,8 +150,14 @@ pub struct AppPerformanceSnapshot {
     pub group_details_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_mls_state_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_roster_read: AppPerformanceOperationSnapshot,
     pub media_upload: AppPerformanceOperationSnapshot,
     pub media_download: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_splash_ready: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_foreground_local_ready: AppPerformanceOperationSnapshot,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,9 +171,25 @@ struct AppPerformanceTelemetryInner {
     directory_subscription_sync: AppPerformanceOperationTelemetry,
     account_reconcile: AppPerformanceOperationTelemetry,
     account_open: AppPerformanceOperationTelemetry,
+    account_session_open: AppPerformanceOperationTelemetry,
+    account_group_hydration: AppPerformanceOperationTelemetry,
+    account_profile_load: AppPerformanceOperationTelemetry,
+    account_group_read_snapshot: AppPerformanceOperationTelemetry,
+    account_transport_activation: AppPerformanceOperationTelemetry,
+    account_subscription_registration: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
+    account_setup_advisory_step: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
+    group_create_queue_wait: AppPerformanceOperationTelemetry,
+    group_create_key_package_lookup: AppPerformanceOperationTelemetry,
+    group_create_image_upload: AppPerformanceOperationTelemetry,
+    group_create_mls_prepare_persist: AppPerformanceOperationTelemetry,
+    group_create_welcome_publish: AppPerformanceOperationTelemetry,
+    group_create_local_projection_save: AppPerformanceOperationTelemetry,
+    group_create_subscription_refresh: AppPerformanceOperationTelemetry,
+    group_create_post_mutation_catch_up: AppPerformanceOperationTelemetry,
+    group_create_total_caller_latency: AppPerformanceOperationTelemetry,
     group_invite_members: AppPerformanceOperationTelemetry,
     group_invite_key_package_lookup: AppPerformanceOperationTelemetry,
     group_invite_routing_refresh: AppPerformanceOperationTelemetry,
@@ -112,8 +201,11 @@ struct AppPerformanceTelemetryInner {
     group_promote_admin: AppPerformanceOperationTelemetry,
     group_details_read: AppPerformanceOperationTelemetry,
     group_mls_state_read: AppPerformanceOperationTelemetry,
+    group_roster_read: AppPerformanceOperationTelemetry,
     media_upload: AppPerformanceOperationTelemetry,
     media_download: AppPerformanceOperationTelemetry,
+    host_splash_ready: AppPerformanceOperationTelemetry,
+    host_foreground_local_ready: AppPerformanceOperationTelemetry,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,6 +220,7 @@ struct AppPerformanceOperationTelemetry {
 struct DurationHistogram {
     buckets: [u64; APP_DURATION_BUCKET_BOUNDS_MS.len()],
     overflow: u64,
+    sum_ms: u64,
 }
 
 impl Default for DurationHistogram {
@@ -135,6 +228,7 @@ impl Default for DurationHistogram {
         Self {
             buckets: [0; APP_DURATION_BUCKET_BOUNDS_MS.len()],
             overflow: 0,
+            sum_ms: 0,
         }
     }
 }
@@ -142,6 +236,7 @@ impl Default for DurationHistogram {
 impl DurationHistogram {
     fn record(&mut self, duration: Duration) {
         let delta_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        self.sum_ms = self.sum_ms.saturating_add(delta_ms);
         for (idx, bound) in APP_DURATION_BUCKET_BOUNDS_MS.iter().enumerate() {
             if delta_ms <= *bound {
                 self.buckets[idx] += 1;
@@ -162,6 +257,7 @@ impl DurationHistogram {
                 })
                 .collect(),
             overflow_count: self.overflow,
+            sum_ms: self.sum_ms,
         }
     }
 }
@@ -207,12 +303,74 @@ impl AppPerformanceTelemetry {
                 inner.account_reconcile.record(duration, success);
             }
             AppPerformanceOperation::AccountOpen => inner.account_open.record(duration, success),
+            AppPerformanceOperation::AccountSessionOpen => {
+                inner.account_session_open.record(duration, success);
+            }
+            AppPerformanceOperation::AccountGroupHydration => {
+                inner.account_group_hydration.record(duration, success);
+            }
+            AppPerformanceOperation::AccountProfileLoad => {
+                inner.account_profile_load.record(duration, success);
+            }
+            AppPerformanceOperation::AccountGroupReadSnapshot => {
+                inner.account_group_read_snapshot.record(duration, success);
+            }
+            AppPerformanceOperation::AccountTransportActivation => {
+                inner.account_transport_activation.record(duration, success);
+            }
+            AppPerformanceOperation::AccountSubscriptionRegistration => {
+                inner
+                    .account_subscription_registration
+                    .record(duration, success);
+            }
             AppPerformanceOperation::AccountCatchUp => {
                 inner.account_catch_up.record(duration, success);
             }
             AppPerformanceOperation::AccountSync => inner.account_sync.record(duration, success),
+            AppPerformanceOperation::AccountSetupAdvisoryStep => {
+                inner.account_setup_advisory_step.record(duration, success)
+            }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateQueueWait => {
+                inner.group_create_queue_wait.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateKeyPackageLookup => {
+                inner
+                    .group_create_key_package_lookup
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateImageUpload => {
+                inner.group_create_image_upload.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateMlsPreparePersist => {
+                inner
+                    .group_create_mls_prepare_persist
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateWelcomePublish => {
+                inner.group_create_welcome_publish.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateLocalProjectionSave => {
+                inner
+                    .group_create_local_projection_save
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateSubscriptionRefresh => {
+                inner
+                    .group_create_subscription_refresh
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreatePostMutationCatchUp => {
+                inner
+                    .group_create_post_mutation_catch_up
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateTotalCallerLatency => {
+                inner
+                    .group_create_total_caller_latency
+                    .record(duration, success);
             }
             AppPerformanceOperation::GroupInviteMembers => {
                 inner.group_invite_members.record(duration, success);
@@ -253,11 +411,41 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::GroupMlsStateRead => {
                 inner.group_mls_state_read.record(duration, success);
             }
+            AppPerformanceOperation::GroupRosterRead => {
+                inner.group_roster_read.record(duration, success);
+            }
             AppPerformanceOperation::MediaUpload => inner.media_upload.record(duration, success),
             AppPerformanceOperation::MediaDownload => {
                 inner.media_download.record(duration, success);
             }
+            AppPerformanceOperation::HostSplashReady => {
+                inner.host_splash_ready.record(duration, success);
+            }
+            AppPerformanceOperation::HostForegroundLocalReady => {
+                inner.host_foreground_local_ready.record(duration, success);
+            }
         }
+    }
+
+    /// Record one approved host-app milestone without accepting arbitrary
+    /// metric names, label names, or label values.
+    pub fn record_host_performance(
+        &self,
+        operation: HostPerformanceOperation,
+        duration: Duration,
+        outcome: HostPerformanceOutcome,
+    ) {
+        let operation = match operation {
+            HostPerformanceOperation::SplashReady => AppPerformanceOperation::HostSplashReady,
+            HostPerformanceOperation::ForegroundLocalReady => {
+                AppPerformanceOperation::HostForegroundLocalReady
+            }
+        };
+        self.record(
+            operation,
+            duration,
+            matches!(outcome, HostPerformanceOutcome::Success),
+        );
     }
 
     pub fn snapshot(&self) -> AppPerformanceSnapshot {
@@ -270,9 +458,27 @@ impl AppPerformanceTelemetry {
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
             account_reconcile: inner.account_reconcile.snapshot(),
             account_open: inner.account_open.snapshot(),
+            account_session_open: inner.account_session_open.snapshot(),
+            account_group_hydration: inner.account_group_hydration.snapshot(),
+            account_profile_load: inner.account_profile_load.snapshot(),
+            account_group_read_snapshot: inner.account_group_read_snapshot.snapshot(),
+            account_transport_activation: inner.account_transport_activation.snapshot(),
+            account_subscription_registration: inner.account_subscription_registration.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
+            account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
+            group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
+            group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
+            group_create_image_upload: inner.group_create_image_upload.snapshot(),
+            group_create_mls_prepare_persist: inner.group_create_mls_prepare_persist.snapshot(),
+            group_create_welcome_publish: inner.group_create_welcome_publish.snapshot(),
+            group_create_local_projection_save: inner.group_create_local_projection_save.snapshot(),
+            group_create_subscription_refresh: inner.group_create_subscription_refresh.snapshot(),
+            group_create_post_mutation_catch_up: inner
+                .group_create_post_mutation_catch_up
+                .snapshot(),
+            group_create_total_caller_latency: inner.group_create_total_caller_latency.snapshot(),
             group_invite_members: inner.group_invite_members.snapshot(),
             group_invite_key_package_lookup: inner.group_invite_key_package_lookup.snapshot(),
             group_invite_routing_refresh: inner.group_invite_routing_refresh.snapshot(),
@@ -286,8 +492,51 @@ impl AppPerformanceTelemetry {
             group_promote_admin: inner.group_promote_admin.snapshot(),
             group_details_read: inner.group_details_read.snapshot(),
             group_mls_state_read: inner.group_mls_state_read.snapshot(),
+            group_roster_read: inner.group_roster_read.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
+            host_splash_ready: inner.host_splash_ready.snapshot(),
+            host_foreground_local_ready: inner.host_foreground_local_ready.snapshot(),
+        }
+    }
+}
+
+/// Run a best-effort account-setup step under a hard time cap. A capped step
+/// behaves exactly like its error path — the caller proceeds without it — and
+/// the cap firing is traced and recorded as a failed
+/// [`AppPerformanceOperation::AccountSetupAdvisoryStep`] sample, so the cap
+/// value can be validated against the fleet rather than the one device it was
+/// tuned on.
+pub(crate) async fn bounded_advisory_step<F: std::future::Future>(
+    telemetry: &AppPerformanceTelemetry,
+    cap: Duration,
+    step: &'static str,
+    future: F,
+) -> Option<F::Output> {
+    let started = Instant::now();
+    match tokio::time::timeout(cap, future).await {
+        Ok(value) => {
+            telemetry.record(
+                AppPerformanceOperation::AccountSetupAdvisoryStep,
+                started.elapsed(),
+                true,
+            );
+            Some(value)
+        }
+        Err(_) => {
+            tracing::debug!(
+                target: "marmot_app::app_telemetry",
+                method = "bounded_advisory_step",
+                step,
+                cap_ms = cap.as_millis() as u64,
+                "advisory account-setup step hit its time cap"
+            );
+            telemetry.record(
+                AppPerformanceOperation::AccountSetupAdvisoryStep,
+                started.elapsed(),
+                false,
+            );
+            None
         }
     }
 }
@@ -315,16 +564,41 @@ mod tests {
             Duration::from_millis(750),
             true,
         );
+        telemetry.record(
+            AppPerformanceOperation::AccountTransportActivation,
+            Duration::from_millis(5_000),
+            false,
+        );
+        telemetry.record(
+            AppPerformanceOperation::AccountSubscriptionRegistration,
+            Duration::from_millis(250),
+            true,
+        );
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.app_start.attempts, 2);
         assert_eq!(snapshot.app_start.successes, 1);
         assert_eq!(snapshot.app_start.failures, 1);
         assert_eq!(snapshot.app_start.duration_ms.sample_count(), 2);
+        assert_eq!(snapshot.app_start.duration_ms.sum_ms, 400_050);
         assert_eq!(snapshot.group_invite_members.attempts, 1);
         assert_eq!(snapshot.group_invite_members.successes, 1);
         assert_eq!(snapshot.group_invite_members.failures, 0);
         assert_eq!(snapshot.group_invite_members.duration_ms.sample_count(), 1);
+        assert_eq!(snapshot.group_invite_members.duration_ms.sum_ms, 750);
+        assert_eq!(snapshot.account_transport_activation.failures, 1);
+        assert_eq!(
+            snapshot.account_transport_activation.duration_ms.sum_ms,
+            5_000
+        );
+        assert_eq!(snapshot.account_subscription_registration.successes, 1);
+        assert_eq!(
+            snapshot
+                .account_subscription_registration
+                .duration_ms
+                .sum_ms,
+            250
+        );
         assert!(
             snapshot
                 .app_start
@@ -334,5 +608,123 @@ mod tests {
                 .any(|bucket| bucket.upper_bound_ms == 50 && bucket.count == 1)
         );
         assert_eq!(snapshot.app_start.duration_ms.overflow_count, 1);
+    }
+
+    #[test]
+    fn records_account_open_stage_operations() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms) in [
+            (AppPerformanceOperation::AccountSessionOpen, 120),
+            (AppPerformanceOperation::AccountGroupHydration, 80),
+            (AppPerformanceOperation::AccountProfileLoad, 15),
+            (AppPerformanceOperation::AccountGroupReadSnapshot, 40),
+        ] {
+            telemetry.record(operation, Duration::from_millis(duration_ms), true);
+        }
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_session_open.successes, 1);
+        assert_eq!(snapshot.account_session_open.duration_ms.sum_ms, 120);
+        assert_eq!(snapshot.account_group_hydration.successes, 1);
+        assert_eq!(snapshot.account_group_hydration.duration_ms.sum_ms, 80);
+        assert_eq!(snapshot.account_profile_load.successes, 1);
+        assert_eq!(snapshot.account_profile_load.duration_ms.sum_ms, 15);
+        assert_eq!(snapshot.account_group_read_snapshot.successes, 1);
+        assert_eq!(snapshot.account_group_read_snapshot.duration_ms.sum_ms, 40);
+    }
+
+    #[test]
+    fn records_each_group_create_stage() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let operations = [
+            AppPerformanceOperation::GroupCreateQueueWait,
+            AppPerformanceOperation::GroupCreateKeyPackageLookup,
+            AppPerformanceOperation::GroupCreateImageUpload,
+            AppPerformanceOperation::GroupCreateMlsPreparePersist,
+            AppPerformanceOperation::GroupCreateWelcomePublish,
+            AppPerformanceOperation::GroupCreateLocalProjectionSave,
+            AppPerformanceOperation::GroupCreateSubscriptionRefresh,
+            AppPerformanceOperation::GroupCreatePostMutationCatchUp,
+            AppPerformanceOperation::GroupCreateTotalCallerLatency,
+        ];
+        for (index, operation) in operations.into_iter().enumerate() {
+            telemetry.record(operation, Duration::from_millis(index as u64 + 1), true);
+        }
+
+        let snapshot = telemetry.snapshot();
+        for stage in [
+            snapshot.group_create_queue_wait,
+            snapshot.group_create_key_package_lookup,
+            snapshot.group_create_image_upload,
+            snapshot.group_create_mls_prepare_persist,
+            snapshot.group_create_welcome_publish,
+            snapshot.group_create_local_projection_save,
+            snapshot.group_create_subscription_refresh,
+            snapshot.group_create_post_mutation_catch_up,
+            snapshot.group_create_total_caller_latency,
+        ] {
+            assert_eq!(stage.attempts, 1);
+            assert_eq!(stage.successes, 1);
+            assert_eq!(stage.duration_ms.sample_count(), 1);
+        }
+    }
+
+    #[test]
+    fn records_each_closed_host_performance_operation() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms, outcome) in [
+            (
+                HostPerformanceOperation::SplashReady,
+                100,
+                HostPerformanceOutcome::Success,
+            ),
+            (
+                HostPerformanceOperation::ForegroundLocalReady,
+                200,
+                HostPerformanceOutcome::Success,
+            ),
+        ] {
+            telemetry.record_host_performance(
+                operation,
+                Duration::from_millis(duration_ms),
+                outcome,
+            );
+        }
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.host_splash_ready.successes, 1);
+        assert_eq!(snapshot.host_splash_ready.duration_ms.sum_ms, 100);
+        assert_eq!(snapshot.host_foreground_local_ready.successes, 1);
+        assert_eq!(snapshot.host_foreground_local_ready.duration_ms.sum_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn bounded_advisory_step_returns_the_value_and_records_success() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let value =
+            bounded_advisory_step(&telemetry, Duration::from_secs(5), "test_step", async { 7 })
+                .await;
+        assert_eq!(value, Some(7));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_setup_advisory_step.attempts, 1);
+        assert_eq!(snapshot.account_setup_advisory_step.successes, 1);
+        assert_eq!(snapshot.account_setup_advisory_step.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_advisory_step_caps_a_stalled_future_and_records_the_cap() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let value: Option<()> = bounded_advisory_step(
+            &telemetry,
+            Duration::from_millis(50),
+            "test_step",
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(value, None);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_setup_advisory_step.attempts, 1);
+        assert_eq!(snapshot.account_setup_advisory_step.successes, 0);
+        assert_eq!(snapshot.account_setup_advisory_step.failures, 1);
     }
 }

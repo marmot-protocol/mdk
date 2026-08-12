@@ -4,6 +4,7 @@
 
 use zeroize::Zeroizing;
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -11,20 +12,149 @@ use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::oneshot;
 
 use super::{
-    AccountManager, AccountWorkerCommand, account_worker_response,
+    AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
     publish_app_runtime_group_state_updated,
 };
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, PushRegistration,
+    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
+    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
+    AppQuarantinedGroup, GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, RetentionSweepReport,
     SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
+    #[cfg(test)]
+    pub(super) async fn unhydrated_group_count_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<usize, AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::UnhydratedGroupCount { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        match tokio::time::timeout(super::APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+            Ok(Ok(count)) => Ok(count),
+            Ok(Err(_)) => Err(AppError::TransportClosed),
+            Err(_) => Err(AppError::BlockingTask(
+                "account worker unhydrated-group probe timed out".into(),
+            )),
+        }
+    }
+
+    pub(super) fn spawn_invite_catch_up(&self) {
+        let mut tasks = self
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.handles.retain(|task| !task.is_finished());
+        if !tasks.accepting {
+            return;
+        }
+        let post_mutation = self.clone();
+        let handle = tokio::spawn(async move {
+            let catch_up_started_at = Instant::now();
+            // Once started, catch-up must run to a normal result. Cancelling
+            // reconcile mid-await could abandon stale workers that it already
+            // removed from the manager map but has not finished reaping.
+            let catch_up = post_mutation.catch_up_accounts().await;
+            post_mutation.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupInvitePostMutationCatchUp,
+                catch_up_started_at.elapsed(),
+                catch_up.is_ok(),
+            );
+            if let Err(error) = catch_up {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "invite_members",
+                    error_kind = error.privacy_safe_kind(),
+                    "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+                );
+            }
+        });
+        tasks.handles.push(handle);
+    }
+
+    /// Refresh other account workers after an irreversible mutation without
+    /// changing the mutation's result. Once the command worker has confirmed
+    /// a publish, a read-side catch-up fault cannot roll it back; surfacing
+    /// that fault would tell the host to retry work already visible to peers.
+    async fn catch_up_after_committed_mutation(&self, method: &'static str) {
+        if let Err(error) = self.catch_up_accounts().await {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = method,
+                error_kind = error.privacy_safe_kind(),
+                "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+            );
+        }
+    }
+
+    async fn schedule_create_group_post_mutation_catch_up(&self) {
+        // Snapshot only workers that already exist when create returns. Calling
+        // the broad `catch_up_accounts()` from the detached task can discover an
+        // account while its setup flow still owns a one-shot AppClient, then
+        // race that setup by trying to start a managed worker for the same
+        // account. Accounts created after this snapshot perform their own
+        // startup catch-up and do not need this repair pass.
+        let commands = self.running_account_commands().await;
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // Test-only barrier (`test-policy-overrides`): lets integration
+            // tests prove the caller returned while this catch-up was still
+            // blocked, instead of depending on scheduler timing.
+            if cfg!(feature = "test-policy-overrides")
+                && let Some(barrier) = manager.shared.create_group_catch_up_barrier()
+            {
+                barrier.notified().await;
+            }
+            let started_at = Instant::now();
+            let result = manager.catch_up_account_commands(commands).await;
+            manager.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountCatchUp,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            manager.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupCreatePostMutationCatchUp,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "create_group_post_mutation_catch_up",
+                    error_kind = error.privacy_safe_kind(),
+                    "committed group creation outpaced post-mutation catch-up; state will refresh on the next cycle"
+                );
+            }
+        });
+    }
+
+    /// Force one complete relay-history query for a local account and project
+    /// every returned event through the ordinary runtime path.
+    pub async fn repair_full_history(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RepairFullHistory { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response
+            .await
+            .map_err(|_| AppError::TransportClosed)?
+            .map_err(AppError::AccountCatchUp)
+    }
+
+    /// Create the group and return its canonical id. Invitation delivery is
+    /// reported independently through `WelcomeDeliveryPending` events and
+    /// `pending_welcome_deliveries`.
     pub async fn create_group(
         &self,
         account_ref: &str,
@@ -32,21 +162,67 @@ impl AccountManager {
         members: &[String],
         description: Option<String>,
     ) -> Result<GroupId, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::CreateGroup {
-                name: name.to_owned(),
-                members: members.to_vec(),
-                description,
-                respond,
-            })
+        self.create_group_with_initial_image(account_ref, name, members, description, None)
             .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let group_id = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+    }
+
+    pub async fn create_group_with_initial_image(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        initial_image: Option<crate::AppInitialGroupImage>,
+    ) -> Result<GroupId, AppError> {
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::CreateGroup {
+                    queued_at: Instant::now(),
+                    name: name.to_owned(),
+                    members: members.to_vec(),
+                    description,
+                    initial_image,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupCreateTotalCallerLatency,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        let group_id = result?;
+        self.schedule_create_group_post_mutation_catch_up().await;
         self.schedule_audit_log_tracker_update("create_group");
         Ok(group_id)
+    }
+
+    /// Accounts the local account currently shares a group with, deduplicated
+    /// and excluding the account itself.
+    ///
+    /// See [`MarmotAppRuntime::group_co_members`] for why this lives with the
+    /// worker-backed reads rather than in the directory.
+    pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        let account = self.resolve(account_ref)?;
+        let mut co_members = BTreeSet::new();
+        for group in self.app.groups(&account.label)? {
+            if !group_contributes_co_members(&group) {
+                continue;
+            }
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            for member in self.group_members(account_ref, &group_id).await? {
+                if member.member_id_hex != account.account_id_hex {
+                    co_members.insert(member.member_id_hex);
+                }
+            }
+        }
+        Ok(co_members.into_iter().collect())
     }
 
     pub async fn group_members(
@@ -59,6 +235,34 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::Members {
                 group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    /// Read identifier-only rosters for a bounded page of groups in one
+    /// account-worker round trip.
+    ///
+    /// The response preserves input order and fails as a whole if any group is
+    /// unknown or hydration-quarantined; it never returns a partial page.
+    pub async fn group_member_ids_page(
+        &self,
+        account_ref: &str,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        if group_ids.len() > crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE {
+            return Err(AppError::InvalidGroupMembershipPage(format!(
+                "at most {} groups are allowed",
+                crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE
+            )));
+        }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::MemberIdsPage {
+                group_ids: group_ids.to_vec(),
                 respond,
             })
             .await
@@ -91,6 +295,99 @@ impl AccountManager {
             result.is_ok(),
         );
         result
+    }
+
+    pub async fn group_roster(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupRoster, AppError> {
+        let account = self.resolve(account_ref)?;
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupRoster {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let session = account_worker_response(response).await?;
+        let member_ids = session
+            .members
+            .iter()
+            .map(|member| member.member_id_hex.clone())
+            .collect::<Vec<_>>();
+        // Display names are optional directory enrichment; preserve the
+        // authoritative roster if that cache is unavailable.
+        let display_names = self
+            .app
+            .display_names_for_account_ids(&member_ids)
+            .unwrap_or_default();
+        Ok(crate::groups::app_group_roster_from_session(
+            session,
+            &account.account_id_hex,
+            display_names,
+        ))
+    }
+
+    pub async fn enable_group_disbanding(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::EnableGroupDisbanding {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_after_committed_mutation("enable_group_disbanding")
+            .await;
+        self.schedule_audit_log_tracker_update("enable_group_disbanding");
+        Ok(summary)
+    }
+
+    pub async fn disband_group(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppDisbandRequest, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DisbandGroup {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let request = account_worker_response(response).await?;
+        self.catch_up_after_committed_mutation("disband_group")
+            .await;
+        self.schedule_audit_log_tracker_update("disband_group");
+        Ok(request)
+    }
+
+    pub async fn acknowledge_disband_failure(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AcknowledgeDisbandFailure {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     /// Stored groups that failed session-open hydration and were skipped
@@ -240,15 +537,7 @@ impl AccountManager {
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
-
-            let catch_up_started_at = Instant::now();
-            let catch_up = self.catch_up_accounts().await;
-            self.shared.app_performance_telemetry().record(
-                AppPerformanceOperation::GroupInvitePostMutationCatchUp,
-                catch_up_started_at.elapsed(),
-                catch_up.is_ok(),
-            );
-            catch_up?;
+            self.spawn_invite_catch_up();
 
             self.schedule_audit_log_tracker_update("invite_members");
             Ok(summary)
@@ -279,7 +568,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("remove_members")
+            .await;
         self.schedule_audit_log_tracker_update("remove_members");
         Ok(summary)
     }
@@ -299,7 +589,7 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("leave_group").await;
         self.schedule_audit_log_tracker_update("leave_group");
         Ok(summary)
     }
@@ -371,7 +661,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let result = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("decline_group_invite")
+            .await;
         self.schedule_audit_log_tracker_update("decline_group_invite");
         Ok(result)
     }
@@ -435,7 +726,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_group_image")
+            .await;
         Ok(summary)
     }
 
@@ -473,7 +765,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_message_retention")
+            .await;
         self.schedule_audit_log_tracker_update("update_message_retention");
         Ok(summary)
     }
@@ -495,7 +788,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("replace_encrypted_media_blob_endpoints")
+            .await;
         self.schedule_audit_log_tracker_update("replace_encrypted_media_blob_endpoints");
         Ok(summary)
     }
@@ -521,7 +815,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_group_avatar_url")
+            .await;
         self.schedule_audit_log_tracker_update("update_group_avatar_url");
         Ok(summary)
     }
@@ -545,7 +840,8 @@ impl AccountManager {
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
-            self.catch_up_accounts().await?;
+            self.catch_up_after_committed_mutation("promote_admin")
+                .await;
             self.schedule_audit_log_tracker_update("promote_admin");
             Ok(summary)
         }
@@ -575,7 +871,7 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("demote_admin").await;
         self.schedule_audit_log_tracker_update("demote_admin");
         Ok(summary)
     }
@@ -595,7 +891,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("self_demote_admin")
+            .await;
         self.schedule_audit_log_tracker_update("self_demote_admin");
         Ok(summary)
     }
@@ -619,7 +916,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_group_profile")
+            .await;
         self.schedule_audit_log_tracker_update("update_group_profile");
         Ok(summary)
     }
@@ -648,18 +946,76 @@ impl AccountManager {
     pub(crate) async fn share_push_registration(
         &self,
         account_ref: &str,
-    ) -> Result<usize, AppError> {
+    ) -> Result<PushRegistrationShareOutcome, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::SharePushRegistration { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let published = account_worker_response(response).await?;
-        if published > 0 {
+        let outcome = account_worker_response(response).await?;
+        if outcome.succeeded_groups > 0 {
             self.schedule_audit_log_tracker_update("share_push_registration");
         }
-        Ok(published)
+        Ok(outcome)
+    }
+
+    pub(crate) async fn upsert_push_registration(
+        &self,
+        account_ref: &str,
+        platform: PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<PushRegistrationSyncResult, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpsertPushRegistration {
+                platform,
+                raw_token: Zeroizing::new(raw_token.to_owned()),
+                server_pubkey_hex: server_pubkey_hex.to_owned(),
+                relay_hint,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let result = account_worker_response(response).await?;
+        if result.share.succeeded_groups > 0 {
+            self.schedule_audit_log_tracker_update("upsert_push_registration");
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn clear_push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<PushRegistrationShareOutcome, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ClearPushRegistration { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let outcome = account_worker_response(response).await?;
+        if outcome.succeeded_groups > 0 {
+            self.schedule_audit_log_tracker_update("clear_push_registration");
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) async fn set_native_push_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SetNativePushEnabled { enabled, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     pub(crate) async fn remove_push_registration(
@@ -837,6 +1193,25 @@ impl AccountManager {
         Ok(result)
     }
 
+    pub(crate) async fn build_media_imeta_tag(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BuildMediaImetaTag {
+                group_id: group_id.clone(),
+                reference,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub(crate) async fn download_media(
         &self,
         account_ref: &str,
@@ -873,11 +1248,26 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub(crate) async fn sweep_expired_retention(
+        &self,
+        account_ref: &str,
+        now_ms: u64,
+    ) -> Result<RetentionSweepReport, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SweepExpiredRetention { now_ms, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub(crate) async fn start_agent_text_stream(
         &self,
         account_ref: &str,
         group_id: &GroupId,
         stream_id: Vec<u8>,
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         let command = self.worker_commands(account_ref).await?;
@@ -886,6 +1276,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::StartAgentTextStream {
                 group_id: group_id.clone(),
                 stream_id,
+                parent_message_id,
                 quic_candidates,
                 respond,
             })
@@ -932,7 +1323,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("retry_group_convergence")
+            .await;
         self.schedule_audit_log_tracker_update("retry_group_convergence");
         Ok(summary)
     }
@@ -987,5 +1379,129 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
+    }
+
+    pub async fn key_package_maintenance_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn durably_owned_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<cgka_traits::engine::KeyPackage>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DurablyOwnedKeyPackages { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn maintenance_status(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::MaintenanceStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn schedule_manual_self_update(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<String, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ScheduleManualSelfUpdate {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn periodic_maintenance_policy(
+        &self,
+        account_ref: &str,
+    ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PeriodicMaintenancePolicy { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn set_periodic_maintenance_policy(
+        &self,
+        account_ref: &str,
+        policy: cgka_traits::PeriodicMaintenancePolicy,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SetPeriodicMaintenancePolicy { policy, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn pause_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PauseMaintenance { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn resume_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ResumeMaintenance { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn run_due_maintenance(
+        &self,
+        account_ref: &str,
+    ) -> Result<MaintenanceRunSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RunDueMaintenance { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_after_committed_mutation("run_due_maintenance")
+            .await;
+        self.schedule_audit_log_tracker_update("run_due_maintenance");
+        Ok(summary)
     }
 }

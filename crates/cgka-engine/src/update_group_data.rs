@@ -19,6 +19,7 @@ use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{LeafNodeIndex, MlsMessageOut};
+use openmls_traits::OpenMlsProvider;
 use std::collections::BTreeSet;
 use tls_codec::Serialize as _;
 
@@ -35,12 +36,16 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        let current_profile = self
-            .storage
-            .get_group(&group_id)
-            .ok()
-            .map(|g| (g.name, g.description))
-            .unwrap_or_default();
+        // A partial update must carry the other field forward from canonical
+        // MLS state. The local Group record is only a projection and can lag a
+        // component removal; using it here can resurrect removed profile data.
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+            .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let current_profile =
+            crate::app_components::group_profile_of_group(&mls_group)?.unwrap_or_default();
         let projected_name = name.unwrap_or(current_profile.0);
         let projected_description = description.unwrap_or(current_profile.1);
         let profile_bytes =
@@ -210,8 +215,9 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             "pre_update_group_data_commit",
         );
-        self.epoch_manager
-            .record_committed_from(&group_id, pre_commit_epoch);
+        // `committed_from` is recorded atomically by `begin_pending` after
+        // staging succeeds — never here, where a staging failure would leave
+        // a phantom entry behind (see do_send_invite).
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -231,6 +237,20 @@ impl<S: StorageProvider> Engine<S> {
             Vec::new(),
             proposals,
             "app_data_update",
+        )?;
+        let staged_commit = mls_group.pending_commit().ok_or_else(|| {
+            EngineError::Backend("app data update produced no pending commit".into())
+        })?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            mls_group.own_leaf_index(),
         )?;
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -263,20 +283,6 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        // Mirror projected app-facing fields at send time. Rollback
-        // re-derives from the unmerged MLS app component.
-        if let Ok(mut g) = self.storage.get_group(&group_id) {
-            for update in &updates {
-                if update.component_id == GROUP_PROFILE_COMPONENT_ID {
-                    let (name, description) =
-                        crate::app_components::decode_group_profile(&update.data)?;
-                    g.name = name;
-                    g.description = description;
-                }
-            }
-            self.storage.put_group(&g)?;
-        }
-
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         let commit_priority = mls_group
             .pending_commit()
@@ -295,6 +301,45 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+
+        // Mirror projected app-facing fields only after the state-machine
+        // transition succeeds. A projection read/write failure must rewind the
+        // pending slot before returning; the still-armed cleanup guard then
+        // clears the staged OpenMLS commit and releases its snapshot.
+        let projection = (|| -> Result<(), EngineError> {
+            let mut group = self.storage.get_group(&group_id)?;
+            for update in &updates {
+                if update.component_id == GROUP_PROFILE_COMPONENT_ID {
+                    let (name, description) =
+                        crate::app_components::decode_group_profile(&update.data)?;
+                    group.name = name;
+                    group.description = description;
+                }
+            }
+            self.storage.put_group(&group)?;
+            Ok(())
+        })();
+        if let Err(err) = projection {
+            if self.epoch_manager.rollback_publish(pending_ref).is_err() {
+                tracing::warn!(
+                    target: "cgka_engine::update_group_data",
+                    method = "do_send_update_app_components",
+                    "state-machine rollback failed after group record projection failure"
+                );
+            }
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    Some("pending_publish"),
+                    "stable",
+                    pre_commit_epoch,
+                    "update_group_data_stage_failed",
+                    Some(pending_ref),
+                    Some("group_evolution"),
+                ),
+            );
+            return Err(err);
+        }
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
@@ -351,22 +396,16 @@ impl<S: StorageProvider> Engine<S> {
         proposals: Vec<Proposal>,
         context: &str,
     ) -> Result<MlsMessageOut, EngineError> {
-        // Mirror the receiver-side guard: a Remove of the negotiation
-        // component or a group-required component must fail at staging, not
-        // surface as a recipient-side rejection. Checked before the builder
-        // takes its mutable borrow of `mls_group`. No current caller produces
-        // a Remove (all send intents carry Update bytes); this keeps the
-        // shared helper in parity with the projection for future callers.
-        for proposal in &proposals {
-            if let Proposal::AppDataUpdate(update) = proposal
-                && matches!(update.operation(), AppDataUpdateOperation::Remove)
-            {
-                crate::app_components::validate_app_component_remove(
-                    mls_group,
-                    update.component_id(),
-                )?;
-            }
-        }
+        // Validate the proposal set as one operation. In particular, removal
+        // legality is based on the resulting requirement list so one Commit
+        // may atomically unrequire and remove an optional component.
+        crate::app_components::validate_app_data_update_batch(
+            mls_group,
+            proposals.iter().filter_map(|proposal| match proposal {
+                Proposal::AppDataUpdate(update) => Some(update.as_ref()),
+                _ => None,
+            }),
+        )?;
         let mut builder = mls_group
             .commit_builder()
             .propose_removals(removals)

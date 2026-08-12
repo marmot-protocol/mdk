@@ -23,6 +23,7 @@
 use openmls::framing::Sender;
 use openmls::group::MlsGroup;
 use openmls::prelude::{LeafNodeIndex, Proposal, QueuedProposal};
+use std::collections::BTreeMap;
 
 /// Decision returned by the policy.
 pub(crate) enum AutoCommitDecision {
@@ -35,6 +36,34 @@ pub(crate) enum AutoCommitDecision {
 pub(crate) struct AutoCommitDecisionReport {
     pub decision: AutoCommitDecision,
     pub reason: &'static str,
+}
+
+/// Return the candidate indexes selected for a new local SelfRemove-only
+/// Commit.
+///
+/// `member-departure.md` requires one deterministic choice when more than one
+/// distinct valid SelfRemove proposal names the same leaving leaf and source
+/// epoch. The caller scopes candidates to one source epoch; this helper groups
+/// by leaf and chooses the lexicographically lowest SHA-256 digest of the
+/// complete serialized proposal MLSMessage. Output is leaf-ordered so commit
+/// preparation is independent of arrival and map iteration order.
+pub(crate) fn select_lowest_digest_per_leaf(
+    candidates: &[(LeafNodeIndex, [u8; 32])],
+) -> Vec<usize> {
+    let mut selected: BTreeMap<u32, ([u8; 32], usize)> = BTreeMap::new();
+    for (index, (leaf, digest)) in candidates.iter().enumerate() {
+        match selected.get_mut(&leaf.u32()) {
+            Some((selected_digest, selected_index)) if digest < selected_digest => {
+                *selected_digest = *digest;
+                *selected_index = index;
+            }
+            None => {
+                selected.insert(leaf.u32(), (*digest, index));
+            }
+            _ => {}
+        }
+    }
+    selected.into_values().map(|(_, index)| index).collect()
 }
 
 /// Inspect a QueuedProposal and decide whether we should auto-commit.
@@ -157,6 +186,41 @@ fn pubkey_at_leaf_index(
     let mut out = [0u8; 32];
     out.copy_from_slice(id);
     PubkeyResult::Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_lowest_digest_per_leaf;
+    use openmls::prelude::LeafNodeIndex;
+
+    #[test]
+    fn self_remove_selection_is_lowest_digest_per_leaf_for_every_arrival_order() {
+        let candidates = [
+            (LeafNodeIndex::new(3), [0x90; 32]),
+            (LeafNodeIndex::new(1), [0x40; 32]),
+            (LeafNodeIndex::new(3), [0x10; 32]),
+        ];
+        for order in [
+            [0usize, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let permuted = order.map(|index| candidates[index]);
+            let selected = select_lowest_digest_per_leaf(&permuted);
+            let selected_values: Vec<_> =
+                selected.into_iter().map(|index| permuted[index]).collect();
+            assert_eq!(
+                selected_values,
+                vec![
+                    (LeafNodeIndex::new(1), [0x40; 32]),
+                    (LeafNodeIndex::new(3), [0x10; 32]),
+                ]
+            );
+        }
+    }
 }
 
 // The commit-staging work happens in `message_processor::ingest_group_message`

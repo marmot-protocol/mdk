@@ -1,8 +1,8 @@
 //! Message-record and message-subscription-update FFI conversions.
 
 use marmot_app::{
-    AppMessageRecord, ReceivedMessage, RuntimeMessageReceived, RuntimeMessageUpdate,
-    SecureDeleteExpiredResult,
+    AppMessageRecord, ReceivedMessage, RetentionSweepGroupOutcome, RetentionSweepReport,
+    RetentionSweepStatus, RuntimeMessageReceived, RuntimeMessageUpdate, SecureDeleteExpiredResult,
 };
 
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
@@ -20,7 +20,14 @@ pub struct AppMessageRecordFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub source_epoch: Option<u64>,
+    /// `None` means no recoverable source-epoch decision (legacy/safe retain).
+    /// `Some(0)` means retention was explicitly disabled.
+    pub retention_seconds: Option<u64>,
+    pub retention_expires_at: Option<u64>,
+    /// Sender-authenticated inner app-event timestamp.
     pub recorded_at: u64,
+    /// Local wall-clock time when this device observed the delivery.
     pub received_at: u64,
 }
 
@@ -36,6 +43,9 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
+            source_epoch: value.source_epoch,
+            retention_seconds: value.retention.map(|decision| decision.retention_seconds),
+            retention_expires_at: value.retention.and_then(|decision| decision.expires_at),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -45,14 +55,77 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct SecureDeleteExpiredResultFfi {
     pub pruned_messages: u64,
+    pub secrets_deleted: u64,
     pub media_ciphertext_sha256: Vec<String>,
+    pub erasure_pending: bool,
 }
 
 impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
     fn from(value: SecureDeleteExpiredResult) -> Self {
         Self {
             pruned_messages: value.pruned_messages,
+            secrets_deleted: value.secrets_deleted,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+            erasure_pending: value.erasure_pending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RetentionSweepStatusFfi {
+    NoExpiredMessages,
+    Pruned,
+    DeferredClockSkew,
+    DeferredUnread,
+    DeferredScanExhausted,
+    Failed,
+}
+
+impl From<RetentionSweepStatus> for RetentionSweepStatusFfi {
+    fn from(value: RetentionSweepStatus) -> Self {
+        match value {
+            RetentionSweepStatus::NoExpiredMessages => Self::NoExpiredMessages,
+            RetentionSweepStatus::Pruned => Self::Pruned,
+            RetentionSweepStatus::DeferredClockSkew => Self::DeferredClockSkew,
+            RetentionSweepStatus::DeferredUnread => Self::DeferredUnread,
+            RetentionSweepStatus::DeferredScanExhausted => Self::DeferredScanExhausted,
+            RetentionSweepStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RetentionSweepGroupOutcomeFfi {
+    pub group_id_hex: String,
+    pub status: RetentionSweepStatusFfi,
+    pub pruned_messages: u64,
+    pub secrets_deleted: u64,
+    pub media_ciphertext_sha256: Vec<String>,
+    pub failure_kind: Option<String>,
+}
+
+impl From<RetentionSweepGroupOutcome> for RetentionSweepGroupOutcomeFfi {
+    fn from(value: RetentionSweepGroupOutcome) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            status: value.status.into(),
+            pruned_messages: value.pruned_messages,
+            secrets_deleted: value.secrets_deleted,
+            media_ciphertext_sha256: value.media_ciphertext_sha256,
+            failure_kind: value.failure_kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RetentionSweepReportFfi {
+    pub groups: Vec<RetentionSweepGroupOutcomeFfi>,
+}
+
+impl From<RetentionSweepReport> for RetentionSweepReportFfi {
+    fn from(value: RetentionSweepReport) -> Self {
+        Self {
+            groups: value.groups.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -69,11 +142,14 @@ pub struct ReceivedMessageFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
-    /// Source-event timestamp (seconds since epoch) for the MLS-delivered
-    /// message. Clients should sort the timeline by this value so chronology
-    /// reflects send time, not delivery time. Zero means the timestamp was
-    /// unavailable at decode time.
+    pub source_epoch: u64,
+    /// `None` means the engine could not recover the historical source policy.
+    pub retention_seconds: Option<u64>,
+    pub retention_expires_at: Option<u64>,
+    /// Sender-authenticated inner app-event timestamp (seconds since epoch).
     pub recorded_at: u64,
+    /// Local wall-clock time when this device observed the delivery.
+    pub received_at: u64,
 }
 
 impl From<&ReceivedMessage> for ReceivedMessageFfi {
@@ -87,7 +163,11 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
+            source_epoch: value.source_epoch,
+            retention_seconds: value.retention.map(|decision| decision.retention_seconds),
+            retention_expires_at: value.retention.and_then(|decision| decision.expires_at),
             recorded_at: value.recorded_at,
+            received_at: value.received_at,
         }
     }
 }

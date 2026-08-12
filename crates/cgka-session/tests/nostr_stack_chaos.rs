@@ -7,7 +7,7 @@ use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, StaleReason};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId, TransportEndpoint, TransportMessage};
 use serde::Serialize;
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
@@ -57,10 +57,12 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
         .confirm_published(invite.pending)
         .await
         .unwrap();
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let commit_event = stack.take_next_published();
     let welcome_event = stack.take_next_published();
@@ -120,8 +122,8 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
         .expect("welcome replay should still route to Carol");
     assert!(matches!(
         carol_welcome_replay.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(carol_welcome_replay.effects.events.is_empty());
@@ -145,7 +147,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
     assert_eq!(bob.session.members(&group_id).unwrap().len(), 3);
 
     let carol_late_commit = take_effect_for(&mut commit_deliveries, &carol_account_id);
-    assert_peel_failed(&carol_late_commit);
+    assert_transport_deferred(&carol_late_commit);
 
     let mut replay_deliveries = stack
         .deliver_event_to_sessions(
@@ -175,10 +177,12 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
     let group_id = created.group_id.clone();
     publish_confirm_and_deliver_welcome(&stack, &mut alice, &mut bob, created).await;
     stack.sync_group(&bob, &group_id).await;
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let invite = invite_carol(&mut alice, &mut carol, &group_id).await;
     let commit_report = stack
@@ -260,7 +264,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
     assert_already_seen(&bob_shared_replay);
 
     let carol_late_commit = take_effect_for(&mut shared_replay, &carol_account_id);
-    assert_peel_failed(&carol_late_commit);
+    assert_transport_deferred(&carol_late_commit);
 }
 
 #[derive(Clone, Debug)]
@@ -559,8 +563,8 @@ impl ChaosRunState<'_> {
         if self.seen[message_index] {
             if !matches!(
                 ingest.outcome,
-                IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate
                 }
             ) {
                 self.failures.push(format!(
@@ -637,8 +641,8 @@ impl ChaosRunState<'_> {
         let payloads = message_payloads(&ingest);
         if !matches!(
             ingest.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
             }
         ) {
             self.failures.push(format!(
@@ -754,7 +758,7 @@ async fn publish_app_events(
             .await
             .unwrap();
         let message = match &sent.publish[0] {
-            PublishWork::ApplicationMessage { msg } => msg.clone(),
+            PublishWork::ApplicationMessage { msg, .. } => msg.clone(),
             other => panic!("expected application message publish work, got {other:?}"),
         };
         let report = stack
@@ -870,11 +874,11 @@ fn assert_already_seen(effects: &IngestEffects) {
     assert!(
         matches!(
             effects.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen
-                    | StaleReason::AlreadyAtEpoch { .. }
-                    | StaleReason::PeelFailed
-            }
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
+            } | IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            } | IngestOutcome::TransportDeferred { .. }
         ),
         "expected duplicate/stale epoch outcome, got {:?}",
         effects.outcome
@@ -882,15 +886,10 @@ fn assert_already_seen(effects: &IngestEffects) {
     assert!(effects.effects.events.is_empty());
 }
 
-fn assert_peel_failed(effects: &IngestEffects) {
+fn assert_transport_deferred(effects: &IngestEffects) {
     assert!(
-        matches!(
-            effects.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
-            }
-        ),
-        "unexpected peel failure outcome: {:?}",
+        matches!(effects.outcome, IngestOutcome::TransportDeferred { .. }),
+        "unexpected transport-deferred outcome: {:?}",
         effects.outcome
     );
     assert!(effects.effects.events.is_empty());

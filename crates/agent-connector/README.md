@@ -11,7 +11,9 @@ Hermes is the first supported adapter. OpenClaw is the second: a TypeScript chan
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
 connector. `wn-opencode` is a pure Rust harness at
 [`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
-OpenCode.
+OpenCode. `wn-pi` is the corresponding Pi harness at
+[`integrations/pi/marmot`](../../integrations/pi/marmot). Both use the shared hardened runtime in
+[`integrations/terminal-harness`](../../integrations/terminal-harness).
 
 ## Names
 
@@ -45,8 +47,10 @@ This crate does not own the stable control DTOs or stream composition rules. Kee
 Start the connector with the same public relay set the phone app uses:
 
 ```sh
+install -d -m 0700 ~/.marmot-agent/dev/outbound-media
 cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
+  --media-allowed-root ~/.marmot-agent/dev/outbound-media \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
@@ -73,6 +77,27 @@ Check the installed or locally built version with:
 ```sh
 wn-agent --version
 ```
+
+## Invite Policy
+
+Production connectors accept pending group invites only when the MLS-authenticated welcomer is on the configured
+`--allow-welcomer` list. An empty allowlist rejects every invite.
+
+Local development may use `--dev-allow-any-invites` together with `--debug-controls`. The connector warns when this
+mode is active and accepts any authenticated welcomer, but it still rejects a welcome whose authenticated author is
+missing. Do not enable either development option in production.
+
+## Outbound Media Paths
+
+Path-based media sends are denied unless `wn-agent` starts with one or more `--media-allowed-root PATH` options. The
+connector opens each root at startup, then accepts only regular files reached beneath that directory handle without
+following symlinks. Hermes and OpenClaw validate their original media source, stage a short-lived copy under
+`$MARMOT_OUTBOUND_MEDIA_DIR`, send that staged path, and remove it after the connector responds.
+
+Use a dedicated staging directory, never `/`, a home directory, or a broad application data tree. For split Unix
+users, make the gateway the directory owner and give the connector's shared group read/traverse access; staged files
+are created `0640`. In split-container deployments, mount the same directory read-write in the gateway and read-only
+in the connector. Omitting `--media-allowed-root` deliberately leaves media sends disabled.
 
 ## Hermes Install
 
@@ -143,6 +168,30 @@ private `wn-opencode.env`, and starts a same-user `wn-opencode` service where su
 uses `wn-agent-harnesses.service` on Linux or `org.marmot.wn-agent.harnesses` on macOS. `WN_OPENCODE_MAX_REPLY_BYTES`
 defaults to 30000 bytes per Marmot reply chunk.
 
+## Pi Harness Install
+
+The same WN Agent release publishes the `wn-pi` harness binary and installer. Pi itself must already be installed and
+authenticated.
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | bash
+```
+
+For repeatable noninteractive setup:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The Pi installer creates or reuses the isolated agent home at `~/.marmot-agents/pi`, writes a private `wn-pi.env`,
+and starts same-user `wn-agent` and `wn-pi` services where supported. Its connector service is `wn-agent-pi.service`
+on Linux or `org.marmot.wn-agent.pi` on macOS. Pi sessions default to
+`~/.marmot-agents/pi/dev/pi-sessions`, and `WN_PI_MAX_REPLY_BYTES` defaults to 30000 bytes per Marmot reply chunk.
+
+Pi-specific configuration and development commands live in
+[`integrations/pi/marmot/README.md`](../../integrations/pi/marmot/README.md).
+
 ## Cutting A WN Agent Release
 
 After the release commit is merged to `master`, cut a WN Agent release tag with:
@@ -171,31 +220,53 @@ Release.
 
 ## Control Plane Security
 
-The v1 control plane is local-only:
+The v2 control plane is local-only:
 
 - Unix socket only;
 - default parent directory mode `0700`;
 - default socket mode `0600`;
-- same effective UID required;
+- same effective UID required when no token is configured;
 - no TCP listener.
+
+Live-preview sessions have a second, narrower bearer boundary. `StreamBegin` requires a nonempty envelope request id
+and returns a fresh 256-bit capability. Every later stream operation must present that capability, which is compared
+without data-dependent early exit and is never logged or persisted. A begin retry must reuse its original request id;
+an exact retry returns the original capability, while a different request or a colliding stream id is rejected without
+replacing the active session.
 
 When the gateway and `wn-agent` run as different local service users, use a bearer token file plus group-readable socket
 modes:
 
 ```sh
-openssl rand -hex 32 > ~/.marmot-agent/control.token
-chmod 0600 ~/.marmot-agent/control.token
+sudo install -d -m 0750 -o root -g marmot-agent /etc/marmot-agent
+sudo sh -c 'umask 0137; openssl rand -hex 32 > /etc/marmot-agent/control.token'
+sudo chown root:marmot-agent /etc/marmot-agent/control.token
 
 cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
-  --auth-token-file ~/.marmot-agent/control.token \
+  --auth-token-file /etc/marmot-agent/control.token \
   --socket-dir-mode 0770 \
   --socket-mode 0660 \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
-export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agent/control.token"
+export MARMOT_AGENT_AUTH_TOKEN_FILE=/etc/marmot-agent/control.token
 ```
+
+The control token is intentionally all-or-nothing. When configured, it replaces the peer-UID decision: every request
+must present the token, and any process that can read it can subscribe to plaintext for every hosted account, send or
+delete messages as those accounts, create accounts, change allowlists, publish account material, transfer media, and
+use any enabled debug controls. There are no read-only, command, or per-account scopes.
+
+Same-UID authorization is also full-control; the token changes who may cross the boundary, not what an authorized
+client may do.
+
+Treat one connector and token as one trust boundary. Give the token only to one trusted gateway identity, keep the file
+owner-only (`0600`) where possible, and use group-read (`0640`) only for the specific split-user gateway deployment.
+Processes sharing that gateway UID inherit the same authority. If Hermes, OpenClaw, another plugin, or another tenant
+must not share full access, run a separate `wn-agent` with its own home, socket, token, and agent account instead of
+sharing this socket. Rotate the token after suspected disclosure, and never place it in logs, command arguments, source
+control, or a world-readable environment/config file.
 
 World-readable or world-writable socket modes are rejected. Split-host gateways need a later authenticated remote control
 plane; do not expose the Unix socket over TCP.
@@ -212,7 +283,10 @@ cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
 integrations/hermes/marmot/tests/test_dev_scripts.sh
+just opencode-installer-test
+just pi-installer-test
 ```
 
 Before checkpointing broader release work, run the normal repo checks from the root:

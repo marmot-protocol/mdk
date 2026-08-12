@@ -152,6 +152,11 @@ Initial requests:
 Important protocol rule: `StreamAppend` carries append-only text. If a gateway has full replacement text, the shim must
 compute the suffix before it calls `StreamAppend`.
 
+The implemented `marmot.agent-control.v2` stream lifecycle also binds every active stream to a random 256-bit bearer
+capability returned by `StreamBegin`. All later stream operations require it. The begin envelope id is a retry key:
+identical retries return the original receipt and capability, while conflicting retry inputs or an occupied explicit
+stream id are rejected without replacing the active session.
+
 If suffix computation fails, the shim has two v1 choices:
 
 - cancel the preview and send only a final message;
@@ -196,7 +201,9 @@ Deployment constraint:
 
 - Hermes/OpenClaw and `wn-agent` must run as the same Unix user with mode `0600`, or as local users in a shared Unix group
   with a configured auth token, mode `0660`, and a non-world-accessible parent directory.
-- No TCP control listener exists in v1. Split-host gateways require a later TLS-authenticated control plane.
+- The configured token replaces peer-UID authorization and grants every control operation for every hosted account. It
+  has no read-only, command, or per-account scopes; separate trust domains require separate connector instances.
+- No TCP control listener exists in v2. Split-host gateways require a later TLS-authenticated control plane.
 
 ## Workstream 4: Invite Authorization And Welcomer Metadata
 
@@ -230,7 +237,9 @@ Connector policy:
 
 - if `welcomer` is in the account allowlist, call `accept_group_invite`;
 - if `welcomer` is absent or not allowed, call `decline_group_invite`;
-- if `--allow-any` is set, accept all welcomes and log only aggregate counts;
+- if the development-only `--dev-allow-any-invites` and `--debug-controls` flags are both set, accept welcomes from
+  any authenticated welcomer and emit a privacy-safe warning;
+- a missing authenticated welcomer always fails closed, including in development mode;
 - empty allowlist means reject all welcomes.
 
 Decline currently means leave the group and archive local projection state. That is acceptable for v1, but the plan
@@ -373,7 +382,7 @@ Connector checks:
 
 - allowlist accepts an invite from an allowed welcomer;
 - allowlist declines an invite from an unknown welcomer;
-- missing welcomer fails closed unless `--allow-any` is set;
+- missing welcomer always fails closed, including with `--dev-allow-any-invites`;
 - decline leaves and archives the pending group projection;
 - `SubscribeInbound` filters by account and group;
 - final send produces a normal projected received message on another client;

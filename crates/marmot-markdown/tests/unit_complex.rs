@@ -8,8 +8,8 @@
 //! sibling unit tests; nothing here introduces new spec interpretations.
 
 use marmot_markdown::{
-    Alignment, AutolinkKind, Block, CodeBlockKind, Inline, ListItem, ListKind, NostrEntity,
-    NostrHrp, TableCell, parse,
+    Alignment, AutolinkKind, Block, CodeBlockKind, Inline, LinkDestinationKind, ListItem, ListKind,
+    NostrEntity, NostrHrp, TableCell, classify_link_destination, parse,
 };
 
 mod common;
@@ -23,6 +23,7 @@ fn link(dest: &str, title: Option<&str>, children: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: title.map(|s| s.to_string()),
         children,
+        classification: classify_link_destination(dest),
     }
 }
 fn image(dest: &str, alt: Vec<Inline>) -> Inline {
@@ -30,6 +31,7 @@ fn image(dest: &str, alt: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: None,
         alt,
+        classification: classify_link_destination(dest),
     }
 }
 fn npub(b32: &str) -> Inline {
@@ -45,7 +47,23 @@ fn nuri(hrp: NostrHrp, b32: &str) -> Inline {
     })
 }
 fn item(checked: Option<bool>, blocks: Vec<Block>) -> ListItem {
-    ListItem { blocks, checked }
+    let blank_lines_before = vec![0; blocks.len()];
+    ListItem {
+        blocks,
+        blank_lines_before,
+        checked,
+    }
+}
+fn item_with_gaps(
+    checked: Option<bool>,
+    blocks: Vec<Block>,
+    blank_lines_before: Vec<u8>,
+) -> ListItem {
+    ListItem {
+        blocks,
+        blank_lines_before,
+        checked,
+    }
 }
 fn bullet(marker: u8, tight: bool, items: Vec<ListItem>) -> Block {
     Block::List {
@@ -112,6 +130,7 @@ fn list_inside_blockquote_inside_list() {
                         true,
                         vec![item(None, vec![paragraph("inner")])],
                     )],
+                    blank_lines_before: vec![0],
                 }],
             )],
         )],
@@ -132,6 +151,7 @@ fn blockquote_inside_list_with_lazy_continuation() {
                 None,
                 vec![Block::BlockQuote {
                     blocks: vec![paragraph("foo\nbar")],
+                    blank_lines_before: vec![0],
                 }],
             )],
         )],
@@ -146,9 +166,12 @@ fn three_levels_of_blockquote() {
         vec![Block::BlockQuote {
             blocks: vec![Block::BlockQuote {
                 blocks: vec![Block::BlockQuote {
-                    blocks: vec![paragraph("deep")]
-                }]
+                    blocks: vec![paragraph("deep")],
+                    blank_lines_before: vec![0],
+                }],
+                blank_lines_before: vec![0],
             }],
+            blank_lines_before: vec![0],
         }],
     );
 }
@@ -192,13 +215,14 @@ fn fenced_code_inside_list_item() {
         vec![bullet(
             b'-',
             false,
-            vec![item(
+            vec![item_with_gaps(
                 None,
                 vec![
                     paragraph("before"),
                     fenced("rust", "fn x(){}\n"),
                     paragraph("after"),
                 ],
+                vec![0, 1, 1],
             )],
         )],
     );
@@ -213,7 +237,11 @@ fn indented_code_inside_list_item() {
         vec![bullet(
             b'-',
             false,
-            vec![item(None, vec![paragraph("text"), indented("x = 1\n")])],
+            vec![item_with_gaps(
+                None,
+                vec![paragraph("text"), indented("x = 1\n")],
+                vec![0, 1],
+            )],
         )],
     );
 }
@@ -307,6 +335,7 @@ fn backslash_hardbreak_inside_blockquote() {
             blocks: vec![Block::Paragraph {
                 inlines: vec![t("foo"), Inline::HardBreak, t("bar")],
             }],
+            blank_lines_before: vec![0],
         }],
     );
 }
@@ -359,6 +388,7 @@ fn autolink_and_nostr_uri_share_paragraph() {
             Inline::Autolink {
                 url: "https://example.com".into(),
                 kind: AutolinkKind::Uri,
+                classification: LinkDestinationKind::Web,
             },
             t(" and "),
             nuri(NostrHrp::Npub, &npub_str()),
@@ -494,6 +524,7 @@ fn heading_interrupts_paragraph_inside_blockquote() {
                     inlines: vec![t("bar")],
                 },
             ],
+            blank_lines_before: vec![0, 0],
         }],
     );
 }

@@ -1,18 +1,19 @@
 //! Active agent text-stream compose sessions, the debug final-send recorder, and idle sweeping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent_control::AgentControlDebugFinalSend;
+use agent_control::{AgentControlDebugFinalSend, AgentControlSendMaintenanceDisposition};
 use agent_stream_compose::StreamComposeCommand;
 use cgka_traits::GroupId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
@@ -27,7 +28,7 @@ impl DebugFinalSendStore {
         &self,
         mut send: AgentControlDebugFinalSend,
     ) -> AgentControlDebugFinalSend {
-        let mut sends = self.sends.lock().expect("debug final send lock poisoned");
+        let mut sends = crate::lock_recover(&self.sends);
         let next_id = sends.len() + 1;
         send.message_ids_hex = vec![format!("{next_id:064x}")];
         sends.push(send.clone());
@@ -35,10 +36,7 @@ impl DebugFinalSendStore {
     }
 
     pub(crate) fn list(&self) -> Vec<AgentControlDebugFinalSend> {
-        self.sends
-            .lock()
-            .expect("debug final send lock poisoned")
-            .clone()
+        crate::lock_recover(&self.sends).clone()
     }
 }
 
@@ -53,6 +51,15 @@ pub(crate) const SEND_IDEMPOTENCY_FILE: &str = "dev/send-idempotency.json";
 
 /// On-disk schema version for [`SEND_IDEMPOTENCY_FILE`].
 const SEND_IDEMPOTENCY_FILE_VERSION: u8 = 1;
+
+type SendIdempotencyGateKey = (String, String);
+type SendIdempotencyGates = Arc<Mutex<HashMap<SendIdempotencyGateKey, Weak<SendIdempotencyGate>>>>;
+type SendIdempotencyResult = (Vec<String>, AgentControlSendMaintenanceDisposition);
+
+struct SendIdempotencyGate {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    completed: Mutex<Option<SendIdempotencyResult>>,
+}
 
 /// Bounded FIFO map from a client-supplied idempotency key to a server-derived
 /// request fingerprint plus the durable message ids produced by the first
@@ -74,6 +81,31 @@ pub(crate) struct SendIdempotencyStore {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
     inner: Arc<Mutex<SendIdempotencyInner>>,
+    in_flight: SendIdempotencyGates,
+}
+
+pub(crate) enum SendIdempotencyAcquisition {
+    Completed(SendIdempotencyResult),
+    Leader(SendIdempotencyLeader),
+}
+
+pub(crate) struct SendIdempotencyLeader {
+    _guard: OwnedMutexGuard<()>,
+    gate: Arc<SendIdempotencyGate>,
+}
+
+impl SendIdempotencyLeader {
+    /// Publish the leader's successful result to callers that were already
+    /// waiting on this in-process gate. This remains transient so a sequential
+    /// reuse of a key with a different fingerprint keeps its legacy cache-miss
+    /// behavior.
+    pub(crate) fn complete(
+        &self,
+        message_ids: Vec<String>,
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
+    ) {
+        *crate::lock_recover(&self.gate.completed) = Some((message_ids, maintenance_disposition));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +113,8 @@ struct PersistedSendIdempotencyEntry {
     key: String,
     fingerprint: String,
     message_ids_hex: Vec<String>,
+    #[serde(default)]
+    maintenance_disposition: AgentControlSendMaintenanceDisposition,
     recorded_at: u64,
 }
 
@@ -93,7 +127,7 @@ struct PersistedSendIdempotencyFile {
 #[derive(Default)]
 struct SendIdempotencyInner {
     order: std::collections::VecDeque<String>,
-    seen: HashMap<String, (String, Vec<String>)>,
+    seen: HashMap<String, (String, Vec<String>, AgentControlSendMaintenanceDisposition)>,
     recorded_at: HashMap<String, u64>,
 }
 
@@ -103,6 +137,7 @@ impl SendIdempotencyStore {
             path: home.join(SEND_IDEMPOTENCY_FILE),
             lock: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         };
         store.load_from_disk();
         store
@@ -112,13 +147,84 @@ impl SendIdempotencyStore {
     /// when the recorded request `fingerprint` matches. A key hit with a different
     /// fingerprint returns `None` (treated as a cache miss).
     pub(crate) fn get(&self, key: &str, fingerprint: &str) -> Option<Vec<String>> {
-        self.inner
-            .lock()
-            .expect("send idempotency lock poisoned")
+        self.get_with_disposition(key, fingerprint)
+            .map(|(ids, _)| ids)
+    }
+
+    pub(crate) fn get_with_disposition(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Option<(Vec<String>, AgentControlSendMaintenanceDisposition)> {
+        crate::lock_recover(&self.inner)
             .seen
             .get(key)
-            .filter(|(recorded, _)| recorded == fingerprint)
-            .map(|(_, ids)| ids.clone())
+            .filter(|(recorded, _, _)| {
+                constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes())
+            })
+            .map(|(_, ids, disposition)| (ids.clone(), *disposition))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_participant_count(&self, key: &str, fingerprint: &str) -> usize {
+        crate::lock_recover(&self.in_flight)
+            .get(&(key.to_owned(), fingerprint.to_owned()))
+            .map_or(0, Weak::strong_count)
+    }
+
+    /// Serialize matching in-flight sends before their first external side
+    /// effect. A follower rechecks the committed cache and the transient gate
+    /// result after the leader exits; if the leader failed, the follower becomes
+    /// the next leader and may retry.
+    ///
+    /// The gate includes the fingerprint so the existing behavior for a reused
+    /// key with a different request body remains a cache miss rather than
+    /// blocking behind or reusing an unrelated send. A leader intentionally
+    /// holds its gate across the external send and result recording. Those
+    /// operations are not cancelled here because cancellation cannot prove that
+    /// an unrecallable send did not land; a follower instead receives
+    /// [`ConnectorError::SendInProgress`] after the bounded gate wait.
+    pub(crate) async fn acquire(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<SendIdempotencyAcquisition, ConnectorError> {
+        if let Some(result) = self.get_with_disposition(key, fingerprint) {
+            return Ok(SendIdempotencyAcquisition::Completed(result));
+        }
+
+        let gate_key = (key.to_owned(), fingerprint.to_owned());
+        let gate = {
+            let mut in_flight = crate::lock_recover(&self.in_flight);
+            in_flight.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = in_flight.get(&gate_key).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(SendIdempotencyGate {
+                    lock: Arc::new(tokio::sync::Mutex::new(())),
+                    completed: Mutex::new(None),
+                });
+                in_flight.insert(gate_key, Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let guard = crate::with_control_operation_timeout(
+            "send_idempotency_wait",
+            Arc::clone(&gate.lock).lock_owned(),
+        )
+        .await
+        .map_err(|_| ConnectorError::SendInProgress)?;
+
+        if let Some(result) = self.get_with_disposition(key, fingerprint) {
+            return Ok(SendIdempotencyAcquisition::Completed(result));
+        }
+        if let Some(result) = crate::lock_recover(&gate.completed).clone() {
+            return Ok(SendIdempotencyAcquisition::Completed(result));
+        }
+        Ok(SendIdempotencyAcquisition::Leader(SendIdempotencyLeader {
+            _guard: guard,
+            gate,
+        }))
     }
 
     /// Record the request `fingerprint` and durable message ids produced for
@@ -126,8 +232,23 @@ impl SendIdempotencyStore {
     /// first successful send wins); otherwise the key is appended and the oldest
     /// is evicted once at capacity.
     pub(crate) fn record(&self, key: String, fingerprint: String, message_ids: Vec<String>) {
+        self.record_with_disposition(
+            key,
+            fingerprint,
+            message_ids,
+            AgentControlSendMaintenanceDisposition::Ready,
+        );
+    }
+
+    pub(crate) fn record_with_disposition(
+        &self,
+        key: String,
+        fingerprint: String,
+        message_ids: Vec<String>,
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
+    ) {
         let should_persist = {
-            let mut inner = self.inner.lock().expect("send idempotency lock poisoned");
+            let mut inner = crate::lock_recover(&self.inner);
             if inner.seen.contains_key(&key) {
                 return;
             }
@@ -137,7 +258,10 @@ impl SendIdempotencyStore {
                 inner.seen.remove(&evicted);
                 inner.recorded_at.remove(&evicted);
             }
-            inner.seen.insert(key.clone(), (fingerprint, message_ids));
+            inner.seen.insert(
+                key.clone(),
+                (fingerprint, message_ids, maintenance_disposition),
+            );
             inner.recorded_at.insert(key.clone(), unix_timestamp_secs());
             inner.order.push_back(key);
             true
@@ -177,7 +301,7 @@ impl SendIdempotencyStore {
     }
 
     fn load_from_disk(&self) {
-        let _guard = self.lock.lock().expect("send idempotency lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == ErrorKind::NotFound => return,
@@ -194,8 +318,7 @@ impl SendIdempotencyStore {
         };
         match serde_json::from_slice::<PersistedSendIdempotencyFile>(&bytes) {
             Ok(file) if file.version == SEND_IDEMPOTENCY_FILE_VERSION => {
-                *self.inner.lock().expect("send idempotency lock poisoned") =
-                    inner_from_persisted(file.entries);
+                *crate::lock_recover(&self.inner) = inner_from_persisted(file.entries);
             }
             Ok(_unsupported) => {
                 tracing::warn!(
@@ -217,17 +340,19 @@ impl SendIdempotencyStore {
     }
 
     fn persist_to_disk(&self) -> Result<(), ConnectorError> {
-        let _guard = self.lock.lock().expect("send idempotency lock poisoned");
-        let inner = self.inner.lock().expect("send idempotency lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
+        let inner = crate::lock_recover(&self.inner);
         let entries = inner
             .order
             .iter()
             .filter_map(|key| {
-                let (fingerprint, message_ids_hex) = inner.seen.get(key)?;
+                let (fingerprint, message_ids_hex, maintenance_disposition) =
+                    inner.seen.get(key)?;
                 Some(PersistedSendIdempotencyEntry {
                     key: key.clone(),
                     fingerprint: fingerprint.clone(),
                     message_ids_hex: message_ids_hex.clone(),
+                    maintenance_disposition: *maintenance_disposition,
                     recorded_at: *inner.recorded_at.get(key).unwrap_or(&0),
                 })
             })
@@ -235,8 +360,11 @@ impl SendIdempotencyStore {
         drop(inner);
 
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            // Create missing directories privately, but preserve an existing
+            // operator-selected mode: this is also the control-socket parent
+            // and may intentionally be group-traversable with token auth.
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700).create(parent)?;
         }
         let temp_path = self.path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(&PersistedSendIdempotencyFile {
@@ -290,7 +418,11 @@ fn inner_from_persisted(entries: Vec<PersistedSendIdempotencyEntry>) -> SendIdem
         }
         inner.seen.insert(
             entry.key.clone(),
-            (entry.fingerprint, entry.message_ids_hex),
+            (
+                entry.fingerprint,
+                entry.message_ids_hex,
+                entry.maintenance_disposition,
+            ),
         );
         inner
             .recorded_at
@@ -307,9 +439,83 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = u8::from(left.len() != right.len());
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
+}
+
+const STREAM_BEGIN_RECEIPT_CAPACITY: usize = 1024;
+
 #[derive(Clone, Default)]
 pub(crate) struct StreamSessionStore {
     sessions: Arc<Mutex<HashMap<String, ActiveStreamSession>>>,
+    begin_receipts: Arc<Mutex<StreamBeginReceiptStore>>,
+}
+
+#[derive(Default)]
+struct StreamBeginReceiptStore {
+    order: VecDeque<String>,
+    by_request_id: HashMap<String, StreamBeginReceipt>,
+    in_flight_by_request_id: HashMap<String, InFlightStreamBegin>,
+    reserved_stream_ids: HashSet<String>,
+}
+
+struct InFlightStreamBegin {
+    fingerprint: String,
+    stream_id_hex: String,
+    completion: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StreamBeginReceipt {
+    pub(crate) fingerprint: String,
+    pub(crate) stream_id_hex: String,
+    pub(crate) stream_capability: String,
+    pub(crate) start_message_id_hex: String,
+    pub(crate) quic_candidates: Vec<String>,
+    pub(crate) policy_max_plaintext_frame_len: Option<u32>,
+}
+
+pub(crate) enum StreamBeginReservation {
+    Completed(StreamBeginReceipt),
+    Wait(watch::Receiver<bool>),
+    Leader {
+        stream_id: Vec<u8>,
+        stream_id_hex: String,
+        guard: StreamBeginReservationGuard,
+    },
+}
+
+pub(crate) struct StreamBeginReservationGuard {
+    store: StreamSessionStore,
+    request_id: String,
+    stream_id_hex: String,
+    active: bool,
+}
+
+impl StreamBeginReservationGuard {
+    pub(crate) fn complete(mut self, receipt: StreamBeginReceipt) {
+        let completed =
+            self.store
+                .complete_stream_begin(&self.request_id, &self.stream_id_hex, receipt);
+        debug_assert!(completed, "active StreamBegin reservation must still exist");
+        self.active = !completed;
+    }
+}
+
+impl Drop for StreamBeginReservationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.store
+                .release_stream_begin(&self.request_id, &self.stream_id_hex);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -317,6 +523,7 @@ pub(crate) struct ActiveStreamSession {
     pub(crate) account_label: String,
     pub(crate) group_id: GroupId,
     pub(crate) stream_id: Vec<u8>,
+    pub(crate) stream_capability: [u8; 32],
     pub(crate) start_message_id_hex: String,
     pub(crate) tx: mpsc::Sender<StreamComposeCommand>,
     pub(crate) cancel_tx: mpsc::Sender<()>,
@@ -342,34 +549,166 @@ pub(crate) struct FinalizedStream {
 }
 
 impl StreamSessionStore {
-    pub(crate) fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
-        if let Some(previous) = sessions.insert(stream_id_hex, session) {
-            // Graceful cancel over the dedicated signal: let the replaced
-            // session emit its live Abort and self-terminate. The cancel signal
-            // can't be starved by a full command queue, so only force-abort if
-            // the cancel channel itself is gone.
-            match previous.cancel_tx.try_send(()) {
-                // Delivered, or a cancel is already queued (`Full`): the session
-                // will still observe a cancel and emit its `Abort`, so leave it
-                // to self-terminate gracefully.
-                Ok(()) | Err(TrySendError::Full(())) => {}
-                // The receiver is gone: the session can no longer publish an
-                // `Abort`, so force-abort the task to reclaim its resources.
-                Err(TrySendError::Closed(())) => previous.abort.abort(),
-            }
+    pub(crate) fn insert_new(
+        &self,
+        stream_id_hex: String,
+        session: ActiveStreamSession,
+    ) -> Result<(), ConnectorError> {
+        let mut sessions = crate::lock_recover(&self.sessions);
+        if sessions.contains_key(&stream_id_hex) {
+            return Err(ConnectorError::StreamIdInUse);
         }
+        sessions.insert(stream_id_hex, session);
+        Ok(())
     }
 
-    pub(crate) fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
+    pub(crate) fn get_authorized(
+        &self,
+        stream_id_hex: &str,
+        stream_capability: &str,
+    ) -> Result<ActiveStreamSession, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
-        let session = sessions.get_mut(&stream_id_hex).ok_or_else(|| {
-            ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
-        })?;
+        let mut sessions = crate::lock_recover(&self.sessions);
+        let session = sessions
+            .get_mut(&stream_id_hex)
+            .ok_or(ConnectorError::StreamCapabilityDenied)?;
+        if !stream_capability_matches(&session.stream_capability, stream_capability) {
+            return Err(ConnectorError::StreamCapabilityDenied);
+        }
         // Touching the session on any command keeps it alive against the idle sweep.
         session.last_activity = Instant::now();
         Ok(session.clone())
+    }
+
+    pub(crate) fn reserve_stream_begin(
+        &self,
+        request_id: String,
+        fingerprint: String,
+        requested_stream_id_hex: Option<String>,
+    ) -> Result<StreamBeginReservation, ConnectorError> {
+        // Keep the lock order stable: active sessions first, then begin state.
+        // No DNS, runtime, or broker work runs while either mutex is held.
+        let sessions = crate::lock_recover(&self.sessions);
+        let mut receipts = crate::lock_recover(&self.begin_receipts);
+
+        if let Some(receipt) = receipts.by_request_id.get(&request_id) {
+            if !constant_time_eq(receipt.fingerprint.as_bytes(), fingerprint.as_bytes()) {
+                return Err(ConnectorError::StreamBeginRequestConflict);
+            }
+            return Ok(StreamBeginReservation::Completed(receipt.clone()));
+        }
+        if let Some(in_flight) = receipts.in_flight_by_request_id.get(&request_id) {
+            if !constant_time_eq(in_flight.fingerprint.as_bytes(), fingerprint.as_bytes()) {
+                return Err(ConnectorError::StreamBeginRequestConflict);
+            }
+            return Ok(StreamBeginReservation::Wait(
+                in_flight.completion.subscribe(),
+            ));
+        }
+
+        let (stream_id, stream_id_hex) = if let Some(stream_id_hex) = requested_stream_id_hex {
+            if sessions.contains_key(&stream_id_hex)
+                || receipts.reserved_stream_ids.contains(&stream_id_hex)
+                || receipts
+                    .by_request_id
+                    .values()
+                    .any(|receipt| receipt.stream_id_hex == stream_id_hex)
+            {
+                return Err(ConnectorError::StreamIdInUse);
+            }
+            (hex::decode(&stream_id_hex)?, stream_id_hex)
+        } else {
+            loop {
+                let stream_id = transport_quic_stream::random_stream_id();
+                let stream_id_hex = hex::encode(&stream_id);
+                if !sessions.contains_key(&stream_id_hex)
+                    && !receipts.reserved_stream_ids.contains(&stream_id_hex)
+                    && !receipts
+                        .by_request_id
+                        .values()
+                        .any(|receipt| receipt.stream_id_hex == stream_id_hex)
+                {
+                    break (stream_id, stream_id_hex);
+                }
+            }
+        };
+        let (completion, _receiver) = watch::channel(false);
+        receipts.reserved_stream_ids.insert(stream_id_hex.clone());
+        receipts.in_flight_by_request_id.insert(
+            request_id.clone(),
+            InFlightStreamBegin {
+                fingerprint,
+                stream_id_hex: stream_id_hex.clone(),
+                completion,
+            },
+        );
+        drop(receipts);
+        drop(sessions);
+
+        Ok(StreamBeginReservation::Leader {
+            stream_id,
+            stream_id_hex: stream_id_hex.clone(),
+            guard: StreamBeginReservationGuard {
+                store: self.clone(),
+                request_id,
+                stream_id_hex,
+                active: true,
+            },
+        })
+    }
+
+    fn complete_stream_begin(
+        &self,
+        request_id: &str,
+        stream_id_hex: &str,
+        receipt: StreamBeginReceipt,
+    ) -> bool {
+        let mut receipts = crate::lock_recover(&self.begin_receipts);
+        let matches = receipts
+            .in_flight_by_request_id
+            .get(request_id)
+            .is_some_and(|in_flight| in_flight.stream_id_hex == stream_id_hex);
+        if !matches {
+            return false;
+        }
+        let completion = receipts
+            .in_flight_by_request_id
+            .remove(request_id)
+            .expect("checked in-flight reservation")
+            .completion;
+        receipts.reserved_stream_ids.remove(stream_id_hex);
+        if !receipts.by_request_id.contains_key(request_id) {
+            if receipts.order.len() >= STREAM_BEGIN_RECEIPT_CAPACITY
+                && let Some(evicted) = receipts.order.pop_front()
+            {
+                receipts.by_request_id.remove(&evicted);
+            }
+            receipts.order.push_back(request_id.to_owned());
+            receipts
+                .by_request_id
+                .insert(request_id.to_owned(), receipt);
+        }
+        drop(receipts);
+        let _ = completion.send(true);
+        true
+    }
+
+    fn release_stream_begin(&self, request_id: &str, stream_id_hex: &str) {
+        let mut receipts = crate::lock_recover(&self.begin_receipts);
+        let matches = receipts
+            .in_flight_by_request_id
+            .get(request_id)
+            .is_some_and(|in_flight| in_flight.stream_id_hex == stream_id_hex);
+        if !matches {
+            return;
+        }
+        let in_flight = receipts
+            .in_flight_by_request_id
+            .remove(request_id)
+            .expect("checked in-flight reservation");
+        receipts.reserved_stream_ids.remove(stream_id_hex);
+        drop(receipts);
+        let _ = in_flight.completion.send(true);
     }
 
     /// Remove the entry for `stream_id_hex` only when it is still the same
@@ -384,7 +723,7 @@ impl StreamSessionStore {
         stream_id_hex: &str,
         session: &ActiveStreamSession,
     ) -> Option<ActiveStreamSession> {
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         match sessions.get(stream_id_hex) {
             Some(entry) if entry.tx.same_channel(&session.tx) => sessions.remove(stream_id_hex),
             _ => None,
@@ -407,7 +746,7 @@ impl StreamSessionStore {
         session: &ActiveStreamSession,
         finalized: FinalizedStream,
     ) -> bool {
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         match sessions.get_mut(stream_id_hex) {
             Some(entry) if entry.tx.same_channel(&session.tx) => {
                 entry.finalized = Some(finalized);
@@ -418,18 +757,56 @@ impl StreamSessionStore {
         }
     }
 
+    pub(crate) fn remove_authorized(
+        &self,
+        stream_id_hex: &str,
+        stream_capability: &str,
+    ) -> Result<ActiveStreamSession, ConnectorError> {
+        let stream_id_hex = normalize_hex(stream_id_hex)?;
+        let mut sessions = crate::lock_recover(&self.sessions);
+        let session = sessions
+            .get(&stream_id_hex)
+            .ok_or(ConnectorError::StreamCapabilityDenied)?;
+        if !stream_capability_matches(&session.stream_capability, stream_capability) {
+            return Err(ConnectorError::StreamCapabilityDenied);
+        }
+        sessions
+            .remove(&stream_id_hex)
+            .ok_or(ConnectorError::StreamCapabilityDenied)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_for_test(
+        &self,
+        stream_id_hex: &str,
+    ) -> Result<ActiveStreamSession, ConnectorError> {
+        let stream_id_hex = normalize_hex(stream_id_hex)?;
+        crate::lock_recover(&self.sessions)
+            .get(&stream_id_hex)
+            .cloned()
+            .ok_or(ConnectorError::StreamCapabilityDenied)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
+        self.insert_new(stream_id_hex, session)
+            .expect("test stream id must be unused");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
+        self.get_for_test(stream_id_hex)
+    }
+
+    #[cfg(test)]
     pub(crate) fn remove(
         &self,
         stream_id_hex: &str,
     ) -> Result<ActiveStreamSession, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        self.sessions
-            .lock()
-            .expect("stream session lock poisoned")
+        crate::lock_recover(&self.sessions)
             .remove(&stream_id_hex)
-            .ok_or_else(|| {
-                ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
-            })
+            .ok_or(ConnectorError::StreamCapabilityDenied)
     }
 
     /// Abort and drop every session whose last activity is older than `max_idle`.
@@ -448,7 +825,7 @@ impl StreamSessionStore {
     /// finish succeeds or the connector restarts.
     pub(crate) fn sweep_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         let stale: Vec<String> = sessions
             .iter()
             .filter(|(_, session)| {
@@ -475,4 +852,25 @@ impl StreamSessionStore {
         }
         stale.len()
     }
+}
+
+fn stream_capability_matches(expected: &[u8; 32], provided_hex: &str) -> bool {
+    let decoded = hex::decode(provided_hex).unwrap_or_default();
+    let mut provided = [0u8; 32];
+    if decoded.len() == provided.len() {
+        provided.copy_from_slice(&decoded);
+    }
+    let mut difference = u8::from(decoded.len() != provided.len());
+    for (expected_byte, provided_byte) in expected.iter().zip(provided) {
+        difference |= expected_byte ^ provided_byte;
+    }
+    difference == 0
+}
+
+pub(crate) fn normalize_stream_capability(provided_hex: &str) -> Result<String, ConnectorError> {
+    let decoded = hex::decode(provided_hex).map_err(|_| ConnectorError::StreamCapabilityDenied)?;
+    if decoded.len() != 32 {
+        return Err(ConnectorError::StreamCapabilityDenied);
+    }
+    Ok(hex::encode(decoded))
 }

@@ -1,20 +1,88 @@
 //! Durable persistence, dedup classification, and stored-message state
 //! transitions for the ingest/send paths of [`Engine`].
 
-use super::content_dedup_id;
+use super::{MAX_DEFERRED_ROWS_PER_SWEEP, content_dedup_id};
 use crate::engine::Engine;
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome, InputRejectionCategory};
+use cgka_traits::message::{
+    DeferredPeelLifecycle, MessageRecord, MessageState, OwnApplicationConvergenceStamp,
+    StoredMessagePayload,
+};
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
+
+fn fresh_deferred_peel_lifecycle(
+    now: crate::convergence_clock::ConvergenceTime,
+    convergence_clock_instance_id: u64,
+    deferred_peel_residence_ms: u64,
+) -> DeferredPeelLifecycle {
+    DeferredPeelLifecycle {
+        first_observed_wall_ms: now.wall_ms,
+        wall_high_water_ms: now.wall_ms,
+        clock_instance_id: convergence_clock_instance_id,
+        residence_deadline_monotonic_ms: now
+            .monotonic_ms
+            .saturating_add(deferred_peel_residence_ms),
+        residence_deadline_wall_ms: now.wall_ms.saturating_add(deferred_peel_residence_ms),
+        distinct_context_attempts: 0,
+        last_context_fingerprint: None,
+    }
+}
+
+/// Return the effective deferred-peel lifecycle for the current clock domain.
+///
+/// This is the single source of truth for legacy-row initialization and
+/// restart rebasing. Runtime maintenance persists the returned value when
+/// `changed` is true; conformance diagnostics use the same normalized copy
+/// without mutating storage.
+pub(crate) fn normalized_deferred_peel_lifecycle(
+    lifecycle: Option<&DeferredPeelLifecycle>,
+    now: crate::convergence_clock::ConvergenceTime,
+    convergence_clock_instance_id: u64,
+    deferred_peel_residence_ms: u64,
+) -> (DeferredPeelLifecycle, bool) {
+    let Some(lifecycle) = lifecycle else {
+        return (
+            fresh_deferred_peel_lifecycle(
+                now,
+                convergence_clock_instance_id,
+                deferred_peel_residence_ms,
+            ),
+            true,
+        );
+    };
+
+    let mut normalized = lifecycle.clone();
+    if normalized.clock_instance_id == convergence_clock_instance_id {
+        return (normalized, false);
+    }
+
+    // Monotonic values do not survive restart. Preserve elapsed wall
+    // residence through a high-water mark. If wall time moved backwards,
+    // using the prior high water prevents premature expiry.
+    let observed_wall = normalized.wall_high_water_ms.max(now.wall_ms);
+    let remaining = normalized
+        .residence_deadline_wall_ms
+        .saturating_sub(observed_wall);
+    normalized.clock_instance_id = convergence_clock_instance_id;
+    normalized.residence_deadline_monotonic_ms = now.monotonic_ms.saturating_add(remaining);
+    normalized.wall_high_water_ms = observed_wall;
+    (normalized, true)
+}
 
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn recorded_message_outcome(
         &self,
         id: &MessageId,
     ) -> Result<Option<IngestOutcome>, EngineError> {
+        if self.storage.has_ingress_dedup_marker(id)? {
+            return Ok(Some(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
+            }));
+        }
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
             Err(StorageError::NotFound) => return Ok(None),
@@ -22,19 +90,34 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         let outcome = match record.state {
-            MessageState::Sent => IngestOutcome::Stale {
-                reason: StaleReason::OwnEcho,
+            MessageState::Sent => IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho,
             },
+            MessageState::Created | MessageState::Retryable
+                if crate::openmls_projection::decode_openmls_wire_projection(&record.payload)
+                    .is_some_and(|(_, projection)| {
+                        projection.kind == crate::openmls_projection::OpenMlsContentKind::Proposal
+                    }) =>
+            {
+                // Retained standalone proposals stay Created/Retryable until
+                // convergence consumes or invalidates them, but byte-identical
+                // transport repeats are still duplicates. Internal replay
+                // bypasses this outer durable-dedup seam.
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
+                }
+            }
             MessageState::Created | MessageState::Retryable => IngestOutcome::Buffered {
                 group_id: record.group_id,
                 epoch: record.epoch,
             },
             MessageState::PeelDeferred => return Ok(None),
-            MessageState::Processed | MessageState::Failed | MessageState::EpochInvalidated => {
-                IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen,
-                }
-            }
+            MessageState::Processed
+            | MessageState::Failed
+            | MessageState::ConvergenceDeferred
+            | MessageState::EpochInvalidated => IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
+            },
         };
         Ok(Some(outcome))
     }
@@ -55,6 +138,31 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    /// Whether the raw transport row `id` is STILL awaiting retry as of its
+    /// *current* stored state — the same `Created | Retryable | PeelDeferred`
+    /// set the replay / deferred-peel loops admit at entry.
+    ///
+    /// Retirement paths re-read through this rather than trusting a row state
+    /// snapshotted before re-ingest: `ingest_group_message` can commit a
+    /// terminal state to this same row during the call (e.g. the `SelfEvicted`
+    /// path persists it `Failed`, `ingest.rs`), and that verdict is
+    /// authoritative — overwriting it with `Processed` would relabel a row we
+    /// were evicted on as a canonicalization input. A vanished row
+    /// (`NotFound`) is not awaiting retry.
+    pub(crate) fn raw_transport_row_awaiting_retry(
+        &self,
+        id: &MessageId,
+    ) -> Result<bool, EngineError> {
+        match self.storage.get_message(id) {
+            Ok(record) => Ok(matches!(
+                record.state,
+                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
+            )),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(EngineError::Storage(e)),
+        }
+    }
+
     pub(crate) fn record_sent_message(
         &mut self,
         msg: &TransportMessage,
@@ -72,20 +180,73 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
-        self.sent_message_ids.insert(msg.id.clone());
+        self.record_sent_openmls_message_with_application_stamp(
+            msg, mls_bytes, group_id, epoch, None,
+        )
+    }
+
+    pub(crate) fn record_sent_openmls_application_message(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+        stamp: OwnApplicationConvergenceStamp,
+    ) -> Result<(), EngineError> {
+        self.record_sent_openmls_message_with_application_stamp(
+            msg,
+            mls_bytes,
+            group_id,
+            epoch,
+            Some(stamp),
+        )
+    }
+
+    fn record_sent_openmls_message_with_application_stamp(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+        application_stamp: Option<OwnApplicationConvergenceStamp>,
+    ) -> Result<(), EngineError> {
         // Also remember and persist the content-derived id so our own commit /
         // app message echoed back inside a freshly re-wrapped transport envelope
         // (different transport id) is still classified `OwnEcho` by the
         // post-peel content check after the hot-process cache misses or the
         // engine restarts.
         let content_id = content_dedup_id(mls_bytes);
-        self.sent_message_ids.insert(content_id.clone());
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
         };
-        self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)?;
-        self.persist_sent_openmls_content_marker(&openmls_msg, content_id, group_id, epoch)
+        self.storage.with_transaction(|_storage| {
+            let payload = match application_stamp {
+                Some(stamp) => StoredMessagePayload::signed_openmls_application_wire(
+                    msg.clone(),
+                    openmls_msg.clone(),
+                    stamp,
+                ),
+                None => StoredMessagePayload::signed_openmls_wire(msg.clone(), openmls_msg.clone()),
+            };
+            self.persist_stored_message_payload(
+                msg.id.clone(),
+                group_id,
+                epoch,
+                MessageState::Sent,
+                payload,
+            )?;
+            self.persist_sent_openmls_content_marker(
+                &openmls_msg,
+                content_id.clone(),
+                group_id,
+                epoch,
+            )
+        })?;
+        // Do not seed the hot-process cache until both durable rows commit.
+        self.sent_message_ids.insert(msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        Ok(())
     }
 
     pub(crate) fn record_sent_openmls_message_with_leave_request(
@@ -96,11 +257,12 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
         request: &LeaveRequest,
     ) -> Result<(), EngineError> {
+        let content_id = content_dedup_id(mls_bytes);
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
         };
-        let payload = StoredMessagePayload::openmls_wire(openmls_msg.clone())
+        let payload = StoredMessagePayload::signed_openmls_wire(msg.clone(), openmls_msg.clone())
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         let record = MessageRecord {
@@ -109,6 +271,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state: MessageState::Sent,
             payload,
+            deferred_peel: None,
         };
         let previous = match self.storage.get_message(&record.id) {
             Ok(record) => Some(record),
@@ -118,13 +281,18 @@ impl<S: StorageProvider> Engine<S> {
         self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
             storage.put_leave_request(request)?;
-            Ok::<_, EngineError>(())
+            self.persist_sent_openmls_content_marker(
+                &openmls_msg,
+                content_id.clone(),
+                group_id,
+                epoch,
+            )
         })?;
 
+        // Do not seed any hot-process sent/leave state until all durable rows
+        // commit together.
         self.sent_message_ids.insert(msg.id.clone());
-        let content_id = content_dedup_id(mls_bytes);
-        self.sent_message_ids.insert(content_id.clone());
-        self.persist_sent_openmls_content_marker(&openmls_msg, content_id, group_id, epoch)?;
+        self.sent_message_ids.insert(content_id);
         self.leaving_groups.insert(request.group_id.clone());
         self.leave_requests
             .insert(request.group_id.clone(), request.clone());
@@ -185,7 +353,21 @@ impl<S: StorageProvider> Engine<S> {
         state: MessageState,
     ) -> Result<(), EngineError> {
         match self.storage.get_group(group_id) {
-            Ok(_) => self.persist_transport_message(msg, group_id, epoch, state),
+            Ok(_) => {
+                // An own transport echo must not erase the delivery-aware
+                // payload flavor of a retained outbound Welcome. The row is
+                // already durable when its id enters `sent_message_ids`.
+                if self
+                    .storage
+                    .get_message(&msg.id)
+                    .ok()
+                    .and_then(|record| StoredMessagePayload::decode(&record.payload).ok())
+                    .is_some_and(|payload| payload.as_outbound_welcome().is_some())
+                {
+                    return Ok(());
+                }
+                self.persist_transport_message(msg, group_id, epoch, state)
+            }
             Err(StorageError::NotFound) => Ok(()),
             Err(e) => Err(EngineError::Storage(e)),
         }
@@ -221,6 +403,21 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(EngineError::Storage(err)),
         };
+        let deferred_peel = if state == MessageState::PeelDeferred {
+            previous
+                .as_ref()
+                .and_then(|record| record.deferred_peel.clone())
+                .or_else(|| {
+                    let now = self.convergence_now();
+                    Some(fresh_deferred_peel_lifecycle(
+                        now,
+                        self.convergence_clock_instance_id,
+                        self.deferred_peel_residence_ms,
+                    ))
+                })
+        } else {
+            None
+        };
         let payload = payload
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -234,6 +431,7 @@ impl<S: StorageProvider> Engine<S> {
                 && record.epoch == epoch
                 && record.state == state
                 && record.payload == payload
+                && record.deferred_peel == deferred_peel
         }) {
             return Ok(());
         }
@@ -243,6 +441,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             payload,
+            deferred_peel,
         })?;
         self.audit_group(
             group_id,
@@ -277,6 +476,109 @@ impl<S: StorageProvider> Engine<S> {
             self.audit(event);
         }
         Ok(())
+    }
+
+    /// Normalize legacy/restarted lifecycle rows and persist at most one
+    /// sweep-sized slice. Returns whether additional normalized rows remain
+    /// to be persisted by a later scheduler tick.
+    pub(super) fn normalize_deferred_peel_lifecycles(
+        &self,
+        records: &mut [MessageRecord],
+        now: crate::convergence_clock::ConvergenceTime,
+    ) -> Result<bool, EngineError> {
+        let mut persisted = 0usize;
+        let mut normalization_pending = false;
+        for record in records {
+            let (lifecycle, changed) = normalized_deferred_peel_lifecycle(
+                record.deferred_peel.as_ref(),
+                now,
+                self.convergence_clock_instance_id,
+                self.deferred_peel_residence_ms,
+            );
+            record.deferred_peel = Some(lifecycle);
+            if changed {
+                if persisted < MAX_DEFERRED_ROWS_PER_SWEEP {
+                    self.storage.put_message(record)?;
+                    persisted += 1;
+                } else {
+                    normalization_pending = true;
+                }
+            }
+        }
+        Ok(normalization_pending)
+    }
+
+    pub(super) fn release_deferred_peel_row(
+        &mut self,
+        record: &MessageRecord,
+        resource: InboundResourceLimit,
+        disposition: crate::message_disposition::MessageDisposition,
+    ) -> Result<(), EngineError> {
+        let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            u64::from(lifecycle.distinct_context_attempts)
+        });
+        let residence_ms = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            lifecycle
+                .wall_high_water_ms
+                .max(self.convergence_now().wall_ms)
+                .saturating_sub(lifecycle.first_observed_wall_ms)
+        });
+        self.storage.delete_message(&record.id)?;
+        self.audit_group(
+            &record.group_id,
+            crate::audit_helpers::deferred_peel_resource_refused_event(
+                hex::encode(record.id.as_slice()),
+                Some(record.epoch),
+                disposition.tag(),
+                retry_count,
+                residence_ms,
+            ),
+        );
+        self.events_buf
+            .push_back(GroupEvent::TransportObjectResourceRefused {
+                group_id: record.group_id.clone(),
+                message_id: record.id.clone(),
+                resource,
+            });
+        self.note_peel_deferred_row_retired(&record.group_id);
+        Ok(())
+    }
+
+    pub(crate) fn mark_raw_transport_message_failed_if_awaiting_retry(
+        &mut self,
+        raw_msg_id: &MessageId,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        match self.storage.get_message(raw_msg_id) {
+            Ok(record)
+                if matches!(
+                    record.state,
+                    MessageState::PeelDeferred | MessageState::Retryable
+                ) =>
+            {
+                self.storage
+                    .update_message_state(raw_msg_id, MessageState::Failed)?;
+                self.audit_group(
+                    &record.group_id,
+                    crate::audit_helpers::message_state_transition_event(
+                        hex::encode(raw_msg_id.as_slice()),
+                        Some(record.state),
+                        MessageState::Failed,
+                        Some(record.epoch),
+                        reason,
+                    ),
+                );
+                // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339);
+                // a `Retryable` row — input buffered pre-peel while the group
+                // could not ingest — sits outside the cap.
+                if record.state == MessageState::PeelDeferred {
+                    self.note_peel_deferred_row_retired(&record.group_id);
+                }
+                Ok(())
+            }
+            Ok(_) | Err(StorageError::NotFound) => Ok(()),
+            Err(err) => Err(EngineError::Storage(err)),
+        }
     }
 }
 
@@ -390,6 +692,7 @@ mod tests {
         let signing_key = test_signing_key();
         let identity = signing_key.verifying_key().to_bytes().to_vec();
         let engine = EngineBuilder::new(storage.clone())
+            .legacy_compatibility_profile()
             .identity(identity)
             .account_identity_proof_signer(Arc::new(TestProofSigner(signing_key)))
             .peeler(Box::new(UnreachablePeeler))
@@ -405,7 +708,10 @@ mod tests {
                 epoch: EpochId(3),
                 members: vec![],
                 required_capabilities: Default::default(),
+                protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
                 removed: false,
+                unrecoverable: false,
+                disbanded: None,
                 join_epoch: EpochId(0),
             })
             .unwrap();

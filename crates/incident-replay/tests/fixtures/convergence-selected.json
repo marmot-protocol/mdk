@@ -1,0 +1,30 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    { "kind": { "type": "epoch_confirmed", "epoch": 30 } },
+    {
+      "kind": {
+        "type": "fork_resolution",
+        "source_epoch": 30,
+        "winner": "incumbent"
+      }
+    },
+    {
+      "kind": {
+        "type": "convergence_decision",
+        "current_tip_epoch": 30,
+        "candidates": [
+          { "branch_id": "winner", "eligible": true },
+          { "branch_id": "loser", "eligible": false }
+        ],
+        "selected_branch_id": "winner",
+        "losing_branch_ids": ["loser"]
+      }
+    }
+  ],
+  "derived_projections": {
+    "pagination": {
+      "convergence_runs": { "has_more": false, "limit": 500, "offset": 0, "returned": 1 }
+    }
+  }
+}

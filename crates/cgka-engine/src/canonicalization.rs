@@ -7,34 +7,123 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::convergence::{
-    AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, is_branch_eligible,
-    select_canonical_branch, select_canonical_branch_traced,
+    AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, ConvergencePolicyError,
+    is_branch_eligible, select_canonical_branch, select_canonical_branch_traced,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
+
+/// Adopted v1 app-message past-epoch delivery/decrypt window.
+///
+/// Must stay equal to [`crate::wire_format::DEFAULT_MAX_PAST_EPOCHS`] — the MLS
+/// past-epoch window — so witness and delivery horizons cannot diverge.
+pub const V1_APP_MESSAGE_PAST_EPOCH_LIMIT: u64 = 5;
+/// Adopted v1 settlement quiescence window, in milliseconds.
+pub const V1_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
+/// Adopted v1 absolute convergence-pass cap, in milliseconds.
+pub const V1_MAX_CONVERGENCE_PASS_MS: u64 = 5_000;
+
+const fn v1_max_convergence_pass_ms() -> u64 {
+    V1_MAX_CONVERGENCE_PASS_MS
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizationPolicy {
     pub convergence: ConvergencePolicy,
     pub app_message_past_epoch_limit: u64,
     pub settlement_quiescence_ms: u64,
+    /// Immutable upper bound from pass admission to the frozen selection set.
+    ///
+    /// The serde default is only for records written before this field existed;
+    /// policy validation still requires exact equality with the adopted v1
+    /// policy.
+    #[serde(default = "v1_max_convergence_pass_ms")]
+    pub max_convergence_pass_ms: u64,
 }
 
 impl Default for CanonicalizationPolicy {
     fn default() -> Self {
         Self {
             convergence: ConvergencePolicy::default(),
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
+            app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+            settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
+            max_convergence_pass_ms: V1_MAX_CONVERGENCE_PASS_MS,
         }
     }
+}
+
+/// Validation errors for a [`CanonicalizationPolicy`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalizationPolicyError {
+    #[error(transparent)]
+    Convergence(#[from] ConvergencePolicyError),
+    /// Policy differs from the adopted v1 baseline. Until a negotiation mechanism
+    /// exists behind a required capability, every client MUST use exactly those
+    /// pinned constants — not a local preference or per-group override.
+    #[error("convergence policy must equal the pinned v1 baseline")]
+    NotPinnedV1,
+    /// App-message window disagrees with the engine's MLS `max_past_epochs`.
+    #[error(
+        "app_message_past_epoch_limit ({app_message_past_epoch_limit}) must equal \
+         engine max_past_epochs ({max_past_epochs})"
+    )]
+    AppWindowMismatch {
+        app_message_past_epoch_limit: u64,
+        max_past_epochs: u64,
+    },
 }
 
 impl CanonicalizationPolicy {
     /// Validate the nested convergence policy bounds. See
     /// [`ConvergencePolicy::validate`](crate::convergence::ConvergencePolicy::validate).
-    pub fn validate(&self) -> Result<(), crate::convergence::ConvergencePolicyError> {
+    pub fn validate(&self) -> Result<(), ConvergencePolicyError> {
         self.convergence.validate()
+    }
+
+    /// Exact equality with the adopted convergence-policy v1 constants.
+    pub fn is_pinned_v1(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Fail closed unless this policy is exactly the adopted v1 baseline.
+    pub fn ensure_pinned_v1(&self) -> Result<(), CanonicalizationPolicyError> {
+        self.validate()?;
+        if !self.is_pinned_v1() {
+            return Err(CanonicalizationPolicyError::NotPinnedV1);
+        }
+        Ok(())
+    }
+
+    /// Keep the app-message delivery window aligned with MLS past-epoch decryptability.
+    pub fn ensure_app_window_matches(
+        &self,
+        max_past_epochs: usize,
+    ) -> Result<(), CanonicalizationPolicyError> {
+        if self.app_message_past_epoch_limit != max_past_epochs as u64 {
+            return Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: self.app_message_past_epoch_limit,
+                max_past_epochs: max_past_epochs as u64,
+            });
+        }
+        Ok(())
+    }
+
+    /// Same acceptance contract as engine setters and session open (mdk#970).
+    ///
+    /// Always enforces the witness-override bound and app-window alignment.
+    /// Normal builds also require the pinned v1 baseline. Only test harnesses
+    /// built with the explicit `test-policy-overrides` feature may override it.
+    pub fn ensure_acceptable(
+        &self,
+        max_past_epochs: usize,
+    ) -> Result<(), CanonicalizationPolicyError> {
+        self.validate()?;
+        self.ensure_app_window_matches(max_past_epochs)?;
+        #[cfg(not(feature = "test-policy-overrides"))]
+        if !self.is_pinned_v1() {
+            return Err(CanonicalizationPolicyError::NotPinnedV1);
+        }
+        Ok(())
     }
 }
 
@@ -98,6 +187,14 @@ pub enum PeeledMessageKind {
         epoch: u64,
         decrypts_on_branches: Vec<String>,
         decrypted_payload_ref: Option<String>,
+        /// This message was already applied/delivered on a prior convergence
+        /// pass (its stored record is `Processed`). It is re-admitted so it can
+        /// still witness its branch during scoring — a same-epoch fork resolved
+        /// *after* the message was delivered must not lose the message's witness
+        /// weight (that would make branch selection depend on local arrival
+        /// order, violating the convergence contract's order-independence). It is
+        /// never re-delivered: [`handle_app_message`] resolves it as already-seen.
+        already_delivered: bool,
     },
 }
 
@@ -141,12 +238,19 @@ pub struct CanonicalizationResult {
     pub accepted_commits: Vec<String>,
     pub accepted_proposals: Vec<String>,
     pub accepted_app_messages: Vec<String>,
+    /// Inputs with a current protocol `deferred` disposition. They remain
+    /// retained and eligible for reconsideration in a later pass.
+    pub deferred_messages: Vec<DeferredMessage>,
     pub invalidated_app_messages: Vec<InvalidatedAppMessage>,
     pub dropped_messages: Vec<DroppedMessage>,
     pub already_seen: Vec<AlreadySeen>,
     pub queued_outbound_intents: Vec<OutboundIntent>,
     pub publishable_outbound_messages: Vec<OutboundIntent>,
     pub errors: Vec<CanonicalizationError>,
+    /// OpenMLS candidate replay probes consumed by this stored pass. Pure
+    /// symbolic canonicalization reports zero.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub replay_probe_count: u64,
     /// Forensic audit trace of the branch-selection decision (per-candidate
     /// scores, the rule-by-rule comparison, and the losing branches). `None`
     /// when no selection was attempted (early-return result builders).
@@ -174,6 +278,7 @@ pub struct DroppedMessage {
     pub message_id: String,
     pub kind: MessageKind,
     pub reason: DroppedMessageReason,
+    pub rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -192,10 +297,26 @@ pub struct AlreadySeen {
     pub kind: MessageKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeferredMessage {
+    pub message_id: String,
+    pub kind: MessageKind,
+    pub reason: DeferredMessageReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeferredMessageReason {
+    MissingCandidateParent,
+    NonSelectedEligibleBranch,
+    AwaitingCanonicalCommit,
+    FutureEpoch,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CanonicalizationError {
     UnsupportedPolicy,
     MissingRetainedAnchor,
+    MissingOwnCommitCheckpoint,
     CandidateStateUnavailable,
     MlsValidationFailed,
     OutboundIntentStale,
@@ -203,26 +324,54 @@ pub enum CanonicalizationError {
 }
 
 pub fn canonicalize(input: CanonicalizationInput) -> CanonicalizationResult {
-    canonicalize_internal(input, &[])
+    canonicalize_internal(input, &[], true)
 }
 
 pub fn canonicalize_with_materialized_candidates(
     input: CanonicalizationInput,
     materialized_candidates: Vec<MaterializedCandidate>,
 ) -> CanonicalizationResult {
-    canonicalize_internal(input, &materialized_candidates)
+    canonicalize_internal(input, &materialized_candidates, true)
+}
+
+/// Canonicalize with an explicit application-witness admission switch.
+///
+/// This is an engine-internal test seam used by the conformance simulator to
+/// compare the complete stored-message engine path with and without the
+/// speculative app-witness ranking term. Production callers always use
+/// [`canonicalize_with_materialized_candidates`].
+#[cfg(feature = "test-policy-overrides")]
+pub(crate) fn canonicalize_with_materialized_candidates_for_test(
+    input: CanonicalizationInput,
+    materialized_candidates: Vec<MaterializedCandidate>,
+    admit_app_witnesses: bool,
+) -> CanonicalizationResult {
+    canonicalize_internal(input, &materialized_candidates, admit_app_witnesses)
 }
 
 fn canonicalize_internal(
     input: CanonicalizationInput,
     materialized_candidates: &[MaterializedCandidate],
+    admit_app_witnesses: bool,
 ) -> CanonicalizationResult {
     let mut already_seen = Vec::new();
     let mut observed_ids = input.state.seen_message_ids.clone();
     let mut unique_messages = Vec::new();
 
     for message in input.pending_messages.iter() {
-        if !observed_ids.insert(message.message_id.clone()) {
+        // An already-delivered app is intentionally in `seen_message_ids`, but it
+        // must still reach materialization + `attach_app_witnesses` to witness its
+        // branch. Exempt it from the seen-dedup here; `handle_app_message` resolves
+        // it as already-seen so it is counted (not `Resolving`) yet never
+        // re-delivered.
+        let readmitted_witness = matches!(
+            message.kind,
+            PeeledMessageKind::AppMessage {
+                already_delivered: true,
+                ..
+            }
+        );
+        if !readmitted_witness && !observed_ids.insert(message.message_id.clone()) {
             already_seen.push(AlreadySeen {
                 message_id: message.message_id.clone(),
                 kind: message.kind_name(),
@@ -234,7 +383,9 @@ fn canonicalize_internal(
 
     let mut materialized_graph =
         materialize_candidate_graph(&input, &unique_messages, materialized_candidates);
-    attach_app_witnesses(&mut materialized_graph, &unique_messages, &input.policy);
+    if admit_app_witnesses {
+        attach_app_witnesses(&mut materialized_graph, &unique_messages, &input.policy);
+    }
     let selected_branch = select_canonical_branch(
         input.state.current_tip_epoch,
         &materialized_graph.candidates,
@@ -268,19 +419,22 @@ fn canonicalize_internal(
         selected_branch_id: selected_branch_id.clone(),
         candidate_count,
         eligible_count,
-        // Provisional; recomputed after dispositions are known so we can
-        // distinguish Settled (fixed point) from Resolving (window
-        // closed, more work pending).
+        // Provisional; recomputed after dispositions are known so a completed
+        // frozen batch can distinguish a fixed point from an actual blocking
+        // error. Missing dependencies receive explicit deferred dispositions.
         convergence_status: ConvergenceStatus::Syncing,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
         invalidated_app_messages: Vec::new(),
         dropped_messages: Vec::new(),
         already_seen,
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace,
     };
 
@@ -310,6 +464,18 @@ fn canonicalize_internal(
         })
         .cloned()
         .unwrap_or_default();
+    let all_consumed_proposal_ids = materialized_graph
+        .consumed_proposal_ids_by_branch
+        .values()
+        .flat_map(|ids| ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let proposal_disposition_context = ProposalDispositionContext {
+        selected_consumed_proposal_ids: &selected_consumed_proposal_ids,
+        all_consumed_proposal_ids: &all_consumed_proposal_ids,
+        selected_branch_path: &selected_branch_path,
+        materialized_branch_ids: &materialized_graph.branch_ids,
+        candidate_branches: &materialized_graph.candidates,
+    };
     result.accepted_commits = selected_commit_ids;
 
     for message in unique_messages {
@@ -336,14 +502,13 @@ fn canonicalize_internal(
                 &input,
                 message,
                 branch_id,
-                &selected_consumed_proposal_ids,
-                &selected_branch_path,
-                &materialized_graph.branch_ids,
+                &proposal_disposition_context,
             ),
             PeeledMessageKind::AppMessage {
                 epoch,
                 decrypts_on_branches,
                 decrypted_payload_ref,
+                already_delivered,
             } => handle_app_message(
                 &mut result,
                 &input,
@@ -351,11 +516,14 @@ fn canonicalize_internal(
                 *epoch,
                 decrypts_on_branches,
                 decrypted_payload_ref.clone(),
+                *already_delivered,
             ),
         }
     }
-    drop_losing_materialized_candidate_commits(
+    classify_losing_materialized_candidate_commits(
         &mut result,
+        &input,
+        &materialized_graph.candidates,
         &materialized_graph.materialized_commit_ids_by_branch,
     );
 
@@ -363,8 +531,10 @@ fn canonicalize_internal(
     // (cgka-engine-canonicalization-contract.md §Lifecycle):
     //
     // - Syncing: convergence-relevant input window has not yet quiesced.
-    // - Resolving: window quiesced, but the canonicalize pass left
-    //   work pending (for example, a commit with no materialized parent).
+    // - Resolving: the frozen batch is actively being resolved. This
+    //   synchronous executable model returns only after resolution, so
+    //   missing dependencies receive an explicit deferred disposition
+    //   rather than pinning the completed pass in Resolving.
     // - Blocked: window quiesced and convergence cannot advance without
     //   a repair path or missing retained material.
     // - Settled: window quiesced AND every input message received a
@@ -617,6 +787,13 @@ fn attach_app_witnesses(
                 .iter_mut()
                 .find(|candidate| candidate.id == *branch_id)
             {
+                // Shared-history traffic is not evidence that a branch was
+                // actually used. Only messages from branch epochs strictly
+                // after the divergence point can witness this candidate
+                // (convergence-v1, #964).
+                if *epoch <= candidate.fork_epoch {
+                    continue;
+                }
                 // Witness counting evaluates the retained app-payload window with
                 // the CANDIDATE's tip_epoch as the reference tip, not the global
                 // canonical tip (retained-history.md "App-payload retention" and
@@ -660,12 +837,25 @@ fn handle_commit(
             result.accepted_commits.push(message.message_id.clone());
         } else if materialized_branch_ids.contains(branch_id) && result.selected_branch_id.is_some()
         {
-            result.dropped_messages.push(dropped(
+            result.deferred_messages.push(deferred(
                 message,
-                DroppedMessageReason::InvalidAgainstCandidateState,
+                DeferredMessageReason::NonSelectedEligibleBranch,
+            ));
+        } else {
+            result.deferred_messages.push(deferred(
+                message,
+                DeferredMessageReason::MissingCandidateParent,
             ));
         }
     }
+}
+
+struct ProposalDispositionContext<'a> {
+    selected_consumed_proposal_ids: &'a BTreeSet<String>,
+    all_consumed_proposal_ids: &'a BTreeSet<String>,
+    selected_branch_path: &'a BTreeSet<String>,
+    materialized_branch_ids: &'a BTreeSet<String>,
+    candidate_branches: &'a [BranchCandidate],
 }
 
 fn handle_proposal(
@@ -673,23 +863,49 @@ fn handle_proposal(
     input: &CanonicalizationInput,
     message: &PeeledMessage,
     branch_id: &str,
-    selected_consumed_proposal_ids: &BTreeSet<String>,
-    selected_branch_path: &BTreeSet<String>,
-    materialized_branch_ids: &BTreeSet<String>,
+    context: &ProposalDispositionContext<'_>,
 ) {
     if message.source_epoch < input.state.retained_anchor_epoch {
         result
             .dropped_messages
             .push(dropped(message, DroppedMessageReason::BeyondAnchor));
-    } else if selected_consumed_proposal_ids.contains(&message.message_id) {
+    } else if context
+        .selected_consumed_proposal_ids
+        .contains(&message.message_id)
+    {
         result.accepted_proposals.push(message.message_id.clone());
-    } else if materialized_branch_ids.contains(branch_id)
-        && !selected_branch_path.contains(branch_id)
+    } else if context
+        .all_consumed_proposal_ids
+        .contains(&message.message_id)
+        && context.materialized_branch_ids.contains(branch_id)
+        && !context.selected_branch_path.contains(branch_id)
         && result.selected_branch_id.is_some()
     {
+        let ineligibility_reason = context
+            .candidate_branches
+            .iter()
+            .find(|candidate| candidate.id == branch_id)
+            .and_then(|candidate| branch_ineligibility_reason(input, candidate));
+        if let Some(reason) = ineligibility_reason {
+            result.dropped_messages.push(dropped(message, reason));
+        } else {
+            result.deferred_messages.push(deferred(
+                message,
+                DeferredMessageReason::NonSelectedEligibleBranch,
+            ));
+        }
+    } else if result.selected_tip.unwrap_or(input.state.current_tip_epoch) > message.source_epoch {
+        // An unconsumed proposal cannot cross an epoch boundary. Once the
+        // canonical tip advances past its source epoch it is terminal and must
+        // not be prepended to every later candidate replay (#963).
         result.dropped_messages.push(dropped(
             message,
             DroppedMessageReason::InvalidAgainstCandidateState,
+        ));
+    } else {
+        result.deferred_messages.push(deferred(
+            message,
+            DeferredMessageReason::AwaitingCanonicalCommit,
         ));
     }
 }
@@ -701,7 +917,34 @@ fn handle_app_message(
     epoch: u64,
     decrypts_on_branches: &[String],
     decrypted_payload_ref: Option<String>,
+    already_delivered: bool,
 ) {
+    // A message applied on a prior pass is re-admitted so it can witness its
+    // branch again (see `attach_app_witnesses`). It must never be re-delivered,
+    // but a later reorg still has to withdraw it when its branch loses (#965).
+    if already_delivered {
+        let selected_still_decrypts = result
+            .selected_branch_id
+            .as_ref()
+            .is_some_and(|selected| decrypts_on_branches.contains(selected));
+        if result.selected_branch_id.is_some()
+            && !selected_still_decrypts
+            && !decrypts_on_branches.is_empty()
+        {
+            result.invalidated_app_messages.push(invalidated_app(
+                message,
+                epoch,
+                InvalidatedAppMessageReason::LosingBranch,
+                decrypted_payload_ref,
+            ));
+        } else {
+            result.already_seen.push(AlreadySeen {
+                message_id: message.message_id.clone(),
+                kind: message.kind_name(),
+            });
+        }
+        return;
+    }
     if epoch < input.state.retained_anchor_epoch {
         result.invalidated_app_messages.push(invalidated_app(
             message,
@@ -727,6 +970,12 @@ fn handle_app_message(
         result
             .accepted_app_messages
             .push(message.message_id.clone());
+    } else if decrypts_on_branches.is_empty()
+        && epoch > result.selected_tip.unwrap_or(input.state.current_tip_epoch)
+    {
+        result
+            .deferred_messages
+            .push(deferred(message, DeferredMessageReason::FutureEpoch));
     } else if decrypts_on_branches.is_empty() {
         result.invalidated_app_messages.push(invalidated_app(
             message,
@@ -744,8 +993,10 @@ fn handle_app_message(
     }
 }
 
-fn drop_losing_materialized_candidate_commits(
+fn classify_losing_materialized_candidate_commits(
     result: &mut CanonicalizationResult,
+    input: &CanonicalizationInput,
+    candidates: &[BranchCandidate],
     materialized_commit_ids_by_branch: &BTreeMap<String, BTreeSet<String>>,
 ) {
     let Some(selected_branch_id) = result.selected_branch_id.as_deref() else {
@@ -755,20 +1006,57 @@ fn drop_losing_materialized_candidate_commits(
         if branch_id == selected_branch_id {
             continue;
         }
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == *branch_id);
         for message_id in commit_ids {
-            if result
-                .dropped_messages
-                .iter()
-                .any(|dropped| dropped.message_id == *message_id)
+            if result.accepted_commits.contains(message_id)
+                || result
+                    .deferred_messages
+                    .iter()
+                    .any(|deferred| deferred.message_id == *message_id)
+                || result
+                    .dropped_messages
+                    .iter()
+                    .any(|dropped| dropped.message_id == *message_id)
             {
                 continue;
             }
-            result.dropped_messages.push(DroppedMessage {
-                message_id: message_id.clone(),
-                kind: MessageKind::Commit,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-            });
+            let ineligibility_reason =
+                candidate.and_then(|candidate| branch_ineligibility_reason(input, candidate));
+            if candidate.is_some() && ineligibility_reason.is_none() {
+                result.deferred_messages.push(DeferredMessage {
+                    message_id: message_id.clone(),
+                    kind: MessageKind::Commit,
+                    reason: DeferredMessageReason::NonSelectedEligibleBranch,
+                });
+            } else {
+                result.dropped_messages.push(DroppedMessage {
+                    message_id: message_id.clone(),
+                    kind: MessageKind::Commit,
+                    reason: ineligibility_reason
+                        .unwrap_or(DroppedMessageReason::BeyondRollbackHorizon),
+                    rejection_category: None,
+                });
+            }
         }
+    }
+}
+
+fn branch_ineligibility_reason(
+    input: &CanonicalizationInput,
+    candidate: &BranchCandidate,
+) -> Option<DroppedMessageReason> {
+    if candidate.fork_epoch < input.state.retained_anchor_epoch {
+        Some(DroppedMessageReason::BeyondAnchor)
+    } else if !is_branch_eligible(
+        input.state.current_tip_epoch,
+        candidate,
+        &input.policy.convergence,
+    ) {
+        Some(DroppedMessageReason::BeyondRollbackHorizon)
+    } else {
+        None
     }
 }
 
@@ -792,6 +1080,12 @@ fn convergence_status_for_result(
         .chain(result.accepted_app_messages.iter().map(String::as_str))
         .chain(
             result
+                .deferred_messages
+                .iter()
+                .map(|d| d.message_id.as_str()),
+        )
+        .chain(
+            result
                 .dropped_messages
                 .iter()
                 .map(|d| d.message_id.as_str()),
@@ -805,29 +1099,9 @@ fn convergence_status_for_result(
         .chain(result.already_seen.iter().map(|s| s.message_id.as_str()))
         .collect();
 
-    // Resolving fires when a pending input message did not receive
-    // a disposition this pass — the typical case is a child commit
-    // whose parent has not yet been materialized into a candidate
-    // branch. `CandidateStateUnavailable` alone is *not* enough to flag
-    // Resolving: it is reported any time no eligible branch was
-    // selected, including the legitimate fixed-point case "no candidate
-    // commits in the input batch at all."
-    //
-    // A lone uncommitted Proposal is exempt: commits are the consensus log and
-    // a proposal only takes effect once a commit consumes it
-    // (convergence.md:7-8), so an un-dispositioned proposal does not leave
-    // canonical state ambiguous and MUST NOT pin the pass in `Resolving`
-    // (mdk#154). A proposal that *was* consumed by the selected branch
-    // already lands in `resolved` via `accepted_proposals`, so this exemption
-    // only affects proposals with no disposition — exactly the lone case that
-    // would otherwise wedge convergence (and, transitively, all outbound sends)
-    // until a consuming commit arrives, which never happens if the committing
-    // member is offline. When that consuming commit does arrive it is itself a
-    // Commit input that drives its own convergence pass.
-    let unresolved_input = input_messages.iter().any(|message| {
-        !matches!(message.kind, PeeledMessageKind::Proposal { .. })
-            && !resolved.contains(message.message_id.as_str())
-    });
+    let unresolved_input = input_messages
+        .iter()
+        .any(|message| !resolved.contains(message.message_id.as_str()));
 
     if unresolved_input {
         ConvergenceStatus::Resolving
@@ -839,10 +1113,13 @@ fn convergence_status_for_result(
 }
 
 fn has_blocking_convergence_error(result: &CanonicalizationResult) -> bool {
-    result
-        .errors
-        .iter()
-        .any(|error| matches!(error, CanonicalizationError::MissingRetainedAnchor))
+    result.errors.iter().any(|error| {
+        matches!(
+            error,
+            CanonicalizationError::MissingRetainedAnchor
+                | CanonicalizationError::MissingOwnCommitCheckpoint
+        )
+    })
 }
 
 fn app_message_expired(
@@ -855,6 +1132,15 @@ fn app_message_expired(
 
 fn dropped(message: &PeeledMessage, reason: DroppedMessageReason) -> DroppedMessage {
     DroppedMessage {
+        message_id: message.message_id.clone(),
+        kind: message.kind_name(),
+        reason,
+        rejection_category: None,
+    }
+}
+
+fn deferred(message: &PeeledMessage, reason: DeferredMessageReason) -> DeferredMessage {
+    DeferredMessage {
         message_id: message.message_id.clone(),
         kind: message.kind_name(),
         reason,
@@ -879,6 +1165,7 @@ impl CanonicalizationResult {
     fn sort(&mut self) {
         self.accepted_proposals.sort();
         self.accepted_app_messages.sort();
+        self.deferred_messages.sort();
         self.invalidated_app_messages.sort();
         self.dropped_messages.sort();
         self.already_seen.sort();
@@ -891,6 +1178,74 @@ impl CanonicalizationResult {
 #[cfg(test)]
 mod witness_window_tests {
     use super::*;
+
+    #[test]
+    fn v1_default_policy_constants_are_pinned() {
+        use crate::convergence::{
+            V1_MAX_REWIND_COMMITS, V1_MAX_WITNESS_OVERRIDE_DEPTH, V1_WITNESS_QUORUM_EPOCHS,
+            V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
+        };
+        assert_eq!(
+            CanonicalizationPolicy::default(),
+            CanonicalizationPolicy {
+                convergence: ConvergencePolicy {
+                    max_rewind_commits: V1_MAX_REWIND_COMMITS,
+                    witness_quorum_senders_per_epoch: V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
+                    witness_quorum_epochs: V1_WITNESS_QUORUM_EPOCHS,
+                    max_witness_override_depth: V1_MAX_WITNESS_OVERRIDE_DEPTH,
+                },
+                app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+                settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
+                max_convergence_pass_ms: V1_MAX_CONVERGENCE_PASS_MS,
+            }
+        );
+        assert!(CanonicalizationPolicy::default().ensure_pinned_v1().is_ok());
+        assert_eq!(
+            CanonicalizationPolicy {
+                settlement_quiescence_ms: 0,
+                ..CanonicalizationPolicy::default()
+            }
+            .ensure_pinned_v1(),
+            Err(CanonicalizationPolicyError::NotPinnedV1)
+        );
+    }
+
+    #[test]
+    fn app_message_window_must_match_engine_max_past_epochs() {
+        let policy = CanonicalizationPolicy::default();
+        assert!(
+            policy
+                .ensure_app_window_matches(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize)
+                .is_ok()
+        );
+        assert_eq!(
+            policy.ensure_app_window_matches(1),
+            Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+                max_past_epochs: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn ensure_acceptable_requires_app_window_alignment() {
+        let policy = CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        };
+        assert_eq!(
+            policy.ensure_acceptable(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize),
+            Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: 1,
+                max_past_epochs: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+            })
+        );
+        assert!(
+            CanonicalizationPolicy::default()
+                .ensure_acceptable(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn app_message_expired_is_relative_to_the_passed_reference_tip() {

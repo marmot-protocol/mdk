@@ -1,0 +1,25 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    {
+      "kind": {
+        "type": "fork_resolution",
+        "source_epoch": 12,
+        "winner": "missing_snapshot"
+      }
+    },
+    {
+      "kind": {
+        "type": "convergence_decision",
+        "candidates": [{ "branch_id": "a" }, { "branch_id": "b" }],
+        "selected_branch_id": "a",
+        "losing_branch_ids": ["b"]
+      }
+    }
+  ],
+  "derived_projections": {
+    "pagination": {
+      "convergence_runs": { "has_more": false, "limit": 500, "offset": 0, "returned": 1 }
+    }
+  }
+}

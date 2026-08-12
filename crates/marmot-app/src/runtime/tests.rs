@@ -1,4 +1,28 @@
+use cgka_traits::TransportAdapterError;
+use cgka_traits::transport_adapter::{
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointRejectionCategory,
+    TransportPublishFailure,
+};
+
+use super::subscriptions::chat_list_mute_expiries;
 use super::*;
+
+#[test]
+fn default_directory_discovery_relays_use_live_indexers() {
+    let relays = default_directory_discovery_relays();
+
+    assert!(
+        relays.iter().any(|relay| relay.0 == VERTEX_DIRECTORY_RELAY),
+        "Vertex must remain available for directory bootstrap"
+    );
+    assert!(
+        relays
+            .iter()
+            .all(|relay| !["wss://relay.nostr.band", "wss://relay.damus.io",]
+                .contains(&relay.0.as_str())),
+        "retired relays must never return to discovery defaults"
+    );
+}
 
 #[test]
 fn message_subscription_seen_ids_are_bounded_to_recent_ids() {
@@ -19,12 +43,16 @@ fn message_subscription_seen_ids_are_bounded_to_recent_ids() {
 }
 
 #[test]
-fn message_subscription_seen_ids_do_not_store_empty_ids() {
+fn live_message_subscription_emits_each_empty_id_without_storing_it() {
     let mut seen = MessageSubscriptionSeenIds::with_limit(1);
 
-    assert!(seen.insert(String::new()));
-    assert!(seen.insert(String::new()));
+    // Both live updates must be emitted; the first empty id must not poison
+    // dedupe state for the second. `subscribe_messages` routes its live and
+    // recovery paths through this same decision.
+    assert!(seen.should_emit(String::new()));
+    assert!(seen.should_emit(String::new()));
     assert_eq!(seen.len(), 0);
+    assert!(!seen.contains(""));
 }
 
 #[test]
@@ -125,11 +153,113 @@ fn stamped_profile_wins_over_stale_relay_copy_in_if_newer_check() {
     assert!(zero_cache.created_at > stale_relay_copy.created_at);
 }
 
+#[test]
+fn merge_user_profile_update_preserves_unknown_kind0_fields() {
+    let current = UserProfileMetadata {
+        name: Some("old-name".to_owned()),
+        display_name: Some("Old Name".to_owned()),
+        picture: Some("https://example.test/old.png".to_owned()),
+        banner: Some("https://example.test/old-banner.png".to_owned()),
+        created_at: 123,
+        source_relays: vec!["wss://relay.example".to_owned()],
+        extra: std::collections::BTreeMap::from([
+            (
+                "website".to_owned(),
+                serde_json::json!("https://example.test"),
+            ),
+            ("bot".to_owned(), serde_json::json!(false)),
+            (
+                "custom".to_owned(),
+                serde_json::json!({"source": "other-client"}),
+            ),
+        ]),
+        ..UserProfileMetadata::default()
+    };
+    let update = UserProfileMetadata {
+        name: Some("new-name".to_owned()),
+        display_name: Some("New Name".to_owned()),
+        about: Some("updated about".to_owned()),
+        picture: None,
+        banner: None,
+        created_at: 0,
+        source_relays: Vec::new(),
+        ..UserProfileMetadata::default()
+    };
+
+    let merged = merge_user_profile_update(current, update);
+
+    assert_eq!(merged.name.as_deref(), Some("new-name"));
+    assert_eq!(merged.display_name.as_deref(), Some("New Name"));
+    assert_eq!(merged.about.as_deref(), Some("updated about"));
+    assert_eq!(merged.picture, None);
+    assert_eq!(
+        merged.banner.as_deref(),
+        Some("https://example.test/old-banner.png")
+    );
+    assert_eq!(
+        merged.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(merged.extra.get("bot"), Some(&serde_json::json!(false)));
+    assert_eq!(
+        merged.extra.get("custom"),
+        Some(&serde_json::json!({"source": "other-client"}))
+    );
+}
+
+#[test]
+fn merge_user_profile_update_replaces_banner_when_present() {
+    let current = UserProfileMetadata {
+        banner: Some("https://example.test/old-banner.png".to_owned()),
+        ..UserProfileMetadata::default()
+    };
+    let update = UserProfileMetadata {
+        banner: Some("https://example.test/new-banner.png".to_owned()),
+        ..UserProfileMetadata::default()
+    };
+
+    assert_eq!(
+        merge_user_profile_update(current, update).banner.as_deref(),
+        Some("https://example.test/new-banner.png")
+    );
+}
+
+#[test]
+fn newest_user_profile_keeps_newer_cached_extra_fields() {
+    let cached = UserProfileMetadata {
+        created_at: 200,
+        extra: std::collections::BTreeMap::from([(
+            "website".to_owned(),
+            serde_json::json!("https://new.example"),
+        )]),
+        ..UserProfileMetadata::default()
+    };
+    let fetched = UserProfileMetadata {
+        created_at: 100,
+        extra: std::collections::BTreeMap::new(),
+        ..UserProfileMetadata::default()
+    };
+
+    let selected = newest_user_profile(Some(cached.clone()), Some(fetched)).unwrap();
+    assert_eq!(selected, cached);
+}
+
 #[tokio::test]
 async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {
+    struct DropSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     let (commands, _commands_rx) = mpsc::channel(1);
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let handle = tokio::spawn(async {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_signal = DropSignal(dropped.clone());
+    let handle = tokio::spawn(async move {
+        let _drop_signal = drop_signal;
         std::future::pending::<()>().await;
     });
     let worker = ManagedAccountWorker {
@@ -144,6 +274,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         .await;
 
     assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -167,6 +298,8 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         source_epoch: None,
+        retention_seconds: None,
+        retention_expires_at: None,
         group_id_hex: "group-1".to_owned(),
         direction: "inbound".to_owned(),
         sender: "sender-1".to_owned(),
@@ -906,6 +1039,80 @@ async fn chat_list_snapshot_reconciliation_updates_changed_rows_and_removes_miss
     ));
 }
 
+#[tokio::test]
+async fn pin_order_changes_are_sent_as_one_atomic_snapshot() {
+    let (updates_tx, mut updates_rx) = mpsc::channel(1);
+    let mut row_fingerprints = HashMap::from([("stale".to_owned(), "old".to_owned())]);
+    let mut first = chat_list_test_row("first", "First");
+    first.pinned = true;
+    first.pinned_position = Some(0);
+    let mut second = chat_list_test_row("second", "Second");
+    second.pinned = true;
+    second.pinned_position = Some(1);
+
+    assert!(
+        send_atomic_chat_list_snapshot(
+            &updates_tx,
+            &mut row_fingerprints,
+            ChatListUpdateTrigger::PinOrderChanged,
+            vec![first.clone(), second.clone()],
+        )
+        .await
+    );
+    assert_eq!(
+        updates_rx.recv().await,
+        Some(RuntimeChatListUpdate::Snapshot {
+            trigger: ChatListUpdateTrigger::PinOrderChanged,
+            rows: vec![first.clone(), second.clone()],
+        })
+    );
+    assert_eq!(row_fingerprints.len(), 2);
+    assert_eq!(
+        row_fingerprints.get("first"),
+        Some(&chat_list_row_fingerprint(&first))
+    );
+    assert_eq!(
+        row_fingerprints.get("second"),
+        Some(&chat_list_row_fingerprint(&second))
+    );
+}
+
+#[test]
+fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
+    let base = chat_list_test_row("group", "title");
+    let mut manual = base.clone();
+    manual.manually_marked_unread = true;
+    manual.has_unread = true;
+    assert_ne!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&manual)
+    );
+    let mut pinned = base.clone();
+    pinned.pinned = true;
+    pinned.pinned_position = Some(0);
+    assert_ne!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&pinned)
+    );
+    let mut disbanding = base.clone();
+    disbanding.disbanding = true;
+    assert_ne!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&disbanding),
+        "pending disband must wake chat-list subscribers so hosts can hide the composer"
+    );
+
+    let mut timed = base.clone();
+    timed.muted = true;
+    timed.muted_until_ms = Some(1_700_000_000_000);
+    let expiries = chat_list_mute_expiries(&[timed]);
+    assert_eq!(expiries.get("group"), Some(&1_700_000_000_000));
+
+    let mut indefinite = base;
+    indefinite.muted = true;
+    assert!(chat_list_mute_expiries(&[indefinite]).is_empty());
+}
+
 #[test]
 fn latest_agent_stream_start_accepts_mixed_case_filter() {
     let stream_id_hex = hex::encode([0xab; 32]);
@@ -922,9 +1129,12 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
                 vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
             ],
             source_epoch: None,
+            retention: None,
             recorded_at: 0,
             received_at: 0,
             insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
         }],
         Some(&stream_id_hex.to_uppercase()),
     )
@@ -938,8 +1148,12 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
 fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
     ChatListRow {
         group_id_hex: group_id_hex.to_owned(),
+        pinned: false,
+        pinned_position: None,
         archived: false,
         pending_confirmation: false,
+        disbanding: false,
+        disband_request: None,
         title: title.to_owned(),
         group_name: title.to_owned(),
         avatar_url: None,
@@ -947,13 +1161,21 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         last_message: None,
         unread_count: 0,
         has_unread: false,
+        manually_marked_unread: false,
         unread_mention_count: 0,
         has_unread_mention: false,
         first_unread_message_id_hex: None,
         last_read_message_id_hex: None,
         last_read_timeline_at: None,
+        conversation_created_at: 0,
+        activity_sort_at: 0,
         updated_at: 0,
         self_membership: crate::SelfMembership::Member,
+        conversation_kind: crate::ChatConversationKind::Unknown,
+        lifecycle_state: cgka_traits::GroupLifecycleState::Stable,
+        muted: false,
+        muted_until_ms: None,
+        leave_requested_at_ms: None,
     }
 }
 
@@ -967,9 +1189,12 @@ fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMes
         kind,
         tags: Vec::new(),
         source_epoch: Some(7),
+        retention: None,
         recorded_at: 11,
         received_at: 12,
         insert_order: 0,
+        invalidated: false,
+        moderation_grant: false,
     }
 }
 
@@ -1173,6 +1398,116 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
     ));
 }
 
+#[tokio::test]
+async fn lifecycle_waits_for_account_opens_to_drain() {
+    let lifecycle = RuntimeLifecycle::new();
+    let permit = lifecycle
+        .begin_account_open()
+        .expect("account open should start before shutdown");
+
+    let waiter = {
+        let lifecycle = lifecycle.clone();
+        tokio::spawn(async move {
+            lifecycle
+                .wait_for_account_opens_to_drain(Duration::from_secs(1))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    drop(permit);
+
+    assert!(waiter.await.expect("drain waiter should complete"));
+}
+
+#[tokio::test]
+async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let manager = runtime.accounts.clone();
+    let release_insertion = Arc::new(Notify::new());
+    let release_for_catch_up = release_insertion.clone();
+    let (catch_up_waiting_tx, catch_up_waiting_rx) = oneshot::channel();
+    let workers = manager.workers.clone();
+    let (worker_exited_tx, worker_exited_rx) = oneshot::channel();
+
+    let catch_up = tokio::spawn(async move {
+        let insertion_released = release_for_catch_up.notified();
+        tokio::pin!(insertion_released);
+        insertion_released.as_mut().enable();
+        let _ = catch_up_waiting_tx.send(());
+        insertion_released.await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            let _ = worker_exited_tx.send(());
+        });
+        workers.lock().await.insert(
+            "replacement".to_owned(),
+            ManagedAccountWorker {
+                handle,
+                commands,
+                shutdown: shutdown_tx,
+            },
+        );
+    });
+    manager
+        .invite_catch_up_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .handles
+        .push(catch_up);
+    catch_up_waiting_rx
+        .await
+        .expect("catch-up should register its release waiter");
+
+    let shutdown_manager = manager.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_manager.shutdown().await;
+    });
+    loop {
+        let accepting = manager
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepting;
+        if !accepting {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    release_insertion.notify_waiters();
+
+    shutdown.await.expect("manager shutdown should complete");
+    worker_exited_rx
+        .await
+        .expect("replacement worker should be shut down");
+    assert!(manager.workers.lock().await.is_empty());
+}
+
+#[test]
+fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let manager = runtime.accounts.clone();
+    manager
+        .invite_catch_up_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .accepting = false;
+
+    manager.spawn_invite_catch_up();
+
+    assert!(
+        manager
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handles
+            .is_empty()
+    );
+}
+
 // Sender-controlled broker candidates must clear the shared dial-safety gate
 // at resolve time: literal-IP authorities resolve without DNS, so these cover
 // the canonical non-public classes end to end (issue #331).
@@ -1211,4 +1546,420 @@ async fn broker_resolve_dev_opt_in_admits_loopback_only() {
             "{authority} must be rejected even with the dev opt-in"
         );
     }
+}
+
+/// A group speaks for who you know only while you are actually in it. Each
+/// state here excludes membership for a different reason, and getting any of
+/// them wrong leaks the wrong people into search: an unaccepted invite is not
+/// a relationship yet, a group you left has stopped being one, and a frozen
+/// group cannot answer for its membership at all.
+mod co_member_eligibility {
+    use super::*;
+    use crate::groups::{AppGroupAdminPolicyComponent, AppGroupMessageRetentionComponent};
+    use crate::{AppGroupImageInput, SelfMembership};
+
+    fn group() -> AppGroupRecord {
+        AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            crate::groups::AppGroupNostrRoutingComponent::new(cgka_traits::NostrRoutingV1 {
+                nostr_group_id: [2u8; 32],
+                relays: vec!["wss://relay.example".to_owned()],
+            })
+            .expect("routing component"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )
+    }
+
+    #[test]
+    fn an_active_membership_contributes() {
+        assert!(group_contributes_co_members(&group()));
+    }
+
+    #[test]
+    fn an_archived_group_still_contributes() {
+        // Archival is a presentation choice, not a change in who you know.
+        let mut archived = group();
+        archived.archived = true;
+        assert!(group_contributes_co_members(&archived));
+    }
+
+    #[test]
+    fn an_unaccepted_invite_contributes_nobody() {
+        let mut pending = group();
+        pending.pending_confirmation = true;
+        assert!(!group_contributes_co_members(&pending));
+    }
+
+    #[test]
+    fn a_departed_group_contributes_nobody() {
+        for membership in [SelfMembership::Left, SelfMembership::Removed] {
+            let mut departed = group();
+            departed.self_membership = membership;
+            assert!(!group_contributes_co_members(&departed));
+        }
+    }
+
+    #[test]
+    fn a_frozen_group_contributes_nobody() {
+        let mut frozen = group();
+        frozen.unrecoverable = true;
+        assert!(!group_contributes_co_members(&frozen));
+    }
+}
+
+#[test]
+fn account_setup_request_debug_redacts_import_nsec() {
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        )),
+        ..AccountSetupRequest::default()
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("nsec1j4"));
+    assert!(debug.contains("redacted"));
+}
+
+#[test]
+fn account_setup_request_debug_redacts_nsec_shaped_identity() {
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let request = AccountSetupRequest {
+        identity: Some(nsec.to_owned()),
+        ..AccountSetupRequest::default()
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("nsec1j4"));
+    assert!(debug.contains("redacted"));
+}
+
+#[test]
+fn account_setup_request_rejects_and_redacts_uppercase_nsec_identity() {
+    let nsec = "NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99";
+    let request = AccountSetupRequest {
+        identity: Some(nsec.to_owned()),
+        ..AccountSetupRequest::default()
+    };
+
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("NSEC1J4"));
+    assert!(debug.contains("redacted"));
+    let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect_err("uppercase nsec-shaped identity must be rejected");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[test]
+fn account_setup_validation_rejects_import_nsec_for_login_operation() {
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        )),
+        ..AccountSetupRequest::default()
+    };
+    let err = validate_account_setup_request(&request, AccountSetupOperation::Login)
+        .expect_err("login must not accept import_nsec");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[test]
+fn account_setup_validation_reports_identity_key_mismatch_without_leaking_secrets() {
+    use nostr::prelude::ToBech32;
+    let keys = nostr::Keys::generate();
+    let other = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        identity: Some(keys.public_key().to_bech32().unwrap()),
+        import_nsec: Some(Zeroizing::new(other.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect_err("mismatched keys");
+    assert!(matches!(err, AppError::IdentityKeyMismatch));
+    let debug = format!("{err:?}");
+    assert!(!debug.contains("nsec"));
+}
+
+#[test]
+fn account_setup_validation_rejects_nsec_in_identity_field() {
+    let request = AccountSetupRequest {
+        identity: Some(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        ),
+        ..AccountSetupRequest::default()
+    };
+    let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect_err("nsec-shaped identity must be rejected");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[tokio::test]
+async fn account_setup_rejects_conflicting_identity_and_import_nsec_before_mutation() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let keys = nostr::Keys::generate();
+    let other = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        identity: Some(keys.public_key().to_bech32().unwrap()),
+        import_nsec: Some(Zeroizing::new(other.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    let err = runtime
+        .create_or_import_account(request)
+        .await
+        .expect_err("mismatched identity and import_nsec must be rejected");
+    assert!(matches!(err, AppError::IdentityKeyMismatch));
+    assert!(
+        app.account_home().accounts().unwrap().is_empty(),
+        "validation must run before account creation or import"
+    );
+}
+
+#[test]
+fn account_setup_validation_accepts_matching_identity_and_import_nsec() {
+    use nostr::prelude::ToBech32;
+    let keys = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        identity: Some(keys.public_key().to_bech32().unwrap()),
+        import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect("matching keys");
+}
+
+#[tokio::test]
+async fn account_setup_login_rejects_import_nsec_sidecar() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let keys = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    let err = runtime
+        .login(keys.public_key().to_bech32().unwrap(), request)
+        .await
+        .expect_err("login must not accept import_nsec");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[tokio::test]
+async fn account_setup_login_rejects_nsec_shaped_identity_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let err = runtime
+        .login(
+            "NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99",
+            AccountSetupRequest::default(),
+        )
+        .await
+        .expect_err("login must reject nsec-shaped identity");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[tokio::test]
+async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        )),
+        ..AccountSetupRequest::default()
+    };
+    let err = runtime
+        .create_identity(request)
+        .await
+        .expect_err("create_identity must not accept import_nsec");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+fn install_local_open_gate(
+    app: &MarmotApp,
+    account_ref: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    app.install_local_open_gate(account_ref, reached_tx, proceed_rx)
+        .expect("install local-open gate");
+    (reached_rx, proceed_tx)
+}
+
+async fn wait_for_test_signal(receiver: std::sync::mpsc::Receiver<()>, signal: &'static str) {
+    tokio::task::spawn_blocking(move || {
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|err| panic!("timed out waiting for {signal}: {err}"));
+    })
+    .await
+    .expect("test signal waiter");
+}
+
+async fn open_runtime_local_test_client(
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+) -> crate::AppClient {
+    let shared = runtime.shared_services();
+    app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle())
+        .await
+        .expect("open local test client")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconcile_failure_releases_spawned_worker_session_guards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("bob")
+        .expect("create bob");
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    let (alice_reached, alice_proceed) = install_local_open_gate(&app, "alice");
+    let (bob_reached, bob_proceed) = install_local_open_gate(&app, "bob");
+    let (rollback_waiter, rollback_started) = std::sync::mpsc::channel();
+    runtime
+        .accounts()
+        .register_reconcile_rollback_waiter(rollback_waiter);
+
+    let reconcile_runtime = runtime.clone();
+    let reconcile = tokio::spawn(async move { reconcile_runtime.reconcile_accounts().await });
+    let ((), ()) = tokio::join!(
+        wait_for_test_signal(alice_reached, "alice open result"),
+        wait_for_test_signal(bob_reached, "bob open result"),
+    );
+
+    alice_proceed.send(()).expect("release alice open result");
+    wait_for_test_signal(rollback_started, "failed-reconcile rollback").await;
+    assert!(
+        !reconcile.is_finished(),
+        "rollback must wait for Bob's in-flight open to release its session guard"
+    );
+    bob_proceed.send(()).expect("release bob open result");
+
+    let err = reconcile
+        .await
+        .expect("reconcile task")
+        .expect_err("reconcile should fail while alice is busy");
+    assert!(matches!(err, AppError::AccountSessionBusy));
+    drop(open_runtime_local_test_client(&app, &runtime, "bob").await);
+    drop(alice_client);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("bob")
+        .expect("create bob");
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    let (alice_reached, alice_proceed) = install_local_open_gate(&app, "alice");
+    let (bob_reached, bob_proceed) = install_local_open_gate(&app, "bob");
+
+    let accounts_a = runtime.accounts();
+    let reconcile_a = tokio::spawn(async move { accounts_a.reconcile().await });
+    let ((), ()) = tokio::join!(
+        wait_for_test_signal(alice_reached, "alice open result"),
+        wait_for_test_signal(bob_reached, "bob open result"),
+    );
+
+    let accounts_b = runtime.accounts();
+    let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
+    let reconcile_b = tokio::spawn(async move {
+        b_started_tx.send(()).expect("signal reconcile B start");
+        accounts_b.reconcile().await
+    });
+    wait_for_test_signal(b_started_rx, "reconcile B start").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !reconcile_b.is_finished(),
+        "reconcile B must not return while reconcile A can still roll back its workers"
+    );
+
+    // Alice's failed open result is already captured behind its gate. Releasing
+    // the one-shot owner now lets B open Alice after A finishes rolling back.
+    drop(alice_client);
+    alice_proceed.send(()).expect("release alice open result");
+    bob_proceed.send(()).expect("release bob open result");
+
+    let err_a = reconcile_a
+        .await
+        .expect("reconcile A task")
+        .expect_err("reconcile A should preserve Alice's captured busy error");
+    assert!(matches!(err_a, AppError::AccountSessionBusy));
+    reconcile_b
+        .await
+        .expect("reconcile B task")
+        .expect("reconcile B should install fresh workers after A rolls back");
+
+    let managed = runtime
+        .accounts()
+        .managed_accounts()
+        .expect("managed accounts");
+    let tested = managed
+        .iter()
+        .filter(|account| account.label == "alice" || account.label == "bob")
+        .collect::<Vec<_>>();
+    assert_eq!(tested.len(), 2, "both test accounts must remain managed");
+    assert!(
+        tested.iter().all(|account| account.running),
+        "successful reconcile B must retain both running workers"
+    );
+    runtime.shutdown().await;
+}
+
+#[test]
+fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_categories() {
+    use crate::KeyPackageDeletionResult;
+
+    let hostile_summary = "publish failed: https://evil.example/nip42";
+    let hostile_reason = "blocked: attacker-controlled suffix at wss://leak.example";
+    let transport_error =
+        TransportAdapterError::PublishEndpoints(TransportPublishFailure::with_endpoint_failures(
+            hostile_summary,
+            vec![
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://relay-a.example".into()),
+                    reason: hostile_reason.to_owned(),
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://relay-b.example".into()),
+                    reason: hostile_reason.to_owned(),
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+            ],
+        ));
+    let err = AppError::Transport(transport_error);
+
+    let wipe_reason = wipe_failure_reason(&err);
+    assert_eq!(wipe_reason, "relay rejected event (blocked)");
+    assert!(!wipe_reason.contains("evil.example"));
+
+    let (deleted, failures) =
+        relay_failures_from_key_package_deletion_results(vec![KeyPackageDeletionResult {
+            event_id_hex: "11".repeat(32),
+            result: Err(err),
+        }]);
+    assert_eq!(deleted, 0);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].reason, "relay rejected event (blocked)");
+    assert!(!failures[0].reason.contains("evil.example"));
+    assert!(!failures[0].reason.contains("leak.example"));
+    assert!(!failures[0].reason.contains("attacker-controlled"));
 }

@@ -1,16 +1,12 @@
-// Inbound -> agent turn dispatch, modeled on the bundled OpenClaw Telegram
-// channel (node_modules/openclaw/dist/bot-*.js): the channel owns its inbound
-// loop and calls `runChannelInboundEvent` itself, with a `resolveTurn` whose
-// `runDispatch` drives `dispatchReplyWithBufferedBlockDispatcher`. The agent's
-// reply arrives as progressive `block` deliveries + a `final` via a
-// `deliver(payload, info)` callback, which we map onto Marmot sends.
+// Inbound -> agent turn dispatch. The channel builds one authoritative OpenClaw
+// route from the received Marmot group, runs the agent turn, and sends its final
+// through OpenClaw's durable message context. That context invokes the channel's
+// registered Marmot message adapter, which is the only durable wn-agent send path.
 //
 // The turn assembly (runChannelInboundEvent / buildChannelInboundEventContext /
-// api.runtime.channel) is typechecked against the SDK but is validated
-// end-to-end against the `openclaw-gateway` docker harness (it needs a running
-// gateway + a model). The MarmotReplySink mapping below is unit-tested.
+// api.runtime.channel) is typechecked against the SDK and validated by the
+// connector E2E. Inbound production turns are deliberately final-only for now.
 
-import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
 
 import {
@@ -18,430 +14,45 @@ import {
   runChannelInboundEvent,
   type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
+import { deliverInboundReplyWithMessageSendContext } from "openclaw/plugin-sdk/channel-outbound";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
+import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 
-import { NonAppendOnlyUpdateError } from "./append-only.js";
-import { isRetryable, type MarmotAgentControlClient } from "./client.js";
-import type { GroupActivation, StreamMode } from "./config.js";
+import type {
+  AgentControlTimelineMessage,
+  MarmotAgentControlClient,
+} from "./client.js";
+import type { GroupActivation } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
-import { MarmotLivePreview, type StreamControlClient } from "./live.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
-import { resolveLatestAssistantTextFromSessionStore } from "./session-transcript.js";
 
-// --- reply sink (unit-tested) -----------------------------------------------
+// --- inbound turn dispatch (SDK-coupled; harness-validated) ------------------
 
-/** Kind of a streamed reply delivery from the OpenClaw reply dispatcher. */
+/** Kind of reply delivery emitted by OpenClaw's buffered dispatcher. */
 export interface ReplyDelivery {
   kind: "final" | "block" | "tool";
 }
 
-/** The subset of the reply payload the Marmot sink reads. */
-export interface ReplyPayloadLike {
-  text?: string;
-}
+/** Reply payload emitted by OpenClaw's buffered reply dispatcher. */
+export type ReplyPayloadLike = ReplyPayload;
 
-/** Partial assistant preview payload emitted before the durable reply dispatcher settles. */
-export interface PartialReplyPayloadLike {
-  text?: string;
-  delta?: string;
-  replace?: true;
-}
-
-export type MarmotSinkClient = Pick<MarmotAgentControlClient, "sendFinal"> & StreamControlClient;
-
-export interface MarmotReplySinkOptions {
-  client: MarmotSinkClient;
-  accountIdHex: string;
-  groupIdHex: string;
-  replyToMessageIdHex?: string | null;
-  streamMode: StreamMode;
-  quicCandidates: string[];
-  chunkBytes?: number;
-  resolveFinalText?: () => Promise<string | undefined> | string | undefined;
-  /** Optional privacy-safe lifecycle logger (kinds + lengths only, no content/ids). */
-  log?: (message: string) => void;
-}
-
-const MIN_TRUNCATED_FINAL_PREFIX_CHARS = 48;
-const MIN_TRUNCATED_FINAL_CONTINUATION_CHARS = 24;
-
-function stripTrailingEllipsis(text: string): string {
-  return text.replace(/(?:\s*(?:\.{3}|…))+$/u, "").trimEnd();
-}
-
-function isPotentialTruncatedFinal(text: string): boolean {
-  const trimmed = text.trimEnd();
-  const untruncated = stripTrailingEllipsis(trimmed);
-  return untruncated.length >= MIN_TRUNCATED_FINAL_PREFIX_CHARS && untruncated !== trimmed;
-}
-
-function selectLongerFinalText(current: string, candidate: string | undefined): string | undefined {
-  const candidateText = candidate?.trimEnd();
-  if (!candidateText) {
-    return undefined;
-  }
-  const currentText = current.trimEnd();
-  if (!currentText) {
-    return candidateText;
-  }
-  if (candidateText === currentText) {
-    return currentText;
-  }
-  if (candidateText.length > currentText.length && candidateText.startsWith(currentText)) {
-    return candidateText;
-  }
-  if (!isPotentialTruncatedFinal(currentText)) {
-    return undefined;
-  }
-  const untruncated = stripTrailingEllipsis(currentText);
-  if (candidateText.length <= currentText.length || !candidateText.startsWith(untruncated)) {
-    return undefined;
-  }
-  const continuation = candidateText.slice(untruncated.length).trimStart();
-  return continuation.length >= MIN_TRUNCATED_FINAL_CONTINUATION_CHARS && /^[\p{L}\p{N}]/u.test(continuation)
-    ? candidateText
-    : undefined;
-}
+const MARMOT_TURN_DENIED_TOOLS = ["sessions_send"] as const;
 
 /**
- * Maps the agent's streamed reply onto Marmot sends: progressive `block`
- * deliveries drive an append-only live QUIC preview; the `final` is committed
- * via `stream_finalize` when a preview is active and the final extends it, else
- * a plain `send_final`. A non-append-only update cancels the preview and falls
- * back to a verbatim `send_final` (mirrors the Hermes shim's behavior).
+ * Keep cross-session coordination out of a source-bound Marmot reply turn.
+ * `sessions_send` does not deliver to a human-facing channel; normal final text
+ * and the shared `message` tool already use the authoritative source route.
  */
-export class MarmotReplySink {
-  private preview: MarmotLivePreview | null = null;
-  private previewAbandoned = false;
-  /** Reply deliveries received from the dispatcher this turn (diagnostic). */
-  deliveries = 0;
-  /** Latest reconstructed answer text; used to commit a blocks-only turn at flush(). */
-  private latestAnswerText = "";
-  /** True once lower-latency partial snapshots, not delayed block chunks, own the preview. */
-  private partialPreviewActive = false;
-  /** True once OpenClaw has emitted any partial reply callback for this turn. */
-  private sawPartialPreview = false;
-  private partialDeliveries = 0;
-  private partialAppendEvents = 0;
-  private partialAppendedChars = 0;
-  private loggedPartialStart = false;
-  private loggedPartialAppendStart = false;
-  private loggedPartialSummary = false;
-  /** Whether the durable reply has been committed (stream_finalize or send_final). */
-  private finalized = false;
-
-  constructor(private readonly options: MarmotReplySinkOptions) {}
-
-  private log(message: string): void {
-    this.options.log?.(message);
-  }
-
-  private get streamingEnabled(): boolean {
-    return this.options.streamMode !== "off" && this.options.quicCandidates.length > 0;
-  }
-
-  private ensurePreview(): MarmotLivePreview {
-    if (!this.preview) {
-      this.preview = new MarmotLivePreview(this.options.client, {
-        accountIdHex: this.options.accountIdHex,
-        groupIdHex: this.options.groupIdHex,
-        quicCandidates: this.options.quicCandidates,
-        chunkBytes: this.options.chunkBytes,
-      });
-    }
-    return this.preview;
-  }
-
-  private async abandonPreview(reason: string): Promise<void> {
-    this.previewAbandoned = true;
-    if (this.preview) {
-      // Best effort: if the QUIC stream is already unhealthy, cancel may also
-      // fail — we still fall back to a plain durable send.
-      await this.preview.cancel(reason).catch(() => undefined);
-    }
-  }
-
-  private nextAnswerTextFromBlock(text: string): string {
-    if (!this.latestAnswerText) {
-      return text;
-    }
-    if (text.startsWith(this.latestAnswerText)) {
-      return text;
-    }
-    if (this.latestAnswerText.endsWith(text)) {
-      return this.latestAnswerText;
-    }
-    return `${this.latestAnswerText}${text}`;
-  }
-
-  private async bestFinalText(fallback: string): Promise<string> {
-    let candidate: string | undefined;
-    try {
-      candidate = await this.options.resolveFinalText?.();
-    } catch {
-      this.log("marmot: transcript final recovery lookup failed");
-    }
-    if (!candidate?.trim()) {
-      return fallback;
-    }
-    if (this.options.streamMode === "partial" || this.options.streamMode === "progress" || this.sawPartialPreview) {
-      return candidate.trimEnd();
-    }
-    return selectLongerFinalText(fallback, candidate) ?? fallback;
-  }
-
-  private async sendProgress(text: string): Promise<void> {
-    const progressText = text.trim();
-    if (!progressText || !this.streamingEnabled || this.previewAbandoned) {
-      return;
-    }
-    try {
-      await this.ensurePreview().progress(progressText);
-    } catch {
-      this.log("marmot: live progress abandoned (preview_error); will send the final durably");
-      await this.abandonPreview("preview_progress_error");
-    }
-  }
-
-  async prewarm(): Promise<void> {
-    if (!this.streamingEnabled || this.previewAbandoned) {
-      return;
-    }
-    try {
-      await this.ensurePreview().begin();
-      this.log("marmot: live preview stream started");
-    } catch {
-      this.log("marmot: live preview start failed; will send the final durably");
-      await this.abandonPreview("preview_begin_error");
-    }
-  }
-
-  async status(status: string): Promise<void> {
-    const statusText = status.trim();
-    if (!statusText || !this.streamingEnabled || this.previewAbandoned) {
-      return;
-    }
-    try {
-      await this.ensurePreview().status(statusText);
-    } catch {
-      this.log("marmot: live status abandoned (preview_error); will send the final durably");
-      await this.abandonPreview("preview_status_error");
-    }
-  }
-
-  async progress(text: string): Promise<void> {
-    await this.sendProgress(text);
-  }
-
-  async partial(payload: PartialReplyPayloadLike): Promise<void> {
-    const text = String(payload.text ?? "");
-    const delta = payload.replace === true ? "" : String(payload.delta ?? "");
-    if (!text.trim() && delta.length === 0) {
-      return;
-    }
-    this.sawPartialPreview = true;
-    this.partialDeliveries += 1;
-    if (!this.loggedPartialStart) {
-      this.loggedPartialStart = true;
-      this.log(
-        `marmot: partial reply streaming started chars=${text.length} delta_chars=${delta.length} streaming=${this.streamingEnabled}`,
-      );
-    }
-    if (!this.streamingEnabled || this.previewAbandoned) {
-      this.latestAnswerText = text || `${this.latestAnswerText}${delta}`;
-      return;
-    }
-    try {
-      const preview = this.ensurePreview();
-      if (delta.length > 0) {
-        await preview.appendDelta(delta);
-        this.partialPreviewActive = true;
-        this.latestAnswerText = text || preview.currentText;
-        this.notePartialAppend("delta", delta.length);
-        return;
-      }
-      if (payload.replace === true) {
-        this.log("marmot: skipped replacement partial without append delta");
-        this.partialPreviewActive = false;
-        return;
-      }
-      const previousLength = preview.currentText.length;
-      await preview.update(text);
-      this.partialPreviewActive = true;
-      this.latestAnswerText = text;
-      const appendedChars = preview.currentText.length - previousLength;
-      if (appendedChars > 0) {
-        this.notePartialAppend("snapshot", appendedChars);
-      }
-    } catch (error) {
-      if (error instanceof NonAppendOnlyUpdateError) {
-        this.log("marmot: skipped non-append partial without append delta");
-        this.partialPreviewActive = false;
-        return;
-      }
-      const reason = "preview_partial_error";
-      this.log(`marmot: live partial preview abandoned (${reason}); will send the final durably`);
-      this.partialPreviewActive = false;
-      this.latestAnswerText = "";
-      await this.abandonPreview(reason);
-    }
-  }
-
-  private notePartialAppend(kind: "delta" | "snapshot", chars: number): void {
-    this.partialAppendEvents += 1;
-    this.partialAppendedChars += chars;
-    if (!this.loggedPartialAppendStart) {
-      this.loggedPartialAppendStart = true;
-      this.log(`marmot: partial reply append started kind=${kind} chars=${chars}`);
-    }
-  }
-
-  private logPartialSummary(): void {
-    if (!this.sawPartialPreview || this.loggedPartialSummary) {
-      return;
-    }
-    this.loggedPartialSummary = true;
-    this.log(
-      `marmot: partial reply summary deliveries=${this.partialDeliveries} appends=${this.partialAppendEvents} appended_chars=${this.partialAppendedChars}`,
-    );
-  }
-
-  private async sendFinal(text: string): Promise<void> {
-    this.log(`marmot: sending durable final (${text.length} chars)`);
-    // One idempotency key for all attempts of THIS durable reply: a retry after a
-    // post-write timeout reuses the key so the connector dedups instead of
-    // double-posting an unrecallable encrypted message. Bounded retries with a
-    // tiny backoff cover the transient/timeout window; non-retryable errors fail
-    // fast and the last error is rethrown.
-    const idempotencyKey = randomUUID();
-    const backoffMs = [100, 300];
-    let attempt = 0;
-    for (;;) {
-      try {
-        await this.options.client.sendFinal(
-          this.options.accountIdHex,
-          this.options.groupIdHex,
-          text,
-          this.options.replyToMessageIdHex ?? null,
-          idempotencyKey,
-        );
-        this.log("marmot: durable final sent");
-        return;
-      } catch (err) {
-        if (attempt >= backoffMs.length || !isRetryable(err)) {
-          throw err;
-        }
-        this.log(`marmot: durable final send failed; retrying (attempt ${attempt + 1})`);
-        await new Promise((resolve) => setTimeout(resolve, backoffMs[attempt]));
-        attempt += 1;
-      }
-    }
-  }
-
-  async deliver(payload: ReplyPayloadLike, info: ReplyDelivery): Promise<void> {
-    const text = payload?.text ?? "";
-    this.deliveries += 1;
-    this.log(
-      `marmot: reply delivery kind=${info.kind} chars=${text.length} streaming=${this.streamingEnabled}`,
-    );
-
-    if (info.kind === "tool") {
-      await this.sendProgress(text);
-      return;
-    }
-
-    if (info.kind === "block") {
-      if (this.partialPreviewActive) {
-        // OpenClaw emits delayed block chunks after earlier partial snapshots.
-        // Once partials own the live preview, blocks are only a durable fallback;
-        // appending them would replay or reorder already-streamed text.
-        return;
-      }
-      this.latestAnswerText = this.nextAnswerTextFromBlock(text);
-      if (!this.streamingEnabled || this.previewAbandoned) {
-        return; // recorded in latestAnswerText; committed by the final delivery or flush()
-      }
-      try {
-        await this.ensurePreview().update(this.latestAnswerText);
-      } catch (error) {
-        // Any preview failure — non-append-only text, or a QUIC/broker error —
-        // abandons the live preview. The full text is still delivered durably by
-        // the final delivery or flush(), so a streaming hiccup never drops it.
-        const reason =
-          error instanceof NonAppendOnlyUpdateError ? "non_append_only" : "preview_error";
-        this.log(`marmot: live preview abandoned (${reason}); will send the final durably`);
-        await this.abandonPreview(reason);
-      }
-      return;
-    }
-
-    this.latestAnswerText = text || this.latestAnswerText;
-    await this.commit(this.latestAnswerText);
-  }
-
-  /**
-   * Commit the durable reply exactly once: finalize an active live preview into
-   * a stream-final, otherwise send a plain durable final.
-   */
-  private async commit(text: string): Promise<boolean> {
-    if (this.finalized) {
-      return true;
-    }
-    const finalText = await this.bestFinalText(text);
-    if (!finalText) {
-      return false;
-    }
-    this.finalized = true;
-    this.logPartialSummary();
-    if (this.preview && this.preview.isActive && !this.previewAbandoned) {
-      try {
-        await this.preview.finalize(finalText);
-        this.log(`marmot: live preview finalized (${finalText.length} chars)`);
-        return true;
-      } catch (error) {
-        const reason =
-          error instanceof NonAppendOnlyUpdateError ? "final_not_append_only" : "finalize_error";
-        this.log(`marmot: preview finalize failed (${reason}); falling back to a durable send`);
-        await this.abandonPreview(reason);
-      }
-    }
-    await this.sendFinal(finalText);
-    return true;
-  }
-
-  /**
-   * Commit the reply once the agent turn has finished. Block streaming can
-   * deliver the whole reply as `block`s with no trailing `final`; without this
-   * the live preview would never be finalized and no durable kind:9 would land.
-   * A no-op once a `final` delivery already committed, or if the turn produced
-   * no text at all.
-   */
-  async flush(): Promise<void> {
-    if (this.finalized) {
-      return;
-    }
-    this.log("marmot: no explicit final delivery; committing the streamed reply at turn end");
-    if (this.options.streamMode === "block" && this.sawPartialPreview && this.deliveries === 0) {
-      this.log("marmot: no block/final reply deliveries; abandoning partial-only block preview");
-      if (this.preview?.isActive) {
-        await this.abandonPreview("no_deliverable_reply");
-      }
-      return;
-    }
-    if (await this.commit(this.latestAnswerText)) {
-      return;
-    }
-    if (!this.latestAnswerText) {
-      this.log("marmot: turn produced no deliverable reply");
-      if (this.preview?.isActive) {
-        await this.abandonPreview("no_deliverable_reply");
-      }
-      return;
-    }
-  }
+export function buildMarmotTurnConfig(baseCfg: unknown): Record<string, unknown> {
+  const cfg = baseCfg as { tools?: { deny?: string[] } };
+  return {
+    ...cfg,
+    tools: {
+      ...cfg.tools,
+      deny: [...new Set([...(cfg.tools?.deny ?? []), ...MARMOT_TURN_DENIED_TOOLS])],
+    },
+  };
 }
-
-// --- inbound turn dispatch (SDK-coupled; harness-validated) ------------------
 
 /** Narrow view of `api.runtime.channel` (only the members we drive). */
 export interface OpenClawChannelRuntime {
@@ -462,11 +73,13 @@ export interface OpenClawChannelRuntime {
 }
 
 /**
- * Dispatcher client: the reply sink surface plus the group-info read for
- * gating and the media download used to surface inbound images to the agent.
+ * Dispatcher client: the group-info read used for activation gating and the
+ * media download used to surface inbound images to the agent.
  */
-export type MarmotDispatchClient = MarmotSinkClient &
-  Pick<MarmotAgentControlClient, "groupInfo" | "downloadMedia">;
+export type MarmotDispatchClient = Pick<
+  MarmotAgentControlClient,
+  "groupInfo" | "downloadMedia" | "timelineList"
+>;
 
 export interface MarmotDispatchDeps {
   /** Full OpenClaw config (`api.config`). */
@@ -476,16 +89,34 @@ export interface MarmotDispatchDeps {
   client: MarmotDispatchClient;
   /** OpenClaw channel account id ("default" or a configured account key), not the Marmot account hex. */
   channelAccountId?: string | null;
-  streamMode: StreamMode;
-  blockStreaming: boolean;
-  quicCandidates: string[];
-  chunkBytes?: number;
   /** When to reply in a multi-party group ("mention" gates; "always" replies to all). */
   groupActivation: GroupActivation;
   /** Case-insensitive trigger phrases that count as addressing the agent. */
   mentionPatterns: string[];
   /** Optional privacy-safe lifecycle logger. */
   log?: (message: string) => void;
+  /** Override OpenClaw durable delivery in focused tests. */
+  deliverInboundReply?: typeof deliverInboundReplyWithMessageSendContext;
+}
+
+/**
+ * Derived from the delivery function rather than imported by name: the
+ * `DurableInboundReplyDeliveryResult` alias is not re-exported from
+ * `plugin-sdk/channel-outbound` on the beta channel, but the function's return
+ * type is identical on both.
+ */
+type DurableInboundReplyDeliveryResult = Awaited<
+  ReturnType<typeof deliverInboundReplyWithMessageSendContext>
+>;
+
+function assertDurableReplyHandled(result: DurableInboundReplyDeliveryResult): void {
+  if (result.status === "handled_visible" || result.status === "handled_no_send") {
+    return;
+  }
+  if (result.status === "failed") {
+    throw result.error;
+  }
+  throw new Error(`marmot: OpenClaw durable reply was not handled (${result.reason})`);
 }
 
 /** Whether the message text contains any configured trigger phrase. */
@@ -597,6 +228,175 @@ function inboundMediaKind(mediaType: string): NonNullable<InboundMediaFacts["kin
   return "document";
 }
 
+function replyFallbackBody(availability: string): string {
+  switch (availability) {
+    case "deleted":
+      return "[Referenced message was deleted]";
+    case "invalidated":
+      return "[Referenced message was invalidated]";
+    case "missing":
+      return "[Referenced message is unavailable]";
+    default:
+      return "";
+  }
+}
+
+/**
+ * Aggregate bound for the rendered conversation-history supplemental entry,
+ * mirroring the Hermes adapter-local bound (#1223): retain at most the newest
+ * eight records and keep the complete serialized entry — envelope, records,
+ * and aggregate truncation metadata — within 16 KiB of UTF-8.
+ */
+export const TIMELINE_CONTEXT_MESSAGE_LIMIT = 8;
+export const TIMELINE_CONTEXT_BYTE_LIMIT = 16 * 1024;
+
+interface TimelineContextPayload {
+  order: "chronological";
+  relation: "before_current_message";
+  messages: AgentControlTimelineMessage[];
+  messages_truncated?: boolean;
+  omitted_message_count?: number;
+  oversized_message_count?: number;
+}
+
+function timelineContextEntry(payload: TimelineContextPayload) {
+  return {
+    label: "Marmot conversation history",
+    source: "marmot",
+    type: "chat_window",
+    payload,
+  };
+}
+
+/** UTF-8 size of the complete serialized supplemental entry. */
+function timelineContextEntryBytes(payload: TimelineContextPayload): number {
+  return Buffer.byteLength(JSON.stringify(timelineContextEntry(payload)), "utf8");
+}
+
+/**
+ * Whether one record alone already exceeds the budget, judged against an entry
+ * carrying the truncation metadata that would accompany its omission.
+ */
+function timelineMessageExceedsByteLimit(message: AgentControlTimelineMessage): boolean {
+  return (
+    timelineContextEntryBytes({
+      order: "chronological",
+      relation: "before_current_message",
+      messages: [message],
+      messages_truncated: true,
+      omitted_message_count: 1,
+    }) > TIMELINE_CONTEXT_BYTE_LIMIT
+  );
+}
+
+/**
+ * Build the bounded conversation-history entry: drop oldest records first,
+ * keep retained records in chronological order, and omit an oversized
+ * remaining record rather than exceed the byte budget. Reports only aggregate
+ * omitted/oversized counts (privacy-safe). `oversized_message_count` counts
+ * every omitted record that is individually unrenderable — including records
+ * dropped by the count window, where size never drove the decision — matching
+ * the Hermes adapter's shared contract.
+ */
+function boundTimelineContextEntry(history: AgentControlTimelineMessage[]) {
+  const bounded = history.slice(-TIMELINE_CONTEXT_MESSAGE_LIMIT);
+  let omittedMessageCount = history.length - bounded.length;
+  let oversizedMessageCount = 0;
+  for (const message of history.slice(0, omittedMessageCount)) {
+    if (timelineMessageExceedsByteLimit(message)) {
+      oversizedMessageCount += 1;
+    }
+  }
+
+  for (;;) {
+    const payload: TimelineContextPayload = {
+      order: "chronological",
+      relation: "before_current_message",
+      messages: bounded,
+      ...(omittedMessageCount > 0
+        ? { messages_truncated: true, omitted_message_count: omittedMessageCount }
+        : {}),
+      ...(oversizedMessageCount > 0 ? { oversized_message_count: oversizedMessageCount } : {}),
+    };
+    if (timelineContextEntryBytes(payload) <= TIMELINE_CONTEXT_BYTE_LIMIT) {
+      return timelineContextEntry(payload);
+    }
+    // Always defined: an empty `bounded` renders a metadata-only payload that
+    // fits the budget, so the check above returns before `shift` can drain it.
+    const dropped = bounded.shift() as AgentControlTimelineMessage;
+    if (timelineMessageExceedsByteLimit(dropped)) {
+      oversizedMessageCount += 1;
+    }
+    omittedMessageCount += 1;
+  }
+}
+
+/**
+ * Convert Marmot reply hydration and buffered ambient facts into OpenClaw's
+ * native, explicitly-untrusted supplemental context. None of this data enters a
+ * system prompt, and ambient events never invoke this dispatcher themselves.
+ */
+function inboundSupplemental(
+  message: MarmotInboundMessage,
+  history: AgentControlTimelineMessage[] = [],
+) {
+  const reply = message.replyTo;
+  const untrustedContext: Array<{
+    label: string;
+    source: string;
+    type: string;
+    payload: unknown;
+  }> = [];
+  if (reply) {
+    untrustedContext.push({
+      label: "Marmot referenced-message context",
+      source: "marmot",
+      type: "referenced_message",
+      payload: {
+        message_id_hex: reply.message_id_hex,
+        availability: reply.availability,
+        sender: reply.sender,
+        recorded_at: reply.recorded_at,
+        text_excerpt: reply.text_excerpt,
+        attachments: reply.attachments ?? [],
+        attachments_truncated: reply.attachments_truncated,
+        text_truncated: reply.text_truncated,
+      },
+    });
+  }
+  if (history.length > 0) {
+    untrustedContext.push(boundTimelineContextEntry(history));
+  }
+  for (const ambient of message.ambientContext ?? []) {
+    untrustedContext.push({
+      label: "Marmot ambient conversation event",
+      source: "marmot",
+      type: ambient.type,
+      payload: ambient,
+    });
+  }
+  if (!reply && untrustedContext.length === 0) {
+    return undefined;
+  }
+  return {
+    ...(reply
+      ? {
+          quote: {
+            id: reply.message_id_hex,
+            body: reply.text_excerpt ?? replyFallbackBody(reply.availability),
+            sender:
+              reply.sender?.display_name ??
+              reply.sender?.account_id_hex ??
+              "Unknown Marmot participant",
+            isQuote: true,
+            isSelf: reply.sender?.is_self ?? false,
+          },
+        }
+      : {}),
+    ...(untrustedContext.length > 0 ? { untrustedContext } : {}),
+  };
+}
+
 /**
  * Best-effort: download each inbound media ref to a local path on the wn-agent
  * host, then re-stage the decrypted bytes through OpenClaw's official media store
@@ -655,7 +455,7 @@ async function downloadInboundMedia(
  * (driven by the inbound runtime's `group_state_changed` handler), and
  * `clearGroupActivationCache` drops every entry (e.g. on an inbound resync).
  */
-export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promise<void>) & {
+export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promise<boolean>) & {
   invalidateGroupActivation: (accountIdHex: string, groupIdHex: string) => void;
   clearGroupActivationCache: () => void;
 };
@@ -663,7 +463,8 @@ export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promis
 /**
  * Build the inbound dispatcher: for each received Marmot message, resolve the
  * agent route, build the inbound context, and run it through the OpenClaw turn
- * kernel, delivering the agent's reply through a per-message MarmotReplySink.
+ * kernel. Final replies re-enter OpenClaw's durable message context, which uses
+ * the registered Marmot message adapter and its trusted source route.
  */
 export function createMarmotInboundDispatcher(
   deps: MarmotDispatchDeps,
@@ -671,11 +472,11 @@ export function createMarmotInboundDispatcher(
   // Per-(account, group) is_direct cache, scoped to this dispatcher instance so
   // it lives exactly as long as the inbound subscription that owns it.
   const activationCache = new GroupActivationCache();
-  const dispatch = async (message: MarmotInboundMessage): Promise<void> => {
+  const dispatch = async (message: MarmotInboundMessage): Promise<boolean> => {
     // Activation gating: in a multi-party group, only run a turn when addressed.
     if (!(await shouldRunTurn(deps, activationCache, message))) {
       deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
-      return;
+      return false;
     }
     const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
@@ -689,11 +490,32 @@ export function createMarmotInboundDispatcher(
     // local path (wn-agent decrypts; the content key never leaves it) and hand
     // the local file facts to OpenClaw, which reads + base64-encodes them.
     const media = await downloadInboundMedia(deps.client, message, deps.log);
+    let history: AgentControlTimelineMessage[] = [];
+    try {
+      const page = await deps.client.timelineList(
+        message.accountIdHex,
+        message.groupIdHex,
+        {
+          before: {
+            recorded_at: message.recordedAt ?? 0,
+            message_id_hex: message.messageIdHex,
+          },
+          // Deliberately over-fetch beyond TIMELINE_CONTEXT_MESSAGE_LIMIT so
+          // the bounded entry can report an exact omitted_message_count.
+          limit: 20,
+        },
+      );
+      history = page.messages;
+    } catch {
+      deps.log?.("marmot: conversation history lookup failed; continuing without history");
+    }
+    const supplemental = inboundSupplemental(message, history);
 
-    const ctxPayload = buildChannelInboundEventContext({
+    const ctxPayload = await buildChannelInboundEventContext({
       channel: "marmot",
       accountId: channelAccountId,
       messageId: message.messageIdHex,
+      timestamp: (message.recordedAt ?? 0) * 1000,
       from: message.senderAccountIdHex,
       sender: {
         id: message.senderAccountIdHex,
@@ -711,32 +533,20 @@ export function createMarmotInboundDispatcher(
       },
       message: { rawBody: message.text, bodyForAgent: message.text },
       ...(media ? { media } : {}),
+      ...(supplemental ? { supplemental } : {}),
+      resolveSupplementalMedia: true,
+      suppressSelfQuoteBody: false,
     });
 
-    const storePath = deps.runtimeChannel.session.resolveStorePath();
-    const dispatchStartedAt = Date.now();
-    const sink = new MarmotReplySink({
-      client: deps.client,
-      accountIdHex: message.accountIdHex,
-      groupIdHex: message.groupIdHex,
-      // Thread the reply to the triggering message (channel declares
-      // topLevelReplyToMode "reply"). Honored by the durable send_final path;
-      // the streaming finalize path threads in a later phase.
-      replyToMessageIdHex: message.messageIdHex,
-      streamMode: deps.streamMode,
-      quicCandidates: deps.quicCandidates,
-      chunkBytes: deps.chunkBytes,
-      resolveFinalText: () =>
-        resolveLatestAssistantTextFromSessionStore({
-          storePath,
-          sessionKey: route.sessionKey,
-          startedAtMs: dispatchStartedAt,
-        }),
-      log: deps.log,
+    const sessionStore = (deps.cfg as { session?: { store?: string } }).session?.store;
+    const storePath = deps.runtimeChannel.session.resolveStorePath(sessionStore, {
+      agentId: route.agentId,
     });
-
+    const turnCfg = buildMarmotTurnConfig(deps.cfg);
+    const deliverInboundReply =
+      deps.deliverInboundReply ?? deliverInboundReplyWithMessageSendContext;
+    let finalDeliveries = 0;
     deps.log?.("marmot: agent turn starting");
-    await sink.prewarm();
     await runChannelInboundEvent({
       channel: "marmot",
       accountId: channelAccountId,
@@ -754,36 +564,54 @@ export function createMarmotInboundDispatcher(
           storePath,
           ctxPayload,
           recordInboundSession: deps.runtimeChannel.session.recordInboundSession as never,
+          // OpenClaw 2026.7.2-beta requires prepared dispatch runners to
+          // declare who owns their adoption lifecycle. Marmot does not create
+          // a durable adoption resource outside runDispatch, so a skipped turn
+          // has nothing to release. Stable 2026.7.1 ignores this additive
+          // property, letting one packaged adapter run on both SDK contracts.
+          runDispatchLifecycle: {
+            turnAdoptionLifecycle: undefined,
+            onDispatchSkipped: async () => undefined,
+          },
           runDispatch: () =>
             deps.runtimeChannel.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: ctxPayload,
-              cfg: deps.cfg,
+              cfg: turnCfg,
               dispatcherOptions: {
-                deliver: (payload: ReplyPayloadLike, info: ReplyDelivery) =>
-                  sink.deliver(payload, info),
+                deliver: async (payload: ReplyPayloadLike, info: ReplyDelivery) => {
+                  if (info.kind !== "final") {
+                    return;
+                  }
+                  finalDeliveries += 1;
+                  const result = await deliverInboundReply({
+                    cfg: turnCfg as never,
+                    channel: "marmot",
+                    accountId: route.accountId,
+                    agentId: route.agentId,
+                    ctxPayload,
+                    payload,
+                    info,
+                    // A normal response threads to the inbound message that
+                    // triggered this turn. The destination itself comes from
+                    // ctxPayload.OriginatingTo / ctxPayload.To.
+                    replyToId: message.messageIdHex,
+                  });
+                  assertDurableReplyHandled(result);
+                },
               },
               replyOptions: {
-                disableBlockStreaming: deps.blockStreaming ? false : true,
-                onPartialReply: (payload: PartialReplyPayloadLike) => sink.partial(payload),
-                onAssistantMessageStart: () => sink.status("Thinking..."),
-                onRunProgress: () => sink.status("Working..."),
-                onExecutionPhase: (info: { phase?: string; firstModelCallStarted?: boolean }) => {
-                  if (info.firstModelCallStarted || info.phase === "model_call_started") {
-                    return sink.status("Thinking...");
-                  }
-                  return undefined;
-                },
-                onToolStart: () => sink.progress("Working..."),
-                onCommandOutput: () => sink.progress("Working..."),
+                sourceReplyDeliveryMode: "automatic",
+                // Keep the initial contract final-only. QUIC previews can be
+                // reintroduced later through the standard message-adapter live
+                // lifecycle without creating a second durable send path.
+                disableBlockStreaming: true,
               },
             }) as never,
         }),
       },
     });
-    // Block streaming can finish a turn with only `block` deliveries; commit the
-    // accumulated reply durably if no explicit `final` did.
-    await sink.flush();
-    deps.log?.(`marmot: agent turn done (sink deliveries=${sink.deliveries})`);
+    deps.log?.(`marmot: agent turn done (final deliveries=${finalDeliveries})`);
+    return true;
   };
 
   return Object.assign(dispatch, {

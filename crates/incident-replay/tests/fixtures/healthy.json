@@ -1,0 +1,14 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    { "kind": { "type": "recorder_started", "recorder": "synthetic" } },
+    { "kind": { "type": "epoch_confirmed", "epoch": 1 } },
+    { "kind": { "type": "group_state_changed", "change": "member_added" } }
+  ],
+  "derived_projections": {
+    "pagination": {
+      "convergence_runs": { "has_more": false, "limit": 500, "offset": 0, "returned": 0 },
+      "delivery_artifacts": { "has_more": false, "limit": 500, "offset": 0, "returned": 3 }
+    }
+  }
+}

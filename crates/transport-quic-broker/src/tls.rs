@@ -1,14 +1,14 @@
 //! Broker TLS plumbing: QUIC transport/server config builders, PEM loaders, the
 //! ALPN-pinned client endpoint, and the loopback-only insecure verifier.
 
-use std::fs::File;
-use std::io::BufReader;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls_platform_verifier::BuilderVerifierExt;
 use transport_quic_stream::QuicPreviewTransportProfile;
@@ -98,10 +98,10 @@ fn broker_server_config(
 }
 
 fn load_certificate_chain(path: &PathBuf) -> Result<Vec<CertificateDer<'static>>, QuicBrokerError> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(pem_error_to_io)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(QuicBrokerError::Io)?;
+        .map_err(pem_error_to_io)?;
     if certs.is_empty() {
         return Err(QuicBrokerError::EmptyCertificateChain);
     }
@@ -109,10 +109,19 @@ fn load_certificate_chain(path: &PathBuf) -> Result<Vec<CertificateDer<'static>>
 }
 
 fn load_private_key(path: &PathBuf) -> Result<PrivateKeyDer<'static>, QuicBrokerError> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(QuicBrokerError::Io)?
+    PrivateKeyDer::pem_file_iter(path)
+        .map_err(pem_error_to_io)?
+        .next()
+        .transpose()
+        .map_err(pem_error_to_io)?
         .ok_or(QuicBrokerError::MissingPrivateKey)
+}
+
+fn pem_error_to_io(error: rustls::pki_types::pem::Error) -> io::Error {
+    match error {
+        rustls::pki_types::pem::Error::Io(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
 }
 
 /// Build the broker rustls client config for a trust mode with the

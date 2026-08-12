@@ -5,8 +5,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 ## Scope
 
 - Own the UniFFI export surface over `marmot-app` for Swift (iOS) and Kotlin (Android) consumers.
-- Own build/packaging scripts: `xcframework.sh` (Swift + XCFramework) and `kotlin-bindings.sh` (Android JNI libs +
-  generated Kotlin).
+- Own build/packaging scripts: `xcframework.sh` (Swift + XCFramework), `kotlin-bindings.sh` (Android JNI libs +
+  generated Kotlin), `package-ios-artifacts.sh`, `validate-ios-artifact.sh`, and `validate-swift-package.sh`.
+- Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
 - Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
 
@@ -19,8 +20,10 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 - Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes, not Nostr `nostr_group_id` route handles.
   Accept non-empty opaque MLS group ids, including the 16-byte ids OpenMLS generates for MDK today, and do not validate
   them with the 32-byte route-id/pubkey/message-id rule.
-- Keep binding changes in lockstep with `marmot-app` public API changes; bump the workspace version when UniFFI records,
-  enums, object methods, or error variants change.
+- Keep binding changes in lockstep with `marmot-app` public API changes, but do not bump the workspace version as part
+  of feature, fix, binding, or review-feedback work. Workspace versions are bumped only as an explicit, user-directed
+  release operation; UniFFI records, enums, object methods, and error variants may change while the current workspace
+  version remains unchanged.
 
 ## Verification
 
@@ -37,6 +40,14 @@ OTLP export builds:
 
 ```sh
 cargo check -p marmot-uniffi --features otlp-export
+```
+
+Release-artifact checks (after `xcframework.sh`):
+
+```sh
+./crates/marmot-uniffi/validate-ios-artifact.sh crates/marmot-uniffi/output/MarmotKit.xcframework 18.0
+./crates/marmot-uniffi/validate-swift-package.sh \
+  crates/marmot-uniffi/output/MarmotKit.xcframework - crates/marmot-uniffi/output/MarmotKit.swift
 ```
 
 See [`README.md`](README.md) for Android NDK prerequisites and initialization requirements.

@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
 use cgka_engine::openmls_projection::project_mls_message;
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::{Engine, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
@@ -166,6 +166,7 @@ impl TransportPeeler for CountingEpochGatePeeler {
 fn build_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(CountingEpochGatePeeler::new()))
@@ -184,15 +185,45 @@ fn build_counting_client(
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let peeler = CountingEpochGatePeeler::new();
     let mut engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(peeler.clone()))
         .build()
         .unwrap();
-    engine.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    (engine, storage, peeler)
+}
+
+fn build_counting_client_with_storage_and_clock(
+    name: &[u8],
+    storage: SqliteAccountStorage,
+    clock: ManualConvergenceClock,
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    CountingEpochGatePeeler,
+) {
+    let peeler = CountingEpochGatePeeler::new();
+    let mut engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .peeler(Box::new(peeler.clone()))
+        .convergence_clock(Arc::new(clock))
+        .build()
+        .unwrap();
+    engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     (engine, storage, peeler)
 }
 
@@ -251,7 +282,7 @@ async fn send_app(
         .await
         .expect("send app");
     match result {
-        SendResult::ApplicationMessage { msg } => route(msg, group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, group_id),
         other => panic!("expected app message, got {other:?}"),
     }
 }
@@ -269,8 +300,26 @@ async fn carol_behind_two_epochs() -> (
     TransportMessage,
     TransportMessage,
 ) {
+    carol_behind_two_epochs_with(build_counting_client(b"carol")).await
+}
+
+async fn carol_behind_two_epochs_with(
+    carol: (
+        Engine<SqliteAccountStorage>,
+        SqliteAccountStorage,
+        CountingEpochGatePeeler,
+    ),
+) -> (
+    Engine<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    CountingEpochGatePeeler,
+    GroupId,
+    TransportMessage,
+    TransportMessage,
+) {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage, carol_peeler) = build_counting_client(b"carol");
+    let (mut carol, carol_storage, carol_peeler) = carol;
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
@@ -343,9 +392,7 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
     // The epoch-3 commit does not peel at carol's epoch 1: deferred.
     assert!(matches!(
         carol.ingest(commit3.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(
         carol_storage.get_message(&commit3.id).unwrap().state,
@@ -416,11 +463,11 @@ async fn deferred_peel_retries_after_epoch_advance() {
     );
 }
 
-/// A row that exhausts its retry budget without ever peeling goes terminal
-/// `Failed` (`permanently_undecryptable`) and is never attempted again.
+/// A row that exhausts its retry budget is resource-refused and released
+/// without poisoning same-id redelivery as a terminal duplicate.
 #[tokio::test]
-async fn deferred_peel_terminal_after_attempt_budget() {
-    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, _commit3) =
+async fn deferred_peel_retry_budget_refuses_without_terminal_dedup() {
+    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs().await;
     carol.set_deferred_peel_retry_budget(1);
 
@@ -429,9 +476,7 @@ async fn deferred_peel_terminal_after_attempt_budget() {
     let stuck_app = send_app(&mut alice, &group_id, "forever ahead").await;
     assert!(matches!(
         carol.ingest(stuck_app.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
 
     // Sweep 1 (context: epoch 1) consumes the single budgeted attempt.
@@ -445,44 +490,173 @@ async fn deferred_peel_terminal_after_attempt_budget() {
     );
 
     // The epoch-2 commit changes the context; the next sweep finds the row
-    // over budget and goes terminal without another peel attempt.
+    // over budget and releases it without another peel attempt.
     carol.ingest(commit2.clone()).await.unwrap();
     carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
         .await
         .unwrap();
-    assert_eq!(
-        carol_storage.get_message(&stuck_app.id).unwrap().state,
-        MessageState::Failed,
-        "budget-exhausted deferred row must go terminal"
+    assert!(
+        matches!(
+            carol_storage.get_message(&stuck_app.id),
+            Err(StorageError::NotFound)
+        ),
+        "budget-exhausted deferred row must be released, not terminally retained"
     );
 
-    // Terminal rows are out of the lifecycle: further context changes do not
-    // re-peel them.
-    let attempts_at_terminal = carol_peeler.attempts_for(&stuck_app.id);
+    // The same transport id remains eligible and is retained again rather
+    // than short-circuiting as a duplicate.
+    let attempts_at_refusal = carol_peeler.attempts_for(&stuck_app.id);
+    assert!(matches!(
+        carol.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert!(
+        carol_peeler.attempts_for(&stuck_app.id) > attempts_at_refusal,
+        "same-id redelivery must reach the peeler again"
+    );
+
+    // Once the missing commit arrives, the redelivered row peels and applies.
+    carol.ingest(commit3).await.unwrap();
     carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_002)
         .await
         .unwrap();
     assert_eq!(
-        carol_peeler.attempts_for(&stuck_app.id),
-        attempts_at_terminal
+        carol_storage.get_message(&stuck_app.id).unwrap().state,
+        MessageState::Processed
+    );
+}
+
+/// The residence budget is durable across engine reconstruction, distinct
+/// context attempts do not reset, and a backwards wall-clock jump cannot make
+/// the row expire before its rebased monotonic remainder.
+#[tokio::test]
+async fn deferred_peel_residence_survives_restart_and_backward_clock() {
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_client =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock.clone());
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(carol_client).await;
+    carol.set_deferred_peel_residence_ms(1_000);
+
+    let stuck_app = send_app(&mut alice, &group_id, "durable residence").await;
+    assert!(matches!(
+        carol.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert!(
+        carol.drain_pending_convergence_groups().contains(&group_id),
+        "first deferral must arm the scheduler even if peel context stays stable"
+    );
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(1_000)
+    );
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    let before_restart = carol_storage.get_message(&stuck_app.id).unwrap();
+    let lifecycle = before_restart
+        .deferred_peel
+        .as_ref()
+        .expect("deferred lifecycle persisted");
+    assert_eq!(lifecycle.distinct_context_attempts, 1);
+    assert!(lifecycle.last_context_fingerprint.is_some());
+
+    clock.advance_ms(400);
+    drop(carol);
+    let (mut restarted, _, _) = build_counting_client_with_storage_and_clock(
+        b"carol",
+        carol_storage.clone(),
+        clock.clone(),
+    );
+    restarted.hydrate_all_stored_groups().unwrap();
+    restarted.set_deferred_peel_residence_ms(1_000);
+    assert_eq!(
+        restarted.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(600)
+    );
+    assert_eq!(
+        carol_storage
+            .get_message(&stuck_app.id)
+            .unwrap()
+            .deferred_peel
+            .unwrap()
+            .distinct_context_attempts,
+        1,
+        "restart must preserve the consumed distinct-context budget"
+    );
+
+    // Reconstruct once more in a wall-clock domain that moved backwards.
+    clock.set_wall_ms(9_000);
+    drop(restarted);
+    let (mut backwards, _, _) = build_counting_client_with_storage_and_clock(
+        b"carol",
+        carol_storage.clone(),
+        clock.clone(),
+    );
+    backwards.hydrate_all_stored_groups().unwrap();
+    backwards.set_deferred_peel_residence_ms(1_000);
+    assert_eq!(
+        backwards.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(600),
+        "backwards wall movement must preserve, not shorten, the remainder"
+    );
+
+    clock.advance_monotonic_ms(599);
+    backwards.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage.get_message(&stuck_app.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    clock.advance_monotonic_ms(1);
+    backwards.retry_deferred_peels(&group_id).await.unwrap();
+    assert!(matches!(
+        carol_storage.get_message(&stuck_app.id),
+        Err(StorageError::NotFound)
+    ));
+    assert!(backwards.drain_events().iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::TransportObjectResourceRefused {
+                message_id,
+                resource:
+                    cgka_traits::ingest::InboundResourceLimit::TransportDeferredResidenceBudget,
+                ..
+            } if message_id == &stuck_app.id
+        )
+    }));
+
+    // Resource release is not terminal dedup: the same exact transport id
+    // reaches the peeler and becomes locally retryable again.
+    assert!(matches!(
+        backwards.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    backwards.ingest(commit2).await.unwrap();
+    backwards.ingest(commit3).await.unwrap();
+    backwards.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage.get_message(&stuck_app.id).unwrap().state,
+        MessageState::Processed,
+        "same-id redelivery must process once the missing commits arrive"
     );
 }
 
 /// A flood of undecryptable group-routed input (fresh transport id per
 /// re-wrap is attacker-controllable) must not grow the durable store past
-/// the per-group cap; overflow is dropped unpersisted and deduplicated.
+/// the per-group cap. Overflow remains retryable by same-id redelivery once
+/// the retained backlog drains.
 #[tokio::test]
 async fn peel_deferred_rows_capped_per_group_under_flood() {
-    let (mut alice, mut carol, carol_storage, _carol_peeler, group_id, _commit2, _commit3) =
+    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs().await;
 
     // One real epoch-3 app message, re-wrapped under distinct transport ids —
     // exactly the re-wrap flood a malicious peer can produce for free.
     let template = send_app(&mut alice, &group_id, "flood payload").await;
-    let flood = MAX_PEEL_DEFERRED_ROWS_PER_GROUP + 5;
-    let mut overflow_ids = Vec::new();
+    let flood = MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
     for i in 0..flood {
         let wrapped = TransportMessage {
             id: MessageId::new(format!("flood-{i}").into_bytes()),
@@ -490,18 +664,23 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         };
         let outcome = carol.ingest(wrapped.clone()).await.unwrap();
         assert!(
-            matches!(
-                outcome,
-                IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed
-                }
-            ),
+            matches!(outcome, IngestOutcome::TransportDeferred { .. }),
             "flood message {i} classified unexpectedly: {outcome:?}"
         );
-        if i >= MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
-            overflow_ids.push(wrapped.id.clone());
-        }
     }
+
+    let legitimate_template = send_app(&mut alice, &group_id, "cap overflow legitimate").await;
+    let overflow = TransportMessage {
+        id: MessageId::new(b"cap-overflow-legitimate".to_vec()),
+        ..legitimate_template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
 
     let retained = carol_storage
         .list_messages(&group_id, EpochId(0))
@@ -513,23 +692,40 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         retained, MAX_PEEL_DEFERRED_ROWS_PER_GROUP,
         "durable PeelDeferred rows must be capped per group"
     );
-    for id in &overflow_ids {
-        assert!(
-            matches!(carol_storage.get_message(id), Err(StorageError::NotFound)),
-            "overflow input must not be persisted"
-        );
-    }
+    assert!(
+        matches!(
+            carol_storage.get_message(&overflow.id),
+            Err(StorageError::NotFound)
+        ),
+        "overflow input must not be persisted"
+    );
 
-    // Overflow ids were remembered in-process: redelivery dedups cheaply.
-    let overflow_replay = TransportMessage {
-        id: overflow_ids[0].clone(),
-        ..template.clone()
-    };
+    // While the cap remains full, same-id redelivery re-attempts the peel and
+    // is cap-dropped again; it is not poisoned as terminal AlreadySeen.
+    let attempts_before_redelivery = carol_peeler.attempts_for(&overflow.id);
     assert!(matches!(
-        carol.ingest(overflow_replay).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        carol.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
         }
+    ));
+    assert_eq!(
+        carol_peeler.attempts_for(&overflow.id),
+        attempts_before_redelivery + 1
+    );
+
+    // Catch up to the sender epoch and drain the retained backlog. The exact
+    // same overflow id can then be redelivered and processed successfully.
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert!(matches!(
+        carol.ingest(overflow).await.unwrap(),
+        IngestOutcome::Processed
     ));
 }
 
@@ -596,7 +792,7 @@ async fn pre_membership_application_message_is_terminal_not_deferred() {
     assert!(matches!(
         outcome,
         IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+            reason: StaleReason::PreMembership
         }
     ));
     let record = carol_storage
@@ -618,6 +814,87 @@ async fn pre_membership_application_message_is_terminal_not_deferred() {
         .await
         .unwrap();
     assert_eq!(carol_peeler.attempts_for(&pre_membership_app.id), attempts);
+}
+
+/// A rejoin replaces a prior local membership interval. Without durable
+/// interval history, the latest Welcome epoch must not be used as a blanket
+/// lower bound that terminalizes messages authored while the earlier interval
+/// was active.
+#[tokio::test]
+async fn rejoin_does_not_generalize_latest_welcome_into_pre_membership() {
+    let (mut alice, _alice_storage) = build_client(b"alice-rejoin-history");
+    let (mut bob, _bob_storage, _bob_peeler) = build_counting_client(b"bob-rejoin-history");
+    let bob_id = bob.self_id().clone();
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "rejoin-history".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob-rejoin-history"))
+        .await
+        .unwrap();
+
+    let prior_membership_app = send_app(&mut alice, &group_id, "earlier membership").await;
+
+    let (remove, pending) = evolution(
+        alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![bob_id],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(route(remove, &group_id)).await.unwrap();
+
+    let rejoin_kp = bob.fresh_key_package().await.unwrap();
+    let rejoin = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![rejoin_kp],
+        })
+        .await
+        .unwrap();
+    let (welcomes, pending) = match rejoin {
+        SendResult::GroupEvolution {
+            welcomes, pending, ..
+        } => (welcomes, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob-rejoin-history"))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.group_record(&group_id).unwrap().join_epoch,
+        EpochId(0),
+        "a single lower bound cannot safely represent multiple membership intervals"
+    );
+
+    let outcome = bob.ingest(prior_membership_app).await.unwrap();
+    assert!(
+        !matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PreMembership
+            }
+        ),
+        "earlier-membership traffic must not be terminalized from the latest Welcome alone"
+    );
 }
 
 /// `join_epoch` bookkeeping: welcome joins record the join epoch; a group's
@@ -658,5 +935,116 @@ async fn join_epoch_recorded_on_welcome_join() {
         alice.group_record(&group_id).unwrap().join_epoch,
         EpochId(0),
         "creator records no pre-membership bound"
+    );
+}
+
+/// Seam parity with `replay_buffered_messages` (5ae9a440): the deferred-peel
+/// sweep must NOT relabel `Processed` a `PeelDeferred` row that
+/// `ingest_group_message` terminalized during the sweep. The reachable case is
+/// `SelfEvicted`: a future-epoch commit sits `PeelDeferred`; once our own leaf
+/// is removed the group is `!is_active` (still `Stable`, not quarantined), so
+/// re-ingesting the deferred row hits the `!is_active` gate, which persists it
+/// `Failed`. That ingest-committed verdict is authoritative — sweeping it back
+/// to `Processed` would feed a row we were evicted on into canonicalization
+/// (`openmls_projection` / `distributed_convergence` select on `Processed`).
+#[tokio::test]
+async fn deferred_peel_self_evicted_row_stays_failed_not_swept_processed() {
+    // alice (admin) removes carol; bob keeps the group non-trivial afterwards.
+    let (mut alice, _alice_storage) = build_client(b"alice-deferred-self-evict");
+    let (mut bob, _bob_storage) = build_client(b"bob-deferred-self-evict");
+    let (mut carol, carol_storage, _carol_peeler) =
+        build_counting_client(b"carol-deferred-self-evict");
+    let carol_id = carol.self_id().clone();
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "deferred-self-evict".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob-deferred-self-evict"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol-deferred-self-evict"))
+        .await
+        .unwrap();
+    carol.drain_events();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    // Alice removes carol at epoch 1 (source epoch 1) → advances to epoch 2.
+    // Carol can peel & apply this at epoch 1; hold it back for now.
+    let (msg, pending) = evolution(
+        alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![carol_id.clone()],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let remove_carol = route(msg, &group_id);
+
+    // Alice, now at epoch 2, produces a future commit (source epoch 2) that
+    // carol at epoch 1 cannot peel — it is retained `PeelDeferred`.
+    let (msg, pending) = evolution(
+        alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("post-remove".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let future_commit = route(msg, &group_id);
+
+    // Carol (epoch 1) ingests the future commit: undecryptable → PeelDeferred.
+    assert!(matches!(
+        carol.ingest(future_commit.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&future_commit.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the future-epoch commit is retained pending a later peel"
+    );
+
+    // Carol applies the removal: her leaf is gone and the group goes inactive
+    // (still `Stable`, not quarantined), so the deferred row will re-ingest
+    // against an inactive group.
+    carol.ingest(remove_carol).await.unwrap();
+    assert!(
+        !carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == carol_id),
+        "carol must have been evicted by the removal"
+    );
+
+    // The deferred future-commit row re-ingests against the inactive group →
+    // `SelfEvicted`, so ingest persists it `Failed`. Regression: the sweep must
+    // not clobber that `Failed` back to `Processed`.
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage.get_message(&future_commit.id).unwrap().state,
+        MessageState::Failed,
+        "a row we were evicted on must stay Failed after the deferred-peel \
+         sweep, not be swept into canonicalization as Processed"
     );
 }

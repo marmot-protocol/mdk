@@ -9,15 +9,17 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::{EngineError, PeelerError};
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::KeyPackageBundleStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use std::sync::Arc;
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
     use sha2::{Digest, Sha256};
@@ -120,8 +122,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -145,6 +149,7 @@ fn config(
         keys.public_key().to_bytes().to_vec(),
         Box::new(MockPeeler),
     )
+    .legacy_compatibility_profile()
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
     .feature_registry(FeatureRegistry::new())
 }
@@ -160,6 +165,54 @@ fn selfremove_registry() -> FeatureRegistry {
         },
     );
     registry
+}
+
+#[tokio::test]
+async fn default_session_cutover_retires_legacy_key_packages_on_every_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("cutover.sqlite");
+    let key = SqlCipherKey::new("strict cutover key").unwrap();
+    let identity = b"strict-cutover";
+
+    let mut legacy = AccountDeviceSession::open(config(&database_path, &key, identity)).unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    drop(legacy);
+
+    let keys = deterministic_nostr_keys(identity);
+    let current_config = || {
+        SessionConfig::new(
+            &database_path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            keys.public_key().to_bytes().to_vec(),
+            Box::new(MockPeeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: keys.clone(),
+        }))
+    };
+
+    let current = AccountDeviceSession::open(current_config()).unwrap();
+    assert_eq!(current.new_protocol_profile(), ProtocolProfile::Current);
+    drop(current);
+
+    let storage = SqliteAccountStorage::open_encrypted(
+        &database_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
+    drop(storage);
+
+    let reopened = AccountDeviceSession::open(current_config()).unwrap();
+    assert_eq!(reopened.new_protocol_profile(), ProtocolProfile::Current);
+    drop(reopened);
+    let storage = SqliteAccountStorage::open_encrypted(
+        &database_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
 }
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
@@ -198,6 +251,14 @@ fn app_payload_for(sender: &AccountDeviceSession, payload: impl AsRef<[u8]>) -> 
     )
     .encode()
     .expect("test app event encodes")
+}
+
+fn only_received_message_id(events: &[GroupEvent]) -> MessageId {
+    let [GroupEvent::MessageReceived { message_id, .. }] = events else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
+    message_id.clone()
 }
 
 #[tokio::test]
@@ -251,6 +312,90 @@ async fn session_reopens_encrypted_sqlite_group_state() {
 }
 
 #[tokio::test]
+async fn current_founding_creation_is_immediately_stable_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-current.sqlite");
+    let bob_path = dir.path().join("bob-current.sqlite");
+    let key = SqlCipherKey::new("session current founding key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(&bob_path, &key, b"bob-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "current-founding".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created.effects.publish.as_slice() {
+        [PublishWork::FoundingGroupCreated { welcomes }] if welcomes.len() == 1 => {
+            welcomes[0].clone()
+        }
+        other => panic!("expected one founding Welcome and no pending commit, got {other:?}"),
+    };
+    assert_eq!(
+        created.effects.events,
+        vec![GroupEvent::GroupCreated {
+            group_id: created.group_id.clone()
+        }]
+    );
+    assert_eq!(alice.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(alice.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(
+        alice.stored_sent_welcome(&welcome.id).unwrap().0,
+        created.group_id
+    );
+
+    bob.ingest(welcome).await.unwrap();
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&bob, b"invitee first message"),
+        })
+        .await
+        .unwrap();
+    let message = match sent.publish.as_slice() {
+        [PublishWork::ApplicationMessage { msg, .. }] => route(msg.clone(), &created.group_id),
+        other => panic!("expected invitee application publish work, got {other:?}"),
+    };
+    let received = alice.ingest(message).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
+    assert_eq!(
+        received.effects.events,
+        vec![GroupEvent::MessageReceived {
+            group_id: created.group_id.clone(),
+            message_id,
+            epoch: EpochId(1),
+            sender: bob.self_id(),
+            payload: app_payload_for(&bob, b"invitee first message"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
+        }]
+    );
+
+    drop(alice);
+    let reopened = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn session_ingest_surfaces_join_and_app_message_events() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("session app event key").unwrap();
@@ -285,7 +430,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         vec![GroupEvent::GroupJoined {
             group_id: created.group_id.clone(),
             via_welcome: welcome_id,
-            welcomer: None,
+            welcomer: Some(alice.self_id()),
         }]
     );
 
@@ -297,11 +442,11 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         .await
         .unwrap();
     let app_msg = match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => route(msg.clone(), &created.group_id),
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
-
     let received = bob.ingest(app_msg).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
     assert_eq!(
         received.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
@@ -310,9 +455,14 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id,
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello through session"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 }
@@ -356,11 +506,11 @@ async fn reopened_creator_can_send_valid_group_messages() {
         .await
         .unwrap();
     let app_msg = match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => route(msg.clone(), &created.group_id),
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
-
     let received = bob.ingest(app_msg).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
     assert_eq!(
         received.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
@@ -369,9 +519,14 @@ async fn reopened_creator_can_send_valid_group_messages() {
         received.effects.events,
         vec![GroupEvent::MessageReceived {
             group_id: created.group_id,
+            message_id,
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello after restart"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 }
@@ -416,7 +571,7 @@ async fn session_ingest_schedules_auto_publish_work() {
         .await
         .unwrap();
     let proposal = match &leave.publish[0] {
-        PublishWork::Proposal { msg } => route(msg.clone(), &created.group_id),
+        PublishWork::Proposal { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected proposal publish work, got {other:?}"),
     };
 
@@ -520,7 +675,8 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
     bob.set_convergence_policy(CanonicalizationPolicy {
         settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
-    });
+    })
+    .expect("convergence policy accepted");
     let advanced = bob.advance_convergence(&created.group_id).await.unwrap();
     assert!(
         advanced
@@ -612,34 +768,87 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
     // early, and the message published instead of queuing (issue #296).
     // A large explicit window makes the queue path deterministic regardless of
     // scheduling jitter; the reset to 0 below deterministically releases it.
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 3_600_000,
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 3_600_000,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let queued_payload = app_payload_for(&carol, b"queued by session");
+    let queued_app_event_id = cgka_traits::MarmotAppEvent::decode(&queued_payload)
+        .expect("queued app event decodes")
+        .id;
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: app_payload_for(&carol, b"queued by session"),
+            payload: queued_payload,
         })
         .await
         .unwrap();
     assert_eq!(queued.queued.len(), 1);
     assert!(queued.publish.is_empty());
+    let queued_intent = queued.queued[0].clone();
 
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     let advanced = carol.advance_convergence(&created.group_id).await.unwrap();
 
     assert_eq!(carol.epoch(&created.group_id).unwrap(), EpochId(2));
     assert!(
-        advanced
-            .publish
-            .iter()
-            .any(|work| matches!(work, PublishWork::ApplicationMessage { .. })),
-        "expected queued application message to be regenerated, got {:?}",
+        advanced.publish.iter().any(|work| {
+            matches!(
+                work,
+                PublishWork::ApplicationMessage {
+                    queued_intent: Some(regenerated),
+                    group_id,
+                    app_event_id,
+                    source_epoch,
+                    retention,
+                    ..
+                } if regenerated == &queued_intent
+                    && group_id == &created.group_id
+                    && app_event_id == &queued_app_event_id
+                    && *source_epoch == EpochId(2)
+                    && *retention
+                        == cgka_traits::AppMessageRetentionDecision::new(1_700_000_000, 0)
+            )
+        }),
+        "expected queued application message to retain its durable intent handle, got {:?}",
         advanced.publish
     );
     assert!(advanced.queued.is_empty());
+}
+
+#[test]
+fn open_rejects_invalid_convergence_policy_before_storage_open() {
+    // mdk#970 / PR review: policy must fail closed before durable open work.
+    // A mismatched app window is rejected in every build; use a path that does
+    // not exist so a late failure would be a storage error rather than policy.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("never-created.sqlite");
+    assert!(!missing.exists(), "fixture path must not exist before open");
+    let key = SqlCipherKey::new("policy reject key").unwrap();
+    let result = AccountDeviceSession::open(
+        config(&missing, &key, b"policy-reject").convergence_policy(CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        }),
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("invalid policy must fail before storage open"),
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("convergence policy"),
+        "expected policy error, got {message}"
+    );
+    assert!(
+        !missing.exists(),
+        "rejected open must not create the database file"
+    );
 }

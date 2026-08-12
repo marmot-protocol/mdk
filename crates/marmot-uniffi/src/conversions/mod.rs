@@ -15,27 +15,39 @@ mod agent_stream;
 mod audit;
 mod chat_list;
 mod common;
+mod directory_search;
+mod draft;
 mod event;
 mod group;
+mod maintenance;
 mod media;
 mod message;
 mod notification;
 mod push;
 mod relay;
+mod telemetry;
 mod timeline;
+
+pub(super) fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
 
 pub use account::*;
 pub use agent_stream::*;
 pub use audit::*;
 pub use chat_list::*;
 pub use common::*;
+pub use directory_search::*;
+pub use draft::*;
 pub use event::*;
 pub use group::*;
+pub use maintenance::*;
 pub use media::*;
 pub use message::*;
 pub use notification::*;
 pub use push::*;
 pub use relay::*;
+pub use telemetry::*;
 pub use timeline::*;
 
 #[cfg(test)]
@@ -43,15 +55,23 @@ mod tests {
     use super::*;
     use crate::markdown::{MarkdownBlockFfi, MarkdownDocumentFfi, MarkdownInlineFfi};
     use marmot_app::{
-        AppMessageRecord, SecureDeleteExpiredResult, TimelineMessageRecord, TimelinePage,
-        TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+        AppMessageRecord, RetentionSweepGroupOutcome, RetentionSweepReport, RetentionSweepStatus,
+        SecureDeleteExpiredResult, TimelineMessageRecord, TimelinePage, TimelineReactionSummary,
+        TimelineReplyPreview, TimelineUserReaction,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn count_conversion_saturates_instead_of_wrapping() {
+        assert_eq!(super::saturating_u32(usize::MAX), u32::MAX);
+    }
 
     fn group(admins: Vec<&str>) -> AppGroupRecordFfi {
         AppGroupRecordFfi {
             group_id_hex: "01".repeat(32),
+            protocol_profile: AppProtocolProfileFfi::Legacy,
             endpoint: "marmot:group:01".into(),
+            profile_present: true,
             name: "Test".into(),
             description: String::new(),
             admins: admins.into_iter().map(ToOwned::to_owned).collect(),
@@ -65,6 +85,7 @@ mod tests {
                 component_id: 0x8008,
                 component: "marmot.group.encrypted-media.v1".into(),
                 required: true,
+                version: Some(EncryptedMediaVersionFfi::V1),
                 media_format: "encrypted-media-v1".into(),
                 allowed_locator_kinds: vec!["blossom-v1".into()],
                 default_blob_endpoints: vec![AppBlobEndpointFfi {
@@ -75,10 +96,32 @@ mod tests {
             disappearing_message_secs: 0,
             archived: false,
             pending_confirmation: false,
+            unrecoverable: false,
             self_membership: SelfMembershipFfi::Member,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
+            disbanding: false,
+            disband_request: None,
+            disbanded: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }
+    }
+
+    #[test]
+    fn cursor_persistence_ffi_preserves_each_variant() {
+        use marmot_app::CursorPersistence;
+        // The FFI enum mirrors the app policy 1:1; a swapped variant here
+        // would hand a wake-collection process the Advance posture and
+        // silently reintroduce the NSE cursor ratchet.
+        assert!(matches!(
+            CursorPersistence::from(CursorPersistenceFfi::Advance),
+            CursorPersistence::Advance
+        ));
+        assert!(matches!(
+            CursorPersistence::from(CursorPersistenceFfi::Frozen),
+            CursorPersistence::Frozen
+        ));
     }
 
     #[test]
@@ -112,6 +155,22 @@ mod tests {
         }
     }
 
+    fn mls_state() -> AppGroupMlsStateFfi {
+        AppGroupMlsStateFfi {
+            group_id_hex: "01".repeat(16),
+            protocol_profile: AppProtocolProfileFfi::Current,
+            lifecycle_state: GroupLifecycleStateFfi::Stable,
+            epoch: 1,
+            member_count: 2,
+            unrecoverable: false,
+            required_app_components: vec![],
+            disbanding_enabled: true,
+            disbanding: false,
+            disbanding_blockers: vec![],
+            disband_request: None,
+        }
+    }
+
     #[test]
     fn group_management_state_marks_last_admin_self_demote_requirement() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
@@ -119,6 +178,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![self_id]),
             members: vec![member(self_id, true, true), member(bob_id, false, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);
@@ -146,17 +206,234 @@ mod tests {
     }
 
     #[test]
+    fn group_management_state_suppresses_leave_while_a_request_is_pending() {
+        // A non-admin member normally has `can_leave`. Once a leave is durable the
+        // engine rejects a second same-epoch request, so the affordance has to go
+        // away — but `requires_self_demote_before_leave` must stay false, since
+        // that is how hosts tell "demote first" from "already leaving".
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let mut leaving = group(vec![bob_id]);
+        leaving.leave_request_pending = true;
+        leaving.leave_requested_at_ms = Some(1_700_000_000_123);
+        let details = GroupDetailsFfi {
+            group: leaving,
+            members: vec![member(self_id, false, true), member(bob_id, true, false)],
+            mls_state: mls_state(),
+        };
+
+        let state = group_management_state_ffi(self_id, &details);
+
+        assert!(!state.can_leave);
+        assert!(!state.requires_self_demote_before_leave);
+        assert!(state.leave_request_pending);
+        assert_eq!(state.leave_requested_at_ms, Some(1_700_000_000_123));
+
+        // Same roster without the pending request: Leave is offered again.
+        let details = GroupDetailsFfi {
+            group: group(vec![bob_id]),
+            members: details.members,
+            mls_state: mls_state(),
+        };
+        let state = group_management_state_ffi(self_id, &details);
+        assert!(state.can_leave);
+        assert!(!state.leave_request_pending);
+        assert_eq!(state.leave_requested_at_ms, None);
+    }
+
+    #[test]
+    fn disband_gate_and_terminal_state_disable_every_management_action() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let members = vec![member(self_id, true, true), member(bob_id, false, false)];
+
+        for terminal in [false, true] {
+            let mut mls = mls_state();
+            if terminal {
+                mls.lifecycle_state = GroupLifecycleStateFfi::Disbanded;
+            } else {
+                mls.disbanding = true;
+                mls.disband_request = Some(DisbandRequestFfi::Pending {
+                    requested_at_ms: 1_700_000_000_123,
+                });
+            }
+            let state = group_management_state_ffi(
+                self_id,
+                &GroupDetailsFfi {
+                    group: group(vec![self_id]),
+                    members: members.clone(),
+                    mls_state: mls,
+                },
+            );
+
+            assert!(!state.can_invite);
+            assert!(!state.can_leave);
+            assert!(!state.requires_self_demote_before_leave);
+            assert!(!state.can_enable_disbanding);
+            assert!(!state.can_disband);
+            assert_eq!(state.disbanding, !terminal);
+            assert!(
+                state.member_actions.iter().all(|action| {
+                    !action.can_remove && !action.can_promote && !action.can_demote
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn disband_management_actions_require_admin_support_and_enablement() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let group = group(vec![self_id]);
+
+        let mut disabled = mls_state();
+        disabled.disbanding_enabled = false;
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group: group.clone(),
+                members: vec![member(self_id, true, true), member(bob_id, false, false)],
+                mls_state: disabled.clone(),
+            },
+        );
+        assert!(state.can_enable_disbanding);
+        assert!(!state.can_disband);
+
+        disabled.disbanding_blockers = vec![bob_id.to_owned()];
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group: group.clone(),
+                members: vec![member(self_id, true, true), member(bob_id, false, false)],
+                mls_state: disabled,
+            },
+        );
+        assert!(!state.can_enable_disbanding);
+        assert!(!state.can_disband);
+        assert_eq!(state.disbanding_blockers, vec![bob_id]);
+
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group: group.clone(),
+                members: vec![member(self_id, true, true), member(bob_id, false, false)],
+                mls_state: mls_state(),
+            },
+        );
+        assert!(!state.can_enable_disbanding);
+        assert!(state.can_disband);
+
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group,
+                members: vec![member(self_id, false, true), member(bob_id, true, false)],
+                mls_state: mls_state(),
+            },
+        );
+        assert!(!state.can_enable_disbanding);
+        assert!(!state.can_disband);
+    }
+
+    #[test]
+    fn lifecycle_ffi_mapping_covers_all_six_canonical_states() {
+        let cases = [
+            (
+                marmot_app::AppGroupLifecycleState::Stable,
+                GroupLifecycleStateFfi::Stable,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::PendingPublish,
+                GroupLifecycleStateFfi::PendingPublish,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Merging,
+                GroupLifecycleStateFfi::Merging,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Recovering,
+                GroupLifecycleStateFfi::Recovering,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Unrecoverable,
+                GroupLifecycleStateFfi::Unrecoverable,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Disbanded,
+                GroupLifecycleStateFfi::Disbanded,
+            ),
+        ];
+        for (app, ffi) in cases {
+            assert_eq!(GroupLifecycleStateFfi::from(app), ffi);
+        }
+    }
+
+    #[test]
     fn secure_delete_expired_result_ffi_preserves_count_and_hashes() {
         let ffi = SecureDeleteExpiredResultFfi::from(SecureDeleteExpiredResult {
             pruned_messages: 2,
+            secrets_deleted: 1,
             media_ciphertext_sha256: vec!["aa".repeat(32), "bb".repeat(32)],
+            erasure_pending: true,
         });
 
         assert_eq!(ffi.pruned_messages, 2);
+        assert_eq!(ffi.secrets_deleted, 1);
         assert_eq!(
             ffi.media_ciphertext_sha256,
             vec!["aa".repeat(32), "bb".repeat(32)]
         );
+        assert!(ffi.erasure_pending);
+    }
+
+    #[test]
+    fn retention_sweep_report_ffi_preserves_every_status_and_payload() {
+        let statuses = [
+            RetentionSweepStatus::NoExpiredMessages,
+            RetentionSweepStatus::Pruned,
+            RetentionSweepStatus::DeferredClockSkew,
+            RetentionSweepStatus::DeferredUnread,
+            RetentionSweepStatus::DeferredScanExhausted,
+            RetentionSweepStatus::Failed,
+        ];
+        let ffi = RetentionSweepReportFfi::from(RetentionSweepReport {
+            groups: statuses
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| RetentionSweepGroupOutcome {
+                    group_id_hex: format!("{index:02x}"),
+                    status,
+                    pruned_messages: index as u64,
+                    secrets_deleted: (index + 1) as u64,
+                    media_ciphertext_sha256: vec![format!("{index:064x}")],
+                    failure_kind: (status == RetentionSweepStatus::Failed)
+                        .then(|| "storage_busy".to_owned()),
+                })
+                .collect(),
+        });
+
+        assert_eq!(ffi.groups.len(), statuses.len());
+        assert_eq!(
+            ffi.groups[0].status,
+            RetentionSweepStatusFfi::NoExpiredMessages
+        );
+        assert_eq!(ffi.groups[1].status, RetentionSweepStatusFfi::Pruned);
+        assert_eq!(
+            ffi.groups[2].status,
+            RetentionSweepStatusFfi::DeferredClockSkew
+        );
+        assert_eq!(
+            ffi.groups[3].status,
+            RetentionSweepStatusFfi::DeferredUnread
+        );
+        assert_eq!(
+            ffi.groups[4].status,
+            RetentionSweepStatusFfi::DeferredScanExhausted
+        );
+        assert_eq!(ffi.groups[5].status, RetentionSweepStatusFfi::Failed);
+        assert_eq!(ffi.groups[1].pruned_messages, 1);
+        assert_eq!(ffi.groups[1].secrets_deleted, 2);
+        assert_eq!(ffi.groups[5].failure_kind.as_deref(), Some("storage_busy"));
     }
 
     #[test]
@@ -165,6 +442,8 @@ mod tests {
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
             source_epoch: Some(7),
+            retention_seconds: Some(300),
+            retention_expires_at: Some(310),
             direction: "received".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),
@@ -183,6 +462,7 @@ mod tests {
                 media: None,
                 agent_text_stream: None,
                 deleted: false,
+                invalidation_status: Some("LosingBranch".to_owned()),
             }),
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]
@@ -216,6 +496,9 @@ mod tests {
         let message = &page.messages[0];
         assert_eq!(message.message_id_hex, "message-1");
         assert_eq!(message.source_message_id_hex.as_deref(), Some("source-1"));
+        assert_eq!(message.source_epoch, Some(7));
+        assert_eq!(message.retention_seconds, Some(300));
+        assert_eq!(message.retention_expires_at, Some(310));
         assert_eq!(message.reply_to_message_id_hex.as_deref(), Some("parent"));
         assert!(matches!(
             &message.content_tokens.blocks[0],
@@ -282,6 +565,8 @@ mod tests {
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "system".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),
@@ -326,6 +611,8 @@ mod tests {
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "system".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),
@@ -359,16 +646,22 @@ mod tests {
             plaintext: "reaction".to_owned(),
             kind: 7,
             tags: vec![vec!["e".to_owned(), "target".to_owned()]],
-            source_epoch: None,
+            source_epoch: Some(4),
+            retention: Some(marmot_app::AppMessageRetentionDecision::new(10, 5)),
             recorded_at: 10,
             received_at: 11,
             insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
         };
 
         let ffi = AppMessageRecordFfi::from(record);
 
         assert_eq!(ffi.kind, 7);
         assert_eq!(ffi.content_tokens, MarkdownDocumentFfi::default());
+        assert_eq!(ffi.source_epoch, Some(4));
+        assert_eq!(ffi.retention_seconds, Some(5));
+        assert_eq!(ffi.retention_expires_at, Some(15));
     }
 
     #[test]
@@ -378,6 +671,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![self_id, bob_id]),
             members: vec![member(self_id, true, true), member(bob_id, true, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);
@@ -401,6 +695,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![alice_id]),
             members: vec![member(self_id, false, true), member(alice_id, true, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);

@@ -1,9 +1,8 @@
 //! Typed outcomes from [`crate::engine::CgkaEngine::ingest`] plus the
 //! peeled-message intermediate form.
 //!
-//! `IngestOutcome` separates applied messages from classifiable stale cases.
-//! Hard errors stay in `EngineError`; stale routing, dedupe, and epoch cases
-//! remain ordinary outcomes.
+//! `IngestOutcome` separates pre-convergence exclusions, convergence
+//! dispositions, and canonical local state. Hard errors stay in `EngineError`.
 
 use crate::transport::TransportMessage;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
@@ -18,16 +17,94 @@ pub enum IngestOutcome {
     /// the group is temporarily not ingestible, usually during a local
     /// publish-before-apply transition. The engine replays buffered messages
     /// when the group returns to `Stable`.
+    ///
+    /// That replay is owned by the application's convergence drain
+    /// (`drain_pending_convergence_groups` →
+    /// `converge_stored_openmls_messages`), not by `replay_buffered_messages`,
+    /// which only re-ingests retained raw transport rows. So an engine seam that
+    /// leaves a retained content row unapplied MUST schedule the group for
+    /// convergence; otherwise this outcome promises a replay that never happens.
     Buffered { group_id: GroupId, epoch: EpochId },
+    /// Rejected before convergence admission because routing or deduplication
+    /// proved the input cannot affect this account-device's canonical state.
+    Ignored { category: InputRejectionCategory },
+    /// A canonical local condition blocked processing. This is deliberately
+    /// separate from convergence dispositions.
+    LocalState { state: LocalIngestState },
+    /// The transport object could not be decoded or decrypted with the
+    /// currently available transport context, but a later canonical epoch,
+    /// retained candidate, staged state, or repair may make it recoverable.
+    /// The object remains outside convergence until peeling succeeds.
+    TransportDeferred { group_id: GroupId },
+    /// A local resource bound prevented the engine from retaining or
+    /// processing an otherwise unclassified transport object. This is not a
+    /// protocol rejection and must not make same-id redelivery a duplicate.
+    ResourceRefused {
+        group_id: GroupId,
+        resource: InboundResourceLimit,
+    },
     /// Message was not applied. The variant names why — callers log by
     /// category rather than pattern-matching error strings.
     Stale { reason: StaleReason },
+    /// A standalone or commit-carried MLS proposal failed Marmot semantic
+    /// admission before it could enter pending state or affect group state.
+    Rejected { category: ProposalRejectionCategory },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputRejectionCategory {
+    Duplicate,
+    OwnEcho,
+    WrongRecipient,
+    UnknownGroup,
+    InvalidEncoding,
+    InvalidSignature,
+    UnsupportedRequiredFeature,
+    AuthorizationFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InboundResourceLimit {
+    /// The per-group durable transport-deferred row cap is full.
+    TransportDeferredCapacity,
+    /// A retained transport object exhausted its changed-context retry budget
+    /// and was retired without a terminal validity claim.
+    TransportDeferredRetryBudget,
+    /// A retained transport object exhausted its durable local residence
+    /// budget and was retired without a terminal validity claim.
+    TransportDeferredResidenceBudget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalIngestState {
+    /// Authenticated MLS state records this account-device's removal. The
+    /// engine has already performed the realizing-removal side effects.
+    Removed,
+    /// Hydration validation froze the local group copy pending repair.
+    Quarantined,
+}
+
+/// Stable rejection taxonomy for authenticated MLS proposals that fail
+/// Marmot's semantic admission rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProposalRejectionCategory {
+    /// The authenticated sender is not authorized for this proposal.
+    AuthorizationFailed,
+    /// The active protocol profile does not admit this proposal type.
+    UnsupportedProposal,
+    /// Proposal bytes, component data, or resulting state are invalid.
+    InvalidEncoding,
+    /// The proposal cannot be authenticated to a valid current member.
+    InvalidSignature,
+    /// SelfRemove violates the active member-departure or admin rules.
+    InvalidSelfRemove,
 }
 
 /// Why an inbound message was not processed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StaleReason {
     /// The engine has already seen this `MessageId`. Coordinator dedup.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: Duplicate }")]
     AlreadySeen,
     /// The engine is already at or past the message's epoch. Commonly hit
     /// when a commit arrives after a welcome that already advanced the
@@ -36,16 +113,30 @@ pub enum StaleReason {
         current: EpochId,
         msg_epoch: EpochId,
     },
-    /// A welcome addressed to a member other than ourselves.
+    /// Input addressed to another member, or whose signed transport routing
+    /// metadata conflicts with the envelope presented to the engine.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: WrongRecipient }")]
     NotForThisClient,
     /// No local group matches this message's routing.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: UnknownGroup }")]
     UnknownGroup,
     /// The message is our own commit echoed back by the transport.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: OwnEcho }")]
     OwnEcho,
-    /// The peeler rejected the message. The stored message may be terminal or
-    /// retryable depending on whether the engine has evidence that another
-    /// epoch context could later peel it.
-    PeelFailed,
+    /// The message predates this account-device's membership and can never
+    /// decrypt on this local copy.
+    PreMembership,
+    /// Convergence excluded the input below the retained anchor.
+    BeyondAnchor,
+    /// Convergence excluded the input beyond the rollback horizon.
+    BeyondRollbackHorizon,
+    /// The application-message decryption window no longer retains its
+    /// source epoch.
+    BeyondAppRetention,
+    /// The message belongs only to a losing canonical branch.
+    LosingBranch,
+    /// Authenticated input is invalid against the selected candidate state.
+    InvalidAgainstCanonicalState,
     /// The local retained canonical state records our own removal from this
     /// group, so later group input can never be processed here. Terminal for
     /// the group on this client. Processing input that classifies as
@@ -56,6 +147,7 @@ pub enum StaleReason {
     /// evidence (the local MLS state records the eviction) maps here — a bare
     /// decrypt failure is a missing-history/repair condition, never
     /// `SelfEvicted`.
+    #[deprecated(note = "use IngestOutcome::LocalState { state: Removed }")]
     SelfEvicted,
     /// The group is under hydration quarantine: it failed session-open
     /// validation and is frozen until explicit repair. The message was not
@@ -65,6 +157,7 @@ pub enum StaleReason {
     /// welcome) clears the quarantine. Terminal for the message until then.
     /// The application can read the quarantine reason from
     /// `quarantined_groups()`.
+    #[deprecated(note = "use IngestOutcome::LocalState { state: Quarantined }")]
     Quarantined,
 }
 

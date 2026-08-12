@@ -33,7 +33,7 @@ impl AllowlistStore {
     }
 
     pub(crate) fn list(&self, account_id_hex: &str) -> Result<Vec<String>, ConnectorError> {
-        let _guard = self.lock.lock().expect("allowlist lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
         Ok(self.read_record(account_id_hex)?.welcomer_account_ids_hex)
     }
 
@@ -42,7 +42,7 @@ impl AllowlistStore {
         account_id_hex: &str,
         welcomer_account_id_hex: &str,
     ) -> Result<Vec<String>, ConnectorError> {
-        let _guard = self.lock.lock().expect("allowlist lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
         let mut record = self.read_record(account_id_hex)?;
         record
             .welcomer_account_ids_hex
@@ -57,7 +57,7 @@ impl AllowlistStore {
         account_id_hex: &str,
         welcomer_account_id_hex: &str,
     ) -> Result<Vec<String>, ConnectorError> {
-        let _guard = self.lock.lock().expect("allowlist lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
         let mut record = self.read_record(account_id_hex)?;
         record
             .welcomer_account_ids_hex

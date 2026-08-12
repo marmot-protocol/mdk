@@ -98,6 +98,9 @@ pub struct TimelineReplyPreviewFfi {
     pub media: Vec<MediaAttachmentReferenceFfi>,
     pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
+    /// Convergence invalidation reason for the previewed message. The content
+    /// fields are intentionally preserved so the application controls display.
+    pub invalidation_status: Option<String>,
 }
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
@@ -114,6 +117,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             deleted: value.deleted,
+            invalidation_status: value.invalidation_status,
         }
     }
 }
@@ -164,6 +168,15 @@ pub struct TimelineMessageRecordFfi {
     /// re-sending the text. For received messages this is the originating event
     /// id and is always `Some(..)`.
     pub source_message_id_hex: Option<String>,
+    /// Authenticated MLS source epoch used to resolve this message's pinned
+    /// retention and encrypted-media decisions.
+    pub source_epoch: Option<u64>,
+    /// `None` means no recoverable source-epoch decision (legacy/safe retain).
+    /// `Some(0)` means retention was explicitly disabled for this message.
+    pub retention_seconds: Option<u64>,
+    /// Exact pinned expiration timestamp. A positive retention duration can
+    /// still have no finite expiry when timestamp addition overflowed.
+    pub retention_expires_at: Option<u64>,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
@@ -171,7 +184,10 @@ pub struct TimelineMessageRecordFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub tags: Vec<MessageTagFfi>,
+    /// Authenticated inner app-event time, or observation time for synthesized
+    /// rows without an inner timestamp.
     pub timeline_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
@@ -205,6 +221,9 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
+            source_epoch: value.source_epoch,
+            retention_seconds: value.retention_seconds,
+            retention_expires_at: value.retention_expires_at,
             direction: value.direction,
             group_id_hex: value.group_id_hex,
             sender: value.sender,
@@ -467,6 +486,8 @@ mod tests {
             message_id_hex: "msg".to_owned(),
             source_message_id_hex: None,
             source_epoch,
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "received".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "alice".to_owned(),
@@ -515,6 +536,28 @@ mod tests {
     }
 
     #[test]
+    fn timeline_message_record_ffi_preserves_retention_states_without_recomputation() {
+        let legacy: TimelineMessageRecordFfi = record_with_media(Some(7), None, None).into();
+        assert_eq!(legacy.source_epoch, Some(7));
+        assert_eq!(legacy.retention_seconds, None);
+        assert_eq!(legacy.retention_expires_at, None);
+
+        let mut disabled = record_with_media(Some(8), None, None);
+        disabled.retention_seconds = Some(0);
+        let disabled = TimelineMessageRecordFfi::from(disabled);
+        assert_eq!(disabled.source_epoch, Some(8));
+        assert_eq!(disabled.retention_seconds, Some(0));
+        assert_eq!(disabled.retention_expires_at, None);
+
+        let mut unbounded = record_with_media(Some(9), None, None);
+        unbounded.retention_seconds = Some(300);
+        let unbounded = TimelineMessageRecordFfi::from(unbounded);
+        assert_eq!(unbounded.source_epoch, Some(9));
+        assert_eq!(unbounded.retention_seconds, Some(300));
+        assert_eq!(unbounded.retention_expires_at, None);
+    }
+
+    #[test]
     fn timeline_reply_preview_ffi_resolves_media_with_its_own_source_epoch() {
         let preview = TimelineReplyPreview {
             message_id_hex: "parent".to_owned(),
@@ -527,6 +570,7 @@ mod tests {
             media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
             agent_text_stream: None,
             deleted: false,
+            invalidation_status: Some("LosingBranch".to_owned()),
         };
         let record: TimelineMessageRecordFfi =
             record_with_media(Some(7), None, Some(preview)).into();
@@ -535,5 +579,6 @@ mod tests {
         assert_eq!(reply.media.len(), 1);
         assert_eq!(reply.media[0].file_name, "clip.mp4");
         assert_eq!(reply.media[0].source_epoch, 3);
+        assert_eq!(reply.invalidation_status.as_deref(), Some("LosingBranch"));
     }
 }

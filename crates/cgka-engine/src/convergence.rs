@@ -10,6 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
 
+/// Adopted convergence-policy v1 rewind horizon (protocol-core/convergence.md).
+pub const V1_MAX_REWIND_COMMITS: u64 = 5;
+/// Adopted v1 distinct-sender count required for witness quorum in an epoch.
+pub const V1_WITNESS_QUORUM_SENDERS_PER_EPOCH: usize = 2;
+/// Adopted v1 number of branch epochs that must meet witness quorum.
+pub const V1_WITNESS_QUORUM_EPOCHS: usize = 1;
+/// Adopted v1 bound on the witness-quorum effective-depth boost.
+pub const V1_MAX_WITNESS_OVERRIDE_DEPTH: u64 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergencePolicy {
     pub max_rewind_commits: u64,
@@ -21,10 +30,10 @@ pub struct ConvergencePolicy {
 impl Default for ConvergencePolicy {
     fn default() -> Self {
         Self {
-            max_rewind_commits: 5,
-            witness_quorum_senders_per_epoch: 2,
-            witness_quorum_epochs: 1,
-            max_witness_override_depth: 1,
+            max_rewind_commits: V1_MAX_REWIND_COMMITS,
+            witness_quorum_senders_per_epoch: V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
+            witness_quorum_epochs: V1_WITNESS_QUORUM_EPOCHS,
+            max_witness_override_depth: V1_MAX_WITNESS_OVERRIDE_DEPTH,
         }
     }
 }
@@ -130,7 +139,6 @@ fn compare_scores(a: &BranchScore, b: &BranchScore) -> Ordering {
     a.effective_commit_depth
         .cmp(&b.effective_commit_depth)
         .then_with(|| a.witness_quorum_met.cmp(&b.witness_quorum_met))
-        .then_with(|| a.valid_commit_depth.cmp(&b.valid_commit_depth))
         .then_with(|| a.app_witness_score.cmp(&b.app_witness_score))
         .then_with(|| b.tip_priority.cmp(&a.tip_priority))
         .then_with(|| b.tip_committer.cmp(&a.tip_committer))
@@ -272,7 +280,7 @@ fn build_rule_trace(
     winner_id: &str,
     other_id: &str,
 ) -> Vec<RuleEvaluation> {
-    let entries: [(&'static str, Ordering, String, String); 7] = [
+    let entries: [(&'static str, Ordering, String, String); 6] = [
         (
             "effective_commit_depth",
             winner
@@ -286,12 +294,6 @@ fn build_rule_trace(
             winner.witness_quorum_met.cmp(&other.witness_quorum_met),
             winner.witness_quorum_met.to_string(),
             other.witness_quorum_met.to_string(),
-        ),
-        (
-            "valid_commit_depth",
-            winner.valid_commit_depth.cmp(&other.valid_commit_depth),
-            winner.valid_commit_depth.to_string(),
-            other.valid_commit_depth.to_string(),
         ),
         (
             "app_witness_score",

@@ -14,7 +14,8 @@
 //! commit is the transport-layer `MessageId`. The two are kept separate inside
 //! `CommitRecoveryRecord` so the ordering key remains transport-independent
 //! while the engine can still reach back to the storage record that needs
-//! `MessageState::EpochInvalidated`.
+//! parking as `MessageState::ConvergenceDeferred` (reconsiderable by a later
+//! distributed-convergence pass, not terminal).
 
 use crate::engine::Engine;
 use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
@@ -32,8 +33,9 @@ struct CommitRecoveryRecord {
     group_id: GroupId,
     source_epoch: EpochId,
     ordering_key: CommitOrderingKey,
-    /// Storage-layer identity of the commit. Used to update
-    /// `MessageState::EpochInvalidated` when this commit loses a fork.
+    /// Storage-layer identity of the commit. Used to park the row
+    /// `MessageState::ConvergenceDeferred` when this commit loses a fork
+    /// (its branch stays reconsiderable for distributed convergence).
     storage_id: MessageId,
     snapshot_name: String,
 }
@@ -43,11 +45,23 @@ pub(crate) enum ForkResolution {
     CandidateWins {
         winner: CommitOrderingKey,
         invalidated: CommitOrderingKey,
-        /// `MessageId` of the now-invalidated incumbent, for the storage
-        /// `update_message_state` call site.
+        /// `MessageId` of the now-displaced incumbent, for the storage
+        /// write that parks its row `ConvergenceDeferred`.
         invalidated_storage_id: MessageId,
+        /// The row `resolve` actually re-persisted `ConvergenceDeferred`, if
+        /// any. `None` when the incumbent had no stored row to capture before
+        /// the rollback (`get_message` → `NotFound`), in which case nothing was
+        /// parked and no `message_state_changed` audit row may claim otherwise.
+        parked: Option<MessageId>,
     },
-    IncumbentWins,
+    IncumbentWins {
+        /// Ordering key of the commit this node kept. Carried so the
+        /// `fork_resolution` audit row can record WHICH branch survived —
+        /// without it, incumbent-wins rows are unverifiable against other
+        /// nodes' logs (cross-node convergence cannot be proven from
+        /// forensics alone).
+        kept: CommitOrderingKey,
+    },
     MissingSnapshot,
 }
 
@@ -91,7 +105,7 @@ impl ForkRecoveryManager {
         Ok(name)
     }
 
-    fn record_pending(
+    pub(crate) fn record_pending(
         &mut self,
         pending: PendingStateRef,
         group_id: GroupId,
@@ -100,6 +114,13 @@ impl ForkRecoveryManager {
         ordering_key: CommitOrderingKey,
         snapshot_name: String,
     ) {
+        if let Some(counter) = snapshot_name
+            .strip_prefix("fork-")
+            .and_then(|suffix| suffix.split('-').nth(1))
+            .and_then(|counter| counter.parse::<u64>().ok())
+        {
+            self.snapshot_counter = self.snapshot_counter.max(counter);
+        }
         self.pending.insert(
             pending,
             CommitRecoveryRecord {
@@ -136,7 +157,12 @@ impl ForkRecoveryManager {
             .insert((record.group_id.clone(), record.source_epoch), record);
     }
 
-    fn resolve<S: MessageStorage>(
+    /// Decide the pairwise race and, when the candidate wins, displace the
+    /// incumbent atomically.
+    ///
+    /// Bounded by `StorageProvider` so capture, rollback, re-persist and
+    /// release can join one transaction.
+    fn resolve<S: StorageProvider>(
         &mut self,
         storage: &S,
         group_id: &GroupId,
@@ -157,20 +183,53 @@ impl ForkRecoveryManager {
             candidate_mls_bytes,
         );
         if candidate_key >= incumbent.ordering_key {
-            return Ok(ForkResolution::IncumbentWins);
+            return Ok(ForkResolution::IncumbentWins {
+                kept: incumbent.ordering_key,
+            });
         }
 
-        storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
-        match storage.release_group_snapshot(group_id, &incumbent.snapshot_name) {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-            Err(e) => return Err(EngineError::Storage(e)),
-        }
+        // Rollback removes the incumbent row because its snapshot predates the
+        // commit. Capture and re-persist it atomically so the displaced branch
+        // remains reconsiderable. A nested call joins its caller's transaction;
+        // either way, an error aborts the boundary that contains this rollback.
+        // Re-key the row to its source epoch because convergence derives the
+        // rewind target from `record.epoch`. Remove the in-memory incumbent only
+        // after that transaction commits.
+        let snapshot_name = incumbent.snapshot_name.clone();
+        let incumbent_storage_id = incumbent.storage_id.clone();
+        let incumbent_source_epoch = incumbent.source_epoch;
+        let parked =
+            storage.with_transaction(|storage| -> Result<Option<MessageId>, EngineError> {
+                let displaced_incumbent_row = match storage.get_message(&incumbent_storage_id) {
+                    Ok(record) => Some(record),
+                    Err(StorageError::NotFound) => None,
+                    Err(e) => return Err(EngineError::Storage(e)),
+                };
+                storage.rollback_group_to_snapshot(group_id, &snapshot_name)?;
+
+                let parked = match displaced_incumbent_row {
+                    Some(mut record) => {
+                        record.epoch = incumbent_source_epoch;
+                        record.state = MessageState::ConvergenceDeferred;
+                        storage.put_message(&record)?;
+                        Some(record.id)
+                    }
+                    None => None,
+                };
+
+                match storage.release_group_snapshot(group_id, &snapshot_name) {
+                    Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                    Err(e) => return Err(EngineError::Storage(e)),
+                }
+                Ok(parked)
+            })?;
         self.incumbents.remove(&key);
 
         Ok(ForkResolution::CandidateWins {
             winner: candidate_key,
             invalidated: incumbent.ordering_key,
             invalidated_storage_id: incumbent.storage_id,
+            parked,
         })
     }
 
@@ -330,7 +389,11 @@ impl<S: StorageProvider> Engine<S> {
                 Some(hex::encode(invalidated.commit_digest)),
                 Some(hex::encode(invalidated_storage_id.as_slice())),
             ),
-            ForkResolution::IncumbentWins => (ForkWinner::Incumbent, None, None),
+            ForkResolution::IncumbentWins { kept } => (
+                ForkWinner::Incumbent,
+                Some(hex::encode(kept.commit_digest)),
+                None,
+            ),
             ForkResolution::MissingSnapshot => (ForkWinner::MissingSnapshot, None, None),
         };
         self.audit_group(
@@ -343,28 +406,25 @@ impl<S: StorageProvider> Engine<S> {
                 invalidated_msg_id,
             },
         );
-        if let ForkResolution::CandidateWins {
-            invalidated_storage_id,
-            ..
-        } = &resolution
-        {
+        if let ForkResolution::CandidateWins { parked, .. } = &resolution {
             self.epoch_manager
                 .set_stable(group_id.clone(), source_epoch);
-            match self
-                .storage
-                .update_message_state(invalidated_storage_id, MessageState::EpochInvalidated)
-            {
-                Ok(()) | Err(StorageError::NotFound) => {}
-                Err(e) => return Err(EngineError::Storage(e)),
+            // Record the transition for forensics — but ONLY for a row that
+            // was really re-persisted. `resolve` parks nothing when the
+            // incumbent had no stored row to capture before the rollback, and
+            // a `message_state_changed` row naming a msg_id that has no
+            // storage row would make the audit log describe a transition that
+            // never happened.
+            if let Some(parked) = parked {
+                self.audit_group(
+                    group_id,
+                    crate::audit_helpers::message_state_changed_event(
+                        hex::encode(parked.as_slice()),
+                        MessageState::ConvergenceDeferred,
+                        "fork_loser",
+                    ),
+                );
             }
-            self.audit_group(
-                group_id,
-                crate::audit_helpers::message_state_changed_event(
-                    hex::encode(invalidated_storage_id.as_slice()),
-                    MessageState::EpochInvalidated,
-                    "fork_loser",
-                ),
-            );
         }
         Ok(resolution)
     }
@@ -419,6 +479,10 @@ mod tests {
             unused()
         }
 
+        fn delete_message(&self, _id: &MessageId) -> StorageResult<()> {
+            unused()
+        }
+
         fn update_message_state(
             &self,
             _id: &MessageId,
@@ -432,6 +496,31 @@ mod tests {
             _group_id: &GroupId,
             _at_or_after_epoch: EpochId,
         ) -> StorageResult<Vec<MessageRecord>> {
+            unused()
+        }
+
+        fn put_pending_application_event(
+            &self,
+            _event: &cgka_traits::engine::GroupEvent,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn list_pending_application_events(
+            &self,
+        ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
+            unused()
+        }
+
+        fn delete_pending_application_events(&self, _ids: &[MessageId]) -> StorageResult<()> {
+            unused()
+        }
+
+        fn put_ingress_dedup_marker(&self, _id: &MessageId) -> StorageResult<()> {
+            unused()
+        }
+
+        fn has_ingress_dedup_marker(&self, _id: &MessageId) -> StorageResult<bool> {
             unused()
         }
 
@@ -454,6 +543,37 @@ mod tests {
         fn release_group_snapshot(&self, _group_id: &GroupId, name: &str) -> StorageResult<()> {
             self.release_attempts.lock().unwrap().push(name.to_string());
             Err(StorageError::Backend("release failed".into()))
+        }
+
+        fn create_group_state_checkpoint(
+            &self,
+            _group_id: &GroupId,
+            _checkpoint: &cgka_traits::storage::GroupStateCheckpointRef,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn restore_group_state_checkpoint(
+            &self,
+            _group_id: &GroupId,
+            _checkpoint_id: &str,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn list_group_state_checkpoints(
+            &self,
+            _group_id: &GroupId,
+        ) -> StorageResult<Vec<cgka_traits::storage::GroupStateCheckpointRef>> {
+            unused()
+        }
+
+        fn release_group_state_checkpoint(
+            &self,
+            _group_id: &GroupId,
+            _checkpoint_id: &str,
+        ) -> StorageResult<()> {
+            unused()
         }
     }
 

@@ -12,10 +12,11 @@ Agent map for the Marmot architecture docs.
 6. `overview/whitenoise-integration-map.md`
 7. `cgka-engine-spec.md`
 8. `cgka-engine-canonicalization-contract.md`
-9. `distributed-convergence.md`
-10. `relay-delivery-telemetry.md`
-11. `relay-observability.md`
-12. `github.com/marmot-protocol/marmot` when the task touches the Marmot protocol specification.
+9. `convergence-reliability-plan.md`
+10. `distributed-convergence.md`
+11. `relay-delivery-telemetry.md`
+12. `relay-observability.md`
+13. `github.com/marmot-protocol/marmot` when the task touches the Marmot protocol specification.
 
 ## Document roles
 
@@ -33,7 +34,7 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `overview/local-artifact-safety.md`
   - **Role:** Restrictive-by-construction creation policy for local files, sockets, and databases; the
-    `crates/fs-private` helper contract.
+    `crates/fs-private` helper contract; the close-before-suspension rules for WAL connections and the root lease.
 
 - **Path:** `overview/dial-safety.md`
   - **Role:** One host-safety discipline for every outbound connection (validate resolved addresses, pin, trust from
@@ -51,6 +52,10 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `cgka-engine-canonicalization-contract.md`
   - **Role:** Detailed post-peeling convergence contract.
+
+- **Path:** `convergence-reliability-plan.md`
+  - **Role:** Tracked convergence assurance, constant classification, simulator roadmap, verification gates, and
+    campaign evidence.
 
 - **Path:** `distributed-convergence.md`
   - **Role:** Branch selection, retained anchors, and convergence model.
@@ -76,8 +81,11 @@ Agent map for the Marmot architecture docs.
 - **Path:** `hermes-openclaw-agent-integration-plan.md`
   - **Role:** Working plan for the Hermes/OpenClaw agent integration. Check status and dates before relying on it.
 
-- **Path:** `../../integrations/hermes/marmot/AGENTS.md` and `../../integrations/openclaw/marmot/AGENTS.md`
-  - **Role:** Agent plugin scope, key files, and verification for the control-plane-only Hermes/OpenClaw integrations.
+- **Path:** `../../integrations/AGENTS.md`, `../../integrations/hermes/marmot/AGENTS.md`,
+  `../../integrations/openclaw/marmot/AGENTS.md`, `../../integrations/opencode/marmot/AGENTS.md`,
+  `../../integrations/pi/marmot/AGENTS.md`, and `../../integrations/terminal-harness/AGENTS.md`
+  - **Role:** Host integration boundaries, connector coexistence, and verification for the Hermes, OpenClaw,
+    OpenCode, and Pi integrations plus their shared terminal-harness runtime.
 
 - **Repo:** `github.com/marmot-protocol/marmot`
   - **Role:** Marmot protocol specification by stable surface and app component.
@@ -91,3 +99,6 @@ Agent map for the Marmot architecture docs.
   components in `github.com/marmot-protocol/marmot`.
 - If Tamarin or Rust tests add a named scenario, mirror the name in the docs when that scenario becomes part of the
   contract.
+- When adding or changing a convergence policy, resource, scheduler, or history-recovery constant, update
+  `convergence-reliability-plan.md` and `convergence-constant-inventory.txt`, then run
+  `just convergence-ledger-gate`.

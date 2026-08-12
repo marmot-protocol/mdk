@@ -165,15 +165,24 @@ impl AgentConnector {
         welcomer: Option<MemberId>,
     ) -> Result<(), ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let allowed = self.allow_any
-            || match welcomer {
-                Some(welcomer) => {
+        let (welcomer_present, welcomer_allowlisted) = match welcomer {
+            Some(welcomer) => {
+                let allowlisted = if self.dev_allow_any_invites {
+                    false
+                } else {
                     let welcomer_account_id_hex = hex::encode(welcomer.as_slice());
                     self.allowlists
                         .contains(&account.account_id_hex, &welcomer_account_id_hex)?
-                }
-                None => false,
-            };
+                };
+                (true, allowlisted)
+            }
+            None => (false, false),
+        };
+        let allowed = invite_policy_allows(
+            self.dev_allow_any_invites,
+            welcomer_present,
+            welcomer_allowlisted,
+        );
         if allowed {
             self.runtime
                 .accept_group_invite(&account.label, group_id)
@@ -185,4 +194,12 @@ impl AgentConnector {
         }
         Ok(())
     }
+}
+
+pub(crate) fn invite_policy_allows(
+    dev_allow_any_invites: bool,
+    welcomer_present: bool,
+    welcomer_allowlisted: bool,
+) -> bool {
+    welcomer_present && (dev_allow_any_invites || welcomer_allowlisted)
 }

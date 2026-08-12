@@ -1,0 +1,692 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marmot-protocol.org/schemas/scenario-ir.v2.schema.json",
+  "title": "MDK adapter-neutral scenario IR v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "spec_version", "clients", "steps"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "spec_version": { "const": "2" },
+    "clients": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "topology": { "$ref": "#/$defs/topology" },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    }
+  },
+  "$defs": {
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accounts": { "type": "array", "items": { "$ref": "#/$defs/account" } },
+        "devices": { "type": "array", "items": { "$ref": "#/$defs/device" } },
+        "processes": { "type": "array", "items": { "$ref": "#/$defs/process" } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/group" } },
+        "relays": { "type": "array", "items": { "$ref": "#/$defs/relay" } }
+      }
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "roles": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "account", "process", "client"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "account": { "type": "string", "minLength": 1 },
+        "process": { "type": "string", "minLength": 1 },
+        "client": { "type": "string", "minLength": 1 }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "binary_version", "policy_version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "binary_version": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "relays": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "members": { "$ref": "#/$defs/string_array" },
+        "admins": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "implementation_version", "policy_version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "implementation_version": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "string_array": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "message_selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "action_id": { "type": "string", "minLength": 1 },
+        "publication": { "type": "string", "minLength": 1 },
+        "sender": { "type": "string", "minLength": 1 },
+        "class": {
+          "enum": ["commit", "proposal", "application", "welcome", "group_message"]
+        },
+        "occurrence": { "type": "integer", "minimum": 0 }
+      },
+      "anyOf": [
+        { "required": ["action_id"] },
+        { "required": ["publication"] },
+        { "required": ["sender"] },
+        { "required": ["class"] }
+      ]
+    },
+    "predicate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "client_state" },
+            "client": { "type": "string", "minLength": 1 },
+            "epoch": { "type": "integer", "minimum": 0 },
+            "member_count": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "payload", "count"],
+          "properties": {
+            "type": { "const": "payload_count" },
+            "client": { "type": "string", "minLength": 1 },
+            "payload": { "type": "string" },
+            "count": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "clients_exactly_equivalent" },
+            "clients": { "$ref": "#/$defs/nonempty_string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "no_pending_work" },
+            "clients": { "$ref": "#/$defs/nonempty_string_array" }
+          }
+        }
+      ]
+    },
+    "assertion": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "predicate"],
+          "properties": {
+            "mode": { "const": "exactly" },
+            "predicate": { "$ref": "#/$defs/predicate" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "predicate", "max_iterations"],
+          "properties": {
+            "mode": { "const": "eventually" },
+            "predicate": { "$ref": "#/$defs/predicate" },
+            "max_iterations": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "predicate", "timeout_ms", "poll_interval_ms"],
+          "properties": {
+            "mode": { "const": "within" },
+            "predicate": { "$ref": "#/$defs/predicate" },
+            "timeout_ms": { "type": "integer", "minimum": 0 },
+            "poll_interval_ms": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "predicate", "duration_ms", "poll_interval_ms"],
+          "properties": {
+            "mode": { "const": "never" },
+            "predicate": { "$ref": "#/$defs/predicate" },
+            "duration_ms": { "type": "integer", "minimum": 0 },
+            "poll_interval_ms": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "metric", "comparison", "value"],
+          "properties": {
+            "mode": { "const": "resource" },
+            "metric": {
+              "enum": [
+                "runnable_work",
+                "deferred_retry_work",
+                "outbound_awaiting_acknowledgement",
+                "transport_queued_messages",
+                "transport_delayed_messages",
+                "transport_mailbox_messages",
+                "scenario_inputs_pending"
+              ]
+            },
+            "comparison": { "enum": ["equal", "less_than_or_equal", "greater_than_or_equal"] },
+            "value": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "relay_sync_mode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "incremental" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "timestamp"],
+          "properties": {
+            "mode": { "const": "since" },
+            "timestamp": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "full_history" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "set_reconciliation" } }
+        }
+      ]
+    },
+    "nonempty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "group", "action"],
+          "properties": {
+            "type": { "const": "in_group" },
+            "group": { "type": "string", "minLength": 1 },
+            "action": {
+              "allOf": [
+                { "$ref": "#/$defs/step" },
+                {
+                  "type": "object",
+                  "required": ["type"],
+                  "properties": {
+                    "type": {
+                      "enum": [
+                        "create_group",
+                        "invite_members",
+                        "remove_members",
+                        "self_update",
+                        "update_group_data",
+                        "update_admin_policy",
+                        "expect_update_admin_policy_error",
+                        "send_app_message",
+                        "leave",
+                        "probe_bidirectional_decryptability",
+                        "observe_admin_policy",
+                        "observe",
+                        "observe_exact",
+                        "clear_events"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "creator", "name", "invitees", "pending"],
+          "properties": {
+            "type": { "const": "create_group" },
+            "creator": { "type": "string", "minLength": 1 },
+            "name": { "type": "string" },
+            "invitees": { "$ref": "#/$defs/string_array" },
+            "required_features": { "$ref": "#/$defs/string_array" },
+            "initial_admins": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "inviter", "invitees", "pending"],
+          "properties": {
+            "type": { "const": "invite_members" },
+            "inviter": { "type": "string", "minLength": 1 },
+            "invitees": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "remover", "members", "pending"],
+          "properties": {
+            "type": { "const": "remove_members" },
+            "remover": { "type": "string", "minLength": 1 },
+            "members": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "pending"],
+          "properties": {
+            "type": { "const": "self_update" },
+            "client": { "type": "string", "minLength": 1 },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "name", "pending"],
+          "properties": {
+            "type": { "const": "update_group_data" },
+            "client": { "type": "string", "minLength": 1 },
+            "name": { "type": "string" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "admins", "pending"],
+          "properties": {
+            "type": { "const": "update_admin_policy" },
+            "client": { "type": "string", "minLength": 1 },
+            "admins": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "admins", "error"],
+          "properties": {
+            "type": { "const": "expect_update_admin_policy_error" },
+            "client": { "type": "string", "minLength": 1 },
+            "admins": { "$ref": "#/$defs/string_array" },
+            "error": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "outcome"],
+          "properties": {
+            "type": { "const": "acknowledge_outbound" },
+            "client": { "type": "string", "minLength": 1 },
+            "publication": { "type": "string", "minLength": 1 },
+            "selection": {
+              "enum": ["all", "state_confirmation", "welcome", "group_message", "regenerated_queued_intent"]
+            },
+            "outcome": { "enum": ["accepted", "reached_no_endpoint"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "sender", "payload"],
+          "properties": {
+            "type": { "const": "send_app_message" },
+            "sender": { "type": "string", "minLength": 1 },
+            "payload": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "leave" },
+            "client": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "set_client_offline" },
+            "client": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "reconnect_client" },
+            "client": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients", "sync"],
+          "properties": {
+            "type": { "const": "sync_relay_history" },
+            "clients": { "$ref": "#/$defs/string_array" },
+            "sync": { "$ref": "#/$defs/relay_sync_mode" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "relay", "order", "duplicate_copies"],
+          "properties": {
+            "type": { "const": "configure_relay" },
+            "relay": { "type": "string", "minLength": 1 },
+            "order": { "enum": ["natural", "reverse"] },
+            "duplicate_copies": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "relay", "selector", "clients", "visible"],
+          "properties": {
+            "type": { "const": "set_relay_event_visibility" },
+            "relay": { "type": "string", "minLength": 1 },
+            "selector": { "$ref": "#/$defs/message_selector" },
+            "clients": { "$ref": "#/$defs/string_array" },
+            "visible": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "relays"],
+          "properties": {
+            "type": { "const": "reconcile_relay_histories" },
+            "relays": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "process"],
+          "properties": {
+            "type": { "const": "crash_process" },
+            "process": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "process"],
+          "properties": {
+            "type": { "const": "restart_process" },
+            "process": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "fault"],
+          "properties": {
+            "type": { "const": "inject_storage_fault" },
+            "fault": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["target", "kind", "operations"],
+              "properties": {
+                "target": { "type": "string", "minLength": 1 },
+                "kind": {
+                  "enum": ["busy", "read_failure", "write_failure", "capacity_exceeded", "torn_write"]
+                },
+                "operations": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target"],
+          "properties": {
+            "type": { "const": "clear_storage_fault" },
+            "target": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "deliver_all" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "tick" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "delta_ms"],
+          "properties": {
+            "type": { "const": "advance_time" },
+            "delta_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "await_quiescence" },
+            "policy": { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "observe" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "observe_exact" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "probe_bidirectional_decryptability" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "observe_admin_policy" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "clear_events" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "selector"],
+          "properties": {
+            "type": { "const": "omit_message" },
+            "selector": { "$ref": "#/$defs/message_selector" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "selector"],
+          "properties": {
+            "type": { "const": "duplicate_message" },
+            "selector": { "$ref": "#/$defs/message_selector" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "selector", "label"],
+          "properties": {
+            "type": { "const": "withhold_message" },
+            "selector": { "$ref": "#/$defs/message_selector" },
+            "label": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "label"],
+          "properties": {
+            "type": { "const": "release_withheld" },
+            "label": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "order"],
+          "properties": {
+            "type": { "const": "reorder_messages" },
+            "order": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/message_selector" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "allow"],
+          "properties": {
+            "type": { "const": "set_partition" },
+            "allow": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "clear_partition" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "restart_client" },
+            "client": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "name"],
+          "properties": {
+            "type": { "const": "barrier" },
+            "name": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "assertion"],
+          "properties": {
+            "type": { "const": "assert" },
+            "assertion": { "$ref": "#/$defs/assertion" }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,4 +1,11 @@
 use cgka_traits::{EngineError, MarmotAppEvent, MemberId};
+use sha2::{Digest, Sha256};
+
+/// Stable transient reference used when convergence reports a decrypted
+/// application payload without retaining the plaintext itself.
+pub(crate) fn decrypted_payload_ref(payload: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(payload)))
+}
 
 /// Shared application-payload sender validation for every inbound seam
 /// (direct ingest, stored-convergence/replay). An application message is
@@ -25,7 +32,7 @@ pub(crate) fn validate_app_payload_for_sender(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_app_payload_for_sender;
+    use super::{decrypted_payload_ref, validate_app_payload_for_sender};
     use cgka_traits::{EngineError, MarmotAppEvent, MemberId};
 
     fn payload_from(pubkey: &str) -> Vec<u8> {
@@ -65,5 +72,13 @@ mod tests {
         let event =
             validate_app_payload_for_sender(&payload, &sender).expect("matching sender validates");
         assert_eq!(event.content, "hello");
+    }
+
+    #[test]
+    fn decrypted_payload_reference_format_is_stable() {
+        assert_eq!(
+            decrypted_payload_ref(b"hello"),
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 }

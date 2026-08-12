@@ -15,6 +15,11 @@ use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, Ta
 use crate::scanner;
 
 pub(crate) const MAX_CONTAINER_DEPTH: usize = 96;
+pub(crate) const MAX_SOURCE_BLANK_LINES: u8 = 8;
+/// Hard cap on GFM table width. Once width is bounded, padding ragged rows is
+/// linear in the input row count instead of permitting an input-sized width
+/// multiplied by an input-sized row count.
+const MAX_TABLE_COLUMNS: usize = 128;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // populated in Phase 3 (link reference definitions)
@@ -23,13 +28,13 @@ pub(crate) struct LinkRef {
     pub title: Option<String>,
 }
 
-pub(crate) fn parse_blocks(input: &str) -> (Vec<Block>, HashMap<String, LinkRef>) {
+pub(crate) fn parse_blocks(input: &str) -> (Vec<Block>, Vec<u8>, HashMap<String, LinkRef>) {
     let mut p = BlockParser::new();
     for line in scanner::lines(input) {
         p.feed(line);
     }
     p.finish();
-    (p.root, p.refs)
+    (p.root, p.root_blank_lines_before, p.refs)
 }
 
 // ---------------------------------------------------------------------------
@@ -40,15 +45,19 @@ pub(crate) fn parse_blocks(input: &str) -> (Vec<Block>, HashMap<String, LinkRef>
 enum Container {
     BlockQuote {
         children: Vec<Block>,
+        blank_lines_before: Vec<u8>,
+        leading_blank_lines: u8,
     },
     List {
         kind: ListKind,
         tight: bool,
         last_blank: bool,
         items: Vec<ListItem>,
+        leading_blank_lines: u8,
     },
     ListItem {
         children: Vec<Block>,
+        blank_lines_before: Vec<u8>,
         indent: usize,
     },
 }
@@ -56,12 +65,14 @@ enum Container {
 #[derive(Debug)]
 enum Leaf {
     Paragraph(String),
-    /// 4-space-indented code block. `pending_blanks` is the number of blank
-    /// lines seen since the last indented content line; they are flushed
-    /// when more content arrives, or discarded on close.
+    /// 4-space-indented code block. Pending blank lines stay speculative until
+    /// another line determines whether they belong to the code or the source
+    /// gap before the next block.
     IndentedCode {
         content: String,
         pending_blanks: usize,
+        pending_source_gaps: Box<[u8; MAX_CONTAINER_DEPTH + 1]>,
+        pending_list_blanks: Box<[bool; MAX_CONTAINER_DEPTH]>,
     },
     /// Fenced code block opened by ` ``` ` or `~~~`.
     FencedCode {
@@ -91,8 +102,14 @@ enum Leaf {
 struct BlockParser {
     refs: HashMap<String, LinkRef>,
     root: Vec<Block>,
+    root_blank_lines_before: Vec<u8>,
     containers: Vec<Container>,
     leaf: Option<Leaf>,
+    leaf_blank_lines_before: u8,
+    /// Pending gap count for root (slot 0) and each container stack index
+    /// (slot `index + 1`). Each slot saturates independently so blank markers
+    /// belonging to a nested quote cannot consume an ancestor's count budget.
+    pending_source_gaps: [u8; MAX_CONTAINER_DEPTH + 1],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,13 +118,22 @@ struct Cursor {
     off: usize,
 }
 
+struct ContainerMatch {
+    cursor: Cursor,
+    depth: usize,
+    blank_owners: [bool; MAX_CONTAINER_DEPTH + 1],
+}
+
 impl BlockParser {
     fn new() -> Self {
         Self {
             refs: HashMap::new(),
             root: Vec::new(),
+            root_blank_lines_before: Vec::new(),
             containers: Vec::new(),
             leaf: None,
+            leaf_blank_lines_before: 0,
+            pending_source_gaps: [0; MAX_CONTAINER_DEPTH + 1],
         }
     }
 
@@ -115,7 +141,11 @@ impl BlockParser {
 
     fn feed(&mut self, line: &str) {
         let bytes = line.as_bytes();
-        let (cursor, matched_depth) = self.match_open_containers(bytes);
+        let ContainerMatch {
+            cursor,
+            depth: matched_depth,
+            blank_owners,
+        } = self.match_open_containers(bytes);
         let remainder = &bytes[cursor.off..];
         let blank = scanner::is_blank(remainder);
 
@@ -130,8 +160,24 @@ impl BlockParser {
         if blank {
             let mut mark_blank = true;
             match &mut self.leaf {
-                Some(Leaf::IndentedCode { pending_blanks, .. }) => {
+                Some(Leaf::IndentedCode {
+                    pending_blanks,
+                    pending_source_gaps,
+                    pending_list_blanks,
+                    ..
+                }) => {
                     *pending_blanks += 1;
+                    Self::record_source_blank_in(
+                        pending_source_gaps,
+                        &self.containers,
+                        scanner::is_blank(bytes),
+                        &blank_owners,
+                    );
+                    Self::record_list_blank_in(
+                        pending_list_blanks,
+                        &self.containers,
+                        matched_depth,
+                    );
                     mark_blank = false;
                 }
                 Some(Leaf::FencedCode { content, .. } | Leaf::MathBlock { content, .. }) => {
@@ -144,6 +190,7 @@ impl BlockParser {
                 _ => self.close_leaf(),
             }
             if mark_blank {
+                self.record_source_blank(scanner::is_blank(bytes), &blank_owners);
                 self.mark_list_blank_at_depth(matched_depth);
             }
             return;
@@ -202,7 +249,7 @@ impl BlockParser {
                 if !rest.is_empty() {
                     if let Some((level, text)) = parse_atx_heading(rest) {
                         self.close_leaf();
-                        self.push_block(Block::Heading {
+                        self.push_new_block(Block::Heading {
                             level,
                             inlines: vec![Inline::Text(text)],
                         });
@@ -210,6 +257,7 @@ impl BlockParser {
                     }
                     if let Some((fence, fence_len, info)) = parse_fence_open(rest) {
                         self.close_leaf();
+                        self.begin_leaf();
                         self.leaf = Some(Leaf::FencedCode {
                             fence,
                             fence_len,
@@ -221,6 +269,7 @@ impl BlockParser {
                     }
                     if is_math_fence(rest) {
                         self.close_leaf();
+                        self.begin_leaf();
                         self.leaf = Some(Leaf::MathBlock {
                             indent: sub_col,
                             content: String::new(),
@@ -235,20 +284,26 @@ impl BlockParser {
                         };
                         let raw = self.harvest_ref_defs(raw);
                         if raw.is_empty() {
+                            self.leaf_blank_lines_before = 0;
                             // All paragraph text was ref-defs — nothing to
                             // promote. Reclassify the underline itself as
                             // ordinary content below.
                         } else {
-                            self.push_block(Block::Heading {
-                                level,
-                                inlines: vec![Inline::Text(raw)],
-                            });
+                            let blank_lines_before =
+                                std::mem::take(&mut self.leaf_blank_lines_before);
+                            self.push_block(
+                                Block::Heading {
+                                    level,
+                                    inlines: vec![Inline::Text(raw)],
+                                },
+                                blank_lines_before,
+                            );
                             return;
                         }
                     }
                     if is_thematic_break(rest) {
                         self.close_leaf();
-                        self.push_block(Block::ThematicBreak);
+                        self.push_new_block(Block::ThematicBreak);
                         return;
                     }
 
@@ -281,11 +336,20 @@ impl BlockParser {
                             return;
                         }
                         self.close_leaf();
+                        let leading_blank_lines = self.take_pending_source_gap();
                         self.containers.push(Container::BlockQuote {
                             children: Vec::new(),
+                            blank_lines_before: Vec::new(),
+                            leading_blank_lines,
                         });
                         col = nc;
                         off = no;
+                        if scanner::is_blank(&bytes[off..]) {
+                            Self::increment_gap(
+                                &mut self.pending_source_gaps[self.containers.len()],
+                            );
+                            return;
+                        }
                         continue;
                     }
                     if let Some(open) = try_open_list_marker(
@@ -299,9 +363,13 @@ impl BlockParser {
                             return;
                         }
                         self.close_leaf();
-                        self.ensure_list_open(open.kind);
+                        let opened_list = self.ensure_list_open(open.kind);
+                        if !opened_list {
+                            self.pending_source_gaps.fill(0);
+                        }
                         self.containers.push(Container::ListItem {
                             children: Vec::new(),
+                            blank_lines_before: Vec::new(),
                             indent: open.indent,
                         });
                         col = open.col_after;
@@ -323,22 +391,29 @@ impl BlockParser {
                 if let Some(Leaf::IndentedCode {
                     content,
                     pending_blanks,
+                    pending_source_gaps,
+                    pending_list_blanks,
                 }) = &mut self.leaf
                 {
                     for _ in 0..*pending_blanks {
                         content.push('\n');
                     }
                     *pending_blanks = 0;
+                    pending_source_gaps.fill(0);
+                    pending_list_blanks.fill(false);
                     content.push_str(stripped);
                     content.push('\n');
                 } else {
                     self.close_leaf();
+                    self.begin_leaf();
                     let mut content = String::new();
                     content.push_str(stripped);
                     content.push('\n');
                     self.leaf = Some(Leaf::IndentedCode {
                         content,
                         pending_blanks: 0,
+                        pending_source_gaps: Box::new([0; MAX_CONTAINER_DEPTH + 1]),
+                        pending_list_blanks: Box::new([false; MAX_CONTAINER_DEPTH]),
                     });
                 }
                 return;
@@ -390,9 +465,10 @@ impl BlockParser {
 
     // -------- container matching --------
 
-    fn match_open_containers(&mut self, bytes: &[u8]) -> (Cursor, usize) {
+    fn match_open_containers(&mut self, bytes: &[u8]) -> ContainerMatch {
         let mut col = 0;
         let mut off = 0;
+        let mut blank_owners = [false; MAX_CONTAINER_DEPTH + 1];
         for (i, c) in self.containers.iter().enumerate() {
             match c {
                 Container::BlockQuote { .. } => {
@@ -400,7 +476,11 @@ impl BlockParser {
                     let (sub_col, sub_off) = scanner::measure_indent(&bytes[off..]);
                     let probe_off = off + sub_off;
                     if sub_col >= 4 || probe_off >= bytes.len() || bytes[probe_off] != b'>' {
-                        return (Cursor { col, off }, i);
+                        return ContainerMatch {
+                            cursor: Cursor { col, off },
+                            depth: i,
+                            blank_owners,
+                        };
                     }
                     col += sub_col + 1;
                     off = probe_off + 1;
@@ -418,6 +498,7 @@ impl BlockParser {
                             _ => {}
                         }
                     }
+                    blank_owners[i + 1] = scanner::is_blank(&bytes[off..]);
                 }
                 Container::List { .. } => {
                     // Lists themselves consume nothing; their open ListItem
@@ -426,23 +507,38 @@ impl BlockParser {
                 Container::ListItem { indent, .. } => {
                     let needed = *indent;
                     if col >= needed {
+                        blank_owners[i + 1] = scanner::is_blank(&bytes[off..]);
                         continue;
                     }
                     // Check whether the rest of the line is blank — a blank
                     // line matches every list item.
                     if scanner::is_blank(&bytes[off..]) {
-                        return (Cursor { col, off }, i + 1);
+                        blank_owners[i + 1] = true;
+                        return ContainerMatch {
+                            cursor: Cursor { col, off },
+                            depth: i + 1,
+                            blank_owners,
+                        };
                     }
                     let (new_col, consumed) = consume_cols(&bytes[off..], col, needed);
                     if new_col < needed {
-                        return (Cursor { col, off }, i);
+                        return ContainerMatch {
+                            cursor: Cursor { col, off },
+                            depth: i,
+                            blank_owners,
+                        };
                     }
                     col = new_col;
                     off += consumed;
+                    blank_owners[i + 1] = scanner::is_blank(&bytes[off..]);
                 }
             }
         }
-        (Cursor { col, off }, self.containers.len())
+        ContainerMatch {
+            cursor: Cursor { col, off },
+            depth: self.containers.len(),
+            blank_owners,
+        }
     }
 
     // -------- leaf handling --------
@@ -493,9 +589,13 @@ impl BlockParser {
                 // A non-paragraph leaf is open (indented code, etc.). Close
                 // it and start a fresh paragraph.
                 self.close_leaf();
+                self.begin_leaf();
                 self.leaf = Some(Leaf::Paragraph(text.to_string()));
             }
-            None => self.leaf = Some(Leaf::Paragraph(text.to_string())),
+            None => {
+                self.begin_leaf();
+                self.leaf = Some(Leaf::Paragraph(text.to_string()));
+            }
         }
     }
 
@@ -503,34 +603,60 @@ impl BlockParser {
         let Some(leaf) = self.leaf.take() else {
             return;
         };
+        let blank_lines_before = std::mem::take(&mut self.leaf_blank_lines_before);
         match leaf {
             Leaf::Paragraph(raw) => {
                 let remaining = self.harvest_ref_defs(raw);
                 if !remaining.is_empty() {
-                    self.push_block(Block::Paragraph {
-                        inlines: vec![Inline::Text(remaining)],
-                    });
+                    self.push_block(
+                        Block::Paragraph {
+                            inlines: vec![Inline::Text(remaining)],
+                        },
+                        blank_lines_before,
+                    );
                 }
             }
             Leaf::IndentedCode {
                 content,
                 pending_blanks: _,
+                pending_source_gaps,
+                pending_list_blanks,
             } => {
-                self.push_block(Block::CodeBlock {
-                    kind: CodeBlockKind::Indented,
-                    info: String::new(),
-                    content,
-                });
+                self.push_block(
+                    Block::CodeBlock {
+                        kind: CodeBlockKind::Indented,
+                        info: String::new(),
+                        content,
+                    },
+                    blank_lines_before,
+                );
+                for (gap, pending) in self
+                    .pending_source_gaps
+                    .iter_mut()
+                    .zip(pending_source_gaps.iter())
+                {
+                    *gap = gap.saturating_add(*pending).min(MAX_SOURCE_BLANK_LINES);
+                }
+                for (container, pending) in
+                    self.containers.iter_mut().zip(pending_list_blanks.iter())
+                {
+                    if *pending && let Container::List { last_blank, .. } = container {
+                        *last_blank = true;
+                    }
+                }
             }
             Leaf::FencedCode { info, content, .. } => {
-                self.push_block(Block::CodeBlock {
-                    kind: CodeBlockKind::Fenced,
-                    info,
-                    content,
-                });
+                self.push_block(
+                    Block::CodeBlock {
+                        kind: CodeBlockKind::Fenced,
+                        info,
+                        content,
+                    },
+                    blank_lines_before,
+                );
             }
             Leaf::MathBlock { content, .. } => {
-                self.push_block(Block::MathBlock { content });
+                self.push_block(Block::MathBlock { content }, blank_lines_before);
             }
             Leaf::Table {
                 alignments,
@@ -553,18 +679,113 @@ impl BlockParser {
                             .collect()
                     })
                     .collect();
-                self.push_block(Block::Table {
-                    alignments,
-                    header: header_cells,
-                    rows: body_rows,
-                });
+                self.push_block(
+                    Block::Table {
+                        alignments,
+                        header: header_cells,
+                        rows: body_rows,
+                    },
+                    blank_lines_before,
+                );
             }
         }
     }
 
     // -------- container stack manipulation --------
 
-    fn push_block(&mut self, block: Block) {
+    fn begin_leaf(&mut self) {
+        debug_assert!(self.leaf.is_none());
+        self.leaf_blank_lines_before = self.take_pending_source_gap();
+    }
+
+    fn push_new_block(&mut self, block: Block) {
+        let blank_lines_before = self.take_pending_source_gap();
+        self.push_block(block, blank_lines_before);
+    }
+
+    fn record_source_blank(
+        &mut self,
+        physically_blank: bool,
+        blank_owners: &[bool; MAX_CONTAINER_DEPTH + 1],
+    ) {
+        Self::record_source_blank_in(
+            &mut self.pending_source_gaps,
+            &self.containers,
+            physically_blank,
+            blank_owners,
+        );
+    }
+
+    fn record_source_blank_in(
+        pending_source_gaps: &mut [u8; MAX_CONTAINER_DEPTH + 1],
+        containers: &[Container],
+        physically_blank: bool,
+        blank_owners: &[bool; MAX_CONTAINER_DEPTH + 1],
+    ) {
+        if physically_blank {
+            Self::increment_gap(&mut pending_source_gaps[0]);
+            for (index, container) in containers.iter().enumerate() {
+                if matches!(
+                    container,
+                    Container::BlockQuote { .. } | Container::ListItem { .. }
+                ) {
+                    Self::increment_gap(&mut pending_source_gaps[index + 1]);
+                }
+            }
+        } else {
+            for (gap, is_blank) in pending_source_gaps.iter_mut().zip(blank_owners) {
+                if *is_blank {
+                    Self::increment_gap(gap);
+                }
+            }
+        }
+    }
+
+    fn record_list_blank_in(
+        pending_list_blanks: &mut [bool; MAX_CONTAINER_DEPTH],
+        containers: &[Container],
+        depth: usize,
+    ) {
+        if let Some((index, _)) = containers
+            .iter()
+            .enumerate()
+            .take(depth)
+            .rev()
+            .find(|(_, container)| matches!(container, Container::List { .. }))
+        {
+            pending_list_blanks[index] = true;
+        }
+    }
+
+    fn increment_gap(gap: &mut u8) {
+        *gap = gap.saturating_add(1).min(MAX_SOURCE_BLANK_LINES);
+    }
+
+    fn take_pending_source_gap(&mut self) -> u8 {
+        // Preserve loose-list bookkeeping before closing a dangling list;
+        // once popped, `push_block` can no longer consume its pending blank.
+        self.consume_list_blank();
+        self.close_dangling_lists();
+        let slot = match self.containers.last() {
+            None => 0,
+            Some(Container::BlockQuote { .. } | Container::ListItem { .. }) => {
+                self.containers.len()
+            }
+            Some(Container::List { .. }) => unreachable!("dangling lists were just closed"),
+        };
+        let count = self.pending_source_gaps[slot];
+        self.pending_source_gaps.fill(0);
+        count
+    }
+
+    fn close_dangling_lists(&mut self) {
+        while let Some(Container::List { .. }) = self.containers.last() {
+            let list = self.containers.pop().unwrap();
+            self.close_container(list);
+        }
+    }
+
+    fn push_block(&mut self, block: Block, blank_lines_before: u8) {
         self.consume_list_blank();
         // A `List` on top of the stack with no active `ListItem` happens
         // when a sibling-failing line closes the last item but the new
@@ -572,14 +793,25 @@ impl BlockParser {
         // indent inside an enclosing blockquote). Close the dangling list
         // so the block lands in the list's parent — the alternative would
         // misroute it to root.
-        while let Some(Container::List { .. }) = self.containers.last() {
-            let list = self.containers.pop().unwrap();
-            self.close_container(list);
-        }
+        self.close_dangling_lists();
         match self.containers.last_mut() {
-            None => self.root.push(block),
-            Some(Container::BlockQuote { children }) => children.push(block),
-            Some(Container::ListItem { children, .. }) => children.push(block),
+            None => {
+                self.root.push(block);
+                self.root_blank_lines_before.push(blank_lines_before);
+            }
+            Some(Container::BlockQuote {
+                children,
+                blank_lines_before: child_gaps,
+                ..
+            })
+            | Some(Container::ListItem {
+                children,
+                blank_lines_before: child_gaps,
+                ..
+            }) => {
+                children.push(block);
+                child_gaps.push(blank_lines_before);
+            }
             Some(Container::List { .. }) => unreachable!("dangling List was just closed"),
         }
     }
@@ -594,14 +826,26 @@ impl BlockParser {
 
     fn close_container(&mut self, c: Container) {
         match c {
-            Container::BlockQuote { children } => {
-                let block = Block::BlockQuote { blocks: children };
-                self.push_block(block);
+            Container::BlockQuote {
+                children,
+                blank_lines_before,
+                leading_blank_lines,
+            } => {
+                let block = Block::BlockQuote {
+                    blocks: children,
+                    blank_lines_before,
+                };
+                self.push_block(block, leading_blank_lines);
             }
-            Container::ListItem { mut children, .. } => {
+            Container::ListItem {
+                mut children,
+                blank_lines_before,
+                ..
+            } => {
                 let checked = detect_task_marker(&mut children);
                 let item = ListItem {
                     blocks: children,
+                    blank_lines_before,
                     checked,
                 };
                 // Push into the enclosing list.
@@ -610,21 +854,25 @@ impl BlockParser {
                 }
             }
             Container::List {
-                kind, tight, items, ..
+                kind,
+                tight,
+                items,
+                leading_blank_lines,
+                ..
             } => {
                 let block = Block::List { kind, tight, items };
-                self.push_block(block);
+                self.push_block(block, leading_blank_lines);
             }
         }
     }
 
-    fn ensure_list_open(&mut self, new_kind: ListKind) {
+    fn ensure_list_open(&mut self, new_kind: ListKind) -> bool {
         // If the top container is a compatible List (same marker kind +
         // delimiter), do nothing — the new ListItem joins that list.
         // Otherwise close any existing list and open a fresh one.
         if let Some(Container::List { kind, .. }) = self.containers.last() {
             if lists_compatible(*kind, new_kind) {
-                return;
+                return false;
             }
             // Different list kind: close the existing one (and its item if open).
             // The previous item was already closed (we entered ensure_list_open
@@ -634,12 +882,15 @@ impl BlockParser {
             self.close_to_depth(depth);
         }
         // After potential close, the top might no longer be a List.
+        let leading_blank_lines = self.take_pending_source_gap();
         self.containers.push(Container::List {
             kind: new_kind,
             tight: true,
             last_blank: false,
             items: Vec::new(),
+            leading_blank_lines,
         });
+        true
     }
 
     // -------- last_blank bookkeeping (loose vs tight) --------
@@ -851,6 +1102,9 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
     while j < b.len() && b[j] != b']' {
         if b[j] == b'\\' && j + 1 < b.len() {
             j += 2;
+            if j - label_start > 999 {
+                return None;
+            }
             continue;
         }
         if b[j] == b'\n' {
@@ -859,6 +1113,9 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
             // — treat newlines as label content.
         }
         j += 1;
+        if j - label_start > 999 {
+            return None;
+        }
     }
     if j >= b.len() || b[j] != b']' {
         return None;
@@ -930,7 +1187,7 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
         let mut j = start;
         let mut out_bytes: Vec<u8> = Vec::new();
         while j < b.len() && b[j] != b'>' {
-            if b[j] == b'<' || b[j] == b'\n' {
+            if b[j] == b'<' || b[j] < 0x20 || b[j] == 0x7f {
                 return None;
             }
             if b[j] == b'\\' && j + 1 < b.len() && scanner::is_ascii_punct(b[j + 1]) {
@@ -1005,7 +1262,11 @@ pub(crate) fn parse_link_title(b: &[u8], i: usize) -> Option<(String, usize)> {
             continue;
         }
         if c == close {
-            return Some((String::from_utf8(out_bytes).ok()?, j + 1));
+            let title = String::from_utf8(out_bytes).ok()?;
+            if title.chars().any(char::is_control) {
+                return None;
+            }
+            return Some((title, j + 1));
         }
         // Disallow unescaped opening quote of same family inside parens form.
         if open == b'(' && c == b'(' {
@@ -1262,7 +1523,11 @@ fn parse_fence_open(bytes: &[u8]) -> Option<(u8, usize, String)> {
         return None;
     }
     let trimmed = trim_ascii_ws(info_bytes);
-    let info = std::str::from_utf8(trimmed).ok()?.to_string();
+    let info = std::str::from_utf8(trimmed)
+        .ok()?
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
     Some((ch, i, info))
 }
 
@@ -1361,7 +1626,7 @@ fn parse_table_delim_row(line: &str) -> Option<Vec<Alignment>> {
         return None;
     }
     let cells = split_table_row(line);
-    if cells.is_empty() {
+    if cells.is_empty() || cells.len() > MAX_TABLE_COLUMNS {
         return None;
     }
     let mut alignments = Vec::with_capacity(cells.len());

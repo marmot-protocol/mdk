@@ -10,12 +10,36 @@ use cgka_traits::GroupId;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    AppQuarantinedGroupFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMutationResultFfi, MemberRefFfi, SendSummaryFfi,
-    group_details_ffi, group_id_from_hex, group_management_state_ffi, normalize_member_ref_ffi,
+    AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
+    AppGroupRecordFfi, AppQuarantinedGroupFfi, DisbandRequestFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
+    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
+    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
+    group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
+
+#[derive(Clone, uniffi::Record)]
+pub struct InitialGroupImageFfi {
+    pub plaintext: Vec<u8>,
+    pub media_type: String,
+    pub source_url: Option<String>,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+impl std::fmt::Debug for InitialGroupImageFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialGroupImageFfi")
+            .field("plaintext_len", &self.plaintext.len())
+            .field("media_type", &self.media_type)
+            .field("has_source_url", &self.source_url.is_some())
+            .field("dim", &self.dim)
+            .field("thumbhash", &self.thumbhash)
+            .finish()
+    }
+}
 
 pub(crate) async fn group_details_for(
     kit: &Marmot,
@@ -48,7 +72,18 @@ pub(crate) async fn group_details_for(
             .runtime
             .display_names_for_account_ids(&member_ids)
             .unwrap_or_default();
-        group_details_ffi(group, members, &account.account_id_hex, display_names)
+        let mls_state = kit
+            .runtime
+            .group_mls_state(account_ref, group_id)
+            .await?
+            .into();
+        group_details_ffi(
+            group,
+            members,
+            mls_state,
+            &account.account_id_hex,
+            display_names,
+        )
     }
     .await;
     kit.runtime
@@ -114,6 +149,16 @@ fn ensure_group_admin(
         Err(MarmotKitError::NotGroupAdmin {
             group_id_hex: group_id_hex.to_string(),
         })
+    }
+}
+
+fn validate_group_image_plaintext(plaintext: &[u8]) -> Result<(), MarmotKitError> {
+    if plaintext.is_empty() {
+        Err(MarmotKitError::InvalidMediaReference {
+            details: "group image cannot be empty; use clear_group_image to remove it".into(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -210,7 +255,12 @@ impl Marmot {
     // -----------------------------------------------------------------------
 
     /// Create a new MLS group with `name` and the given members. Members are
-    /// referenced by `npub` or hex account id. Returns the group id as hex.
+    /// referenced by `npub` or hex account id. Returns the locally canonical
+    /// group id as hex; this confirms local canonicalization, not Welcome
+    /// delivery. `WelcomeDeliveryPending` is a delivery-failure signal, not an
+    /// acknowledgement. Hosts should subscribe before creation and/or query
+    /// `pending_welcome_deliveries` afterward before presenting invitation
+    /// success.
     pub async fn create_group(
         &self,
         account_ref: String,
@@ -221,6 +271,37 @@ impl Marmot {
         let group_id = self
             .runtime
             .create_group(&account_ref, &name, &member_refs, description)
+            .await?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Create a group with an optional initial avatar. MDK prefers an
+    /// encrypted Blossom image and uses `source_url` only when the founding
+    /// members do not all support that component but do support URL avatars.
+    pub async fn create_group_with_initial_image(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+        initial_image: Option<InitialGroupImageFfi>,
+    ) -> Result<String, MarmotKitError> {
+        let initial_image = initial_image.map(|image| marmot_app::AppInitialGroupImage {
+            plaintext: image.plaintext,
+            media_type: image.media_type,
+            source_url: image.source_url,
+            dim: image.dim,
+            thumbhash: image.thumbhash,
+        });
+        let group_id = self
+            .runtime
+            .create_group_with_initial_image(
+                &account_ref,
+                &name,
+                &member_refs,
+                description,
+                initial_image,
+            )
             .await?;
         Ok(hex::encode(group_id.as_slice()))
     }
@@ -242,6 +323,34 @@ impl Marmot {
         Ok(members.into_iter().map(Into::into).collect())
     }
 
+    /// Identifier-only rosters for a bounded page of groups.
+    ///
+    /// This is the chat-projection companion read: it is one worker command,
+    /// performs no profile enrichment, and fails the whole page if any group
+    /// is unknown or quarantined.
+    pub async fn group_member_ids_page(
+        &self,
+        account_ref: String,
+        group_ids_hex: Vec<String>,
+    ) -> Result<Vec<AppGroupMemberIdsFfi>, MarmotKitError> {
+        if group_ids_hex.len() > marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE {
+            return Err(MarmotKitError::InvalidGroupMembershipPage {
+                max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
+            });
+        }
+        let group_ids = group_ids_hex
+            .iter()
+            .map(|group_id_hex| group_id_from_hex(group_id_hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .runtime
+            .group_member_ids_page(&account_ref, &group_ids)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Group plus enriched member rows for detail screens.
     pub async fn group_details(
         &self,
@@ -253,6 +362,17 @@ impl Marmot {
         group_details_for(self, &account_ref, &group_id, &group_id_hex).await
     }
 
+    /// Lightweight membership roster projection for membership screens.
+    pub async fn group_roster(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupRosterFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let roster = self.runtime.group_roster(&account_ref, &group_id).await?;
+        group_roster_ffi(roster)
+    }
+
     /// Current caller permissions plus per-member action availability.
     pub async fn group_management_state(
         &self,
@@ -262,6 +382,53 @@ impl Marmot {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await
+    }
+
+    /// Install lifecycle-v1 and require it in one admin Commit.
+    pub async fn enable_group_disbanding(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
+        let summary = self
+            .runtime
+            .enable_group_disbanding(&account_ref, &group_id)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    /// Durably accept an irreversible disband request. Completion is observed
+    /// through normal group state updates after bounded convergence.
+    pub async fn disband_group(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<DisbandRequestFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
+        let request = self.runtime.disband_group(&account_ref, &group_id).await?;
+        Ok(request.into())
+    }
+
+    pub async fn acknowledge_disband_failure(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .acknowledge_disband_failure(&account_ref, &group_id)
+            .await?)
     }
 
     pub async fn invite_members(
@@ -309,6 +476,20 @@ impl Marmot {
         let group_id_hex = hex::encode(group_id.as_slice());
         let state =
             group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        // A fast-path reject only, not the source of correctness: this read and
+        // the worker command that acts on it are not atomic, so two concurrent
+        // leaves can both pass here. The engine settles it under its own lock and
+        // returns `EngineError::LeaveAlreadyRequested`, which maps to this same
+        // variant — see `MarmotKitError::from_engine_error`.
+        //
+        // Checked before the two below because a pending leave also clears
+        // `can_leave`, so letting them run would report a wrong reason
+        // (`MemberNotInGroup`) for a group the account is very much still in.
+        if state.leave_request_pending {
+            return Err(MarmotKitError::LeaveAlreadyRequested {
+                group_id_hex: group_id_hex.clone(),
+            });
+        }
         if state.requires_self_demote_before_leave {
             return Err(MarmotKitError::AdminCannotSelfRemove {
                 group_id_hex: group_id_hex.clone(),
@@ -399,6 +580,41 @@ impl Marmot {
         let summary = self
             .runtime
             .update_group_profile(&account_ref, &group_id, name, description)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Encrypt and upload a group avatar to Blossom, then commit the
+    /// `marmot.group.blossom.image.v1` component. `plaintext` must contain the
+    /// decoded image bytes; use `clear_group_image` to remove an existing
+    /// encrypted Blossom avatar.
+    pub async fn update_group_image(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        validate_group_image_plaintext(&plaintext)?;
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .update_group_image(&account_ref, &group_id, plaintext, media_type)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Clear the group's encrypted Blossom avatar by committing the absent
+    /// `marmot.group.blossom.image.v1` component state.
+    pub async fn clear_group_image(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .update_group_image(&account_ref, &group_id, Vec::new(), String::new())
             .await?;
         Ok(summary.into())
     }
@@ -680,6 +896,79 @@ impl Marmot {
             .await?;
         Ok(group.into())
     }
+
+    pub async fn group_maintenance_status(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupMaintenanceStatusFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .maintenance_status(&account_ref, &group_id)
+            .await?
+            .into())
+    }
+
+    pub async fn key_package_maintenance_status(
+        &self,
+        account_ref: String,
+    ) -> Result<Option<KeyPackageMaintenanceStatusFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .key_package_maintenance_status(&account_ref)
+            .await?
+            .map(Into::into))
+    }
+
+    pub async fn schedule_group_self_update(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .schedule_manual_self_update(&account_ref, &group_id)
+            .await?)
+    }
+
+    pub async fn periodic_maintenance_policy(
+        &self,
+        account_ref: String,
+    ) -> Result<PeriodicMaintenancePolicyFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .periodic_maintenance_policy(&account_ref)
+            .await?
+            .into())
+    }
+
+    pub async fn set_periodic_maintenance_policy(
+        &self,
+        account_ref: String,
+        policy: PeriodicMaintenancePolicyFfi,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_periodic_maintenance_policy(&account_ref, policy.into())
+            .await?)
+    }
+
+    pub async fn pause_maintenance(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        Ok(self.runtime.pause_maintenance(&account_ref).await?)
+    }
+
+    pub async fn resume_maintenance(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        Ok(self.runtime.resume_maintenance(&account_ref).await?)
+    }
+
+    pub async fn run_due_maintenance(
+        &self,
+        account_ref: String,
+    ) -> Result<MaintenanceRunSummaryFfi, MarmotKitError> {
+        Ok(self.runtime.run_due_maintenance(&account_ref).await?.into())
+    }
 }
 
 #[cfg(test)]
@@ -696,6 +985,15 @@ mod tests {
             can_invite: self_admin,
             can_leave: !self_admin,
             requires_self_demote_before_leave: self_admin,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
+            lifecycle_state: crate::conversions::GroupLifecycleStateFfi::Stable,
+            disbanding_enabled: true,
+            disbanding: false,
+            can_enable_disbanding: false,
+            can_disband: self_admin,
+            disbanding_blockers: vec![],
+            disband_request: None,
             member_actions: vec![
                 GroupMemberActionStateFfi {
                     member_id_hex: self_id.into(),
@@ -762,5 +1060,18 @@ mod tests {
             ensure_can_demote_admin(&state(false, false), &group_id_hex, absent_member)
                 .expect_err("non-admin demote should fail");
         assert!(matches!(demote_err, MarmotKitError::NotGroupAdmin { .. }));
+    }
+
+    #[test]
+    fn group_image_upload_requires_nonempty_plaintext() {
+        let err = validate_group_image_plaintext(&[])
+            .expect_err("empty image bytes must use the explicit clear method");
+        assert!(matches!(
+            err,
+            MarmotKitError::InvalidMediaReference { details }
+                if details.contains("clear_group_image")
+        ));
+        validate_group_image_plaintext(&[0x89, b'P', b'N', b'G'])
+            .expect("nonempty image bytes should reach the runtime");
     }
 }

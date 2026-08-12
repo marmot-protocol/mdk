@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
-    CanonicalizationState, ConvergenceStatus, DroppedMessage, DroppedMessageReason,
-    InvalidatedAppMessage, InvalidatedAppMessageReason, MessageKind,
-    canonicalize_with_materialized_candidates,
+    CanonicalizationState, ConvergenceStatus, DeferredMessage, DeferredMessageReason,
+    DroppedMessage, DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
+    MessageKind, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::ConvergencePolicy;
 use cgka_conformance_simulator::openmls_projection::{
@@ -16,17 +16,32 @@ use cgka_conformance_simulator::openmls_projection::{
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
+use cgka_engine::{DEFAULT_CIPHERSUITE, openmls_projection::OpenMlsProjectionError};
+use cgka_traits::app_components::{GROUP_PROFILE_COMPONENT_ID, encode_component_vectors};
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
+use cgka_traits::engine::CgkaEngine;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group::{Group, Member};
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{IngestOutcome, ProposalRejectionCategory};
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+};
+use cgka_traits::transport::{
+    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::AppDataUpdateOperation;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
+use sha2::{Digest, Sha256};
+use tls_codec::Serialize;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -48,16 +63,27 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn one_rewind_policy() -> CanonicalizationPolicy {
+fn base_test_policy() -> CanonicalizationPolicy {
     CanonicalizationPolicy {
         convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
+            max_rewind_commits: 5,
             witness_quorum_senders_per_epoch: 2,
             witness_quorum_epochs: 1,
             max_witness_override_depth: 1,
         },
         app_message_past_epoch_limit: 5,
         settlement_quiescence_ms: 1_000,
+        max_convergence_pass_ms: 5_000,
+    }
+}
+
+fn one_rewind_policy() -> CanonicalizationPolicy {
+    CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..base_test_policy().convergence
+        },
+        ..base_test_policy()
     }
 }
 
@@ -98,6 +124,182 @@ async fn queued_commit_messages(
         .collect()
 }
 
+fn raw_group_profile_update_proposal(
+    client: &HarnessClient,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        client.storage().mls_storage(),
+    );
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut group = MlsGroup::load(provider.storage(), &mls_group_id)
+        .expect("load MLS group")
+        .expect("MLS group exists");
+    let binding = client
+        .storage()
+        .account_device_signer(&client.member_id())
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        client.storage().mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("load MLS signer");
+    let (proposal, _) = group
+        .propose_app_data_update(
+            &provider,
+            &signer,
+            GROUP_PROFILE_COMPONENT_ID,
+            AppDataUpdateOperation::Update(
+                encode_component_vectors(&[b"renamed", b"description"]).into(),
+            ),
+        )
+        .expect("build valid group-profile proposal");
+    let payload = proposal
+        .tls_serialize_detached()
+        .expect("serialize proposal");
+    TransportMessage {
+        id: MessageId::new(Sha256::digest(&payload).to_vec()),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("openmls-proposal-vector".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+fn stored_pending_proposal_count(client: &HarnessClient, group_id: &GroupId) -> usize {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        client.storage().mls_storage(),
+    );
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    MlsGroup::load(provider.storage(), &mls_group_id)
+        .expect("load MLS group")
+        .expect("MLS group exists")
+        .pending_proposals()
+        .count()
+}
+
+#[tokio::test]
+async fn proposal_authorization_vector_rejects_direct_and_nostr_wrapped_input() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group_with_admins_maybe_pending(
+            "proposal-authorization-vector",
+            vec![bob_kp],
+            vec![],
+            vec![],
+        )
+        .await;
+    assert!(
+        pending.is_none(),
+        "current-profile founding creation is immediately stable"
+    );
+    bus.deliver_all();
+    let join_outcomes = bob.tick().await;
+    assert!(
+        join_outcomes.iter().all(Result::is_ok),
+        "bob joins current-profile group: {join_outcomes:?}"
+    );
+
+    // Bob is a member but not an admin. The proposal is MLS-valid and its
+    // component payload is well-formed, so authorization is the only reason it
+    // must be rejected.
+    let stable_epoch = alice.epoch();
+    let direct = raw_group_profile_update_proposal(&bob, &group_id);
+    let direct_rejection =
+        replay_openmls_messages(alice.storage(), &group_id, std::slice::from_ref(&direct))
+            .expect_err("direct OpenMLS replay rejects unauthorized proposal");
+    assert!(matches!(
+        direct_rejection,
+        OpenMlsProjectionError::RejectedProposal {
+            category: ProposalRejectionCategory::AuthorizationFailed,
+            ..
+        }
+    ));
+    assert_eq!(
+        alice.epoch(),
+        stable_epoch,
+        "direct replay rolls back without changing the live group"
+    );
+    assert_eq!(
+        stored_pending_proposal_count(&alice, &group_id),
+        0,
+        "direct replay cannot leave the rejected proposal pending"
+    );
+
+    // Exercise the production-shaped Nostr kind-445 seam with the same inner
+    // MLS proposal. It must terminate as Failed before pending storage or
+    // auto-commit scheduling.
+    let snapshot = {
+        let context = alice
+            .engine_mut()
+            .group_context(&group_id)
+            .expect("load group context");
+        GroupContextSnapshot::from_context(
+            context.as_ref(),
+            &[transport_nostr_peeler::DEFAULT_EXPORTER_LABEL],
+        )
+    };
+    let wrapped = transport_nostr_peeler::NostrMlsPeeler::default()
+        .wrap_group_message(
+            &EncryptedPayload {
+                ciphertext: direct.payload,
+                aad: vec![],
+            },
+            &snapshot,
+        )
+        .await
+        .expect("wrap proposal as Nostr group event");
+    bus.inject(alice.bus_id, wrapped.clone());
+    let outcomes = alice.tick_ingest_only().await;
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [Ok(IngestOutcome::Rejected {
+                category: ProposalRejectionCategory::AuthorizationFailed
+            })]
+        ),
+        "wrapped unauthorized proposal is terminal: {outcomes:?}"
+    );
+    assert!(
+        alice
+            .storage()
+            .list_messages(&group_id, EpochId(0))
+            .expect("list durable group messages")
+            .iter()
+            .any(|record| record.state == MessageState::Failed),
+        "wrapped rejection leaves a terminal failed content record"
+    );
+    assert!(
+        alice.engine_mut().drain_auto_publish().is_empty(),
+        "rejected proposal cannot schedule an auto-commit"
+    );
+    assert_eq!(
+        stored_pending_proposal_count(&alice, &group_id),
+        0,
+        "wrapped ingest cannot leave the rejected proposal pending"
+    );
+    assert_eq!(alice.epoch(), stable_epoch);
+}
+
 #[tokio::test]
 async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
     let bus = TransportBus::ordered();
@@ -121,7 +323,7 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
     bob.tick().await;
     carol.tick().await;
 
-    let proposal_msg = bob.leave_capture().await;
+    let proposal_msg = bob.leave_capture().await.expect("leave proposal");
     let proposal_msg = openmls_projection_message(&carol, &proposal_msg).await;
     assert_projected_kind(&proposal_msg, OpenMlsContentKind::Proposal, 1);
 
@@ -264,16 +466,7 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
             pending_messages: vec![],
             outbound_intents: vec![],
             candidate_branches: vec![],
-            policy: CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
-                },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
-            },
+            policy: base_test_policy(),
             now_ms: 2_000,
         },
         candidates
@@ -304,10 +497,10 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
         .find(|candidate| candidate.branch_id != selected_candidate.branch_id)
         .and_then(|candidate| candidate.commit_message_ids.first())
         .expect("losing commit exists");
-    assert!(canonicalized.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == *losing_commit_id
-            && dropped.kind == MessageKind::Commit
-            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    assert!(canonicalized.deferred_messages.iter().any(|deferred| {
+        deferred.message_id == *losing_commit_id
+            && deferred.kind == MessageKind::Commit
+            && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
     }));
     assert_eq!(
         carol.epoch().0,
@@ -339,7 +532,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
     bob.tick().await;
     carol.tick().await;
 
-    let proposal_msg = bob.leave_capture().await;
+    let proposal_msg = bob.leave_capture().await.expect("leave proposal");
     let proposal_msg = openmls_projection_message(&carol, &proposal_msg).await;
     bus.deliver_all();
     let alice_outcomes = alice.tick().await;
@@ -368,17 +561,9 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
                 messages: vec![commit_msg.clone()],
             }],
             pending_messages: vec![proposal_msg.clone()],
+            already_delivered_app_ids: BTreeSet::new(),
             outbound_intents: vec![],
-            policy: CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
-                },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
-            },
+            policy: base_test_policy(),
             now_ms: 2_000,
         },
     )
@@ -483,17 +668,9 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
                 },
             ],
             pending_messages: vec![app_msg.clone()],
+            already_delivered_app_ids: BTreeSet::new(),
             outbound_intents: vec![],
-            policy: CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
-                },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
-            },
+            policy: base_test_policy(),
             now_ms: 2_000,
         },
     )
@@ -512,6 +689,268 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
         carol.epoch().0,
         1,
         "canonicalization probes must leave the retained anchor untouched"
+    );
+}
+
+#[tokio::test]
+async fn multi_device_account_witness_deduplication_uses_real_openmls_leaves() {
+    let bus = TransportBus::ordered();
+    let shared_account_seed = pad32(b"shared-account");
+    let mut device_a = ClientBuilder::new(shared_account_seed.clone())
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut device_b = ClientBuilder::new(shared_account_seed)
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut other_account = ClientBuilder::new(pad32(b"other-account"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut competitor = ClientBuilder::new(pad32(b"competitor"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut observer = ClientBuilder::new(pad32(b"observer"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut app_invitee = ClientBuilder::new(pad32(b"app-invitee"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut quiet_invitee = ClientBuilder::new(pad32(b"quiet-invitee"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+
+    assert_eq!(
+        device_a.member_id(),
+        device_b.member_id(),
+        "the two devices intentionally share one Marmot account credential"
+    );
+    let device_b_kp = device_b.fresh_key_package().await;
+    let other_account_kp = other_account.fresh_key_package().await;
+    let competitor_kp = competitor.fresh_key_package().await;
+    let observer_kp = observer.fresh_key_package().await;
+    let (group_id, pending) = device_a
+        .create_group_with_admins_maybe_pending(
+            "multi-device-account-witness-dedupe",
+            vec![device_b_kp, other_account_kp, competitor_kp, observer_kp],
+            vec![],
+            vec![competitor.member_id()],
+        )
+        .await;
+    assert!(
+        pending.is_none(),
+        "current-profile founding creation is immediately stable"
+    );
+    bus.deliver_all();
+    for client in [
+        &mut device_b,
+        &mut other_account,
+        &mut competitor,
+        &mut observer,
+    ] {
+        let outcomes = client.tick().await;
+        assert!(
+            outcomes.iter().all(Result::is_ok),
+            "client joins the shared base group: {outcomes:?}"
+        );
+    }
+
+    let base_epoch = observer.epoch().0;
+    let observer_members = observer.members();
+    let shared_account_leaves: Vec<_> = observer_members
+        .iter()
+        .filter(|member| member.id == device_a.member_id())
+        .collect();
+    assert_eq!(
+        shared_account_leaves.len(),
+        2,
+        "the base group must contain two MLS leaves for the shared account"
+    );
+    assert_ne!(
+        shared_account_leaves[0].credential, shared_account_leaves[1].credential,
+        "the shared-account leaves retain distinct MLS signature keys"
+    );
+
+    let shared_history = device_b
+        .send_app_capture(b"shared history before the fork".to_vec())
+        .await;
+    let shared_history = openmls_projection_message(&device_b, &shared_history).await;
+    assert_eq!(
+        project_mls_message(&shared_history.payload)
+            .expect("shared-history app projects")
+            .source_epoch,
+        Some(base_epoch),
+        "the control message is at the fork epoch and must not witness either branch"
+    );
+
+    let app_invitee_kp = app_invitee.fresh_key_package().await;
+    let quiet_invitee_kp = quiet_invitee.fresh_key_package().await;
+    let app_pending = device_a.invite(vec![app_invitee_kp]).await;
+    let _quiet_pending = competitor.invite(vec![quiet_invitee_kp]).await;
+    let commit_messages = queued_commit_messages(&observer, &bus).await;
+    assert_eq!(
+        commit_messages.len(),
+        2,
+        "the setup creates two branch tips"
+    );
+
+    let wrapped_app_commit = bus
+        .queued_messages()
+        .into_iter()
+        .find(|message| message.id == commit_messages[0].id)
+        .expect("wrapped app-branch commit remains queued");
+    device_a.confirm(app_pending).await;
+    for client in [&mut device_b, &mut other_account] {
+        bus.inject(client.bus_id, wrapped_app_commit.clone());
+        let outcomes = client.tick().await;
+        assert!(
+            outcomes.iter().all(Result::is_ok),
+            "peer advances onto the app branch: {outcomes:?}"
+        );
+        assert_eq!(client.epoch().0, base_epoch + 1);
+    }
+
+    let device_b_app = device_b
+        .send_app_capture(b"shared account device B".to_vec())
+        .await;
+    let device_b_app = openmls_projection_message(&device_b, &device_b_app).await;
+    let device_a_app = device_a
+        .send_app_capture(b"shared account device A".to_vec())
+        .await;
+    let device_a_app = openmls_projection_message(&device_a, &device_a_app).await;
+    let other_account_app = other_account
+        .send_app_capture(b"different account witness".to_vec())
+        .await;
+    let other_account_app = openmls_projection_message(&other_account, &other_account_app).await;
+
+    let canonicalize = |pending_messages: Vec<TransportMessage>| {
+        canonicalize_openmls_batch(
+            observer.storage(),
+            &group_id,
+            OpenMlsCanonicalizationBatch {
+                state: CanonicalizationState {
+                    current_tip_epoch: base_epoch,
+                    retained_anchor_epoch: base_epoch,
+                    last_convergence_relevant_input_ms: 0,
+                    seen_message_ids: BTreeSet::new(),
+                },
+                candidate_paths: vec![
+                    OpenMlsCandidatePath {
+                        branch_id: "same-account-branch".into(),
+                        messages: vec![commit_messages[0].clone()],
+                    },
+                    OpenMlsCandidatePath {
+                        branch_id: "quiet-branch".into(),
+                        messages: vec![commit_messages[1].clone()],
+                    },
+                ],
+                pending_messages,
+                already_delivered_app_ids: BTreeSet::new(),
+                outbound_intents: vec![],
+                policy: base_test_policy(),
+                now_ms: 2_000,
+            },
+        )
+        .expect("real OpenMLS canonicalization succeeds")
+    };
+
+    let device_b_first = canonicalize(vec![
+        shared_history.clone(),
+        device_b_app.clone(),
+        device_a_app.clone(),
+    ]);
+    let device_a_first = canonicalize(vec![
+        device_a_app.clone(),
+        shared_history.clone(),
+        device_b_app.clone(),
+    ]);
+    for result in [&device_b_first, &device_a_first] {
+        let trace = result
+            .selection_trace
+            .as_ref()
+            .expect("selection trace is recorded");
+        let candidate = trace
+            .candidates
+            .iter()
+            .find(|candidate| candidate.branch_id == "same-account-branch")
+            .expect("app branch is traced");
+        assert_eq!(candidate.app_witnesses.len(), 2);
+        assert_eq!(
+            candidate.score.app_witness_score, 1,
+            "two real leaves of one account count once"
+        );
+        assert!(
+            !candidate.score.witness_quorum_met,
+            "one distinct account cannot satisfy a two-account quorum"
+        );
+        assert_eq!(
+            result.selected_branch_id.as_deref(),
+            Some("same-account-branch")
+        );
+        assert_eq!(
+            trace
+                .rule_trace
+                .iter()
+                .find(|rule| rule.decisive)
+                .map(|rule| rule.rule_name),
+            Some("app_witness_score")
+        );
+    }
+    assert_eq!(
+        device_b_first.selection_trace, device_a_first.selection_trace,
+        "delivery order and which same-account device arrives first do not change selection"
+    );
+
+    let with_other_account = canonicalize(vec![
+        shared_history,
+        device_b_app,
+        other_account_app,
+        device_a_app,
+    ]);
+    let trace = with_other_account
+        .selection_trace
+        .as_ref()
+        .expect("selection trace is recorded");
+    let candidate = trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.branch_id == "same-account-branch")
+        .expect("app branch is traced");
+    assert_eq!(
+        candidate.app_witnesses.len(),
+        3,
+        "the fork-epoch shared-history message is excluded from branch witnesses"
+    );
+    assert_eq!(
+        candidate.score.app_witness_score, 2,
+        "a genuinely different account increases the witness score"
+    );
+    assert!(
+        candidate.score.witness_quorum_met,
+        "two distinct accounts satisfy the configured quorum"
+    );
+    assert_eq!(
+        with_other_account.selected_branch_id.as_deref(),
+        Some("same-account-branch")
+    );
+    assert_eq!(
+        trace
+            .rule_trace
+            .iter()
+            .find(|rule| rule.decisive)
+            .map(|rule| rule.rule_name),
+        Some("effective_commit_depth"),
+        "quorum boost is the first decisive selector field"
+    );
+    assert_eq!(
+        observer.epoch().0,
+        base_epoch,
+        "projection probes leave the retained observer state untouched"
     );
 }
 
@@ -593,16 +1032,7 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
             seen_message_ids: BTreeSet::new(),
         },
         vec![],
-        CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 5,
-                witness_quorum_senders_per_epoch: 2,
-                witness_quorum_epochs: 1,
-                max_witness_override_depth: 1,
-            },
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
-        },
+        base_test_policy(),
         2_000,
     )
     .expect("stored OpenMLS canonicalization succeeds");
@@ -699,16 +1129,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
             seen_message_ids: BTreeSet::new(),
         },
         vec![],
-        CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 5,
-                witness_quorum_senders_per_epoch: 2,
-                witness_quorum_epochs: 1,
-                max_witness_override_depth: 1,
-            },
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
-        },
+        base_test_policy(),
         2_000,
     )
     .expect("stored OpenMLS canonicalization succeeds");
@@ -724,7 +1145,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
     assert_message_state(
         carol.storage(),
         &commit_messages[quiet_branch_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
     assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
 }
@@ -808,16 +1229,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
             seen_message_ids: BTreeSet::new(),
         },
         vec![],
-        CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 5,
-                witness_quorum_senders_per_epoch: 2,
-                witness_quorum_epochs: 1,
-                max_witness_override_depth: 1,
-            },
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
-        },
+        base_test_policy(),
         2_000,
     )
     .expect("stored OpenMLS canonicalization succeeds");
@@ -863,7 +1275,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
     assert_message_state(
         carol.storage(),
         &commit_messages[quiet_branch_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
     assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
 }
@@ -1271,12 +1683,14 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
             .collect(),
         accepted_proposals: vec![],
         accepted_app_messages: vec![],
+        deferred_messages: vec![],
         invalidated_app_messages: vec![],
         dropped_messages: vec![],
         already_seen: vec![],
         queued_outbound_intents: vec![],
         publishable_outbound_messages: vec![],
         errors: vec![],
+        replay_probe_count: 0,
         selection_trace: None,
     };
 
@@ -1330,28 +1744,28 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
         accepted_commits: vec![hex::encode(accepted_commit_id.as_slice())],
         accepted_proposals: vec![],
         accepted_app_messages: vec![hex::encode(accepted_app_id.as_slice())],
+        deferred_messages: vec![DeferredMessage {
+            message_id: hex::encode(losing_commit_id.as_slice()),
+            kind: MessageKind::Commit,
+            reason: DeferredMessageReason::NonSelectedEligibleBranch,
+        }],
         invalidated_app_messages: vec![InvalidatedAppMessage {
             message_id: hex::encode(losing_app_id.as_slice()),
             epoch: 2,
             reason: InvalidatedAppMessageReason::LosingBranch,
             decrypted_payload_ref: Some("stored-payload".into()),
         }],
-        dropped_messages: vec![
-            DroppedMessage {
-                message_id: hex::encode(losing_commit_id.as_slice()),
-                kind: MessageKind::Commit,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-            },
-            DroppedMessage {
-                message_id: hex::encode(malformed_proposal_id.as_slice()),
-                kind: MessageKind::Proposal,
-                reason: DroppedMessageReason::Malformed,
-            },
-        ],
+        dropped_messages: vec![DroppedMessage {
+            message_id: hex::encode(malformed_proposal_id.as_slice()),
+            kind: MessageKind::Proposal,
+            reason: DroppedMessageReason::Malformed,
+            rejection_category: None,
+        }],
         already_seen: vec![],
         queued_outbound_intents: vec![],
         publishable_outbound_messages: vec![],
         errors: vec![],
+        replay_probe_count: 0,
         selection_trace: None,
     };
 
@@ -1360,7 +1774,11 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
 
     assert_message_id_state(&storage, &accepted_commit_id, MessageState::Processed);
     assert_message_id_state(&storage, &accepted_app_id, MessageState::Processed);
-    assert_message_id_state(&storage, &losing_commit_id, MessageState::EpochInvalidated);
+    assert_message_id_state(
+        &storage,
+        &losing_commit_id,
+        MessageState::ConvergenceDeferred,
+    );
     assert_message_id_state(&storage, &losing_app_id, MessageState::EpochInvalidated);
     assert_message_id_state(&storage, &malformed_proposal_id, MessageState::Failed);
 }
@@ -1416,6 +1834,7 @@ fn store_dummy_created_message(
             epoch: EpochId(1),
             state: MessageState::Created,
             payload: Vec::new(),
+            deferred_peel: None,
         })
         .expect("message stored");
 }
@@ -1431,7 +1850,10 @@ fn dummy_group(group_id: GroupId) -> Group {
             credential: vec![1],
         }],
         required_capabilities: GroupCapabilities::default(),
+        protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
         removed: false,
+        unrecoverable: false,
+        disbanded: None,
         join_epoch: EpochId(0),
     }
 }
@@ -1452,6 +1874,7 @@ fn store_created_message(
             epoch: EpochId(epoch),
             state: MessageState::Created,
             payload: serde_json::to_vec(msg).expect("transport serializes"),
+            deferred_peel: None,
         })
         .expect("message stored");
 }

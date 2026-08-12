@@ -41,9 +41,10 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account welcomer allowlist persistence.
 - `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the persisted
   `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
-  versioned SHA-256 request fingerprints, `stream_finalize:` keys for durable finalized sends,
-  crash-safe atomic writes), and the
-  `DebugFinalSendStore` recorder.
+  versioned SHA-256 request fingerprints, `stream_finalize_v2:` keys for durable finalized sends,
+  crash-safe atomic writes, plus bounded same-key/same-fingerprint in-flight gates whose followers
+  reuse a leader's successful result or receive `send_in_progress` when the gate wait expires), and
+  the `DebugFinalSendStore` recorder.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.
 - `src/quic.rs` — QUIC broker candidate parsing, address resolution, and trust selection.

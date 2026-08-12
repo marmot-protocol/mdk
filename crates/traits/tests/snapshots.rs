@@ -18,8 +18,10 @@ use cgka_traits::engine::{
     KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::group::{Group, Member};
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
+};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -223,7 +225,7 @@ fn snapshot_transport_adapter_boundary_types() {
 }
 
 #[test]
-fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
+fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() {
     let raw = TransportMessage {
         id: mid(),
         payload: vec![1, 2, 3],
@@ -238,11 +240,19 @@ fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
         payload: vec![0xAB, 0xCD],
         ..raw.clone()
     };
+    let outbound_welcome = TransportMessage {
+        envelope: TransportEnvelope::Welcome {
+            recipient: MemberId::new(vec![0xDD; 32]),
+        },
+        ..raw.clone()
+    };
 
     let raw_payload = StoredMessagePayload::raw_transport(raw.clone());
+    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome.clone());
     let openmls_payload = StoredMessagePayload::openmls_wire(openmls.clone());
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
+    insta::assert_json_snapshot!("stored_payload_outbound_welcome", outbound_welcome_payload);
     insta::assert_json_snapshot!("stored_payload_openmls_wire", openmls_payload);
 
     assert_eq!(
@@ -251,6 +261,18 @@ fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
             .as_raw_transport()
             .unwrap()
             .payload,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        StoredMessagePayload::decode(
+            &StoredMessagePayload::outbound_welcome(outbound_welcome)
+                .encode()
+                .unwrap()
+        )
+        .unwrap()
+        .as_outbound_welcome()
+        .unwrap()
+        .payload,
         vec![1, 2, 3]
     );
     assert_eq!(
@@ -286,6 +308,8 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
         committer: MemberId::new(vec![0xEE; 32]),
         priority: CommitOrderingPriority::Privileged,
         consumed_proposal_refs: vec!["0a0b".into()],
+        checkpoint_id: None,
+        resulting_epoch_authenticator: None,
     };
     let payload = StoredMessagePayload::own_commit_wire(message.clone(), stamp.clone());
 
@@ -297,6 +321,64 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
     assert_eq!(decoded.as_openmls_wire().unwrap(), &message);
     assert_eq!(decoded.own_commit_stamp().unwrap(), &stamp);
     assert!(decoded.as_raw_transport().is_none());
+
+    // A branch-addressed checkpoint and its resulting epoch authenticator
+    // round-trip together. Older stamp rows omit both optional fields.
+    let marked = OwnCommitConvergenceStamp {
+        checkpoint_id: Some(format!("openmls-own-commit-v1-{}", "ab".repeat(32))),
+        resulting_epoch_authenticator: Some("cd".repeat(32)),
+        ..stamp.clone()
+    };
+    let marked_payload = StoredMessagePayload::own_commit_wire(message, marked.clone());
+    let decoded_marked = StoredMessagePayload::decode(&marked_payload.encode().unwrap()).unwrap();
+    assert_eq!(decoded_marked.own_commit_stamp().unwrap(), &marked);
+    assert!(decoded.own_commit_stamp().unwrap().checkpoint_id.is_none());
+}
+
+#[test]
+fn stored_signed_application_payload_round_trips_and_old_rows_default_to_unstamped() {
+    use cgka_traits::message::OwnApplicationConvergenceStamp;
+
+    let exact = TransportMessage {
+        id: mid(),
+        payload: vec![0x01, 0x02],
+        timestamp: Timestamp(1717171717),
+        causal_deps: vec![],
+        source: TransportSource("nostr".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xCC; 4],
+        },
+    };
+    let openmls = TransportMessage {
+        payload: vec![0xAB, 0xCD],
+        ..exact.clone()
+    };
+    let stamp = OwnApplicationConvergenceStamp {
+        sender: MemberId::new(vec![0xEE; 32]),
+        source_epoch_authenticator: "ab".repeat(32),
+    };
+    let payload = StoredMessagePayload::signed_openmls_application_wire(
+        exact.clone(),
+        openmls.clone(),
+        stamp.clone(),
+    );
+    let decoded = StoredMessagePayload::decode(&payload.encode().unwrap()).unwrap();
+    assert_eq!(decoded.as_exact_transport(), Some(&exact));
+    assert_eq!(decoded.as_openmls_wire(), Some(&openmls));
+    assert_eq!(decoded.own_application_stamp(), Some(&stamp));
+
+    // The new field is serde-defaulted and omitted when absent, so every
+    // pre-upgrade SignedOpenMlsWire row remains decodable.
+    let legacy_signed = StoredMessagePayload::signed_openmls_wire(exact, openmls);
+    let legacy_json = serde_json::to_value(&legacy_signed).unwrap();
+    assert!(
+        legacy_json["message"]
+            .get("own_application_stamp")
+            .is_none()
+    );
+    let decoded_legacy =
+        StoredMessagePayload::decode(&serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+    assert!(decoded_legacy.own_application_stamp().is_none());
 }
 
 #[test]
@@ -331,6 +413,7 @@ fn snapshot_encrypted_payload() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn snapshot_ingest_outcomes() {
     insta::assert_json_snapshot!("processed", IngestOutcome::Processed);
     insta::assert_json_snapshot!(
@@ -374,9 +457,64 @@ fn snapshot_ingest_outcomes() {
         }
     );
     insta::assert_json_snapshot!(
-        "stale_peel_failed",
+        "transport_deferred",
+        IngestOutcome::TransportDeferred { group_id: gid() }
+    );
+    insta::assert_json_snapshot!(
+        "resource_refused_deferred_capacity",
+        IngestOutcome::ResourceRefused {
+            group_id: gid(),
+            resource: InboundResourceLimit::TransportDeferredCapacity
+        }
+    );
+    insta::assert_json_snapshot!(
+        "resource_refused_retry_budget",
+        IngestOutcome::ResourceRefused {
+            group_id: gid(),
+            resource: InboundResourceLimit::TransportDeferredRetryBudget
+        }
+    );
+    insta::assert_json_snapshot!(
+        "resource_refused_residence_budget",
+        IngestOutcome::ResourceRefused {
+            group_id: gid(),
+            resource: InboundResourceLimit::TransportDeferredResidenceBudget
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_pre_membership",
         IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+            reason: StaleReason::PreMembership
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_beyond_anchor",
+        IngestOutcome::Stale {
+            reason: StaleReason::BeyondAnchor
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_beyond_rollback_horizon",
+        IngestOutcome::Stale {
+            reason: StaleReason::BeyondRollbackHorizon
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_beyond_app_retention",
+        IngestOutcome::Stale {
+            reason: StaleReason::BeyondAppRetention
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_losing_branch",
+        IngestOutcome::Stale {
+            reason: StaleReason::LosingBranch
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_invalid_against_canonical_state",
+        IngestOutcome::Stale {
+            reason: StaleReason::InvalidAgainstCanonicalState
         }
     );
     insta::assert_json_snapshot!(
@@ -389,6 +527,36 @@ fn snapshot_ingest_outcomes() {
         "stale_quarantined",
         IngestOutcome::Stale {
             reason: StaleReason::Quarantined
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_authorization_failed",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_unsupported_proposal",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::UnsupportedProposal
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_encoding",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_signature",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSignature
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_self_remove",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSelfRemove
         }
     );
 }
@@ -463,6 +631,10 @@ fn snapshot_send_results() {
                 transport_group_id: vec![],
             },
         },
+        group_id: gid(),
+        app_event_id: "app-event-id".into(),
+        source_epoch: EpochId(1),
+        retention: cgka_traits::AppMessageRetentionDecision::new(10, 60),
     };
     insta::assert_json_snapshot!("result_application_message", app);
     insta::assert_json_snapshot!(
@@ -504,12 +676,22 @@ fn snapshot_group_events() {
         }
     );
     insta::assert_json_snapshot!(
+        "event_transport_object_resource_refused",
+        GroupEvent::TransportObjectResourceRefused {
+            group_id: gid(),
+            message_id: mid(),
+            resource: InboundResourceLimit::TransportDeferredResidenceBudget,
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_message_received",
         GroupEvent::MessageReceived {
             group_id: gid(),
+            message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
             payload: b"hi".to_vec(),
+            retention: None,
         }
     );
     insta::assert_json_snapshot!(
@@ -662,9 +844,58 @@ fn snapshot_group_and_member() {
                 credential: vec![],
             }],
             required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
             removed: false,
+            unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(2),
         }
+    );
+}
+
+#[test]
+fn key_package_profile_is_persisted_and_old_records_default_to_legacy() {
+    let legacy: KeyPackage = serde_json::from_value(serde_json::json!({
+        "bytes": [1, 2, 3],
+        "source": null
+    }))
+    .unwrap();
+    assert_eq!(legacy.protocol_profile, ProtocolProfile::Legacy);
+
+    let current = KeyPackage::new(vec![4, 5, 6]).with_protocol_profile(ProtocolProfile::Current);
+    let reopened: KeyPackage =
+        serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+    assert_eq!(reopened.protocol_profile, ProtocolProfile::Current);
+
+    let invalid = serde_json::from_value::<KeyPackage>(serde_json::json!({
+        "bytes": [7, 8, 9],
+        "protocol_profile": "nope"
+    }))
+    .expect_err("a present corrupt profile must not fall through the serde default");
+    assert!(invalid.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn key_package_equality_and_hash_include_protocol_profile_but_not_source() {
+    use std::collections::HashSet;
+
+    let legacy = KeyPackage::new(vec![1, 2, 3]);
+    let legacy_with_source =
+        KeyPackage::with_source_event_id(vec![1, 2, 3], MessageId::new(vec![4; 32]));
+    let current = KeyPackage::new(vec![1, 2, 3]).with_protocol_profile(ProtocolProfile::Current);
+
+    assert_eq!(
+        legacy, legacy_with_source,
+        "transport provenance must not change KeyPackage identity"
+    );
+    assert_ne!(
+        legacy, current,
+        "application-profile metadata must remain visible to equality"
+    );
+    assert_eq!(
+        HashSet::from([legacy, legacy_with_source, current]).len(),
+        2,
+        "hashing must use the same identity fields as equality"
     );
 }
 
@@ -684,4 +915,22 @@ fn snapshot_create_group_request() {
             }
         )
     );
+}
+
+#[test]
+fn unrecoverable_defaults_false_for_old_records() {
+    let legacy: Group = serde_json::from_value(serde_json::json!({
+        "id": [1, 2, 3, 4],
+        "name": "ops",
+        "description": "",
+        "epoch": 1,
+        "members": [],
+        "required_capabilities": {
+            "proposals": [],
+            "extensions": [],
+            "app_components": { "ids": [] }
+        }
+    }))
+    .unwrap();
+    assert!(!legacy.unrecoverable);
 }

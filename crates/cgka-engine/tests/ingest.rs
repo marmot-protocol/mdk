@@ -11,14 +11,16 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{
+    IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage, StaleReason,
+};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
-use cgka_traits::storage::MessageStorage;
+use cgka_traits::storage::{MessageStorage, StorageError};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{EpochId, MemberId, MessageId};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -54,6 +56,44 @@ struct RecordingPeeler {
 }
 struct FailOncePeeler {
     failed: Mutex<HashSet<MessageId>>,
+}
+/// Structural minimum mirroring the production Nostr peeler's content-length
+/// gate: a payload too short to carry a nonce-prefixed ciphertext classifies
+/// as `Malformed` before any decryption attempt.
+const STRUCTURAL_MIN_PAYLOAD_LEN: usize = 28;
+struct MalformedShortPayloadPeeler;
+#[derive(Clone, Copy)]
+enum BoundaryRejection {
+    InvalidSignature,
+    WrongRecipient,
+}
+#[derive(Clone, Copy)]
+enum InitialPeelFailure {
+    DecryptFailed,
+    StaleEpoch,
+}
+#[derive(Clone, Copy)]
+enum BoundaryRejectionPath {
+    Direct,
+    SnapshotFallback {
+        live_epoch: u64,
+        initial_failure: InitialPeelFailure,
+    },
+}
+struct BoundaryRejectionPeeler {
+    rejection: BoundaryRejection,
+    path: BoundaryRejectionPath,
+}
+
+const BOUNDARY_REJECTION_PAYLOAD: &[u8] = b"typed-boundary-rejection-payload";
+
+impl BoundaryRejection {
+    fn peeler_error(self) -> PeelerError {
+        match self {
+            Self::InvalidSignature => PeelerError::InvalidSignature,
+            Self::WrongRecipient => PeelerError::WrongRecipient,
+        }
+    }
 }
 
 impl FailOncePeeler {
@@ -222,6 +262,188 @@ impl TransportPeeler for FailOncePeeler {
     }
 }
 
+#[async_trait]
+impl TransportPeeler for MalformedShortPayloadPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload.len() < STRUCTURAL_MIN_PAYLOAD_LEN {
+            return Err(PeelerError::Malformed(
+                "content too short for nonce-prefixed ciphertext".into(),
+            ));
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for BoundaryRejectionPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload != BOUNDARY_REJECTION_PAYLOAD {
+            return MockPeeler.peel_group_message(msg, ctx).await;
+        }
+
+        match self.path {
+            BoundaryRejectionPath::Direct => Err(self.rejection.peeler_error()),
+            BoundaryRejectionPath::SnapshotFallback {
+                live_epoch,
+                initial_failure,
+            } if ctx.epoch().0 >= live_epoch => Err(match initial_failure {
+                InitialPeelFailure::DecryptFailed => PeelerError::DecryptFailed,
+                InitialPeelFailure::StaleEpoch => PeelerError::StaleEpoch {
+                    message_epoch: EpochId(live_epoch.saturating_sub(1)),
+                    context_epoch: ctx.epoch(),
+                },
+            }),
+            BoundaryRejectionPath::SnapshotFallback { .. } => Err(self.rejection.peeler_error()),
+        }
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload == BOUNDARY_REJECTION_PAYLOAD {
+            return Err(self.rejection.peeler_error());
+        }
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+/// Garbage payload whose malformed verdict is context-dependent: it peels
+/// `DecryptFailed` against the live epoch (so ingest falls through to the
+/// retained-snapshot fallback) but `Malformed` against any older snapshot
+/// context. This simulates a trait-permitted non-Nostr peeler: the production
+/// Nostr peeler can never reach the fallback with a `Malformed` verdict, since
+/// its malformed detection is a pure function of the message bytes and is
+/// always caught by the direct peel first. The public `TransportPeeler`
+/// contract, however, allows `StaleEpoch`-hint peelers whose malformed
+/// detection is context-dependent, so the fallback seam must still treat that
+/// verdict as terminal (mdk#707).
+const SNAPSHOT_FALLBACK_GARBAGE: &[u8] = b"snapshot-fallback-garbage-payload";
+
+struct SnapshotFallbackMalformedPeeler {
+    malformed_below_epoch: u64,
+}
+
+#[async_trait]
+impl TransportPeeler for SnapshotFallbackMalformedPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload == SNAPSHOT_FALLBACK_GARBAGE {
+            return if ctx.epoch().0 < self.malformed_below_epoch {
+                Err(PeelerError::Malformed(
+                    "malformed only against an older snapshot context".into(),
+                ))
+            } else {
+                Err(PeelerError::DecryptFailed)
+            };
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+/// Pass-through peeler (identical to [`MockPeeler`]) that counts how many times
+/// `peel_group_message` is invoked, so a test can assert a retired raw row is
+/// not wastefully re-peeled on later replay passes.
+struct CountingPeeler {
+    peels: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl TransportPeeler for CountingPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        *self.peels.lock().unwrap() += 1;
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 fn selfremove_registry() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -263,6 +485,7 @@ fn build_client_with_storage_and_peeler(
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -297,6 +520,7 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
     let mut supported = default_group_components();
     supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
     let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
         .feature_registry(selfremove_registry())
@@ -361,8 +585,8 @@ async fn ingest_unknown_group_message_returns_unknown_group() {
     let outcome = engine.ingest(msg).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::UnknownGroup
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::UnknownGroup
         }
     ));
 }
@@ -383,8 +607,8 @@ async fn ingest_welcome_for_another_client_returns_not_for_this_client() {
     let outcome = engine.ingest(msg).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::NotForThisClient
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient
         }
     ));
 }
@@ -407,10 +631,102 @@ async fn ingest_duplicate_message_id_returns_already_seen() {
     let outcome = engine.ingest(msg).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
+}
+
+#[tokio::test]
+async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut engine = build_client_with_storage(storage.clone(), b"malformed-welcome");
+    let message_id = MessageId::new(vec![0x67; 32]);
+    let msg = TransportMessage {
+        id: message_id.clone(),
+        payload: b"not an MLS welcome".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+    };
+
+    let outcome = engine
+        .ingest(msg.clone())
+        .await
+        .expect("malformed welcome is a per-message rejection outcome");
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidEncoding
+        }
+    ));
+    assert!(storage.has_ingress_dedup_marker(&message_id).unwrap());
+    drop(engine);
+
+    let mut reopened = build_client_with_storage(storage, b"malformed-welcome");
+    let replay = reopened
+        .ingest(msg)
+        .await
+        .expect("poisoned welcome must not hard-error after restart");
+    assert!(matches!(
+        replay,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    ));
+}
+
+#[tokio::test]
+async fn rewrapped_identical_welcome_uses_content_dedup() {
+    let mut alice = build_client(b"alice-welcome-content-dedup");
+    let mut bob = build_client(b"bob-welcome-content-dedup");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (_group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "content dedup".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected group create, got {other:?}"),
+    };
+
+    assert!(matches!(
+        bob.ingest(welcome.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    bob.drain_events();
+
+    let rewrapped = TransportMessage {
+        id: MessageId::new(vec![0x68; 32]),
+        ..welcome
+    };
+    let outcome = bob.ingest(rewrapped).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    ));
+    assert!(
+        bob.drain_events().is_empty(),
+        "content-duplicate welcome must not emit a second join"
+    );
 }
 
 #[tokio::test]
@@ -448,7 +764,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -458,12 +774,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
     };
 
     let first = bob.ingest(msg.clone()).await.unwrap();
-    assert!(matches!(
-        first,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
-    ));
+    assert!(matches!(first, IngestOutcome::TransportDeferred { .. }));
 
     let second = bob.ingest(msg).await.unwrap();
     assert!(matches!(second, IngestOutcome::Processed));
@@ -473,6 +784,629 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
             |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"retry after peel")
         ),
         "expected retried message to emit after peel succeeds, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client_with_peeler(b"bob", Box::new(MalformedShortPayloadPeeler));
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Anyone can publish to a group's cleartext routing tag without being a
+    // member, so structurally-invalid content is ordinary hostile input. It
+    // must classify as invalid encoding — never abort ingest, or one garbage event
+    // starves every message queued behind it in a transport drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"malformed garbage"),
+        payload: b"too short".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed input must classify as rejected, not abort ingest");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::InvalidEncoding
+            }
+        ),
+        "expected invalid encoding for malformed content, got {outcome:?}"
+    );
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after the garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let after = bob.ingest(msg).await.unwrap();
+    assert!(matches!(after, IngestOutcome::Processed));
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after the garbage")
+        ),
+        "expected the message behind the garbage to still deliver, got {events:?}"
+    );
+}
+
+async fn assert_typed_terminal_transport_rejection(
+    rejection: BoundaryRejection,
+    expected_outcome: IngestOutcome,
+) {
+    let mut alice = build_client(b"alice-terminal-rejection");
+    let mut bob = build_client_with_peeler(
+        b"bob-terminal-rejection",
+        Box::new(BoundaryRejectionPeeler {
+            rejection,
+            path: BoundaryRejectionPath::Direct,
+        }),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let rejected = TransportMessage {
+        id: hash_id(b"terminal transport rejection"),
+        payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(rejected.clone())
+        .await
+        .expect("boundary rejection is terminal input, not a drain failure");
+    assert_eq!(outcome, expected_outcome);
+
+    let duplicate = bob
+        .ingest(rejected)
+        .await
+        .expect("redelivery short-circuits after terminal rejection");
+    assert!(matches!(
+        duplicate,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    ));
+}
+
+async fn assert_snapshot_fallback_terminal_transport_rejection(
+    rejection: BoundaryRejection,
+    initial_failure: InitialPeelFailure,
+    expected_outcome: IngestOutcome,
+) {
+    let mut alice = build_client(b"alice-snapshot-boundary-rejection");
+    let live_epoch = 2u64;
+    let mut bob = build_client_with_peeler(
+        b"bob-snapshot-boundary-rejection",
+        Box::new(BoundaryRejectionPeeler {
+            rejection,
+            path: BoundaryRejectionPath::SnapshotFallback {
+                live_epoch,
+                initial_failure,
+            },
+        }),
+    );
+    let mut carol = build_client(b"carol-snapshot-boundary-rejection");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected invite commit, got {other:?}"),
+    };
+    bob.buffer_openmls_convergence_message_at(&group_id, invite, 1_000)
+        .expect("invite commit buffered");
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("invite commit applies and retains the pre-commit anchor");
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(live_epoch));
+
+    let rejected = TransportMessage {
+        id: hash_id(b"snapshot fallback terminal transport rejection"),
+        payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(rejected.clone())
+        .await
+        .expect("snapshot-fallback boundary rejection is terminal, not a drain failure");
+    assert_eq!(outcome, expected_outcome);
+
+    let duplicate = bob
+        .ingest(rejected)
+        .await
+        .expect("redelivery short-circuits after snapshot-fallback rejection");
+    assert_eq!(
+        duplicate,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    );
+}
+
+#[tokio::test]
+async fn invalid_transport_signature_is_typed_terminal_input() {
+    assert_typed_terminal_transport_rejection(
+        BoundaryRejection::InvalidSignature,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidSignature,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_transport_recipient_is_typed_terminal_input() {
+    assert_typed_terminal_transport_rejection(
+        BoundaryRejection::WrongRecipient,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
+    let mut engine = build_client_with_peeler(
+        b"welcome-wrong-recipient",
+        Box::new(BoundaryRejectionPeeler {
+            rejection: BoundaryRejection::WrongRecipient,
+            path: BoundaryRejectionPath::Direct,
+        }),
+    );
+    let rejected = TransportMessage {
+        id: hash_id(b"wrong transport welcome recipient"),
+        payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+    };
+
+    let outcome = engine
+        .ingest(rejected.clone())
+        .await
+        .expect("wrong-recipient welcome is terminal input, not a drain failure");
+    assert_eq!(
+        outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient
+        }
+    );
+
+    let duplicate = engine
+        .ingest(rejected)
+        .await
+        .expect("redelivery short-circuits after wrong-recipient welcome");
+    assert_eq!(
+        duplicate,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    );
+}
+
+#[tokio::test]
+async fn invalid_transport_signature_after_decrypt_failed_fallback_is_terminal() {
+    assert_snapshot_fallback_terminal_transport_rejection(
+        BoundaryRejection::InvalidSignature,
+        InitialPeelFailure::DecryptFailed,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidSignature,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_transport_recipient_after_stale_epoch_fallback_is_terminal() {
+    assert_snapshot_fallback_terminal_transport_rejection(
+        BoundaryRejection::WrongRecipient,
+        InitialPeelFailure::StaleEpoch,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest() {
+    let mut alice = build_client(b"alice-post-peel");
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(storage.clone(), b"bob-post-peel");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // The pass-through test peeler represents a valid authenticated wrapper;
+    // only the carried MLS bytes are malformed. This must be a per-message
+    // terminal disposition, not an engine error that aborts the relay drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"authenticated wrapper with malformed MLS bytes"),
+        payload: b"not an MLS message".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let garbage_content_id = content_id(&garbage);
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed post-peel MLS bytes must not abort ingest");
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidEncoding
+        }
+    ));
+    assert_eq!(
+        storage.get_message(&garbage_content_id).unwrap().state,
+        MessageState::Failed,
+        "the content-derived poison row must be durable and terminal"
+    );
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after post-peel garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        other => panic!("expected app message, got {other:?}"),
+    };
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(bob.drain_events().iter().any(
+        |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after post-peel garbage")
+    ));
+}
+
+#[tokio::test]
+async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_rollback() {
+    let mut alice =
+        build_client_with_peeler(b"alice-pending", Box::new(MalformedShortPayloadPeeler));
+    let mut bob = build_client(b"bob-pending");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    // Stage a commit so the group sits in PendingPublish — the window where
+    // inbound input is persisted `Retryable` for replay BEFORE the peeler
+    // ever classifies it.
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("doomed".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+
+    let garbage = TransportMessage {
+        id: hash_id(b"malformed garbage during pending publish"),
+        payload: b"too short".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let buffered = alice.ingest(garbage.clone()).await.unwrap();
+    assert!(
+        matches!(buffered, IngestOutcome::Buffered { .. }),
+        "pre-peel buffering during PendingPublish is the tested entry \
+         condition, got {buffered:?}"
+    );
+
+    // Rollback returns the group to Stable and replays the buffered backlog;
+    // the garbage now peels `Malformed` for the first time. The terminal
+    // contract: once classification has run, the attacker-keyed row must not
+    // stay in a non-terminal state that re-enters replay forever.
+    alice.publish_failed(staged).await.unwrap();
+    let after_replay = alice.ingest(garbage).await.unwrap();
+    assert!(
+        matches!(
+            after_replay,
+            IngestOutcome::Stale { .. } | IngestOutcome::Ignored { .. }
+        ),
+        "a malformed message must land terminal once classified — a \
+         `Buffered` here means the stored row is still non-terminal and \
+         perpetually reported as pending, got {after_replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_via_snapshot_fallback_is_rejected_and_does_not_wedge_ingest() {
+    // Simulates a trait-permitted non-Nostr peeler whose `Malformed` verdict is
+    // context-dependent: the direct peel at the live epoch returns
+    // `DecryptFailed`, driving ingest into the retained-snapshot fallback, where
+    // the peel against the older snapshot context returns `Malformed`. The
+    // production Nostr peeler cannot reach this branch (its malformed detection
+    // is a pure function of the bytes, so the direct peel catches it first), but
+    // the fallback seam must handle the verdict identically to the direct seam:
+    // terminal stale, never an aborted drain (mdk#707).
+    let mut alice = build_client(b"alice");
+    // The group reaches epoch 2 below (create -> 1, invite -> 2), so the
+    // retained epoch-1 anchor is the only past-peel snapshot older than live.
+    let live_epoch = 2u64;
+    let mut bob = build_client_with_peeler(
+        b"bob",
+        Box::new(SnapshotFallbackMalformedPeeler {
+            malformed_below_epoch: live_epoch,
+        }),
+    );
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Alice invites Carol so a commit advances the group and Bob retains an
+    // anchor snapshot at the pre-commit epoch — the snapshot the fallback rolls
+    // back to and peels against below.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        _ => unreachable!(),
+    };
+    // Convergence settles a peer commit only after its quiescence window has
+    // elapsed, so buffer at one instant and converge at a later one (mirroring
+    // the retained-anchor convergence tests) to apply the commit and retain the
+    // pre-commit epoch anchor.
+    bob.buffer_openmls_convergence_message_at(&group_id, invite, 1_000)
+        .expect("invite commit buffered");
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("invite commit applies and retains the pre-commit anchor");
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        EpochId(live_epoch),
+        "Bob must advance to the live epoch so an older retained anchor exists"
+    );
+
+    // Garbage arrives: direct peel `DecryptFailed` -> snapshot fallback peels
+    // `Malformed`. The terminal contract must hold on this seam too — classify
+    // invalid encoding, do not abort the drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"malformed via snapshot fallback"),
+        payload: SNAPSHOT_FALLBACK_GARBAGE.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed snapshot-fallback peel must classify, not abort ingest");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::InvalidEncoding
+            }
+        ),
+        "expected invalid encoding for a malformed snapshot-fallback peel, got {outcome:?}"
+    );
+
+    // The drain is not wedged: a well-formed message queued behind the garbage
+    // still processes.
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after the snapshot garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let after = bob.ingest(msg).await.unwrap();
+    assert!(matches!(after, IngestOutcome::Processed));
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after the snapshot garbage")
+        ),
+        "expected the message behind the garbage to still deliver, got {events:?}"
     );
 }
 
@@ -510,7 +1444,7 @@ async fn ingest_own_created_message_returns_own_echo() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => unreachable!(),
     };
 
@@ -524,11 +1458,132 @@ async fn ingest_own_created_message_returns_own_echo() {
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::OwnEcho
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::OwnEcho
         }
     ));
     let _ = (bob, create);
+}
+
+/// A database created before durable sent-content markers existed can still
+/// contain an outbound MLS message that OpenMLS itself recognizes as ours.
+/// If that echo was buffered before peeling, the library-level `OwnPrivateMessage`
+/// fallback must retire the raw retry row instead of leaving it replayable.
+#[tokio::test]
+async fn buffered_legacy_own_echo_retires_raw_retry_row() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_client_with_storage(storage.clone(), b"alice-legacy-own-echo");
+    let mut bob = build_client(b"bob-legacy-own-echo");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "legacy own echo".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, mut welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    // Roll the local store back across the send to model a legacy database
+    // that has the MLS group state but no durable sent-content marker.
+    const SNAPSHOT: &str = "before-legacy-own-echo";
+    storage.create_group_snapshot(&group_id, SNAPSHOT).unwrap();
+    let own_message = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"legacy own echo"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => msg,
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+    let own_content_id = content_id(&own_message);
+    assert_eq!(
+        storage.get_message(&own_content_id).unwrap().state,
+        MessageState::Sent,
+        "the modern send path must first create the marker removed below"
+    );
+    storage
+        .rollback_group_to_snapshot(&group_id, SNAPSHOT)
+        .unwrap();
+    storage.release_group_snapshot(&group_id, SNAPSHOT).unwrap();
+    assert!(
+        matches!(
+            storage.get_message(&own_content_id),
+            Err(StorageError::NotFound)
+        ),
+        "the simulated legacy store must not retain the sent-content marker"
+    );
+
+    // Rebuild to clear the hot-process sent-id cache as a real restart would.
+    drop(alice);
+    let mut alice = build_client_with_storage(storage.clone(), b"alice-legacy-own-echo");
+    alice.hydrate_all_stored_groups().unwrap();
+
+    // Buffer the echo before peeling while a local commit awaits publication.
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let raw_id = MessageId::new(b"legacy-own-echo-wrapper".to_vec());
+    let echoed = TransportMessage {
+        id: raw_id.clone(),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..own_message
+    };
+    assert!(
+        matches!(
+            alice.ingest(echoed).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ),
+        "the own echo must enter through the raw retry lifecycle"
+    );
+    assert_eq!(
+        storage.get_message(&raw_id).unwrap().state,
+        MessageState::Retryable
+    );
+
+    alice.publish_failed(staged).await.unwrap();
+
+    assert_eq!(
+        storage.get_message(&own_content_id).unwrap().state,
+        MessageState::Processed,
+        "OpenMLS must classify and terminalize the legacy own content"
+    );
+    assert_eq!(
+        storage.get_message(&raw_id).unwrap().state,
+        MessageState::Failed,
+        "the raw retry row must be retired by the OwnEcho fallback"
+    );
+    assert!(
+        alice
+            .drain_events()
+            .into_iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. })),
+        "an own echo must not surface as an inbound application message"
+    );
 }
 
 #[tokio::test]
@@ -574,7 +1629,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
             .await
             .unwrap()
         {
-            SendResult::ApplicationMessage { msg } => msg,
+            SendResult::ApplicationMessage { msg, .. } => msg,
             _ => unreachable!(),
         };
     }
@@ -587,7 +1642,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
     assert_eq!(marker.state, MessageState::Sent);
 
     let mut alice = build_client_with_storage(reopened_store, b"alice-own-restart");
-    alice.hydrate_stable_groups_from_storage().unwrap();
+    alice.hydrate_all_stored_groups().unwrap();
     let rewrapped = TransportMessage {
         id: MessageId::new(b"fresh-own-echo-transport-id".to_vec()),
         timestamp: Timestamp(app_msg.timestamp.0 + 1),
@@ -601,8 +1656,8 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::OwnEcho
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho
             }
         ),
         "re-wrapped own OpenMLS echo after restart must be OwnEcho, got {outcome:?}"
@@ -733,7 +1788,7 @@ async fn send_app_message_round_trips_to_another_client() {
         .unwrap();
 
     let msg = match send_res {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => panic!("expected ApplicationMessage"),
     };
 
@@ -757,6 +1812,87 @@ async fn send_app_message_round_trips_to_another_client() {
         )
     });
     assert!(got_it, "expected MessageReceived; got {events:?}");
+}
+
+#[tokio::test]
+async fn pending_application_delivery_replays_after_restart_until_acknowledged() {
+    let mut alice = build_client(b"alice-outbox");
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(bob_storage.clone(), b"bob-outbox");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"survive the projection crash"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let pending_events = bob_storage.list_pending_application_events().unwrap();
+    assert_eq!(pending_events.len(), 1);
+    let pending_message_id = match &pending_events[0] {
+        GroupEvent::MessageReceived { message_id, .. } => message_id.clone(),
+        event => panic!("unexpected pending event: {event:?}"),
+    };
+
+    // Simulate process death after the protocol transition committed but before
+    // the app drained/projected the event.
+    drop(bob);
+    let mut reopened = build_client_with_storage(bob_storage.clone(), b"bob-outbox");
+    let recovered = reopened.drain_events();
+    assert!(recovered.iter().any(
+        |event| matches!(event, GroupEvent::MessageReceived { payload, .. }
+            if app_content(payload) == b"survive the projection crash")
+    ));
+
+    bob_storage
+        .delete_pending_application_events(&[pending_message_id])
+        .unwrap();
+    drop(reopened);
+    let mut acknowledged = build_client_with_storage(bob_storage, b"bob-outbox");
+    assert!(
+        acknowledged
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. })),
+        "acknowledged application events must not replay again",
+    );
 }
 
 #[tokio::test]
@@ -797,7 +1933,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -840,6 +1976,144 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
     assert!(
         replayed,
         "expected buffered message after rollback; got {events:?}"
+    );
+}
+
+/// A peer message that arrives during our own `PendingPublish` window is
+/// buffered `Retryable` (persisted before any peel). Once the publish cycle
+/// resolves and replay applies it, the raw transport wrapper MUST reach a
+/// terminal state: the content-derived row now carries the real verdict, so
+/// leaving the raw row `Retryable` only makes replay re-peel it wastefully on
+/// every subsequent publish cycle.
+#[tokio::test]
+async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
+    let peels = Arc::new(Mutex::new(0usize));
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = storage.clone();
+    let mut alice = build_client_with_storage_and_peeler(
+        storage,
+        b"alice-buffered-retire",
+        Box::new(CountingPeeler {
+            peels: peels.clone(),
+        }),
+    );
+    let mut bob = build_client(b"bob-buffered-retire");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (create_pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+
+    let bob_msg = match bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"arrived while alice was pending"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let raw_id = bob_msg.id.clone();
+
+    // ── Cycle 1: buffer during PendingPublish, then replay on rollback. ──
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+
+    let buffered = alice.ingest(bob_msg).await.unwrap();
+    assert!(
+        matches!(buffered, IngestOutcome::Buffered { .. }),
+        "peer message during PendingPublish must buffer, got {buffered:?}"
+    );
+    assert_eq!(
+        *peels.lock().unwrap(),
+        0,
+        "buffering is pre-peel: the PendingPublish window must not peel the row"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Retryable,
+        "the buffered raw transport row is persisted Retryable pending replay"
+    );
+
+    alice.publish_failed(staged).await.unwrap();
+    assert!(
+        alice.drain_events().iter().any(
+            |e| matches!(e, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"arrived while alice was pending"),
+        ),
+        "the buffered message must be delivered once replay runs"
+    );
+    assert_eq!(
+        *peels.lock().unwrap(),
+        1,
+        "replay peels the buffered row exactly once"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Processed,
+        "after replay applies it, the raw transport wrapper must be terminal \
+         (Processed) — not left Retryable to be re-peeled forever"
+    );
+
+    // ── Cycle 2: a second publish cycle must not re-peel the retired row. ──
+    let staged_again = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending-again".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.publish_failed(staged_again).await.unwrap();
+    assert_eq!(
+        *peels.lock().unwrap(),
+        1,
+        "a retired raw row is excluded from replay — no wasted re-peel on the \
+         next publish cycle"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Processed,
+        "the retired raw row stays terminal across publish cycles"
     );
 }
 
@@ -898,7 +2172,7 @@ async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => unreachable!(),
     };
 
@@ -940,8 +2214,8 @@ async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
     assert!(
         matches!(
             bob.ingest(rewrapped).await.unwrap(),
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
             }
         ),
         "re-wrapped duplicate MLS message must be classified AlreadySeen"
@@ -971,7 +2245,7 @@ async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
             .await
             .unwrap()
         {
-            SendResult::ApplicationMessage { msg } => msg,
+            SendResult::ApplicationMessage { msg, .. } => msg,
             _ => unreachable!(),
         };
         let routed = TransportMessage {

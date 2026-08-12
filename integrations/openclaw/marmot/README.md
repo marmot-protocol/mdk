@@ -6,12 +6,22 @@ routing. `wn-agent` owns the Marmot account, MLS group state, Nostr transport,
 durable encrypted sends, and QUIC live-preview stream records.
 
 The plugin is intentionally thin and **control-plane only**: it speaks the
-`marmot.agent-control.v1` newline-delimited JSON protocol to `wn-agent` over a
+`marmot.agent-control.v2` newline-delimited JSON protocol to `wn-agent` over a
 local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
-- Pinned OpenClaw SDK: **`openclaw@2026.6.8`** (`openclaw/plugin-sdk/*`).
+For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
+materialized chat window and supplies it to OpenClaw with durable message ids,
+senders, timestamps, reply links, current reaction summaries, and
+delete/invalidation state. Reply context is supplied through both OpenClaw's
+native quote fields and a complete structured referenced-message payload.
+The model-callable `marmot_history` tool can fetch one exact message id or page
+older messages using the returned `(recorded_at, message_id_hex)` cursor.
+History reads are best-effort for turn activation, so a temporary read failure
+does not suppress the new inbound message.
+
+- Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
 
 ## Install (release)
@@ -21,7 +31,8 @@ GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH
 
 Prerequisites:
 
-- OpenClaw **2026.6.8** or compatible (this plugin pins `openclaw@2026.6.8`)
+- OpenClaw host **2026.7.1 or newer**. The installer validates the existing
+  host and never installs or upgrades OpenClaw.
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
@@ -46,16 +57,49 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-la
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
-Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
+Generated-identity onboarding is the default (and can be selected explicitly
+with `--generate-identity`). To preserve an existing Nostr identity, place its
+`nsec` or raw secret hex in a regular file owned by the current user with mode
+`0600`, then use a pinned release URL:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.9/install-openclaw-marmot.sh" | \
+  bash -s -- \
+    --yes \
+    --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+    --expected-npub npub1... \
+    --allow-welcomer npub1...
+```
+
+The installer passes only the file path, never the secret, in process arguments.
+`wn-agent` rejects symlinks, non-regular files, files owned by another user, and
+files accessible by group/other users. It verifies `--expected-npub` before
+starting the connector or changing OpenClaw configuration, imports idempotently,
+then bootstraps the exact account with creation disabled. During interactive
+setup, the same identity can instead be entered through a masked `/dev/tty`
+prompt, which remains usable when the installer itself arrives through a pipe.
+The source credential file is read-only and is not rewritten or removed.
+The `--expected-npub` value must be a public `npub` or public-key hex, never an
+`nsec` or raw secret key.
+
+OpenClaw keeps its isolated default connector home. Reusing the same identity in
+another connector home, such as Hermes's, requires a separate explicit import;
+the installers never opt into shared home/socket state silently.
 
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically. Manual equivalent:
 
 ```sh
+wn-agent import-identity --json \
+  --home ~/.marmot-agents/openclaw \
+  --label openclaw-agent \
+  --identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+  --expected-identity npub1...
 wn-agent --home ~/.marmot-agents/openclaw \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
-wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent --qr
+wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent \
+  --no-create --account-id-hex <imported-account-hex> --qr
 openclaw gateway run
 ```
 
@@ -65,6 +109,7 @@ Invite the printed agent account from the phone app.
 
 ```sh
 just openclaw-dev-test                 # pnpm install + typecheck + vitest
+just openclaw-host-compat-test         # build + focused runtime tests on supported beta
 just openclaw-dev-script-test          # generated helper/env/installer contract test
 just openclaw-dev-setup --print-env    # build + isolated dev root + helper scripts
 just openclaw-dev-e2e-connector        # real wn-agent + debug control deterministic E2E
@@ -132,9 +177,10 @@ relay, phone, or OpenClaw gateway.
 ## Docker phone test
 
 A Compose profile builds a container with `wn-agent`, OpenClaw, this plugin, and
-`qrencode`. It starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1` so the first
-phone invite lands without pre-seeding an allowlist (use an explicit allowlist
-for a real deployment).
+`qrencode`. It starts `wn-agent` with `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1`
+and `MARMOT_AGENT_DEBUG_CONTROLS=1` so the first invite from an authenticated
+phone lands without pre-seeding an allowlist (use an explicit allowlist and
+omit both development options for a real deployment).
 
 ```sh
 export OPENAI_API_KEY=...        # or ANTHROPIC_API_KEY / OPENROUTER_API_KEY / ...
@@ -167,9 +213,13 @@ advanced shared deployment can point both gateways at one `wn-agent`:
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
 | `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
 | `groupActivation` | `MARMOT_GROUP_ACTIVATION` | `mention` (reply only when addressed in 3+ member groups; `always` replies to every message) |
+| — | `MARMOT_OUTBOUND_MEDIA_DIR` | `$MARMOT_HOME/dev/outbound-media` (short-lived connector-approved staging copies) |
 | `mentionPatterns` | `MARMOT_MENTION_PATTERNS` | — (extra case-insensitive trigger phrases; the configured agent name is always a trigger) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
+
+The QUIC/streaming settings are still accepted for configuration compatibility,
+but inbound agent replies are currently delivered final-only.
 
 `accountIdHex` is the Marmot/wn-agent account id. It is intentionally distinct
 from OpenClaw's channel account id (`default`, or a key under
@@ -181,12 +231,18 @@ no TCP listener). If OpenClaw and `wn-agent` run as different local users, start
 `wn-agent` with `--auth-token-file` + group-readable socket modes (`0660`) and
 set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 [`crates/agent-connector/README.md`](../../../crates/agent-connector/README.md).
+The token grants the full connector API for every hosted account, not only the
+configured OpenClaw channel account. Use a separate connector home/socket/token
+for any plugin or tenant that is not in the same trust boundary.
 
-- **Inbound → agent turn** (`src/dispatch.ts`): the inbound bridge feeds each
-  received Marmot message (`chatId` = Marmot group id, `userId` = sender) into
-  OpenClaw's turn kernel via `runChannelInboundEvent` + `dispatchReplyWithBufferedBlockDispatcher`,
-  **modeled on the bundled Telegram channel**. The agent's reply is delivered
-  back through the message adapter and threads to the triggering message.
+- **Inbound → agent turn** (`src/dispatch.ts`): the gateway-owned inbound bridge
+  feeds each received Marmot message (`chatId` = Marmot group id, `userId` =
+  sender) into OpenClaw's turn kernel via `runChannelInboundEvent` +
+  `dispatchReplyWithBufferedBlockDispatcher`. The trusted inbound context owns
+  the destination. A normal assistant final is passed to
+  `deliverInboundReplyWithMessageSendContext`, which invokes the registered
+  Marmot message adapter and threads the reply to the triggering message. The
+  model never has to reconstruct or select the source group.
   Dispatch is serialized per group (distinct groups run concurrently, each group
   stays FIFO), so a slow turn in one group never blocks inbound for others; set
   `debounceMs` to coalesce rapid same-sender bursts into one turn.
@@ -207,16 +263,11 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   unrecallable barge-in there is worse than dropping a single reply in a true
   two-party DM (where the user can re-send or address the agent explicitly). The
   error is not cached, so the next message retries the lookup.
-- **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
-  the adapter never merges or rewrites text across sends. Each durable reply is
-  **idempotent + retried**: the sink generates one `idempotency_key` per reply
-  and retries the send a few times (with a short backoff) on retryable errors,
-  reusing the same key so `wn-agent` dedups instead of double-posting. A repeated
-  key returns the original message ids without a second send, so a retry after a
-  post-write timeout cannot double-post an unrecallable encrypted message.
-  Live-preview `stream_finalize` uses the same posture: one idempotency key per
-  preview stream, bounded retry on retryable failures, and connector-side cached
-  final message ids for post-success retries.
+- **Durable replies** are sent verbatim as `kind: 9` messages via the registered
+  message adapter's `send.text` → `wn-agent send_final` mapping. The adapter
+  never merges or rewrites text across sends. A bounded retry reuses one
+  per-send idempotency key so a transient control-socket failure does not create
+  a second Marmot message.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call
@@ -238,34 +289,33 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   add/remove/leave, admin grant/revoke, rename/avatar) surface as a
   `group_state_changed` event carrying only a coarse `change` kind and, for a
   rename, the new group display name — never a member pubkey.
-- **Ambient context** (`index.ts` ambient surfacer): `message_deleted` and
-  `group_state_changed` are surfaced to the agent's session as quiet,
-  next-turn context via `api.runtime.system.enqueueSystemEvent(text, {
-  sessionKey, contextKey })` (sessionKey from `resolveAgentRoute`). It is
-  feature-detected (no-ops on a runtime without the system-event surface). The
-  agent sees the event as context without being forced to reply; confirmed on
-  the docker harness.
-- **Media**: inbound — an `inbound_message` carries non-secret `media` refs
+- **Native reply and ambient context**: reply hydration maps to
+  `supplemental.quote`; quoted attachment summaries and buffered
+  `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`, and
+  group-state facts map to structured `supplemental.untrustedContext`. Ambient
+  facts are isolated per account/group and attached only to the next triggering
+  user turn; they never start a turn and never enter a system prompt.
+- **Media**: inbound — an `inbound_message.message` carries non-secret `media` refs
   (the `imeta` mirror); on dispatch the connector calls `download_media` to get
   a host-local decrypted path and passes it to the turn as an OpenClaw
   `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
   base64-encodes for a vision model. Outbound — the message adapter declares
   `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
-  `mediaReadFile` when needed) onto `send_media` (`wn-agent` encrypts + uploads
-  to Blossom; the content key never leaves it). The vision model actually
+  `mediaReadFile` when needed) onto `send_media`. The adapter retains OpenClaw's
+  local-root check, stages a short-lived copy under `MARMOT_OUTBOUND_MEDIA_DIR`,
+  and cleans it up after the response; `wn-agent` independently requires that
+  path beneath a startup `--media-allowed-root` and rejects symlinks and
+  non-regular files. `wn-agent` encrypts + uploads to Blossom; the content key
+  never leaves it. The vision model actually
   receiving the image is confirmed on the docker harness.
-- **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
-  append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
-  update cancels the preview and sends the final verbatim. The transcript hash +
-  chunk count match `wn-agent` byte-for-byte (Rust-anchored parity test in
-  `test/transcript.test.ts`). Previews run whenever `streaming.mode` is not
-  `off` and `quicCandidates` are set, and OpenClaw is emitting progressive
-  blocks. Marmot enables OpenClaw block delivery automatically when
-  `quicCandidates` are configured and `streaming.mode` is not `off`; operators
-  can override it with `blockStreaming`, `streaming.block.enabled`, or
-  `MARMOT_BLOCK_STREAMING`. Like a Telegram preview,
-  this is driven by the channel's reply `deliver` callback, not a core-driven
-  live adapter (that SDK seam does not exist yet).
+- **Live QUIC previews** (`src/live.ts`) are temporarily not wired into inbound
+  agent turns. Those turns are final-only so durable delivery has one owner: the
+  registered OpenClaw message adapter. The transcript and preview primitives
+  remain tested for a later reintroduction through OpenClaw's standard live
+  message-adapter lifecycle.
+  The plugin keeps one stable request id across retries of the initial
+  `stream_begin`, retains the returned v2 stream capability in memory, and
+  presents it on every later operation. It never logs or persists that bearer.
   - `block` is the best live-preview mode because it naturally maps onto Marmot's
     append-only stream. `partial`/`progress` can emit windowed OpenClaw preview
     text; the plugin treats those modes as best-effort live previews and recovers
@@ -294,7 +344,7 @@ validated by running the local `openclaw-gateway` harness (below).
 ## Local gateway harness
 
 `just openclaw-gateway-up` brings up a fully local stack — the in-repo
-`nostr-rs-relay` + QUIC broker + `wn-agent` (with `--allow-any` and
+`nostr-rs-relay` + QUIC broker + `wn-agent` (with `--dev-allow-any-invites` and
 `--debug-controls`) + a real OpenClaw gateway with this plugin installed — with
 no public relays and no phone required. This is the harness for wiring and
 validating the inbound and live-preview paths above: inject an inbound message

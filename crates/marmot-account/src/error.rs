@@ -33,6 +33,8 @@ pub enum AccountHomeError {
     InvalidAccountLabel(String),
     #[error("stored account id does not match stored secret key")]
     AccountIdMismatch,
+    #[error("durable account setup state is missing")]
+    AccountSetupStateMissing,
     #[error("unsupported account secret storage backend: {0}")]
     UnsupportedSecretBackend(String),
     #[error("account secret store is not initialized: {0}")]
@@ -52,6 +54,7 @@ pub enum AccountHomeError {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AccountError {
     #[error(transparent)]
     Session(#[from] SessionError),
@@ -63,6 +66,10 @@ pub enum AccountError {
     TransportRouting(#[from] TransportRoutingError),
     #[error(transparent)]
     KeyPackage(#[from] KeyPackagePublishError),
+    #[error("key package replacement is blocked by local clock skew")]
+    ClockSkewBlocked,
+    #[error("key package rotation is already in progress")]
+    KeyPackageRotationInProgress,
     #[error("transport delivery was addressed to a different account")]
     WrongAccountDelivery,
 }

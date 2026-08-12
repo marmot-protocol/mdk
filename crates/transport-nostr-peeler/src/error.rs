@@ -6,6 +6,8 @@ use cgka_traits::error::PeelerError;
 pub enum NostrPeelerError {
     #[error("malformed Nostr event: {0}")]
     Malformed(String),
+    #[error("invalid Nostr event signature")]
+    InvalidSignature,
     #[error("unsupported Nostr kind: {0}")]
     UnsupportedKind(u64),
     #[error("missing required Nostr tag: {0}")]
@@ -15,6 +17,7 @@ pub enum NostrPeelerError {
 pub(crate) fn to_peeler_error(err: NostrPeelerError) -> PeelerError {
     match err {
         NostrPeelerError::Malformed(msg) => PeelerError::Malformed(msg),
+        NostrPeelerError::InvalidSignature => PeelerError::InvalidSignature,
         NostrPeelerError::UnsupportedKind(kind) => {
             PeelerError::Malformed(format!("unsupported Nostr kind: {kind}"))
         }

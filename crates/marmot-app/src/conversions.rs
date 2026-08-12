@@ -11,16 +11,21 @@ use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent,
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
     AppGroupImageInput, AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent,
-    AppGroupRecord, AppMessageProjection, AppMessageRecord, AuditLogSettings,
-    ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
-    NotificationSettings, PushPlatform, PushRegistration, RelayTelemetrySettings,
+    AppGroupOpaqueComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageProjection,
+    AppMessageRecord, AuditLogSettings, ChatNotificationSettings, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupPushTokenRecord,
+    NOSTR_ROUTING_COMPONENT_ID, NotificationSettings, PushPlatform, PushRegistration,
+    RelayTelemetrySettings,
+};
+use cgka_traits::app_components::{
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
 };
 use storage_sqlite::{
     AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
-    AccountPushRegistration, AccountStoredPushRegistration, StoredAccountGroup,
-    StoredAccountGroupComponent, StoredAccountState, StoredAppEvent, StoredAppMessageRecord,
-    StoredAuditLogSettings, StoredRelayTelemetrySettings,
+    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountStoredPushRegistration,
+    StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppEvent,
+    StoredAppMessageRecord, StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
 };
 
 pub(crate) fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -65,11 +70,22 @@ pub(crate) fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccou
         admin_keys_hex: group.admin_policy.admins.join(","),
         archived: group.archived,
         pending_confirmation: group.pending_confirmation,
+        member_count: group.member_count,
         // Ignored by the projection save (owned by `set_group_self_membership`);
         // carried for struct completeness and round-trip symmetry.
         self_membership: group.self_membership,
         welcomer_account_id_hex: group.welcomer_account_id_hex.clone(),
         via_welcome_message_id_hex: group.via_welcome_message_id_hex.clone(),
+        nostr_routing_last_epoch: group.nostr_routing_last_epoch,
+        prior_nostr_routes: group
+            .prior_nostr_routes
+            .iter()
+            .map(|route| StoredNostrRoute {
+                nostr_group_id_hex: route.nostr_group_id_hex.clone(),
+                relays: route.relays.clone(),
+                last_epoch: route.last_epoch,
+            })
+            .collect(),
         components: stored_components_from_app_group(group),
     }
 }
@@ -77,12 +93,15 @@ pub(crate) fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccou
 pub(crate) fn stored_components_from_app_group(
     group: &AppGroupRecord,
 ) -> Vec<StoredAccountGroupComponent> {
-    let mut components = vec![
-        StoredAccountGroupComponent {
+    let mut components = Vec::new();
+    if group.profile.present {
+        components.push(StoredAccountGroupComponent {
             component_id: group.profile.component_id,
             component_name: group.profile.component.clone(),
             component_data_hex: group.profile.data_hex.clone(),
-        },
+        });
+    }
+    components.extend([
         StoredAccountGroupComponent {
             component_id: group.image.component_id,
             component_name: group.image.component.clone(),
@@ -103,7 +122,7 @@ pub(crate) fn stored_components_from_app_group(
             component_name: group.nostr_routing.component.clone(),
             component_data_hex: group.nostr_routing.data_hex.clone(),
         },
-    ];
+    ]);
     if group.agent_text_stream.required {
         components.push(StoredAccountGroupComponent {
             component_id: group.agent_text_stream.component_id,
@@ -125,17 +144,41 @@ pub(crate) fn stored_components_from_app_group(
             component_data_hex: group.encrypted_media.data_hex.clone(),
         });
     }
+    components.extend(
+        group
+            .unknown_components
+            .iter()
+            .filter(|component| !is_projected_group_component(component.component_id))
+            .map(|component| StoredAccountGroupComponent {
+                component_id: component.component_id,
+                component_name: component.component.clone(),
+                component_data_hex: component.data_hex.clone(),
+            }),
+    );
     components
 }
 
 pub(crate) fn app_group_from_stored_group(
     stored: StoredAccountGroup,
 ) -> Result<AppGroupRecord, AppError> {
+    let unknown_components = stored
+        .components
+        .iter()
+        .filter(|component| !is_projected_group_component(component.component_id))
+        .map(|component| AppGroupOpaqueComponent {
+            component_id: component.component_id,
+            component: component.component_name.clone(),
+            data_hex: component.component_data_hex.clone(),
+        })
+        .collect();
     let routing_bytes = hex::decode(
         account_component_data_hex(&stored.components, NOSTR_ROUTING_COMPONENT_ID).ok_or_else(
             || AppError::InvalidNostrRouting("stored group is missing routing".into()),
         )?,
     )?;
+    let profile_bytes = account_component_data_hex(&stored.components, GROUP_PROFILE_COMPONENT_ID)
+        .map(hex::decode)
+        .transpose()?;
     let retention =
         account_component_data_hex(&stored.components, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
             .map(hex::decode)
@@ -157,6 +200,10 @@ pub(crate) fn app_group_from_stored_group(
         AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&stored.admin_keys_hex)),
         retention,
     );
+    group.profile = profile_bytes
+        .as_deref()
+        .map(AppGroupProfileComponent::from_bytes)
+        .unwrap_or_else(AppGroupProfileComponent::absent);
     if let Some(agent_hex) =
         account_component_data_hex(&stored.components, AGENT_TEXT_STREAM_COMPONENT_ID)
         && !agent_hex.is_empty()
@@ -171,19 +218,57 @@ pub(crate) fn app_group_from_stored_group(
         let avatar_bytes = hex::decode(avatar_hex)?;
         group.avatar_url = AppGroupAvatarUrlComponent::from_bytes(&avatar_bytes);
     }
-    if let Some(media_hex) =
-        account_component_data_hex(&stored.components, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)
-        && !media_hex.is_empty()
-    {
+    let stored_media = [
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    ]
+    .into_iter()
+    .find_map(|component_id| {
+        account_component_data_hex(&stored.components, component_id)
+            .filter(|data_hex| !data_hex.is_empty())
+            .map(|data_hex| (component_id, data_hex))
+    });
+    if let Some((component_id, media_hex)) = stored_media {
         let media_bytes = hex::decode(media_hex)?;
-        group.encrypted_media = AppGroupEncryptedMediaComponent::from_bytes(&media_bytes);
+        group.encrypted_media =
+            AppGroupEncryptedMediaComponent::from_bytes(component_id, &media_bytes);
+        if component_id == GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID {
+            group.protocol_profile = crate::AppProtocolProfile::Current;
+        }
     }
     group.archived = stored.archived;
     group.pending_confirmation = stored.pending_confirmation;
     group.self_membership = stored.self_membership;
+    group.member_count = stored.member_count;
     group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
     group.via_welcome_message_id_hex = stored.via_welcome_message_id_hex;
+    group.nostr_routing_last_epoch = stored.nostr_routing_last_epoch;
+    group.prior_nostr_routes = stored
+        .prior_nostr_routes
+        .into_iter()
+        .map(|route| crate::AppPriorNostrRoute {
+            nostr_group_id_hex: route.nostr_group_id_hex,
+            relays: route.relays,
+            last_epoch: route.last_epoch,
+        })
+        .collect();
+    group.unknown_components = unknown_components;
     Ok(group)
+}
+
+fn is_projected_group_component(component_id: u16) -> bool {
+    matches!(
+        component_id,
+        GROUP_PROFILE_COMPONENT_ID
+            | GROUP_BLOSSOM_IMAGE_COMPONENT_ID
+            | GROUP_ADMIN_POLICY_COMPONENT_ID
+            | NOSTR_ROUTING_COMPONENT_ID
+            | GROUP_MESSAGE_RETENTION_COMPONENT_ID
+            | AGENT_TEXT_STREAM_COMPONENT_ID
+            | GROUP_AVATAR_URL_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+    )
 }
 
 pub(crate) fn account_component_data_hex(
@@ -217,9 +302,12 @@ pub(crate) fn app_message_record_from_stored(record: StoredAppMessageRecord) -> 
         kind: record.kind,
         tags: record.tags,
         source_epoch: record.source_epoch,
+        retention: record.retention,
         recorded_at: record.recorded_at,
         received_at: record.received_at,
         insert_order: record.insert_order,
+        invalidated: record.invalidated,
+        moderation_grant: record.moderation_grant,
     }
 }
 
@@ -240,6 +328,7 @@ pub(crate) fn stored_app_event_from_projection(
         recorded_at: message.recorded_at.unwrap_or(received_at),
         received_at,
         origin_commit_id: message.origin_commit_id.clone(),
+        moderation_grant: message.moderation_grant,
     }
 }
 
@@ -257,6 +346,9 @@ pub(crate) fn stored_app_event_from_message_record(record: &AppMessageRecord) ->
         recorded_at: record.recorded_at,
         received_at: record.received_at,
         origin_commit_id: None,
+        // Legacy-import records predate moderation deletes, so none carries a
+        // grant.
+        moderation_grant: false,
     }
 }
 
@@ -380,6 +472,25 @@ pub(crate) fn stored_push_registration_from_account(
         },
         token_bytes: stored.token_bytes,
     })
+}
+
+pub(crate) fn pending_push_registration_removal_from_account(
+    pending: AccountPendingPushRegistrationRemoval,
+) -> Result<(String, PushRegistration), AppError> {
+    Ok((
+        pending.group_id_hex,
+        PushRegistration {
+            account_ref: pending.registration.account_label,
+            account_id_hex: pending.registration.account_id_hex,
+            platform: PushPlatform::from_platform_byte(pending.registration.platform)?,
+            token_fingerprint: pending.registration.token_fingerprint,
+            server_pubkey_hex: pending.registration.server_pubkey_hex,
+            relay_hint: pending.registration.relay_hint,
+            created_at_ms: pending.registration.created_at_ms,
+            updated_at_ms: pending.registration.updated_at_ms,
+            last_shared_at_ms: None,
+        },
+    ))
 }
 
 pub(crate) fn account_group_push_token_from_app(

@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use cgka_traits::TransportEndpoint;
-use marmot_app::{MarmotApp, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination};
+use marmot_app::{
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination,
+};
 
 mod commands;
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so
@@ -36,38 +38,58 @@ pub use errors::MarmotKitError;
 pub use external_signer::ExternalAccountSignerFfi;
 pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
-    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownListItemFfi, MarkdownListKindFfi,
-    MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
+    MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
 };
 
 uniffi::setup_scaffolding!();
 
+pub use commands::{InitialGroupImageFfi, parse_media_imeta_tag};
 pub use conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AuditDataModeFfi,
+    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi, AuditDataModeFfi,
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
     AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceFfi,
-    BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
-    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi,
-    GroupPushTokenDebugEntryFfi, GroupSystemEventFfi, LocalPushRegistrationDebugFfi,
-    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
-    MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
-    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
-    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
+    BackgroundNotificationCollectionFfi, ChatConversationKindFfi, ChatListAttachmentKindFfi,
+    ChatListAvatarFfi, ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
+    ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
+    ChatPinStateFfi, CursorPersistenceFfi, EncryptedMediaVersionFfi, GroupEvolutionStatusFfi,
+    GroupMaintenanceStatusFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
+    GroupSystemEventFfi, HostPerformanceOperationFfi, HostPerformanceOutcomeFfi,
+    KeyPackageMaintenanceStatusFfi, LocalPushRegistrationDebugFfi, MaintenanceObligationFfi,
+    MaintenancePhaseFfi, MaintenanceTriggerFfi, MediaAttachmentReferenceFfi,
+    MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
+    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
+    MessageDraftSummaryFfi, MessageTagFfi, NotificationCollectionStatusFfi,
+    NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    PeriodicMaintenancePolicyFfi, PushPlatformFfi, PushRegistrationFfi,
+    PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
+    RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
+    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,
+    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeProjectionUpdateFfi,
     SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
     TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
     TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
     TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
+    TransportFanoutStatusFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
 /// [`TransportEndpoint`] wrapper, dedup-stripped of empties.
 pub(crate) fn endpoints(urls: &[String]) -> Vec<TransportEndpoint> {
-    urls.iter()
-        .filter(|u| !u.trim().is_empty())
-        .map(|u| TransportEndpoint::from(u.as_str()))
-        .collect()
+    let mut endpoints = Vec::new();
+    for url in urls {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let endpoint = TransportEndpoint::from(url);
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
 }
 
 pub(crate) fn optional_group_id_hex(
@@ -135,19 +157,61 @@ impl Marmot {
     /// platform keyring (Keychain on Apple platforms, Android's native
     /// keyring on Android) via the default keychain-backed account home —
     /// not in a plaintext file. Fallible because initializing the platform
-    /// secret store can fail. Call [`Marmot::start`] before subscribing to
-    /// events.
+    /// secret store can fail or another process may own the same root
+    /// ([`MarmotKitError::RuntimeBusy`]). Root ownership is nonblocking and
+    /// remains held until the final `Marmot`/runtime handle is dropped, even
+    /// after [`Marmot::shutdown`]. Call [`Marmot::start`] before subscribing
+    /// to events.
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
-        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
-            .map_err(marmot_app::AppError::from)?;
-        let app = MarmotApp::with_relays_and_account_home(&root_path, relay_urls, account_home);
-        let runtime = app.runtime();
-        Ok(Arc::new(Self { app, runtime }))
+        Self::open(root_path, relay_urls, MarmotAppConfig::default())
     }
 
-    /// Bring the runtime online: reconcile known accounts, start workers,
-    /// subscribe to transport events.
+    /// Open the Marmot app with an explicit durable transport-cursor policy.
+    /// Identical to [`Marmot::new`] except for the policy; `new` itself is
+    /// [`CursorPersistenceFfi::Advance`].
+    ///
+    /// Wake-collection processes — the iOS NSE constructing one `Marmot` per
+    /// push around [`Marmot::collect_notifications_after_wake`], and the
+    /// notification reply/mark-read action paths — construct with
+    /// [`CursorPersistenceFfi::Frozen`]: the pass still ingests, decrypts, and
+    /// projects everything, but a sub-second drain on cold sockets can never
+    /// ratchet the durable `since` floor past events it did not receive (the
+    /// wake-collection trigger). Foreground app processes keep [`Marmot::new`].
+    // Construction-surface addition: binding regeneration and the workspace
+    // version bump ride the release per this crate's lockstep invariant — do
+    // not bump versions here.
+    #[uniffi::constructor]
+    pub fn new_with_cursor_persistence(
+        root_path: String,
+        relay_urls: Vec<String>,
+        cursor_persistence: CursorPersistenceFfi,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        Self::open(
+            root_path,
+            relay_urls,
+            MarmotAppConfig::default().with_cursor_persistence(cursor_persistence.into()),
+        )
+    }
+
+    /// Bring the runtime to local readiness.
+    ///
+    /// On success, persisted account state is seeded and worker-routed local
+    /// reads are available: group reads issued before a group's background
+    /// hydration completes wait for exactly that group. Relay activation,
+    /// group-subscription registration, shared-directory synchronization,
+    /// remaining group hydration, and initial catch-up continue
+    /// asynchronously. Hosts should render local projections immediately and
+    /// represent network progress separately.
+    ///
+    /// Ready is NOT "safe to send without waiting" (mdk#1161): mutations
+    /// issued before the initial catch-up completes are queued and replayed
+    /// in arrival order after it, so first-send latency can still cover
+    /// remaining hydration plus catch-up even when the target group is
+    /// already readable.
+    ///
+    /// The binding signature and result type are unchanged; this local-ready
+    /// completion point is the behavioral contract for this implementation.
     pub async fn start(&self) -> Result<(), MarmotKitError> {
         self.runtime.start().await?;
         Ok(())
@@ -156,8 +220,51 @@ impl Marmot {
     /// Tear the runtime down. Drops all subscriptions; long-lived
     /// [`EventsSubscription`] / [`ChatsSubscription`] / etc. instances on the
     /// host side will see their `next()` return `None` shortly after.
+    ///
+    /// This stops work but does **not** release the store's file locks — the
+    /// SQLite connections stay open. Hosts whose process can be suspended
+    /// should call [`Marmot::shutdown_and_close`] instead.
     pub async fn shutdown(&self) {
         self.runtime.shutdown().await;
+    }
+
+    /// [`Marmot::shutdown`], then close every SQLite database and release the
+    /// Marmot root's runtime lease.
+    ///
+    /// Await this before letting the process be suspended. When it returns,
+    /// nothing this process owns holds a file lock inside the Marmot root —
+    /// which is the fact iOS actually checks: a process suspended while holding
+    /// a lock in a shared App Group container is killed with `0xdead10cc`, and
+    /// a WAL connection holds one on its `-shm` sidecar for its entire
+    /// lifetime. [`Marmot::shutdown`] cannot deliver that on its own; it stops
+    /// workers, but the databases are shared behind `Arc`s that no host can
+    /// observe or await going away.
+    ///
+    /// **Terminal: this handle is finished.** Every subsequent call that
+    /// touches storage fails with [`MarmotKitError::StorageClosed`] rather than
+    /// reopening the databases, because reopening would re-lock the container
+    /// this method just cleared. Construct a new `Marmot` on resume — which is
+    /// what a foregrounding app does anyway.
+    ///
+    /// Safe to call twice, and safe to call with or without a preceding
+    /// [`Marmot::shutdown`]. Bounded: worker drain has a fixed budget and the
+    /// close itself waits only for the SQLite statement currently executing.
+    /// An error means at least one database reported a problem while closing;
+    /// every database is still attempted and left closed, so a failure is not
+    /// a reason to retry or to keep the process alive.
+    // Object-method and error-variant addition: binding regeneration and the
+    // workspace version bump ride the release per this crate's lockstep
+    // invariant — do not bump versions here.
+    pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError> {
+        self.runtime.shutdown_and_close().await?;
+        Ok(())
+    }
+
+    /// True once [`Marmot::shutdown_and_close`] has closed the store. A host
+    /// can check this to confirm it is safe to be suspended, or to notice it is
+    /// holding a spent handle and needs a fresh one.
+    pub fn storage_is_closed(&self) -> bool {
+        self.runtime.storage_is_closed()
     }
 
     /// True once shutdown has started. Host apps can use this to avoid
@@ -165,6 +272,27 @@ impl Marmot {
     /// the background.
     pub fn is_stopping(&self) -> bool {
         self.runtime.is_stopping()
+    }
+}
+
+impl Marmot {
+    /// Shared open path behind the exported constructors: keychain-backed
+    /// account home, app configured by `config`, runtime pair.
+    fn open(
+        root_path: String,
+        relay_urls: Vec<String>,
+        config: MarmotAppConfig,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
+            .map_err(marmot_app::AppError::from)?;
+        let app = MarmotApp::try_with_relays_and_account_home_and_config(
+            &root_path,
+            relay_urls,
+            account_home,
+            config,
+        )?;
+        let runtime = app.runtime();
+        Ok(Arc::new(Self { app, runtime }))
     }
 }
 
@@ -206,5 +334,24 @@ mod tests {
         // Absurdly large group ids are rejected at the FFI boundary instead of
         // allocating arbitrary host input.
         assert!(optional_group_id_hex(Some("ab".repeat(1025))).is_err());
+    }
+
+    #[test]
+    fn endpoints_trim_drop_empties_and_deduplicate_in_order() {
+        let urls = vec![
+            " wss://relay.one ".to_owned(),
+            "".to_owned(),
+            "wss://relay.two".to_owned(),
+            "wss://relay.one".to_owned(),
+            "  ".to_owned(),
+        ];
+
+        assert_eq!(
+            endpoints(&urls),
+            vec![
+                TransportEndpoint::from("wss://relay.one"),
+                TransportEndpoint::from("wss://relay.two"),
+            ]
+        );
     }
 }

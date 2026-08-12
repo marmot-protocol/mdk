@@ -13,7 +13,7 @@ impl AgentStreamStartFfi {
     pub(crate) fn new(stream_id_hex: String, summary: SendSummary) -> Self {
         Self {
             stream_id_hex,
-            published: summary.published as u32,
+            published: super::saturating_u32(summary.published),
             message_ids: summary.message_ids,
         }
     }

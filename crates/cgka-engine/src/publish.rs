@@ -21,20 +21,21 @@
 //! 4. Hand off to `EpochManager::rollback_publish` for the state-machine
 //!    bookkeeping.
 //!
-//! ### Solo `create_group`
-//! Solo create has no pending commit (no `add_members` was called). Both
-//! confirm + fail are state-machine-only — confirm transitions to Stable
-//! at epoch 0, fail rewinds to Stable at epoch 0 (no-op MLS-side, but the
-//! group record stays around).
+//! ### Founding `create_group`
+//! Current-profile founding creation is completed atomically in
+//! `group_lifecycle::do_create_group` and never enters these confirm/fail
+//! paths. The temporary explicit-legacy path still does: a solo legacy create
+//! has no pending commit, so confirm + fail are state-machine-only at epoch 0.
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::OutboundFanout;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::StorageProvider;
-use cgka_traits::types::EpochId;
+use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider as _;
 
@@ -43,6 +44,29 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<GroupEvent, EngineError> {
+        self.do_confirm_published_with_fanout(pending, None).await
+    }
+
+    pub(crate) async fn do_confirm_published_with_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        mut fanout: Option<&mut OutboundFanout>,
+    ) -> Result<GroupEvent, EngineError> {
+        let confirmed_fanout = fanout
+            .as_deref()
+            .map(|fanout| {
+                if fanout.pending_ref() != Some(pending) || fanout.outcome().accepted_targets == 0 {
+                    return Err(EngineError::Other(
+                        "fanout does not contain an accepted matching pending publish".into(),
+                    ));
+                }
+                let mut confirmed = fanout.clone();
+                confirmed.mark_mls_confirmed().map_err(|_| {
+                    EngineError::Other("fanout MLS confirmation transition failed".into())
+                })?;
+                Ok(confirmed)
+            })
+            .transpose()?;
         // Look up which group this pending belongs to without consuming the
         // entry — we need the MlsGroup load to succeed before we burn the
         // state-machine slot.
@@ -66,6 +90,7 @@ impl<S: StorageProvider> Engine<S> {
         // publish-confirm call), so re-attach it explicitly.
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
+        let queued_intent = self.queued_intent_by_pending.get(&pending).cloned();
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
@@ -104,10 +129,7 @@ impl<S: StorageProvider> Engine<S> {
                             .pending_commit()
                             .expect("pending commit presence checked above");
                         crate::capability_manager::cache_from_staged_commit(
-                            storage,
-                            &group_id,
-                            staged,
-                            self.ciphersuite,
+                            storage, &group_id, staged,
                         )?;
                         // Capture the convergence ordering stamp while the
                         // staged commit is still attached: stored convergence
@@ -118,12 +140,40 @@ impl<S: StorageProvider> Engine<S> {
                             staged,
                             self.identity.self_id().clone(),
                         )?);
+                        if let (Some(stamp), Some(message_id)) =
+                            (own_commit_stamp.as_mut(), origin_commit_id.as_ref())
+                        {
+                            stamp.checkpoint_id =
+                                Some(crate::openmls_projection::own_commit_checkpoint_id(
+                                    storage, message_id,
+                                )?);
+                        }
                     }
+                    let source_epoch = EpochId(mls_group.epoch().as_u64());
+                    crate::openmls_projection::mark_consumed_proposal_records_processed(
+                        storage,
+                        &self.crypto,
+                        &mut mls_group,
+                        &group_id,
+                        source_epoch,
+                        &own_commit_stamp
+                            .as_ref()
+                            .expect("pending commit produced a stamp")
+                            .consumed_proposal_refs,
+                    )?;
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                     mls_group
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
+                    crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
+                    if let Some(stamp) = own_commit_stamp.as_mut() {
+                        stamp.resulting_epoch_authenticator = Some(
+                            crate::openmls_projection::own_commit_post_merge_epoch_authenticator(
+                                &mls_group,
+                            ),
+                        );
+                    }
                 }
 
                 // Now the MLS group is at the new epoch. Mirror the Marmot
@@ -136,7 +186,9 @@ impl<S: StorageProvider> Engine<S> {
                 // never commit the merge + `Processed` write with a stale record.
                 let mut g = storage.get_group(&group_id)?;
                 g.epoch = EpochId(mls_group.epoch().as_u64());
-                g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                if kind != crate::epoch_manager::PendingKind::Disband {
+                    g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                }
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
                 storage.put_group(&g)?;
@@ -147,6 +199,17 @@ impl<S: StorageProvider> Engine<S> {
                     self.identity.self_id(),
                     self.ciphersuite,
                 )?;
+                if let Some(stamp) = own_commit_stamp.as_ref()
+                    && let Some(checkpoint_id) = stamp.checkpoint_id.as_ref()
+                {
+                    storage.create_group_state_checkpoint(
+                        &group_id,
+                        &cgka_traits::storage::GroupStateCheckpointRef {
+                            id: checkpoint_id.clone(),
+                            resulting_epoch: EpochId(mls_group.epoch().as_u64()),
+                        },
+                    )?;
+                }
                 if let Some(message_id) = origin_commit_id.as_ref() {
                     // Enrich the stored wire record with the convergence stamp
                     // (when one was captured above) in the same write that marks
@@ -158,6 +221,23 @@ impl<S: StorageProvider> Engine<S> {
                         message_id,
                         own_commit_stamp.take(),
                     )?;
+                    if let Some(maintenance) = storage.maintenance_storage()
+                        && let Some(mut evolution) = maintenance
+                            .list_group_evolutions()?
+                            .into_iter()
+                            .find(|evolution| {
+                                evolution.signed_message_id.as_ref() == Some(message_id)
+                            })
+                    {
+                        evolution.phase = cgka_traits::maintenance::GroupEvolutionPhase::Confirmed;
+                        maintenance.put_group_evolution(&evolution)?;
+                    }
+                }
+                if let Some((_, intent_id)) = queued_intent.as_ref() {
+                    storage.delete_queued_outbound_intent(intent_id)?;
+                }
+                if let Some(fanout) = confirmed_fanout.as_ref() {
+                    storage.put_outbound_fanout(fanout)?;
                 }
                 Ok(())
             })?;
@@ -176,6 +256,16 @@ impl<S: StorageProvider> Engine<S> {
         // backend) plus best-effort cleanup. Kind discriminates create (always
         // `GroupCreated`) from evolution (always `EpochChanged`).
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
+        if let (Some(fanout), Some(confirmed)) = (fanout.take(), confirmed_fanout) {
+            *fanout = confirmed;
+        }
+        self.queued_intent_by_pending.remove(&pending);
+        if has_pending_commit {
+            // A proposal-arrival signal only resets scheduling for its source
+            // epoch. Confirming any commit crosses that boundary, so no
+            // signal from the prior epoch remains actionable.
+            self.valid_proposal_groups.remove(&group_id);
+        }
         self.audit_with_context(
             Some(&group_id),
             audit_context.clone(),
@@ -226,9 +316,15 @@ impl<S: StorageProvider> Engine<S> {
                 "deferred fork-recovery prune after confirm; will retry on next pass"
             );
         }
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
             crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
+                group_id,
+                from: EpochId(new_epoch.0.saturating_sub(1)),
+                to: new_epoch,
+            },
+            crate::epoch_manager::PendingKind::Disband => GroupEvent::EpochChanged {
                 group_id,
                 from: EpochId(new_epoch.0.saturating_sub(1)),
                 to: new_epoch,
@@ -241,6 +337,11 @@ impl<S: StorageProvider> Engine<S> {
             _ => unreachable!("confirm only emits create/evolution events"),
         };
         self.events_buf.push_back(event.clone());
+        if kind == crate::epoch_manager::PendingKind::Disband {
+            self.pending_state_changes.remove(&pending);
+            self.schedule_pending_convergence_group(&replay_group_id);
+            return Ok(event);
+        }
         if let Some(changes) = self.pending_state_changes.remove(&pending) {
             for pending_change in changes {
                 self.push_group_state_change(
@@ -260,11 +361,24 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
+        self.do_publish_failed_with_fanout(pending, None).await
+    }
+
+    pub(crate) async fn do_publish_failed_with_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        mut fanout: Option<&mut OutboundFanout>,
+    ) -> Result<(), EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
 
         let group_id = self
             .epoch_manager
             .group_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+        let kind = self
+            .epoch_manager
+            .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
 
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -272,36 +386,91 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
-        if mls_group.pending_commit().is_some() {
-            self.storage.with_transaction(|storage| {
-                let tx_provider =
-                    EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-                mls_group
-                    .clear_pending_commit(tx_provider.storage())
-                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+        let rolled_back_fanout = fanout
+            .as_deref()
+            .map(|fanout| {
+                let outcome = fanout.outcome();
+                if fanout.pending_ref() != Some(pending)
+                    || outcome.accepted_targets != 0
+                    || !outcome.fanout_complete
+                {
+                    return Err(EngineError::Other(
+                        "fanout is not a complete all-failed matching pending publish".into(),
+                    ));
+                }
+                let mut rolled_back = fanout.clone();
+                rolled_back.mark_mls_rolled_back().map_err(|_| {
+                    EngineError::Other("fanout MLS rollback transition failed".into())
+                })?;
+                Ok(rolled_back)
+            })
+            .transpose()?;
+
+        let has_pending_commit = mls_group.pending_commit().is_some();
+        let pending_was_self_remove_only = mls_group.pending_commit().is_some_and(|staged| {
+            let mut count = 0usize;
+            staged.queued_proposals().all(|queued| {
+                count += 1;
+                matches!(queued.proposal(), openmls::prelude::Proposal::SelfRemove)
+            }) && count > 0
+        });
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                if has_pending_commit {
+                    let tx_provider =
+                        EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                    mls_group
+                        .clear_pending_commit(tx_provider.storage())
+                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                    if pending_was_self_remove_only {
+                        // Auto-commit preparation started from an empty
+                        // OpenMLS proposal store and queued only its selected
+                        // SelfRemove references. Drop that staging residue so
+                        // the durable retained-message scan can deterministically
+                        // rebuild the same selection after publish failure.
+                        mls_group
+                            .clear_pending_proposals(tx_provider.storage())
+                            .map_err(|e| {
+                                EngineError::Backend(format!("clear_pending_proposals: {e:?}"))
+                            })?;
+                    }
+                }
+
+                // Re-derive the Marmot projection in the same durable unit as the
+                // MLS clear and fanout terminal state.
+                let mut g = storage.get_group(&group_id)?;
+                g.epoch = EpochId(mls_group.epoch().as_u64());
+                g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                g.required_capabilities = required_capabilities_from_group(&mls_group);
+                crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+                storage.put_group(&g)?;
+                if let Some(fanout) = rolled_back_fanout.as_ref() {
+                    storage.put_outbound_fanout(fanout)?;
+                }
+                if let Some(message_id) = origin_commit_id.as_ref()
+                    && let Some(maintenance) = storage.maintenance_storage()
+                    && let Some(evolution) = maintenance
+                        .list_group_evolutions_for_group(&group_id)?
+                        .into_iter()
+                        .find(|evolution| evolution.signed_message_id.as_ref() == Some(message_id))
+                {
+                    // No relay accepted the event, so compensate the staged
+                    // evolution in the same transaction as the MLS clear.
+                    maintenance.delete_group_evolution(&evolution.id)?;
+                }
+                if kind == crate::epoch_manager::PendingKind::Disband {
+                    storage.clear_disband_candidates(&group_id)?;
+                    if let Some(mut request) = storage.disband_request(&group_id)? {
+                        request.last_prepared_epoch = None;
+                        storage.put_disband_request(&request)?;
+                    }
+                }
+                Ok(())
             })?;
-        }
 
-        // Roll back the Marmot record's projected fields. The send paths
-        // wrote a projected `members` list (+ for upgrade, projected
-        // `required_capabilities`); after `clear_pending_commit` the MLS
-        // group is back to its pre-stage shape, so re-deriving from MLS
-        // restores the prior projection. The capability cache for newly-
-        // invited members stays — it's not visible via `members()` once
-        // we drop them from the Marmot record, and the next successful
-        // invite simply overwrites.
-        if let Ok(mut g) = self.storage.get_group(&group_id) {
-            g.epoch = EpochId(mls_group.epoch().as_u64());
-            g.members = crate::group_lifecycle::marmot_members(&mls_group);
-            g.required_capabilities = required_capabilities_from_group(&mls_group);
-            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-            self.storage.put_group(&g)?;
+        if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
+            *fanout = rolled_back;
         }
-
-        let kind = self
-            .epoch_manager
-            .kind_for_pending(pending)
-            .ok_or(EngineError::UnknownPending)?;
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
@@ -327,9 +496,62 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.pending_state_changes.remove(&pending);
+        if kind == crate::epoch_manager::PendingKind::Disband {
+            self.schedule_pending_convergence_group(&group_id);
+        }
+        if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
+            self.schedule_pending_convergence_group(&queued_group_id);
+        }
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
         self.forget_pending_commit_for_recovery(pending)?;
+        self.restore_self_remove_auto_commit_schedules_for_group(
+            &group_id,
+            prior_epoch,
+            self.convergence_now_ms(),
+        )?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())
+    }
+
+    /// Put a group back on the runtime's drain list when it still holds durable
+    /// outbound intents.
+    ///
+    /// Retained application payloads are released by the next convergence drain
+    /// (`converge_and_drain_queued_outbound_intents`), and in this process only
+    /// the seam that returns the group to `Stable` arranges that. While the
+    /// group is held — `PendingPublish`, or halted `Unrecoverable` — the caller
+    /// gates keep it still: ingest buffers rather than advances the state, and
+    /// the drain and send paths both return early on non-`Stable`. So every
+    /// such seam must schedule on its way out: a publish outcome and a verified
+    /// repair Welcome through this helper, quarantine recovery
+    /// (`retry_hydrate_quarantined_group`) unconditionally because it has
+    /// already read the group. (Across a restart, session-open hydration re-arms
+    /// the drain from the same durable queue whatever state the group landed
+    /// in.)
+    ///
+    /// Best-effort by construction: this runs after the outcome is durable, so
+    /// a transient backend lock here must not fail already-committed work.
+    /// Skipping the schedule is not free, though: the intents stay durable, but
+    /// their release then waits until unrelated traffic happens to schedule this
+    /// group or the process restarts. So a failed read — which cannot prove the
+    /// queue is empty — schedules the drain anyway; a spurious no-op pass is
+    /// cheaper than a stranded payload.
+    pub(crate) fn schedule_drain_for_retained_outbound_intents(&mut self, group_id: &GroupId) {
+        match self.storage.list_queued_outbound_intents(group_id) {
+            Ok(retained) if !retained.is_empty() => {
+                self.schedule_pending_convergence_group(group_id);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "cgka_engine::publish",
+                    method = "schedule_drain_for_retained_outbound_intents",
+                    transient = error.is_transient(),
+                    "retained-intent read failed while returning a group to Stable; scheduling the drain anyway"
+                );
+                self.schedule_pending_convergence_group(group_id);
+            }
+        }
     }
 }
 

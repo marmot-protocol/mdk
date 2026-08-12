@@ -1,0 +1,9 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "IngestOutcome::Rejected\n{ category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSignature }"
+---
+{
+  "Rejected": {
+    "category": "InvalidSignature"
+  }
+}

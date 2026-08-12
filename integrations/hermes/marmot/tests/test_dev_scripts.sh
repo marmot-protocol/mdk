@@ -30,6 +30,7 @@ group_id="$(printf '22%.0s' {1..32})"
 [ -x "$dev_root/smoke-plugin.sh" ]
 [ -x "$dev_root/e2e-deterministic.sh" ]
 [ -x "$dev_root/e2e-connector.sh" ]
+[ -x "$dev_root/verify-persisted-config.sh" ]
 [ -x "$dev_root/bootstrap-agent.sh" ]
 [ -L "$dev_root/hermes-home/plugins/marmot" ]
 
@@ -42,9 +43,12 @@ for helper in \
     "$dev_root/smoke-plugin.sh" \
     "$dev_root/e2e-deterministic.sh" \
     "$dev_root/e2e-connector.sh" \
+    "$dev_root/verify-persisted-config.sh" \
     "$dev_root/bootstrap-agent.sh"; do
     bash -n "$helper"
 done
+grep -F 'hermes_marmot_verify_persisted_config.sh" "$@" --root "$dev_root"' \
+    "$dev_root/verify-persisted-config.sh" >/dev/null
 
 # shellcheck disable=SC1091
 source "$dev_root/env.sh"
@@ -93,25 +97,145 @@ source "$default_root/env.sh"
 [ ! -e "$default_root" ]
 
 [ -x "$repo_root/scripts/install-hermes-marmot.sh" ]
+allowed_sender_hex="$(printf 'aa%.0s' {1..32})"
+installer_hermes_home="$tmp_parent/hermes-install-home"
+mkdir -p "$installer_hermes_home"
+
+run_installer_scrubbed() {
+    python3 - "$@" <<'PY'
+import os
+import subprocess
+import sys
+
+extra = {}
+args = sys.argv[1:]
+while args and args[0] == "--env":
+    args.pop(0)
+    key, value = args.pop(0).split("=", 1)
+    extra[key] = value
+
+env = {key: value for key, value in os.environ.items() if not key.startswith("MARMOT_")}
+env.update(extra)
+completed = subprocess.run(args, env=env, capture_output=True, text=True)
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+PY
+}
+
+"$repo_root/integrations/test_installer_systemd_service.sh" hermes
 installer_dry_run="$(
-    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes
+    run_installer_scrubbed \
+        --env "WN_AGENT_SHA=9.9.9" \
+        --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+        --env "HERMES_HOME=$installer_hermes_home" \
+        "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-user "$allowed_sender_hex"
 )"
 installer_stdin_dry_run="$(
-    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    bash -s -- --dry-run --yes < "$repo_root/scripts/install-hermes-marmot.sh"
+    python3 - "$repo_root/scripts/install-hermes-marmot.sh" "$allowed_sender_hex" "$installer_hermes_home" <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+installer = Path(sys.argv[1])
+allowed_sender_hex = sys.argv[2]
+installer_hermes_home = sys.argv[3]
+env = {key: value for key, value in os.environ.items() if not key.startswith("MARMOT_")}
+env.update(
+    {
+        "WN_AGENT_SHA": "9.9.9",
+        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+        "HERMES_HOME": installer_hermes_home,
+    }
+)
+completed = subprocess.run(
+    [
+        "bash",
+        "-s",
+        "--",
+        "--dry-run",
+        "--yes",
+        "--allow-user",
+        allowed_sender_hex,
+    ],
+    input=installer.read_text(encoding="utf-8"),
+    capture_output=True,
+    text=True,
+    env=env,
+)
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+PY
+)"
+identity_secret="nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99"
+identity_file="$tmp_parent/hermes-agent.nsec"
+printf '%s\n' "$identity_secret" > "$identity_file"
+chmod 0600 "$identity_file"
+expected_identity="$(printf '11%.0s' {1..32})"
+installer_existing_identity_dry_run="$(
+    run_installer_scrubbed \
+        --env "WN_AGENT_SHA=9.9.9" \
+        --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+        --env "HERMES_HOME=$installer_hermes_home" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes \
+        --existing-identity-file "$identity_file" \
+        --expected-npub "$expected_identity" \
+        --allow-user "$allowed_sender_hex"
+)"
+installer_generated_identity_dry_run="$(
+    run_installer_scrubbed \
+        --env "WN_AGENT_SHA=9.9.9" \
+        --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+        --env "HERMES_HOME=$installer_hermes_home" \
+        "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes \
+        --generate-identity --allow-user "$allowed_sender_hex"
 )"
 installer_bad_welcomer_status=0
-env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+run_installer_scrubbed \
+    --env "WN_AGENT_SHA=9.9.9" \
+    --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+    --env "HERMES_HOME=$installer_hermes_home" \
     "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
     >/dev/null 2>&1 || installer_bad_welcomer_status=$?
+installer_missing_sender_status=0
+run_installer_scrubbed \
+    --env "WN_AGENT_SHA=9.9.9" \
+    --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+    --env "HERMES_HOME=$installer_hermes_home" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes \
+    >/dev/null 2>&1 || installer_missing_sender_status=$?
 [ "$installer_bad_welcomer_status" -ne 0 ]
+installer_identity_conflict_status=0
+run_installer_scrubbed \
+    --env "WN_AGENT_SHA=9.9.9" \
+    --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+    --env "HERMES_HOME=$installer_hermes_home" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --generate-identity \
+    --existing-identity-file "$identity_file" --allow-user "$allowed_sender_hex" \
+    >/dev/null 2>&1 || installer_identity_conflict_status=$?
+[ "$installer_identity_conflict_status" -ne 0 ]
+installer_expected_without_source_status=0
+run_installer_scrubbed \
+    --env "WN_AGENT_SHA=9.9.9" \
+    --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+    --env "HERMES_HOME=$installer_hermes_home" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes \
+    --expected-npub "$expected_identity" --allow-user "$allowed_sender_hex" \
+    >/dev/null 2>&1 || installer_expected_without_source_status=$?
+[ "$installer_expected_without_source_status" -ne 0 ]
+[ "$installer_missing_sender_status" -ne 0 ]
+case "$installer_dry_run" in
+    *"would configure Marmot message-sender authorization"* ) ;;
+    *) echo "Hermes installer dry-run did not describe sender authorization" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"$allowed_sender_hex"* )
+        echo "Hermes installer dry-run leaked sender identity" >&2
+        exit 1
+        ;;
+esac
 case "$installer_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -140,6 +264,16 @@ case "$installer_dry_run" in
     *"wn-agent-hermes.service"* | *"org.marmot.wn-agent.hermes.plist"* ) ;;
     *) echo "Hermes installer dry-run did not use the Hermes-specific service identity" >&2; exit 1;;
 esac
+if [ "$(uname -s)" = Linux ]; then
+    case "$installer_dry_run" in
+        *"would enable/start, or restart if already active, systemd user service: wn-agent-hermes.service"* ) ;;
+        *) echo "Hermes installer dry-run did not describe active-service upgrade behavior" >&2; exit 1;;
+    esac
+fi
+case "$installer_dry_run" in
+    *"hermes gateway restart"* ) ;;
+    *) echo "Hermes installer dry-run did not print gateway restart guidance" >&2; exit 1;;
+esac
 case "$installer_stdin_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer stdin dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -160,5 +294,23 @@ case "$installer_stdin_dry_run" in
     *"--label hermes-agent"* ) ;;
     *) echo "Hermes installer stdin dry-run did not pass the Hermes bootstrap label" >&2; exit 1;;
 esac
+case "$installer_existing_identity_dry_run" in
+    *"import-identity"*"--identity-file"*"$identity_file"*"--expected-identity"*"$expected_identity"* ) ;;
+    *) echo "Hermes installer did not use the shared secure identity-import command" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"bootstrap"*"--no-create"*"--account-id-hex"* ) ;;
+    *) echo "Hermes installer did not bootstrap the imported account with creation disabled" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"$identity_secret"* ) echo "Hermes installer output exposed identity secret material" >&2; exit 1;;
+    *) ;;
+esac
+case "$installer_generated_identity_dry_run" in
+    *"import-identity"* | *"--no-create"* ) echo "Hermes generated-identity path used existing-identity flags" >&2; exit 1;;
+    *) ;;
+esac
+
+bash "$repo_root/integrations/hermes/marmot/tests/test_installer_env.sh"
 
 echo "dev script test passed"

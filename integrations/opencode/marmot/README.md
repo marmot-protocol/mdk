@@ -1,6 +1,6 @@
 # wn-opencode
 
-`wn-opencode` is the first terminal-harness backend for Marmot. It runs
+`wn-opencode` is a terminal-harness backend for Marmot. It runs
 [OpenCode](https://opencode.ai/) through the local `wn-agent` connector and
 sends every message from an allowed sender to `opencode run --format json`.
 
@@ -90,13 +90,19 @@ Configure with environment variables:
 | `WN_OPENCODE_ADMIN_HEX` | unset | Legacy alias for `WN_OPENCODE_ALLOWED_SENDERS_HEX` |
 | `WN_OPENCODE_ACCOUNT_ID_HEX` | first local account | Specific `wn-agent` account to use |
 | `WN_OPENCODE_BIN` | `opencode` | OpenCode binary or executable path |
-| `WN_OPENCODE_TIMEOUT_SECS` | `300` | Hard timeout for each OpenCode invocation |
+| `WN_OPENCODE_IDLE_TIMEOUT_SECS` | `120` | Kill the invocation when OpenCode produces no stdout line for this long |
+| `WN_OPENCODE_TIMEOUT_SECS` | `3600` | Generous total safety cap for wedge recovery; ongoing output resets only the idle timer |
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
 | `WN_OPENCODE_MAX_REPLY_BYTES` | `30000` | UTF-8 byte limit for each durable Marmot reply chunk |
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
 | `WN_OPENCODE_STATE_PATH` | `$XDG_STATE_HOME/wn-opencode/sessions.json` | Session map path |
 | `WN_OPENCODE_ACTIVATION` | `always` | Only `always` is supported today |
-| `RUST_LOG` | `info,wn_opencode=info` | tracing filter |
+| `RUST_LOG` | `info,marmot_terminal_harness=info` | tracing filter |
+
+The optional bearer token grants the complete `wn-agent` control API for every
+account in its home; the harness sender allowlist does not narrow that token's
+authority. Do not give it to an untrusted harness. Use a separate connector
+home, socket, token, and account for a separate trust boundary.
 
 The reply limit is byte-based, not character-based. The default is 30KB, well
 below Marmot's roughly 60KB message ceiling. Splitting prefers paragraph,
@@ -104,19 +110,23 @@ newline, then space boundaries and never splits a UTF-8 code point.
 
 ## Workdir Picker
 
-On the first message in a new Marmot group, a leading `/<name>` selects
-`~/<name>` as the OpenCode working directory if it is a direct child directory of
-`$HOME`.
+On the first message in a new Marmot group, a leading `/<path>` selects
+`~/<path>` as the OpenCode working directory if the canonical target is inside
+`$HOME`. Path segments are separated by `/` and each segment must be
+ASCII-alphanumeric or `.`, `_`, `-`; empty, `.`, and `..` segments are rejected.
 
 Examples:
 
 ```text
 /mdk fix the failing test
 /mdk
+/projects/mdk fix the failing test
 ```
 
 When the message is only the picker, `wn-opencode` stores the workdir and asks
-for the next prompt.
+for the next prompt. Symlinks that resolve outside `$HOME` are rejected after
+canonicalization. Picker-looking messages with invalid segments are rejected
+and are not forwarded to OpenCode as prompts.
 
 ## Security Notes
 

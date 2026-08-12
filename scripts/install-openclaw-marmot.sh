@@ -28,11 +28,13 @@ MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 OPENCLAW_HOME="${OPENCLAW_HOME:-${HOME}}"
 MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agents/openclaw}"
 MARMOT_AGENT_SOCKET_OVERRIDE="${MARMOT_AGENT_SOCKET:-}"
+MARMOT_OUTBOUND_MEDIA_DIR_OVERRIDE="${MARMOT_OUTBOUND_MEDIA_DIR:-}"
 MARMOT_AGENT_LABEL="${MARMOT_AGENT_LABEL:-openclaw-agent}"
 MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-openclaw}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.openclaw}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 PLUGIN_PACKAGE="${PLUGIN_PACKAGE:-openclaw-marmot-plugin-${WN_AGENT_VERSION}.tgz}"
+MIN_OPENCLAW_VERSION="2026.7.1"
 
 ASSUME_YES=0
 CONFIGURE_OPENCLAW=1
@@ -47,6 +49,11 @@ CLI_RELAYS=0
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_JSON_PATH=""
 BOOTSTRAP_WELCOMER_ALLOWLIST_CSV=""
+EXISTING_IDENTITY_FILE=""
+EXISTING_IDENTITY_PROMPT=0
+GENERATE_IDENTITY_EXPLICIT=0
+EXPECTED_IDENTITY=""
+IMPORTED_ACCOUNT_ID_HEX=""
 WN_AGENT_TEMP_PID=""
 
 RELAYS=()
@@ -66,6 +73,13 @@ Options:
   --home PATH              Marmot agent home (default: ~/.marmot-agents/openclaw)
   --openclaw-home PATH     OpenClaw home (default: $OPENCLAW_HOME or $HOME)
   --allow-welcomer VALUE   Allow invites from this npub or hex pubkey; may repeat
+  --existing-identity-file PATH
+                           Import an existing nsec/raw-hex identity from an
+                           owner-only regular file before bootstrap
+  --expected-npub VALUE    Fail unless the imported identity matches this npub
+                           or 64-character hex public key; this must be a public
+                           key, never an nsec or raw secret key
+  --generate-identity      Explicitly use generated-identity onboarding (default)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --enable-streaming       Configure OpenClaw/Marmot live preview streaming
   --quic-candidate URI     QUIC preview candidate used with --enable-streaming
@@ -96,6 +110,10 @@ Example:
   curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
 
   curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
+
+  curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes \
+    --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+    --expected-npub npub1... --allow-welcomer npub1...
 USAGE
 }
 
@@ -106,6 +124,37 @@ run() {
     "$@"
 }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1" >&2; exit 1; }; }
+
+version_at_least() {
+    awk -v have="$1" -v need="$2" 'BEGIN {
+        split(have, h, "."); split(need, n, ".");
+        for (i = 1; i <= 3; i++) {
+            hv = (h[i] == "" ? 0 : h[i]) + 0;
+            nv = (n[i] == "" ? 0 : n[i]) + 0;
+            if (hv > nv) exit 0;
+            if (hv < nv) exit 1;
+        }
+        exit 0;
+    }'
+}
+
+require_openclaw_version() {
+    local output version
+    output="$(openclaw --version 2>&1)" || {
+        echo "error: could not determine OpenClaw version; OpenClaw $MIN_OPENCLAW_VERSION or newer is required" >&2
+        exit 1
+    }
+    version="$(printf '%s\n' "$output" | awk '
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')"
+    if [ -z "$version" ] || ! version_at_least "$version" "$MIN_OPENCLAW_VERSION"; then
+        echo "error: OpenClaw $MIN_OPENCLAW_VERSION or newer is required (found ${version:-unknown}); upgrade OpenClaw separately, then rerun this installer" >&2
+        exit 1
+    fi
+}
 
 append_csv() {
     local value="$1"
@@ -351,7 +400,8 @@ install_macos_service() {
         return 0
     fi
 
-    run mkdir -p "$plist_dir" "$logs_dir" || return 1
+    run mkdir -p "$plist_dir" "$logs_dir" "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
+    run chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
     {
         printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
         printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -366,6 +416,8 @@ install_macos_service() {
         plist_string "$MARMOT_HOME"
         plist_string "--socket"
         plist_string "$MARMOT_AGENT_SOCKET"
+        plist_string "--media-allowed-root"
+        plist_string "$MARMOT_OUTBOUND_MEDIA_DIR"
         for relay in "${RELAYS[@]}"; do
             plist_string "--relay"
             plist_string "$relay"
@@ -392,6 +444,16 @@ install_macos_service() {
     log "installed and started LaunchAgent: $label"
 }
 
+enable_or_restart_systemd_user_service() {
+    local service="$1"
+    if systemctl --user is-active --quiet "$service"; then
+        run systemctl --user enable "$service" || return 1
+        run systemctl --user restart "$service" || return 1
+    else
+        run systemctl --user enable --now "$service" || return 1
+    fi
+}
+
 install_linux_user_service() {
     local service_dir service program relay
     if ! command -v systemctl >/dev/null 2>&1; then return 1; fi
@@ -401,18 +463,19 @@ install_linux_user_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service"
+        log "would enable/start, or restart if already active, systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
         return 0
     fi
 
-    run mkdir -p "$service_dir" "$MARMOT_HOME/logs" || return 1
+    run mkdir -p "$service_dir" "$MARMOT_HOME/logs" "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
+    run chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
     {
         printf '%s\n' '[Unit]'
         printf '%s\n' 'Description=Marmot wn-agent connector'
         printf '%s\n' 'After=network-online.target'
         printf '\n'
         printf '%s\n' '[Service]'
-        printf 'ExecStart=%q --home %q --socket %q' "$program" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
+        printf 'ExecStart=%q --home %q --socket %q --media-allowed-root %q' "$program" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET" "$MARMOT_OUTBOUND_MEDIA_DIR"
         for relay in "${RELAYS[@]}"; do printf ' --relay %q' "$relay"; done
         printf '\n'
         printf '%s\n' 'Restart=always'
@@ -426,8 +489,8 @@ install_linux_user_service() {
         warn "systemctl --user daemon-reload failed; falling back to a temporary wn-agent process"
         return 1
     fi
-    if ! run systemctl --user enable --now "$MARMOT_AGENT_SERVICE_NAME.service"; then
-        warn "systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service failed; falling back to a temporary wn-agent process"
+    if ! enable_or_restart_systemd_user_service "$MARMOT_AGENT_SERVICE_NAME.service"; then
+        warn "could not enable/start systemd user service $MARMOT_AGENT_SERVICE_NAME.service; falling back to a temporary wn-agent process"
         return 1
     fi
     log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
@@ -452,7 +515,7 @@ install_user_service() {
 start_temp_agent() {
     if [ "$NO_START_WN_AGENT" -eq 1 ]; then return 0; fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] wn-agent --home %q --socket %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
+        printf '[dry-run] wn-agent --home %q --socket %q --media-allowed-root %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET" "$MARMOT_OUTBOUND_MEDIA_DIR"
         local relay
         for relay in "${RELAYS[@]}"; do printf ' --relay %q' "$relay"; done
         printf '\n'
@@ -462,14 +525,61 @@ start_temp_agent() {
         log "found existing wn-agent socket: $MARMOT_AGENT_SOCKET"
         return 0
     fi
-    run mkdir -p "$MARMOT_HOME"
-    local -a args=(--home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
+    run mkdir -p "$MARMOT_HOME" "$MARMOT_OUTBOUND_MEDIA_DIR"
+    run chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
+    local -a args=(--home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR")
     local relay
     for relay in "${RELAYS[@]}"; do args+=(--relay "$relay"); done
     log "starting temporary wn-agent for bootstrap"
     wn-agent "${args[@]}" &
     WN_AGENT_TEMP_PID="$!"
     log "temporary wn-agent pid: $WN_AGENT_TEMP_PID"
+}
+
+import_existing_identity() {
+    if [ -z "$EXISTING_IDENTITY_FILE" ] && [ "$EXISTING_IDENTITY_PROMPT" -ne 1 ]; then
+        return 0
+    fi
+    ensure_path
+    if [ "$DRY_RUN" -eq 0 ]; then
+        need_cmd wn-agent
+        need_cmd python3
+    fi
+
+    local -a args=(
+        import-identity
+        --json
+        --home "$MARMOT_HOME"
+        --label "$MARMOT_AGENT_LABEL"
+    )
+    if [ -n "$EXISTING_IDENTITY_FILE" ]; then
+        args+=(--identity-file "$EXISTING_IDENTITY_FILE")
+    else
+        args+=(--prompt)
+    fi
+    if [ -n "$EXPECTED_IDENTITY" ]; then
+        args+=(--expected-identity "$EXPECTED_IDENTITY")
+    fi
+
+    log "importing and verifying existing Nostr identity"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] wn-agent'
+        printf ' %q' "${args[@]}"
+        printf '\n'
+        IMPORTED_ACCOUNT_ID_HEX="<account-id-from-identity-import>"
+        return 0
+    fi
+
+    local imported_json
+    imported_json="$(wn-agent "${args[@]}")"
+    IMPORTED_ACCOUNT_ID_HEX="$(
+        printf '%s\n' "$imported_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
+    )"
+    if [ -z "$IMPORTED_ACCOUNT_ID_HEX" ]; then
+        echo "error: identity import did not return an account id" >&2
+        exit 1
+    fi
 }
 
 bootstrap_agent() {
@@ -493,6 +603,9 @@ bootstrap_agent() {
         --socket "$MARMOT_AGENT_SOCKET"
         --label "$MARMOT_AGENT_LABEL"
     )
+    if [ -n "$IMPORTED_ACCOUNT_ID_HEX" ]; then
+        args+=(--no-create --account-id-hex "$IMPORTED_ACCOUNT_ID_HEX")
+    fi
     local relay
     for relay in "${RELAYS[@]}"; do args+=(--relay "$relay"); done
     if [ "$ENABLE_STREAMING" -eq 1 ]; then
@@ -639,6 +752,9 @@ while [ $# -gt 0 ]; do
         --yes | --non-interactive) ASSUME_YES=1; shift ;;
         --home) MARMOT_HOME="${2:?missing value for --home}"; MARMOT_AGENT_SOCKET_OVERRIDE=""; shift 2 ;;
         --openclaw-home) OPENCLAW_HOME="${2:?missing value for --openclaw-home}"; shift 2 ;;
+        --existing-identity-file) EXISTING_IDENTITY_FILE="${2:?missing value for --existing-identity-file}"; shift 2 ;;
+        --expected-npub) EXPECTED_IDENTITY="${2:?missing value for --expected-npub}"; shift 2 ;;
+        --generate-identity) GENERATE_IDENTITY_EXPLICIT=1; shift ;;
         --allow-welcomer) ALLOW_WELCOMERS+=("${2:?missing value for --allow-welcomer}"); shift 2 ;;
         --relay) CLI_RELAYS=1; RELAYS+=("${2:?missing value for --relay}"); shift 2 ;;
         --enable-streaming) ENABLE_STREAMING=1; shift ;;
@@ -676,6 +792,20 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     if [ -e "$MARMOT_HOME" ]; then
         log "existing Marmot agent home detected; bootstrap will reuse or repair it: $MARMOT_HOME"
     fi
+    if [ "$GENERATE_IDENTITY_EXPLICIT" -ne 1 ] && [ -z "$EXISTING_IDENTITY_FILE" ]; then
+        if prompt_yes_no "Import an existing Nostr identity?" "no"; then
+            if prompt_yes_no "Read the identity from an owner-only file?" "yes"; then
+                EXISTING_IDENTITY_FILE="$(prompt_value "Existing identity file" "")"
+                if [ -z "$EXISTING_IDENTITY_FILE" ]; then
+                    echo "error: existing identity file path cannot be empty" >&2
+                    exit 1
+                fi
+            else
+                EXISTING_IDENTITY_PROMPT=1
+            fi
+            EXPECTED_IDENTITY="$(prompt_value "Expected npub or hex (blank to skip)" "$EXPECTED_IDENTITY")"
+        fi
+    fi
     if [ "${#ALLOW_WELCOMERS[@]}" -eq 0 ]; then
         while true; do
             welcomer_reply="$(prompt_value "Allowed inviter/welcomer npub or hex (blank to skip)" "")"
@@ -690,12 +820,24 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     fi
 fi
 
+MARMOT_OUTBOUND_MEDIA_DIR="${MARMOT_OUTBOUND_MEDIA_DIR_OVERRIDE:-$MARMOT_HOME/dev/outbound-media}"
+
+if [ "$GENERATE_IDENTITY_EXPLICIT" -eq 1 ] && { [ -n "$EXISTING_IDENTITY_FILE" ] || [ "$EXISTING_IDENTITY_PROMPT" -eq 1 ]; }; then
+    echo "error: --generate-identity conflicts with existing-identity onboarding" >&2
+    exit 1
+fi
+if [ -n "$EXPECTED_IDENTITY" ] && [ -z "$EXISTING_IDENTITY_FILE" ] && [ "$EXISTING_IDENTITY_PROMPT" -ne 1 ]; then
+    echo "error: --expected-npub requires --existing-identity-file" >&2
+    exit 1
+fi
+
 validate_welcomer_inputs
 
 need_cmd curl
 need_cmd tar
 if [ "$DRY_RUN" -eq 0 ]; then
     need_cmd openclaw
+    require_openclaw_version
     need_cmd python3
     if [ "$CONFIGURE_OPENCLAW" -eq 1 ]; then need_cmd node; fi
 else
@@ -719,6 +861,7 @@ log "Marmot home: $MARMOT_HOME"
 log "Marmot socket: $MARMOT_AGENT_SOCKET"
 log "Marmot agent label: $MARMOT_AGENT_LABEL"
 install_wn_agent "$platform" "$tmpdir"
+import_existing_identity
 install_plugin "$tmpdir"
 enable_openclaw_plugin
 bootstrap_agent

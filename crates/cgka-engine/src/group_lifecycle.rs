@@ -1,14 +1,12 @@
 //! Group lifecycle — `create_group`, `join_welcome`, etc.
 //!
-//! `do_create_group` uses publish-before-apply: it stages an add-members
-//! commit, wraps welcomes from the staged group, enters `PendingPublish`,
-//! and returns. `Engine::do_confirm_published` merges the MLS commit and
-//! updates Marmot records after the application reports transport success.
-//! `publish_failed` clears the staged commit and rewinds to `Stable`.
-//!
-//! For SOLO create (no invitees) there is no pending commit — the engine
-//! still issues a `PendingStateRef` so the API shape is uniform, but
-//! confirm/fail are state-machine-only no-ops MLS-side.
+//! Current-profile `do_create_group` follows the founding exception to normal
+//! publish-before-apply: epoch 0 and its optional founding Add are made
+//! canonical locally, no ordinary group message is emitted, and the returned
+//! Welcomes are independent delivery obligations. Explicit legacy-profile
+//! creation retains the older staged/pending lifecycle until strict cutover.
+
+use std::collections::BTreeSet;
 
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
@@ -17,24 +15,139 @@ use crate::capabilities::{
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
-use crate::wire_format::{PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
+use crate::wire_format::{
+    PURE_PLAINTEXT_WIRE_FORMAT_POLICY, default_sender_ratchet_configuration, join_config,
+};
 use cgka_traits::TransportEndpoint;
-use cgka_traits::app_components::{AppComponentSet, default_group_components};
+use cgka_traits::app_components::{
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet, default_group_components,
+};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
+use cgka_traits::maintenance::{
+    GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
+    MaintenanceTrigger, PeriodicMaintenancePolicy,
+};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
-use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
+use openmls::prelude::{
+    BasicCredential, CreationFromExternalError, Extension, Extensions, KeyPackageBundle,
+    MlsMessageBodyIn, MlsMessageIn, WelcomeError,
+};
 use openmls::treesync::Node;
+use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
+
+const POST_JOIN_OPERATIONAL_TARGET_SECS: u64 = 24 * 60 * 60;
+
+fn persist_new_group_maintenance<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    enrolled_at: cgka_traits::Timestamp,
+    post_join: Option<(&MessageId, u64)>,
+    own_leaf_baseline_hash: Option<Vec<u8>>,
+) -> Result<(), EngineError> {
+    let Some(maintenance) = storage.maintenance_storage() else {
+        return Ok(());
+    };
+    let periodic_enrolled = matches!(
+        maintenance.periodic_maintenance_policy()?,
+        PeriodicMaintenancePolicy::EnabledForNewGroups
+    );
+    maintenance.put_group_maintenance(&GroupMaintenanceState {
+        group_id: group_id.clone(),
+        enrolled_at: Some(enrolled_at),
+        periodic_enrolled,
+        last_own_leaf_rotation_at: post_join.is_none().then_some(enrolled_at),
+        next_periodic_rotation_at: None,
+    })?;
+    if let Some((welcome_id, sampled_jitter_ms)) = post_join {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-post-join-maintenance-v1");
+        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+        hasher.update(group_id.as_slice());
+        hasher.update(welcome_id.as_slice());
+        let obligation_id = MessageId::new(hasher.finalize().to_vec());
+        maintenance.put_maintenance_obligation(&MaintenanceObligation {
+            id: obligation_id,
+            group_id: group_id.clone(),
+            trigger: MaintenanceTrigger::PostJoin,
+            phase: MaintenancePhase::CatchUp,
+            created_at: enrolled_at,
+            operational_target_at: Some(cgka_traits::Timestamp(
+                enrolled_at
+                    .0
+                    .saturating_add(POST_JOIN_OPERATIONAL_TARGET_SECS),
+            )),
+            overdue: false,
+            // Starts when the temporary full-history subscription is actually
+            // installed, not merely when the Welcome transaction commits.
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash,
+            sampled_jitter_ms,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn welcome_content_dedup_id(
+    peeled: &cgka_traits::ingest::PeeledMessage,
+) -> Result<cgka_traits::types::MessageId, EngineError> {
+    match &peeled.content {
+        cgka_traits::ingest::PeeledContent::Welcome { bytes } => {
+            Ok(crate::message_processor::content_dedup_id(bytes))
+        }
+        _ => Err(EngineError::Peeler(
+            cgka_traits::error::PeelerError::Malformed("peeled content was not a Welcome".into()),
+        )),
+    }
+}
+
+pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Peeler(cgka_traits::error::PeelerError::DecryptFailed)
+            | EngineError::Peeler(cgka_traits::error::PeelerError::Malformed(_))
+            | EngineError::Peeler(cgka_traits::error::PeelerError::InvalidSignature)
+            | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
+            | EngineError::Serialize(_)
+            | EngineError::InvalidWelcome
+            | EngineError::InvalidCredentialIdentity(_)
+            | EngineError::InvalidAccountIdentityProof(_)
+            | EngineError::MissingRequiredCapabilities { .. }
+            | EngineError::NotGroupAdmin { .. }
+            | EngineError::WelcomeAlreadyProcessed
+    )
+}
+
+fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
+    error: WelcomeError<StorageError>,
+) -> EngineError {
+    match error {
+        WelcomeError::StorageError(_)
+        | WelcomeError::PublicGroupError(CreationFromExternalError::WriteToStorageError(_)) => {
+            // OpenMLS storage errors are backend-specific and cannot be converted
+            // into the Marmot storage error type generically. Keep them retryable
+            // without leaking backend details into a user-visible error string.
+            EngineError::Backend("OpenMLS Welcome storage failure".into())
+        }
+        _ => EngineError::InvalidWelcome,
+    }
+}
 
 /// MLS exporter input for the Nostr kind-445 group-event encryption key:
 /// `MLS-Exporter("marmot", "group-event", 32)`.
@@ -52,11 +165,76 @@ pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
 pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 
+/// Deletes a not-yet-canonical current-profile group if creation returns early
+/// or the async future is cancelled after OpenMLS first persists it.
+///
+/// The final creation transaction disarms this immediately after atomically
+/// merging the optional founding Add, writing the Marmot group record, and
+/// retaining every wrapped Welcome. Until then no caller has received the
+/// group id and no transport work has escaped.
+struct NewGroupCleanupGuard<S: StorageProvider> {
+    storage: *const S,
+    group_id: GroupId,
+    armed: bool,
+}
+
+// SAFETY: `S` is `Send + Sync`; the pointer is dereferenced only from Drop
+// while the guarded `&mut Engine` future (and therefore its storage) is alive.
+unsafe impl<S: StorageProvider> Send for NewGroupCleanupGuard<S> {}
+
+impl<S: StorageProvider> NewGroupCleanupGuard<S> {
+    fn arm(storage: &S, group_id: GroupId) -> Self {
+        Self {
+            storage: storage as *const S,
+            group_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: see the `Send` justification above.
+        let storage = unsafe { &*self.storage };
+        let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
+        let cleanup = storage.with_transaction(|storage| {
+            let crypto = openmls_rust_crypto::RustCrypto::default();
+            let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+            if let Some(mut group) = MlsGroup::load(provider.storage(), &mls_gid)
+                .map_err(|error| StorageError::Backend(format!("load new group: {error:?}")))?
+            {
+                group.delete(provider.storage()).map_err(|error| {
+                    StorageError::Backend(format!("delete new group: {error:?}"))
+                })?;
+            }
+            match storage.delete_group(&self.group_id) {
+                Ok(()) | Err(StorageError::NotFound) => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
+        if cleanup.is_err() {
+            tracing::warn!(
+                target: "cgka_engine::group_lifecycle",
+                method = "new_group_cleanup",
+                "could not remove incomplete current-profile group"
+            );
+        }
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     /// Implementation of `CgkaEngine::create_group`.
     pub(crate) async fn do_create_group(
         &mut self,
         req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         // 1. Validate invitees against required capabilities.
         let active_transports: [TransportKind; 0] = []; // engine-layer: no transports
@@ -64,6 +242,7 @@ impl<S: StorageProvider> Engine<S> {
             &self.registry,
             &active_transports,
             &req.required_features,
+            self.new_protocol_profile,
         )?;
         let mut desired_components = AppComponentSet::from(default_group_components());
         for component_id in required_caps.app_components.ids.clone() {
@@ -73,17 +252,39 @@ impl<S: StorageProvider> Engine<S> {
             required_caps.app_components.insert(component.component_id);
             desired_components.insert(component.component_id);
         }
+        let mut self_supported_components = self.supported_app_components.clone();
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            self_supported_components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        }
         let self_missing = required_caps
             .app_components
-            .missing_from(&self.supported_app_components);
+            .missing_from(&self_supported_components);
         if !self_missing.is_empty() {
             let had = GroupCapabilities {
-                app_components: self.supported_app_components.clone(),
+                app_components: self_supported_components.clone(),
                 ..GroupCapabilities::default()
             };
             return Err(EngineError::MissingRequiredCapabilities {
                 required: Box::new(required_caps.clone()),
                 had: Box::new(had),
+            });
+        }
+        let optional_ids = AppComponentSet::new(
+            optional_app_components
+                .iter()
+                .map(|component| component.component_id),
+        );
+        let self_optional_missing = optional_ids.missing_from(&self_supported_components);
+        if !self_optional_missing.is_empty() {
+            return Err(EngineError::MissingRequiredCapabilities {
+                required: Box::new(GroupCapabilities {
+                    app_components: optional_ids,
+                    ..GroupCapabilities::default()
+                }),
+                had: Box::new(GroupCapabilities {
+                    app_components: self_supported_components.clone(),
+                    ..GroupCapabilities::default()
+                }),
             });
         }
 
@@ -99,13 +300,21 @@ impl<S: StorageProvider> Engine<S> {
             );
 
         let mut parsed_kps = Vec::with_capacity(req.members.len());
-        let mut negotiated_components =
-            desired_components.intersection(&self.supported_app_components);
+        let mut negotiated_components = desired_components.intersection(&self_supported_components);
         // Engine-owned components (profile + admin policy) are NON-NEGOTIABLE
         // (mdk#746).
-        let mandatory_components = AppComponentSet::from(default_group_components());
+        let mut mandatory_components = AppComponentSet::from(default_group_components());
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            mandatory_components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        }
         for kp in &req.members {
             let parsed = self.parse_key_package(kp)?;
+            if kp.protocol_profile != self.new_protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "cannot create a {:?} group from a {:?} KeyPackage",
+                    self.new_protocol_profile, kp.protocol_profile
+                )));
+            }
             let had = capabilities_of_key_package(&parsed);
             let missing = required_caps.missing_from(&had);
             if !missing.is_empty() {
@@ -158,12 +367,16 @@ impl<S: StorageProvider> Engine<S> {
 
         // 2. Build the group config with leaf capabilities, MLS
         //    RequiredCapabilities, and Marmot app-component state.
-        let leaf_caps = leaf_capabilities(&self.registry, self.ciphersuite);
-        let leaf_extensions = Extensions::from_vec(vec![
-            crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
-            self.identity.account_identity_proof_extension.clone(),
-        ])
-        .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
+        let leaf_caps =
+            leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
+        debug_assert_eq!(
+            self.identity.protocol_profile(),
+            self.new_protocol_profile,
+            "identity proof material must match the new-state profile"
+        );
+        let leaf_extensions = self
+            .identity
+            .leaf_extensions(&self.supported_app_components)?;
 
         // Validate the creator (implicit admin) on the SAME x-only secp256k1
         // basis as the co-admins below (mdk#737 review), so no admin-set entry
@@ -192,6 +405,7 @@ impl<S: StorageProvider> Engine<S> {
                 description: req.description.clone(),
                 admins: admin_set,
                 app_components: req.app_components.clone(),
+                optional_app_components,
             },
         )?;
 
@@ -210,17 +424,28 @@ impl<S: StorageProvider> Engine<S> {
             .max_past_epochs(self.max_past_epochs)
             .with_group_context_extensions(gc_exts)
             .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(default_sender_ratchet_configuration())
             .build();
 
+        // `MlsGroup::new` persists the OpenMLS group as a sequence of value
+        // writes. Keep that logical store in one backend transaction so a
+        // crash or write fault cannot leave a partial, undiscoverable group.
+        let mut mls_group = self.storage.with_transaction(|storage| {
+            let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+            let group = MlsGroup::new(
+                &provider,
+                &self.identity.signer,
+                &group_config,
+                self.identity.credential_with_key.clone(),
+            )
+            .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
+            crate::app_components::validate_current_profile_group_invariants(&group)?;
+            Ok::<MlsGroup, EngineError>(group)
+        })?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::new(
-            &provider,
-            &self.identity.signer,
-            &group_config,
-            self.identity.credential_with_key.clone(),
-        )
-        .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
+        let mut new_group_guard = (self.new_protocol_profile == ProtocolProfile::Current)
+            .then(|| NewGroupCleanupGuard::arm(&self.storage, group_id.clone()));
 
         // Admin-leaf coupling at creation (mdk#737): every admin key MUST
         // correspond to a member of the initial group (creator + invitees).
@@ -258,11 +483,28 @@ impl<S: StorageProvider> Engine<S> {
             let (_commit_out, welcome_out, _group_info) = mls_group
                 .add_members(&provider, &self.identity.signer, &parsed_kps)
                 .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-            pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
-                &self.storage,
-                &provider,
-                group_id.clone(),
-            ));
+            if self.new_protocol_profile == ProtocolProfile::Legacy {
+                pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
+                    &self.storage,
+                    &provider,
+                    group_id.clone(),
+                ));
+            }
+            let own_leaf_index = mls_group.own_leaf_index();
+            let staged = mls_group.pending_commit().ok_or_else(|| {
+                EngineError::Backend("founding add produced no pending commit".into())
+            })?;
+            crate::app_components::validate_current_profile_invariants_for_staged_commit(
+                &mls_group,
+                staged,
+                own_leaf_index,
+            )?;
+            crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                staged,
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
             let bytes = welcome_out
                 .tls_serialize_detached()
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -288,19 +530,31 @@ impl<S: StorageProvider> Engine<S> {
             epoch: EpochId(mls_group.epoch().as_u64()),
             members: projected_members,
             required_capabilities: required_caps,
+            protocol_profile: self.new_protocol_profile,
             removed: false,
+            unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
-        self.storage.put_group(&group_record)?;
-        // #740: index this group's transport routing id for O(1) inbound
-        // resolution (see `Engine::transport_group_id_index`). Best-effort: a
-        // routing-read failure only forfeits the fast path (inbound would fall
-        // through to the unknown-group disposition), never fails creation.
-        if let Ok(transport_group_id) =
-            crate::app_components::transport_group_id_of_group(&mls_group)
-        {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            self.storage.put_group(&group_record)?;
+            // #740: index this group's transport routing id for O(1) inbound
+            // resolution (see `Engine::transport_group_id_index`). Best-effort:
+            // a routing-read failure only forfeits the fast path.
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                // Inlined `index_transport_group_route` (field-split borrows:
+                // `provider` above still holds `&self`); creation needs no
+                // retention prune yet.
+                self.transport_group_id_index
+                    .insert(transport_group_id.clone(), group_id.clone());
+                let _ = self.storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
+            }
         }
 
         // 5. Wrap welcomes via the peeler.
@@ -336,17 +590,163 @@ impl<S: StorageProvider> Engine<S> {
                     self.peeler.wrap_welcome(&payload, &recipient).await
                 }
                 .map_err(EngineError::Peeler)?;
-                self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
+                if self.new_protocol_profile == ProtocolProfile::Legacy {
+                    self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
+                }
                 welcomes.push(wrapped);
             }
         }
 
-        crate::capability_manager::cache_from_key_packages(
-            &self.storage,
-            &group_id,
-            &parsed_kps,
-            self.ciphersuite,
-        )?;
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            let enrolled_at = self.wall_clock.now();
+            let unique_welcome_ids = welcomes
+                .iter()
+                .map(|welcome| welcome.id.as_slice().to_vec())
+                .collect::<BTreeSet<_>>();
+            if welcomes.len() != parsed_kps.len() || unique_welcome_ids.len() != parsed_kps.len() {
+                return Err(EngineError::Backend(
+                    "founding creation did not produce one distinct Welcome per invitee".into(),
+                ));
+            }
+            // Founding creation has an empty group-message publication
+            // obligation. Atomically make the optional Add canonical together
+            // with the Marmot projection and durable Welcome artifacts before
+            // any caller can attempt transport delivery.
+            let canonical_epoch =
+                self.storage
+                    .with_transaction(|storage| -> Result<EpochId, EngineError> {
+                        if mls_group.pending_commit().is_some() {
+                            // The capability cache validates every added leaf
+                            // against the persisted group's protocol profile.
+                            // Seed the projected record inside this same
+                            // transaction before inspecting the staged Add;
+                            // it is overwritten with the canonical epoch and
+                            // roster after the merge below.
+                            storage.put_group(&group_record)?;
+                            {
+                                let staged = mls_group.pending_commit().ok_or_else(|| {
+                                    EngineError::Backend(
+                                        "founding add lost its pending commit".into(),
+                                    )
+                                })?;
+                                crate::capability_manager::cache_from_staged_commit(
+                                    storage, &group_id, staged,
+                                )?;
+                            }
+                            let tx_provider = EngineOpenMlsProvider::<S>::new(
+                                &self.crypto,
+                                storage.mls_storage(),
+                            );
+                            mls_group
+                                .merge_pending_commit(&tx_provider)
+                                .map_err(|error| {
+                                    EngineError::Backend(format!("merge founding add: {error:?}"))
+                                })?;
+                            crate::app_components::validate_current_profile_group_invariants(
+                                &mls_group,
+                            )?;
+                        }
+
+                        let canonical_epoch = EpochId(mls_group.epoch().as_u64());
+                        let mut canonical_record = group_record.clone();
+                        canonical_record.epoch = canonical_epoch;
+                        canonical_record.members = marmot_members(&mls_group);
+                        storage.put_group(&canonical_record)?;
+                        persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
+
+                        for welcome in &welcomes {
+                            let payload = StoredMessagePayload::outbound_welcome(welcome.clone())
+                                .encode()
+                                .map_err(|error| {
+                                    EngineError::Serialize(format!(
+                                        "encode founding Welcome: {error:?}"
+                                    ))
+                                })?;
+                            storage.put_message(&MessageRecord {
+                                id: welcome.id.clone(),
+                                group_id: group_id.clone(),
+                                epoch: canonical_epoch,
+                                state: MessageState::Sent,
+                                payload,
+                                deferred_peel: None,
+                            })?;
+                        }
+                        crate::capability_manager::cache_from_key_packages(
+                            storage,
+                            &group_id,
+                            &parsed_kps,
+                        )?;
+                        crate::capability_manager::cache_self_capabilities(
+                            storage,
+                            &group_id,
+                            &mls_group,
+                            self.identity.self_id(),
+                            self.ciphersuite,
+                        )?;
+                        Ok(canonical_epoch)
+                    })?;
+
+            // The durable creation transaction is complete. From here on,
+            // failure must not delete or roll back the canonical group.
+            new_group_guard
+                .take()
+                .expect("current creation arms cleanup")
+                .disarm();
+            if let Some(guard) = pending_commit_guard.take() {
+                guard.disarm();
+            }
+
+            for welcome in &welcomes {
+                // `Sent` deliberately means "durable outbound obligation",
+                // not "transport delivery completed". Account orchestration
+                // moves an acknowledged Welcome to `Processed`; until then it
+                // remains discoverable after a crash for independent retry.
+                self.sent_message_ids.insert(welcome.id.clone());
+                self.audit_group(
+                    &group_id,
+                    crate::audit_helpers::message_state_transition_event(
+                        hex::encode(welcome.id.as_slice()),
+                        None,
+                        MessageState::Sent,
+                        Some(canonical_epoch),
+                        "founding_welcome_persisted",
+                    ),
+                );
+            }
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                self.index_transport_group_route(transport_group_id, &group_id, canonical_epoch);
+            }
+            self.epoch_manager
+                .set_stable(group_id.clone(), canonical_epoch);
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    None,
+                    "stable",
+                    canonical_epoch,
+                    "founding_create",
+                    None,
+                    None,
+                ),
+            );
+            self.events_buf
+                .push_back(cgka_traits::engine::GroupEvent::GroupCreated {
+                    group_id: group_id.clone(),
+                });
+            if let Err(error) = self.retain_current_epoch_snapshot_for_group(&group_id) {
+                tracing::warn!(
+                    target: "cgka_engine::group_lifecycle",
+                    method = "do_create_group",
+                    transient = error.is_transient(),
+                    "deferred founding snapshot retention"
+                );
+            }
+            return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
+        }
+
+        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
         crate::capability_manager::cache_self_capabilities(
             &self.storage,
             &group_id,
@@ -429,7 +829,7 @@ impl<S: StorageProvider> Engine<S> {
         // skipped that. Without this check, a re-call would re-stage a
         // Welcome on top of an existing group, which is unsafe.
         if self.seen_message_ids.contains(&welcome_msg.id) {
-            return Err(EngineError::Other("welcome already processed".to_string()));
+            return Err(EngineError::WelcomeAlreadyProcessed);
         }
         if let Ok(record) = self.storage.get_message(&welcome_msg.id)
             && matches!(
@@ -439,7 +839,7 @@ impl<S: StorageProvider> Engine<S> {
                     | cgka_traits::message::MessageState::EpochInvalidated
             )
         {
-            return Err(EngineError::Other("welcome already processed".to_string()));
+            return Err(EngineError::WelcomeAlreadyProcessed);
         }
 
         // 2. Envelope check.
@@ -467,7 +867,36 @@ impl<S: StorageProvider> Engine<S> {
             .peel_welcome(&welcome_msg)
             .await
             .map_err(EngineError::Peeler)?;
-        let welcomer = peeled.sender.clone();
+        let content_id = welcome_content_dedup_id(&peeled)?;
+        if self.storage.has_ingress_dedup_marker(&content_id)? {
+            self.storage.put_ingress_dedup_marker(&welcome_id)?;
+            return Err(EngineError::WelcomeAlreadyProcessed);
+        }
+
+        let result = self
+            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone())
+            .await;
+        match &result {
+            Ok(_) => {}
+            Err(error) if terminal_welcome_error(error) => {
+                self.storage.with_transaction(|storage| {
+                    storage.put_ingress_dedup_marker(&welcome_id)?;
+                    storage.put_ingress_dedup_marker(&content_id)?;
+                    Ok::<_, EngineError>(())
+                })?;
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    pub(crate) async fn do_join_peeled_welcome(
+        &mut self,
+        welcome_msg: TransportMessage,
+        peeled: cgka_traits::ingest::PeeledMessage,
+        content_id: MessageId,
+    ) -> Result<GroupId, EngineError> {
+        let welcome_id = welcome_msg.id.clone();
         let welcome_bytes = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome { bytes } => bytes,
             _ => {
@@ -495,9 +924,11 @@ impl<S: StorageProvider> Engine<S> {
         //
         // Use the two-step OpenMLS welcome API so we can read the target group
         // id and clear stale local OpenMLS state BEFORE the join is staged.
-        // `ProcessedWelcome::new_from_welcome` decrypts the GroupInfo (consuming
-        // the KeyPackage init key material — OpenMLS contract, so it runs
-        // exactly once) and exposes the group id via the unverified group info.
+        // `ProcessedWelcome::new_from_welcome` decrypts the GroupInfo and
+        // consumes the KeyPackage init key material. It therefore belongs in
+        // the same transaction as every later join write: a rejected or
+        // backend-failed attempt must restore the KeyPackage so the identical
+        // Welcome remains retryable.
         // If leftover live OpenMLS state survives for this group id (a re-add
         // after a prior removal, or state that outlived a missed removal commit
         // / restart) AND we are not currently an active member, clear ONLY that
@@ -516,172 +947,346 @@ impl<S: StorageProvider> Engine<S> {
         // only for the group being re-joined. We never clear a group we are
         // still an active member of.
         let join_config = join_config(self.max_past_epochs);
-        let processed = {
-            let provider =
-                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-            openmls::group::ProcessedWelcome::new_from_welcome(&provider, &join_config, welcome)
-                .map_err(|e| EngineError::Backend(format!("process welcome: {e:?}")))?
-        };
-        let group_id = GroupId::new(
-            processed
-                .unverified_group_info()
-                .group_id()
-                .as_slice()
-                .to_vec(),
+        let joined_at = self.wall_clock.now();
+        let sampled_jitter_ms = self.maintenance_random.sample_inclusive(
+            0,
+            cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
         );
-        // The first provider borrow has ended; the clear takes `&mut self`. Done
-        // before the staged welcome is built so `into_staged_welcome` does not
-        // hit `GroupAlreadyExists`.
-        if self.local_state_is_stale_for_rejoin(&group_id) {
-            self.clear_live_openmls_group(&group_id)?;
-        }
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let staged = processed
-            .into_staged_welcome(&provider, None)
-            .map_err(|e| EngineError::Backend(format!("stage welcome: {e:?}")))?;
-        let welcome_sender = staged
-            .welcome_sender()
-            .map_err(|e| EngineError::Backend(format!("welcome sender: {e:?}")))?;
-        let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
-        let mls_group = staged
-            .into_group(&provider)
-            .map_err(|e| EngineError::Backend(format!("into_group: {e:?}")))?;
+        // Building a group from a staged Welcome performs the same multi-row
+        // OpenMLS store as group creation. Keep KeyPackage consumption, stale
+        // live-state clearing, that store, every Marmot post-check, the
+        // discoverable group record, capability cache, and both durable
+        // Welcome dispositions in one transaction.
+        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) =
+            self.storage.with_transaction(|storage| {
+                let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                // Match in the same order OpenMLS uses: the first Welcome
+                // KeyPackageRef for which this account-device has a private
+                // bundle. Transport tags are deliberately outside this
+                // selection.
+                let local_bundle_keys = storage
+                    .stored_key_package_bundles()?
+                    .into_iter()
+                    .map(|stored| {
+                        let bundle = serde_json::from_slice::<KeyPackageBundle>(&stored.value)
+                            .map_err(|error| EngineError::Serialize(error.to_string()))?;
+                        let reference =
+                            bundle
+                                .key_package()
+                                .hash_ref(provider.crypto())
+                                .map_err(|error| {
+                                    EngineError::Backend(format!("key_package ref: {error:?}"))
+                                })?;
+                        Ok::<_, EngineError>(reference.as_slice().to_vec())
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                let consumed_key_package_ref = welcome
+                    .secrets()
+                    .iter()
+                    .map(|secret| secret.new_member())
+                    .find(|reference| local_bundle_keys.contains(reference.as_slice()))
+                    .map(|reference| reference.as_slice().to_vec())
+                    .ok_or(EngineError::InvalidWelcome)?;
+                let processed = openmls::group::ProcessedWelcome::new_from_welcome(
+                    &provider,
+                    &join_config,
+                    welcome,
+                )
+                .map_err(classify_openmls_welcome_error)?;
+                let group_id = GroupId::new(
+                    processed
+                        .unverified_group_info()
+                        .group_id()
+                        .as_slice()
+                        .to_vec(),
+                );
+                if storage.disband_tombstone(&group_id)?.is_some() {
+                    return Err(EngineError::InvalidWelcome);
+                }
 
-        debug_assert_eq!(
-            group_id,
-            GroupId::new(mls_group.group_id().as_slice().to_vec())
-        );
+                let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
+                let (local_state_is_stale, repaired_unrecoverable) =
+                    match storage.get_group(&group_id) {
+                        Ok(group) => {
+                            let self_is_recorded_member = group
+                                .members
+                                .iter()
+                                .any(|member| &member.id == self.identity.self_id());
+                            if self_is_recorded_member && !group.unrecoverable {
+                                // A distinct transport/content id does not make a
+                                // second normal Welcome for an already-active group
+                                // a rejoin. Reject before OpenMLS staging and let
+                                // the surrounding transaction restore KeyPackage
+                                // consumption and every tentative write.
+                                return Err(EngineError::WelcomeAlreadyProcessed);
+                            }
+                            // Unrecoverable is the explicit exception: a fully
+                            // authenticated replacement Welcome is a protocol-defined
+                            // repair even though the frozen record still lists us as
+                            // a member. The surrounding transaction restores the old
+                            // OpenMLS state and KeyPackage on any later validation
+                            // failure, so clearing the live rows remains tentative.
+                            (true, group.unrecoverable)
+                        }
+                        Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
+                        Err(error) => return Err(EngineError::Storage(error)),
+                    };
+                if local_state_is_stale {
+                    self.clear_live_openmls_group_on_storage(storage, &group_id)?;
+                }
 
-        // 5b. Reject the Welcome if any member leaf carries an invalid Marmot
-        // credential identity (foundation/identity.md, joining.md:65). The
-        // Welcome embeds the full ratchet tree, so every current member's
-        // credential is checked here at join ingress.
-        validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+                let staged = processed
+                    .into_staged_welcome(&provider, None)
+                    .map_err(classify_openmls_welcome_error)?;
+                let welcome_sender = staged
+                    .welcome_sender()
+                    .map_err(|_| EngineError::InvalidWelcome)?;
+                let welcome_sender_id =
+                    crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+                let mls_group = staged
+                    .into_group(&provider)
+                    .map_err(classify_openmls_welcome_error)?;
 
-        // 5c. Reject the Welcome if the resulting group has active required
-        // capabilities (MLS extensions, proposal types, or Marmot app
-        // components) this client cannot apply. The create/invite paths run the
-        // symmetric `missing_from` check; joining.md:65 and convergence.md:19
-        // require it here too. `had` is this client's CURRENT runtime support
-        // (feature registry + supported app components), so a group requiring
-        // more than this client can process is rejected even if a stale or
-        // over-broad KeyPackage was consumed.
-        //
-        // This also covers the agent-text-stream-QUIC join self-check (#177,
-        // agent-text-stream-quic-v1.md): the group's `required_member_roles`
-        // mask is translated into role-Feature capabilities and folded into
-        // `group_required`, so a joiner that does not advertise every required
-        // role capability is rejected here before it joins.
-        let mut group_required =
-            crate::capability_manager::required_capabilities_from_group(&mls_group);
-        crate::message_processor::merge_capabilities(
-            &mut group_required,
-            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
-        );
-        let had = crate::capabilities::self_supported_capabilities(
-            &self.registry,
-            self.ciphersuite,
-            &self.supported_app_components,
-        );
-        let missing = group_required.missing_from(&had);
-        if !missing.is_empty() {
-            return Err(EngineError::MissingRequiredCapabilities {
-                required: Box::new(group_required),
-                had: Box::new(had),
-            });
-        }
+                debug_assert_eq!(
+                    group_id,
+                    GroupId::new(mls_group.group_id().as_slice().to_vec())
+                );
 
-        // 5d. Reject Welcome forks authored by a non-admin member. OpenMLS
-        // verifies the GroupInfo signature; Marmot additionally requires the
-        // signer leaf's MLS-authenticated account identity to be authorized for
-        // admin-gated member additions (joining.md, admin-policy-v1.md).
-        crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+                // 5b. Reject the Welcome if any member leaf carries an invalid
+                // Marmot credential identity (foundation/identity.md,
+                // joining.md:65).
+                let protocol_profile =
+                    validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+                if self.new_protocol_profile == ProtocolProfile::Current
+                    && protocol_profile != ProtocolProfile::Current
+                {
+                    return Err(EngineError::InvalidWelcome);
+                }
+                crate::app_components::validate_current_profile_group_invariants(&mls_group)
+                    .map_err(|_| EngineError::InvalidWelcome)?;
 
-        // 5e. Admin-leaf coupling on the joined group (mdk#737): reject a
-        // Welcome whose admin set lists an admin with no member leaf. The
-        // Welcome embeds the full ratchet tree, so every current member's leaf
-        // is present here — a phantom/pre-provisioned admin is detectable and
-        // must be rejected, mirroring the check every commit seam enforces so a
-        // joiner never silently accepts a group with a pre-provisioned admin.
-        crate::app_components::reject_admins_without_member_leaf(
-            &mls_group,
-            &group_id,
-            &crate::app_components::admins_of_group(&mls_group)?,
-        )?;
+                // Validate every known GroupContext component before any joined
+                // state leaves this transaction. Commit ingest validates
+                // AppDataUpdate payloads, but a Welcome installs a complete
+                // dictionary without traversing that seam.
+                crate::app_components::validate_app_component_dictionary(&mls_group).map_err(
+                    |error| match error {
+                        storage @ EngineError::Storage(_) => storage,
+                        _ => EngineError::InvalidWelcome,
+                    },
+                )?;
 
-        // 6. Persist Marmot group record from signed group-context data.
-        let mut group_record = Group {
-            id: group_id.clone(),
-            name: String::new(),
-            description: String::new(),
-            epoch: EpochId(mls_group.epoch().as_u64()),
-            members: marmot_members(&mls_group),
-            required_capabilities: crate::capability_manager::required_capabilities_from_group(
-                &mls_group,
-            ),
-            removed: false,
-            join_epoch: EpochId(mls_group.epoch().as_u64()),
-        };
-        mirror_app_components_into_record(&mls_group, &mut group_record);
-        self.storage.put_group(&group_record)?;
+                // 5c. Reject active required capabilities this client cannot
+                // apply, including required agent-stream roles.
+                let mut group_required =
+                    crate::capability_manager::required_capabilities_from_group(&mls_group);
+                crate::message_processor::merge_capabilities(
+                    &mut group_required,
+                    &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+                );
+                let had = crate::capabilities::self_supported_capabilities(
+                    &self.registry,
+                    self.ciphersuite,
+                    &self.supported_app_components,
+                );
+                let missing = group_required.missing_from(&had);
+                if !missing.is_empty() {
+                    return Err(EngineError::MissingRequiredCapabilities {
+                        required: Box::new(group_required),
+                        had: Box::new(had),
+                    });
+                }
+
+                // 5d. The authenticated Welcome sender must be an admin.
+                crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+
+                // 5e. Every advertised admin must have a current member leaf.
+                crate::app_components::reject_admins_without_member_leaf(
+                    &mls_group,
+                    &group_id,
+                    &crate::app_components::admins_of_group(&mls_group)?,
+                )
+                .map_err(|error| match error {
+                    storage @ EngineError::Storage(_) => storage,
+                    _ => EngineError::InvalidWelcome,
+                })?;
+
+                // 6. Make the committed OpenMLS group discoverable through the
+                // Marmot record and cache this device's capabilities.
+                let mut group_record = Group {
+                    id: group_id.clone(),
+                    name: String::new(),
+                    description: String::new(),
+                    epoch: EpochId(mls_group.epoch().as_u64()),
+                    members: marmot_members(&mls_group),
+                    required_capabilities:
+                        crate::capability_manager::required_capabilities_from_group(&mls_group),
+                    protocol_profile,
+                    removed: false,
+                    unrecoverable: false,
+                    disbanded: None,
+                    // A first Welcome proves the lower membership bound. A
+                    // rejoin/repair replaces an older local membership
+                    // interval; without durable interval history, treating
+                    // every earlier epoch as pre-membership would incorrectly
+                    // terminalize messages authored during that interval.
+                    // Epoch zero means "unknown — apply no lower bound".
+                    join_epoch: if local_state_is_stale {
+                        EpochId(0)
+                    } else {
+                        EpochId(mls_group.epoch().as_u64())
+                    },
+                };
+                mirror_app_components_into_record(&mls_group, &mut group_record);
+                storage.put_group(&group_record)?;
+                if local_state_is_stale {
+                    // A verified replacement Welcome establishes a new local
+                    // MLS copy. Frozen-pass membership belongs to the discarded
+                    // copy and must not re-halt the repaired group.
+                    storage.delete_convergence_pass(&group_id)?;
+                    // The pass is only half of that residue. Unresolved commits
+                    // retained below the replacement epoch were retained
+                    // against the discarded copy too, and an anchor-less one
+                    // steers every later pass's rewind target into
+                    // `MissingRetainedAnchor` — re-halting the group this
+                    // Welcome just repaired. The epoch bound is the new copy's
+                    // own authenticated epoch, never an inbound claim.
+                    superseded =
+                        crate::openmls_projection::retire_commits_superseded_by_replacement_welcome(
+                            storage,
+                            &group_id,
+                            mls_group.epoch().as_u64(),
+                        )?;
+                }
+                crate::capability_manager::cache_self_capabilities(
+                    storage,
+                    &group_id,
+                    &mls_group,
+                    self.identity.self_id(),
+                    self.ciphersuite,
+                )?;
+
+                // Direct join callers need the same durable dedup disposition as
+                // the transport-ingest path.
+                let payload = StoredMessagePayload::raw_transport(welcome_msg)
+                    .encode()
+                    .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+                storage.put_message(&MessageRecord {
+                    id: welcome_id.clone(),
+                    group_id: group_id.clone(),
+                    epoch: EpochId(mls_group.epoch().as_u64()),
+                    state: MessageState::Processed,
+                    payload,
+                    deferred_peel: None,
+                })?;
+                storage.put_ingress_dedup_marker(&welcome_id)?;
+                storage.put_ingress_dedup_marker(&content_id)?;
+
+                let own_leaf_baseline_hash = mls_group
+                    .own_leaf_node()
+                    .ok_or(EngineError::InvalidWelcome)?
+                    .tls_serialize_detached()
+                    .map(|leaf| Sha256::digest(leaf).to_vec())
+                    .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+                persist_new_group_maintenance(
+                    storage,
+                    &group_id,
+                    joined_at,
+                    Some((&welcome_id, sampled_jitter_ms)),
+                    Some(own_leaf_baseline_hash),
+                )?;
+                if let Some(maintenance) = storage.maintenance_storage() {
+                    let mut lifecycle = maintenance
+                        .key_package_lifecycle()?
+                        .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
+                    lifecycle.last_consumed_key_package_ref =
+                        Some(consumed_key_package_ref.clone());
+                    lifecycle.last_consumed_at = Some(joined_at);
+                    maintenance.put_key_package_lifecycle(&lifecycle)?;
+                }
+
+                Ok::<_, EngineError>((
+                    group_id,
+                    mls_group,
+                    welcome_sender_id,
+                    repaired_unrecoverable,
+                    superseded,
+                ))
+            })?;
+
         // #740: index this joined group's transport routing id for O(1) inbound
         // resolution (see `Engine::transport_group_id_index`).
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
+            let joined_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, &group_id, joined_epoch);
         }
 
-        // Cache self's capabilities. Other members' capabilities arrive as
-        // we ingest commits that touched their leaves; join-via-welcome
-        // alone does not give us KeyPackage-level access to other members.
-        crate::capability_manager::cache_self_capabilities(
-            &self.storage,
-            &group_id,
-            &mls_group,
-            self.identity.self_id(),
-            self.ciphersuite,
-        )?;
+        // The retirements are durable now. Record each one so a forensic reader
+        // can tell a commit the repair superseded from one that merely aged out
+        // below the retained anchor.
+        for (message_id, _source_epoch) in &superseded {
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::message_state_changed_event(
+                    hex::encode(message_id.as_slice()),
+                    MessageState::EpochInvalidated,
+                    "superseded_by_replacement_welcome",
+                ),
+            );
+        }
 
         // 7. State machine: Stable at the post-welcome epoch.
+        // An authenticated Welcome is a verified repair path: if the group was
+        // halted Unrecoverable, exit through `repair_to_stable` rather than a
+        // blind `set_stable` overwrite (mdk#971). The group record written
+        // above already clears the durable `unrecoverable` marker.
         let joined_epoch = EpochId(mls_group.epoch().as_u64());
-        self.epoch_manager
-            .set_stable(group_id.clone(), joined_epoch);
+        let join_reason = if repaired_unrecoverable {
+            if !self.epoch_manager.is_unrecoverable(&group_id) {
+                // Direct join callers are not required to run session-open
+                // hydration first. Recreate the durable prior state so the
+                // explicit repair transition remains the only exit.
+                self.epoch_manager
+                    .restore_unrecoverable(group_id.clone(), joined_epoch);
+            }
+            self.epoch_manager
+                .repair_to_stable(&group_id, joined_epoch)?;
+            "join_welcome_repair"
+        } else {
+            self.epoch_manager
+                .set_stable(group_id.clone(), joined_epoch);
+            "join_welcome"
+        };
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 None,
                 "stable",
                 joined_epoch,
-                "join_welcome",
+                join_reason,
                 None,
                 None,
             ),
         );
-        self.audit_group_context(&group_id, "join_welcome");
-
-        // 8. Persist durable dedup state for direct `join_welcome`
-        // callers. The ingest path records the welcome after this
-        // method returns, but callers using the trait method directly
-        // need restart-safe duplicate detection too.
-        let payload = StoredMessagePayload::raw_transport(welcome_msg)
-            .encode()
-            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        self.storage.put_message(&MessageRecord {
-            id: welcome_id.clone(),
-            group_id: group_id.clone(),
-            epoch: EpochId(mls_group.epoch().as_u64()),
-            state: MessageState::Processed,
-            payload,
-        })?;
+        self.audit_group_context(&group_id, join_reason);
+        // The group is Stable again and its record is durable, so release any
+        // work it retained while it was held. A repair Welcome is the halted
+        // group's one legal exit (mdk#1106), and nothing else in a running
+        // process would put it back on the drain list — without this the
+        // retained intents wait for a restart. Ordinary joins take the same
+        // call rather than a `repaired_unrecoverable`-only branch: the read is
+        // conditional, a group with no retained work schedules nothing, and
+        // that leaves no re-join shape to reason about separately.
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
 
         // 9. Emit event + register for in-process dedup.
         self.events_buf
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: welcome_id.clone(),
-                welcomer,
+                welcomer: Some(welcome_sender_id.clone()),
             });
         if let Some(new_seconds) =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?
@@ -699,7 +1304,12 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         self.seen_message_ids.insert(welcome_id);
-
+        // An authenticated welcome re-validated every leaf and wrote fresh
+        // group state, which supersedes any outstanding lazy hydration for
+        // this id (mdk#1161): the group is fully live now, and its route was
+        // indexed above.
+        self.unhydrated_groups.remove(&group_id);
+        self.route_backfill_pending.remove(&group_id);
         // An authenticated welcome re-validated every leaf and wrote fresh
         // group state — strictly stronger evidence of health than
         // `retry_hydrate_quarantined_group` re-reading stored state. Clear a
@@ -729,23 +1339,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group_id)
     }
 
-    /// Whether leftover local state for `group_id` is stale for a fresh join —
-    /// i.e. a Marmot group record exists but the local identity is NOT a member
-    /// of it. True means a re-add Welcome would otherwise restage onto leftover
-    /// state and should tear it down first; false covers both "no local state"
-    /// (a genuine first join) and "we are still an active member" (must NOT be
-    /// torn down). Best-effort: a record that fails to load is treated as not
-    /// stale so the normal join path surfaces any real storage error.
-    fn local_state_is_stale_for_rejoin(&self, group_id: &GroupId) -> bool {
-        match self.storage.get_group(group_id) {
-            Ok(group) => !group
-                .members
-                .iter()
-                .any(|member| &member.id == self.identity.self_id()),
-            Err(_) => false,
-        }
-    }
-
     pub(crate) fn do_members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
         // Source of truth: the Marmot record's `members` list. The send
         // paths write the projected post-merge member set there; confirm
@@ -773,17 +1366,19 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         key_packages: &[cgka_traits::engine::KeyPackage],
     ) -> Result<GroupCapabilities, EngineError> {
-        if key_packages.is_empty() {
-            return Ok(leaf_capabilities_as_marmot(
-                &self.registry,
-                self.ciphersuite,
-                &self.supported_app_components,
-            ));
-        }
-        let mut it = key_packages.iter();
-        let first = self.parse_key_package(it.next().unwrap())?;
-        let mut acc = capabilities_of_key_package(&first);
-        for kp in it {
+        let mut acc = leaf_capabilities_as_marmot(
+            &self.registry,
+            self.ciphersuite,
+            &self.supported_app_components,
+            self.new_protocol_profile,
+        );
+        for kp in key_packages {
+            if kp.protocol_profile != self.new_protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(
+                    "cannot compute constructable capabilities across mixed-profile founding members"
+                        .into(),
+                ));
+            }
             let parsed = self.parse_key_package(kp)?;
             let other = capabilities_of_key_package(&parsed);
             acc = GroupCapabilities {
@@ -886,28 +1481,30 @@ pub(crate) fn validate_member_credentials(group: &MlsGroup) -> Result<(), Engine
 pub(crate) fn validate_member_credentials_and_account_proofs(
     group: &MlsGroup,
     ciphersuite: Ciphersuite,
-) -> Result<(), EngineError> {
+) -> Result<ProtocolProfile, EngineError> {
     validate_member_credentials(group)?;
-    let tree = group.export_ratchet_tree();
-    let value = serde_json::to_value(tree)
-        .map_err(|e| EngineError::Backend(format!("export ratchet tree: {e}")))?;
-    let nodes: Vec<Option<Node>> = serde_json::from_value(value)
-        .map_err(|e| EngineError::Backend(format!("decode exported ratchet tree: {e}")))?;
+    let protocol_profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
+    let nodes = crate::app_components::ratchet_tree_nodes(group.export_ratchet_tree())?;
     for node in nodes {
         if let Some(Node::LeafNode(leaf)) = node {
-            crate::account_identity_proof::validate_leaf_account_identity_proof(
+            let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
                 &leaf,
                 ciphersuite,
             )?;
+            if leaf_profile != protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "group contains a {leaf_profile:?} leaf in a {protocol_profile:?} profile"
+                )));
+            }
         }
     }
-    Ok(())
+    Ok(protocol_profile)
 }
 
 /// Bumped whenever the member-credential / account-identity-proof validation
 /// logic changes. A bump makes every previously stored marker mismatch, so a
 /// group's tree is fully re-validated under the new rules on the next open.
-const VALIDATED_TREE_MARKER_VERSION: u8 = 1;
+const VALIDATED_TREE_MARKER_VERSION: u8 = 2;
 
 /// Derive a cheap, content-bound marker certifying a specific ratchet-tree
 /// state passed [`validate_member_credentials_and_account_proofs`].
@@ -957,12 +1554,21 @@ fn leaf_capabilities_as_marmot(
     registry: &crate::feature_registry::FeatureRegistry,
     _cs: openmls_traits::types::Ciphersuite,
     supported_app_components: &cgka_traits::app_components::AppComponentSet,
+    protocol_profile: ProtocolProfile,
 ) -> GroupCapabilities {
     let mut out = GroupCapabilities::default();
     for (_f, req) in registry.iter() {
         out.insert(req.requires);
     }
     out.app_components = supported_app_components.clone();
+    match protocol_profile {
+        ProtocolProfile::Legacy => out.insert(cgka_traits::capabilities::Capability::Extension(
+            crate::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+        )),
+        ProtocolProfile::Current => out
+            .app_components
+            .insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID),
+    }
     out
 }
 
@@ -990,17 +1596,47 @@ pub(crate) fn build_group_context_snapshot<S: StorageProvider>(
 }
 
 /// Mirror signed app-component state into the local app-facing group record.
-/// Missing profile state leaves the record's existing values unchanged.
 pub(crate) fn mirror_app_components_into_record(
     mls_group: &MlsGroup,
     record: &mut cgka_traits::group::Group,
 ) {
-    if let Ok(Some((name, description))) = crate::app_components::group_profile_of_group(mls_group)
-    {
-        record.name = name;
-        record.description = description;
+    match crate::app_components::group_profile_of_group(mls_group) {
+        Ok(Some((name, description))) => {
+            record.name = name;
+            record.description = description;
+        }
+        Ok(None) => {
+            record.name.clear();
+            record.description.clear();
+        }
+        Err(_) => {}
     }
     if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
         record.required_capabilities.app_components = components;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openmls_welcome_storage_errors_remain_retryable() {
+        let direct = classify_openmls_welcome_error(WelcomeError::StorageError("busy"));
+        assert!(matches!(direct, EngineError::Backend(_)));
+        assert!(!terminal_welcome_error(&direct));
+
+        let nested = classify_openmls_welcome_error(WelcomeError::PublicGroupError(
+            CreationFromExternalError::WriteToStorageError("busy"),
+        ));
+        assert!(matches!(nested, EngineError::Backend(_)));
+        assert!(!terminal_welcome_error(&nested));
+    }
+
+    #[test]
+    fn invalid_openmls_welcome_errors_remain_terminal() {
+        let invalid = classify_openmls_welcome_error(WelcomeError::<&str>::UnableToDecrypt);
+        assert!(matches!(invalid, EngineError::InvalidWelcome));
+        assert!(terminal_welcome_error(&invalid));
     }
 }

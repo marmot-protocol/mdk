@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

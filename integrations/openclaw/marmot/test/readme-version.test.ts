@@ -1,0 +1,27 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+const pkg = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as {
+  devDependencies?: { openclaw?: string };
+};
+const pinnedOpenClaw = pkg.devDependencies?.openclaw;
+if (!pinnedOpenClaw) {
+  throw new Error("package.json must pin openclaw in devDependencies");
+}
+
+const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+const pinnedLabel = `openclaw@${pinnedOpenClaw}`;
+
+describe("README OpenClaw SDK pin", () => {
+  it("documents the pinned SDK version from package.json", () => {
+    expect(readme).toContain(`Pinned OpenClaw development SDK: **\`${pinnedLabel}\`**`);
+  });
+
+  it("documents the OpenClaw prerequisite version from package.json", () => {
+    const hostVersion = pinnedOpenClaw.replace(/-\d+$/, "");
+    expect(readme).toContain(`OpenClaw host **${hostVersion} or newer**`);
+    expect(readme).toContain("never installs or upgrades OpenClaw");
+  });
+});

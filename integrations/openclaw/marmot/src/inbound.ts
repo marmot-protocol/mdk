@@ -5,6 +5,8 @@
 // can before emitting it). SDK-independent so it can be unit-tested directly.
 
 import type {
+  AgentControlActor,
+  AgentControlReferencedMessage,
   AgentControlEvent,
   AgentControlMediaRef,
   MarmotAgentControlClient,
@@ -17,7 +19,10 @@ export interface MarmotInboundMessage {
   groupIdHex: string;
   messageIdHex: string;
   senderAccountIdHex: string;
+  sender?: AgentControlActor;
   text: string;
+  /** Sender-authenticated event time in Unix seconds. */
+  recordedAt?: number;
   /**
    * True when the message addresses the agent via p-tag, nostr hex, or visible
    * npub mention.
@@ -25,10 +30,14 @@ export interface MarmotInboundMessage {
   mentionsSelf?: boolean;
   /** The message id this message replies to, when present. */
   replyToMessageIdHex?: string | null;
+  /** Bounded, privacy-aware reply snapshot from wn-agent. */
+  replyTo?: AgentControlReferencedMessage | null;
   /** Sender's directory display name, when resolvable. */
   senderDisplayName?: string | null;
   /** Encrypted media references (`imeta` tags) attached to this message, if any. */
   media?: AgentControlMediaRef[];
+  /** Structured, untrusted facts buffered since the previous triggering turn. */
+  ambientContext?: MarmotAmbientEvent[];
 }
 
 export interface MarmotGroupInvite {
@@ -36,25 +45,38 @@ export interface MarmotGroupInvite {
   groupIdHex: string;
 }
 
-export interface MarmotMessageDeleted {
-  accountIdHex: string;
-  groupIdHex: string;
-  targetMessageIdHex: string;
-  senderAccountIdHex: string;
-}
-
 export interface MarmotGroupStateChanged {
   accountIdHex: string;
   groupIdHex: string;
   /**
    * Coarse change kind: "member_added" | "member_removed" | "member_left" |
-   * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed".
+   * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed" |
+   * "disappearing_timer_changed".
    * Privacy: never carries a member pubkey.
    */
   change: string;
   /** New group display name for "group_renamed"; absent otherwise. */
   detail?: string | null;
 }
+
+export type MarmotMutationEvent = Extract<
+  AgentControlEvent,
+  {
+    type:
+      | "message_edited"
+      | "message_deleted"
+      | "reaction_added"
+      | "reaction_removed";
+  }
+>;
+
+export type MarmotAmbientEvent = MarmotMutationEvent | {
+  type: "group_state_changed";
+  account_id_hex: string;
+  group_id_hex: string;
+  change: string;
+  detail?: string | null;
+};
 
 export interface MarmotInboundBridgeOptions {
   accountIdHex?: string | null;
@@ -63,10 +85,8 @@ export interface MarmotInboundBridgeOptions {
   onMessage: (message: MarmotInboundMessage) => void | Promise<void>;
   /** The agent joined a group via a welcome (used to greet/onboard on join). */
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
-  /** Another member deleted (retracted) a message in a group. */
-  onMessageDeleted?: (deletion: MarmotMessageDeleted) => void | Promise<void>;
-  /** A durable group-state change (membership/admin/rename/avatar) was observed. */
-  onGroupStateChanged?: (change: MarmotGroupStateChanged) => void | Promise<void>;
+  /** A durable mutation/group-state fact that must not trigger a turn. */
+  onAmbientEvent?: (event: MarmotAmbientEvent) => void | Promise<void>;
   onResync?: (info: { droppedEvents: number }) => void | Promise<void>;
   onError?: (error: unknown) => void;
   /** Base reconnect delay (first attempt). Grows exponentially up to the cap. */
@@ -212,45 +232,47 @@ export class MarmotInboundBridge {
       });
       return;
     }
-    if (event.type === "message_deleted") {
-      await this.options.onMessageDeleted?.({
-        accountIdHex: event.account_id_hex,
-        groupIdHex: event.group_id_hex,
-        targetMessageIdHex: event.target_message_id_hex,
-        senderAccountIdHex: event.sender_account_id_hex,
-      });
+    if (
+      event.type === "message_edited" ||
+      event.type === "message_deleted" ||
+      event.type === "reaction_added" ||
+      event.type === "reaction_removed"
+    ) {
+      if (this.recent.has(event.event_id_hex)) {
+        return;
+      }
+      this.recent.add(event.event_id_hex);
+      await this.options.onAmbientEvent?.(event);
       return;
     }
     if (event.type === "group_state_changed") {
-      await this.options.onGroupStateChanged?.({
-        accountIdHex: event.account_id_hex,
-        groupIdHex: event.group_id_hex,
-        change: event.change,
-        detail: event.detail ?? null,
-      });
+      await this.options.onAmbientEvent?.(event);
       return;
     }
     if (event.type !== "inbound_message") {
       return;
     }
-    if (this.recent.has(event.message_id_hex)) {
+    if (this.recent.has(event.message.message_id_hex)) {
       return;
     }
     // Record before dispatching: wn-agent can re-emit the same message (e.g. a
     // rapid catch-up just after subscribe), and an agent turn takes long enough
     // that a record-after-dispatch would let the duplicate slip through and
     // start a second, concurrent turn for the same message.
-    this.recent.add(event.message_id_hex);
+    this.recent.add(event.message.message_id_hex);
     await this.options.onMessage({
       accountIdHex: event.account_id_hex,
       groupIdHex: event.group_id_hex,
-      messageIdHex: event.message_id_hex,
-      senderAccountIdHex: event.sender_account_id_hex,
-      text: event.text,
+      messageIdHex: event.message.message_id_hex,
+      senderAccountIdHex: event.message.sender.account_id_hex,
+      sender: event.message.sender,
+      text: event.message.text,
+      recordedAt: event.message.recorded_at,
       mentionsSelf: event.mentions_self ?? false,
-      replyToMessageIdHex: event.reply_to_message_id_hex ?? null,
-      senderDisplayName: event.sender_display_name ?? null,
-      media: event.media ?? [],
+      replyToMessageIdHex: event.reply_to?.message_id_hex ?? null,
+      replyTo: event.reply_to ?? null,
+      senderDisplayName: event.message.sender.display_name ?? null,
+      media: event.message.media ?? [],
     });
   }
 }

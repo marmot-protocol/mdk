@@ -1,7 +1,7 @@
 ---
 title: "Nostr Account Transport Notes"
 created: 2026-05-11
-updated: 2026-06-07
+updated: 2026-07-22
 tags: [marmot, overview, nostr, transport, accounts]
 status: working-note
 ---
@@ -46,10 +46,12 @@ It should track:
 This is close to the shape whitenoise-rs already has: users and accounts are different records, with relationship and
 relay data kept fresh in the background.
 
-The first MDK implementation keeps that scope bounded. It refreshes contact-list events for local signing
-accounts, caches direct follows and profile metadata, and supports radius-bounded search over cached follow edges for app
-surfaces. It does not try to crawl or score the full Nostr social graph, and the CLI does not expose a separate user
-directory browsing command.
+The MDK implementation keeps that scope bounded. It refreshes contact-list events for local signing accounts, caches
+direct follows and profile metadata, and offers app surfaces both an offline search over cached follow edges and a
+streaming search that traverses the live follow graph ranked by social distance. Live traversal stays bounded by
+construction -- a capped radius, batched author-scoped fetches under a per-radius timeout, and a per-search lifecycle --
+and never promotes a discovered stranger into the directory, so no discovery turns into a standing subscription. It does
+not score the full Nostr social graph, and the CLI does not expose a separate user directory browsing command.
 
 ### Account Bootstrap
 
@@ -106,7 +108,7 @@ Relay lists in the wild contain bad data. Local clients need a safety policy bef
 The policy should be explicit and testable:
 
 - require valid relay URLs;
-- prefer `wss://` by default;
+- require `wss://` for public relays; admit `ws://` only for loopback behind the explicit dev/test flag;
 - reject malformed URLs;
 - reject duplicate relay URLs after normalization rules are applied;
 - cap relay counts;
