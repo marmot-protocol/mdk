@@ -1095,8 +1095,11 @@ fn pruned_read_marker_keeps_canonical_epoch_anchor() {
 }
 
 #[test]
-fn failed_local_send_does_not_replace_delivered_chat_preview() {
+fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() {
     let store = setup_store();
+    let mut pruned = chat("pruned", REMOTE, 10, "expired history");
+    pruned.source_epoch = Some(6);
+    store.record_app_event(&pruned).unwrap();
     let mut failed = chat("failed", LOCAL, 300, "did not reach the group");
     failed.source_message_id_hex = None;
     store.record_app_event(&failed).unwrap();
@@ -1114,6 +1117,35 @@ fn failed_local_send_does_not_replace_delivered_chat_preview() {
         .expect("chat row");
     assert_eq!(
         row.last_message
+            .as_ref()
+            .map(|message| message.message_id_hex.as_str()),
+        Some("delivered")
+    );
+
+    store
+        .secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
+        .unwrap();
+    let after_prune = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(
+        after_prune
+            .last_message
+            .as_ref()
+            .map(|message| message.message_id_hex.as_str()),
+        Some("delivered")
+    );
+
+    {
+        let conn = store.lock().unwrap();
+        assert!(
+            chat_list_projection_complete_tx(&conn, LOCAL, &no_mentions).unwrap(),
+            "failed-send preview priority must match the completeness query"
+        );
+    }
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after_ensure = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(
+        after_ensure
+            .last_message
             .as_ref()
             .map(|message| message.message_id_hex.as_str()),
         Some("delivered")

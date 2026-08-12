@@ -513,9 +513,10 @@ pub(crate) fn apply_projection_to_window(
                     );
                 }
                 TimelineMessageChange::Remove { message_id_hex, .. } => {
-                    window
-                        .messages
-                        .retain(|message| &message.message_id_hex != message_id_hex);
+                    window.messages.retain(|message| {
+                        message.group_id_hex != update.group_id_hex
+                            || &message.message_id_hex != message_id_hex
+                    });
                 }
             }
         }
@@ -544,10 +545,10 @@ fn insert_live_message(
     newest_order: Option<&(u8, u64, u8, u64, String)>,
     canonical_group_order: bool,
 ) {
-    if let Some(existing) = messages
-        .iter_mut()
-        .find(|existing| existing.message_id_hex == message.message_id_hex)
-    {
+    if let Some(existing) = messages.iter_mut().find(|existing| {
+        existing.group_id_hex == message.group_id_hex
+            && existing.message_id_hex == message.message_id_hex
+    }) {
         *existing = message;
         return;
     }
@@ -566,10 +567,10 @@ fn upsert_window_message(
     messages: &mut Vec<TimelineMessageRecord>,
     message: TimelineMessageRecord,
 ) {
-    if let Some(existing) = messages
-        .iter_mut()
-        .find(|existing| existing.message_id_hex == message.message_id_hex)
-    {
+    if let Some(existing) = messages.iter_mut().find(|existing| {
+        existing.group_id_hex == message.group_id_hex
+            && existing.message_id_hex == message.message_id_hex
+    }) {
         *existing = message;
     } else {
         messages.push(message);

@@ -10,7 +10,7 @@ use crate::{
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
-use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -708,6 +708,25 @@ fn refresh_chat_list_row_tx(
 /// again leave the counts stale.
 const CHAT_LIST_MENTION_COUNTS_VERSION: i64 = 1;
 
+/// One authoritative latest-preview order for rebuild, completeness, and
+/// secure-prune repair. Failed local sends remain visible in the timeline but
+/// do not outrank accepted history in the chat-list projection.
+pub(crate) const CHAT_LIST_PREVIEW_ORDER_DESC: &str = "CASE
+        WHEN direction = 'sent'
+         AND invalidation_status = 'local_publish_failed' THEN 0
+        ELSE 1
+    END DESC,
+    timeline_order_class DESC,
+    timeline_order_primary DESC,
+    timeline_order_phase DESC,
+    timeline_order_at DESC,
+    message_id_hex DESC";
+
+struct LatestChatListMessage {
+    preview: ChatListMessagePreview,
+    canonical_order_prefix: (u8, u64, u8, u64),
+}
+
 fn chat_list_mention_counts_version_tx(tx: &Connection) -> StorageResult<i64> {
     Ok(tx
         .query_row(
@@ -821,7 +840,8 @@ fn chat_list_projection_complete_tx(
     }
     if projection_has_rows_tx(
         tx,
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
                 SELECT 1
                 FROM account_groups AS ag
                 JOIN chat_list_rows AS row
@@ -843,11 +863,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_sender IS NOT (
@@ -862,11 +878,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_preview IS NOT (
@@ -881,11 +893,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_kind IS NOT (
@@ -900,11 +908,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_timeline_at IS NOT (
@@ -919,11 +923,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_deleted IS NOT COALESCE((
@@ -938,11 +938,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      ), 0)
                    OR row.last_message_media_json IS NOT (
@@ -957,11 +953,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_delivery_state IS NOT COALESCE((
@@ -981,11 +973,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_order_class DESC,
-                          mt.timeline_order_primary DESC,
-                          mt.timeline_order_phase DESC,
-                          mt.timeline_order_at DESC,
-                          mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      ), 'not_applicable')
                    OR row.activity_sort_at IS NOT MAX(
@@ -1002,11 +990,7 @@ fn chat_list_projection_complete_tx(
                                       AND mt.invalidation_status = 'local_publish_failed'
                                   )
                               )
-                            ORDER BY mt.timeline_order_class DESC,
-                              mt.timeline_order_primary DESC,
-                              mt.timeline_order_phase DESC,
-                              mt.timeline_order_at DESC,
-                              mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                             LIMIT 1
                         ), 0),
                         COALESCE((
@@ -1016,7 +1000,8 @@ fn chat_list_projection_complete_tx(
                         ), 0),
                         ag.conversation_created_at
                      )
-             )",
+             )"
+        ),
         params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
     )? {
         return Ok(false);
@@ -1084,6 +1069,7 @@ fn rebuild_chat_list_row_for_group_tx(
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
     let latest = latest_kind9_message_tx(tx, &group.group_id_hex)?;
+    let latest_message = latest.as_ref().map(|latest| &latest.preview);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
     let unread = unread_summary_tx(
         tx,
@@ -1092,8 +1078,7 @@ fn rebuild_chat_list_row_for_group_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
-    let activity_sort_at = latest
-        .as_ref()
+    let activity_sort_at = latest_message
         .map(|message| message.timeline_at)
         .into_iter()
         .chain(
@@ -1187,22 +1172,16 @@ fn rebuild_chat_list_row_for_group_tx(
                 .avatar
                 .as_ref()
                 .and_then(|avatar| avatar.media_type.as_deref()),
-            latest
-                .as_ref()
-                .map(|message| message.message_id_hex.as_str()),
-            latest.as_ref().map(|message| message.sender.as_str()),
-            latest.as_ref().map(|message| message.plaintext.as_str()),
-            optional_u64_to_i64(latest.as_ref().map(|message| message.kind))?,
-            optional_u64_to_i64(latest.as_ref().map(|message| message.timeline_at))?,
-            latest
-                .as_ref()
+            latest_message.map(|message| message.message_id_hex.as_str()),
+            latest_message.map(|message| message.sender.as_str()),
+            latest_message.map(|message| message.plaintext.as_str()),
+            optional_u64_to_i64(latest_message.map(|message| message.kind))?,
+            optional_u64_to_i64(latest_message.map(|message| message.timeline_at))?,
+            latest_message
                 .map(|message| bool_i64(message.deleted))
                 .unwrap_or(0),
-            latest
-                .as_ref()
-                .and_then(|message| message.media_json.as_deref()),
-            latest
-                .as_ref()
+            latest_message.and_then(|message| message.media_json.as_deref()),
+            latest_message
                 .map(|message| message.delivery_state.as_str())
                 .unwrap_or_else(|| ChatListMessageDeliveryState::NotApplicable.as_str()),
             u64_to_i64(unread.count)?,
@@ -1447,29 +1426,35 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
 fn latest_kind9_message_tx(
     tx: &Connection,
     group_id_hex: &str,
-) -> StorageResult<Option<ChatListMessagePreview>> {
-    tx.query_row(
+) -> StorageResult<Option<LatestChatListMessage>> {
+    let sql = format!(
         "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                media_json, direction, source_message_id_hex, invalidation_status
+                media_json, direction, source_message_id_hex, invalidation_status,
+                timeline_order_class, timeline_order_primary,
+                timeline_order_phase, timeline_order_at
          FROM message_timeline
          WHERE group_id_hex = ?1 AND kind = ?2
            AND (
                invalidation_status IS NULL
                OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
            )
-         ORDER BY CASE
-                      WHEN direction = 'sent'
-                       AND invalidation_status = 'local_publish_failed' THEN 0
-                      ELSE 1
-                  END DESC,
-                  timeline_order_class DESC,
-                  timeline_order_primary DESC,
-                  timeline_order_phase DESC,
-                  timeline_order_at DESC,
-                  message_id_hex DESC
-         LIMIT 1",
+         ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
+         LIMIT 1"
+    );
+    tx.query_row(
+        &sql,
         params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
-        chat_list_message_from_row,
+        |row| {
+            Ok(LatestChatListMessage {
+                preview: chat_list_message_from_row(row)?,
+                canonical_order_prefix: (
+                    row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+                    row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+                    row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
+                    row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
+                ),
+            })
+        },
     )
     .optional()
     .storage()
@@ -1542,24 +1527,14 @@ fn insert_initial_read_state_tx(
     let latest = latest_kind9_message_tx(tx, group_id_hex)?;
     let (message_id, timeline_at, order_class, order_primary, order_phase, order_at) = match latest
     {
-        Some(message) => {
-            let marker =
-                timeline_message_for_read_marker_tx(tx, group_id_hex, &message.message_id_hex)?
-                    .ok_or_else(|| {
-                        StorageError::Backend(
-                            "latest chat message disappeared while creating read state".to_owned(),
-                        )
-                    })?;
-            let (class, primary, phase, at, _id) = marker.canonical_order_key();
-            (
-                Some(message.message_id_hex),
-                Some(message.timeline_at),
-                Some(class),
-                Some(primary),
-                Some(phase),
-                Some(at),
-            )
-        }
+        Some(latest) => (
+            Some(latest.preview.message_id_hex),
+            Some(latest.preview.timeline_at),
+            Some(latest.canonical_order_prefix.0),
+            Some(latest.canonical_order_prefix.1),
+            Some(latest.canonical_order_prefix.2),
+            Some(latest.canonical_order_prefix.3),
+        ),
         None => (None, None, None, None, None, None),
     };
     // Match first-open semantics: with no retained kind-9 history there is no

@@ -1173,29 +1173,29 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
+    let sql = format!(
+        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
+                media_json,
+                CASE
+                    WHEN direction != 'sent' THEN 'not_applicable'
+                    WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
+                    WHEN source_message_id_hex IS NULL THEN 'pending'
+                    ELSE 'delivered'
+                END
+         FROM message_timeline
+         WHERE group_id_hex = ?1
+           AND kind = ?2
+           AND (
+               invalidation_status IS NULL
+               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+           )
+         ORDER BY {}
+         LIMIT 1",
+        crate::chat_list::CHAT_LIST_PREVIEW_ORDER_DESC
+    );
     let latest = tx
         .query_row(
-            "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                    media_json,
-                    CASE
-                        WHEN direction != 'sent' THEN 'not_applicable'
-                        WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
-                        WHEN source_message_id_hex IS NULL THEN 'pending'
-                        ELSE 'delivered'
-                    END
-             FROM message_timeline
-             WHERE group_id_hex = ?1
-               AND kind = ?2
-               AND (
-                   invalidation_status IS NULL
-                   OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
-               )
-             ORDER BY timeline_order_class DESC,
-                      timeline_order_primary DESC,
-                      timeline_order_phase DESC,
-                      timeline_order_at DESC,
-                      message_id_hex DESC
-             LIMIT 1",
+            &sql,
             params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
             |row| {
                 Ok((

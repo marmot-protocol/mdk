@@ -714,6 +714,72 @@ fn apply_projection_preserves_wall_clock_order_for_global_windows() {
     assert_eq!(timeline_ids(&window), ["newer-epoch", "older-epoch"]);
 }
 
+#[test]
+fn apply_projection_scopes_global_window_changes_by_group() {
+    let mut group_a = timeline_test_record("shared-id", 10);
+    group_a.group_id_hex = "group-a".to_owned();
+    let mut group_b = timeline_test_record("shared-id", 20);
+    group_b.group_id_hex = "group-b".to_owned();
+    let mut window = TimelinePage {
+        messages: vec![group_a, group_b],
+        has_more_before: false,
+        has_more_after: false,
+    };
+
+    let mut edited_group_a = timeline_test_record("shared-id", 30);
+    edited_group_a.group_id_hex = "group-a".to_owned();
+    edited_group_a.plaintext = "edited group A".to_owned();
+    let edit = AppProjectionUpdate {
+        group_id_hex: "group-a".to_owned(),
+        timeline_messages: Vec::new(),
+        timeline_changes: vec![TimelineMessageChange::Upsert {
+            trigger: crate::TimelineUpdateTrigger::MessageEditedOrReprojected,
+            message: Box::new(edited_group_a),
+        }],
+        chat_list_row: None,
+        chat_list_trigger: Default::default(),
+    };
+
+    apply_projection_to_window(&mut window, &edit, 300, false);
+
+    assert_eq!(window.messages.len(), 2);
+    assert_eq!(
+        window
+            .messages
+            .iter()
+            .find(|message| message.group_id_hex == "group-a")
+            .expect("group A row")
+            .plaintext,
+        "edited group A"
+    );
+    assert_eq!(
+        window
+            .messages
+            .iter()
+            .find(|message| message.group_id_hex == "group-b")
+            .expect("group B row")
+            .plaintext,
+        "shared-id"
+    );
+
+    let remove = AppProjectionUpdate {
+        group_id_hex: "group-a".to_owned(),
+        timeline_messages: Vec::new(),
+        timeline_changes: vec![TimelineMessageChange::Remove {
+            message_id_hex: "shared-id".to_owned(),
+            reason: crate::TimelineRemoveReason::Invalidated,
+        }],
+        chat_list_row: None,
+        chat_list_trigger: Default::default(),
+    };
+
+    apply_projection_to_window(&mut window, &remove, 300, false);
+
+    assert_eq!(window.messages.len(), 1);
+    assert_eq!(window.messages[0].group_id_hex, "group-b");
+    assert_eq!(window.messages[0].message_id_hex, "shared-id");
+}
+
 #[tokio::test]
 async fn paginate_backwards_extends_window_and_clears_more_before() {
     let store = ScriptedTimelineStore::new(vec![timeline_test_page(
