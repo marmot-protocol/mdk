@@ -1137,7 +1137,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
 /// Stored rows classified into the inputs the candidate-path BFS consumes.
 ///
 /// Seeding is shared by the canonicalization pass and by
-/// [`candidate_branch_peel_contexts`], so both classify a given row identically.
+/// [`candidate_branch_peel`], so both classify a given row identically.
 /// They do not necessarily see the same rows: the pass passes its frozen
 /// batch as `admitted_message_ids` and context collection passes `None`, so
 /// context collection may enumerate branches off commits the pass in flight has
@@ -1608,32 +1608,67 @@ pub(crate) struct CandidateBranchPeelContext {
     pub(crate) context: cgka_traits::group_context::GroupContextSnapshot,
 }
 
-/// Peel contexts for the branches a contested convergence graph offers.
+/// What a deferred-peel sweep learns about this group's convergence graph.
 ///
-/// Best-effort by contract: the pass — not this helper — owns every verdict, so
-/// an inability to enumerate branches (no retained anchor, no own-commit
-/// checkpoint, exhausted replay budget) yields no contexts rather than an
-/// error. Storage and snapshot faults still propagate; they mean the caller's
-/// own state is in doubt.
+/// The two fields answer different questions and are deliberately independent.
+/// Contested-ness is a property of the STORED COMMIT GRAPH, decided before any
+/// replay; the contexts are what enumeration managed to MATERIALIZE from it.
+/// Enumeration halts for reasons that say nothing about whether the graph is
+/// split — a released anchor, a missing own-commit checkpoint, an exhausted
+/// replay budget — so a halt loses the contexts and never the split.
+pub(crate) struct CandidateBranchPeel {
+    /// Two stored commits fork from the same source epoch.
+    pub(crate) contested: bool,
+    /// Tip contexts enumeration captured, at most `max_contexts` of them.
+    /// Empty on every halt, and empty for an uncontested graph.
+    pub(crate) contexts: Vec<CandidateBranchPeelContext>,
+}
+
+impl CandidateBranchPeel {
+    /// No two stored commits fork from the same source epoch, so there is no
+    /// rival branch to materialize.
+    const UNCONTESTED: Self = Self {
+        contested: false,
+        contexts: Vec::new(),
+    };
+
+    /// Whatever enumeration captured from a graph already known to be split.
+    fn contested_over(contexts: Vec<CandidateBranchPeelContext>) -> Self {
+        Self {
+            contested: true,
+            contexts,
+        }
+    }
+}
+
+/// Survey the branches a convergence graph offers: whether it is contested, and
+/// the peel context of each candidate branch tip that could be materialized.
 ///
-/// Returns nothing unless at least two candidate branches exist: a single
-/// branch is by definition one this device can already reach.
-pub(crate) fn candidate_branch_peel_contexts<S: StorageProvider>(
+/// Best-effort by contract for the CONTEXTS: the pass — not this helper — owns
+/// every verdict, so an inability to enumerate branches (no retained anchor, no
+/// own-commit checkpoint, exhausted replay budget) yields no contexts rather
+/// than an error. Storage and snapshot faults still propagate; they mean the
+/// caller's own state is in doubt.
+///
+/// Contested-ness is NOT best-effort. It is decided by the shared-source-epoch
+/// check below, ahead of every path that can lose contexts.
+pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
     max_rewind_commits: u64,
     profile_policy: ReplayProfilePolicy,
     max_contexts: usize,
-) -> Result<Vec<CandidateBranchPeelContext>, OpenMlsProjectionError> {
+) -> Result<CandidateBranchPeel, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
 
     let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)?;
     // Cheap contested-graph gate ahead of any replay: competing branches exist
     // only where two commits share a source epoch. An uncontested graph pays
-    // the seeding scan and nothing more.
+    // the seeding scan and nothing more. This is also the ONLY answer to
+    // "contested?"; everything past it can only lose contexts.
     if !commits_share_a_source_epoch(&inputs.commit_messages) {
-        return Ok(Vec::new());
+        return Ok(CandidateBranchPeel::UNCONTESTED);
     }
     if inputs.replay_start_epoch >= inputs.current_epoch {
         return candidate_branch_peel_contexts_from_current(
@@ -1643,7 +1678,8 @@ pub(crate) fn candidate_branch_peel_contexts<S: StorageProvider>(
             max_rewind_commits,
             profile_policy,
             max_contexts,
-        );
+        )
+        .map(CandidateBranchPeel::contested_over);
     }
 
     // Same rewind shape as the pass: probe-snapshot the live state, roll back
@@ -1670,7 +1706,7 @@ pub(crate) fn candidate_branch_peel_contexts<S: StorageProvider>(
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-    contexts
+    contexts.map(CandidateBranchPeel::contested_over)
 }
 
 /// Whether two distinct stored commits fork from the same source epoch — the
@@ -1690,6 +1726,11 @@ fn commits_share_a_source_epoch(commits: &[StoredCommitMessage]) -> bool {
     false
 }
 
+/// Enumerate and capture branch tips from the state currently restored.
+///
+/// Only ever called once the graph is known contested, so every early return
+/// here means "captured nothing", never "nothing to capture" — the caller
+/// stamps `contested` on whatever comes back.
 fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1711,16 +1752,17 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     ) {
         Ok(result) => result,
         // The pass, not this helper, owns every verdict, so an inability to
-        // enumerate branches yields no contexts. Say so: silently returning
-        // "uncontested" for a graph that is in fact contested is the one way
-        // this helper can hide a split-brain, and it must be greppable.
+        // enumerate branches yields no contexts. The graph stays contested
+        // either way — the caller reads that from the source-epoch check, not
+        // from this set — but a halt is still worth a greppable line, because
+        // it is the fork this device has stopped being able to see.
         Err(
             err @ (OpenMlsProjectionError::MissingOwnCommitCheckpoint
             | OpenMlsProjectionError::ReplayBudgetExceeded),
         ) => {
             tracing::debug!(
                 target: "cgka_engine::openmls_projection",
-                method = "candidate_branch_peel_contexts",
+                method = "candidate_branch_peel",
                 reason = candidate_branch_enumeration_halt_reason(&err),
                 "no candidate branch peel contexts: branch enumeration halted"
             );
@@ -1754,7 +1796,7 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
             Err(err @ OpenMlsProjectionError::ReplayBudgetExceeded) => {
                 tracing::debug!(
                     target: "cgka_engine::openmls_projection",
-                    method = "candidate_branch_peel_contexts",
+                    method = "candidate_branch_peel",
                     reason = candidate_branch_enumeration_halt_reason(&err),
                     captured = contexts.len() as u64,
                     "candidate branch peel contexts truncated"

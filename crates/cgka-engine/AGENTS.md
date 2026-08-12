@@ -30,7 +30,7 @@ capability negotiation, and MIP-03 admin policy — everything that OpenMLS does
     `src/message_processor/ingest.rs` + `src/distributed_convergence.rs` — same-epoch rivals are adjudicated by
     distributed convergence for every member; the `WrongEpoch` branch retains and schedules an in-horizon rival whose
     source anchor is gone, and the coordinator's `MissingRetainedAnchor` verdict owns the durable halt. Post-fork
-    traffic on an unadopted branch is unreadable until `openmls_projection::candidate_branch_peel_contexts` gives
+    traffic on an unadopted branch is unreadable until `openmls_projection::candidate_branch_peel` gives
     `Engine::retry_deferred_peels` that branch's own state — see "Branch-relative peel" below
 
 - **You want to...:** Figure out SelfRemove auto-commit eligibility
@@ -154,7 +154,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 
 - **Module:** `openmls_projection.rs`
   - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay and
-    `candidate_branch_peel_contexts` (candidate branch tips captured as owned peel contexts)
+    `candidate_branch_peel` (whether the graph is contested, plus candidate branch tips captured as owned peel
+    contexts)
 
 - **Module:** `update_group_data.rs`
   - **Owns:** `SendIntent::UpdateGroupData` — stages an `AppDataUpdate` commit for `marmot.group.profile.v1`
@@ -344,7 +345,7 @@ secret with no epoch hint on the wire. So once two members commit from the same 
 opaque to every device that adopted the other branch: it sits retained as `PeelDeferred`, contributes neither depth nor
 witnesses, every committer over-scores its own branch, and the fork never heals. Candidate branch states are therefore
 part of a group's *peel context*, not a separate mechanism.
-`openmls_projection::candidate_branch_peel_contexts` materializes each candidate branch under a
+`openmls_projection::candidate_branch_peel` materializes each candidate branch under a
 `SnapshotRollbackGuard` and captures its tip's owned `GroupContextSnapshot`; the exporter secret is derived while the
 branch state exists, so the transient state is rolled back before any (async) peel runs against it.
 `Engine::retry_deferred_peels` then offers those contexts to every retained row through the ordinary ingest seam.
@@ -357,6 +358,17 @@ yields no contexts rather than an error — the pass, not this helper, owns ever
 states are part of the peel context, `deferred_peel_context_fingerprint` folds in the stored commit graph: a newly
 retained rival commit adds a readable context even when the live epoch and retained-anchor set are unchanged, and
 without that term the sweep gate would stay armed exactly where it must not.
+
+**Contested-ness and contexts are separate answers.** That shared-source-epoch check is the *only* thing that decides
+whether the graph is contested, and `CandidateBranchPeel` carries it independently of the captured contexts, because
+every path after it — released anchor, missing own-commit checkpoint, exhausted budget, fewer than two surviving
+candidate paths, no tip captured — loses contexts without saying anything about whether the graph is split. Reading
+contested-ness off an empty context set would report a fork as healed exactly when this device stopped being able to
+see it. The two then drive different decisions and must stay split: `DeferredPeelSweep::is_contested` gates only the
+drain policy (a contested sweep's recovered rows are one evidence set, so the drain waits for the whole batch), while
+routing live-readable application traffic into the convergence seam keys on `has_branch_contexts` — a sweep holding no
+rival state would only feed evidence to a pass that, having halted on the same checkpoint or the same budget, almost
+certainly cannot read the rival branch either.
 
 **Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
 not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical

@@ -113,7 +113,7 @@ pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 
 /// Upper bound on candidate branch states materialized as peel contexts in one
-/// deferred-peel sweep (`Engine::candidate_branch_peel_contexts`).
+/// deferred-peel sweep (`Engine::candidate_branch_peel`).
 ///
 /// Each context costs one bounded replay of its branch, and each is then
 /// offered to at most [`MAX_DEFERRED_ROWS_PER_SWEEP`] retained rows, so one
@@ -1202,9 +1202,8 @@ impl<S: StorageProvider> Engine<S> {
         // pays only the seeding scan. Nothing read here is trusted: the bytes
         // re-enter through ordinary ingest and only the next pass's OpenMLS
         // replay authenticates them. A peel that fails is silence.
-        let branch_contexts = self.candidate_branch_peel_contexts(group_id)?;
-        let sweep =
-            crate::message_processor::ingest::DeferredPeelSweep::over_branches(&branch_contexts);
+        let peel = self.candidate_branch_peel(group_id)?;
+        let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel);
 
         let end = (start + MAX_DEFERRED_ROWS_PER_SWEEP).min(total);
         let mut progressed = 0usize;
@@ -1251,6 +1250,11 @@ impl<S: StorageProvider> Engine<S> {
         // losers of that verdict are terminalized before the evidence that
         // would have saved them is even admitted. Uncontested sweeps drained
         // per row on the way in and have nothing left to do here.
+        //
+        // Same predicate as `drain_policy`, so no row is ever deferred to a
+        // drain that does not run. A sweep whose enumeration halted recovers
+        // nothing and still drains: the fork is real, and the pass — not this
+        // sweep — owns what to do about a fork it cannot enumerate.
         if sweep.is_contested() {
             self.converge_stored_openmls_messages_with_time(group_id, now)
                 .map_err(|e| EngineError::Backend(format!("converge swept batch: {e}")))?;
@@ -1275,7 +1279,8 @@ impl<S: StorageProvider> Engine<S> {
             backlog = total as u64,
             progressed = progressed as u64,
             terminal = terminal as u64,
-            branch_contexts = branch_contexts.len() as u64,
+            contested = peel.contested,
+            branch_contexts = peel.contexts.len() as u64,
             queue_depth = queue_depth as u64,
             sweep_duration_ms = sweep_started.elapsed().as_millis() as u64,
             "deferred-peel retry sweep"
@@ -1283,18 +1288,18 @@ impl<S: StorageProvider> Engine<S> {
         Ok(progressed)
     }
 
-    /// Materialize the candidate branches of this group's convergence graph and
-    /// capture each tip's peel context.
-    fn candidate_branch_peel_contexts(
+    /// Classify this group's convergence graph as contested or not, and
+    /// materialize the candidate branches it offers.
+    fn candidate_branch_peel(
         &self,
         group_id: &GroupId,
-    ) -> Result<Vec<crate::openmls_projection::CandidateBranchPeelContext>, EngineError> {
+    ) -> Result<crate::openmls_projection::CandidateBranchPeel, EngineError> {
         let group = self.storage.get_group(group_id)?;
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
             .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
         let max_rewind_commits = policy.convergence.max_rewind_commits;
-        crate::openmls_projection::candidate_branch_peel_contexts(
+        crate::openmls_projection::candidate_branch_peel(
             &self.storage,
             group_id,
             group.epoch.0.saturating_sub(max_rewind_commits),
@@ -1305,7 +1310,7 @@ impl<S: StorageProvider> Engine<S> {
             },
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
         )
-        .map_err(|e| EngineError::Backend(format!("candidate branch peel contexts: {e}")))
+        .map_err(|e| EngineError::Backend(format!("candidate branch peel: {e}")))
     }
 
     /// Re-ingest one retained raw-transport row and settle its retry lifecycle

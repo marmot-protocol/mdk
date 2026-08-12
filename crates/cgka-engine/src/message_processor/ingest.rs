@@ -11,8 +11,9 @@ use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
 use crate::identity::member_id_of_sender;
 use crate::openmls_projection::{
-    CandidateBranchPeelContext, OpenMlsContentKind, process_commit_with_app_data_updates,
-    project_mls_message, retained_anchor_epoch_from_snapshot_name,
+    CandidateBranchPeel, CandidateBranchPeelContext, OpenMlsContentKind,
+    process_commit_with_app_data_updates, project_mls_message,
+    retained_anchor_epoch_from_snapshot_name,
 };
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -40,33 +41,46 @@ use tls_codec::{Deserialize as _, Serialize as _};
 /// What a deferred-peel sweep offers the ingest seam for one retained row.
 ///
 /// The candidate branch states this sweep materialized are offered to a row the
-/// live context cannot read. Their presence is also what makes the graph
-/// *contested*: `candidate_branch_peel_contexts` returns nothing unless two
-/// branches actually compete, so a non-empty set means this sweep is feeding a
-/// pass that has a fork to adjudicate.
+/// live context cannot read. Their presence is a ONE-WAY signal about the
+/// graph: a non-empty set proves a fork, but an empty set proves nothing, since
+/// [`candidate_branch_peel`] loses its contexts on every enumeration halt.
+/// Contested-ness therefore travels in its own field, decided from the stored
+/// commit graph before any replay.
+///
+/// [`candidate_branch_peel`]: crate::openmls_projection::candidate_branch_peel
 #[derive(Clone, Copy)]
 pub(crate) struct DeferredPeelSweep<'a> {
+    contested: bool,
     branch_contexts: &'a [CandidateBranchPeelContext],
 }
 
 impl<'a> DeferredPeelSweep<'a> {
     /// Ordinary live ingest: no sweep, no candidate branches, no contest.
     pub(crate) const LIVE: Self = Self {
+        contested: false,
         branch_contexts: &[],
     };
 
-    pub(crate) fn over_branches(branch_contexts: &'a [CandidateBranchPeelContext]) -> Self {
-        Self { branch_contexts }
+    pub(crate) fn over_branches(peel: &'a CandidateBranchPeel) -> Self {
+        Self {
+            contested: peel.contested,
+            branch_contexts: &peel.contexts,
+        }
     }
 
     fn branch_contexts(&self) -> &'a [CandidateBranchPeelContext] {
         self.branch_contexts
     }
 
-    /// Whether this sweep is feeding a pass that has competing branches to
-    /// adjudicate.
-    pub(crate) fn is_contested(&self) -> bool {
+    /// Whether this sweep materialized a rival branch's state — i.e. whether it
+    /// can read traffic this device's own lineage cannot.
+    pub(crate) fn has_branch_contexts(&self) -> bool {
         !self.branch_contexts.is_empty()
+    }
+
+    /// Whether this sweep is feeding a pass that has a fork to adjudicate.
+    pub(crate) fn is_contested(&self) -> bool {
+        self.contested
     }
 
     /// When a contested sweep buffers evidence, the drain waits for the whole
@@ -887,7 +901,7 @@ impl<S: StorageProvider> Engine<S> {
         // enters convergence as input for the pass that adjudicates that
         // branch, which is the only seam that authenticates it.
         //
-        // While a sweep is working a CONTESTED graph, an application message
+        // While a sweep holds a rival branch's state, an application message
         // takes that same seam whichever context read it. Branch selection
         // weighs app witnesses, and a witness weighs nothing unless the pass
         // sees it. Routing only the rival branch's witnesses into the pass
@@ -896,8 +910,15 @@ impl<S: StorageProvider> Engine<S> {
         // selection is driven off it by construction — the split-brain,
         // inverted. Commits need no such rule; `commit_should_enter_convergence`
         // below decides on epoch, which is already provenance-blind.
+        //
+        // Keyed on captured contexts, NOT on `is_contested`. A contested sweep
+        // whose enumeration halted holds no rival state, so it reads only this
+        // device's own branch — and the pass it would feed almost certainly
+        // cannot read the rival either, having halted on the same missing
+        // checkpoint or the same budget. Routing traffic there restores no
+        // symmetry; it only adds noise.
         let evidence_for_a_contested_pass =
-            msg_content_type == ContentType::Application && sweep.is_contested();
+            msg_content_type == ContentType::Application && sweep.has_branch_contexts();
         if recovered_from_candidate_branch || evidence_for_a_contested_pass {
             return self.buffer_openmls_message_into_convergence(
                 group_id,
@@ -2814,4 +2835,54 @@ fn convergence_ingest_outcome(
     }
 
     IngestOutcome::Buffered { group_id, epoch }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConvergenceDrain, DeferredPeelSweep};
+    use crate::openmls_projection::CandidateBranchPeel;
+
+    /// The whole point of carrying `contested` separately: branch enumeration
+    /// halts for reasons that say nothing about whether the graph is split, so
+    /// an empty context set must not read as "no fork". The two facts drive
+    /// different decisions and must not be collapsed back into one.
+    #[test]
+    fn a_halted_enumeration_leaves_the_sweep_contested_with_nothing_to_read() {
+        let halted = CandidateBranchPeel {
+            contested: true,
+            contexts: Vec::new(),
+        };
+
+        let sweep = DeferredPeelSweep::over_branches(&halted);
+
+        assert!(
+            sweep.is_contested(),
+            "a halt loses the contexts, never the fork"
+        );
+        assert!(
+            !sweep.has_branch_contexts(),
+            "the halt captured no rival state, so there is none to read with"
+        );
+        assert!(
+            matches!(sweep.drain_policy(), ConvergenceDrain::DeferredToCaller),
+            "a contested sweep drains once over its batch, not once per row"
+        );
+    }
+
+    #[test]
+    fn an_uncontested_graph_drains_per_row() {
+        let uncontested = CandidateBranchPeel {
+            contested: false,
+            contexts: Vec::new(),
+        };
+
+        for sweep in [
+            DeferredPeelSweep::over_branches(&uncontested),
+            DeferredPeelSweep::LIVE,
+        ] {
+            assert!(!sweep.is_contested());
+            assert!(!sweep.has_branch_contexts());
+            assert!(matches!(sweep.drain_policy(), ConvergenceDrain::Now));
+        }
+    }
 }
