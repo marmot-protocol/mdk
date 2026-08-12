@@ -154,6 +154,8 @@ impl CFree for MarmotPushRegistrationShareOutcome {
     unsafe fn free_in_place(&mut self) {}
 }
 
+/// # Safety
+/// `outcome` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_push_registration_share_outcome_free(
     outcome: *mut MarmotPushRegistrationShareOutcome,
@@ -182,6 +184,8 @@ impl CFree for MarmotPushRegistrationSyncResult {
     }
 }
 
+/// # Safety
+/// `result` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_push_registration_sync_result_free(
     result: *mut MarmotPushRegistrationSyncResult,
