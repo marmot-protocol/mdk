@@ -3008,6 +3008,18 @@ impl AppClient {
     }
 
     fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
+        // Exporting the secret loads the full MLS group state, so skip it when
+        // the current epoch's secret is already cached. The record epoch can
+        // trail a staged commit by one epoch; that window is covered by the
+        // live-export fallback in `encrypted_media_secret_for_epoch`.
+        let record = self.runtime.group_record(group_id)?;
+        let component_id = Self::encrypted_media_component_id(record.protocol_profile);
+        if self
+            .cached_encrypted_media_epoch_secret(group_id, component_id, record.epoch.0)?
+            .is_some()
+        {
+            return Ok(());
+        }
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
             group_id,
             GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
@@ -3028,7 +3040,15 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            if !self.encrypted_media_for_group(&group_id).required {
+            // The projected component is a positive-only fast path: `true`
+            // warms without an MLS group load. A projected `false` may be
+            // stale (a rebuild error can leave it lagging the signed
+            // component), so it must re-check the authoritative component
+            // before skipping — a missed warm here can strand a
+            // historical epoch's media once the group advances.
+            if !group.encrypted_media.required
+                && !self.encrypted_media_for_group(&group_id).required
+            {
                 continue;
             }
             if self

@@ -9,6 +9,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- App-runtime encrypted-media secret caching now skips the MLS group load,
+  exporter-secret derivation, and database write when the current epoch's
+  secret is already cached, and the cache sweep's `required` pre-check uses
+  the projected group record as a positive-only fast path, re-checking the
+  signed component only when the projection reports media disabled. Message
+  sends and group syncs no longer pay three MLS group loads per media group
+  per sweep.
+  ([#1396](https://github.com/marmot-protocol/mdk/pull/1396))
+
 ### Fixed
 
 - OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the

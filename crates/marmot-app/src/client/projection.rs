@@ -618,6 +618,13 @@ impl AppClient {
             .unwrap_or_else(AppGroupAvatarUrlComponent::absent)
     }
 
+    pub(crate) fn encrypted_media_component_id(profile: ProtocolProfile) -> u16 {
+        match profile {
+            ProtocolProfile::Legacy => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            ProtocolProfile::Current => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        }
+    }
+
     pub(crate) fn encrypted_media_for_group(
         &self,
         group_id: &GroupId,
@@ -627,10 +634,7 @@ impl AppClient {
             .group_record(group_id)
             .map(|group| group.protocol_profile)
             .unwrap_or(ProtocolProfile::Legacy);
-        let component_id = match profile {
-            ProtocolProfile::Legacy => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
-            ProtocolProfile::Current => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-        };
+        let component_id = Self::encrypted_media_component_id(profile);
         self.runtime
             .app_component(group_id, component_id)
             .ok()
