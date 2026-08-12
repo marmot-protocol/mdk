@@ -1968,6 +1968,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         await self._cancel_all_streams("adapter disconnect")
         self._cancel_debounce_tasks()
         self._pending_ambient_context.clear()
+        self._last_inbound_message_ids.clear()
         self._activation_cache.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
@@ -2774,7 +2775,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if not target_message_id:
             return {"success": False, "error": "No Marmot message is available to react to"}
         success = await self._add_reaction(chat_id, target_message_id, emoji)
-        return {"success": success, "emoji": emoji}
+        if not success:
+            return {"success": False, "error": "Marmot reaction failed"}
+        return {"success": True, "message_id": target_message_id}
 
     async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
         try:
@@ -2803,7 +2806,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         target_message_id = message_id or self._last_inbound_message_ids.get(chat_id)
         if not target_message_id:
             return {"success": False, "error": "No Marmot message is available to unreact"}
-        return {"success": await self._remove_reaction(chat_id, target_message_id)}
+        success = await self._remove_reaction(chat_id, target_message_id)
+        if not success:
+            return {"success": False, "error": "Marmot unreact failed"}
+        return {"success": True, "message_id": target_message_id}
 
     async def _send_tool_progress_events(
         self,

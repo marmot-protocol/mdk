@@ -122,7 +122,8 @@ pub enum AgentControlRequest {
         target_message_id_hex: String,
         emoji: String,
     },
-    /// Retract this account's reaction to a durable message.
+    /// Retract this account's most recent active reaction to a durable message,
+    /// whichever reaction content it carries.
     RemoveReaction {
         account_id_hex: String,
         group_id_hex: String,

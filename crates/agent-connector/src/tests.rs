@@ -1213,6 +1213,21 @@ async fn connector_socket_subscribes_to_inbound_messages() {
     assert_eq!(removal_message_ids.len(), 1);
     assert!(!removal_message_ids[0].is_empty());
 
+    let repeated_removal = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-repeat",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = repeated_removal.payload else {
+        panic!("expected missing-reaction error on repeated removal");
+    };
+    assert_eq!(code, "reaction_not_found");
+
     let deleted = send_control_request(
         &socket,
         "req-human-delete",

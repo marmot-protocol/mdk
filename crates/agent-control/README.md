@@ -30,7 +30,9 @@ begin inputs is an error, and trying to begin another active stream with an occu
 `send_reaction` adds arbitrary non-blank, control-free reaction content of at
 most 64 Unicode scalar values to a durable message.
 `remove_reaction` takes the original target message id and retracts the calling
-account's matching reaction; callers do not need to discover the reaction event id.
+account's most recent active reaction on that message, whichever reaction
+content it carries; callers do not need to discover the reaction event id. To
+swap a progress reaction for a completion reaction, remove first and then add.
 
 ## Materialized timeline reads
 

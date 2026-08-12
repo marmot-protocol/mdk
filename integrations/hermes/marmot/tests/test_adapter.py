@@ -128,6 +128,12 @@ def install_fake_hermes_modules():
             # the keyword even when they ignore it (#836).
             raise NotImplementedError
 
+        async def add_reaction(self, chat_id, emoji, message_id=None):
+            raise NotImplementedError
+
+        async def remove_reaction(self, chat_id, message_id=None):
+            raise NotImplementedError
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
@@ -5225,11 +5231,11 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             await adapter.add_reaction(chat_id, "👀"),
-            {"success": True, "emoji": "👀"},
+            {"success": True, "message_id": latest_id},
         )
         self.assertEqual(
             await adapter.remove_reaction(chat_id, explicit_id),
-            {"success": True},
+            {"success": True, "message_id": explicit_id},
         )
 
         client.send_reaction.assert_awaited_once_with(
@@ -5265,7 +5271,7 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             await adapter.add_reaction(chat_id, "👀"),
-            {"success": True, "emoji": "👀"},
+            {"success": True, "message_id": latest_id},
         )
         client.send_reaction.assert_awaited_once_with(
             "11" * 32, chat_id, latest_id, "👀"
@@ -5282,6 +5288,39 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await adapter.remove_reaction("22" * 32))["success"])
         client.send_reaction.assert_not_awaited()
         client.remove_reaction.assert_not_awaited()
+
+    async def test_public_reaction_api_returns_error_for_failed_send(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": [],
+        }
+        client.remove_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": [],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        added = await adapter.add_reaction("22" * 32, "👀", "33" * 32)
+        removed = await adapter.remove_reaction("22" * 32, "33" * 32)
+        self.assertFalse(added["success"])
+        self.assertIn("error", added)
+        self.assertFalse(removed["success"])
+        self.assertIn("error", removed)
+
+    async def test_disconnect_clears_latest_inbound_reaction_targets(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=unittest.mock.AsyncMock(),
+        )
+        adapter._last_inbound_message_ids["22" * 32] = "33" * 32
+
+        await adapter.disconnect()
+
+        self.assertEqual(adapter._last_inbound_message_ids, {})
 
 
 class GroupActivationTests(unittest.IsolatedAsyncioTestCase):

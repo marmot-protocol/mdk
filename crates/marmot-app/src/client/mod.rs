@@ -14,9 +14,7 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
-use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
-};
+use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
@@ -36,18 +34,18 @@ use crate::media::{
     download_encrypted_media, fetch_group_image, is_loopback_http_endpoint, upload_encrypted_media,
     upload_group_image,
 };
-use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
+use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
     AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
-    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    AppInitialGroupImage, AppPerformanceTelemetry, AppQuarantinedGroup, AppRoutingState,
+    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
+    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
+    TimelineMessageQuery, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -2253,7 +2251,7 @@ impl AppClient {
         }
     }
 
-    /// Most recent kind-7 reaction this account authored that targets
+    /// Most recent active reaction this account authored that targets
     /// `target_message_id`, identified by its own message id. Used to build the
     /// kind-5 retraction for an un-react.
     fn own_reaction_event_id(
@@ -2263,23 +2261,26 @@ impl AppClient {
         target_message_id: &str,
     ) -> Result<String, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let messages = self.app.messages_with_query(
+        let timeline = self.app.timeline_messages_with_query(
             &self.state.label,
-            AppMessageQuery {
+            TimelineMessageQuery {
                 group_id_hex: Some(group_id_hex),
-                limit: None,
+                ..TimelineMessageQuery::default()
             },
         )?;
-        messages
+        timeline
+            .messages
             .into_iter()
-            .rev()
-            .find(|message| {
-                message.kind == MARMOT_APP_EVENT_KIND_REACTION
-                    && message.sender == sender
-                    && tag_value(&message.tags, EVENT_REF_TAG) == Some(target_message_id)
-                    && !message.message_id_hex.is_empty()
+            .find(|message| message.message_id_hex == target_message_id)
+            .and_then(|message| {
+                message
+                    .reactions
+                    .user_reactions
+                    .into_iter()
+                    .rev()
+                    .find(|reaction| reaction.sender == sender)
             })
-            .map(|message| message.message_id_hex)
+            .map(|reaction| reaction.reaction_message_id_hex)
             .ok_or(AppError::ReactionNotFound)
     }
 
