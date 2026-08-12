@@ -663,6 +663,56 @@ async fn escalation_from_completed_delivery_survives_later_sync_failure() {
     assert_eq!(escalation.arms, ESCALATION_ARM_THRESHOLD as u32);
 }
 
+/// A failed app-projection checkpoint excludes that batch's message/join
+/// outputs, but it must not discard the one-shot escalation raised by a durable
+/// engine outcome in the same batch.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn escalation_survives_failed_projection_checkpoint() {
+    let dir_bob = tempfile::tempdir().unwrap();
+    let dir_alice = tempfile::tempdir().unwrap();
+    let config = MarmotAppConfig::default()
+        .with_dev_fail_sync_before_boundary_save(BACKFILL_THRESHOLD as u64);
+    let mut live = stalled_bob_in_a_live_group_with_config(&dir_bob, &dir_alice, config).await;
+
+    for run in 0..(ESCALATION_ARM_THRESHOLD - 1) {
+        assert!(live.stall_bob_for_one_run(run).await.is_empty());
+        live.advance_bobs_epoch(&format!("checkpoint-advanced-{run}"))
+            .await;
+    }
+
+    let stalled_epoch = live.bobs_epoch();
+    let created_at = test_unix_now_seconds();
+    for probe in 0..=BACKFILL_THRESHOLD {
+        publish_garbage_group_message_at(
+            &live.relay_url,
+            &live.nostr_group_id_hex,
+            created_at,
+            &format!("checkpoint-failing-probe-{probe}"),
+        )
+        .await;
+    }
+
+    let failure = live
+        .bob
+        .sync_with_partial_progress()
+        .await
+        .expect_err("the accumulated projection checkpoint must fail");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected catch-up boundary save failure")
+    );
+    assert!(failure.partial_summary.messages.is_empty());
+    assert!(failure.partial_summary.joined_groups.is_empty());
+    assert_eq!(failure.partial_summary.epoch_stall_escalations.len(), 1);
+    let escalation = &failure.partial_summary.epoch_stall_escalations[0];
+    assert_eq!(escalation.group_id, live.group_id);
+    assert_eq!(escalation.stalled_epoch, stalled_epoch);
+    assert_eq!(escalation.arms, ESCALATION_ARM_THRESHOLD as u32);
+}
+
 /// An epoch bob passes through cleanly — he keeps up with alice's commits
 /// without stalling at that epoch — ends the arm run. Later arms then open a new
 /// run, so `ESCALATION_ARM_THRESHOLD` arms spread across a recovery never

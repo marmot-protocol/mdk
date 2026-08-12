@@ -102,10 +102,10 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides`; this exercises truthful partial-progress
     /// reporting when delivery N+1 fails before ingest.
     pub dev_fail_sync_before_delivery: Option<u64>,
-    /// Dev/test-only fault injected before persisting the current delivery's
-    /// completion boundary, after this many earlier deliveries completed.
-    /// Honored only with `test-policy-overrides`; this verifies that an
-    /// incompletely persisted delivery is excluded from the completed prefix.
+    /// Dev/test-only fault injected before checkpointing an accumulated sync
+    /// prefix after more than this many deliveries completed. Honored only with
+    /// `test-policy-overrides`; this verifies that an uncommitted batch is
+    /// excluded from the completed prefix and replayed from the engine outbox.
     pub dev_fail_sync_before_boundary_save: Option<u64>,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
@@ -263,8 +263,8 @@ impl MarmotAppConfig {
         self
     }
 
-    /// Fail before saving the current delivery's completion boundary after
-    /// `completed_deliveries` earlier deliveries in test-policy builds. Normal
+    /// Fail before checkpointing a sync prefix after more than
+    /// `completed_deliveries` were accumulated in test-policy builds. Normal
     /// builds ignore this field.
     pub fn with_dev_fail_sync_before_boundary_save(mut self, completed_deliveries: u64) -> Self {
         self.dev_fail_sync_before_boundary_save = Some(completed_deliveries);

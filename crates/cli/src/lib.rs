@@ -423,6 +423,17 @@ pub(crate) fn command_output_result(
             stderr: String::new(),
         },
         Err(err) if json_output => json_wn_error(err),
+        Err(WnError::Sync(sync)) => CliOutput {
+            code: 1,
+            stdout: String::new(),
+            // Partial message plaintext belongs only in this explicit CLI
+            // presentation path. Keep it out of `Error::Display`, which can be
+            // logged by callers and must remain privacy-safe.
+            stderr: format!(
+                "error: sync failed; completed prefix:\n{}\nerror: {}\n",
+                sync.partial_plain, sync.source
+            ),
+        },
         Err(err) => CliOutput {
             code: 1,
             stdout: String::new(),

@@ -381,6 +381,7 @@ fn incremental_retention_finalization_is_visible_without_stale_projection_data()
 
     let mut reprojected = optimistic;
     reprojected.plaintext = "updated projection".to_owned();
+    reprojected.source_message_id_hex = Some("later-duplicate-source".to_owned());
     let update = store.record_app_event(&reprojected).unwrap();
     assert_eq!(update.messages[0].source_epoch, Some(9));
     assert_eq!(update.messages[0].retention_seconds, Some(300));
@@ -388,6 +389,11 @@ fn incremental_retention_finalization_is_visible_without_stale_projection_data()
 
     let page = list(&store);
     assert_eq!(page[0].source_epoch, Some(9));
+    assert_eq!(
+        page[0].source_message_id_hex.as_deref(),
+        Some("source-optimistic"),
+        "reprojection must retain the first durable transport source id",
+    );
     assert_eq!(page[0].retention_seconds, Some(300));
     assert_eq!(page[0].retention_expires_at, Some(350));
 }

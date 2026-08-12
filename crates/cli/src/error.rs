@@ -9,13 +9,23 @@ use serde_json::{Value, json};
 
 use crate::relay_lists_json;
 
-#[derive(Debug, thiserror::Error)]
-#[error("sync failed; completed prefix:\n{partial_plain}\nerror: {source}")]
+#[derive(thiserror::Error)]
+#[error("sync failed")]
 pub(crate) struct SyncCommandError {
     #[source]
     pub(crate) source: AppError,
     pub(crate) partial_plain: String,
     pub(crate) partial_json: Value,
+}
+
+impl std::fmt::Debug for SyncCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncCommandError")
+            .field("source", &self.source)
+            .field("partial", &"redacted")
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

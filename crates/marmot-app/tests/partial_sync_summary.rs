@@ -177,10 +177,28 @@ async fn direct_sync_failure_returns_applied_prefix() {
         "the fault must come from the N+1 ingest attempt: {}",
         failure.source
     );
+    let audit_rows = app_bob
+        .audit_log_files()
+        .unwrap()
+        .into_iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        audit_rows
+            .iter()
+            .any(|row| { row["kind"]["type"] == "sync_drain" && row["kind"]["deliveries"] == 1 }),
+        "the failed drain must retain forensic span and completed-delivery evidence",
+    );
 }
 
 #[tokio::test]
-async fn delivery_with_failed_boundary_save_is_excluded_from_applied_prefix() {
+async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
     let batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
@@ -188,21 +206,38 @@ async fn delivery_with_failed_boundary_save_is_excluded_from_applied_prefix() {
     let failure = bob
         .sync_with_partial_progress()
         .await
-        .expect_err("the second delivery boundary save must fail");
+        .expect_err("the accumulated batch checkpoint must fail");
     assert_eq!(
         failure.partial_summary.messages.len(),
-        1,
-        "the delivery whose completion boundary failed is not part of the completed prefix",
+        0,
+        "no delivery from an uncommitted batch is part of the completed prefix",
     );
     assert!(
         failure
             .source
             .to_string()
             .contains("injected catch-up boundary save failure"),
-        "the fault must come from the N+1 completion boundary: {}",
+        "the fault must come from the accumulated-prefix checkpoint: {}",
         failure.source
     );
-    let completed_plaintext = failure.partial_summary.messages[0].plaintext.clone();
+    let failed_drain = app_bob
+        .audit_log_files()
+        .unwrap()
+        .into_iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| row["kind"]["type"] == "sync_drain")
+        .last()
+        .expect("failed drain audit row");
+    assert_eq!(
+        failed_drain["kind"]["cursor_after_secs"], failed_drain["kind"]["cursor_before_secs"],
+        "a failed projection checkpoint must not claim an uncommitted cursor",
+    );
     drop(bob);
     drop(app_bob);
 
@@ -211,10 +246,9 @@ async fn delivery_with_failed_boundary_save_is_excluded_from_applied_prefix() {
     let recovered = bob_recovered.sync().await.unwrap();
     assert_eq!(
         recovered.messages.len(),
-        1,
-        "the failed boundary's durable message must replay after reopen"
+        2,
+        "every durable engine output from the failed checkpoint must replay after reopen"
     );
-    assert_ne!(recovered.messages[0].plaintext, completed_plaintext);
     drop(bob_recovered);
     drop(app_bob_recovered);
 
@@ -223,6 +257,33 @@ async fn delivery_with_failed_boundary_save_is_excluded_from_applied_prefix() {
     assert!(
         bob_acknowledged.sync().await.unwrap().messages.is_empty(),
         "the replayed message must be acknowledged exactly once"
+    );
+}
+
+#[tokio::test]
+async fn failed_checkpoint_retries_once_on_retained_client() {
+    let batch = pending_two_message_batch().await;
+    let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
+    let mut bob = app_bob.client("bob").await.unwrap();
+
+    let failure = bob
+        .sync_with_partial_progress()
+        .await
+        .expect_err("the accumulated batch checkpoint must fail");
+    assert!(failure.partial_summary.messages.is_empty());
+
+    let recovered = bob
+        .sync_with_partial_progress()
+        .await
+        .expect("the retained projection and outbox acknowledgements retry");
+    assert_eq!(recovered.messages.len(), 2);
+    assert!(
+        bob.sync_with_partial_progress()
+            .await
+            .unwrap()
+            .messages
+            .is_empty(),
+        "the retained client must return the checkpointed summary exactly once",
     );
 }
 
@@ -330,7 +391,7 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     assert_eq!(
         failure.partial_summary.joined_groups.len(),
         1,
-        "exactly one route-changing welcome must cross the completion boundary",
+        "exactly one route-changing welcome must cross the accumulated-prefix checkpoint",
     );
     assert!(failure.partial_summary.messages.is_empty());
     let completed_group = failure.partial_summary.joined_groups[0].clone();
@@ -420,9 +481,9 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
     tracker_server.await.unwrap();
     runtime_bob_boot2.shutdown().await;
 
-    // The same per-delivery boundary must persist the seen-id/cursor state and
-    // app-outbox acknowledgement. Bound the third boot with fresh traffic and
-    // prove the delivery announced before the failure is not replayed.
+    // The accumulated-prefix checkpoint must persist the seen-id/cursor state
+    // and app-outbox acknowledgement. Bound the third boot with fresh traffic
+    // and prove the delivery announced before the failure is not replayed.
     let app_bob_boot3 = batch.bob_app(None);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3);
     let mut events_bob_boot3 = runtime_bob_boot3.subscribe();

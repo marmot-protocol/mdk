@@ -165,8 +165,9 @@ impl AppClient {
         );
     }
 
-    /// Record a `sync_drain` forensic audit row at the drain-loop exit: how long
-    /// the drain ran (`duration_ms`, wall-clock), how many deliveries it ingested
+    /// Record a `sync_drain` forensic audit row at every drain-loop exit: how
+    /// long the drain ran (`duration_ms`, wall-clock), how many deliveries it
+    /// ingested
     /// (`deliveries`), and the durable transport cursor immediately before and
     /// after the drain (Nostr second-granular). Account-scoped, so `group_ref`
     /// is `None`.

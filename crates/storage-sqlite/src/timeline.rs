@@ -504,7 +504,7 @@ impl SqliteAccountStorage {
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
-                    source_message_id_hex = excluded.source_message_id_hex,
+                    source_message_id_hex = COALESCE(app_events.source_message_id_hex, excluded.source_message_id_hex),
                     source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,

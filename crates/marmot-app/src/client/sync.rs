@@ -51,6 +51,11 @@ pub(crate) enum ConvergenceScheduleState {
     PendingOutbound,
 }
 
+enum SyncCheckpointError {
+    BeforePersistence(AppError),
+    AfterPersistence(AppError),
+}
+
 impl AppClient {
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
@@ -196,21 +201,33 @@ impl AppClient {
     /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
     /// report the durably applied prefix of a failed catch-up pass.
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
-        self.sync_with_partial_progress()
+        self.sync_inner(None)
             .await
             .map_err(|failure| failure.source)
     }
 
     /// Synchronize while retaining the durably applied prefix on failure.
     pub async fn sync_with_partial_progress(&mut self) -> Result<SyncSummary, SyncFailure> {
-        self.sync_inner(None).await
+        match self.sync_inner(None).await {
+            Ok(summary) => Ok(summary),
+            Err(mut failure) => {
+                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
+                Err(failure)
+            }
+        }
     }
 
     pub(crate) async fn sync_with_startup_stage_telemetry(
         &mut self,
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<SyncSummary, SyncFailure> {
-        self.sync_inner(Some(telemetry)).await
+        match self.sync_inner(Some(telemetry)).await {
+            Ok(summary) => Ok(summary),
+            Err(mut failure) => {
+                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
+                Err(failure)
+            }
+        }
     }
 
     async fn sync_inner(
@@ -244,7 +261,10 @@ impl AppClient {
         // unrelated send/ingest. Fold any pending events into this summary.
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
-            Err(error) => return Err(SyncFailure::new(summary, error)),
+            Err(error) => {
+                self.drain_epoch_stall_escalations(&mut summary);
+                return Err(SyncFailure::new(summary, error));
+            }
         };
         summary.merge(drained);
         self.drain_epoch_stall_escalations(&mut summary);
@@ -294,17 +314,25 @@ impl AppClient {
             return Ok(summary);
         }
         let display_names = self.app.display_names_by_id()?;
-        // Synthetic source identity: drained events have no inbound transport
-        // message. The empty id signals "no source message"; the audit recorder
-        // drops it rather than emitting a schema-invalid `message_ids` entry
-        // (see `schema_valid_message_ids`).
-        let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
         let mut gossip_message_ids = HashSet::new();
         for event in &effects.events {
+            // A replayed application event has no outer relay envelope, but its
+            // durable engine outbox key is stable and unique. Use that key as
+            // the synthetic source so a crash can replay several pending
+            // events in one drain without colliding on an empty source id.
+            let source_message_id_hex = match event {
+                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                    hex::encode(message_id.as_slice())
+                }
+                cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
+                    hex::encode(via_welcome.as_slice())
+                }
+                _ => String::new(),
+            };
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
                     local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
@@ -386,10 +414,20 @@ impl AppClient {
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
         let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
+        if (routes_dirty || routes_changed)
+            && let Err(error) = self.sync_runtime_groups().await
+        {
+            self.pending_failed_sync_summary.merge(summary);
+            return Err(error);
         }
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
+            // The engine outbox remains unacknowledged. A reopened client will
+            // replay it; a retained client instead checkpoints the projected
+            // state on its next sync and returns this deferred summary once.
+            self.pending_failed_sync_summary.merge(summary);
+            return Err(error);
+        }
+        summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -558,11 +596,11 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let routes_dirty = self
-            .ingest_delivery(delivery, &display_names, &mut summary, None)
+            .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
-        // fail, matching the catch-up delivery boundary below.
+        // fail, matching the catch-up checkpoint below.
         if routes_dirty {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
@@ -598,6 +636,7 @@ impl AppClient {
         let drain_started = std::time::Instant::now();
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut deliveries: u64 = 0;
+        let mut routes_dirty = false;
 
         loop {
             let wait = if first_wait {
@@ -610,7 +649,16 @@ impl AppClient {
                 Ok(Ok(Some(delivery))) => delivery,
                 Ok(Ok(None)) => break,
                 Ok(Err(error)) => {
-                    return Err(SyncFailure::new(summary, error.into()));
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            deliveries,
+                            error.into(),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
                 }
                 Err(_) => break,
             };
@@ -621,68 +669,65 @@ impl AppClient {
             if seen.contains(&event_id) {
                 continue;
             }
-            let cursor_before_delivery = self.state.last_transport_timestamp;
-            let mut delivery_summary = SyncSummary::default();
-            let delivery_routes_dirty = match self
-                .ingest_delivery(
-                    delivery,
-                    &display_names,
-                    &mut delivery_summary,
-                    Some(deliveries),
-                )
-                .await
-            {
-                Ok(routes_dirty) => routes_dirty,
-                Err(error) => return Err(SyncFailure::new(summary, error)),
-            };
-            let mut state_before_boundary = self.state.clone();
-            state_before_boundary.last_transport_timestamp = cursor_before_delivery;
-            remember_seen_event(&mut seen, &mut self.state, event_id);
-            // A later delivery may fail after these effects are already durable.
-            // Persist the matching seen-id/cursor state at the same per-delivery
-            // boundary so a restart cannot replay work already reported in the
-            // partial summary or advance the relay floor past uncommitted state.
-            let boundary_failure = if cfg!(feature = "test-policy-overrides")
+            if cfg!(feature = "test-policy-overrides")
                 && self
                     .app
                     .config
-                    .dev_fail_sync_before_boundary_save
+                    .dev_fail_sync_before_delivery
                     .is_some_and(|limit| deliveries >= limit)
             {
-                Err(AppError::BlockingTask(
-                    "injected catch-up boundary save failure".to_owned(),
-                ))
-            } else {
-                self.save_state_with_pending_local_group_deletion_frontier_clears()
-            };
-            if let Err(error) = boundary_failure {
-                // The SQLite boundary is atomic. Restore the in-memory seen id
-                // and transport cursor while retaining the state projections
-                // produced by the already-durable engine effects.
-                self.state = state_before_boundary;
-                return Err(SyncFailure::new(summary, error));
+                return Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        deliveries,
+                        AppError::BlockingTask("injected catch-up delivery failure".to_owned()),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await);
             }
-            // Escalations are accumulated as a side channel while observing
-            // this delivery. Move them into the delivery-local summary only
-            // after its persistence boundary succeeds, so N's escalation is
-            // returned when N+1 fails and an incomplete N is never reported.
-            self.drain_epoch_stall_escalations(&mut delivery_summary);
+            let mut delivery_summary = SyncSummary::default();
+            let delivery_routes_dirty = match self
+                .ingest_delivery(delivery, &display_names, &mut delivery_summary)
+                .await
+            {
+                Ok(routes_dirty) => routes_dirty,
+                Err(error) => {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            deliveries,
+                            error,
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            };
+            remember_seen_event(&mut seen, &mut self.state, event_id);
             deliveries = deliveries.saturating_add(1);
             summary.merge(delivery_summary);
-            // Refresh subscriptions at the same durable per-delivery boundary.
-            // If N+1 fails, groups joined by the reported N-prefix must already
-            // be live instead of waiting for another sync/startup recovery pass.
-            if delivery_routes_dirty && let Err(error) = self.sync_runtime_groups().await {
-                return Err(SyncFailure::new(summary, error));
-            }
+            routes_dirty |= delivery_routes_dirty;
         }
 
-        let routes_changed = match self.refresh_group_routes() {
-            Ok(routes_changed) => routes_changed,
-            Err(error) => return Err(SyncFailure::new(summary, error)),
-        };
-        if routes_changed && let Err(error) = self.sync_runtime_groups().await {
-            return Err(SyncFailure::new(summary, error));
+        if let Err(error) = self
+            .checkpoint_sync_prefix(&mut summary, routes_dirty, deliveries)
+            .await
+        {
+            let cursor_after_secs = match &error {
+                SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
+                SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
+            };
+            let (summary, source) = self.checkpoint_failure_summary(summary, error);
+            self.record_sync_drain(
+                drain_started.elapsed().as_millis() as u64,
+                deliveries,
+                cursor_before_secs,
+                cursor_after_secs,
+            );
+            return Err(SyncFailure::new(summary, source));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -690,10 +735,102 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
-            return Err(SyncFailure::new(summary, error));
-        }
         Ok(summary)
+    }
+
+    async fn finish_failed_sync_drain(
+        &mut self,
+        mut summary: SyncSummary,
+        routes_dirty: bool,
+        deliveries: u64,
+        original_error: AppError,
+        drain_started: std::time::Instant,
+        cursor_before_secs: Option<u64>,
+    ) -> SyncFailure {
+        let (source, cursor_after_secs) = match self
+            .checkpoint_sync_prefix(&mut summary, routes_dirty, deliveries)
+            .await
+        {
+            Ok(()) => (original_error, self.state.last_transport_timestamp),
+            Err(error) => {
+                let cursor_after_secs = match &error {
+                    SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
+                    SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
+                };
+                let (retained_summary, checkpoint_error) =
+                    self.checkpoint_failure_summary(summary, error);
+                summary = retained_summary;
+                (checkpoint_error, cursor_after_secs)
+            }
+        };
+        self.record_sync_drain(
+            drain_started.elapsed().as_millis() as u64,
+            deliveries,
+            cursor_before_secs,
+            cursor_after_secs,
+        );
+        SyncFailure::new(summary, source)
+    }
+
+    async fn checkpoint_sync_prefix(
+        &mut self,
+        summary: &mut SyncSummary,
+        routes_dirty: bool,
+        deliveries: u64,
+    ) -> Result<(), SyncCheckpointError> {
+        let routes_changed = self
+            .refresh_group_routes()
+            .map_err(SyncCheckpointError::BeforePersistence)?;
+        let checkpoint = if cfg!(feature = "test-policy-overrides")
+            && self
+                .app
+                .config
+                .dev_fail_sync_before_boundary_save
+                .is_some_and(|limit| deliveries > 0 && deliveries > limit)
+        {
+            Err(AppError::BlockingTask(
+                "injected catch-up boundary save failure".to_owned(),
+            ))
+        } else {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()
+        };
+        if let Err(error) = checkpoint {
+            return Err(SyncCheckpointError::BeforePersistence(error));
+        }
+
+        summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
+
+        // Escalations describe a durable engine decision, not the re-derivable
+        // account projection. Once the prefix commits, move them alongside its
+        // summary before any fallible route work.
+        self.drain_epoch_stall_escalations(summary);
+
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups()
+                .await
+                .map_err(SyncCheckpointError::AfterPersistence)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_failure_summary(
+        &mut self,
+        summary: SyncSummary,
+        error: SyncCheckpointError,
+    ) -> (SyncSummary, AppError) {
+        match error {
+            SyncCheckpointError::BeforePersistence(source) => {
+                // Message/join projections from this drain are not reportable
+                // until their checkpoint commits. Epoch-stall escalations are
+                // already durable engine decisions and one-shot, so surface
+                // them rather than losing them when a managed client is rebuilt.
+                self.pending_failed_sync_summary.merge(summary);
+                let mut retained = SyncSummary::default();
+                self.drain_epoch_stall_escalations(&mut retained);
+                (retained, source)
+            }
+            SyncCheckpointError::AfterPersistence(source) => (summary, source),
+        }
     }
 
     async fn ingest_delivery(
@@ -701,20 +838,7 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
-        sync_deliveries_before_delivery: Option<u64>,
     ) -> Result<bool, AppError> {
-        if cfg!(feature = "test-policy-overrides")
-            && sync_deliveries_before_delivery.is_some_and(|deliveries| {
-                self.app
-                    .config
-                    .dev_fail_sync_before_delivery
-                    .is_some_and(|limit| deliveries >= limit)
-            })
-        {
-            return Err(AppError::BlockingTask(
-                "injected catch-up delivery failure".to_owned(),
-            ));
-        }
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
@@ -856,11 +980,12 @@ impl AppClient {
     ///
     /// Call this as the LAST step before `Ok(summary)`, at every outermost seam
     /// — the ones whose `Ok` is handed to a caller rather than followed by more
-    /// fallible work. An interior `?` returns before the move runs, so the stash
-    /// simply rides the next successful seam instead of being lost with the
-    /// failed pass's summary. Moving (not copying) is what keeps delivery
-    /// exactly-once. Because the stash is shared, a seam that omits this call
-    /// *defers* delivery to the next seam that does; it does not lose it.
+    /// fallible work. Partial-progress sync also calls it on `Err`, moving the
+    /// one-shot decision into `SyncFailure::partial_summary` before a managed
+    /// worker can discard and rebuild the client. The compatibility `sync()`
+    /// path leaves it stashed on failure because its `AppError` contract has no
+    /// partial-summary channel. Moving (not copying) keeps delivery exactly
+    /// once across either path.
     ///
     /// One nested case needs care: [`Self::drain_pending_session_events`] drains
     /// while nested inside `sync_inner`, so its escalations leave the stash and
@@ -870,19 +995,6 @@ impl AppClient {
     /// also makes `sync_inner`'s own call belt-and-braces rather than
     /// load-bearing: the nested drain has already emptied the stash.)
     ///
-    /// Residual: the receive arm drops the whole client on a failed pass, so the
-    /// replacement starts with an empty stash and a fresh detector; the
-    /// `epoch_stall_backfill_escalated` row recorded just before the push is the
-    /// only trace that outlives them, and only where audit logging is on (opt-in,
-    /// off by default). Re-escalating then costs a whole fresh three-arm run, and
-    /// only its first arm can land at the epoch the device already sits at — an
-    /// arm at an epoch already fired at is a `Skip` — so arms two and three each
-    /// need the local epoch to genuinely advance. A group that is still advancing
-    /// therefore re-escalates roughly two epochs later, delayed rather than lost;
-    /// a group frozen at one local epoch arms once and never escalates again.
-    /// That second case is a pre-existing blind spot of the arm counter, not a
-    /// rebuild artifact — a group frozen from its first arm never escalates in a
-    /// fresh process either — and is tracked for a follow-up.
     fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations

@@ -107,14 +107,20 @@ pub struct AppClient {
     /// sync summary so live chat-list/group-state subscriptions observe the
     /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
+    /// App-visible outputs ingested during a sync whose account-projection
+    /// checkpoint failed. A retained client keeps the matching projected state
+    /// and outbox acknowledgements, then returns this summary after its next
+    /// successful checkpoint. A reopened client recovers the same outputs from
+    /// the durable engine outbox instead.
+    pub(crate) pending_failed_sync_summary: crate::SyncSummary,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
     /// The detector latches `escalated` one-shot per unrecovered run, so an
     /// escalation dropped by a later `?` on the recording pass is never raised
-    /// again — the run keeps arming in silence. Escalations therefore land here
-    /// and move onto a delivery-local summary only after that delivery crosses
-    /// its persistence boundary (see `Self::drain_epoch_stall_escalations`).
+    /// again. Escalations therefore land here and move onto either a successful
+    /// summary or a partial-progress failure before a managed client is rebuilt
+    /// (see `Self::drain_epoch_stall_escalations`).
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Batch-start local-deletion frontiers crossed by authenticated fresh

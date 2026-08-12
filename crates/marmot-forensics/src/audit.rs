@@ -982,9 +982,9 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relay_results: Vec<RelayRegistration>,
     },
-    /// The transport drain loop (`sync_sdk_relay`) finished draining inbound
-    /// deliveries and is about to persist state. Records how long the drain ran
-    /// (`duration_ms`, true wall-clock), how many deliveries it ingested
+    /// The transport drain loop (`sync_sdk_relay`) reached a success or failure
+    /// exit. Records how long the drain ran (`duration_ms`, true wall-clock),
+    /// how many deliveries it ingested
     /// (`deliveries`), and the durable transport cursor immediately before and
     /// after the drain (`cursor_before_secs` / `cursor_after_secs`; `None`
     /// before any delivery has ever advanced the cursor).

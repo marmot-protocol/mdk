@@ -48,6 +48,10 @@ fn sync_failure_error(
 }
 
 fn sync_plain(summary: &SyncSummary) -> String {
+    sync_plain_with_empty(summary, "no new events")
+}
+
+fn sync_plain_with_empty(summary: &SyncSummary, empty: &str) -> String {
     let mut lines = Vec::new();
     for group_id in &summary.joined_groups {
         lines.push(format!("joined group {}", hex::encode(group_id.as_slice())));
@@ -60,12 +64,23 @@ fn sync_plain(summary: &SyncSummary) -> String {
             message.plaintext
         ));
     }
+    if !summary.events.is_empty() {
+        lines.push(format!("processed {} event(s)", summary.events.len()));
+    }
+    if !summary.projection_updates.is_empty() {
+        lines.push(format!(
+            "processed {} projection update(s)",
+            summary.projection_updates.len()
+        ));
+    }
+    if !summary.epoch_stall_escalations.is_empty() {
+        lines.push(format!(
+            "reported {} epoch stall escalation(s)",
+            summary.epoch_stall_escalations.len()
+        ));
+    }
     if lines.is_empty() {
-        if summary.events.is_empty() {
-            "no new events".to_owned()
-        } else {
-            format!("processed {} event(s)", summary.events.len())
-        }
+        empty.to_owned()
     } else {
         lines.join("\n")
     }
@@ -84,6 +99,8 @@ fn sync_json(
         }).collect::<Vec<_>>(),
         "messages": sync_messages_json(app, summary.messages),
         "events": summary.events.len(),
+        "projection_updates": summary.projection_updates.len(),
+        "epoch_stall_escalations": summary.epoch_stall_escalations.len(),
     }))
 }
 
@@ -116,38 +133,7 @@ fn sync_messages_json(app: &MarmotApp, messages: Vec<ReceivedMessage>) -> Vec<Va
 }
 
 fn partial_sync_plain(summary: &SyncSummary) -> String {
-    let mut lines = Vec::new();
-    for group_id in &summary.joined_groups {
-        lines.push(format!("joined group {}", hex::encode(group_id.as_slice())));
-    }
-    for message in &summary.messages {
-        lines.push(format!(
-            "received group={} from={}: {}",
-            hex::encode(message.group_id.as_slice()),
-            message.sender,
-            message.plaintext
-        ));
-    }
-    if !summary.events.is_empty() {
-        lines.push(format!("processed {} event(s)", summary.events.len()));
-    }
-    if !summary.projection_updates.is_empty() {
-        lines.push(format!(
-            "processed {} projection update(s)",
-            summary.projection_updates.len()
-        ));
-    }
-    if !summary.epoch_stall_escalations.is_empty() {
-        lines.push(format!(
-            "reported {} epoch stall escalation(s)",
-            summary.epoch_stall_escalations.len()
-        ));
-    }
-    if lines.is_empty() {
-        "no completed sync progress".to_owned()
-    } else {
-        lines.join("\n")
-    }
+    sync_plain_with_empty(summary, "no completed sync progress")
 }
 
 fn partial_sync_json_value(
@@ -220,13 +206,16 @@ mod tests {
             "durable before sync failure"
         );
         assert_eq!(rendered["partial"]["epoch_stall_escalations"], 1);
-        assert!(error.to_string().contains("durable before sync failure"));
+        assert_eq!(error.to_string(), "sync failed");
+        assert!(!format!("{error:?}").contains("durable before sync failure"));
+        let plain = crate::command_output_result(false, Err(error));
+        assert!(plain.stderr.contains("durable before sync failure"));
         assert!(
-            error
-                .to_string()
+            plain
+                .stderr
                 .contains("reported 1 epoch stall escalation(s)")
         );
-        assert!(error.to_string().contains("injected sync failure"));
+        assert!(plain.stderr.contains("injected sync failure"));
     }
 
     #[test]
@@ -254,11 +243,11 @@ mod tests {
                 .is_some_and(|message| message.contains("original sync failure"))
         );
         assert!(rendered["partial"]["npub"].is_null());
-        assert!(error.to_string().contains("original sync failure"));
+        assert_eq!(error.to_string(), "sync failed");
     }
 
     #[test]
-    fn successful_sync_output_keeps_its_existing_shape() {
+    fn successful_sync_output_reports_all_summary_counts() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let account = home.create_account("alice").unwrap();
@@ -272,10 +261,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(sync_plain(&summary), "no new events");
+        assert_eq!(sync_plain(&summary), "reported 1 epoch stall escalation(s)");
         let rendered = sync_json(&app, account, summary).unwrap();
-        assert!(rendered.get("projection_updates").is_none());
-        assert!(rendered.get("epoch_stall_escalations").is_none());
+        assert_eq!(rendered["projection_updates"], 0);
+        assert_eq!(rendered["epoch_stall_escalations"], 1);
         assert_eq!(rendered["events"], 0);
     }
 }
