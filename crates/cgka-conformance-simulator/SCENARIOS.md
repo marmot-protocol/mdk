@@ -293,6 +293,19 @@ These are the scenarios another implementation should be able to load from JSON 
   replay from retained histories) stays in the `adversarial-reliability` generated family per `retained_relay.rs`
   doctrine; this vector models mailbox catch-up.
 
+### `late-welcome-backfill/v1`
+
+- File: `vectors/late-welcome-backfill.v1.json`
+- Setup: Alice creates a group with Bob, invites Dave, and the group advances two epochs while Dave's Welcome is
+  withheld. The commits reach Dave before he can resolve the group. After the Welcome arrives and Dave joins at the
+  invite epoch, duplicates of the missed commits are released, standing in for relay redelivery.
+- Pressure: pre-join traffic is dropped without a durable record (the deliberate unknown-route flood posture), so
+  the post-join redelivery must not be misclassified as a duplicate of terminal input.
+- Expected: Dave joins at epoch 2, applies the redelivered commits to reach epoch 4, and sends the first post-join
+  application message; all three clients converge on the tip. The Rust regression for this shape is
+  `late_welcome_join_catches_up_via_redelivered_commits` in `tests/canonical_scenarios.rs`, and
+  `commit_missing_proposal_defers_and_applies_after_proposal_backfill` pins the sibling missing-proposal deferral.
+
 ## Incident-Replay Vectors
 
 These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
