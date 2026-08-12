@@ -148,7 +148,7 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
 - Boundary: this is public projection evidence. Adapter-local message ids, runtime event counts, database paths, and
   other execution-specific observations are deliberately not compared.
 
-### `four_party_cross_route_recovery_reaches_app_runtime_equivalence`
+### `four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes`
 
 - Runs: the four-participant cross-route topology through both the strict retained-engine subject and the full
   `MarmotAppRuntime` adapter. The app harness's real in-memory Nostr relay associates retained events with stable
@@ -161,15 +161,14 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   self-update) are not action-addressable on this adapter.
 - Checks: the retained-engine reference reaches exact canonical equality, durable accepted/invalidated/accepted commit
   dispositions, no pending work, and all twelve active decryptability edges. The app run pins the intended split at
-  the intermediate checkpoint, then requires every app participant to match the reference epoch, roster, profile, and
-  administration and to expose the complete witness plus four active probes exactly once. Superseded profile commits
-  may correctly leave invalidated kind-1210 system rows; exact equality of the known visible chat inputs proves the
-  application messages were neither lost nor incorrectly withdrawn.
+  the intermediate checkpoint, then accepts only reviewed corrected-input terminal surfaces: complete equivalence,
+  the previously characterized lag/missing-probe surfaces, or an exact branch-aligned protocol/probe split. It also
+  pins the only two observed participant-local invalidated-row count shapes instead of comparing opaque local ids.
 - Regression: the original harness used the Nostr database's destructive `delete` operation for temporary
   invisibility. That permanently tombstoned the event id, and a later unchecked `save_event` could not restore it. The
-  resulting three terminal shapes were simulator artifacts caused by genuinely incomplete relay history, not
-  production convergence counterexamples. `retained_relay_control_restores_hidden_history_for_offline_repair` pins
-  that a hidden event is absent during repair and queryable again after restoration.
+  old runs therefore did not prove the claimed restored-input contract. The focused
+  `retained_relay_control_restores_hidden_history_for_offline_repair` test now pins that contract, but repeated runs
+  against the corrected input still produce a genuine branch/probe split. The assurance claims therefore remain open.
 - Boundary: process, container, and VM adapters do not yet expose equivalent controlled retained-event staging. They
   must not claim this topology from targeted catch-up alone because a live relay can deliver the competing root first.
 

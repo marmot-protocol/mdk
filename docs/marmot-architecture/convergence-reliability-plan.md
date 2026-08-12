@@ -1023,12 +1023,11 @@ engine repair or scaling the existing corpus is sufficient.
     restarts around each durable transition rather than the single post-displacement restart. The #1372 journeys are
     capability-overlap evidence, not execution of the four-party adversarial vector or a substitute for its exact
     cryptographic, disposition, pending-work, and active-decryptability assertions. The first controlled app-runtime
-    execution now exists as `cross-route-app-runtime-recovery/v1` and reaches the strict reference's public protocol
-    state with the witness and all four active probes visible exactly once. Its former apparent falsification came from
-    destructive relay-database deletion in the simulator: the event ids were permanently tombstoned, so the attempted
-    restore did not provide the authenticated dependency-closed input set the test claimed. Keep this item open for
-    process/container/VM execution, per-durable-transition restart permutations, and exact evidence on adapters that
-    can expose it.
+    execution now exists as `cross-route-app-runtime-recovery/v1`. A reversible relay query layer fixes the original
+    destructive event-id tombstone artifact, but repeated corrected-input executions still alternate between complete
+    equivalence and reviewed non-equivalent terminal surfaces, including a two-branch protocol/probe split. Keep this
+    item open for that app-runtime falsification, process/container/VM execution, per-durable-transition restart
+    permutations, and exact evidence on adapters that can expose it.
 - [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
   disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
   comparison remains part of the open route-equivalence work above.
@@ -1042,9 +1041,10 @@ engine repair or scaling the existing corpus is sufficient.
   mutation result falsifies one of its premises.
 
 The remaining 6.1 work is assurance closure, not another speculative engine rewrite. #1285 is the implementation now
-on `master`; the retained-engine and app-runtime routes now agree for the controlled four-party topology. The next
-tests must carry the same authenticated dependency-closed input contract into process/container/VM execution and the
-remaining durable-transition permutations, preserving any genuine counterexample before changing production code.
+on `master`; the retained-engine reference settles, while the corrected-input app-runtime route does not do so
+reliably. Preserve and minimize that counterexample before changing production code, then carry the same authenticated
+dependency-closed input contract into process/container/VM execution and the remaining durable-transition
+permutations.
 
 [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) has now merged the fail-closed missing-anchor behavior and
 Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) remains
@@ -1243,13 +1243,12 @@ residual gap.
    projections without weakening the four-party vector or claiming exact cryptographic/disposition evidence from
    adapters that cannot expose it. The app-runtime slice now runs the actual four-party adversarial vector with
    action-addressed, reversible shared-relay event staging rather than timing a live relay. Its strict retained-engine
-   reference passes exact state, dispositions, pending-work, and decryptability checks; every app participant reaches
-   the same public epoch, roster, profile, and administration with the witness and all four probes visible exactly
-   once. The former three-shape counterexample was a simulator artifact: temporary visibility used destructive database
-   deletion, whose permanent event-id tombstone made the later restore a no-op. A focused hide/repair/restore/repair
-   regression now protects the input contract. Process/container/VM execution and durable-transition permutations
-   still need equivalent controlled retained-event staging. The decision-route inventory is machine checked; keep the
-   remaining assurance artifacts independent of #1293.
+   reference passes exact state, dispositions, pending-work, and decryptability checks. A focused
+   hide/repair/restore/repair regression fixes and protects the original destructive event-id tombstone bug, but
+   repeated corrected-input app runs still produce both complete equivalence and a two-branch protocol/probe split.
+   Route equivalence, active decryptability, and complete application disposition therefore remain open alongside
+   process/container/VM execution and durable-transition permutations. The decision-route inventory is machine
+   checked; keep the remaining assurance artifacts independent of #1293.
 6. [x] Land and execute a focused current-`master` regression gate for the production convergence changes that landed
    after the reviewed 1,170-case snapshot. Cover #1329 missing-anchor halt and authenticated Welcome repair, #1360
    atomic self-removal persistence across injected write failures and restart, #1365 armed full-history backfill after
@@ -1421,8 +1420,8 @@ incorrect result.
 | 2026-08-11 | 6.1 cross-adapter public projection checkpoint | Made accepted publication checkpoints portable across the `CgkaEngine` harness's staged transport and the app runtime's already-published command surface, then ran a three-participant profile/message/restart IR unchanged through the `CgkaEngine` harness, full app-runtime adapter, and isolated app processes. The production-shaped adapters cross the `CgkaEngine`, `TransportPeeler`, and `TransportAdapter` seams. A companion app/process permutation takes one member offline across the commit and message, restarts another member, performs full-history repair, and requires equivalent duplicate-free public projections. Exact MLS state, active decryptability, the four-party adversarial topology, containers, and VMs remain open. | [MDK #1372](https://github.com/marmot-protocol/mdk/pull/1372); `engine_app_runtime_and_process_adapters_reach_equivalent_public_state`; `app_runtime_and_process_adapters_recover_the_same_offline_projection`; simulator-only adapter seam and focused process/app tests |
 | 2026-08-11 | Failure-input and pinned-policy boundary hardening | Rejected manifest-less or corrupt NDJSON stream remnants instead of silently classifying them as empty healthy incident exports, and restored normal-build coverage proving that a commit beyond the pinned five-commit rewind horizon is terminal stale without weakening the production policy guard. These strengthen failure-corpus admission and the P1 boundary sentinel; they do not replace incident-corpus lane execution or a delayed-history campaign. | [MDK #1140](https://github.com/marmot-protocol/mdk/pull/1140); [MDK #1377](https://github.com/marmot-protocol/mdk/pull/1377); incident-replay regressions; `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork` |
 | 2026-08-11 | Focused post-campaign production-delta gate | Added a fail-closed named CI gate for the missing-anchor halt, verified Welcome repair, three-write atomic self-removal rollback/restart, armed post-catch-up backfill, and pinned rewind-horizon regressions. Every exact Nextest selector runs independently, so moving or removing one test cannot silently become a zero-test success. The squash-merge commit's successful named CI step will be the durable current-`master` evidence. This is targeted regression coverage, not a rerun of the historical generated matrix or distributed cross-route evidence. | `just focused-convergence-regressions`; `Run focused convergence regressions` CI step; five exact named engine/app tests |
-| 2026-08-11 | 6.1 app-runtime cross-route falsification | Added action-addressed event staging to the app-runtime harness's real retained Nostr relay so offline recipients cannot race the intended four-party branch topology. The strict retained-engine reference still reaches exact state, durable commit dispositions, no pending work, and twelve active decryptability edges; repeated app-runtime executions have three exact counterexample surfaces: Zeta one epoch behind, public agreement with Alpha's probe missing at Zeta, or an Alpha/Observer versus Yankee/Zeta protocol-and-probe split. A fourth shape or complete equivalence now fails the characterization. This is retained counterexample evidence, not passing route-equivalence evidence; no production convergence behavior changed. | `cross-route-app-runtime-recovery/v1`; `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; route-assurance claims reopened; superseded by the corrected 2026-08-12 evidence below |
-| 2026-08-12 | 6.1 app-runtime cross-route corrected evidence | Replaced destructive event deletion with a reversible relay query-visibility layer, added a focused offline hide/repair/restore/repair regression, and converted the four-party app test to a positive equivalence contract. The strict retained-engine reference still pins exact canonical state, accepted/invalidated/accepted commit dispositions, no pending work, and twelve decryptability edges; every production-shaped app runtime now matches its public epoch, roster, profile, and administration and exposes the witness plus all four active probes exactly once. No production convergence behavior changed. Process/container/VM execution, exact external-adapter state, and durable-transition permutations remain open. | `retained_relay_control_restores_hidden_history_for_offline_repair`; `four_party_cross_route_recovery_reaches_app_runtime_equivalence`; corrected simulator-only relay staging |
+| 2026-08-11 | 6.1 app-runtime cross-route falsification | Added action-addressed event staging to the app-runtime harness's real retained Nostr relay so offline recipients cannot race the intended four-party branch topology. The strict retained-engine reference still reaches exact state, durable commit dispositions, no pending work, and twelve active decryptability edges; repeated app-runtime executions have three exact counterexample surfaces: Zeta one epoch behind, public agreement with Alpha's probe missing at Zeta, or an Alpha/Observer versus Yankee/Zeta protocol-and-probe split. A fourth shape or complete equivalence now fails the characterization. This is retained counterexample evidence, not passing route-equivalence evidence; no production convergence behavior changed. | `cross-route-app-runtime-recovery/v1`; `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; route-assurance claims reopened |
+| 2026-08-12 | 6.1 app-runtime cross-route corrected-input evidence | Replaced destructive event deletion with a reversible relay query-visibility layer and added a focused offline hide/repair/restore/repair regression. Repeated validation disproved the proposed positive-equivalence rewrite: corrected-input executions can reach full equivalence or retain a two-branch public/probe split even though the strict retained-engine reference reaches exact canonical state, accepted/invalidated/accepted commit dispositions, no pending work, and twelve decryptability edges. The app-runtime route-equivalence, active-decryptability, and complete-application-disposition claims remain open; no production behavior changed. | `retained_relay_control_restores_hidden_history_for_offline_repair`; `four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes`; corrected simulator input contract plus retained falsification |
 
 ## Capability Naming Cleanup
 

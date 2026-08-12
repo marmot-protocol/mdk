@@ -134,7 +134,7 @@ These are the scenarios another implementation should be able to load from JSON 
 
 ### `cross-route-app-runtime-recovery/v1`
 
-- File: constructed by `four_party_cross_route_recovery_reaches_app_runtime_equivalence`; promotion to a portable saved
+- File: constructed by `four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes`; promotion to a portable saved
   input still requires an adapter-neutral representation of reversible retained-event staging.
 - Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
   `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
@@ -144,11 +144,11 @@ These are the scenarios another implementation should be able to load from JSON 
   root, hides Alpha's root before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both retained
   roots, and performs repeated full-history repair. Every harness participant must be offline before relay-wide
   hiding; the step's named clients are not a per-recipient visibility filter.
-- Current result: exact retained-engine settlement passes, and every app-runtime participant reaches the same public
-  epoch, roster, profile, and administration with the witness and all four active probes visible exactly once. The
-  former three-shape falsification was caused by destructive database deletion in the harness: restoring a tombstoned
-  event id was rejected, so the app subjects never actually received complete relay history. Process, container, VM,
-  and per-durable-transition permutations remain open.
+- Current result: exact retained-engine settlement passes. The reversible relay layer fixes the former destructive
+  tombstone artifact, but repeated app-runtime executions still alternate between complete equivalence and reviewed
+  non-equivalent terminal surfaces, including a two-branch protocol/probe split. Route equivalence, active
+  decryptability, complete application disposition, process/container/VM execution, and per-durable-transition
+  permutations remain open.
 
 ### `convergence-committer-selected/v1`
 

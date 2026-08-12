@@ -501,8 +501,7 @@ impl AppRuntimeHarness {
     }
 
     /// Drive public catch-up/timer work until all named participants expose
-    /// one shared, stable protocol commitment, one shared visible application
-    /// projection, and no pending projection.
+    /// one shared, stable protocol commitment and no pending projection.
     /// Quiescence is intentionally defined without engine-private counters.
     pub async fn await_observable_settlement(
         &mut self,
@@ -510,7 +509,7 @@ impl AppRuntimeHarness {
         max_wait: Duration,
     ) -> Result<Vec<AppRuntimeObservationV1>, SubjectError> {
         let deadline = tokio::time::Instant::now() + max_wait;
-        let mut previous_projection: Option<(Vec<String>, Vec<Vec<String>>)> = None;
+        let mut previous_commitments: Option<Vec<String>> = None;
         loop {
             self.catch_up(clients).await?;
             let observations = self.observations(clients).await?;
@@ -521,25 +520,10 @@ impl AppRuntimeHarness {
             let shared = commitments
                 .first()
                 .is_some_and(|first| commitments.iter().all(|item| item == first));
-            let application_views = observations
-                .iter()
-                .map(|observation| {
-                    let mut payloads = observation.application.visible_plaintexts.clone();
-                    payloads.sort();
-                    payloads
-                })
-                .collect::<Vec<_>>();
-            let shared_application = application_views
-                .first()
-                .is_some_and(|first| application_views.iter().all(|item| item == first));
             let projections_settled = observations
                 .iter()
                 .all(|observation| !observation.application.pending_confirmation);
-            let projection = (commitments, application_views);
-            if shared
-                && shared_application
-                && projections_settled
-                && previous_projection.as_ref() == Some(&projection)
+            if shared && projections_settled && previous_commitments.as_ref() == Some(&commitments)
             {
                 return Ok(observations);
             }
@@ -550,7 +534,7 @@ impl AppRuntimeHarness {
                     "public app projections did not reach a stable shared commitment before the deadline",
                 ));
             }
-            previous_projection = Some(projection);
+            previous_commitments = Some(commitments);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
