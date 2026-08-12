@@ -2407,7 +2407,16 @@ async fn router_flip_fixture_arranged_with_creator(
         }
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcome_id = welcome.id.clone();
     joiner.join_welcome(welcome).await.unwrap();
+    // Play the host for the join notification: take it and acknowledge it.
+    // An unacknowledged application event stays durably pending and is
+    // re-delivered on every session open, so skipping the ack would hand each
+    // `reopen_legacy_client` below a `GroupJoined` from this arrangement.
+    joiner.drain_events();
+    joiner_storage
+        .delete_pending_application_events(&[welcome_id])
+        .unwrap();
 
     let own_kp = own_invitee.fresh_key_package().await.unwrap();
     let sibling_kp = sibling_invitee.fresh_key_package().await.unwrap();
