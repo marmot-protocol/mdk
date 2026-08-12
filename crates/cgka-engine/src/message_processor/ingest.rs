@@ -2839,6 +2839,11 @@ fn convergence_ingest_outcome(
 
 #[cfg(test)]
 mod tests {
+    //! The consumer side of the split, over hand-built peels: which decision
+    //! each field drives. That the PRODUCER keeps `contested` true through a
+    //! real enumeration halt is pinned separately, over a real forked graph, in
+    //! `openmls_projection::candidate_branch_peel_halt_tests`.
+
     use super::{ConvergenceDrain, DeferredPeelSweep};
     use crate::openmls_projection::CandidateBranchPeel;
 
