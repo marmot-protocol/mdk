@@ -169,9 +169,9 @@ pub use ids::{
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
-    EncryptedMediaVersion, MediaAttachmentReference, MediaDownloadResult, MediaLocator,
-    MediaUploadAttachmentRequest, MediaUploadAttachmentResult, MediaUploadRequest,
-    MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
+    EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MediaAttachmentReference,
+    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
+    MediaUploadRequest, MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;

@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use bytes::Bytes;
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTimestamp};
@@ -23,8 +24,14 @@ pub(crate) const MAX_BLOSSOM_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const BLOSSOM_REDIRECT_LIMIT: usize = 5;
-pub(crate) const MAX_ENCRYPTED_MEDIA_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest encrypted media blob this implementation will upload or download.
+///
+/// The encrypted-media wire format has no 64 MiB protocol limit. Keep this
+/// implementation bound finite for resource safety while allowing release APKs
+/// and other substantial application artifacts.
+pub const MAX_ENCRYPTED_MEDIA_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct BlossomBlobDescriptor {
@@ -34,7 +41,7 @@ struct BlossomBlobDescriptor {
 
 pub(crate) async fn upload_blossom_blob(
     server: &str,
-    blob: &[u8],
+    blob: Bytes,
     blob_hash_hex: &str,
     signer: &dyn NostrSigner,
     allow_loopback_http: bool,
@@ -53,7 +60,7 @@ pub(crate) async fn upload_blossom_blob(
 
 pub(crate) async fn upload_blossom_blob_with_content_type(
     server: &str,
-    blob: &[u8],
+    blob: Bytes,
     blob_hash_hex: &str,
     signer: &dyn NostrSigner,
     allow_loopback_http: bool,
@@ -65,10 +72,11 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
         .put(upload_url.clone())
+        .timeout(MEDIA_BLOB_TRANSFER_TIMEOUT)
         .header(reqwest::header::AUTHORIZATION, authorization)
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .header("X-SHA-256", blob_hash_hex)
-        .body(blob.to_vec())
+        .body(blob)
         .send()
         .await
         .map_err(reqwest_blob_error)?;
@@ -181,6 +189,7 @@ pub(crate) async fn fetch_blossom_blob(
     fetch_http_with_bounded_redirects(
         current,
         MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        MEDIA_BLOB_TRANSFER_TIMEOUT,
         move |url| {
             let allow_loopback_http = allow_loopback_http;
             async move { media_http_client_for_url(&url, allow_loopback_http).await }
@@ -218,6 +227,7 @@ pub(crate) async fn fetch_profile_image_with_loopback(
     profile_operation_timeout(fetch_http_with_bounded_redirects(
         current,
         max_bytes,
+        MEDIA_HTTP_TOTAL_TIMEOUT,
         move |url| async move { media_http_client_for_url(&url, true).await },
         move |current, location| {
             let raw_location = location.trim();
@@ -251,6 +261,7 @@ async fn fetch_profile_image_impl(url: &str, max_bytes: u64) -> Result<Vec<u8>, 
     fetch_http_with_bounded_redirects(
         current,
         max_bytes,
+        MEDIA_HTTP_TOTAL_TIMEOUT,
         move |url| async move { media_http_client_for_profile(&url).await },
         move |current, location| {
             parse_profile_image_redirect_url(current, location).map_err(AppError::UnsafeMediaFetch)
@@ -274,6 +285,7 @@ pub(crate) fn vet_profile_fetch_resolved_addresses(addrs: &[SocketAddr]) -> Resu
 async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     mut current: Url,
     max_body_bytes: u64,
+    request_timeout: Duration,
     mut client_for_url: C,
     mut redirect_target: R,
 ) -> Result<Vec<u8>, AppError>
@@ -283,11 +295,23 @@ where
     R: FnMut(&Url, &str) -> Result<Url, AppError>,
 {
     let mut redirects = 0_usize;
+    let deadline = tokio::time::Instant::now() + request_timeout;
 
     loop {
-        let client = client_for_url(current.clone()).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AppError::BlobStore("request timed out".into()));
+        }
+        let client = tokio::time::timeout(remaining, client_for_url(current.clone()))
+            .await
+            .map_err(|_| AppError::BlobStore("request timed out".into()))??;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AppError::BlobStore("request timed out".into()));
+        }
         let response = client
             .get(current.clone())
+            .timeout(remaining)
             .send()
             .await
             .map_err(reqwest_blob_error)?;

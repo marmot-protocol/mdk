@@ -442,15 +442,25 @@ the connector responds. `wn-agent` must independently allow that exact staging
 directory with `--media-allowed-root`; without one, path sends fail closed.
 
 Hermes multi-image responses are sent as one ordered Marmot media message, not
-as one message per image. The adapter accepts at most 10 attachments, caps each
-plaintext to the encrypted-blob limit (64 MiB minus authentication overhead),
-and caps the full batch at 128 MiB. It validates every source before staging or
+as one message per image. The adapter accepts at most 10 attachments and caps
+both each plaintext and the full batch to the encrypted-blob limit (512 MiB
+minus authentication overhead). It validates every source before staging or
 uploading any of them, applies the first non-empty caption once, and removes all
 staged copies on success, error, timeout, or cancellation. Retryable control-
 plane failures reuse one idempotency key; `wn-agent` binds that key to the
 destination, caption, ordered attachment metadata, and plaintext hashes before
 uploading, then returns the original durable message ids on a matching retry.
 Reply-targeted media sends remain unsupported and fail before upload.
+
+Large encrypted-media blobs retain the existing wire format, but every receiver
+must run an MDK version with the matching 512 MiB receive bound; older receivers
+still reject blobs above 64 MiB. MDK encrypts and decrypts each blob in place and
+passes upload retries a shared immutable body, avoiding separate full-size
+plaintext, ciphertext, and HTTP-body copies. The active blob still resides in
+memory, and the connector reads the validated batch before upload, so the
+aggregate 512 MiB request cap is also a deliberate peak-memory bound. This is
+appropriate for release APK delivery on a suitably provisioned connector; it is
+not a disk-streaming or low-memory-mobile transfer mode.
 
 ## Behavior
 
