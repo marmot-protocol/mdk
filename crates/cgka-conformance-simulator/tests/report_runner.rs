@@ -766,7 +766,7 @@ async fn refused_application_send_fails_step_without_aborting_the_run() {
         fs::remove_dir_all(&base).expect("remove stale test dir");
     }
     let vectors_dir = base.join("vectors");
-    fs::create_dir_all(&vectors_dir).expect("create vectors dir");
+    fs_private::create_dir_all_private(&vectors_dir).expect("create private vectors dir");
     let out_dir = base.join("out");
 
     let refused = serde_json::json!({
@@ -821,14 +821,14 @@ async fn refused_application_send_fails_step_without_aborting_the_run() {
              "member_count": 2, "received_payloads": []}
         ]
     });
-    fs::write(
-        vectors_dir.join("a-refused-send.v1.json"),
-        serde_json::to_string_pretty(&refused).expect("encode refused fixture"),
+    fs_private::write_private(
+        &vectors_dir.join("a-refused-send.v1.json"),
+        &serde_json::to_vec_pretty(&refused).expect("encode refused fixture"),
     )
     .expect("write refused fixture");
-    fs::write(
-        vectors_dir.join("zz-sibling.v1.json"),
-        serde_json::to_string_pretty(&sibling).expect("encode sibling fixture"),
+    fs_private::write_private(
+        &vectors_dir.join("zz-sibling.v1.json"),
+        &serde_json::to_vec_pretty(&sibling).expect("encode sibling fixture"),
     )
     .expect("write sibling fixture");
 
