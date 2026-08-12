@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use rand::RngCore;
@@ -94,7 +95,14 @@ pub(crate) async fn upload_group_image(
     // Group images upload to the public default Blossom server and are not part
     // of the loopback-blob-endpoint dev/test path, so loopback HTTP is never
     // permitted here.
-    upload_blossom_blob(server, &encrypted, &encrypted_hash_hex, &upload_keys, false).await?;
+    upload_blossom_blob(
+        server,
+        Bytes::from(encrypted),
+        &encrypted_hash_hex,
+        &upload_keys,
+        false,
+    )
+    .await?;
     Ok(GroupImageUpload {
         image_hash_hex: encrypted_hash_hex,
         image_key_hex: hex::encode(&content_key),

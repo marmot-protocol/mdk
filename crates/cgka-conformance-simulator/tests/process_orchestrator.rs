@@ -5,11 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeObservationV1, GeneratedScenarioCase, GeneratedScenarioInputV1,
-    GeneratedSubjectKind, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
-    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, TraceExpectation, compile_scenario,
-    node_protocol::NodeObservationV1, resolve_scenario_input_bytes, run_scenario_report,
-    run_scenario_report_with_subject,
+    GeneratedSubjectKind, HarnessStorageMode, RetainedRelaySubject, ScenarioAccountV2,
+    ScenarioDeviceV2, ScenarioInputDisposition, ScenarioMessageSelectorV2, ScenarioProcessV2,
+    ScenarioRelaySyncModeV2, ScenarioRelayV2, ScenarioSpec, ScenarioStep, ScenarioTopologyV2,
+    TraceExpectation, compile_scenario, node_protocol::NodeObservationV1,
+    resolve_scenario_input_bytes, run_scenario_report, run_scenario_report_with_subject,
 };
+use cgka_traits::group::ProtocolProfile;
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
     ScenarioStep::InGroup {
@@ -150,6 +152,42 @@ fn controlled_relay_topology() -> ScenarioTopologyV2 {
     }
 }
 
+fn single_relay_topology(clients: &[String]) -> ScenarioTopologyV2 {
+    ScenarioTopologyV2 {
+        accounts: clients
+            .iter()
+            .map(|client| ScenarioAccountV2 {
+                id: format!("account:{client}"),
+                roles: vec!["member".into()],
+            })
+            .collect(),
+        devices: clients
+            .iter()
+            .map(|client| ScenarioDeviceV2 {
+                id: format!("device:{client}"),
+                account: format!("account:{client}"),
+                process: format!("process:{client}"),
+                client: client.clone(),
+            })
+            .collect(),
+        processes: clients
+            .iter()
+            .map(|client| ScenarioProcessV2 {
+                id: format!("process:{client}"),
+                binary_version: "current-test-node".into(),
+                policy_version: "marmot-convergence-v1".into(),
+                relays: vec!["relay:shared".into()],
+            })
+            .collect(),
+        groups: Vec::new(),
+        relays: vec![ScenarioRelayV2 {
+            id: "relay:shared".into(),
+            implementation_version: "retained-memory/v1".into(),
+            policy_version: "retain-all-v1".into(),
+        }],
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CrossAdapterRecovery {
     Restart,
@@ -278,17 +316,348 @@ fn cross_adapter_offline_scenario() -> ScenarioSpec {
     build_cross_adapter_scenario(CrossAdapterRecovery::OfflineFullHistory)
 }
 
-async fn run_app_and_process_adapters(
+fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
+    let clients = vec![
+        "zeta".into(),
+        "alpha".into(),
+        "yankee".into(),
+        "observer".into(),
+    ];
+    let mut steps = vec![
+        in_group(
+            "main",
+            ScenarioStep::CreateGroup {
+                creator: "zeta".into(),
+                name: "cross-route".into(),
+                invitees: vec!["alpha".into(), "yankee".into(), "observer".into()],
+                required_features: Vec::new(),
+                initial_admins: Some(vec!["zeta".into()]),
+                pending: "create".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "zeta".into(),
+            publication: Some("create".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["alpha".into(), "yankee".into(), "observer".into()],
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: vec!["alpha".into(), "yankee".into(), "observer".into()],
+        },
+        in_group(
+            "main",
+            ScenarioStep::UpdateAdminPolicy {
+                client: "zeta".into(),
+                admins: vec!["zeta".into(), "alpha".into()],
+                pending: "promote-alpha".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "zeta".into(),
+            publication: Some("promote-alpha".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::UpdateAdminPolicy {
+                client: "zeta".into(),
+                admins: vec!["zeta".into(), "alpha".into(), "yankee".into()],
+                pending: "promote-yankee".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "zeta".into(),
+            publication: Some("promote-yankee".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::ClearEvents {
+                clients: clients.clone(),
+            },
+        ),
+        in_group(
+            "main",
+            ScenarioStep::Observe {
+                clients: clients.clone(),
+            },
+        ),
+        ScenarioStep::SetClientOffline {
+            client: "alpha".into(),
+        },
+        ScenarioStep::SetClientOffline {
+            client: "observer".into(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::UpdateGroupData {
+                client: "zeta".into(),
+                name: "zeta-root".into(),
+                pending: "zeta-root".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "zeta".into(),
+            publication: Some("zeta-root".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["yankee".into()],
+            sync: ScenarioRelaySyncModeV2::Incremental,
+        },
+        ScenarioStep::Tick {
+            clients: vec!["yankee".into()],
+        },
+        in_group(
+            "main",
+            ScenarioStep::SendAppMessage {
+                sender: "yankee".into(),
+                payload: "zeta-branch-witness".into(),
+            },
+        ),
+        ScenarioStep::SetClientOffline {
+            client: "zeta".into(),
+        },
+        ScenarioStep::SetClientOffline {
+            client: "yankee".into(),
+        },
+        ScenarioStep::SetRelayEventVisibility {
+            relay: "relay:shared".into(),
+            selector: ScenarioMessageSelectorV2 {
+                action_id: Some("step-16:update_group_data@main".into()),
+                ..Default::default()
+            },
+            clients: vec!["alpha".into(), "observer".into()],
+            visible: false,
+        },
+        ScenarioStep::ReconnectClient {
+            client: "alpha".into(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::UpdateGroupData {
+                client: "alpha".into(),
+                name: "alpha-root".into(),
+                pending: "alpha-root".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "alpha".into(),
+            publication: Some("alpha-root".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::ReconnectClient {
+            client: "zeta".into(),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["zeta".into()],
+            sync: ScenarioRelaySyncModeV2::Incremental,
+        },
+        ScenarioStep::Tick {
+            clients: vec!["zeta".into()],
+        },
+        ScenarioStep::SetClientOffline {
+            client: "alpha".into(),
+        },
+        ScenarioStep::SetClientOffline {
+            client: "zeta".into(),
+        },
+        ScenarioStep::SetRelayEventVisibility {
+            relay: "relay:shared".into(),
+            selector: ScenarioMessageSelectorV2 {
+                action_id: Some("step-25:update_group_data@main".into()),
+                ..Default::default()
+            },
+            clients: vec!["yankee".into(), "observer".into()],
+            visible: false,
+        },
+        in_group(
+            "main",
+            ScenarioStep::Observe {
+                clients: clients.clone(),
+            },
+        ),
+        ScenarioStep::ReconnectClient {
+            client: "yankee".into(),
+        },
+        in_group(
+            "main",
+            ScenarioStep::UpdateGroupData {
+                client: "yankee".into(),
+                name: "zeta-branch-depth-two".into(),
+                pending: "zeta-child".into(),
+            },
+        ),
+        ScenarioStep::AcknowledgeOutbound {
+            client: "yankee".into(),
+            publication: Some("zeta-child".into()),
+            selection: Default::default(),
+            outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+        },
+        ScenarioStep::RestartClient {
+            client: "zeta".into(),
+        },
+        ScenarioStep::ReconnectClient {
+            client: "zeta".into(),
+        },
+        ScenarioStep::SetRelayEventVisibility {
+            relay: "relay:shared".into(),
+            selector: ScenarioMessageSelectorV2 {
+                action_id: Some("step-16:update_group_data@main".into()),
+                ..Default::default()
+            },
+            clients: vec!["alpha".into(), "observer".into()],
+            visible: true,
+        },
+        ScenarioStep::SetRelayEventVisibility {
+            relay: "relay:shared".into(),
+            selector: ScenarioMessageSelectorV2 {
+                action_id: Some("step-25:update_group_data@main".into()),
+                ..Default::default()
+            },
+            clients: vec!["yankee".into(), "observer".into()],
+            visible: true,
+        },
+        ScenarioStep::ReconnectClient {
+            client: "alpha".into(),
+        },
+        ScenarioStep::ReconnectClient {
+            client: "observer".into(),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+    ];
+    if strict_engine_tail {
+        steps.push(ScenarioStep::AwaitQuiescence {
+            policy: cgka_conformance_simulator::QuiescencePolicy {
+                max_iterations: 200,
+                ..Default::default()
+            },
+        });
+    }
+    for client in &clients {
+        steps.push(in_group(
+            "main",
+            ScenarioStep::SendAppMessage {
+                sender: client.clone(),
+                payload: format!("probe-from-{client}"),
+            },
+        ));
+    }
+    steps.extend([
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        },
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+    ]);
+    if strict_engine_tail {
+        steps.push(ScenarioStep::AwaitQuiescence {
+            policy: cgka_conformance_simulator::QuiescencePolicy {
+                max_iterations: 200,
+                ..Default::default()
+            },
+        });
+    }
+    steps.push(in_group(
+        "main",
+        ScenarioStep::Observe {
+            clients: clients.clone(),
+        },
+    ));
+    if !strict_engine_tail {
+        steps.push(in_group(
+            "main",
+            ScenarioStep::Observe {
+                clients: clients.clone(),
+            },
+        ));
+    }
+    if strict_engine_tail {
+        steps.extend([
+            in_group(
+                "main",
+                ScenarioStep::ProbeBidirectionalDecryptability {
+                    clients: clients.clone(),
+                },
+            ),
+            in_group(
+                "main",
+                ScenarioStep::ObserveExact {
+                    clients: clients.clone(),
+                },
+            ),
+        ]);
+    }
+    let topology = single_relay_topology(&clients);
+    ScenarioSpec {
+        name: "cross-route-app-runtime-recovery/v1".into(),
+        spec_version: "2".into(),
+        clients,
+        topology,
+        steps,
+    }
+}
+
+async fn run_app_runtime_adapter(
     spec: &ScenarioSpec,
 ) -> (
+    cgka_conformance_simulator::ScenarioReport,
     BTreeMap<String, AppRuntimeObservationV1>,
-    BTreeMap<String, NodeObservationV1>,
 ) {
     let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
     let app_report = run_scenario_report_with_subject(spec, None, Vec::new(), &mut app)
         .await
         .unwrap();
     assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
+    assert_eq!(
+        app_report.step_log.len(),
+        compile_scenario(spec).unwrap().expanded_schedule().len(),
+        "{app_report:#?}"
+    );
     let app_observations = app
         .observations(&spec.clients)
         .await
@@ -296,6 +665,17 @@ async fn run_app_and_process_adapters(
         .into_iter()
         .map(|observation| (observation.participant.clone(), observation))
         .collect::<BTreeMap<_, _>>();
+    app.shutdown().await;
+    (app_report, app_observations)
+}
+
+async fn run_app_and_process_adapters(
+    spec: &ScenarioSpec,
+) -> (
+    BTreeMap<String, AppRuntimeObservationV1>,
+    BTreeMap<String, NodeObservationV1>,
+) {
+    let (_, app_observations) = run_app_runtime_adapter(spec).await;
 
     let process_artifacts = tempfile::tempdir().unwrap();
     let mut process = ProcessOrchestrator::launch(
@@ -316,7 +696,6 @@ async fn run_app_and_process_adapters(
         .collect::<BTreeMap<_, _>>();
 
     process.shutdown().await;
-    app.shutdown().await;
     (app_observations, process_observations)
 }
 
@@ -526,6 +905,237 @@ async fn app_runtime_and_process_adapters_recover_the_same_offline_projection() 
             process.application.stored_member_count
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsification() {
+    let strict_spec = cross_route_app_runtime_scenario(true);
+    let clients = strict_spec.clients.clone();
+    let mut expectations = clients
+        .iter()
+        .map(|client| TraceExpectation::ClientState {
+            client: client.clone(),
+            epoch: 5,
+            member_count: 4,
+            received_payloads: None,
+            added_members: None,
+            removed_members: None,
+        })
+        .collect::<Vec<_>>();
+    expectations.extend([
+        TraceExpectation::GroupProfile {
+            client: "zeta".into(),
+            name: "zeta-branch-depth-two".into(),
+            description: String::new(),
+        },
+        TraceExpectation::ClientsExactlyEquivalent {
+            clients: clients.clone(),
+        },
+        TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: clients.clone(),
+        },
+        TraceExpectation::NoPendingWork {
+            clients: clients.clone(),
+        },
+    ]);
+    let mut retained = RetainedRelaySubject::new(
+        &clients,
+        &strict_spec.topology,
+        ProtocolProfile::Legacy,
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .unwrap();
+    let retained_report =
+        run_scenario_report_with_subject(&strict_spec, None, expectations, &mut retained)
+            .await
+            .unwrap();
+    assert!(
+        retained_report.invariant_failures.is_empty(),
+        "retained-engine invariants: {:#?}; steps: {:#?}",
+        retained_report.invariant_failures,
+        retained_report.step_log
+    );
+    assert!(
+        retained_report.expectation_failures.is_empty(),
+        "retained-engine expectations: {:#?}",
+        retained_report.expectation_failures
+    );
+    let retained_trace = retained_report.observed_trace.unwrap();
+    assert_eq!(retained_trace.observations.len(), clients.len() * 4);
+    let retained_baseline = retained_trace.observations[..clients.len()]
+        .iter()
+        .map(|observation| (observation.client.as_str(), observation))
+        .collect::<BTreeMap<_, _>>();
+    let retained_observations = retained_trace
+        .observations
+        .iter()
+        .rev()
+        .take(clients.len())
+        .map(|observation| (observation.client.clone(), observation))
+        .collect::<BTreeMap<_, _>>();
+    for observation in retained_observations.values() {
+        for (scenario_id, disposition) in [
+            (
+                "step-16:update_group_data@main",
+                ScenarioInputDisposition::Accepted,
+            ),
+            (
+                "step-25:update_group_data@main",
+                ScenarioInputDisposition::Invalidated,
+            ),
+            (
+                "step-35:update_group_data@main",
+                ScenarioInputDisposition::Accepted,
+            ),
+        ] {
+            let entry = observation
+                .scenario_input_ledger
+                .iter()
+                .find(|entry| entry.scenario_id == scenario_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing durable disposition for {scenario_id}",
+                        observation.client
+                    )
+                });
+            assert_eq!(
+                entry.disposition, disposition,
+                "{} disposition for {scenario_id}",
+                observation.client
+            );
+        }
+    }
+
+    let public_spec = cross_route_app_runtime_scenario(false);
+    let (app_report, app_observations) = run_app_runtime_adapter(&public_spec).await;
+    let app_trace = app_report.observed_trace.unwrap().observations;
+    assert_eq!(app_trace.len(), clients.len() * 4);
+    let app_baseline = app_trace[..clients.len()]
+        .iter()
+        .map(|observation| (observation.client.as_str(), observation))
+        .collect::<BTreeMap<_, _>>();
+    let app_routed = app_trace[clients.len()..clients.len() * 2]
+        .iter()
+        .map(|observation| (observation.client.as_str(), observation))
+        .collect::<BTreeMap<_, _>>();
+    // Alpha and Observer have not ticked since the pre-split checkpoint, so
+    // these two values pin cached schedule state. Zeta and Yankee's refreshed
+    // epoch-4 observations are the independent evidence of the routed split.
+    assert_eq!(app_routed["zeta"].epoch, 4);
+    assert_eq!(app_routed["alpha"].epoch, 3);
+    assert_eq!(app_routed["yankee"].epoch, 4);
+    assert_eq!(app_routed["observer"].epoch, 3);
+    let mut expected_payloads = clients
+        .iter()
+        .map(|client| format!("probe-from-{client}"))
+        .collect::<BTreeSet<_>>();
+    expected_payloads.insert("zeta-branch-witness".into());
+    let mut protocol_equivalent = true;
+    let mut protocol_equivalent_by_client = BTreeMap::new();
+    let mut protocol_non_epoch_equivalent_by_client = BTreeMap::new();
+    let mut app_payloads_by_client = BTreeMap::new();
+    for client in &clients {
+        let retained = retained_observations[client];
+        let app = &app_observations[client];
+        let retained_baseline = retained_baseline[client.as_str()];
+        let app_baseline = app_baseline[client.as_str()];
+        assert_eq!(
+            app_baseline.epoch, retained_baseline.epoch,
+            "{client} baseline epoch"
+        );
+        assert_eq!(
+            retained.epoch - retained_baseline.epoch,
+            2,
+            "{client} retained route depth"
+        );
+        let exact_roster =
+            app.protocol.member_identities == ["alpha", "observer", "yankee", "zeta"];
+        let non_epoch_equivalent = app.protocol.member_count == retained.member_count
+            && exact_roster
+            && app.protocol.group_name == retained.group_name
+            && app.protocol.group_description == retained.group_description;
+        let client_protocol_equivalent =
+            app.protocol.epoch == retained.epoch && non_epoch_equivalent;
+        protocol_equivalent &= client_protocol_equivalent;
+        protocol_equivalent_by_client.insert(client.clone(), client_protocol_equivalent);
+        protocol_non_epoch_equivalent_by_client.insert(client.clone(), non_epoch_equivalent);
+        assert_eq!(app.protocol.member_count, 4, "{client} roster size");
+        assert!(exact_roster, "{client} exact roster");
+        assert_eq!(app.protocol.admin_identities, ["alpha", "yankee", "zeta"]);
+        let app_payloads = app
+            .application
+            .visible_plaintexts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            app_payloads.is_subset(&expected_payloads),
+            "{client} projected an unexpected application payload"
+        );
+        assert_eq!(app.application.visible_plaintexts.len(), app_payloads.len());
+        app_payloads_by_client.insert(client.clone(), app_payloads);
+        assert!(app.application.invalidated_message_ids.is_empty());
+        assert!(!app.application.pending_confirmation);
+    }
+
+    let zeta_one_epoch_behind = clients.iter().all(|client| {
+        if client == "zeta" {
+            let app = &app_observations[client];
+            let retained = retained_observations[client];
+            app.protocol.epoch.checked_add(1) == Some(retained.epoch)
+                && protocol_non_epoch_equivalent_by_client[client]
+        } else {
+            protocol_equivalent_by_client[client]
+        }
+    }) && app_payloads_by_client
+        .values()
+        .all(|payloads| payloads == &expected_payloads);
+
+    let mut zeta_missing_alpha_probe = expected_payloads.clone();
+    assert!(zeta_missing_alpha_probe.remove("probe-from-alpha"));
+    let missing_probe_after_agreement = protocol_equivalent
+        && clients.iter().all(|client| {
+            let expected = if client == "zeta" {
+                &zeta_missing_alpha_probe
+            } else {
+                &expected_payloads
+            };
+            &app_payloads_by_client[client] == expected
+        });
+
+    let payload_set = |payloads: &[&str]| {
+        payloads
+            .iter()
+            .map(|payload| (*payload).to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let split_protocol_and_probe_surface = {
+        let alpha = &app_observations["alpha"];
+        let observer = &app_observations["observer"];
+        alpha.protocol.epoch == app_baseline["alpha"].epoch + 1
+            && alpha.protocol.group_name == "alpha-root"
+            && alpha.protocol.group_description.is_empty()
+            && observer.protocol.epoch == app_baseline["observer"].epoch
+            && observer.protocol.group_name == "cross-route"
+            && observer.protocol.group_description.is_empty()
+            && protocol_equivalent_by_client["yankee"]
+            && protocol_equivalent_by_client["zeta"]
+            && app_payloads_by_client["alpha"]
+                == payload_set(&["probe-from-alpha", "probe-from-observer"])
+            && app_payloads_by_client["observer"] == payload_set(&["probe-from-observer"])
+            && app_payloads_by_client["yankee"]
+                == payload_set(&[
+                    "probe-from-observer",
+                    "probe-from-yankee",
+                    "probe-from-zeta",
+                    "zeta-branch-witness",
+                ])
+            && app_payloads_by_client["zeta"] == app_payloads_by_client["yankee"]
+    };
+    assert!(
+        zeta_one_epoch_behind || missing_probe_after_agreement || split_protocol_and_probe_surface,
+        "app-runtime route result was neither documented counterexample shape; protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; observations={app_observations:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

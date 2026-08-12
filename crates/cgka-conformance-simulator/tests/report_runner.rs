@@ -751,3 +751,143 @@ async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
         String::from_utf8_lossy(&cli.stderr)
     );
 }
+
+#[tokio::test]
+async fn refused_application_send_fails_step_without_aborting_the_run() {
+    // A scripted send_app_message from a client in `Leaving` is refused by
+    // the engine (InvalidTransition). The report run must record a
+    // structured invalid_transition step failure with a failure capsule,
+    // keep executing sibling vectors, and report the run as failed.
+    let base = std::env::temp_dir().join(format!(
+        "mdk-cgka-refused-send-report-test-{}",
+        std::process::id()
+    ));
+    if base.exists() {
+        fs::remove_dir_all(&base).expect("remove stale test dir");
+    }
+    let vectors_dir = base.join("vectors");
+    fs_private::create_dir_all_private(&vectors_dir).expect("create private vectors dir");
+    let out_dir = base.join("out");
+
+    let refused = serde_json::json!({
+        "scenario_name": "refused-send-after-leave/v1",
+        "vector_version": "1",
+        "conformance_version": "0.0.0-test",
+        "seed": null,
+        "scenario": {
+            "name": "refused-send-after-leave/v1",
+            "spec_version": "2",
+            "clients": ["alice", "bob", "carol"],
+            "steps": [
+                {"type": "create_group", "creator": "alice", "name": "refused-send",
+                 "invitees": ["bob", "carol"], "required_features": [], "pending": "create"},
+                {"type": "acknowledge_outbound", "client": "alice",
+                 "publication": "create", "outcome": "accepted"},
+                {"type": "deliver_all"},
+                {"type": "tick", "clients": ["bob", "carol"]},
+                {"type": "leave", "client": "carol"},
+                {"type": "send_app_message", "sender": "carol", "payload": "carol:refused"},
+                {"type": "observe", "clients": ["alice"]}
+            ]
+        },
+        "expected_outcomes": [
+            {"type": "client_state", "client": "alice", "epoch": 1,
+             "member_count": 3, "received_payloads": []}
+        ]
+    });
+    let sibling = serde_json::json!({
+        "scenario_name": "zz-sibling-after-refusal/v1",
+        "vector_version": "1",
+        "conformance_version": "0.0.0-test",
+        "seed": null,
+        "scenario": {
+            "name": "zz-sibling-after-refusal/v1",
+            "spec_version": "2",
+            "clients": ["alice", "bob"],
+            "steps": [
+                {"type": "create_group", "creator": "alice", "name": "sibling",
+                 "invitees": ["bob"], "required_features": [], "pending": "create"},
+                {"type": "acknowledge_outbound", "client": "alice",
+                 "publication": "create", "outcome": "accepted"},
+                {"type": "deliver_all"},
+                {"type": "tick", "clients": ["bob"]},
+                {"type": "observe", "clients": ["alice", "bob"]}
+            ]
+        },
+        "expected_outcomes": [
+            {"type": "client_state", "client": "alice", "epoch": 1,
+             "member_count": 2, "received_payloads": []},
+            {"type": "client_state", "client": "bob", "epoch": 1,
+             "member_count": 2, "received_payloads": []}
+        ]
+    });
+    fs_private::write_private(
+        &vectors_dir.join("a-refused-send.v1.json"),
+        &serde_json::to_vec_pretty(&refused).expect("encode refused fixture"),
+    )
+    .expect("write refused fixture");
+    fs_private::write_private(
+        &vectors_dir.join("zz-sibling.v1.json"),
+        &serde_json::to_vec_pretty(&sibling).expect("encode sibling fixture"),
+    )
+    .expect("write sibling fixture");
+
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::VectorFixtures {
+            paths: vec![vectors_dir],
+        },
+        out: out_dir.clone(),
+        strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
+    })
+    .await
+    .expect("runner completes despite the refused send");
+
+    // The refused send fails its scenario; the run reports it and continues.
+    assert_eq!(summary.total(), 2, "both vectors execute");
+    assert_eq!(summary.failed(), 1);
+    assert_eq!(summary.passed(), 1, "sibling vector still runs and passes");
+    assert!(summary.to_human_text().contains("1 passed, 1 failed"));
+
+    let refused_summary = summary
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario_name == "refused-send-after-leave/v1")
+        .expect("refused scenario summarized");
+    assert!(
+        refused_summary.failures.iter().any(|failure| {
+            failure.kind.contains("invalid_transition")
+                || failure.message.contains("invalid_transition")
+        }),
+        "failures must name invalid_transition: {:?}",
+        refused_summary.failures
+    );
+    let capsule = refused_summary
+        .failure_capsule
+        .as_ref()
+        .expect("refused scenario writes a failure capsule");
+    assert!(capsule.exists(), "failure capsule file exists");
+
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&refused_summary.output).expect("read refused report"),
+    )
+    .expect("refused report parses");
+    let failed_step = report["step_log"]
+        .as_array()
+        .expect("step log")
+        .iter()
+        .find(|step| step["status"]["status"] == "failed")
+        .expect("one step fails");
+    assert_eq!(failed_step["step_type"], "send_app_message");
+    assert_eq!(failed_step["status"]["kind"], "invalid_transition");
+
+    let sibling_summary = summary
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario_name == "zz-sibling-after-refusal/v1")
+        .expect("sibling scenario summarized");
+    assert_eq!(sibling_summary.failure_count, 0);
+
+    fs::remove_dir_all(&base).expect("clean up test dir");
+}

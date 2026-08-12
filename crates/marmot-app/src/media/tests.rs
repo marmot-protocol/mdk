@@ -1,14 +1,61 @@
 use super::*;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread;
 
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use url::Url;
 
 use super::blossom::{
     MAX_BLOSSOM_DESCRIPTOR_BYTES, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body,
 };
 use super::host_safety::validate_blossom_fetch_url;
+
+#[test]
+fn encrypted_media_blob_limit_supports_large_application_artifacts() {
+    assert_eq!(MAX_ENCRYPTED_MEDIA_BLOB_BYTES, 512 * 1024 * 1024);
+}
+
+#[test]
+fn media_plaintext_limit_accounts_for_the_aead_tag_without_allocating_the_boundary() {
+    let max_plaintext = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    assert!(validate_media_plaintext_len(max_plaintext).is_ok());
+    assert!(validate_media_plaintext_len(max_plaintext + 1).is_err());
+}
+
+#[test]
+fn media_upload_batch_enforces_the_same_aggregate_bound_as_the_connector() {
+    let max_plaintext = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    assert!(validate_media_upload_batch_lengths([max_plaintext]).is_ok());
+    assert!(validate_media_upload_batch_lengths([max_plaintext - 3, 3]).is_ok());
+    assert!(validate_media_upload_batch_lengths([max_plaintext, 1]).is_err());
+    assert!(validate_media_upload_batch_lengths([u64::MAX, 1]).is_err());
+}
+
+#[test]
+fn in_place_encryption_is_wire_identical_to_the_previous_allocating_api() {
+    let key = [0x11_u8; 32];
+    let nonce = [0x22_u8; 12];
+    let aad = b"encrypted-media compatibility";
+    let plaintext = b"same key nonce aad and plaintext";
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let expected = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .unwrap();
+    let mut actual = plaintext.to_vec();
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce), aad, &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+}
 
 fn valid_imeta_tag() -> Vec<String> {
     vec![
@@ -297,6 +344,100 @@ pub(super) fn spawn_http_response(response: Vec<u8>) -> String {
     spawn_http_responses(vec![response])
 }
 
+fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
+    let addr = listener.local_addr().expect("upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut remaining = content_length;
+        let mut body = Vec::with_capacity(content_length as usize);
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            stream
+                .read_exact(&mut buffer[..take])
+                .expect("read complete upload body");
+            body.extend_from_slice(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        let digest = hex::encode(Sha256::digest(&body));
+        stream
+            .get_mut()
+            .write_all(&http_json_response("{}"))
+            .expect("write upload descriptor");
+        drop(stream);
+        let (mut download, _) = listener.accept().expect("accept download");
+        let mut request = [0_u8; 4096];
+        let _ = download.read(&mut request).expect("read download request");
+        download
+            .write_all(&http_ok_response(&body))
+            .expect("write encrypted blob");
+        tx.send((content_length, digest))
+            .expect("report upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn spawn_hashing_upload_response(response: Vec<u8>) -> (String, mpsc::Receiver<(u64, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
+    let addr = listener.local_addr().expect("upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut remaining = content_length;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            stream
+                .read_exact(&mut buffer[..take])
+                .expect("read complete upload body");
+            hash.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        stream
+            .get_mut()
+            .write_all(&response)
+            .expect("write upload response");
+        tx.send((content_length, hex::encode(hash.finalize())))
+            .expect("report upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
 pub(super) fn http_redirect_response(location: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -424,6 +565,77 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
 }
 
 #[tokio::test]
+async fn blossom_fallback_reuses_the_identical_encrypted_body() {
+    let (failing, first_body) =
+        spawn_hashing_upload_response(http_status_response(500, "Internal Server Error"));
+    let (succeeding, second_body) = spawn_hashing_upload_response(http_json_response("{}"));
+    let endpoints = [blossom_endpoint(failing), blossom_endpoint(succeeding)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("second Blossom endpoint should accept the retry body");
+
+    assert_eq!(first_body.recv().unwrap(), second_body.recv().unwrap());
+}
+
+#[tokio::test]
+async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
+    let (server, received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+    let plaintext_len = 64 * 1024 * 1024 + 1;
+    let request = MediaUploadRequest {
+        attachments: vec![MediaUploadAttachmentRequest {
+            file_name: "release.apk".to_owned(),
+            media_type: "application/vnd.android.package-archive".to_owned(),
+            plaintext: vec![0x5a; plaintext_len],
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server: None,
+    };
+
+    let result = upload_encrypted_media(
+        request,
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("payload above the previous limit should upload");
+
+    let attachment = &result.attachments[0];
+    let downloaded = download_encrypted_media(
+        attachment.reference.clone(),
+        &secret,
+        &endpoints,
+        &allowed,
+        true,
+    )
+    .await
+    .expect("payload above the previous limit should download and decrypt");
+    let (received_len, received_hash) = received.recv().expect("upload body report");
+    assert_eq!(received_len, plaintext_len as u64 + 16);
+    assert_eq!(attachment.encrypted_size_bytes, received_len);
+    assert_eq!(attachment.reference.ciphertext_sha256, received_hash);
+    assert_eq!(downloaded.plaintext, vec![0x5a; plaintext_len]);
+}
+
+#[tokio::test]
 async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
     let server = spawn_http_responses(vec![http_json_response("{}"), http_json_response("{}")]);
     let endpoints = [blossom_endpoint(server)];
@@ -471,9 +683,15 @@ async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
     let encrypted = b"encrypted bytes";
     let encrypted_hash = hex::encode(Sha256::digest(encrypted));
 
-    let error = upload_blossom_blob(&server, encrypted, &encrypted_hash, &signing_keys(), true)
-        .await
-        .unwrap_err();
+    let error = upload_blossom_blob(
+        &server,
+        bytes::Bytes::from_static(encrypted),
+        &encrypted_hash,
+        &signing_keys(),
+        true,
+    )
+    .await
+    .unwrap_err();
 
     assert_eq!(
         error.to_string(),

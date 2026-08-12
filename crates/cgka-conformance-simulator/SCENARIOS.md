@@ -132,6 +132,26 @@ These are the scenarios another implementation should be able to load from JSON 
   the state, profile, recovery, pending-work, and decryptability contract; the focused Rust regression owns the
   retained-injection observations and stable commit-disposition subset.
 
+### `cross-route-app-runtime-recovery/v1`
+
+- File: constructed by `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; promotion to a
+  portable saved input waits until the falsified oracle has a reviewed resolution.
+- Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
+  `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
+  Nostr relay.
+- Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
+  The harness removes Zeta's root from the whole shared-relay history before Alpha reconnects and authors its competing
+  root, removes Alpha's root relay-wide before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both
+  roots, and performs repeated full-history repair. Every harness participant must be offline before relay-wide
+  removal; the step's named clients are not a per-recipient visibility filter.
+- Current result: exact retained-engine settlement passes. Across repeated app-runtime executions, Zeta can remain one
+  epoch behind; public protocol state can agree while Alpha's later application probe remains absent and
+  non-invalidated at Zeta; or Alpha and Observer can remain on the competing root and baseline respectively while only
+  Yankee/Zeta reach the retained reference branch, with application probes split along those branch boundaries. Each
+  shape is asserted exactly, so a fourth shape or complete equivalence forces review. This is a retained counterexample
+  and keeps route equivalence, active decryptability, and complete application disposition open outside the
+  engine/retained reference.
+
 ### `convergence-committer-selected/v1`
 
 - File: `vectors/convergence-committer-selected.v1.json`
@@ -226,8 +246,19 @@ These are the scenarios another implementation should be able to load from JSON 
   the full transcript minus the departed members' silence and converge at epoch 3 with two members. `no_pending_work`
   covers Alice and Bob only: like the latecomer vector's pre-join input, Dave and Carol legitimately retain their
   undecryptable post-departure inputs as deferred transport work. The original harness scenario's re-add leg (removed
-  member rejoins via a fresh KeyPackage) is deliberately absent: welcome-after-eviction currently fails in the engine
-  harness with `GroupStateError(UseAfterEviction)` and is tracked as a coverage gap.
+  member rejoins via a fresh KeyPackage) lives in `readd-after-eviction/v1`.
+
+### `readd-after-eviction/v1`
+
+- File: `vectors/readd-after-eviction.v1.json`
+- Setup: Alice creates a group with Bob and Carol, removes Carol, then re-invites her with a fresh KeyPackage. Carol
+  sends the first post-rejoin application message.
+- Pressure: the rejoin Welcome lands on stale evicted local state, and the re-add commit reaches Carol as an
+  old-epoch group message whose only retained peel snapshots are from her evicted era.
+- Expected: the Welcome supersedes the stale live OpenMLS state, evicted-era retained snapshots are skipped as peel
+  sources instead of failing ingest with `UseAfterEviction`, and all three clients converge at epoch 3 with Carol's
+  post-rejoin payload delivered. The Rust regression for this shape is
+  `removed_member_rejoins_via_fresh_welcome` in `tests/canonical_scenarios.rs`.
 
 ### `incremental-growth/v1`
 
@@ -281,6 +312,19 @@ These are the scenarios another implementation should be able to load from JSON 
   epoch, member count, and the renamed group with no pending work. Durable-relay offline recovery (subscription
   replay from retained histories) stays in the `adversarial-reliability` generated family per `retained_relay.rs`
   doctrine; this vector models mailbox catch-up.
+
+### `late-welcome-backfill/v1`
+
+- File: `vectors/late-welcome-backfill.v1.json`
+- Setup: Alice creates a group with Bob, invites Dave, and the group advances two epochs while Dave's Welcome is
+  withheld. The commits reach Dave before he can resolve the group. After the Welcome arrives and Dave joins at the
+  invite epoch, duplicates of the missed commits are released, standing in for relay redelivery.
+- Pressure: pre-join traffic is dropped without a durable record (the deliberate unknown-route flood posture), so
+  the post-join redelivery must not be misclassified as a duplicate of terminal input.
+- Expected: Dave joins at epoch 2, applies the redelivered commits to reach epoch 4, and sends the first post-join
+  application message; all three clients converge on the tip. The Rust regression for this shape is
+  `late_welcome_join_catches_up_via_redelivered_commits` in `tests/canonical_scenarios.rs`, and
+  `commit_missing_proposal_defers_and_applies_after_proposal_backfill` pins the sibling missing-proposal deferral.
 
 ## Incident-Replay Vectors
 

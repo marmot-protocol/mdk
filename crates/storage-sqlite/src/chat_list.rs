@@ -247,8 +247,46 @@ struct AccountGroupRow {
 struct ConversationReadState {
     last_read_message_id_hex: Option<String>,
     last_read_timeline_at: Option<u64>,
+    last_read_order_class: Option<u8>,
+    last_read_order_primary: Option<u64>,
+    last_read_order_phase: Option<u8>,
+    last_read_order_at: Option<u64>,
     initialized_at: u64,
     manually_marked_unread: bool,
+}
+
+impl ConversationReadState {
+    fn canonical_order_key(&self) -> Option<(u8, u64, u8, u64, &str)> {
+        Some((
+            self.last_read_order_class?,
+            self.last_read_order_primary?,
+            self.last_read_order_phase?,
+            self.last_read_order_at?,
+            self.last_read_message_id_hex.as_deref()?,
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TimelineReadMarker {
+    message_id_hex: String,
+    source_message_id_hex: Option<String>,
+    source_epoch: Option<u64>,
+    invalidation_status: Option<String>,
+    timeline_at: u64,
+}
+
+impl TimelineReadMarker {
+    fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
+        crate::timeline::canonical_timeline_order_key(
+            self.source_message_id_hex.as_deref(),
+            self.source_epoch,
+            self.invalidation_status.as_deref(),
+            MARMOT_APP_EVENT_KIND_CHAT,
+            self.timeline_at,
+            &self.message_id_hex,
+        )
+    }
 }
 
 impl SqliteAccountStorage {
@@ -447,26 +485,7 @@ impl SqliteAccountStorage {
                 return Ok(None);
             };
             if read_state_tx(&conn, group_id_hex)?.is_none() {
-                let latest = latest_kind9_message_tx(&conn, group_id_hex)?;
-                let (last_read_message_id_hex, last_read_timeline_at) = latest
-                    .map(|message| (Some(message.message_id_hex), Some(message.timeline_at)))
-                    .unwrap_or((None, None));
-                let initialized_at = last_read_timeline_at.unwrap_or(0);
-                conn.execute(
-                    "INSERT INTO conversation_read_state (
-                        group_id_hex, last_read_message_id_hex, last_read_timeline_at,
-                        initialized_at, updated_at, manually_marked_unread
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-                    params![
-                        group_id_hex,
-                        last_read_message_id_hex,
-                        optional_u64_to_i64(last_read_timeline_at)?,
-                        u64_to_i64(initialized_at)?,
-                        u64_to_i64(unix_now_seconds())?
-                    ],
-                )
-                .storage()?;
+                insert_initial_read_state_tx(&conn, group_id_hex, false)?;
             }
             rebuild_chat_list_row_for_group_tx(
                 &conn,
@@ -497,31 +516,7 @@ impl SqliteAccountStorage {
                 // Before a read-state row exists, retained history is implicitly
                 // read. Preserve that baseline when creating the manual flag so
                 // "mark unread" does not suddenly count the whole backlog.
-                let latest = latest_kind9_message_tx(&conn, group_id_hex)?;
-                let (last_read_message_id_hex, last_read_timeline_at) = latest
-                    .map(|message| (Some(message.message_id_hex), Some(message.timeline_at)))
-                    .unwrap_or((None, None));
-                // Match first-open semantics: with no retained kind-9 history
-                // there is no read anchor yet, so a subsequently recorded
-                // message must count even when its sender timestamp predates
-                // this local interaction.
-                let initialized_at = last_read_timeline_at.unwrap_or(0);
-                conn.execute(
-                    "INSERT INTO conversation_read_state (
-                        group_id_hex, last_read_message_id_hex, last_read_timeline_at,
-                        initialized_at, updated_at, manually_marked_unread
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        group_id_hex,
-                        last_read_message_id_hex,
-                        optional_u64_to_i64(last_read_timeline_at)?,
-                        u64_to_i64(initialized_at)?,
-                        u64_to_i64(now)?,
-                        bool_i64(manually_unread),
-                    ],
-                )
-                .storage()?;
+                insert_initial_read_state_tx(&conn, group_id_hex, manually_unread)?;
             } else {
                 conn.execute(
                     "UPDATE conversation_read_state
@@ -553,32 +548,52 @@ impl SqliteAccountStorage {
             if let Some(target) =
                 timeline_message_for_read_marker_tx(&conn, group_id_hex, message_id_hex)?
             {
-                let should_advance = read_state_tx(&conn, group_id_hex)?
-                    .and_then(|state| {
-                        state
+                let target_order = target.canonical_order_key();
+                let should_advance = match read_state_tx(&conn, group_id_hex)? {
+                    None => true,
+                    Some(state) => match state.canonical_order_key() {
+                        Some(current_order) => target_order > current_order,
+                        None => state
                             .last_read_timeline_at
-                            .zip(state.last_read_message_id_hex)
-                    })
-                    .is_none_or(|(at, id)| {
-                        timeline_tuple_after(target.timeline_at, &target.message_id_hex, at, &id)
-                    });
+                            .zip(state.last_read_message_id_hex.as_deref())
+                            .is_none_or(|(at, id)| {
+                                timeline_tuple_after(
+                                    target.timeline_at,
+                                    &target.message_id_hex,
+                                    at,
+                                    id,
+                                )
+                            }),
+                    },
+                };
 
                 if should_advance {
+                    let (order_class, order_primary, order_phase, order_at, _id) = target_order;
                     conn.execute(
                         "INSERT INTO conversation_read_state (
                             group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                            last_read_order_class, last_read_order_primary,
+                            last_read_order_phase, last_read_order_at,
                             initialized_at, updated_at, manually_marked_unread
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?4, 0)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0)
                          ON CONFLICT(group_id_hex) DO UPDATE SET
                             last_read_message_id_hex = excluded.last_read_message_id_hex,
                             last_read_timeline_at = excluded.last_read_timeline_at,
+                            last_read_order_class = excluded.last_read_order_class,
+                            last_read_order_primary = excluded.last_read_order_primary,
+                            last_read_order_phase = excluded.last_read_order_phase,
+                            last_read_order_at = excluded.last_read_order_at,
                             updated_at = excluded.updated_at,
                             manually_marked_unread = 0",
                         params![
                             group_id_hex,
                             &target.message_id_hex,
                             u64_to_i64(target.timeline_at)?,
+                            i64::from(order_class),
+                            u64_to_i64(order_primary)?,
+                            i64::from(order_phase),
+                            u64_to_i64(order_at)?,
                             u64_to_i64(unix_now_seconds())?
                         ],
                     )
@@ -693,6 +708,25 @@ fn refresh_chat_list_row_tx(
 /// again leave the counts stale.
 const CHAT_LIST_MENTION_COUNTS_VERSION: i64 = 1;
 
+/// One authoritative latest-preview order for rebuild, completeness, and
+/// secure-prune repair. Failed local sends remain visible in the timeline but
+/// do not outrank accepted history in the chat-list projection.
+pub(crate) const CHAT_LIST_PREVIEW_ORDER_DESC: &str = "CASE
+        WHEN direction = 'sent'
+         AND invalidation_status = 'local_publish_failed' THEN 0
+        ELSE 1
+    END DESC,
+    timeline_order_class DESC,
+    timeline_order_primary DESC,
+    timeline_order_phase DESC,
+    timeline_order_at DESC,
+    message_id_hex DESC";
+
+struct LatestChatListMessage {
+    preview: ChatListMessagePreview,
+    canonical_order_prefix: (u8, u64, u8, u64),
+}
+
 fn chat_list_mention_counts_version_tx(tx: &Connection) -> StorageResult<i64> {
     Ok(tx
         .query_row(
@@ -806,7 +840,8 @@ fn chat_list_projection_complete_tx(
     }
     if projection_has_rows_tx(
         tx,
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
                 SELECT 1
                 FROM account_groups AS ag
                 JOIN chat_list_rows AS row
@@ -828,7 +863,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_sender IS NOT (
@@ -843,7 +878,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_preview IS NOT (
@@ -858,7 +893,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_kind IS NOT (
@@ -873,7 +908,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_timeline_at IS NOT (
@@ -888,7 +923,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_deleted IS NOT COALESCE((
@@ -903,7 +938,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      ), 0)
                    OR row.last_message_media_json IS NOT (
@@ -918,7 +953,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      )
                    OR row.last_message_delivery_state IS NOT COALESCE((
@@ -938,7 +973,7 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                         LIMIT 1
                      ), 'not_applicable')
                    OR row.activity_sort_at IS NOT MAX(
@@ -955,7 +990,7 @@ fn chat_list_projection_complete_tx(
                                       AND mt.invalidation_status = 'local_publish_failed'
                                   )
                               )
-                            ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
                             LIMIT 1
                         ), 0),
                         COALESCE((
@@ -965,7 +1000,8 @@ fn chat_list_projection_complete_tx(
                         ), 0),
                         ag.conversation_created_at
                      )
-             )",
+             )"
+        ),
         params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
     )? {
         return Ok(false);
@@ -1033,6 +1069,7 @@ fn rebuild_chat_list_row_for_group_tx(
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
     let latest = latest_kind9_message_tx(tx, &group.group_id_hex)?;
+    let latest_message = latest.as_ref().map(|latest| &latest.preview);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
     let unread = unread_summary_tx(
         tx,
@@ -1041,8 +1078,7 @@ fn rebuild_chat_list_row_for_group_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
-    let activity_sort_at = latest
-        .as_ref()
+    let activity_sort_at = latest_message
         .map(|message| message.timeline_at)
         .into_iter()
         .chain(
@@ -1136,22 +1172,16 @@ fn rebuild_chat_list_row_for_group_tx(
                 .avatar
                 .as_ref()
                 .and_then(|avatar| avatar.media_type.as_deref()),
-            latest
-                .as_ref()
-                .map(|message| message.message_id_hex.as_str()),
-            latest.as_ref().map(|message| message.sender.as_str()),
-            latest.as_ref().map(|message| message.plaintext.as_str()),
-            optional_u64_to_i64(latest.as_ref().map(|message| message.kind))?,
-            optional_u64_to_i64(latest.as_ref().map(|message| message.timeline_at))?,
-            latest
-                .as_ref()
+            latest_message.map(|message| message.message_id_hex.as_str()),
+            latest_message.map(|message| message.sender.as_str()),
+            latest_message.map(|message| message.plaintext.as_str()),
+            optional_u64_to_i64(latest_message.map(|message| message.kind))?,
+            optional_u64_to_i64(latest_message.map(|message| message.timeline_at))?,
+            latest_message
                 .map(|message| bool_i64(message.deleted))
                 .unwrap_or(0),
-            latest
-                .as_ref()
-                .and_then(|message| message.media_json.as_deref()),
-            latest
-                .as_ref()
+            latest_message.and_then(|message| message.media_json.as_deref()),
+            latest_message
                 .map(|message| message.delivery_state.as_str())
                 .unwrap_or_else(|| ChatListMessageDeliveryState::NotApplicable.as_str()),
             u64_to_i64(unread.count)?,
@@ -1201,28 +1231,51 @@ fn unread_summary_tx(
             first_message_id: None,
         });
     };
-    let (where_sql, marker_at, marker_id) =
-        if let Some(last_read_at) = read_state.last_read_timeline_at {
+    let (where_sql, marker_params, order_sql) =
+        if let Some((class, primary, phase, at, id)) = read_state.canonical_order_key() {
+            (
+                "(timeline_order_class,
+              timeline_order_primary,
+              timeline_order_phase,
+              timeline_order_at,
+              message_id_hex) > (?4, ?5, ?6, ?7, ?8)",
+                vec![
+                    rusqlite::types::Value::Integer(i64::from(class)),
+                    rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+                    rusqlite::types::Value::Integer(i64::from(phase)),
+                    rusqlite::types::Value::Integer(u64_to_i64(at)?),
+                    rusqlite::types::Value::Text(id.to_owned()),
+                ],
+                "timeline_order_class ASC,
+              timeline_order_primary ASC,
+              timeline_order_phase ASC,
+              timeline_order_at ASC,
+              message_id_hex ASC",
+            )
+        } else if let Some(last_read_at) = read_state.last_read_timeline_at {
+            let marker_id = read_state.last_read_message_id_hex.as_deref().unwrap_or("");
             (
                 "(timeline_at > ?4 OR (timeline_at = ?4 AND message_id_hex > ?5))",
-                last_read_at,
-                read_state.last_read_message_id_hex.as_deref().unwrap_or(""),
+                vec![
+                    rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
+                    rusqlite::types::Value::Text(marker_id.to_owned()),
+                ],
+                "timeline_at ASC, message_id_hex ASC",
             )
         } else {
             (
                 "timeline_at > ?4 AND (?5 = ?5)",
-                read_state.initialized_at,
-                "",
+                vec![
+                    rusqlite::types::Value::Integer(u64_to_i64(read_state.initialized_at)?),
+                    rusqlite::types::Value::Text(String::new()),
+                ],
+                "timeline_at ASC, message_id_hex ASC",
             )
         };
-    // #704: derive count + first-unread id + mention_count from ONE ordered scan
-    // over the unread window, instead of a separate COUNT(*), a LIMIT 1, and a
-    // full mention scan over the identical predicate. Ordered by the
-    // materialized-timeline key `(timeline_at, message_id_hex)` so the first row
-    // is the first-unread message. Mention classification is injected (the
-    // storage layer never parses nostr/NIP-21); a tag blob that fails to decode
-    // is treated as no tags (no mention) so one malformed row never errors the
-    // whole projection.
+    // Derive count + first-unread id + mention_count from one ordered scan over
+    // the unread window. Persisted canonical anchors use the same accepted-history
+    // key as timeline pagination even after retention prunes the marker row.
+    // Legacy states without a canonical anchor use wall-clock predicate + order.
     let scan_sql = format!(
         "SELECT message_id_hex, plaintext, tags_json
          FROM message_timeline
@@ -1232,17 +1285,17 @@ fn unread_summary_tx(
            AND invalidation_status IS NULL
            AND sender != ?3
            AND {where_sql}
-         ORDER BY timeline_at ASC, message_id_hex ASC"
+         ORDER BY {order_sql}"
     );
+    let mut query_params = vec![
+        rusqlite::types::Value::Text(group_id_hex.to_owned()),
+        rusqlite::types::Value::Integer(u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?),
+        rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
+    ];
+    query_params.extend(marker_params);
     let mut scan_stmt = tx.prepare(&scan_sql).storage()?;
     let mut scan_rows = scan_stmt
-        .query(params![
-            group_id_hex,
-            u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
-            local_account_id_hex,
-            u64_to_i64(marker_at)?,
-            marker_id,
-        ])
+        .query(rusqlite::params_from_iter(query_params))
         .storage()?;
     let mut count: u64 = 0;
     let mut mention_count: u64 = 0;
@@ -1373,20 +1426,35 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
 fn latest_kind9_message_tx(
     tx: &Connection,
     group_id_hex: &str,
-) -> StorageResult<Option<ChatListMessagePreview>> {
-    tx.query_row(
+) -> StorageResult<Option<LatestChatListMessage>> {
+    let sql = format!(
         "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                media_json, direction, source_message_id_hex, invalidation_status
+                media_json, direction, source_message_id_hex, invalidation_status,
+                timeline_order_class, timeline_order_primary,
+                timeline_order_phase, timeline_order_at
          FROM message_timeline
          WHERE group_id_hex = ?1 AND kind = ?2
            AND (
                invalidation_status IS NULL
                OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
            )
-         ORDER BY timeline_at DESC, message_id_hex DESC
-         LIMIT 1",
+         ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
+         LIMIT 1"
+    );
+    tx.query_row(
+        &sql,
         params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
-        chat_list_message_from_row,
+        |row| {
+            Ok(LatestChatListMessage {
+                preview: chat_list_message_from_row(row)?,
+                canonical_order_prefix: (
+                    row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+                    row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+                    row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
+                    row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
+                ),
+            })
+        },
     )
     .optional()
     .storage()
@@ -1396,10 +1464,10 @@ fn timeline_message_for_read_marker_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<Option<ChatListMessagePreview>> {
+) -> StorageResult<Option<TimelineReadMarker>> {
     tx.query_row(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                media_json, direction, source_message_id_hex, invalidation_status
+        "SELECT message_id_hex, source_message_id_hex, source_epoch,
+                invalidation_status, timeline_at
          FROM message_timeline
          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind = ?3",
         params![
@@ -1407,7 +1475,17 @@ fn timeline_message_for_read_marker_tx(
             message_id_hex,
             u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?
         ],
-        chat_list_message_from_row,
+        |row| {
+            Ok(TimelineReadMarker {
+                message_id_hex: row.get(0)?,
+                source_message_id_hex: row.get(1)?,
+                source_epoch: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|value| value.try_into().ok()),
+                invalidation_status: row.get(3)?,
+                timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+            })
+        },
     )
     .optional()
     .storage()
@@ -1441,13 +1519,62 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
     })
 }
 
+fn insert_initial_read_state_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    manually_marked_unread: bool,
+) -> StorageResult<()> {
+    let latest = latest_kind9_message_tx(tx, group_id_hex)?;
+    let (message_id, timeline_at, order_class, order_primary, order_phase, order_at) = match latest
+    {
+        Some(latest) => (
+            Some(latest.preview.message_id_hex),
+            Some(latest.preview.timeline_at),
+            Some(latest.canonical_order_prefix.0),
+            Some(latest.canonical_order_prefix.1),
+            Some(latest.canonical_order_prefix.2),
+            Some(latest.canonical_order_prefix.3),
+        ),
+        None => (None, None, None, None, None, None),
+    };
+    // Match first-open semantics: with no retained kind-9 history there is no
+    // read anchor yet, so a subsequently recorded message counts even when its
+    // sender timestamp predates this local interaction.
+    let initialized_at = timeline_at.unwrap_or(0);
+    tx.execute(
+        "INSERT INTO conversation_read_state (
+            group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+            last_read_order_class, last_read_order_primary,
+            last_read_order_phase, last_read_order_at,
+            initialized_at, updated_at, manually_marked_unread
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            group_id_hex,
+            message_id,
+            optional_u64_to_i64(timeline_at)?,
+            order_class.map(i64::from),
+            optional_u64_to_i64(order_primary)?,
+            order_phase.map(i64::from),
+            optional_u64_to_i64(order_at)?,
+            u64_to_i64(initialized_at)?,
+            u64_to_i64(unix_now_seconds())?,
+            bool_i64(manually_marked_unread),
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
 fn read_state_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<ConversationReadState>> {
     tx.query_row(
-        "SELECT last_read_message_id_hex, last_read_timeline_at, initialized_at,
-                manually_marked_unread
+        "SELECT last_read_message_id_hex, last_read_timeline_at,
+                last_read_order_class, last_read_order_primary,
+                last_read_order_phase, last_read_order_at,
+                initialized_at, manually_marked_unread
          FROM conversation_read_state
          WHERE group_id_hex = ?1",
         params![group_id_hex],
@@ -1457,8 +1584,20 @@ fn read_state_tx(
                 last_read_timeline_at: row
                     .get::<_, Option<i64>>(1)?
                     .and_then(|value| value.try_into().ok()),
-                initialized_at: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
-                manually_marked_unread: row.get::<_, i64>(3)? != 0,
+                last_read_order_class: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|value| value.try_into().ok()),
+                last_read_order_primary: row
+                    .get::<_, Option<i64>>(3)?
+                    .and_then(|value| value.try_into().ok()),
+                last_read_order_phase: row
+                    .get::<_, Option<i64>>(4)?
+                    .and_then(|value| value.try_into().ok()),
+                last_read_order_at: row
+                    .get::<_, Option<i64>>(5)?
+                    .and_then(|value| value.try_into().ok()),
+                initialized_at: row.get::<_, i64>(6)?.try_into().unwrap_or_default(),
+                manually_marked_unread: row.get::<_, i64>(7)? != 0,
             })
         },
     )

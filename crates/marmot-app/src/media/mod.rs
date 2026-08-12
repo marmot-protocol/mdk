@@ -1,9 +1,10 @@
+use bytes::Bytes;
 use cgka_traits::app_components::{
     BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     canonicalize_marmot_media_type,
 };
-use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use nostr::NostrSigner;
 use rand::RngCore;
@@ -27,6 +28,7 @@ use crypto::{
 };
 use host_safety::validate_locator;
 
+pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
 pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
 pub(crate) use group_image::{fetch_group_image, upload_group_image};
 pub(crate) use host_safety::is_loopback_http_endpoint;
@@ -179,7 +181,7 @@ pub(crate) async fn upload_profile_image_with_policy(
     let hash_hex = hex::encode(Sha256::digest(image));
     let url = upload_blossom_blob_with_content_type(
         server,
-        image,
+        Bytes::copy_from_slice(image),
         &hash_hex,
         signer,
         allow_loopback_http,
@@ -487,6 +489,7 @@ pub(crate) async fn upload_encrypted_media(
             "media upload requires at least one attachment".into(),
         ));
     }
+    validate_media_upload_batch(&request.attachments)?;
     let upload_servers = match request.blossom_server {
         Some(server) => vec![server],
         None => policy
@@ -520,6 +523,29 @@ pub(crate) async fn upload_encrypted_media(
     })
 }
 
+fn validate_media_upload_batch(
+    attachments: &[MediaUploadAttachmentRequest],
+) -> Result<(), AppError> {
+    validate_media_upload_batch_lengths(
+        attachments
+            .iter()
+            .map(|attachment| attachment.plaintext.len() as u64),
+    )
+}
+
+fn validate_media_upload_batch_lengths(
+    lengths: impl IntoIterator<Item = u64>,
+) -> Result<(), AppError> {
+    let max_plaintext_bytes = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    let total_plaintext_bytes = lengths.into_iter().try_fold(0_u64, u64::checked_add);
+    if total_plaintext_bytes.is_none_or(|total| total > max_plaintext_bytes) {
+        return Err(AppError::InvalidEncryptedMedia(format!(
+            "media upload batch exceeds {max_plaintext_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
 async fn upload_encrypted_media_attachment(
     request: MediaUploadAttachmentRequest,
     source_epoch: u64,
@@ -533,6 +559,7 @@ async fn upload_encrypted_media_attachment(
             "media plaintext cannot be empty".into(),
         ));
     }
+    validate_media_plaintext_len(request.plaintext.len() as u64)?;
     let file_name = match policy.version {
         EncryptedMediaVersion::V1 => request.file_name.trim().to_owned(),
         EncryptedMediaVersion::V2 => request.file_name,
@@ -556,19 +583,15 @@ async fn upload_encrypted_media_attachment(
     let aad = media_aad(policy.version, &plaintext_hash, &media_type, &file_name);
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid media key length".into()))?;
-    let encrypted = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &request.plaintext,
-                aad: &aad,
-            },
-        )
+    let mut encrypted = request.plaintext;
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut encrypted)
         .map_err(|_| AppError::InvalidEncryptedMedia("media encryption failed".into()))?;
+    let encrypted_size_bytes = encrypted.len() as u64;
     let ciphertext_sha256 = hex::encode(Sha256::digest(&encrypted));
     let url = upload_blossom_blob_with_fallback(
         upload_servers,
-        &encrypted,
+        Bytes::from(encrypted),
         &ciphertext_sha256,
         signer,
         policy.allow_loopback_http,
@@ -599,14 +622,24 @@ async fn upload_encrypted_media_attachment(
         policy.allow_loopback_http,
     )?;
     Ok(MediaUploadAttachmentResult {
-        encrypted_size_bytes: encrypted.len() as u64,
+        encrypted_size_bytes,
         reference,
     })
 }
 
+fn validate_media_plaintext_len(plaintext_bytes: u64) -> Result<(), AppError> {
+    let max_plaintext_bytes = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    if plaintext_bytes > max_plaintext_bytes {
+        return Err(AppError::InvalidEncryptedMedia(format!(
+            "media plaintext exceeds {max_plaintext_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
 async fn upload_blossom_blob_with_fallback(
     servers: &[String],
-    encrypted: &[u8],
+    encrypted: Bytes,
     encrypted_hash_hex: &str,
     signer: &dyn NostrSigner,
     allow_loopback_http: bool,
@@ -615,7 +648,7 @@ async fn upload_blossom_blob_with_fallback(
     for (idx, server) in servers.iter().enumerate() {
         match upload_blossom_blob(
             server,
-            encrypted,
+            encrypted.clone(),
             encrypted_hash_hex,
             signer,
             allow_loopback_http,
@@ -690,14 +723,9 @@ pub(crate) async fn download_encrypted_media(
     let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid media key length".into()))?;
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &encrypted,
-                aad: &aad,
-            },
-        )
+    let mut plaintext = encrypted;
+    cipher
+        .decrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut plaintext)
         .map_err(|_| AppError::InvalidEncryptedMedia("media decryption failed".into()))?;
     let actual_plaintext_hash: [u8; 32] = Sha256::digest(&plaintext).into();
     if actual_plaintext_hash != plaintext_hash {

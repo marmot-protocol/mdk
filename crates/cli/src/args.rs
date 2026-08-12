@@ -732,13 +732,13 @@ pub(crate) enum MessageCommand {
         group_id: Option<String>,
         #[arg(long, help = "Group id to list")]
         group: Option<String>,
-        #[arg(long, help = "Only include messages before this unix timestamp")]
+        #[arg(long, help = "Before-cursor timestamp; requires --before-message-id")]
         before: Option<u64>,
-        #[arg(long, help = "Only include messages before this message id")]
+        #[arg(long, help = "Before-cursor message id; requires --before")]
         before_message_id: Option<String>,
-        #[arg(long, help = "Only include messages after this unix timestamp")]
+        #[arg(long, help = "After-cursor timestamp; requires --after-message-id")]
         after: Option<u64>,
-        #[arg(long, help = "Only include messages after this message id")]
+        #[arg(long, help = "After-cursor message id; requires --after")]
         after_message_id: Option<String>,
         #[arg(long, help = "Maximum number of messages to return")]
         limit: Option<usize>,
@@ -781,13 +781,13 @@ pub(crate) enum MessageTimelineCommand {
         group_id: Option<String>,
         #[arg(long, help = "Group id to list")]
         group: Option<String>,
-        #[arg(long, help = "Only include timeline rows before this unix timestamp")]
+        #[arg(long, help = "Before-cursor timestamp; requires --before-message-id")]
         before: Option<u64>,
-        #[arg(long, help = "Only include timeline rows before this message id")]
+        #[arg(long, help = "Before-cursor message id; requires --before")]
         before_message_id: Option<String>,
-        #[arg(long, help = "Only include timeline rows after this unix timestamp")]
+        #[arg(long, help = "After-cursor timestamp; requires --after-message-id")]
         after: Option<u64>,
-        #[arg(long, help = "Only include timeline rows after this message id")]
+        #[arg(long, help = "After-cursor message id; requires --after")]
         after_message_id: Option<String>,
         #[arg(long, help = "Maximum number of timeline rows to return")]
         limit: Option<usize>,

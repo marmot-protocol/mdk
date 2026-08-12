@@ -9,6 +9,25 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Encrypted media and Hermes/WN Agent file delivery now accept blobs up to
+  512 MiB (including the 16-byte authentication tag), enabling APKs and other
+  artifacts above the previous 64 MiB ceiling. Encryption/decryption is
+  performed in place, Blossom fallback retries share the same immutable upload
+  body, and large blob transfers have a 15-minute request budget. Receivers must
+  upgrade to this compatibility cohort before downloading blobs above 64 MiB;
+  the active blob remains memory-resident and one media request is bounded to
+  512 MiB total.
+- App-runtime encrypted-media secret caching now skips the MLS group load,
+  exporter-secret derivation, and database write when the current epoch's
+  secret is already cached, and the cache sweep's `required` pre-check uses
+  the projected group record as a positive-only fast path, re-checking the
+  signed component only when the projection reports media disabled. Message
+  sends and group syncs no longer pay three MLS group loads per media group
+  per sweep.
+  ([#1396](https://github.com/marmot-protocol/mdk/pull/1396))
+
 ### Fixed
 
 - OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the
@@ -25,15 +44,33 @@ versioning through the workspace version in the root `Cargo.toml`.
   until a causally newer chat message arrives, while a durable engine-to-app
   delivery outbox makes that first crossing chat recoverable after a crash and
   does not affect other locally deleted groups.
+- Nostr group-sync unsubscribe draining now keeps unresolved relay teardowns
+  queued until teardown is confirmed, so cancelling a sync after routing
+  state commits retries pending unsubscribes and converges removal metrics
+  without double-counting.
 - OpenCode harness idle-timeout regression test now keeps the mock child alive
   past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
+- Nostr group-subscription sync now registers new routes and telemetry before
+  issuing relay REQs, so immediate stored-event replay cannot be dropped as
+  unroutable; failed subscriptions roll the staged state back for clean retry.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.
+- Group timelines now derive their durable order from authenticated MLS source
+  epochs instead of local receive time. State-change rows lead the application
+  messages they authorize, pagination/live windows and read markers share that
+  order, and delayed catch-up converges to the same sequence on every device.
 - Runtime catch-up, key-package maintenance, and every other incremental sync
   seam now execute an armed epoch-gap full-history replay immediately instead of
   waiting for unrelated later relay traffic. Explicit full-history repair also
   consumes a pending replay without issuing the same account-wide query twice.
+- Epoch-gap backfill forensic audit rows now continue past `armed` with typed
+  `started`, `completed`/`failed`, and optional `deferred` lifecycle evidence
+  correlated by `operation_id`, including replay seam, delivery count, transport
+  activation outcome, and per-group local epoch before/after observation. In-flight
+  arms minted during a replay are queued instead of being overwritten when the
+  current attempt fails, and identical deferred evidence is debounced until the
+  observable group-epoch state changes.
 - KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
   categories (for example `blocked` or `auth-required`) instead of repeating a
   generic `relay rejected event` summary, while successful deletions still

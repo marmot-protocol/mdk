@@ -148,6 +148,31 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
 - Boundary: this is public projection evidence. Adapter-local message ids, runtime event counts, database paths, and
   other execution-specific observations are deliberately not compared.
 
+### `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`
+
+- Runs: the four-participant cross-route topology through both the strict retained-engine subject and the full
+  `MarmotAppRuntime` adapter. The app harness's real in-memory Nostr relay associates retained events with stable
+  Scenario IR action ids. After verifying every harness participant is offline, it removes a selected event from the
+  single shared relay database, making that event unavailable to every participant that has not already fetched it,
+  and reinserts it before full-history repair. This is deliberately relay-wide rather than the strict retained-relay
+  subject's per-recipient visibility model, and avoids treating process timing or a live relay race as controlled
+  delivery. Action selectors cover group-message events and action-local Welcome gift wraps admitted before a
+  successful serialized app command returns; publications deferred beyond that command boundary (for example, a
+  scheduled self-update) are not action-addressable on this adapter.
+- Checks: the retained-engine reference reaches exact canonical equality, durable accepted/invalidated/accepted commit
+  dispositions, no pending work, and all twelve active decryptability edges. The app run pins the intended split at
+  the intermediate checkpoint, compares final public protocol state and active probes with that reference, and keeps
+  the observed falsification explicit.
+- Known falsification: repeated executions have produced three exactly characterized non-equivalent terminal surfaces
+  after the controlled input schedule: Zeta remains one epoch behind with the complete probe set; public protocol state
+  agrees while only Alpha's post-settlement application probe remains neither visible nor invalidated at Zeta; or
+  Alpha remains on its competing root, Observer remains at the baseline, and only Yankee/Zeta reach the retained
+  reference branch, with the probe sets split along those same branch boundaries. The characterization rejects any
+  fourth divergence shape, unexpected or duplicate payloads, and complete equivalence so every changed outcome forces
+  review of the counterexample and claim together. It is not passing route-equivalence evidence.
+- Boundary: process, container, and VM adapters do not yet expose equivalent controlled retained-event staging. They
+  must not claim this topology from targeted catch-up alone because a live relay can deliver the competing root first.
+
 ## Shared Generators
 
 ### `intent_seq(3, range)`

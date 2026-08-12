@@ -135,7 +135,7 @@ pub use audit_log::{
     AuditLogUploadResult,
 };
 pub use client::AppClient;
-pub(crate) use client::ConvergenceScheduleState;
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
     MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
@@ -169,9 +169,9 @@ pub use ids::{
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
-    EncryptedMediaVersion, MediaAttachmentReference, MediaDownloadResult, MediaLocator,
-    MediaUploadAttachmentRequest, MediaUploadAttachmentResult, MediaUploadRequest,
-    MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
+    EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MediaAttachmentReference,
+    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
+    MediaUploadRequest, MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
@@ -1460,7 +1460,8 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
-            epoch_backfill_pending: false,
+            pending_epoch_backfill: None,
+            queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
         };
         if !defer_group_hydration {
@@ -1954,6 +1955,17 @@ impl MarmotApp {
         .entered();
         self.ensure_account_state(label)?;
         Ok(self.account_storage(label)?.message_timeline(query)?)
+    }
+
+    pub(crate) fn timeline_messages_by_wall_clock_with_query(
+        &self,
+        label: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .message_timeline_by_wall_clock(query)?)
     }
 
     pub fn timeline_message(

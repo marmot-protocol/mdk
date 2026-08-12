@@ -56,6 +56,8 @@ pub(crate) fn projection_update_matches_query(
 }
 
 pub(crate) fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
+    // Projection application already derives canonical-vs-wall ordering from
+    // this field, so global windows can safely merge per-group deltas.
     query
         .search
         .as_ref()

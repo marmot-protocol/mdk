@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-06-30
+updated: 2026-08-11
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -104,9 +104,15 @@ add the incremental, bounded, non-blocking, single-source properties around it s
      correct here because this cursor is only a per-client lag-recovery cut-point (never cross-client display). The
      third field is load-bearing for unscoped (all-groups) recovery, where the same `message_id_hex` can appear in two
      groups.
-   - **Materialized-timeline order** — `TIMELINE_ORDER_BY_ASC/_DESC` = `(timeline_at, message_id_hex)` over
-     `message_timeline`/chat-list; the cross-client user-visible display + pagination order (`timeline_at == recorded_at`
-     at projection). The replay cursor MUST NOT be applied to timeline pagination.
+   - **Materialized-timeline order** — authenticated `source_epoch` boundaries define the cross-client order for a
+     single group's `message_timeline`/chat-list rows. `TIMELINE_GROUP_ORDER_BY_ASC/_DESC` places synthesized state
+     changes before authenticated application messages in the epoch they establish and uses stable message ids to
+     break remaining ties. Group pagination resolves a retained cursor by `(group_id_hex, message_id_hex)` to recover
+     that canonical key; if the row was pruned, the caller must refresh instead of applying a wall-clock predicate to
+     canonical order. `TIMELINE_WALL_ORDER_BY_ASC/_DESC` = `(timeline_at, message_id_hex)` remains the order for
+     cross-group queries and retention scans. Cross-group queries use wall-clock order because epochs are not
+     comparable; retention scans use it for time-based expiry. The replay cursor MUST NOT be applied to either
+     timeline order.
 2. **Runtime recovery** (`marmot-app` runtime). The lag-recovery watermark capture and `recovery_row_is_pre_subscription`
    suppression are the SAME `AppEventReplayCursor` the recovery query orders by, so the suppression boundary can never
    drift from the query order. Lag replay reads a bounded window (broadcast-depth/watermark-keyed), never the full
@@ -125,9 +131,10 @@ add the incremental, bounded, non-blocking, single-source properties around it s
 Canonical derived-state owners: timeline display order + raw-event replay cursor = `storage-sqlite` (the two helpers
 above); lag watermark/suppression = the subscription runtime, typed on `AppEventReplayCursor`; pending-convergence
 scheduling = `ScheduledConvergence`; transport routing = the engine + adapter indexes; message dedup = the engine's
-bounded `seen_message_ids` set (borrowed, not re-serialized, per convergence pass). `recorded_at` is cross-client-stable:
-the outer transport envelope's `created_at` is bound to the inner app event's `created_at` at wrap time, so a sender and
-every receiver record the same value.
+bounded `seen_message_ids` set (borrowed, not re-serialized, per convergence pass). Authenticated app-message
+`recorded_at` is cross-client-stable: the outer transport envelope's `created_at` is bound to the inner app event's
+`created_at` at wrap time, so a sender and every receiver record the same value. Synthesized state rows have only local
+observation time, which is a display/retention value and never the canonical group-history authority.
 
 The convergence branch-selection model is unchanged; see [`../distributed-convergence.md`](../distributed-convergence.md)
 and [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md).
