@@ -353,8 +353,12 @@ branch state exists, so the transient state is rolled back before any (async) pe
 Gating, so the uncontested path pays no replay: the sweep returns before any context work on an empty backlog; context
 collection stops at the cheap "two commits share a source epoch" check before any replay; at most
 `MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS` branches are materialized, one bounded replay each under a fresh budget of the
-pass's shape; and failure to enumerate branches (missing anchor, missing own-commit checkpoint, exhausted budget)
-yields no contexts rather than an error — the pass, not this helper, owns every verdict. Because candidate branch
+pass's shape. That cap is applied to candidates ranked by tip epoch then branch id, never to the BFS's own
+shallowest-first completion order: both keys are content-derived, so peers holding the same evidence keep the same
+branches, and a wide shallow fork cannot evict the deep branch that actually carries the post-fork traffic. Branch
+*selection* is uncapped — a branch past the prefix can still win a pass and peels natively once adopted. Finally,
+failure to enumerate branches (missing anchor, missing own-commit checkpoint, exhausted budget) yields no contexts
+rather than an error — the pass, not this helper, owns every verdict. Because candidate branch
 states are part of the peel context, `deferred_peel_context_fingerprint` folds in the stored commit graph: a newly
 retained rival commit adds a readable context even when the live epoch and retained-anchor set are unchanged, and
 without that term the sweep gate would stay armed exactly where it must not.

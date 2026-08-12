@@ -1775,13 +1775,15 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     }
 
     let pending_proposals = pending_proposal_messages(&inputs.pending_messages)?;
-    let mut contexts = Vec::with_capacity(max_contexts.min(path_result.candidate_paths.len()));
+    let ranked =
+        candidate_paths_ranked_for_peel(&path_result.candidate_paths, &path_result.materialized);
+    let mut contexts = Vec::with_capacity(max_contexts.min(ranked.len()));
     // Each tip context costs one replay of its path. The BFS already replayed
     // every node to enumerate the paths; capturing the contexts inside that
     // walk would have to carry exporter material through
     // `OpenMlsMaterializedCandidate` and into every canonicalization result, so
     // this pays a bounded second replay to keep secrets out of those types.
-    for path in path_result.candidate_paths.iter().take(max_contexts) {
+    for path in ranked.into_iter().take(max_contexts) {
         match candidate_path_peel_context(
             storage,
             group_id,
@@ -1807,6 +1809,38 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
         }
     }
     Ok(contexts)
+}
+
+/// Order candidate paths by how much a peel context on each is worth, so the
+/// context cap keeps the branches most likely to unseal retained traffic.
+///
+/// The BFS completes paths in level order, so the raw vector runs shallowest
+/// first and a prefix would keep exactly the wrong branches: a handful of
+/// one-commit rivals — the cheapest fork there is to post — would evict every
+/// branch that actually carries post-fork traffic. Deeper tips rank first.
+///
+/// Both keys are content-derived: `tip_epoch` comes from replaying the stored
+/// commits, `branch_id` from their digests. Peers holding the same evidence
+/// therefore keep the same branches, which is what makes capping safe at all.
+fn candidate_paths_ranked_for_peel<'a>(
+    candidate_paths: &'a [OpenMlsCandidatePath],
+    materialized: &[OpenMlsMaterializedCandidate],
+) -> Vec<&'a OpenMlsCandidatePath> {
+    // Joined on `branch_id` rather than position: `materialized` is parallel to
+    // `candidate_paths` by construction but is allowed to come back short, and
+    // a silent index skew would rank branches by another branch's depth.
+    let tip_epochs: BTreeMap<&str, u64> = materialized
+        .iter()
+        .map(|candidate| (candidate.branch_id.as_str(), candidate.tip_epoch))
+        .collect();
+    let mut ranked: Vec<&OpenMlsCandidatePath> = candidate_paths.iter().collect();
+    ranked.sort_by(|a, b| {
+        tip_epochs
+            .get(b.branch_id.as_str())
+            .cmp(&tip_epochs.get(a.branch_id.as_str()))
+            .then_with(|| a.branch_id.cmp(&b.branch_id))
+    });
+    ranked
 }
 
 /// Stable low-cardinality label for a halt that yields no (or fewer) candidate
@@ -4584,6 +4618,95 @@ mod candidate_branch_peel_halt_tests {
         assert!(
             halted.contested,
             "the fork is in the stored graph, not in what enumeration managed to read"
+        );
+    }
+
+    // --- The cap -------------------------------------------------------------
+
+    /// The epoch every device in these fixtures is standing on when the fork
+    /// happens, so a one-commit branch tips at `FORK_EPOCH + 1` and the
+    /// two-commit branch at `FORK_EPOCH + 2`.
+    const FORK_EPOCH: u64 = 1;
+
+    /// Wide enough that the surviving branches outnumber the cap: one rival per
+    /// width, minus the one Carol extends, plus her deeper branch.
+    const WIDE_FORK_WIDTH: usize = MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS + 2;
+
+    /// A fork wider than the cap, with one branch carried a commit deeper, as
+    /// stored by two devices that never left the fork epoch.
+    ///
+    /// Bob forks [`WIDE_FORK_WIDTH`] ways and Carol adopts one rival and commits
+    /// on it, so each observer holds `WIDE_FORK_WIDTH - 1` one-commit branches
+    /// plus one two-commit branch. Both observers are given the same evidence,
+    /// which is what lets a peer comparison mean anything.
+    async fn wide_fork_with_one_deep_branch()
+    -> (GroupId, SqliteAccountStorage, SqliteAccountStorage) {
+        let (mut alice, alice_storage) = build_client(b"peel-rank-alice");
+        let (mut bob, bob_storage) = build_client(b"peel-rank-bob");
+        let (mut carol, carol_storage) = build_client(b"peel-rank-carol");
+        let (mut dave, dave_storage) = build_client(b"peel-rank-dave");
+        let group_id = group_with(&mut alice, &mut [&mut bob, &mut carol, &mut dave]).await;
+
+        let bob_id = member_id(b"peel-rank-bob");
+        let mut fork = Vec::new();
+        for _ in 0..WIDE_FORK_WIDTH {
+            let commit = rival_commit(&bob_storage, &bob_id, &group_id);
+            for observer in [&alice_storage, &dave_storage] {
+                admit_rival(observer, &group_id, &commit, FORK_EPOCH);
+            }
+            fork.push(commit);
+        }
+
+        adopt_branch(&carol_storage, &group_id, &fork[0]);
+        let deeper = rival_commit(&carol_storage, &member_id(b"peel-rank-carol"), &group_id);
+        for observer in [&alice_storage, &dave_storage] {
+            admit_rival(observer, &group_id, &deeper, FORK_EPOCH + 1);
+        }
+
+        (group_id, alice_storage, dave_storage)
+    }
+
+    fn branch_ids(survey: &CandidateBranchPeel) -> Vec<String> {
+        survey
+            .contexts
+            .iter()
+            .map(|context| context.branch_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_fork_wider_than_the_cap_keeps_the_same_branches_on_every_peer() {
+        let (group_id, alice_storage, dave_storage) = wide_fork_with_one_deep_branch().await;
+
+        let alice = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+        let dave = peel(&dave_storage, &group_id, V1_MAX_REWIND_COMMITS);
+
+        assert!(alice.contested && dave.contested);
+        assert_eq!(
+            alice.contexts.len(),
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+            "a graph offering more branches than the cap must fill it exactly"
+        );
+        assert_eq!(
+            branch_ids(&alice),
+            branch_ids(&dave),
+            "the capped subset is content-derived, so peers holding the same \
+             evidence must keep the same branches in the same order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deeper_branch_outranks_shallow_rivals_for_the_capped_contexts() {
+        let (group_id, alice_storage, _dave_storage) = wide_fork_with_one_deep_branch().await;
+
+        let survey = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+
+        assert_eq!(
+            survey.contexts.iter().map(|c| c.tip_epoch).max(),
+            Some(FORK_EPOCH + 2),
+            "a branch carried two commits deep holds traffic the one-commit \
+             rivals cannot unseal, so filling the cap with rivals must not \
+             evict it"
         );
     }
 }
