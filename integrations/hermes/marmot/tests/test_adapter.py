@@ -5139,6 +5139,14 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_adapter_reaction_primitives_use_inbound_target(self):
         client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["44" * 32],
+        }
+        client.remove_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["55" * 32],
+        }
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),
             client=client,
@@ -5154,6 +5162,36 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
             "11" * 32, "22" * 32, "33" * 32
         )
 
+    async def test_reaction_primitives_reject_non_durable_responses(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": [],
+        }
+        client.remove_reaction.return_value = {
+            "type": "final_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        self.assertFalse(await adapter._add_reaction("22" * 32, "33" * 32, "👀"))
+        self.assertFalse(await adapter._remove_reaction("22" * 32, "33" * 32))
+
+    async def test_reaction_failures_do_not_log_exception_text(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.side_effect = RuntimeError("sensitive-local-path")
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        with self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs:
+            self.assertFalse(await adapter._add_reaction("22" * 32, "33" * 32, "👀"))
+        self.assertNotIn("sensitive-local-path", "\n".join(logs.output))
+
     async def test_missing_reaction_is_idempotent_for_adapter_remove(self):
         client = unittest.mock.AsyncMock()
         client.remove_reaction.side_effect = self.adapter_module.AgentControlError(
@@ -5168,6 +5206,14 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_reaction_api_targets_explicit_or_latest_inbound_message(self):
         client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        client.remove_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["66" * 32],
+        }
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),
             client=client,

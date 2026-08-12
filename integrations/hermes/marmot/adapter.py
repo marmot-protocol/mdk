@@ -2752,10 +2752,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         try:
             account_id = await self._ensure_account_id()
-            await self.client.send_reaction(account_id, chat_id, message_id, emoji)
-            return True
+            response = await self.client.send_reaction(account_id, chat_id, message_id, emoji)
+            return response.get("type") == "app_event_sent" and bool(
+                response.get("message_ids_hex")
+            )
+        except AgentControlError as exc:
+            logger.debug("Marmot send_reaction failed (code=%s)", exc.code or "unknown")
+            return False
         except Exception as exc:
-            logger.debug("Marmot send_reaction failed: %s", exc)
+            logger.debug("Marmot send_reaction failed (%s)", type(exc).__name__)
             return False
 
     async def add_reaction(
@@ -2774,17 +2779,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
         try:
             account_id = await self._ensure_account_id()
-            await self.client.remove_reaction(account_id, chat_id, message_id)
-            return True
+            response = await self.client.remove_reaction(account_id, chat_id, message_id)
+            return response.get("type") == "app_event_sent" and bool(
+                response.get("message_ids_hex")
+            )
         except AgentControlError as exc:
             # A missing own reaction is already the desired state. This occurs
             # after cancellation or when an earlier acknowledgement failed.
             if exc.code == "reaction_not_found":
                 return True
-            logger.debug("Marmot remove_reaction failed: %s", exc)
+            logger.debug("Marmot remove_reaction failed (code=%s)", exc.code or "unknown")
             return False
         except Exception as exc:
-            logger.debug("Marmot remove_reaction failed: %s", exc)
+            logger.debug("Marmot remove_reaction failed (%s)", type(exc).__name__)
             return False
 
     async def remove_reaction(
