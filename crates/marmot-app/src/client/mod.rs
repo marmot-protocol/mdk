@@ -3040,11 +3040,15 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            // The projected component mirrors the engine's signed component;
-            // reading it avoids an MLS group load per group on every sweep. A
-            // stale `required` only delays warming — decryption falls back to
-            // a live export.
-            if !group.encrypted_media.required {
+            // The projected component is a positive-only fast path: `true`
+            // warms without an MLS group load. A projected `false` may be
+            // stale (a rebuild error can leave it lagging the signed
+            // component), so it must re-check the authoritative component
+            // before skipping — a missed warm here can strand a
+            // historical epoch's media once the group advances.
+            if !group.encrypted_media.required
+                && !self.encrypted_media_for_group(&group_id).required
+            {
                 continue;
             }
             if self
