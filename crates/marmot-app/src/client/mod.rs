@@ -45,7 +45,7 @@ use crate::{
     AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
     MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
     MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
-    TimelineMessageQuery, remember_seen_event, unix_now_seconds,
+    remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -2261,17 +2261,8 @@ impl AppClient {
         target_message_id: &str,
     ) -> Result<String, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let timeline = self.app.timeline_messages_with_query(
-            &self.state.label,
-            TimelineMessageQuery {
-                group_id_hex: Some(group_id_hex),
-                ..TimelineMessageQuery::default()
-            },
-        )?;
-        timeline
-            .messages
-            .into_iter()
-            .find(|message| message.message_id_hex == target_message_id)
+        self.app
+            .timeline_message(&self.state.label, &group_id_hex, target_message_id)?
             .and_then(|message| {
                 message
                     .reactions
