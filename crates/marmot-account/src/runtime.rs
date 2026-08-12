@@ -2489,49 +2489,53 @@ where
             .filter(|target| transport_fanout_target_retry_due(target, self.wall_clock.now()))
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
-        for endpoint in remaining {
-            let target = publish_target_for_endpoint(&fanout.target, endpoint.clone());
+        if !remaining.is_empty() {
+            // One adapter call fans out to every retry-due endpoint
+            // concurrently; `required_acks` is the attempt count so the
+            // adapter does not abort the remainder once one relay accepts.
+            let target = publish_target_with_endpoints(&fanout.target, remaining.clone());
             match self
                 .adapter
                 .publish(TransportPublishRequest {
                     account_id: self.session.self_id(),
                     message: fanout.exact_message.clone(),
                     target,
-                    required_acks: 1,
+                    required_acks: remaining.len(),
                 })
                 .await
             {
                 Ok(report) => {
-                    apply_report_to_fanout(
-                        &mut fanout,
-                        std::slice::from_ref(&endpoint),
-                        &report,
-                        self.wall_clock.now(),
-                    );
-                    if !report.met_required_acks() {
-                        output.failures.push(PublishFailure {
-                            message_id: report.message_id.clone(),
-                            reason: "fanout endpoint did not acknowledge".into(),
-                        });
+                    apply_report_to_fanout(&mut fanout, &remaining, &report, self.wall_clock.now());
+                    for endpoint in &remaining {
+                        let accepted = report
+                            .accepted
+                            .iter()
+                            .any(|receipt| &receipt.endpoint == endpoint);
+                        if !accepted {
+                            output.failures.push(PublishFailure {
+                                message_id: report.message_id.clone(),
+                                reason: "fanout endpoint did not acknowledge".into(),
+                            });
+                        }
                     }
                     output.reports.push(report);
                 }
                 Err(_) => {
                     fanout.possible_exposure = true;
-                    if let Some(target) = fanout
+                    for target in fanout
                         .targets
                         .iter_mut()
-                        .find(|target| target.endpoint == endpoint)
+                        .filter(|target| remaining.contains(&target.endpoint))
                     {
                         target.attempt_count = target.attempt_count.saturating_add(1);
                         target.last_attempt_at = Some(self.wall_clock.now());
                         target.state = TransportFanoutAttemptState::AttemptedFailed;
                         target.failure_code = Some("adapter_error".into());
+                        output.failures.push(PublishFailure {
+                            message_id: message_id.clone(),
+                            reason: "fanout adapter error".into(),
+                        });
                     }
-                    output.failures.push(PublishFailure {
-                        message_id: message_id.clone(),
-                        reason: "fanout adapter error".into(),
-                    });
                 }
             }
             self.session.put_transport_fanout(&fanout)?;
@@ -2726,31 +2730,54 @@ where
         self.resolve_outbound_fanout_mls(&mut fanout, output, queue)
             .await?;
         let endpoints = fanout.request().target.endpoints().to_vec();
-        for index in fanout.outstanding_target_indexes() {
-            let endpoint = endpoints[index].clone();
-            fanout.mark_attempt_started(index)?;
+        let outstanding = fanout.outstanding_target_indexes();
+        if !outstanding.is_empty() {
+            for &index in &outstanding {
+                fanout.mark_attempt_started(index)?;
+            }
             self.session.put_outbound_fanout(&fanout)?;
 
+            // One adapter call fans out to every outstanding endpoint
+            // concurrently. `required_acks` is the attempt count — not the
+            // policy threshold — so the adapter waits for every endpoint
+            // instead of aborting the remainder once the threshold is met;
+            // the policy threshold is judged against the frozen record when
+            // the report below is built.
             let attempt = TransportPublishRequest {
                 account_id: fanout.request().account_id.clone(),
                 message: fanout.request().message.clone(),
-                target: single_endpoint_target(&fanout.request().target, endpoint.clone()),
-                required_acks: 1,
+                target: publish_target_with_endpoints(
+                    &fanout.request().target,
+                    outstanding
+                        .iter()
+                        .map(|&index| endpoints[index].clone())
+                        .collect(),
+                ),
+                required_acks: outstanding.len(),
             };
-            let accepted = match self.adapter.publish(attempt).await {
+            match self.adapter.publish(attempt).await {
                 Ok(report) => {
                     fanout.record_published_message_id(report.message_id)?;
-                    report
-                        .accepted
-                        .iter()
-                        .any(|receipt| receipt.endpoint == endpoint)
+                    for &index in &outstanding {
+                        let accepted = report
+                            .accepted
+                            .iter()
+                            .any(|receipt| receipt.endpoint == endpoints[index]);
+                        if accepted {
+                            fanout.mark_target_accepted(index)?;
+                        } else {
+                            fanout.mark_target_failed(index)?;
+                        }
+                    }
                 }
-                Err(_) => false,
-            };
-            if accepted {
-                fanout.mark_target_accepted(index)?;
-            } else {
-                fanout.mark_target_failed(index)?;
+                Err(_) => {
+                    // A whole-call adapter error is systemic (e.g. signing or
+                    // preparation), not endpoint-specific; per-endpoint
+                    // failures come back inside an `Ok` report.
+                    for &index in &outstanding {
+                        fanout.mark_target_failed(index)?;
+                    }
+                }
             }
             self.session.put_outbound_fanout(&fanout)?;
             self.resolve_outbound_fanout_mls(&mut fanout, output, queue)
@@ -3200,20 +3227,6 @@ where
             retry_deferred: false,
         })
     }
-}
-
-fn single_endpoint_target(
-    target: &TransportPublishTarget,
-    endpoint: TransportEndpoint,
-) -> TransportPublishTarget {
-    publish_target_with_endpoints(target, vec![endpoint])
-}
-
-fn publish_target_for_endpoint(
-    target: &TransportPublishTarget,
-    endpoint: TransportEndpoint,
-) -> TransportPublishTarget {
-    publish_target_with_endpoints(target, vec![endpoint])
 }
 
 fn publish_target_with_endpoints(

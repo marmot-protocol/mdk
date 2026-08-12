@@ -1,17 +1,17 @@
 
 #[derive(Clone, Default)]
-struct CrashAfterFirstAcceptanceAdapter {
+struct CrashDuringFanoutPublishAdapter {
     publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
 }
 
-impl CrashAfterFirstAcceptanceAdapter {
+impl CrashDuringFanoutPublishAdapter {
     fn publishes(&self) -> Vec<TransportPublishRequest> {
         self.publishes.lock().unwrap().clone()
     }
 }
 
 #[async_trait]
-impl TransportAdapter for CrashAfterFirstAcceptanceAdapter {
+impl TransportAdapter for CrashDuringFanoutPublishAdapter {
     async fn activate_account(
         &self,
         _activation: TransportAccountActivation,
@@ -37,27 +37,10 @@ impl TransportAdapter for CrashAfterFirstAcceptanceAdapter {
         &self,
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
-        let call = {
-            let mut publishes = self.publishes.lock().unwrap();
-            publishes.push(request.clone());
-            publishes.len()
-        };
-        assert_ne!(call, 2, "simulated process crash after the first relay ack");
-        Ok(TransportPublishReport {
-            message_id: request.message.id,
-            accepted: request
-                .target
-                .endpoints()
-                .iter()
-                .cloned()
-                .map(|endpoint| TransportEndpointReceipt {
-                    endpoint,
-                    accepted_at: None,
-                })
-                .collect(),
-            failed: Vec::new(),
-            required_acks: request.required_acks,
-        })
+        self.publishes.lock().unwrap().push(request);
+        // The send-before-side-effect edge (`Attempting`) is already durable
+        // when the batched publish call runs; crash inside it.
+        panic!("simulated process crash during the batched fanout publish");
     }
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
@@ -65,7 +48,7 @@ impl TransportAdapter for CrashAfterFirstAcceptanceAdapter {
     }
 }
 
-async fn assert_frozen_fanout_case(accept_at: Option<usize>, timeout_at: Option<usize>) {
+async fn assert_frozen_fanout_case(accept_at: Option<usize>, adapter_error: bool) {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot fanout matrix key").unwrap();
     let mut alice = session(
@@ -99,11 +82,14 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, timeout_at: Option<
         TransportEndpoint("wss://fanout-three.example".into()),
     ];
     let adapter = RecordingAdapter::default();
-    adapter.timeout_pattern((0..endpoints.len()).map(|index| timeout_at == Some(index)));
-    for index in 0..endpoints.len() {
-        if timeout_at != Some(index) {
-            adapter.accept_next(usize::from(accept_at == Some(index)));
-        }
+    if adapter_error {
+        adapter.error_next();
+    } else {
+        adapter.accept_endpoints_next(
+            accept_at
+                .map(|index| vec![endpoints[index].clone()])
+                .unwrap_or_default(),
+        );
     }
     let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
         .with_group_route(
@@ -127,7 +113,14 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, timeout_at: Option<
         .await
         .unwrap();
 
-    assert_eq!(adapter.publishes().len(), endpoints.len());
+    // The whole outstanding fanout goes to the adapter as one batched call so
+    // endpoints are attempted concurrently instead of one awaited ack at a
+    // time; `required_acks` is the attempt count so the adapter does not
+    // abort the remainder once the policy threshold is met.
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 1);
+    assert_eq!(publishes[0].target.endpoints(), endpoints.as_slice());
+    assert_eq!(publishes[0].required_acks, endpoints.len());
     assert_eq!(effects.reports.len(), 1);
     assert_eq!(effects.fanout.len(), 1);
     assert!(effects.fanout[0].fanout_complete);
@@ -167,13 +160,13 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, timeout_at: Option<
 #[tokio::test]
 async fn frozen_fanout_first_middle_last_ack_and_all_fail_are_terminal() {
     for accept_at in [Some(0), Some(1), Some(2), None] {
-        assert_frozen_fanout_case(accept_at, None).await;
+        assert_frozen_fanout_case(accept_at, false).await;
     }
 }
 
 #[tokio::test]
-async fn frozen_fanout_mixed_ack_failure_and_timeout_still_completes() {
-    assert_frozen_fanout_case(Some(0), Some(1)).await;
+async fn frozen_fanout_whole_call_adapter_error_is_terminal() {
+    assert_frozen_fanout_case(None, true).await;
 }
 
 async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
@@ -288,17 +281,13 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
     assert_eq!(resumed.session().epoch(&group_id).unwrap().0, 2);
     let attempts = adapter.publishes();
     let resumed_attempts = &attempts[pre_restart_publish_count..];
-    assert_eq!(resumed_attempts.len(), endpoints.len());
+    // Every outstanding target — including the pre-restart `Attempting` one —
+    // resumes in a single batched adapter call over the frozen route.
+    assert_eq!(resumed_attempts.len(), 1);
     assert!(resumed_attempts.iter().all(|attempt| {
         attempt.message.id == message.id && attempt.message.payload == message.payload
     }));
-    assert_eq!(
-        resumed_attempts
-            .iter()
-            .flat_map(|attempt| attempt.target.endpoints())
-            .collect::<Vec<_>>(),
-        endpoints.iter().collect::<Vec<_>>()
-    );
+    assert_eq!(resumed_attempts[0].target.endpoints(), endpoints.as_slice());
 }
 
 #[tokio::test]
@@ -343,7 +332,7 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
         TransportEndpoint("wss://original-two.example".into()),
         TransportEndpoint("wss://original-three.example".into()),
     ];
-    let crash_adapter = CrashAfterFirstAcceptanceAdapter::default();
+    let crash_adapter = CrashDuringFanoutPublishAdapter::default();
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_group_route(
@@ -370,10 +359,10 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
     assert!(crashed.unwrap_err().is_panic());
 
     let first_attempts = crash_adapter.publishes();
-    assert_eq!(first_attempts.len(), 2);
+    assert_eq!(first_attempts.len(), 1);
     assert_eq!(
         first_attempts[0].target.endpoints(),
-        &original_endpoints[..1]
+        original_endpoints.as_slice()
     );
     let frozen_id = first_attempts[0].message.id.clone();
     let frozen_bytes = first_attempts[0].message.payload.clone();
@@ -392,12 +381,12 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
         assert_eq!(
             fanouts[0].target_statuses(),
             &[
-                FanoutTargetStatus::Accepted,
                 FanoutTargetStatus::Attempting,
-                FanoutTargetStatus::NotAttempted,
+                FanoutTargetStatus::Attempting,
+                FanoutTargetStatus::Attempting,
             ]
         );
-        assert_eq!(fanouts[0].mls_state(), FanoutMlsState::Confirmed);
+        assert!(matches!(fanouts[0].mls_state(), FanoutMlsState::Pending(_)));
     }
 
     let reopened = session(
@@ -429,13 +418,12 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
     assert!(effects.fanout[0].fanout_complete);
 
     let resumed_attempts = resumed_adapter.publishes();
-    assert_eq!(resumed_attempts.len(), 2);
+    // The resumed fanout re-attempts every outstanding target in one batched
+    // call over the frozen route, ignoring the replacement routing policy.
+    assert_eq!(resumed_attempts.len(), 1);
     assert_eq!(
-        resumed_attempts
-            .iter()
-            .flat_map(|request| request.target.endpoints())
-            .collect::<Vec<_>>(),
-        vec![&original_endpoints[1], &original_endpoints[2]]
+        resumed_attempts[0].target.endpoints(),
+        original_endpoints.as_slice()
     );
     assert!(resumed_attempts.iter().all(|request| {
         request.message.id == frozen_id && request.message.payload == frozen_bytes
@@ -443,5 +431,5 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
 
     let duplicate_resume = resumed.resume_outbound_fanouts().await.unwrap();
     assert!(duplicate_resume.reports.is_empty());
-    assert_eq!(resumed_adapter.publishes().len(), 2);
+    assert_eq!(resumed_adapter.publishes().len(), 1);
 }
