@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit SHA on master to publish as an immutable iOS snapshot
+        description: Full 40-character commit SHA on master to publish as an immutable Apple platform snapshot
         required: true
         type: string
 
@@ -35,6 +35,7 @@ jobs:
       release_id: ${{ steps.identity.outputs.release_id }}
       release_tag: ${{ steps.identity.outputs.release_tag }}
       binary_name: ${{ steps.identity.outputs.binary_name }}
+      macos_binary_name: ${{ steps.identity.outputs.macos_binary_name }}
       swift_name: ${{ steps.identity.outputs.swift_name }}
       is_snapshot: ${{ steps.identity.outputs.is_snapshot }}
 
@@ -98,6 +99,7 @@ jobs:
             echo "release_id=$release_id"
             echo "release_tag=$release_tag"
             echo "binary_name=MarmotKitFFI-$release_id.xcframework.zip"
+            echo "macos_binary_name=MarmotKitFFI-macos-$release_id.xcframework.zip"
             echo "swift_name=MarmotKit-$release_id.swift"
             echo "is_snapshot=$is_snapshot"
           } >> "$GITHUB_OUTPUT"
@@ -181,6 +183,95 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: marmotkit-ios-${{ needs.metadata.outputs.source_sha }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos-bindings:
+    name: Build macOS bindings
+    runs-on: macos-latest
+    needs: metadata
+    timeout-minutes: 60
+    env:
+      # This value is what the job both builds and validates against, so those
+      # two steps cannot disagree. Validating against a lower number fails,
+      # because locally compiled members report exactly this minimum. The
+      # build/package/validate scripts each default to the same 15.0 when run
+      # outside CI; keep those defaults in step with this value.
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add aarch64-apple-darwin
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: packaged-source -> target
+
+      - name: Build MarmotKit macOS XCFramework
+        env:
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
+        run: ./crates/marmot-uniffi/xcframework-macos.sh
+
+      - name: Package immutable macOS artifacts
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/package-macos-artifacts.sh \
+            "$RELEASE_ID" "$RELEASE_TAG" "$SOURCE_SHA" dist "$BUILDER_SHA"
+
+      - name: Validate XCFramework slice and SwiftPM archive layout
+        shell: bash
+        env:
+          MACOS_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/validate-macos-artifact.sh \
+            "dist/$MACOS_BINARY_NAME" "$MACOSX_DEPLOYMENT_TARGET"
+
+      - name: Compile and link a local SwiftPM consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/validate-swift-package-macos.sh \
+            packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.xcframework \
+            - \
+            packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift \
+            "$RUNNER_TEMP/marmotkit-local-macos-consumer"
+
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-macos-${{ needs.metadata.outputs.source_sha }}
           path: dist/*
           if-no-files-found: error
 
@@ -318,11 +409,13 @@ jobs:
     needs:
       - metadata
       - ios-bindings
+      - macos-bindings
       - android-bindings
     if: >-
       always() &&
       needs.metadata.result == 'success' &&
       needs.ios-bindings.result == 'success' &&
+      needs.macos-bindings.result == 'success' &&
       (needs.android-bindings.result == 'success' || needs.android-bindings.result == 'skipped')
     timeout-minutes: 15
     permissions:
@@ -338,9 +431,11 @@ jobs:
           IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
         run: |
           set -euo pipefail
-          mkdir -p dist/ios dist/android
+          mkdir -p dist/ios dist/macos dist/android
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "marmotkit-ios-$SOURCE_SHA" --dir dist/ios
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-macos-$SOURCE_SHA" --dir dist/macos
           if [[ "$IS_SNAPSHOT" == "false" ]]; then
             gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
               --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
@@ -356,24 +451,61 @@ jobs:
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
           IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
           BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
+          MACOS_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
+          SWIFT_NAME: ${{ needs.metadata.outputs.swift_name }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
           version="$RELEASE_ID"
           notes="$RUNNER_TEMP/release-notes.md"
           checksum="$(cat "dist/ios/$BINARY_NAME.swiftpm-checksum")"
+          macos_checksum="$(cat "dist/macos/$MACOS_BINARY_NAME.swiftpm-checksum")"
+
+          # The generated Swift binding is platform-independent and published
+          # once, by the iOS job. Both jobs generate it independently from the
+          # same source SHA, so assert they agree: a mismatch means a consumer
+          # could compile that Swift against a mismatched binary ABI.
+          ios_swift_sha="$(jq -r --arg name "$SWIFT_NAME" '.artifacts[$name].sha256' \
+            "dist/ios/marmotkit-ios-$version.manifest.json")"
+          macos_swift_sha="$(jq -r --arg name "$SWIFT_NAME" '.artifacts[$name].sha256' \
+            "dist/macos/marmotkit-macos-$version.manifest.json")"
+          # Check both manifests for a recorded hash before comparing, so a
+          # malformed manifest reports itself instead of masquerading as an
+          # iOS/macOS Swift mismatch.
+          if [[ -z "$ios_swift_sha" || "$ios_swift_sha" == "null" ]]; then
+            echo "error: iOS manifest does not record a SHA-256 for $SWIFT_NAME" >&2
+            exit 1
+          fi
+          if [[ -z "$macos_swift_sha" || "$macos_swift_sha" == "null" ]]; then
+            echo "error: macOS manifest does not record a SHA-256 for $SWIFT_NAME" >&2
+            exit 1
+          fi
+          if [[ "$ios_swift_sha" != "$macos_swift_sha" ]]; then
+            echo "error: iOS and macOS jobs generated different Swift bindings from $SOURCE_SHA" >&2
+            exit 1
+          fi
+
           cat > "$notes" <<EOF
           MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.
 
-          Assets:
+          iOS assets:
           - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive.
-          - \`MarmotKit-$version.swift\`: generated Swift source matching that binary.
           - \`marmotkit-ios-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
 
-          SwiftPM checksum: \`$checksum\`
+          iOS SwiftPM checksum: \`$checksum\`
 
-          Verify source and artifact provenance with \`marmotkit-ios-$version.manifest.json\`
-          and \`marmotkit-ios-$version.checksums.txt\`. Assets on this release are immutable.
+          macOS assets (arm64):
+          - \`$MACOS_BINARY_NAME\`: SwiftPM-compatible binary target archive.
+          - \`marmotkit-macos-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
+
+          macOS SwiftPM checksum: \`$macos_checksum\`
+
+          Shared:
+          - \`MarmotKit-$version.swift\`: generated Swift source matching both binaries.
+
+          Verify source and artifact provenance with \`marmotkit-ios-$version.manifest.json\`,
+          \`marmotkit-macos-$version.manifest.json\`, and the matching \`.checksums.txt\` assets.
+          Assets on this release are immutable.
           EOF
 
           if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
@@ -392,7 +524,7 @@ jobs:
             exit 1
           fi
 
-          assets=(dist/ios/*)
+          assets=(dist/ios/* dist/macos/*)
           if [[ "$IS_SNAPSHOT" == "false" ]]; then
             assets+=(dist/android/*)
             title="v$version - MarmotKit"
@@ -448,7 +580,7 @@ jobs:
           exit 1
 
   validate-published-ios:
-    name: Validate published SwiftPM consumer
+    name: Validate published iOS SwiftPM consumer
     runs-on: macos-latest
     needs:
       - metadata
@@ -491,3 +623,50 @@ jobs:
             "$checksum" \
             "$RUNNER_TEMP/MarmotKit.swift" \
             "$RUNNER_TEMP/marmotkit-remote-consumer"
+
+  validate-published-macos:
+    name: Validate published macOS SwiftPM consumer
+    runs-on: macos-latest
+    needs:
+      - metadata
+      - release
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download matching source and checksum
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          MACOS_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
+          # The generated Swift is platform-independent and published once, by
+          # the iOS job. A macOS consumer resolves this exact asset.
+          SWIFT_NAME: ${{ needs.metadata.outputs.swift_name }}
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          for attempt in 1 2 3 4 5; do
+            if curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$SWIFT_NAME" -o "$RUNNER_TEMP/MarmotKit.swift" && \
+              curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$MACOS_BINARY_NAME.swiftpm-checksum" -o "$RUNNER_TEMP/swiftpm-checksum"; then
+              break
+            fi
+            if [[ $attempt -eq 5 ]]; then
+              echo "error: published MarmotKit macOS assets did not become available" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          checksum="$(tr -d '[:space:]' < "$RUNNER_TEMP/swiftpm-checksum")"
+          ./crates/marmot-uniffi/validate-swift-package-macos.sh \
+            "$base_url/$MACOS_BINARY_NAME" \
+            "$checksum" \
+            "$RUNNER_TEMP/MarmotKit.swift" \
+            "$RUNNER_TEMP/marmotkit-remote-macos-consumer"
