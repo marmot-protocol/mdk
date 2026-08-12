@@ -66,11 +66,12 @@ pub use conversions::{
     RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
     RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,
     RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeProjectionUpdateFfi,
-    SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
-    TransportFanoutStatusFfi,
+    SecureDeleteExpiredResultFfi, StickerAssetFfi, StickerFfi, StickerImportResultFfi,
+    StickerPackFfi, StickerRefFfi, StickerSyncResultFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
+    TimelineUserReactionFfi, TransportFanoutStatusFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's

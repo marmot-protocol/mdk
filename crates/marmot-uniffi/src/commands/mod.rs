@@ -19,6 +19,7 @@ mod message;
 mod notification;
 mod push;
 mod relay;
+mod sticker;
 mod subscription;
 mod telemetry;
 mod timeline;

@@ -16,6 +16,7 @@ mod migrations;
 mod openmls_storage;
 mod pending_welcome_delivery;
 mod shared;
+mod stickers;
 mod storage;
 mod timeline;
 
@@ -46,6 +47,10 @@ pub use pending_welcome_delivery::PendingWelcomeDeliveryRecord;
 pub use shared::{
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
     StoredRelayTelemetrySettings,
+};
+pub use stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
 };
 pub use timeline::{
     MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult, StoredAppEvent, TimelineMessageChange,

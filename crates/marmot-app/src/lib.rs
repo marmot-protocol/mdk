@@ -98,6 +98,7 @@ mod relay_telemetry_export;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
+mod stickers;
 
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
@@ -118,6 +119,11 @@ pub use runtime::{
     default_directory_discovery_relays,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
+pub use stickers::{
+    AppSticker, AppStickerAsset, AppStickerImportResult, AppStickerPack, AppStickerRef,
+    AppStickerSyncResult, parse_sticker_pack_input, sticker_ref_from_message,
+    sticker_ref_from_tags,
+};
 pub use storage_sqlite::{
     ChatPinState, TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
 };
@@ -480,6 +486,10 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    /// Per-account serialization for public sticker-pack/install mutations.
+    /// The mutex values are lifecycle-only; protocol truth and pending intent
+    /// remain in the account SQLCipher database.
+    sticker_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1198,6 +1208,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1265,6 +1276,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

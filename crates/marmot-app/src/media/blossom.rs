@@ -182,13 +182,21 @@ pub(crate) async fn fetch_blossom_blob(
     url: &str,
     allow_loopback_http: bool,
 ) -> Result<Vec<u8>, AppError> {
+    fetch_blossom_blob_limited(url, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, allow_loopback_http).await
+}
+
+pub(crate) async fn fetch_blossom_blob_limited(
+    url: &str,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+) -> Result<Vec<u8>, AppError> {
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
     fetch_http_with_bounded_redirects(
         current,
-        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        max_bytes,
         MEDIA_BLOB_TRANSFER_TIMEOUT,
         move |url| {
             let allow_loopback_http = allow_loopback_http;

@@ -10,7 +10,7 @@ use crate::{
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
-use cgka_traits::storage::StorageResult;
+use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -146,6 +146,7 @@ pub struct ChatListMessagePreview {
     pub sender_display_name: Option<String>,
     pub plaintext: String,
     pub kind: u64,
+    pub tags: Vec<Vec<String>>,
     pub timeline_at: u64,
     pub deleted: bool,
     pub attachment_kind: Option<ChatListAttachmentKind>,
@@ -822,6 +823,21 @@ fn chat_list_projection_complete_tx(
     )? {
         return Ok(false);
     }
+    // Migration 0046 added `last_message_tags_json` as nullable. Existing
+    // rows with a last message have NULL tags until rebuilt, so detect them
+    // here and force a rebuild.
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM chat_list_rows AS row
+                WHERE row.last_message_id_hex IS NOT NULL
+                   AND row.last_message_tags_json IS NULL
+             )",
+        [],
+    )? {
+        return Ok(false);
+    }
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(
@@ -1101,12 +1117,12 @@ fn rebuild_chat_list_row_for_group_tx(
             first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
             conversation_created_at, activity_sort_at, retained_activity_sort_at,
-            updated_at, self_membership
+            updated_at, self_membership, last_message_tags_json
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1127,6 +1143,7 @@ fn rebuild_chat_list_row_for_group_tx(
             last_message_deleted = excluded.last_message_deleted,
             last_message_media_json = excluded.last_message_media_json,
             last_message_delivery_state = excluded.last_message_delivery_state,
+            last_message_tags_json = excluded.last_message_tags_json,
             unread_count = excluded.unread_count,
             manually_marked_unread = excluded.manually_marked_unread,
             unread_mention_count = excluded.unread_mention_count,
@@ -1204,6 +1221,10 @@ fn rebuild_chat_list_row_for_group_tx(
             u64_to_i64(activity_sort_at)?,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
+            latest_message
+                .map(|message| serde_json::to_string(&message.tags))
+                .transpose()
+                .map_err(|err| StorageError::Serialization(err.to_string()))?,
         ],
     )
     .storage()?;
@@ -1431,7 +1452,7 @@ fn latest_kind9_message_tx(
         "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
                 media_json, direction, source_message_id_hex, invalidation_status,
                 timeline_order_class, timeline_order_primary,
-                timeline_order_phase, timeline_order_at
+                timeline_order_phase, timeline_order_at, tags_json
          FROM message_timeline
          WHERE group_id_hex = ?1 AND kind = ?2
            AND (
@@ -1510,6 +1531,7 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         sender_display_name: None,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
+        tags: crate::tags_from_json(row.get::<_, String>(14)?).unwrap_or_default(),
         timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
         deleted: row.get::<_, i64>(5)? != 0,
         attachment_kind: None,
@@ -1697,7 +1719,8 @@ const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
                 SELECT COUNT(*)
                 FROM chat_pin_positions AS earlier_pin
                 WHERE earlier_pin.ordinal < pin.ordinal
-            ) END
+            ) END,
+            row.last_message_tags_json
      FROM chat_list_rows AS row
      LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
      LEFT JOIN chat_notification_settings AS mute
@@ -1728,6 +1751,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             .get::<_, Option<i64>>(14)
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
+            .unwrap_or_default(),
+        tags: crate::tags_from_json(row.get::<_, String>(35).unwrap_or_default())
             .unwrap_or_default(),
         timeline_at: row
             .get::<_, Option<i64>>(15)

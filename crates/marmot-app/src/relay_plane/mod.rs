@@ -13,7 +13,7 @@ use cgka_traits::{
     TransportPublishReport, TransportPublishRequest,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
+    Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
     RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,7 @@ pub(crate) use transport_nostr_adapter::{
 const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const DIRECTORY_EVENT_BUFFER: usize = 1024;
 pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+const PUBLIC_EVENT_FETCH_WAIT: Duration = Duration::from_secs(8);
 const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -467,6 +468,77 @@ impl MarmotRelayPlane {
             .directory
             .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
             .await
+    }
+
+    pub(crate) async fn fetch_public_events(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        filter: Filter,
+    ) -> Result<Vec<Event>, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "public event fetch")
+            .map_err(|_| "public event fetch: relay endpoints rejected".to_owned())?;
+        if endpoints.is_empty() {
+            return Err("public event fetch: no relay endpoints".to_owned());
+        }
+        let relay_urls = endpoints
+            .iter()
+            .map(|endpoint| {
+                RelayUrl::parse(endpoint.as_str())
+                    .map_err(|_| "public event fetch: invalid relay endpoint".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let client = NostrSdkClient::builder().build();
+        let mut connected_relays = Vec::with_capacity(relay_urls.len());
+        for relay_url in relay_urls {
+            if client.add_relay(relay_url.clone()).await.is_err() {
+                continue;
+            }
+            if client
+                .try_connect_relay(relay_url.clone(), DIRECTORY_RELAY_CONNECT_WAIT)
+                .await
+                .is_ok()
+            {
+                connected_relays.push(relay_url);
+            }
+        }
+        if connected_relays.is_empty() {
+            return Err("public event fetch: no relay connected".to_owned());
+        }
+        client
+            .fetch_events_from(connected_relays, filter, PUBLIC_EVENT_FETCH_WAIT)
+            .await
+            .map(|events| events.into_iter().collect())
+            .map_err(|_| "public event fetch failed".to_owned())
+    }
+
+    pub(crate) async fn publish_public_event(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        event: &Event,
+    ) -> Result<NostrPublishOutcome, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "public event publish")
+            .map_err(|_| "public event publish: relay endpoints rejected".to_owned())?;
+        if endpoints.is_empty() {
+            return Err("public event publish: no relay endpoints".to_owned());
+        }
+        let relay_client = self
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .ok_or_else(|| "public event publish requires SDK relay plane".to_owned())?;
+        let event = NostrTransportEvent::from_nostr_event(event)
+            .map_err(|_| "public event publish: invalid signed event".to_owned())?;
+        relay_client
+            .publish_event(&endpoints, &event, 1)
+            .await
+            .map_err(|_| "public event publish failed".to_owned())
     }
 
     /// Narrow discovered relay endpoints to the safe ones, dropping the rest.
