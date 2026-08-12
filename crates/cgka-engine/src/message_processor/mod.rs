@@ -412,9 +412,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        let queued = self.queue_outbound_intent(group_id.clone(), intent)?;
-        self.schedule_pending_convergence_group(&group_id);
-        Ok(queued)
+        self.queue_outbound_intent(group_id, intent)
     }
 
     fn validate_send_acceptance(&mut self, intent: &SendIntent) -> Result<GroupId, EngineError> {
@@ -1662,6 +1660,19 @@ impl<S: StorageProvider> Engine<S> {
                 intent,
                 created_at_ms,
             })?;
+        // The drain is what releases this row, so writing it and arming the
+        // drain are one step — see `has_queued_outbound_intents`. `Stable` is
+        // the drain's own precondition: a group held by a publish or a halt
+        // gets its arm from the seam that ends the hold
+        // (`schedule_drain_for_retained_outbound_intents`), and arming into the
+        // hold would only spend the schedule on a drain that returns early.
+        if self
+            .epoch_manager
+            .state(&group_id)
+            .is_some_and(EpochState::is_stable)
+        {
+            self.schedule_pending_convergence_group(&group_id);
+        }
         Ok(SendResult::Queued {
             group_id,
             intent_id,
