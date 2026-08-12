@@ -88,6 +88,26 @@ enum MarmotStatus
   MARMOT_STATUS_EXTERNAL_SIGNER_UNAVAILABLE = 32,
   MARMOT_STATUS_EXTERNAL_SIGNER_MISMATCH = 33,
   MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED = 34,
+  MARMOT_STATUS_INVALID_GROUP_MEMBERSHIP_PAGE = 35,
+  MARMOT_STATUS_GROUP_HYDRATION_PENDING = 36,
+  MARMOT_STATUS_INVALID_CHAT_PIN = 37,
+  MARMOT_STATUS_INVALID_MESSAGE_DRAFT = 38,
+  MARMOT_STATUS_INVALID_MEDIA_REFERENCE = 39,
+  MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT = 40,
+  MARMOT_STATUS_FOLLOW_LIST_UNAVAILABLE = 41,
+  MARMOT_STATUS_RUNTIME_BUSY = 42,
+  MARMOT_STATUS_ACCOUNT_SESSION_BUSY = 43,
+  MARMOT_STATUS_ACCOUNT_SETUP_RECOVERY_REQUIRED = 44,
+  MARMOT_STATUS_ACCOUNT_SETUP_RETRY_REQUIRED = 45,
+  MARMOT_STATUS_ACCOUNT_SETUP_RESET_NOT_APPLICABLE = 46,
+  MARMOT_STATUS_ACCOUNT_SETUP_KEY_PACKAGE_RECOVERY_AVAILABLE = 47,
+  MARMOT_STATUS_ACCOUNT_CATCH_UP = 48,
+  MARMOT_STATUS_LEAVE_ALREADY_REQUESTED = 49,
+  MARMOT_STATUS_DISBANDING_UNSUPPORTED_MEMBERS = 50,
+  MARMOT_STATUS_DISBANDING_NOT_ENABLED = 51,
+  MARMOT_STATUS_GROUP_DISBANDING = 52,
+  MARMOT_STATUS_STORAGE_CLOSED = 53,
+  MARMOT_STATUS_GROUP_SEND_QUEUE_FULL = 54,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -126,12 +146,38 @@ typedef enum MarmotAuditDataMode {
   MARMOT_AUDIT_DATA_MODE_FULL_DATA,
 } MarmotAuditDataMode;
 
+typedef enum MarmotGroupLifecycleState {
+  MARMOT_GROUP_LIFECYCLE_STATE_STABLE,
+  MARMOT_GROUP_LIFECYCLE_STATE_PENDING_PUBLISH,
+  MARMOT_GROUP_LIFECYCLE_STATE_MERGING,
+  MARMOT_GROUP_LIFECYCLE_STATE_RECOVERING,
+  MARMOT_GROUP_LIFECYCLE_STATE_UNRECOVERABLE,
+  MARMOT_GROUP_LIFECYCLE_STATE_DISBANDED,
+} MarmotGroupLifecycleState;
+
+typedef enum MarmotDisbandFailureReason {
+  MARMOT_DISBAND_FAILURE_REASON_NO_LONGER_ADMIN,
+  MARMOT_DISBAND_FAILURE_REASON_NO_LONGER_MEMBER,
+} MarmotDisbandFailureReason;
+
+typedef enum MarmotMarkdownLinkDestinationKind {
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_WEB,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_CONTACT,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_APP,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_NOSTR,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_RELATIVE,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_UNKNOWN,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_DANGEROUS,
+  MARMOT_MARKDOWN_LINK_DESTINATION_KIND_SENSITIVE,
+} MarmotMarkdownLinkDestinationKind;
+
 /**
  * Flavor of an autolink.
  */
 typedef enum MarmotMarkdownAutolinkKind {
   MARMOT_MARKDOWN_AUTOLINK_KIND_URI,
   MARMOT_MARKDOWN_AUTOLINK_KIND_EMAIL,
+  MARMOT_MARKDOWN_AUTOLINK_KIND_WWW,
 } MarmotMarkdownAutolinkKind;
 
 /**
@@ -164,6 +210,21 @@ typedef enum MarmotMarkdownAlignment {
   MARMOT_MARKDOWN_ALIGNMENT_RIGHT,
 } MarmotMarkdownAlignment;
 
+typedef enum MarmotChatListAttachmentKind {
+  MARMOT_CHAT_LIST_ATTACHMENT_KIND_PHOTO,
+  MARMOT_CHAT_LIST_ATTACHMENT_KIND_VIDEO,
+  MARMOT_CHAT_LIST_ATTACHMENT_KIND_AUDIO,
+  MARMOT_CHAT_LIST_ATTACHMENT_KIND_FILE,
+  MARMOT_CHAT_LIST_ATTACHMENT_KIND_MIXED,
+} MarmotChatListAttachmentKind;
+
+typedef enum MarmotChatListMessageDeliveryState {
+  MARMOT_CHAT_LIST_MESSAGE_DELIVERY_STATE_NOT_APPLICABLE,
+  MARMOT_CHAT_LIST_MESSAGE_DELIVERY_STATE_PENDING,
+  MARMOT_CHAT_LIST_MESSAGE_DELIVERY_STATE_DELIVERED,
+  MARMOT_CHAT_LIST_MESSAGE_DELIVERY_STATE_FAILED,
+} MarmotChatListMessageDeliveryState;
+
 /**
  * The local account's own membership in a group: an active `Member`, or a
  * terminal state describing how it left — `Left` (a voluntary self-removal
@@ -175,6 +236,27 @@ typedef enum MarmotSelfMembership {
   MARMOT_SELF_MEMBERSHIP_LEFT,
   MARMOT_SELF_MEMBERSHIP_REMOVED,
 } MarmotSelfMembership;
+
+typedef enum MarmotChatConversationKind {
+  MARMOT_CHAT_CONVERSATION_KIND_UNKNOWN,
+  MARMOT_CHAT_CONVERSATION_KIND_DIRECT,
+  MARMOT_CHAT_CONVERSATION_KIND_GROUP,
+} MarmotChatConversationKind;
+
+typedef enum MarmotAppProtocolProfile {
+  MARMOT_APP_PROTOCOL_PROFILE_LEGACY,
+  MARMOT_APP_PROTOCOL_PROFILE_CURRENT,
+} MarmotAppProtocolProfile;
+
+typedef enum MarmotEncryptedMediaVersion {
+  MARMOT_ENCRYPTED_MEDIA_VERSION_V1,
+  MARMOT_ENCRYPTED_MEDIA_VERSION_V2,
+} MarmotEncryptedMediaVersion;
+
+typedef enum MarmotSendMaintenanceDisposition {
+  MARMOT_SEND_MAINTENANCE_DISPOSITION_READY,
+  MARMOT_SEND_MAINTENANCE_DISPOSITION_POST_JOIN_ROTATION_PENDING_RETRYABLE,
+} MarmotSendMaintenanceDisposition;
 
 /**
  * Coarse, privacy-safe reason a stored group failed session-open hydration
@@ -261,6 +343,11 @@ typedef enum MarmotNotificationTrigger {
   MARMOT_NOTIFICATION_TRIGGER_GROUP_INVITE,
 } MarmotNotificationTrigger;
 
+typedef enum MarmotNotificationTrafficClass {
+  MARMOT_NOTIFICATION_TRAFFIC_CLASS_STANDARD,
+  MARMOT_NOTIFICATION_TRAFFIC_CLASS_AGENT_ACTIVITY,
+} MarmotNotificationTrafficClass;
+
 /**
  * Native push platform a device token belongs to. Used both as a return
  * field and as a borrowed input to `marmot_upsert_push_registration`.
@@ -275,6 +362,11 @@ typedef enum MarmotPushPlatform {
    */
   MARMOT_PUSH_PLATFORM_FCM,
 } MarmotPushPlatform;
+
+typedef enum MarmotPushRegistrationShareStatus {
+  MARMOT_PUSH_REGISTRATION_SHARE_STATUS_COMPLETE,
+  MARMOT_PUSH_REGISTRATION_SHARE_STATUS_PENDING,
+} MarmotPushRegistrationShareStatus;
 
 /**
  * Why the timeline subscription raised an upsert.
@@ -317,6 +409,11 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_PENDING_CONFIRMATION_CHANGED,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_MEMBERSHIP_CHANGED,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_UNREAD_CHANGED,
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_MANUAL_UNREAD_CHANGED,
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_MUTE_CHANGED,
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_CONVERSATION_KIND_CHANGED,
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_LATEST_MESSAGE_DELIVERY_CHANGED,
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_PIN_ORDER_CHANGED,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_SNAPSHOT_REFRESH,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_REMOVED,
 } MarmotChatListUpdateTrigger;
@@ -569,6 +666,7 @@ typedef struct MarmotUserProfileMetadata {
   char *display_name;
   char *about;
   char *picture;
+  char *banner;
   char *nip05;
   char *lud16;
 } MarmotUserProfileMetadata;
@@ -700,6 +798,28 @@ typedef struct MarmotAuditLogTrackerUpdateResult {
   char *skipped_reason;
 } MarmotAuditLogTrackerUpdateResult;
 
+typedef enum MarmotDisbandRequest_Tag {
+  MARMOT_DISBAND_REQUEST_PENDING,
+  MARMOT_DISBAND_REQUEST_FAILED,
+} MarmotDisbandRequest_Tag;
+
+typedef struct MarmotDisbandRequest_Pending_Body {
+  uint64_t requested_at_ms;
+} MarmotDisbandRequest_Pending_Body;
+
+typedef struct MarmotDisbandRequest_Failed_Body {
+  uint64_t requested_at_ms;
+  enum MarmotDisbandFailureReason reason;
+} MarmotDisbandRequest_Failed_Body;
+
+typedef struct MarmotDisbandRequest {
+  MarmotDisbandRequest_Tag tag;
+  union {
+    MarmotDisbandRequest_Pending_Body PENDING;
+    MarmotDisbandRequest_Failed_Body FAILED;
+  };
+} MarmotDisbandRequest;
+
 /**
  * Group avatar reference. `image_key_hex` is the symmetric key that decrypts
  * the avatar blob and `image_upload_key_hex` is the Blossom upload secret —
@@ -782,6 +902,7 @@ typedef struct MarmotMarkdownInline_Link_Body {
   char *title;
   struct MarmotMarkdownInline *children;
   uintptr_t children_len;
+  enum MarmotMarkdownLinkDestinationKind classification;
 } MarmotMarkdownInline_Link_Body;
 
 typedef struct MarmotMarkdownInline_Image_Body {
@@ -792,11 +913,13 @@ typedef struct MarmotMarkdownInline_Image_Body {
   char *title;
   struct MarmotMarkdownInline *alt;
   uintptr_t alt_len;
+  enum MarmotMarkdownLinkDestinationKind classification;
 } MarmotMarkdownInline_Image_Body;
 
 typedef struct MarmotMarkdownInline_Autolink_Body {
   char *url;
   enum MarmotMarkdownAutolinkKind kind;
+  enum MarmotMarkdownLinkDestinationKind classification;
 } MarmotMarkdownInline_Autolink_Body;
 
 typedef struct MarmotMarkdownInline_Math_Body {
@@ -927,6 +1050,8 @@ typedef struct MarmotMarkdownBlock_CodeBlock_Body {
 typedef struct MarmotMarkdownBlock_BlockQuote_Body {
   struct MarmotMarkdownBlock *blocks;
   uintptr_t blocks_len;
+  uint8_t *blank_lines_before;
+  uintptr_t blank_lines_before_len;
 } MarmotMarkdownBlock_BlockQuote_Body;
 
 typedef struct MarmotMarkdownBlock_ListBlock_Body {
@@ -973,6 +1098,8 @@ typedef struct MarmotMarkdownDocument {
    * blocks were parsed from a UTF-8-boundary prefix.
    */
   bool truncated;
+  uint8_t *blank_lines_before;
+  uintptr_t blank_lines_before_len;
 } MarmotMarkdownDocument;
 
 /**
@@ -998,6 +1125,9 @@ typedef struct MarmotChatListMessagePreview {
   uint64_t kind;
   uint64_t timeline_at;
   bool deleted;
+  enum MarmotChatListAttachmentKind *attachment_kind;
+  uint32_t attachment_count;
+  enum MarmotChatListMessageDeliveryState delivery_state;
 } MarmotChatListMessagePreview;
 
 /**
@@ -1006,8 +1136,14 @@ typedef struct MarmotChatListMessagePreview {
  */
 typedef struct MarmotChatListRow {
   char *group_id_hex;
+  bool pinned;
+  bool has_pinned_position;
+  uint32_t pinned_position;
   bool archived;
   bool pending_confirmation;
+  enum MarmotGroupLifecycleState lifecycle_state;
+  bool disbanding;
+  struct MarmotDisbandRequest *disband_request;
   char *title;
   char *group_name;
   /**
@@ -1025,6 +1161,7 @@ typedef struct MarmotChatListRow {
   struct MarmotChatListMessagePreview *last_message;
   uint64_t unread_count;
   bool has_unread;
+  bool manually_marked_unread;
   uint64_t unread_mention_count;
   bool unread_mention;
   /**
@@ -1041,12 +1178,21 @@ typedef struct MarmotChatListRow {
    */
   bool has_last_read_timeline_at;
   uint64_t last_read_timeline_at;
+  uint64_t conversation_created_at;
+  uint64_t activity_sort_at;
   uint64_t updated_at;
   /**
    * Whether the local account is still a member of this group, and if not,
    * whether it left voluntarily or was removed.
    */
   enum MarmotSelfMembership self_membership;
+  enum MarmotChatConversationKind conversation_kind;
+  bool muted;
+  bool has_muted_until_ms;
+  int64_t muted_until_ms;
+  bool leave_request_pending;
+  bool has_leave_requested_at_ms;
+  uint64_t leave_requested_at_ms;
 } MarmotChatListRow;
 
 /**
@@ -1109,6 +1255,7 @@ typedef struct MarmotAppGroupEncryptedMediaComponent {
   uint32_t component_id;
   char *component;
   bool required;
+  enum MarmotEncryptedMediaVersion *version;
   char *media_format;
   char **allowed_locator_kinds;
   uintptr_t allowed_locator_kinds_len;
@@ -1121,7 +1268,9 @@ typedef struct MarmotAppGroupEncryptedMediaComponent {
  */
 typedef struct MarmotAppGroupRecord {
   char *group_id_hex;
+  enum MarmotAppProtocolProfile protocol_profile;
   char *endpoint;
+  bool profile_present;
   char *name;
   char *description;
   char **admins;
@@ -1150,11 +1299,18 @@ typedef struct MarmotAppGroupRecord {
   uint64_t disappearing_message_secs;
   bool archived;
   bool pending_confirmation;
+  bool unrecoverable;
   /**
    * Whether the local account is still a member of this group, and if not,
    * whether it left voluntarily or was removed.
    */
   enum MarmotSelfMembership self_membership;
+  bool leave_request_pending;
+  bool has_leave_requested_at_ms;
+  uint64_t leave_requested_at_ms;
+  bool disbanding;
+  struct MarmotDisbandRequest *disband_request;
+  bool disbanded;
   char *welcomer_account_id_hex;
   char *via_welcome_message_id_hex;
 } MarmotAppGroupRecord;
@@ -1181,6 +1337,27 @@ typedef struct MarmotGroupMemberDetails {
 } MarmotGroupMemberDetails;
 
 /**
+ * MLS-level group state for the conversation's developer/debug view: the
+ * current epoch, live member count, and the app components the group
+ * requires.
+ */
+typedef struct MarmotAppGroupMlsState {
+  char *group_id_hex;
+  enum MarmotAppProtocolProfile protocol_profile;
+  enum MarmotGroupLifecycleState lifecycle_state;
+  uint64_t epoch;
+  uint32_t member_count;
+  bool unrecoverable;
+  uint16_t *required_app_components;
+  uintptr_t required_app_components_len;
+  bool disbanding_enabled;
+  bool disbanding;
+  char **disbanding_blockers;
+  uintptr_t disbanding_blockers_len;
+  struct MarmotDisbandRequest *disband_request;
+} MarmotAppGroupMlsState;
+
+/**
  * Group plus enriched member rows for detail screens
  * (`marmot_group_details`).
  */
@@ -1188,6 +1365,7 @@ typedef struct MarmotGroupDetails {
   struct MarmotAppGroupRecord group;
   struct MarmotGroupMemberDetails *members;
   uintptr_t members_len;
+  struct MarmotAppGroupMlsState mls_state;
 } MarmotGroupDetails;
 
 /**
@@ -1213,6 +1391,17 @@ typedef struct MarmotGroupManagementState {
   bool can_invite;
   bool can_leave;
   bool requires_self_demote_before_leave;
+  bool leave_request_pending;
+  bool has_leave_requested_at_ms;
+  uint64_t leave_requested_at_ms;
+  enum MarmotGroupLifecycleState lifecycle_state;
+  bool disbanding_enabled;
+  bool disbanding;
+  bool can_enable_disbanding;
+  bool can_disband;
+  char **disbanding_blockers;
+  uintptr_t disbanding_blockers_len;
+  struct MarmotDisbandRequest *disband_request;
   struct MarmotGroupMemberActionState *member_actions;
   uintptr_t member_actions_len;
 } MarmotGroupManagementState;
@@ -1224,6 +1413,7 @@ typedef struct MarmotSendSummary {
   uint32_t published;
   char **message_ids;
   uintptr_t message_ids_len;
+  enum MarmotSendMaintenanceDisposition maintenance_disposition;
 } MarmotSendSummary;
 
 /**
@@ -1244,19 +1434,6 @@ typedef struct MarmotGroupMutationResult {
   struct MarmotGroupDetails details;
   struct MarmotGroupManagementState management_state;
 } MarmotGroupMutationResult;
-
-/**
- * MLS-level group state for the conversation's developer/debug view: the
- * current epoch, live member count, and the app components the group
- * requires.
- */
-typedef struct MarmotAppGroupMlsState {
-  char *group_id_hex;
-  uint64_t epoch;
-  uint32_t member_count;
-  uint16_t *required_app_components;
-  uintptr_t required_app_components_len;
-} MarmotAppGroupMlsState;
 
 /**
  * A stored group that failed session-open hydration and was skipped so the
@@ -1321,9 +1498,9 @@ typedef struct MarmotMediaAttachmentReference {
    */
   char *media_type;
   /**
-   * Encrypted-media format version, e.g. `encrypted-media-v1`.
+   * Encrypted-media format version.
    */
-  char *version;
+  enum MarmotEncryptedMediaVersion version;
   /**
    * Group epoch whose media secret encrypted this attachment.
    */
@@ -1469,12 +1646,14 @@ typedef struct MarmotMediaRecordList {
  */
 typedef struct MarmotSecureDeleteExpiredResult {
   uint64_t pruned_messages;
+  uint64_t secrets_deleted;
   /**
    * SHA-256 hex digests of media ciphertexts no longer referenced by any
    * surviving message.
    */
   char **media_ciphertext_sha256;
   uintptr_t media_ciphertext_sha256_len;
+  bool erasure_pending;
 } MarmotSecureDeleteExpiredResult;
 
 /**
@@ -1510,6 +1689,12 @@ typedef struct MarmotAppMessageRecord {
    */
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
+  bool has_source_epoch;
+  uint64_t source_epoch;
+  bool has_retention_seconds;
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  uint64_t retention_expires_at;
   uint64_t recorded_at;
   uint64_t received_at;
 } MarmotAppMessageRecord;
@@ -1567,6 +1752,7 @@ typedef struct MarmotNotificationUpdate {
    */
   char *conversation_key;
   enum MarmotNotificationTrigger trigger;
+  enum MarmotNotificationTrafficClass traffic_class;
   char *account_ref;
   char *account_id_hex;
   /**
@@ -1658,6 +1844,19 @@ typedef struct MarmotPushRegistration {
   bool has_last_shared_at_ms;
   int64_t last_shared_at_ms;
 } MarmotPushRegistration;
+
+typedef struct MarmotPushRegistrationShareOutcome {
+  enum MarmotPushRegistrationShareStatus status;
+  uint32_t attempted_groups;
+  uint32_t succeeded_groups;
+  uint32_t failed_groups;
+  uint32_t pending_groups;
+} MarmotPushRegistrationShareOutcome;
+
+typedef struct MarmotPushRegistrationSyncResult {
+  struct MarmotPushRegistration registration;
+  struct MarmotPushRegistrationShareOutcome share;
+} MarmotPushRegistrationSyncResult;
 
 /**
  * Local-member registration state inside a group push-debug snapshot.
@@ -1754,6 +1953,12 @@ typedef struct MarmotRelayHealth {
   uint32_t sleeping;
   uint32_t connection_attempts;
   uint32_t connection_successes;
+  bool notification_forwarder_running;
+  uint64_t notification_forwarder_restarts;
+  uint64_t notification_forwarder_lag_incidents;
+  uint64_t notification_forwarder_lagged_notifications;
+  uint64_t notification_forwarder_panics;
+  uint64_t notification_forwarder_unexpected_exits;
 } MarmotRelayHealth;
 
 /**
@@ -1874,6 +2079,7 @@ typedef struct MarmotTimelineReplyPreview {
    */
   char *agent_text_stream_json;
   bool deleted;
+  char *invalidation_status;
 } MarmotTimelineReplyPreview;
 
 /**
@@ -1979,6 +2185,12 @@ typedef struct MarmotTimelineMessageRecord {
    * originating event id and is always non-NULL.
    */
   char *source_message_id_hex;
+  bool has_source_epoch;
+  uint64_t source_epoch;
+  bool has_retention_seconds;
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  uint64_t retention_expires_at;
   char *direction;
   char *group_id_hex;
   char *sender;
@@ -2072,6 +2284,11 @@ typedef struct MarmotReceivedMessage {
    */
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
+  uint64_t source_epoch;
+  bool has_retention_seconds;
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  uint64_t retention_expires_at;
   /**
    * Source-event timestamp (seconds since epoch) for the MLS-delivered
    * message. Clients should sort the timeline by this value so chronology
@@ -2079,6 +2296,7 @@ typedef struct MarmotReceivedMessage {
    * unavailable at decode time.
    */
   uint64_t recorded_at;
+  uint64_t received_at;
 } MarmotReceivedMessage;
 
 /**
@@ -2156,6 +2374,7 @@ typedef struct MarmotRuntimeProjectionUpdate {
 typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_GROUP_CREATED,
   MARMOT_GROUP_EVENT_KIND_GROUP_JOINED,
+  MARMOT_GROUP_EVENT_KIND_TRANSPORT_OBJECT_RESOURCE_REFUSED,
   MARMOT_GROUP_EVENT_KIND_MESSAGE_RECEIVED,
   MARMOT_GROUP_EVENT_KIND_APP_MESSAGE_INVALIDATED,
   MARMOT_GROUP_EVENT_KIND_GROUP_STATE_CHANGED,
@@ -2183,6 +2402,11 @@ typedef struct MarmotGroupEventKind_GroupJoined_Body {
    */
   char *welcomer_id_hex;
 } MarmotGroupEventKind_GroupJoined_Body;
+
+typedef struct MarmotGroupEventKind_TransportObjectResourceRefused_Body {
+  char *message_id_hex;
+  char *resource;
+} MarmotGroupEventKind_TransportObjectResourceRefused_Body;
 
 typedef struct MarmotGroupEventKind_MessageReceived_Body {
   char *sender_id_hex;
@@ -2256,6 +2480,7 @@ typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
     MarmotGroupEventKind_GroupJoined_Body GROUP_JOINED;
+    MarmotGroupEventKind_TransportObjectResourceRefused_Body TRANSPORT_OBJECT_RESOURCE_REFUSED;
     MarmotGroupEventKind_MessageReceived_Body MESSAGE_RECEIVED;
     MarmotGroupEventKind_AppMessageInvalidated_Body APP_MESSAGE_INVALIDATED;
     MarmotGroupEventKind_GroupStateChanged_Body GROUP_STATE_CHANGED;
@@ -2290,6 +2515,7 @@ typedef enum MarmotEvent_Tag {
    * welcome is re-delivered via `redeliver_welcome(message_id_hex)`.
    */
   MARMOT_EVENT_WELCOME_DELIVERY_PENDING,
+  MARMOT_EVENT_EPOCH_STALL_ESCALATED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -2338,6 +2564,14 @@ typedef struct MarmotEvent_WelcomeDeliveryPending_Body {
   char *recipient_hex;
 } MarmotEvent_WelcomeDeliveryPending_Body;
 
+typedef struct MarmotEvent_EpochStallEscalated_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+  uint64_t stalled_epoch;
+  uint32_t arms;
+} MarmotEvent_EpochStallEscalated_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -2349,6 +2583,7 @@ typedef struct MarmotEvent {
     MarmotEvent_AccountError_Body ACCOUNT_ERROR;
     MarmotEvent_AgentStreamActivity_Body AGENT_STREAM_ACTIVITY;
     MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING;
+    MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
   };
 } MarmotEvent;
 
@@ -2426,6 +2661,10 @@ typedef enum MarmotChatListSubscriptionUpdate_Tag {
    * Remove the row for this group from the chat list.
    */
   MARMOT_CHAT_LIST_SUBSCRIPTION_UPDATE_REMOVE_ROW,
+  /**
+   * Atomically replace the subscribed visible chat list with these rows.
+   */
+  MARMOT_CHAT_LIST_SUBSCRIPTION_UPDATE_SNAPSHOT,
 } MarmotChatListSubscriptionUpdate_Tag;
 
 typedef struct MarmotChatListSubscriptionUpdate_Row_Body {
@@ -2438,11 +2677,18 @@ typedef struct MarmotChatListSubscriptionUpdate_RemoveRow_Body {
   char *group_id_hex;
 } MarmotChatListSubscriptionUpdate_RemoveRow_Body;
 
+typedef struct MarmotChatListSubscriptionUpdate_Snapshot_Body {
+  enum MarmotChatListUpdateTrigger trigger;
+  struct MarmotChatListRow *rows;
+  uintptr_t rows_len;
+} MarmotChatListSubscriptionUpdate_Snapshot_Body;
+
 typedef struct MarmotChatListSubscriptionUpdate {
   MarmotChatListSubscriptionUpdate_Tag tag;
   union {
     MarmotChatListSubscriptionUpdate_Row_Body ROW;
     MarmotChatListSubscriptionUpdate_RemoveRow_Body REMOVE_ROW;
+    MarmotChatListSubscriptionUpdate_Snapshot_Body SNAPSHOT;
   };
 } MarmotChatListSubscriptionUpdate;
 
@@ -3940,7 +4186,7 @@ MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *client,
                                              const char *raw_token,
                                              const char *server_pubkey_hex,
                                              const char *relay_hint,
-                                             struct MarmotPushRegistration **out_registration);
+                                             struct MarmotPushRegistrationSyncResult **out_result);
 
 /**
  * Remove the account's local native-push registration.
@@ -3949,7 +4195,8 @@ MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *client,
  * `client` must be a live handle; `account_ref` a valid string.
  */
 MarmotStatus marmot_clear_push_registration(const struct MarmotClient *client,
-                                            const char *account_ref);
+                                            const char *account_ref,
+                                            struct MarmotPushRegistrationShareOutcome **out_outcome);
 
 /**
  * Aggregated push-token diagnostics for one group: token counts, the
@@ -5054,6 +5301,10 @@ void marmot_background_notification_collection_free(struct MarmotBackgroundNotif
  * library.
  */
 void marmot_push_registration_free(struct MarmotPushRegistration *registration);
+
+void marmot_push_registration_share_outcome_free(struct MarmotPushRegistrationShareOutcome *outcome);
+
+void marmot_push_registration_sync_result_free(struct MarmotPushRegistrationSyncResult *result);
 
 /**
  * Free a group push-debug info root. NULL is a no-op.

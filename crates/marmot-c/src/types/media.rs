@@ -3,10 +3,39 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
-    MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi,
+    EncryptedMediaVersionFfi, MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi,
+    MediaRecordFfi, MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi,
+    MediaUploadRequestFfi, MediaUploadResultFfi,
 };
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotEncryptedMediaVersion {
+    V1,
+    V2,
+}
+
+impl From<EncryptedMediaVersionFfi> for MarmotEncryptedMediaVersion {
+    fn from(value: EncryptedMediaVersionFfi) -> Self {
+        match value {
+            EncryptedMediaVersionFfi::V1 => Self::V1,
+            EncryptedMediaVersionFfi::V2 => Self::V2,
+        }
+    }
+}
+
+impl MarmotEncryptedMediaVersion {
+    pub(crate) fn to_ffi(self) -> EncryptedMediaVersionFfi {
+        match self {
+            Self::V1 => EncryptedMediaVersionFfi::V1,
+            Self::V2 => EncryptedMediaVersionFfi::V2,
+        }
+    }
+}
+
+impl CFree for MarmotEncryptedMediaVersion {
+    unsafe fn free_in_place(&mut self) {}
+}
 
 use super::account::MarmotSendSummary;
 use crate::MarmotStatus;
@@ -76,8 +105,8 @@ pub struct MarmotMediaAttachmentReference {
     pub file_name: *mut c_char,
     /// MIME type of the plaintext, e.g. `image/png`.
     pub media_type: *mut c_char,
-    /// Encrypted-media format version, e.g. `encrypted-media-v1`.
-    pub version: *mut c_char,
+    /// Encrypted-media format version.
+    pub version: MarmotEncryptedMediaVersion,
     /// Group epoch whose media secret encrypted this attachment.
     pub source_epoch: u64,
     /// Pixel dimensions as `WxH`, when known. Nullable.
@@ -98,7 +127,7 @@ impl From<MediaAttachmentReferenceFfi> for MarmotMediaAttachmentReference {
             nonce_hex: owned_c_string(value.nonce_hex),
             file_name: owned_c_string(value.file_name),
             media_type: owned_c_string(value.media_type),
-            version: owned_c_string(value.version),
+            version: value.version.into(),
             source_epoch: value.source_epoch,
             dim: owned_opt_c_string(value.dim),
             thumbhash: owned_opt_c_string(value.thumbhash),
@@ -138,7 +167,7 @@ impl MarmotMediaAttachmentReference {
             nonce_hex: unsafe { required_str(self.nonce_hex.cast_const()) }?,
             file_name: unsafe { required_str(self.file_name.cast_const()) }?,
             media_type: unsafe { required_str(self.media_type.cast_const()) }?,
-            version: unsafe { required_str(self.version.cast_const()) }?,
+            version: self.version.to_ffi(),
             source_epoch: self.source_epoch,
             dim: unsafe { optional_str(self.dim.cast_const()) }?,
             thumbhash: unsafe { optional_str(self.thumbhash.cast_const()) }?,
@@ -155,7 +184,6 @@ impl CFree for MarmotMediaAttachmentReference {
             free_c_string(self.nonce_hex);
             free_c_string(self.file_name);
             free_c_string(self.media_type);
-            free_c_string(self.version);
             free_c_string(self.dim);
             free_c_string(self.thumbhash);
         }
@@ -514,7 +542,7 @@ mod tests {
             nonce_hex: format!("{byte:02x}").repeat(12),
             file_name: file_name.into(),
             media_type: "image/png".into(),
-            version: "encrypted-media-v1".into(),
+            version: EncryptedMediaVersionFfi::V1,
             source_epoch: 7,
             dim: Some("800x600".into()),
             thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".into()),
@@ -541,6 +569,8 @@ mod tests {
             sent: Some(SendSummaryFfi {
                 published: 1,
                 message_ids: vec!["ee".repeat(32)],
+                maintenance_disposition:
+                    marmot_uniffi::conversions::SendMaintenanceDispositionFfi::Ready,
             }),
         }
         .into();

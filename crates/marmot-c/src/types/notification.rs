@@ -5,7 +5,8 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
     BackgroundNotificationCollectionFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
-    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    NotificationTrafficClassFfi, NotificationTriggerFfi, NotificationUpdateFfi,
+    NotificationUserFfi, NotificationWakeSourceFfi,
 };
 
 use crate::memory::{
@@ -184,6 +185,7 @@ pub struct MarmotNotificationUpdate {
     /// Stable key identifying the conversation for grouping/threading.
     pub conversation_key: *mut c_char,
     pub trigger: MarmotNotificationTrigger,
+    pub traffic_class: MarmotNotificationTrafficClass,
     pub account_ref: *mut c_char,
     pub account_id_hex: *mut c_char,
     /// Opaque MLS group id, hex-encoded (variable length; not a 32-byte
@@ -216,6 +218,7 @@ impl From<NotificationUpdateFfi> for MarmotNotificationUpdate {
             notification_key: owned_c_string(value.notification_key),
             conversation_key: owned_c_string(value.conversation_key),
             trigger: value.trigger.into(),
+            traffic_class: value.traffic_class.into(),
             account_ref: owned_c_string(value.account_ref),
             account_id_hex: owned_c_string(value.account_id_hex),
             group_id_hex: owned_c_string(value.group_id_hex),
@@ -232,6 +235,24 @@ impl From<NotificationUpdateFfi> for MarmotNotificationUpdate {
             is_from_self: value.is_from_self,
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotNotificationTrafficClass {
+    Standard,
+    AgentActivity,
+}
+impl From<NotificationTrafficClassFfi> for MarmotNotificationTrafficClass {
+    fn from(v: NotificationTrafficClassFfi) -> Self {
+        match v {
+            NotificationTrafficClassFfi::Standard => Self::Standard,
+            NotificationTrafficClassFfi::AgentActivity => Self::AgentActivity,
+        }
+    }
+}
+impl CFree for MarmotNotificationTrafficClass {
+    unsafe fn free_in_place(&mut self) {}
 }
 
 impl CFree for MarmotNotificationUpdate {
@@ -317,6 +338,7 @@ mod tests {
             notification_key: "notif-1".into(),
             conversation_key: "conv-1".into(),
             trigger: NotificationTriggerFfi::NewMessage,
+            traffic_class: NotificationTrafficClassFfi::Standard,
             account_ref: "primary".into(),
             account_id_hex: "aa11".into(),
             group_id_hex: "bb22".into(),

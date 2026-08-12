@@ -4,8 +4,9 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupHydrationQuarantineReasonFfi,
-    AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi, AppQuarantinedGroupFfi,
-    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupManagementStateFfi,
+    AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi, AppProtocolProfileFfi,
+    AppQuarantinedGroupFfi, DisbandFailureReasonFfi, DisbandRequestFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
     GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi, MemberRefFfi,
 };
 
@@ -16,6 +17,97 @@ use crate::memory::{
 };
 use crate::types::account::MarmotSendSummary;
 use crate::types::common::MarmotSelfMembership;
+use crate::types::media::MarmotEncryptedMediaVersion;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotAppProtocolProfile {
+    Legacy,
+    Current,
+}
+impl From<AppProtocolProfileFfi> for MarmotAppProtocolProfile {
+    fn from(v: AppProtocolProfileFfi) -> Self {
+        match v {
+            AppProtocolProfileFfi::Legacy => Self::Legacy,
+            AppProtocolProfileFfi::Current => Self::Current,
+        }
+    }
+}
+impl CFree for MarmotAppProtocolProfile {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotGroupLifecycleState {
+    Stable,
+    PendingPublish,
+    Merging,
+    Recovering,
+    Unrecoverable,
+    Disbanded,
+}
+impl From<GroupLifecycleStateFfi> for MarmotGroupLifecycleState {
+    fn from(v: GroupLifecycleStateFfi) -> Self {
+        match v {
+            GroupLifecycleStateFfi::Stable => Self::Stable,
+            GroupLifecycleStateFfi::PendingPublish => Self::PendingPublish,
+            GroupLifecycleStateFfi::Merging => Self::Merging,
+            GroupLifecycleStateFfi::Recovering => Self::Recovering,
+            GroupLifecycleStateFfi::Unrecoverable => Self::Unrecoverable,
+            GroupLifecycleStateFfi::Disbanded => Self::Disbanded,
+        }
+    }
+}
+impl CFree for MarmotGroupLifecycleState {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotDisbandFailureReason {
+    NoLongerAdmin,
+    NoLongerMember,
+}
+impl From<DisbandFailureReasonFfi> for MarmotDisbandFailureReason {
+    fn from(v: DisbandFailureReasonFfi) -> Self {
+        match v {
+            DisbandFailureReasonFfi::NoLongerAdmin => Self::NoLongerAdmin,
+            DisbandFailureReasonFfi::NoLongerMember => Self::NoLongerMember,
+        }
+    }
+}
+impl CFree for MarmotDisbandFailureReason {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+pub enum MarmotDisbandRequest {
+    Pending {
+        requested_at_ms: u64,
+    },
+    Failed {
+        requested_at_ms: u64,
+        reason: MarmotDisbandFailureReason,
+    },
+}
+impl From<DisbandRequestFfi> for MarmotDisbandRequest {
+    fn from(v: DisbandRequestFfi) -> Self {
+        match v {
+            DisbandRequestFfi::Pending { requested_at_ms } => Self::Pending { requested_at_ms },
+            DisbandRequestFfi::Failed {
+                requested_at_ms,
+                reason,
+            } => Self::Failed {
+                requested_at_ms,
+                reason: reason.into(),
+            },
+        }
+    }
+}
+impl CFree for MarmotDisbandRequest {
+    unsafe fn free_in_place(&mut self) {}
+}
 
 /// One default blob endpoint for encrypted media uploads. Used both as an
 /// owned output (nested in the encrypted-media component) and as a borrowed
@@ -67,6 +159,7 @@ pub struct MarmotAppGroupEncryptedMediaComponent {
     pub component_id: u32,
     pub component: *mut c_char,
     pub required: bool,
+    pub version: *mut MarmotEncryptedMediaVersion,
     pub media_format: *mut c_char,
     pub allowed_locator_kinds: *mut *mut c_char,
     pub allowed_locator_kinds_len: usize,
@@ -94,6 +187,7 @@ impl From<AppGroupEncryptedMediaComponentFfi> for MarmotAppGroupEncryptedMediaCo
             component_id: value.component_id,
             component: owned_c_string(value.component),
             required: value.required,
+            version: crate::memory::boxed_opt(value.version.map(Into::into)),
             media_format: owned_c_string(value.media_format),
             allowed_locator_kinds,
             allowed_locator_kinds_len,
@@ -107,6 +201,7 @@ impl CFree for MarmotAppGroupEncryptedMediaComponent {
     unsafe fn free_in_place(&mut self) {
         unsafe {
             free_c_string(self.component);
+            free_boxed(self.version);
             free_c_string(self.media_format);
             free_vec(self.allowed_locator_kinds, self.allowed_locator_kinds_len);
             free_vec(self.default_blob_endpoints, self.default_blob_endpoints_len);
@@ -118,7 +213,9 @@ impl CFree for MarmotAppGroupEncryptedMediaComponent {
 #[repr(C)]
 pub struct MarmotAppGroupRecord {
     pub group_id_hex: *mut c_char,
+    pub protocol_profile: MarmotAppProtocolProfile,
     pub endpoint: *mut c_char,
+    pub profile_present: bool,
     pub name: *mut c_char,
     pub description: *mut c_char,
     pub admins: *mut *mut c_char,
@@ -141,9 +238,16 @@ pub struct MarmotAppGroupRecord {
     pub disappearing_message_secs: u64,
     pub archived: bool,
     pub pending_confirmation: bool,
+    pub unrecoverable: bool,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily or was removed.
     pub self_membership: MarmotSelfMembership,
+    pub leave_request_pending: bool,
+    pub has_leave_requested_at_ms: bool,
+    pub leave_requested_at_ms: u64,
+    pub disbanding: bool,
+    pub disband_request: *mut MarmotDisbandRequest,
+    pub disbanded: bool,
     pub welcomer_account_id_hex: *mut c_char,
     pub via_welcome_message_id_hex: *mut c_char,
 }
@@ -166,7 +270,9 @@ impl From<AppGroupRecordFfi> for MarmotAppGroupRecord {
         );
         Self {
             group_id_hex: owned_c_string(value.group_id_hex),
+            protocol_profile: value.protocol_profile.into(),
             endpoint: owned_c_string(value.endpoint),
+            profile_present: value.profile_present,
             name: owned_c_string(value.name),
             description: owned_c_string(value.description),
             admins,
@@ -182,7 +288,14 @@ impl From<AppGroupRecordFfi> for MarmotAppGroupRecord {
             disappearing_message_secs: value.disappearing_message_secs,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
+            unrecoverable: value.unrecoverable,
             self_membership: value.self_membership.into(),
+            leave_request_pending: value.leave_request_pending,
+            has_leave_requested_at_ms: value.leave_requested_at_ms.is_some(),
+            leave_requested_at_ms: value.leave_requested_at_ms.unwrap_or_default(),
+            disbanding: value.disbanding,
+            disband_request: crate::memory::boxed_opt(value.disband_request.map(Into::into)),
+            disbanded: value.disbanded,
             welcomer_account_id_hex: owned_opt_c_string(value.welcomer_account_id_hex),
             via_welcome_message_id_hex: owned_opt_c_string(value.via_welcome_message_id_hex),
         }
@@ -193,6 +306,7 @@ impl CFree for MarmotAppGroupRecord {
     unsafe fn free_in_place(&mut self) {
         unsafe {
             free_c_string(self.group_id_hex);
+            free_boxed(self.disband_request);
             free_c_string(self.endpoint);
             free_c_string(self.name);
             free_c_string(self.description);
@@ -395,6 +509,7 @@ pub struct MarmotGroupDetails {
     pub group: MarmotAppGroupRecord,
     pub members: *mut MarmotGroupMemberDetails,
     pub members_len: usize,
+    pub mls_state: MarmotAppGroupMlsState,
 }
 
 impl From<GroupDetailsFfi> for MarmotGroupDetails {
@@ -404,6 +519,7 @@ impl From<GroupDetailsFfi> for MarmotGroupDetails {
             group: value.group.into(),
             members,
             members_len,
+            mls_state: value.mls_state.into(),
         }
     }
 }
@@ -413,6 +529,7 @@ impl CFree for MarmotGroupDetails {
         unsafe {
             self.group.free_in_place();
             free_vec(self.members, self.members_len);
+            self.mls_state.free_in_place();
         }
     }
 }
@@ -466,6 +583,17 @@ pub struct MarmotGroupManagementState {
     pub can_invite: bool,
     pub can_leave: bool,
     pub requires_self_demote_before_leave: bool,
+    pub leave_request_pending: bool,
+    pub has_leave_requested_at_ms: bool,
+    pub leave_requested_at_ms: u64,
+    pub lifecycle_state: MarmotGroupLifecycleState,
+    pub disbanding_enabled: bool,
+    pub disbanding: bool,
+    pub can_enable_disbanding: bool,
+    pub can_disband: bool,
+    pub disbanding_blockers: *mut *mut c_char,
+    pub disbanding_blockers_len: usize,
+    pub disband_request: *mut MarmotDisbandRequest,
     pub member_actions: *mut MarmotGroupMemberActionState,
     pub member_actions_len: usize,
 }
@@ -474,6 +602,13 @@ impl From<GroupManagementStateFfi> for MarmotGroupManagementState {
     fn from(value: GroupManagementStateFfi) -> Self {
         let (member_actions, member_actions_len) =
             owned_vec(value.member_actions.into_iter().map(Into::into).collect());
+        let (disbanding_blockers, disbanding_blockers_len) = owned_vec(
+            value
+                .disbanding_blockers
+                .into_iter()
+                .map(owned_c_string)
+                .collect(),
+        );
         Self {
             my_account_id_hex: owned_c_string(value.my_account_id_hex),
             is_self_admin: value.is_self_admin,
@@ -481,6 +616,17 @@ impl From<GroupManagementStateFfi> for MarmotGroupManagementState {
             can_invite: value.can_invite,
             can_leave: value.can_leave,
             requires_self_demote_before_leave: value.requires_self_demote_before_leave,
+            leave_request_pending: value.leave_request_pending,
+            has_leave_requested_at_ms: value.leave_requested_at_ms.is_some(),
+            leave_requested_at_ms: value.leave_requested_at_ms.unwrap_or_default(),
+            lifecycle_state: value.lifecycle_state.into(),
+            disbanding_enabled: value.disbanding_enabled,
+            disbanding: value.disbanding,
+            can_enable_disbanding: value.can_enable_disbanding,
+            can_disband: value.can_disband,
+            disbanding_blockers,
+            disbanding_blockers_len,
+            disband_request: crate::memory::boxed_opt(value.disband_request.map(Into::into)),
             member_actions,
             member_actions_len,
         }
@@ -491,6 +637,8 @@ impl CFree for MarmotGroupManagementState {
     unsafe fn free_in_place(&mut self) {
         unsafe {
             free_c_string(self.my_account_id_hex);
+            free_vec(self.disbanding_blockers, self.disbanding_blockers_len);
+            free_boxed(self.disband_request);
             free_vec(self.member_actions, self.member_actions_len);
         }
     }
@@ -588,22 +736,45 @@ pub unsafe extern "C" fn marmot_group_invite_decline_result_free(
 #[repr(C)]
 pub struct MarmotAppGroupMlsState {
     pub group_id_hex: *mut c_char,
+    pub protocol_profile: MarmotAppProtocolProfile,
+    pub lifecycle_state: MarmotGroupLifecycleState,
     pub epoch: u64,
     pub member_count: u32,
+    pub unrecoverable: bool,
     pub required_app_components: *mut u16,
     pub required_app_components_len: usize,
+    pub disbanding_enabled: bool,
+    pub disbanding: bool,
+    pub disbanding_blockers: *mut *mut c_char,
+    pub disbanding_blockers_len: usize,
+    pub disband_request: *mut MarmotDisbandRequest,
 }
 
 impl From<AppGroupMlsStateFfi> for MarmotAppGroupMlsState {
     fn from(value: AppGroupMlsStateFfi) -> Self {
         let (required_app_components, required_app_components_len) =
             owned_vec(value.required_app_components);
+        let (disbanding_blockers, disbanding_blockers_len) = owned_vec(
+            value
+                .disbanding_blockers
+                .into_iter()
+                .map(owned_c_string)
+                .collect(),
+        );
         Self {
             group_id_hex: owned_c_string(value.group_id_hex),
+            protocol_profile: value.protocol_profile.into(),
+            lifecycle_state: value.lifecycle_state.into(),
             epoch: value.epoch,
             member_count: value.member_count,
+            unrecoverable: value.unrecoverable,
             required_app_components,
             required_app_components_len,
+            disbanding_enabled: value.disbanding_enabled,
+            disbanding: value.disbanding,
+            disbanding_blockers,
+            disbanding_blockers_len,
+            disband_request: crate::memory::boxed_opt(value.disband_request.map(Into::into)),
         }
     }
 }
@@ -616,6 +787,8 @@ impl CFree for MarmotAppGroupMlsState {
                 self.required_app_components,
                 self.required_app_components_len,
             );
+            free_vec(self.disbanding_blockers, self.disbanding_blockers_len);
+            free_boxed(self.disband_request);
         }
     }
 }
@@ -738,6 +911,7 @@ mod tests {
             component_id: 2,
             component: "marmot.group.encrypted-media.v1".into(),
             required: true,
+            version: Some(marmot_uniffi::conversions::EncryptedMediaVersionFfi::V1),
             media_format: "mip04-v2".into(),
             allowed_locator_kinds: vec!["blossom".into(), "https".into()],
             default_blob_endpoints: vec![AppBlobEndpointFfi {
@@ -750,7 +924,9 @@ mod tests {
     fn sample_group_record() -> AppGroupRecordFfi {
         AppGroupRecordFfi {
             group_id_hex: "aabbccdd".into(),
+            protocol_profile: AppProtocolProfileFfi::Current,
             endpoint: "nostr".into(),
+            profile_present: true,
             name: "burrow".into(),
             description: "alpine chat".into(),
             admins: vec!["aa11".into()],
@@ -767,7 +943,13 @@ mod tests {
             disappearing_message_secs: 3600,
             archived: false,
             pending_confirmation: true,
+            unrecoverable: false,
             self_membership: SelfMembershipFfi::Member,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
+            disbanding: false,
+            disband_request: None,
+            disbanded: false,
             welcomer_account_id_hex: Some("cc22".into()),
             via_welcome_message_id_hex: Some("dd33".into()),
         }
@@ -789,6 +971,7 @@ mod tests {
         GroupDetailsFfi {
             group: sample_group_record(),
             members: vec![sample_member_details()],
+            mls_state: sample_mls_state(),
         }
     }
 
@@ -800,6 +983,15 @@ mod tests {
             can_invite: true,
             can_leave: false,
             requires_self_demote_before_leave: true,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
+            lifecycle_state: GroupLifecycleStateFfi::Stable,
+            disbanding_enabled: false,
+            disbanding: false,
+            can_enable_disbanding: true,
+            can_disband: false,
+            disbanding_blockers: Vec::new(),
+            disband_request: None,
             member_actions: vec![GroupMemberActionStateFfi {
                 member_id_hex: "bb22".into(),
                 is_self: false,
@@ -815,6 +1007,24 @@ mod tests {
         SendSummaryFfi {
             published: 1,
             message_ids: vec!["ff".repeat(32)],
+            maintenance_disposition:
+                marmot_uniffi::conversions::SendMaintenanceDispositionFfi::Ready,
+        }
+    }
+
+    fn sample_mls_state() -> AppGroupMlsStateFfi {
+        AppGroupMlsStateFfi {
+            group_id_hex: "aabb".into(),
+            protocol_profile: AppProtocolProfileFfi::Current,
+            lifecycle_state: GroupLifecycleStateFfi::Stable,
+            epoch: 42,
+            member_count: 3,
+            unrecoverable: false,
+            required_app_components: vec![1, 2, 3],
+            disbanding_enabled: false,
+            disbanding: false,
+            disbanding_blockers: Vec::new(),
+            disband_request: None,
         }
     }
 
@@ -999,13 +1209,7 @@ mod tests {
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
 
-        let mirror: MarmotAppGroupMlsState = AppGroupMlsStateFfi {
-            group_id_hex: "aabb".into(),
-            epoch: 42,
-            member_count: 3,
-            required_app_components: vec![1, 2, 3],
-        }
-        .into();
+        let mirror: MarmotAppGroupMlsState = sample_mls_state().into();
         assert_eq!(mirror.epoch, 42);
         assert_eq!(mirror.member_count, 3);
         assert_eq!(mirror.required_app_components_len, 3);

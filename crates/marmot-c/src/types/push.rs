@@ -4,7 +4,8 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
     GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi,
-    PushPlatformFfi, PushRegistrationFfi,
+    PushPlatformFfi, PushRegistrationFfi, PushRegistrationShareOutcomeFfi,
+    PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
 };
 
 use crate::memory::{
@@ -106,6 +107,86 @@ impl CFree for MarmotPushRegistration {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_push_registration_free(registration: *mut MarmotPushRegistration) {
     crate::memory::free_guard(|| unsafe { free_boxed(registration) });
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotPushRegistrationShareStatus {
+    Complete,
+    Pending,
+}
+
+impl From<PushRegistrationShareStatusFfi> for MarmotPushRegistrationShareStatus {
+    fn from(value: PushRegistrationShareStatusFfi) -> Self {
+        match value {
+            PushRegistrationShareStatusFfi::Complete => Self::Complete,
+            PushRegistrationShareStatusFfi::Pending => Self::Pending,
+        }
+    }
+}
+
+impl CFree for MarmotPushRegistrationShareStatus {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+pub struct MarmotPushRegistrationShareOutcome {
+    pub status: MarmotPushRegistrationShareStatus,
+    pub attempted_groups: u32,
+    pub succeeded_groups: u32,
+    pub failed_groups: u32,
+    pub pending_groups: u32,
+}
+
+impl From<PushRegistrationShareOutcomeFfi> for MarmotPushRegistrationShareOutcome {
+    fn from(value: PushRegistrationShareOutcomeFfi) -> Self {
+        Self {
+            status: value.status.into(),
+            attempted_groups: value.attempted_groups,
+            succeeded_groups: value.succeeded_groups,
+            failed_groups: value.failed_groups,
+            pending_groups: value.pending_groups,
+        }
+    }
+}
+
+impl CFree for MarmotPushRegistrationShareOutcome {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_push_registration_share_outcome_free(
+    outcome: *mut MarmotPushRegistrationShareOutcome,
+) {
+    crate::memory::free_guard(|| unsafe { free_boxed(outcome) });
+}
+
+#[repr(C)]
+pub struct MarmotPushRegistrationSyncResult {
+    pub registration: MarmotPushRegistration,
+    pub share: MarmotPushRegistrationShareOutcome,
+}
+
+impl From<PushRegistrationSyncResultFfi> for MarmotPushRegistrationSyncResult {
+    fn from(value: PushRegistrationSyncResultFfi) -> Self {
+        Self {
+            registration: value.registration.into(),
+            share: value.share.into(),
+        }
+    }
+}
+
+impl CFree for MarmotPushRegistrationSyncResult {
+    unsafe fn free_in_place(&mut self) {
+        unsafe { self.registration.free_in_place() }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_push_registration_sync_result_free(
+    result: *mut MarmotPushRegistrationSyncResult,
+) {
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// Local-member registration state inside a group push-debug snapshot.

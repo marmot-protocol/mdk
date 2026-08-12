@@ -4,11 +4,14 @@ use std::ffi::c_char;
 
 use crate::memory::{optional_str, required_str};
 use crate::status::MarmotStatus;
-use crate::types::push::{MarmotGroupPushDebugInfo, MarmotPushPlatform, MarmotPushRegistration};
+use crate::types::push::{
+    MarmotGroupPushDebugInfo, MarmotPushPlatform, MarmotPushRegistration,
+    MarmotPushRegistrationShareOutcome, MarmotPushRegistrationSyncResult,
+};
 use crate::{MarmotClient, client_ref, ffi_guard};
 
 use super::account::try_arg;
-use super::{deliver, deliver_opt, deliver_unit};
+use super::{deliver, deliver_opt};
 
 /// The account's current local native-push registration, if any. Writes
 /// NULL with `MARMOT_STATUS_OK` when no registration exists — callers
@@ -53,7 +56,7 @@ pub unsafe extern "C" fn marmot_upsert_push_registration(
     raw_token: *const c_char,
     server_pubkey_hex: *const c_char,
     relay_hint: *const c_char,
-    out_registration: *mut *mut MarmotPushRegistration,
+    out_result: *mut *mut MarmotPushRegistrationSyncResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
         let client = try_arg!(unsafe { client_ref(client) });
@@ -70,7 +73,7 @@ pub unsafe extern "C" fn marmot_upsert_push_registration(
                     server_pubkey_hex,
                     relay_hint,
                 )),
-                out_registration,
+                out_result,
             )
         }
     })
@@ -84,11 +87,17 @@ pub unsafe extern "C" fn marmot_upsert_push_registration(
 pub unsafe extern "C" fn marmot_clear_push_registration(
     client: *const MarmotClient,
     account_ref: *const c_char,
+    out_outcome: *mut *mut MarmotPushRegistrationShareOutcome,
 ) -> MarmotStatus {
     ffi_guard(|| {
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
-        deliver_unit(client.block_on(client.marmot.clear_push_registration(account_ref)))
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.clear_push_registration(account_ref)),
+                out_outcome,
+            )
+        }
     })
 }
 

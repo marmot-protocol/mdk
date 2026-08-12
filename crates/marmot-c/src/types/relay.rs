@@ -345,6 +345,12 @@ pub struct MarmotRelayHealth {
     pub sleeping: u32,
     pub connection_attempts: u32,
     pub connection_successes: u32,
+    pub notification_forwarder_running: bool,
+    pub notification_forwarder_restarts: u64,
+    pub notification_forwarder_lag_incidents: u64,
+    pub notification_forwarder_lagged_notifications: u64,
+    pub notification_forwarder_panics: u64,
+    pub notification_forwarder_unexpected_exits: u64,
 }
 
 impl From<RelayHealthFfi> for MarmotRelayHealth {
@@ -362,6 +368,13 @@ impl From<RelayHealthFfi> for MarmotRelayHealth {
             sleeping: value.sleeping,
             connection_attempts: value.connection_attempts,
             connection_successes: value.connection_successes,
+            notification_forwarder_running: value.notification_forwarder_running,
+            notification_forwarder_restarts: value.notification_forwarder_restarts,
+            notification_forwarder_lag_incidents: value.notification_forwarder_lag_incidents,
+            notification_forwarder_lagged_notifications: value
+                .notification_forwarder_lagged_notifications,
+            notification_forwarder_panics: value.notification_forwarder_panics,
+            notification_forwarder_unexpected_exits: value.notification_forwarder_unexpected_exits,
         }
     }
 }
@@ -542,6 +555,12 @@ mod tests {
             sleeping: 0,
             connection_attempts: 21,
             connection_successes: 20,
+            notification_forwarder_running: true,
+            notification_forwarder_restarts: 1,
+            notification_forwarder_lag_incidents: 2,
+            notification_forwarder_lagged_notifications: 3,
+            notification_forwarder_panics: 4,
+            notification_forwarder_unexpected_exits: 5,
         }
         .into();
         assert!(mirror.sdk_backed);

@@ -9,8 +9,8 @@ use std::ffi::c_char;
 
 use marmot_uniffi::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
-    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownListItemFfi, MarkdownListKindFfi,
-    MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
+    MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
 };
 
 use crate::memory::{
@@ -35,22 +35,30 @@ pub struct MarmotMarkdownDocument {
     /// True when the input exceeded the FFI Markdown safety cap and the
     /// blocks were parsed from a UTF-8-boundary prefix.
     pub truncated: bool,
+    pub blank_lines_before: *mut u8,
+    pub blank_lines_before_len: usize,
 }
 
 impl From<MarkdownDocumentFfi> for MarmotMarkdownDocument {
     fn from(value: MarkdownDocumentFfi) -> Self {
         let (blocks, blocks_len) = owned_blocks(value.blocks);
+        let (blank_lines_before, blank_lines_before_len) = owned_vec(value.blank_lines_before);
         Self {
             blocks,
             blocks_len,
             truncated: value.truncated,
+            blank_lines_before,
+            blank_lines_before_len,
         }
     }
 }
 
 impl CFree for MarmotMarkdownDocument {
     unsafe fn free_in_place(&mut self) {
-        unsafe { free_vec(self.blocks, self.blocks_len) };
+        unsafe {
+            free_vec(self.blocks, self.blocks_len);
+            free_vec(self.blank_lines_before, self.blank_lines_before_len);
+        }
     }
 }
 
@@ -86,6 +94,8 @@ pub enum MarmotMarkdownBlock {
     BlockQuote {
         blocks: *mut MarmotMarkdownBlock,
         blocks_len: usize,
+        blank_lines_before: *mut u8,
+        blank_lines_before_len: usize,
     },
     /// Named `ListBlock` (not `List`) to match the sibling `*Block` variants.
     ListBlock {
@@ -135,9 +145,18 @@ impl From<MarkdownBlockFfi> for MarmotMarkdownBlock {
                 info: owned_c_string(info),
                 content: owned_c_string(content),
             },
-            MarkdownBlockFfi::BlockQuote { blocks } => {
+            MarkdownBlockFfi::BlockQuote {
+                blocks,
+                blank_lines_before,
+            } => {
                 let (blocks, blocks_len) = owned_blocks(blocks);
-                Self::BlockQuote { blocks, blocks_len }
+                let (blank_lines_before, blank_lines_before_len) = owned_vec(blank_lines_before);
+                Self::BlockQuote {
+                    blocks,
+                    blocks_len,
+                    blank_lines_before,
+                    blank_lines_before_len,
+                }
             }
             MarkdownBlockFfi::ListBlock { kind, tight, items } => {
                 let (items, items_len) = owned_vec(items.into_iter().map(Into::into).collect());
@@ -190,8 +209,14 @@ impl CFree for MarmotMarkdownBlock {
                 free_c_string(*info);
                 free_c_string(*content);
             },
-            Self::BlockQuote { blocks, blocks_len } => unsafe {
+            Self::BlockQuote {
+                blocks,
+                blocks_len,
+                blank_lines_before,
+                blank_lines_before_len,
+            } => unsafe {
                 free_vec(*blocks, *blocks_len);
+                free_vec(*blank_lines_before, *blank_lines_before_len);
             },
             Self::ListBlock {
                 kind,
@@ -399,6 +424,7 @@ pub enum MarmotMarkdownInline {
         title: *mut c_char,
         children: *mut MarmotMarkdownInline,
         children_len: usize,
+        classification: MarmotMarkdownLinkDestinationKind,
     },
     Image {
         dest: *mut c_char,
@@ -406,10 +432,12 @@ pub enum MarmotMarkdownInline {
         title: *mut c_char,
         alt: *mut MarmotMarkdownInline,
         alt_len: usize,
+        classification: MarmotMarkdownLinkDestinationKind,
     },
     Autolink {
         url: *mut c_char,
         kind: MarmotMarkdownAutolinkKind,
+        classification: MarmotMarkdownLinkDestinationKind,
     },
     Math {
         content: *mut c_char,
@@ -458,6 +486,7 @@ impl From<MarkdownInlineFfi> for MarmotMarkdownInline {
                 dest,
                 title,
                 children,
+                classification,
             } => {
                 let (children, children_len) = owned_inlines(children);
                 Self::Link {
@@ -465,20 +494,32 @@ impl From<MarkdownInlineFfi> for MarmotMarkdownInline {
                     title: owned_opt_c_string(title),
                     children,
                     children_len,
+                    classification: classification.into(),
                 }
             }
-            MarkdownInlineFfi::Image { dest, title, alt } => {
+            MarkdownInlineFfi::Image {
+                dest,
+                title,
+                alt,
+                classification,
+            } => {
                 let (alt, alt_len) = owned_inlines(alt);
                 Self::Image {
                     dest: owned_c_string(dest),
                     title: owned_opt_c_string(title),
                     alt,
                     alt_len,
+                    classification: classification.into(),
                 }
             }
-            MarkdownInlineFfi::Autolink { url, kind } => Self::Autolink {
+            MarkdownInlineFfi::Autolink {
+                url,
+                kind,
+                classification,
+            } => Self::Autolink {
                 url: owned_c_string(url),
                 kind: kind.into(),
+                classification: classification.into(),
             },
             MarkdownInlineFfi::Math { content } => Self::Math {
                 content: owned_c_string(content),
@@ -517,6 +558,7 @@ impl CFree for MarmotMarkdownInline {
                 title,
                 children,
                 children_len,
+                ..
             } => unsafe {
                 free_c_string(*dest);
                 free_c_string(*title);
@@ -527,6 +569,7 @@ impl CFree for MarmotMarkdownInline {
                 title,
                 alt,
                 alt_len,
+                ..
             } => unsafe {
                 free_c_string(*dest);
                 free_c_string(*title);
@@ -546,6 +589,7 @@ impl CFree for MarmotMarkdownInline {
 pub enum MarmotMarkdownAutolinkKind {
     Uri,
     Email,
+    Www,
 }
 
 impl From<MarkdownAutolinkKindFfi> for MarmotMarkdownAutolinkKind {
@@ -553,11 +597,44 @@ impl From<MarkdownAutolinkKindFfi> for MarmotMarkdownAutolinkKind {
         match value {
             MarkdownAutolinkKindFfi::Uri => Self::Uri,
             MarkdownAutolinkKindFfi::Email => Self::Email,
+            MarkdownAutolinkKindFfi::Www => Self::Www,
         }
     }
 }
 
 impl CFree for MarmotMarkdownAutolinkKind {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotMarkdownLinkDestinationKind {
+    Web,
+    Contact,
+    App,
+    Nostr,
+    Relative,
+    Unknown,
+    Dangerous,
+    Sensitive,
+}
+
+impl From<MarkdownLinkDestinationKindFfi> for MarmotMarkdownLinkDestinationKind {
+    fn from(value: MarkdownLinkDestinationKindFfi) -> Self {
+        match value {
+            MarkdownLinkDestinationKindFfi::Web => Self::Web,
+            MarkdownLinkDestinationKindFfi::Contact => Self::Contact,
+            MarkdownLinkDestinationKindFfi::App => Self::App,
+            MarkdownLinkDestinationKindFfi::Nostr => Self::Nostr,
+            MarkdownLinkDestinationKindFfi::Relative => Self::Relative,
+            MarkdownLinkDestinationKindFfi::Unknown => Self::Unknown,
+            MarkdownLinkDestinationKindFfi::Dangerous => Self::Dangerous,
+            MarkdownLinkDestinationKindFfi::Sensitive => Self::Sensitive,
+        }
+    }
+}
+
+impl CFree for MarmotMarkdownLinkDestinationKind {
     unsafe fn free_in_place(&mut self) {}
 }
 
@@ -649,6 +726,7 @@ mod tests {
                             dest: "https://example.com".into(),
                             title: Some("example".into()),
                             children: vec![text("site")],
+                            classification: MarkdownLinkDestinationKindFfi::Web,
                         },
                         MarkdownInlineFfi::NostrMention {
                             entity: MarkdownNostrEntityFfi {
@@ -680,10 +758,12 @@ mod tests {
                                         inlines: vec![text("reinforce walls")],
                                     }],
                                     checked: Some(true),
+                                    blank_lines_before: vec![0],
                                 }],
                             },
                         ],
                         checked: None,
+                        blank_lines_before: vec![0, 1],
                     }],
                 },
                 MarkdownBlockFfi::Table {
@@ -712,6 +792,7 @@ mod tests {
                 },
             ],
             truncated: true,
+            blank_lines_before: vec![0, 1, 0, 2],
         }
     }
 
@@ -754,6 +835,7 @@ mod tests {
             title,
             children,
             children_len,
+            ..
         } = &para[0]
         else {
             panic!("expected link");
@@ -878,11 +960,13 @@ mod tests {
             MarkdownInlineFfi::Autolink {
                 url: "https://marmot.example".into(),
                 kind: MarkdownAutolinkKindFfi::Uri,
+                classification: MarkdownLinkDestinationKindFfi::Web,
             },
             MarkdownInlineFfi::Image {
                 dest: "https://example.com/m.png".into(),
                 title: None,
                 alt: vec![text("marmot")],
+                classification: MarkdownLinkDestinationKindFfi::Web,
             },
             MarkdownInlineFfi::Strikethrough {
                 children: vec![text("gone")],
@@ -895,6 +979,7 @@ mod tests {
         let mirror: MarmotMarkdownDocument = MarkdownDocumentFfi {
             blocks: vec![MarkdownBlockFfi::Paragraph { inlines }],
             truncated: false,
+            blank_lines_before: Vec::new(),
         }
         .into();
 
@@ -929,7 +1014,7 @@ mod tests {
         };
         assert!(c_str_eq(*content, "deep"));
 
-        let MarmotMarkdownInline::Autolink { url, kind } = &para[1] else {
+        let MarmotMarkdownInline::Autolink { url, kind, .. } = &para[1] else {
             panic!("expected autolink");
         };
         assert!(c_str_eq(*url, "https://marmot.example"));
@@ -940,6 +1025,7 @@ mod tests {
             title,
             alt,
             alt_len,
+            ..
         } = &para[2]
         else {
             panic!("expected image");
@@ -971,6 +1057,7 @@ mod tests {
         let mirror: MarmotMarkdownDocument = MarkdownDocumentFfi {
             blocks: Vec::new(),
             truncated: false,
+            blank_lines_before: Vec::new(),
         }
         .into();
         assert!(mirror.blocks.is_null());
@@ -983,6 +1070,7 @@ mod tests {
             dest: "https://example.com".into(),
             title: None,
             children: Vec::new(),
+            classification: MarkdownLinkDestinationKindFfi::Web,
         }
         .into();
         let MarmotMarkdownInline::Link {

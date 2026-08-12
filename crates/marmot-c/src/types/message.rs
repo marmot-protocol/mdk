@@ -38,6 +38,12 @@ pub struct MarmotAppMessageRecord {
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: *mut MarmotMessageTag,
     pub tags_len: usize,
+    pub has_source_epoch: bool,
+    pub source_epoch: u64,
+    pub has_retention_seconds: bool,
+    pub retention_seconds: u64,
+    pub has_retention_expires_at: bool,
+    pub retention_expires_at: u64,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -55,6 +61,12 @@ impl From<AppMessageRecordFfi> for MarmotAppMessageRecord {
             kind: value.kind,
             tags,
             tags_len,
+            has_source_epoch: value.source_epoch.is_some(),
+            source_epoch: value.source_epoch.unwrap_or_default(),
+            has_retention_seconds: value.retention_seconds.is_some(),
+            retention_seconds: value.retention_seconds.unwrap_or_default(),
+            has_retention_expires_at: value.retention_expires_at.is_some(),
+            retention_expires_at: value.retention_expires_at.unwrap_or_default(),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -121,10 +133,12 @@ pub unsafe extern "C" fn marmot_app_message_record_list_free(
 #[repr(C)]
 pub struct MarmotSecureDeleteExpiredResult {
     pub pruned_messages: u64,
+    pub secrets_deleted: u64,
     /// SHA-256 hex digests of media ciphertexts no longer referenced by any
     /// surviving message.
     pub media_ciphertext_sha256: *mut *mut c_char,
     pub media_ciphertext_sha256_len: usize,
+    pub erasure_pending: bool,
 }
 
 impl From<SecureDeleteExpiredResultFfi> for MarmotSecureDeleteExpiredResult {
@@ -138,8 +152,10 @@ impl From<SecureDeleteExpiredResultFfi> for MarmotSecureDeleteExpiredResult {
         );
         Self {
             pruned_messages: value.pruned_messages,
+            secrets_deleted: value.secrets_deleted,
             media_ciphertext_sha256,
             media_ciphertext_sha256_len,
+            erasure_pending: value.erasure_pending,
         }
     }
 }
@@ -183,11 +199,17 @@ pub struct MarmotReceivedMessage {
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: *mut MarmotMessageTag,
     pub tags_len: usize,
+    pub source_epoch: u64,
+    pub has_retention_seconds: bool,
+    pub retention_seconds: u64,
+    pub has_retention_expires_at: bool,
+    pub retention_expires_at: u64,
     /// Source-event timestamp (seconds since epoch) for the MLS-delivered
     /// message. Clients should sort the timeline by this value so chronology
     /// reflects send time, not delivery time. Zero means the timestamp was
     /// unavailable at decode time.
     pub recorded_at: u64,
+    pub received_at: u64,
 }
 
 impl From<ReceivedMessageFfi> for MarmotReceivedMessage {
@@ -203,7 +225,13 @@ impl From<ReceivedMessageFfi> for MarmotReceivedMessage {
             kind: value.kind,
             tags,
             tags_len,
+            source_epoch: value.source_epoch,
+            has_retention_seconds: value.retention_seconds.is_some(),
+            retention_seconds: value.retention_seconds.unwrap_or_default(),
+            has_retention_expires_at: value.retention_expires_at.is_some(),
+            retention_expires_at: value.retention_expires_at.unwrap_or_default(),
             recorded_at: value.recorded_at,
+            received_at: value.received_at,
         }
     }
 }
@@ -336,6 +364,7 @@ mod tests {
                 }],
             }],
             truncated: false,
+            blank_lines_before: Vec::new(),
         }
     }
 
@@ -360,6 +389,9 @@ mod tests {
             content_tokens: sample_tokens("hello burrow"),
             kind: 9,
             tags: sample_tags(),
+            source_epoch: Some(3),
+            retention_seconds: Some(60),
+            retention_expires_at: Some(1_700_000_060),
             recorded_at: 1_700_000_000,
             received_at: 1_700_000_005,
         }
@@ -375,7 +407,11 @@ mod tests {
             content_tokens: sample_tokens("fresh dirt"),
             kind: 9,
             tags: sample_tags(),
+            source_epoch: 3,
+            retention_seconds: Some(60),
+            retention_expires_at: Some(1_700_000_070),
             recorded_at: 1_700_000_010,
+            received_at: 1_700_000_015,
         }
     }
 
@@ -441,7 +477,9 @@ mod tests {
 
         let mirror: MarmotSecureDeleteExpiredResult = SecureDeleteExpiredResultFfi {
             pruned_messages: 4,
+            secrets_deleted: 3,
             media_ciphertext_sha256: vec!["aa11".to_string(), "bb22".to_string()],
+            erasure_pending: true,
         }
         .into();
         assert_eq!(mirror.pruned_messages, 4);
@@ -524,7 +562,9 @@ mod tests {
 
         let result: MarmotSecureDeleteExpiredResult = SecureDeleteExpiredResultFfi {
             pruned_messages: 0,
+            secrets_deleted: 0,
             media_ciphertext_sha256: Vec::new(),
+            erasure_pending: false,
         }
         .into();
         assert!(result.media_ciphertext_sha256.is_null());
@@ -541,10 +581,15 @@ mod tests {
             content_tokens: MarkdownDocumentFfi {
                 blocks: Vec::new(),
                 truncated: false,
+                blank_lines_before: Vec::new(),
             },
             kind: 7,
             tags: Vec::new(),
+            source_epoch: 0,
+            retention_seconds: None,
+            retention_expires_at: None,
             recorded_at: 0,
+            received_at: 0,
         }
         .into();
         assert!(received.sender_display_name.is_null());

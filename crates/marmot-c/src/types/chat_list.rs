@@ -7,8 +7,9 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    ChatListAvatarFfi, ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
-    ChatListUpdateTriggerFfi,
+    ChatConversationKindFfi, ChatListAttachmentKindFfi, ChatListAvatarFfi,
+    ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
+    ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi,
 };
 
 use crate::memory::{
@@ -16,7 +17,74 @@ use crate::memory::{
     owned_vec,
 };
 use crate::types::common::MarmotSelfMembership;
+use crate::types::group::{MarmotDisbandRequest, MarmotGroupLifecycleState};
 use crate::types::markdown::MarmotMarkdownDocument;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotChatListAttachmentKind {
+    Photo,
+    Video,
+    Audio,
+    File,
+    Mixed,
+}
+impl From<ChatListAttachmentKindFfi> for MarmotChatListAttachmentKind {
+    fn from(v: ChatListAttachmentKindFfi) -> Self {
+        match v {
+            ChatListAttachmentKindFfi::Photo => Self::Photo,
+            ChatListAttachmentKindFfi::Video => Self::Video,
+            ChatListAttachmentKindFfi::Audio => Self::Audio,
+            ChatListAttachmentKindFfi::File => Self::File,
+            ChatListAttachmentKindFfi::Mixed => Self::Mixed,
+        }
+    }
+}
+impl CFree for MarmotChatListAttachmentKind {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotChatListMessageDeliveryState {
+    NotApplicable,
+    Pending,
+    Delivered,
+    Failed,
+}
+impl From<ChatListMessageDeliveryStateFfi> for MarmotChatListMessageDeliveryState {
+    fn from(v: ChatListMessageDeliveryStateFfi) -> Self {
+        match v {
+            ChatListMessageDeliveryStateFfi::NotApplicable => Self::NotApplicable,
+            ChatListMessageDeliveryStateFfi::Pending => Self::Pending,
+            ChatListMessageDeliveryStateFfi::Delivered => Self::Delivered,
+            ChatListMessageDeliveryStateFfi::Failed => Self::Failed,
+        }
+    }
+}
+impl CFree for MarmotChatListMessageDeliveryState {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotChatConversationKind {
+    Unknown,
+    Direct,
+    Group,
+}
+impl From<ChatConversationKindFfi> for MarmotChatConversationKind {
+    fn from(v: ChatConversationKindFfi) -> Self {
+        match v {
+            ChatConversationKindFfi::Unknown => Self::Unknown,
+            ChatConversationKindFfi::Direct => Self::Direct,
+            ChatConversationKindFfi::Group => Self::Group,
+        }
+    }
+}
+impl CFree for MarmotChatConversationKind {
+    unsafe fn free_in_place(&mut self) {}
+}
 
 /// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
 /// the avatar blob and `image_upload_key_hex` is the Blossom upload secret —
@@ -74,6 +142,9 @@ pub struct MarmotChatListMessagePreview {
     pub kind: u64,
     pub timeline_at: u64,
     pub deleted: bool,
+    pub attachment_kind: *mut MarmotChatListAttachmentKind,
+    pub attachment_count: u32,
+    pub delivery_state: MarmotChatListMessageDeliveryState,
 }
 
 impl From<ChatListMessagePreviewFfi> for MarmotChatListMessagePreview {
@@ -87,6 +158,9 @@ impl From<ChatListMessagePreviewFfi> for MarmotChatListMessagePreview {
             kind: value.kind,
             timeline_at: value.timeline_at,
             deleted: value.deleted,
+            attachment_kind: boxed_opt(value.attachment_kind.map(Into::into)),
+            attachment_count: value.attachment_count,
+            delivery_state: value.delivery_state.into(),
         }
     }
 }
@@ -99,6 +173,7 @@ impl CFree for MarmotChatListMessagePreview {
             free_c_string(self.sender_display_name);
             free_c_string(self.plaintext);
             self.content_tokens.free_in_place();
+            free_boxed(self.attachment_kind);
         }
     }
 }
@@ -108,8 +183,14 @@ impl CFree for MarmotChatListMessagePreview {
 #[repr(C)]
 pub struct MarmotChatListRow {
     pub group_id_hex: *mut c_char,
+    pub pinned: bool,
+    pub has_pinned_position: bool,
+    pub pinned_position: u32,
     pub archived: bool,
     pub pending_confirmation: bool,
+    pub lifecycle_state: MarmotGroupLifecycleState,
+    pub disbanding: bool,
+    pub disband_request: *mut MarmotDisbandRequest,
     pub title: *mut c_char,
     pub group_name: *mut c_char,
     /// Plain avatar URL, when set. Nullable.
@@ -121,6 +202,7 @@ pub struct MarmotChatListRow {
     pub last_message: *mut MarmotChatListMessagePreview,
     pub unread_count: u64,
     pub has_unread: bool,
+    pub manually_marked_unread: bool,
     pub unread_mention_count: u64,
     pub unread_mention: bool,
     /// First unread message id, when known. Nullable.
@@ -131,18 +213,33 @@ pub struct MarmotChatListRow {
     /// `has_last_read_timeline_at` is true; otherwise it is zero.
     pub has_last_read_timeline_at: bool,
     pub last_read_timeline_at: u64,
+    pub conversation_created_at: u64,
+    pub activity_sort_at: u64,
     pub updated_at: u64,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily or was removed.
     pub self_membership: MarmotSelfMembership,
+    pub conversation_kind: MarmotChatConversationKind,
+    pub muted: bool,
+    pub has_muted_until_ms: bool,
+    pub muted_until_ms: i64,
+    pub leave_request_pending: bool,
+    pub has_leave_requested_at_ms: bool,
+    pub leave_requested_at_ms: u64,
 }
 
 impl From<ChatListRowFfi> for MarmotChatListRow {
     fn from(value: ChatListRowFfi) -> Self {
         Self {
             group_id_hex: owned_c_string(value.group_id_hex),
+            pinned: value.pinned,
+            has_pinned_position: value.pinned_position.is_some(),
+            pinned_position: value.pinned_position.unwrap_or_default(),
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
+            lifecycle_state: value.lifecycle_state.into(),
+            disbanding: value.disbanding,
+            disband_request: boxed_opt(value.disband_request.map(Into::into)),
             title: owned_c_string(value.title),
             group_name: owned_c_string(value.group_name),
             avatar_url: owned_opt_c_string(value.avatar_url),
@@ -150,14 +247,24 @@ impl From<ChatListRowFfi> for MarmotChatListRow {
             last_message: boxed_opt(value.last_message.map(Into::into)),
             unread_count: value.unread_count,
             has_unread: value.has_unread,
+            manually_marked_unread: value.manually_marked_unread,
             unread_mention_count: value.unread_mention_count,
             unread_mention: value.unread_mention,
             first_unread_message_id_hex: owned_opt_c_string(value.first_unread_message_id_hex),
             last_read_message_id_hex: owned_opt_c_string(value.last_read_message_id_hex),
             has_last_read_timeline_at: value.last_read_timeline_at.is_some(),
             last_read_timeline_at: value.last_read_timeline_at.unwrap_or(0),
+            conversation_created_at: value.conversation_created_at,
+            activity_sort_at: value.activity_sort_at,
             updated_at: value.updated_at,
             self_membership: value.self_membership.into(),
+            conversation_kind: value.conversation_kind.into(),
+            muted: value.muted,
+            has_muted_until_ms: value.muted_until_ms.is_some(),
+            muted_until_ms: value.muted_until_ms.unwrap_or_default(),
+            leave_request_pending: value.leave_request_pending,
+            has_leave_requested_at_ms: value.leave_requested_at_ms.is_some(),
+            leave_requested_at_ms: value.leave_requested_at_ms.unwrap_or_default(),
         }
     }
 }
@@ -166,6 +273,7 @@ impl CFree for MarmotChatListRow {
     unsafe fn free_in_place(&mut self) {
         unsafe {
             free_c_string(self.group_id_hex);
+            free_boxed(self.disband_request);
             free_c_string(self.title);
             free_c_string(self.group_name);
             free_c_string(self.avatar_url);
@@ -230,6 +338,11 @@ pub enum MarmotChatListUpdateTrigger {
     PendingConfirmationChanged,
     MembershipChanged,
     UnreadChanged,
+    ManualUnreadChanged,
+    MuteChanged,
+    ConversationKindChanged,
+    LatestMessageDeliveryChanged,
+    PinOrderChanged,
     SnapshotRefresh,
     Removed,
 }
@@ -246,6 +359,13 @@ impl From<ChatListUpdateTriggerFfi> for MarmotChatListUpdateTrigger {
             }
             ChatListUpdateTriggerFfi::MembershipChanged => Self::MembershipChanged,
             ChatListUpdateTriggerFfi::UnreadChanged => Self::UnreadChanged,
+            ChatListUpdateTriggerFfi::ManualUnreadChanged => Self::ManualUnreadChanged,
+            ChatListUpdateTriggerFfi::MuteChanged => Self::MuteChanged,
+            ChatListUpdateTriggerFfi::ConversationKindChanged => Self::ConversationKindChanged,
+            ChatListUpdateTriggerFfi::LatestMessageDeliveryChanged => {
+                Self::LatestMessageDeliveryChanged
+            }
+            ChatListUpdateTriggerFfi::PinOrderChanged => Self::PinOrderChanged,
             ChatListUpdateTriggerFfi::SnapshotRefresh => Self::SnapshotRefresh,
             ChatListUpdateTriggerFfi::Removed => Self::Removed,
         }
@@ -270,6 +390,12 @@ pub enum MarmotChatListSubscriptionUpdate {
         trigger: MarmotChatListUpdateTrigger,
         group_id_hex: *mut c_char,
     },
+    /// Atomically replace the subscribed visible chat list with these rows.
+    Snapshot {
+        trigger: MarmotChatListUpdateTrigger,
+        rows: *mut MarmotChatListRow,
+        rows_len: usize,
+    },
 }
 
 impl From<ChatListSubscriptionUpdateFfi> for MarmotChatListSubscriptionUpdate {
@@ -286,6 +412,14 @@ impl From<ChatListSubscriptionUpdateFfi> for MarmotChatListSubscriptionUpdate {
                 trigger: trigger.into(),
                 group_id_hex: owned_c_string(group_id_hex),
             },
+            ChatListSubscriptionUpdateFfi::Snapshot { trigger, rows } => {
+                let (rows, rows_len) = owned_vec(rows.into_iter().map(Into::into).collect());
+                Self::Snapshot {
+                    trigger: trigger.into(),
+                    rows,
+                    rows_len,
+                }
+            }
         }
     }
 }
@@ -295,6 +429,7 @@ impl CFree for MarmotChatListSubscriptionUpdate {
         match self {
             Self::Row { row, .. } => unsafe { row.free_in_place() },
             Self::RemoveRow { group_id_hex, .. } => unsafe { free_c_string(*group_id_hex) },
+            Self::Snapshot { rows, rows_len, .. } => unsafe { free_vec(*rows, *rows_len) },
         }
     }
 }
@@ -334,6 +469,7 @@ mod tests {
                 }],
             }],
             truncated: false,
+            blank_lines_before: Vec::new(),
         }
     }
 
@@ -347,14 +483,22 @@ mod tests {
             kind: 9,
             timeline_at: 1_700_000_100,
             deleted: false,
+            attachment_kind: Some(marmot_uniffi::conversions::ChatListAttachmentKindFfi::Photo),
+            attachment_count: 1,
+            delivery_state: marmot_uniffi::conversions::ChatListMessageDeliveryStateFfi::Delivered,
         }
     }
 
     fn sample_row() -> ChatListRowFfi {
         ChatListRowFfi {
             group_id_hex: "aa".repeat(16),
+            pinned: true,
+            pinned_position: Some(0),
             archived: false,
             pending_confirmation: true,
+            lifecycle_state: marmot_uniffi::conversions::GroupLifecycleStateFfi::Stable,
+            disbanding: false,
+            disband_request: None,
             title: "Burrow crew".into(),
             group_name: "burrow-crew".into(),
             avatar_url: Some("https://example.com/a.png".into()),
@@ -368,13 +512,21 @@ mod tests {
             last_message: Some(sample_preview()),
             unread_count: 4,
             has_unread: true,
+            manually_marked_unread: false,
             unread_mention_count: 1,
             unread_mention: true,
             first_unread_message_id_hex: Some("44".repeat(32)),
             last_read_message_id_hex: Some("55".repeat(32)),
             last_read_timeline_at: Some(1_700_000_000),
+            conversation_created_at: 1_600_000_000,
+            activity_sort_at: 1_700_000_100,
             updated_at: 1_700_000_200,
             self_membership: SelfMembershipFfi::Member,
+            conversation_kind: marmot_uniffi::conversions::ChatConversationKindFfi::Group,
+            muted: false,
+            muted_until_ms: None,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
         }
     }
 

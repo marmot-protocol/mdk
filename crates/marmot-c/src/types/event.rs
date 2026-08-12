@@ -24,6 +24,10 @@ pub enum MarmotGroupEventKind {
         /// Member id of the welcomer, when known. Nullable.
         welcomer_id_hex: *mut c_char,
     },
+    TransportObjectResourceRefused {
+        message_id_hex: *mut c_char,
+        resource: *mut c_char,
+    },
     MessageReceived {
         sender_id_hex: *mut c_char,
         epoch: u64,
@@ -90,6 +94,13 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
             } => Self::GroupJoined {
                 via_welcome_hex: owned_c_string(via_welcome_hex),
                 welcomer_id_hex: owned_opt_c_string(welcomer_id_hex),
+            },
+            GroupEventKindFfi::TransportObjectResourceRefused {
+                message_id_hex,
+                resource,
+            } => Self::TransportObjectResourceRefused {
+                message_id_hex: owned_c_string(message_id_hex),
+                resource: owned_c_string(resource),
             },
             GroupEventKindFfi::MessageReceived {
                 sender_id_hex,
@@ -175,6 +186,13 @@ impl CFree for MarmotGroupEventKind {
             } => unsafe {
                 free_c_string(*via_welcome_hex);
                 free_c_string(*welcomer_id_hex);
+            },
+            Self::TransportObjectResourceRefused {
+                message_id_hex,
+                resource,
+            } => unsafe {
+                free_c_string(*message_id_hex);
+                free_c_string(*resource);
             },
             Self::MessageReceived { sender_id_hex, .. } => unsafe {
                 free_c_string(*sender_id_hex);
@@ -271,6 +289,13 @@ pub enum MarmotEvent {
         message_id_hex: *mut c_char,
         recipient_hex: *mut c_char,
     },
+    EpochStallEscalated {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+        stalled_epoch: u64,
+        arms: u32,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -340,6 +365,19 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 message_id_hex: owned_c_string(message_id_hex),
                 recipient_hex: owned_c_string(recipient_hex),
             },
+            MarmotEventFfi::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                stalled_epoch,
+                arms,
+            } => Self::EpochStallEscalated {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+                stalled_epoch,
+                arms,
+            },
         }
     }
 }
@@ -407,6 +445,16 @@ impl CFree for MarmotEvent {
                 free_c_string(*message_id_hex);
                 free_c_string(*recipient_hex);
             },
+            Self::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                ..
+            } => unsafe {
+                free_c_string(*account_id_hex);
+                free_c_string(*account_label);
+                free_c_string(*group_id_hex);
+            },
         }
     }
 }
@@ -462,12 +510,17 @@ mod tests {
                         }],
                     }],
                     truncated: false,
+                    blank_lines_before: Vec::new(),
                 },
                 kind: 9,
                 tags: vec![MessageTagFfi {
                     values: vec!["e".to_string(), "abcd".to_string()],
                 }],
+                source_epoch: 3,
+                retention_seconds: Some(60),
+                retention_expires_at: Some(1_700_000_070),
                 recorded_at: 1_700_000_010,
+                received_at: 1_700_000_020,
             },
         }
     }

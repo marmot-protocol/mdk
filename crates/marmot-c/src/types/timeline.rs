@@ -222,6 +222,7 @@ pub struct MarmotTimelineReplyPreview {
     /// Raw agent text-stream JSON of the previewed message. Nullable.
     pub agent_text_stream_json: *mut c_char,
     pub deleted: bool,
+    pub invalidation_status: *mut c_char,
 }
 
 impl From<TimelineReplyPreviewFfi> for MarmotTimelineReplyPreview {
@@ -238,6 +239,7 @@ impl From<TimelineReplyPreviewFfi> for MarmotTimelineReplyPreview {
             media_len,
             agent_text_stream_json: owned_opt_c_string(value.agent_text_stream_json),
             deleted: value.deleted,
+            invalidation_status: owned_opt_c_string(value.invalidation_status),
         }
     }
 }
@@ -252,6 +254,7 @@ impl CFree for MarmotTimelineReplyPreview {
             free_c_string(self.media_json);
             free_vec(self.media, self.media_len);
             free_c_string(self.agent_text_stream_json);
+            free_c_string(self.invalidation_status);
         }
     }
 }
@@ -328,6 +331,12 @@ pub struct MarmotTimelineMessageRecord {
     /// than re-sending the text. For received messages this is the
     /// originating event id and is always non-NULL.
     pub source_message_id_hex: *mut c_char,
+    pub has_source_epoch: bool,
+    pub source_epoch: u64,
+    pub has_retention_seconds: bool,
+    pub retention_seconds: u64,
+    pub has_retention_expires_at: bool,
+    pub retention_expires_at: u64,
     pub direction: *mut c_char,
     pub group_id_hex: *mut c_char,
     pub sender: *mut c_char,
@@ -375,6 +384,12 @@ impl From<TimelineMessageRecordFfi> for MarmotTimelineMessageRecord {
         Self {
             message_id_hex: owned_c_string(value.message_id_hex),
             source_message_id_hex: owned_opt_c_string(value.source_message_id_hex),
+            has_source_epoch: value.source_epoch.is_some(),
+            source_epoch: value.source_epoch.unwrap_or_default(),
+            has_retention_seconds: value.retention_seconds.is_some(),
+            retention_seconds: value.retention_seconds.unwrap_or_default(),
+            has_retention_expires_at: value.retention_expires_at.is_some(),
+            retention_expires_at: value.retention_expires_at.unwrap_or_default(),
             direction: owned_c_string(value.direction),
             group_id_hex: owned_c_string(value.group_id_hex),
             sender: owned_c_string(value.sender),
@@ -730,6 +745,7 @@ mod tests {
                 }],
             }],
             truncated: false,
+            blank_lines_before: Vec::new(),
         }
     }
 
@@ -744,7 +760,7 @@ mod tests {
             nonce_hex: "cc".repeat(12),
             file_name: "diagram.png".to_owned(),
             media_type: "image/png".to_owned(),
-            version: "encrypted-media-v1".to_owned(),
+            version: marmot_uniffi::conversions::EncryptedMediaVersionFfi::V1,
             source_epoch: 7,
             dim: Some("640x480".to_owned()),
             thumbhash: Some("thumb".to_owned()),
@@ -779,6 +795,7 @@ mod tests {
             media: vec![sample_media_reference()],
             agent_text_stream_json: Some("{\"stream\":\"s\"}".to_owned()),
             deleted: false,
+            invalidation_status: None,
         }
     }
 
@@ -820,14 +837,22 @@ mod tests {
             deleted: true,
             deleted_by_message_id_hex: Some("del1".to_owned()),
             invalidation_status: Some("LosingBranch".to_owned()),
+            source_epoch: Some(3),
+            retention_seconds: Some(60),
+            retention_expires_at: Some(70),
         }
     }
 
     fn sample_chat_list_row() -> ChatListRowFfi {
         ChatListRowFfi {
             group_id_hex: "11".repeat(16),
+            pinned: false,
+            pinned_position: None,
             archived: false,
             pending_confirmation: false,
+            lifecycle_state: marmot_uniffi::conversions::GroupLifecycleStateFfi::Stable,
+            disbanding: false,
+            disband_request: None,
             title: "Burrow".to_owned(),
             group_name: "Burrow".to_owned(),
             avatar_url: None,
@@ -835,13 +860,21 @@ mod tests {
             last_message: None,
             unread_count: 1,
             has_unread: true,
+            manually_marked_unread: false,
             unread_mention_count: 0,
             unread_mention: false,
             first_unread_message_id_hex: None,
             last_read_message_id_hex: None,
             last_read_timeline_at: None,
+            conversation_created_at: 1,
+            activity_sort_at: 12,
             updated_at: 12,
             self_membership: SelfMembershipFfi::Member,
+            conversation_kind: marmot_uniffi::conversions::ChatConversationKindFfi::Group,
+            muted: false,
+            muted_until_ms: None,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
         }
     }
 
@@ -1059,6 +1092,9 @@ mod tests {
         let record: MarmotTimelineMessageRecord = TimelineMessageRecordFfi {
             message_id_hex: "m1".to_owned(),
             source_message_id_hex: None,
+            source_epoch: None,
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "sent".to_owned(),
             group_id_hex: "11".repeat(16),
             sender: "me".to_owned(),
@@ -1066,6 +1102,7 @@ mod tests {
             content_tokens: MarkdownDocumentFfi {
                 blocks: Vec::new(),
                 truncated: false,
+                blank_lines_before: Vec::new(),
             },
             kind: 9,
             tags: Vec::new(),

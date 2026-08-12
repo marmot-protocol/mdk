@@ -65,6 +65,26 @@ pub enum MarmotStatus {
     ExternalSignerUnavailable = 32,
     ExternalSignerMismatch = 33,
     ExternalSignerRejected = 34,
+    InvalidGroupMembershipPage = 35,
+    GroupHydrationPending = 36,
+    InvalidChatPin = 37,
+    InvalidMessageDraft = 38,
+    InvalidMediaReference = 39,
+    InvalidKeyPackageEvent = 40,
+    FollowListUnavailable = 41,
+    RuntimeBusy = 42,
+    AccountSessionBusy = 43,
+    AccountSetupRecoveryRequired = 44,
+    AccountSetupRetryRequired = 45,
+    AccountSetupResetNotApplicable = 46,
+    AccountSetupKeyPackageRecoveryAvailable = 47,
+    AccountCatchUp = 48,
+    LeaveAlreadyRequested = 49,
+    DisbandingUnsupportedMembers = 50,
+    DisbandingNotEnabled = 51,
+    GroupDisbanding = 52,
+    StorageClosed = 53,
+    GroupSendQueueFull = 54,
 }
 
 thread_local! {
@@ -110,6 +130,34 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
         MarmotKitError::ExternalSignerRejected => MarmotStatus::ExternalSignerRejected,
+        MarmotKitError::InvalidGroupMembershipPage { .. } => {
+            MarmotStatus::InvalidGroupMembershipPage
+        }
+        MarmotKitError::GroupHydrationPending { .. } => MarmotStatus::GroupHydrationPending,
+        MarmotKitError::InvalidChatPin { .. } => MarmotStatus::InvalidChatPin,
+        MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
+        MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
+        MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
+        MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
+        MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
+        MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
+        MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
+        MarmotKitError::AccountSetupRetryRequired => MarmotStatus::AccountSetupRetryRequired,
+        MarmotKitError::AccountSetupResetNotApplicable => {
+            MarmotStatus::AccountSetupResetNotApplicable
+        }
+        MarmotKitError::AccountSetupKeyPackageRecoveryAvailable => {
+            MarmotStatus::AccountSetupKeyPackageRecoveryAvailable
+        }
+        MarmotKitError::AccountCatchUp { .. } => MarmotStatus::AccountCatchUp,
+        MarmotKitError::LeaveAlreadyRequested { .. } => MarmotStatus::LeaveAlreadyRequested,
+        MarmotKitError::DisbandingUnsupportedMembers { .. } => {
+            MarmotStatus::DisbandingUnsupportedMembers
+        }
+        MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
+        MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
+        MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
+        MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
     }
 }
 

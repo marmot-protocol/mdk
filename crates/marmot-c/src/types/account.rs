@@ -4,8 +4,8 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
     AccountKeyPackageFfi, AccountSummaryFfi, AccountUnreadFfi, GroupLeaveFailureFfi,
-    LocalCleanupReportFfi, RelayFailureFfi, SendSummaryFfi, SignOutOutcomeFfi,
-    UserProfileMetadataFfi, WipeOutcomeFfi,
+    LocalCleanupReportFfi, RelayFailureFfi, SendMaintenanceDispositionFfi, SendSummaryFfi,
+    SignOutOutcomeFfi, UserProfileMetadataFfi, WipeOutcomeFfi,
 };
 
 use crate::MarmotStatus;
@@ -147,6 +147,27 @@ pub struct MarmotSendSummary {
     pub published: u32,
     pub message_ids: *mut *mut c_char,
     pub message_ids_len: usize,
+    pub maintenance_disposition: MarmotSendMaintenanceDisposition,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotSendMaintenanceDisposition {
+    Ready,
+    PostJoinRotationPendingRetryable,
+}
+impl From<SendMaintenanceDispositionFfi> for MarmotSendMaintenanceDisposition {
+    fn from(v: SendMaintenanceDispositionFfi) -> Self {
+        match v {
+            SendMaintenanceDispositionFfi::Ready => Self::Ready,
+            SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable => {
+                Self::PostJoinRotationPendingRetryable
+            }
+        }
+    }
+}
+impl CFree for MarmotSendMaintenanceDisposition {
+    unsafe fn free_in_place(&mut self) {}
 }
 
 impl From<SendSummaryFfi> for MarmotSendSummary {
@@ -162,6 +183,7 @@ impl From<SendSummaryFfi> for MarmotSendSummary {
             published: value.published,
             message_ids,
             message_ids_len,
+            maintenance_disposition: value.maintenance_disposition.into(),
         }
     }
 }
@@ -277,6 +299,7 @@ pub struct MarmotUserProfileMetadata {
     pub display_name: *mut c_char,
     pub about: *mut c_char,
     pub picture: *mut c_char,
+    pub banner: *mut c_char,
     pub nip05: *mut c_char,
     pub lud16: *mut c_char,
 }
@@ -288,6 +311,7 @@ impl From<UserProfileMetadataFfi> for MarmotUserProfileMetadata {
             display_name: owned_opt_c_string(value.display_name),
             about: owned_opt_c_string(value.about),
             picture: owned_opt_c_string(value.picture),
+            banner: owned_opt_c_string(value.banner),
             nip05: owned_opt_c_string(value.nip05),
             lud16: owned_opt_c_string(value.lud16),
         }
@@ -306,6 +330,7 @@ impl MarmotUserProfileMetadata {
             display_name: unsafe { optional_str(self.display_name) }?,
             about: unsafe { optional_str(self.about) }?,
             picture: unsafe { optional_str(self.picture) }?,
+            banner: unsafe { optional_str(self.banner) }?,
             nip05: unsafe { optional_str(self.nip05) }?,
             lud16: unsafe { optional_str(self.lud16) }?,
         })
@@ -319,6 +344,7 @@ impl CFree for MarmotUserProfileMetadata {
             free_c_string(self.display_name);
             free_c_string(self.about);
             free_c_string(self.picture);
+            free_c_string(self.banner);
             free_c_string(self.nip05);
             free_c_string(self.lud16);
         }
@@ -576,6 +602,7 @@ mod tests {
             display_name: None,
             about: Some("burrow enthusiast".into()),
             picture: None,
+            banner: Some("https://example.test/banner.png".into()),
             nip05: None,
             lud16: None,
         }
@@ -584,6 +611,10 @@ mod tests {
         assert_eq!(ffi.name.as_deref(), Some("marmy"));
         assert_eq!(ffi.display_name, None);
         assert_eq!(ffi.about.as_deref(), Some("burrow enthusiast"));
+        assert_eq!(
+            ffi.banner.as_deref(),
+            Some("https://example.test/banner.png")
+        );
         let root = boxed(owned);
         unsafe { marmot_user_profile_metadata_free(root) };
     }
