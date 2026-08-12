@@ -165,6 +165,8 @@ export function createMarmotMessageActionAdapter(
         const messageId =
           typeof ctx.params.messageId === "string"
             ? ctx.params.messageId
+            : typeof ctx.params.message_id === "string"
+              ? ctx.params.message_id
             : String(ctx.toolContext?.currentMessageId ?? "");
         const to =
           typeof ctx.params.to === "string"
@@ -179,13 +181,13 @@ export function createMarmotMessageActionAdapter(
         if (!to) {
           return jsonResult({ ok: false, error: "could not resolve group for this message id" });
         }
-        const { client, marmotAccountIdHex } = await deps.resolveTarget(
-          ctx.cfg,
-          ctx.accountId ?? null,
-        );
         const emoji = typeof ctx.params.emoji === "string" ? ctx.params.emoji : "";
         const remove = ctx.params.remove === true || emoji.length === 0;
         try {
+          const { client, marmotAccountIdHex } = await deps.resolveTarget(
+            ctx.cfg,
+            ctx.accountId ?? null,
+          );
           if (remove) {
             if (!client.removeReaction) {
               return jsonResult({ ok: false, error: "reaction removal unavailable" });
