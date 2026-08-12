@@ -50,6 +50,7 @@ impl ConnectorError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::AccountHome(_) => "account_home_error",
+            Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(_) => "app_error",
             Self::Control(_) => "control_error",
             Self::Hex(_) => "invalid_hex",
@@ -93,6 +94,7 @@ impl ConnectorError {
                 "stream begin request id was reused with different inputs"
             }
             Self::Io(_) => "connector I/O failed",
+            Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
         }
     }

@@ -86,6 +86,13 @@ fn send_in_progress_has_a_distinct_retry_contract() {
     );
 }
 
+#[test]
+fn reaction_not_found_has_a_distinct_idempotency_contract() {
+    let error = crate::ConnectorError::App(marmot_app::AppError::ReactionNotFound);
+    assert_eq!(error.code(), "reaction_not_found");
+    assert_eq!(error.client_message(), "no matching reaction to remove");
+}
+
 #[tokio::test]
 async fn control_frame_write_timeout_includes_flush() {
     struct FlushStallingWriter;
