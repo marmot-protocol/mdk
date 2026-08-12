@@ -5234,6 +5234,10 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
             {"success": True, "message_id": latest_id},
         )
         self.assertEqual(
+            await adapter.remove_reaction(chat_id),
+            {"success": True, "message_id": latest_id},
+        )
+        self.assertEqual(
             await adapter.remove_reaction(chat_id, explicit_id),
             {"success": True, "message_id": explicit_id},
         )
@@ -5241,8 +5245,12 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
         client.send_reaction.assert_awaited_once_with(
             "11" * 32, chat_id, latest_id, "👀"
         )
-        client.remove_reaction.assert_awaited_once_with(
-            "11" * 32, chat_id, explicit_id
+        self.assertEqual(
+            client.remove_reaction.await_args_list,
+            [
+                unittest.mock.call("11" * 32, chat_id, latest_id),
+                unittest.mock.call("11" * 32, chat_id, explicit_id),
+            ],
         )
 
     async def test_fallback_reaction_targets_latest_unmentioned_inbound_message(self):
