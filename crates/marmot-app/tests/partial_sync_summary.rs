@@ -165,7 +165,7 @@ async fn direct_sync_failure_returns_applied_prefix() {
     let mut bob = app_bob.client("bob").await.unwrap();
 
     let failure = bob
-        .sync()
+        .sync_with_partial_progress()
         .await
         .expect_err("the second delivery must hit the injected ingest failure");
     assert_eq!(failure.partial_summary.messages.len(), 1);
@@ -186,7 +186,7 @@ async fn delivery_with_failed_boundary_save_is_excluded_from_applied_prefix() {
     let mut bob = app_bob.client("bob").await.unwrap();
 
     let failure = bob
-        .sync()
+        .sync_with_partial_progress()
         .await
         .expect_err("the second delivery boundary save must fail");
     assert_eq!(
@@ -201,6 +201,90 @@ async fn delivery_with_failed_boundary_save_is_excluded_from_applied_prefix() {
             .contains("injected catch-up boundary save failure"),
         "the fault must come from the N+1 completion boundary: {}",
         failure.source
+    );
+    let completed_plaintext = failure.partial_summary.messages[0].plaintext.clone();
+    drop(bob);
+    drop(app_bob);
+
+    let app_bob_recovered = open_store(&batch.bob_dir, &batch.relay_url, None);
+    let mut bob_recovered = app_bob_recovered.client("bob").await.unwrap();
+    let recovered = bob_recovered.sync().await.unwrap();
+    assert_eq!(
+        recovered.messages.len(),
+        1,
+        "the failed boundary's durable message must replay after reopen"
+    );
+    assert_ne!(recovered.messages[0].plaintext, completed_plaintext);
+    drop(bob_recovered);
+    drop(app_bob_recovered);
+
+    let app_bob_acknowledged = open_store(&batch.bob_dir, &batch.relay_url, None);
+    let mut bob_acknowledged = app_bob_acknowledged.client("bob").await.unwrap();
+    assert!(
+        bob_acknowledged.sync().await.unwrap().messages.is_empty(),
+        "the replayed message must be acknowledged exactly once"
+    );
+}
+
+#[tokio::test]
+async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let home_bob = AccountHome::open(bob_dir.path());
+    home_bob.create_account("bob").unwrap();
+    let bob_id = home_bob.account("bob").unwrap().account_id_hex;
+    let app_bob_setup = open_store(&bob_dir, &relay_url, None);
+    {
+        let mut bob = app_bob_setup.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+    }
+    drop(app_bob_setup);
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let home_alice = AccountHome::open(alice_dir.path());
+    home_alice.create_account("alice").unwrap();
+    let app_alice = open_store(&alice_dir, &relay_url, None);
+    let mut alice = app_alice.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("join boundary recovery", &[bob_id.as_str()])
+        .await
+        .unwrap();
+
+    let app_bob_failing = open_store_with_boundary_failure(&bob_dir, &relay_url, 0);
+    let mut bob_failing = app_bob_failing.client("bob").await.unwrap();
+    let failure = bob_failing
+        .sync_with_partial_progress()
+        .await
+        .expect_err("the Welcome projection boundary must fail");
+    assert!(failure.partial_summary.joined_groups.is_empty());
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected catch-up boundary save failure")
+    );
+    drop(bob_failing);
+    drop(app_bob_failing);
+
+    let app_bob_recovered = open_store(&bob_dir, &relay_url, None);
+    let mut bob_recovered = app_bob_recovered.client("bob").await.unwrap();
+    let recovered = bob_recovered.sync().await.unwrap();
+    assert_eq!(
+        recovered.joined_groups,
+        vec![group_id.clone()],
+        "the durable engine-to-app outbox must replay the joined group"
+    );
+    drop(bob_recovered);
+    drop(app_bob_recovered);
+
+    let app_bob_acknowledged = open_store(&bob_dir, &relay_url, None);
+    let mut bob_acknowledged = app_bob_acknowledged.client("bob").await.unwrap();
+    let after_ack = bob_acknowledged.sync().await.unwrap();
+    assert!(
+        after_ack.joined_groups.is_empty(),
+        "the projection save must acknowledge the replay exactly once"
     );
 }
 
@@ -240,7 +324,7 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     let app_bob_failing = open_store(&bob_dir, &relay_url, Some(1));
     let mut bob_failing = app_bob_failing.client("bob").await.unwrap();
     let failure = bob_failing
-        .sync()
+        .sync_with_partial_progress()
         .await
         .expect_err("the second welcome must fail before ingest");
     assert_eq!(

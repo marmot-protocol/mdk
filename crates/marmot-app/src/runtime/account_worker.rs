@@ -1117,7 +1117,12 @@ async fn run_app_runtime_account_worker(
                     continue 'worker;
                 }
                 if client.key_package_maintenance_requires_catch_up() {
-                    match timeout(Duration::from_secs(15), client.sync()).await {
+                    match timeout(
+                        Duration::from_secs(15),
+                        client.sync_with_partial_progress(),
+                    )
+                    .await
+                    {
                         Ok(Ok(summary)) => {
                             publish_app_runtime_summary(
                                 &events,
@@ -1258,7 +1263,7 @@ async fn handle_account_worker_catch_up(
     let mut commands_open = true;
     let sync_started_at = Instant::now();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync());
+        let mut sync = std::pin::pin!(client.sync_with_partial_progress());
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
@@ -1629,7 +1634,7 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();
-            let result = match client.sync().await {
+            let result = match client.sync_with_partial_progress().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
                     let backfill_result = run_pending_epoch_backfill_reporting_arm(

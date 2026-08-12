@@ -647,7 +647,7 @@ async fn escalation_from_completed_delivery_survives_later_sync_failure() {
 
     let failure = live
         .bob
-        .sync()
+        .sync_with_partial_progress()
         .await
         .expect_err("delivery after the threshold-crossing escalation must fail");
     assert!(

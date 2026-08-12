@@ -14,7 +14,7 @@ pub(crate) async fn sync_command(
 ) -> Result<CommandOutput, WnError> {
     app.status(&account.label)?;
     let mut client = app.client(&account.label).await?;
-    let summary = match client.sync().await {
+    let summary = match client.sync_with_partial_progress().await {
         Ok(summary) => summary,
         Err(failure) => return Err(sync_failure_error(app, account, failure)),
     };

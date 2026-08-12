@@ -191,7 +191,18 @@ impl AppClient {
 
     /// Transport-first startup sync. All authenticated, newly-applied effects
     /// are projected into app state; no historical replay cursor is maintained.
-    pub async fn sync(&mut self) -> Result<SyncSummary, SyncFailure> {
+    ///
+    /// This compatibility entry point preserves the original [`AppError`]
+    /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
+    /// report the durably applied prefix of a failed catch-up pass.
+    pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+        self.sync_with_partial_progress()
+            .await
+            .map_err(|failure| failure.source)
+    }
+
+    /// Synchronize while retaining the durably applied prefix on failure.
+    pub async fn sync_with_partial_progress(&mut self) -> Result<SyncSummary, SyncFailure> {
         self.sync_inner(None).await
     }
 
@@ -1192,10 +1203,12 @@ impl AppClient {
     }
 
     fn prepare_pending_application_event_ack(&mut self, event: &cgka_traits::engine::GroupEvent) {
-        if let cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } = event {
-            self.pending_application_event_acks
-                .insert(message_id.clone());
-        }
+        let event_id = match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => message_id,
+            cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => via_welcome,
+            _ => return,
+        };
+        self.pending_application_event_acks.insert(event_id.clone());
     }
 
     pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(

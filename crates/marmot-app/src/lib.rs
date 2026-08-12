@@ -685,9 +685,11 @@ impl SyncSummary {
 /// A sync failure together with the prefix that was already durably applied.
 ///
 /// Catch-up processes deliveries incrementally, so a later transport, engine,
-/// or projection error cannot roll back earlier deliveries. Direct callers must
-/// report or otherwise consume `partial_summary`; dropping it would hide durable
-/// progress until the host takes a fresh storage snapshot.
+/// or projection error cannot roll back earlier deliveries. Callers of
+/// [`AppClient::sync_with_partial_progress`] must report or otherwise consume
+/// `partial_summary`; dropping it would hide durable progress until the host
+/// takes a fresh storage snapshot. The compatibility [`AppClient::sync`] entry
+/// point retains its original [`AppError`] result.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct SyncFailure {

@@ -1840,8 +1840,12 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
+    let welcome_id = welcome.id.clone();
     bob.join_welcome(welcome).await.unwrap();
     bob.drain_events();
+    bob_storage
+        .delete_pending_application_events(&[welcome_id])
+        .unwrap();
 
     let msg = match alice
         .send(SendIntent::AppMessage {
@@ -1892,6 +1896,60 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
             .iter()
             .all(|event| !matches!(event, GroupEvent::MessageReceived { .. })),
         "acknowledged application events must not replay again",
+    );
+}
+
+#[tokio::test]
+async fn pending_group_join_replays_after_restart_until_acknowledged() {
+    let mut alice = build_client(b"alice-join-outbox");
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(bob_storage.clone(), b"bob-join-outbox");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (_, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let welcome_id = welcome.id.clone();
+    bob.join_welcome(welcome).await.unwrap();
+    assert!(bob.drain_events().iter().any(
+        |event| matches!(event, GroupEvent::GroupJoined { via_welcome, .. }
+                if via_welcome == &welcome_id)
+    ));
+
+    drop(bob);
+    let mut reopened = build_client_with_storage(bob_storage.clone(), b"bob-join-outbox");
+    assert!(reopened.drain_events().iter().any(
+        |event| matches!(event, GroupEvent::GroupJoined { via_welcome, .. }
+                if via_welcome == &welcome_id)
+    ));
+
+    bob_storage
+        .delete_pending_application_events(&[welcome_id])
+        .unwrap();
+    drop(reopened);
+    let mut acknowledged = build_client_with_storage(bob_storage, b"bob-join-outbox");
+    assert!(
+        acknowledged
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::GroupJoined { .. })),
+        "acknowledged group joins must not replay again",
     );
 }
 
