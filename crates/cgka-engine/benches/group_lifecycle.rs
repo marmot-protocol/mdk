@@ -230,10 +230,7 @@ fn bench_create_group(c: &mut Criterion) {
                             .expect("create_group succeeds");
                         eprintln!("TEMP-PROBE closure create_group: {:?}", __tg.elapsed()); // TEMP-PROBE
                         // Sanity: founding creation returns one Welcome per invitee.
-                        debug_assert!(matches!(
-                            result,
-                            SendResult::FoundingGroupCreated { .. }
-                        ));
+                        debug_assert!(matches!(result, SendResult::FoundingGroupCreated { .. }));
                         group_id
                     }
                 });
@@ -280,7 +277,9 @@ fn bench_join_welcome(c: &mut Criterion) {
                 .block_on(alice.create_group(create_request(vec![bob_kp.clone()])))
                 .expect("create_group succeeds");
             match result {
-                SendResult::FoundingGroupCreated { welcomes: mut wrapped } => {
+                SendResult::FoundingGroupCreated {
+                    welcomes: mut wrapped,
+                } => {
                     welcomes.push(wrapped.remove(0));
                 }
                 other => panic!("expected FoundingGroupCreated, got {other:?}"),
@@ -338,7 +337,9 @@ fn bench_join_welcome_large_group(c: &mut Criterion) {
             .block_on(alice.create_group(create_request(members)))
             .expect("create_group succeeds");
         match result {
-            SendResult::FoundingGroupCreated { welcomes: mut wrapped } => {
+            SendResult::FoundingGroupCreated {
+                welcomes: mut wrapped,
+            } => {
                 // bob's KeyPackage was last, so his Welcome is last.
                 welcomes.push(wrapped.remove(wrapped.len() - 1));
             }
