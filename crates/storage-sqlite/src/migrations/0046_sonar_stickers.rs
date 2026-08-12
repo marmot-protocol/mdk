@@ -37,7 +37,7 @@ CREATE TABLE app_stickers (
     FOREIGN KEY (pack_coordinate) REFERENCES app_sticker_packs(coordinate) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX idx_app_stickers_pack_hash
+CREATE INDEX idx_app_stickers_pack_hash
     ON app_stickers (pack_coordinate, sha256);
 
 CREATE TABLE app_sticker_install_state (

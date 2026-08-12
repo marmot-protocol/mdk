@@ -706,6 +706,38 @@ mod tests {
     }
 
     #[test]
+    fn pack_can_reuse_one_image_across_multiple_shortcodes() {
+        // A pack where two different shortcodes reference the same sha256
+        // (same image) must be ingestible. Migration 0046 originally had a
+        // UNIQUE constraint on (pack_coordinate, sha256) that rejected this.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let shared_hash = "ab".repeat(32);
+        let mut pack = pack(&"cc".repeat(32), 10, &shared_hash);
+        pack.stickers = vec![
+            sticker("wave", &shared_hash),
+            sticker("dance", &shared_hash),
+        ];
+
+        assert!(
+            store.replace_sticker_pack_if_newer(&pack).unwrap(),
+            "pack with reused image hash must store successfully"
+        );
+
+        assert!(
+            store
+                .sticker_for_ref(&pack.coordinate, "wave", &shared_hash)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .sticker_for_ref(&pack.coordinate, "dance", &shared_hash)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn pack_replacement_is_atomic_and_nip01_ordered() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let hash_a = "11".repeat(32);

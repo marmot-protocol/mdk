@@ -823,6 +823,21 @@ fn chat_list_projection_complete_tx(
     )? {
         return Ok(false);
     }
+    // Migration 0046 added `last_message_tags_json` as nullable. Existing
+    // rows with a last message have NULL tags until rebuilt, so detect them
+    // here and force a rebuild.
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM chat_list_rows AS row
+                WHERE row.last_message_id_hex IS NOT NULL
+                   AND row.last_message_tags_json IS NULL
+             )",
+        [],
+    )? {
+        return Ok(false);
+    }
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(

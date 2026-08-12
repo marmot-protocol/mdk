@@ -896,6 +896,51 @@ fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
     assert_eq!(last_message.plaintext, "new preview");
 }
 
+/// Migration 0046 adds `last_message_tags_json` as nullable. Existing rows with
+/// a last message have NULL until rebuilt; the completeness check must detect
+/// them and force a rebuild so tags are populated.
+#[test]
+fn ensure_chat_list_rows_rebuilds_when_last_message_tags_json_is_null() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat_with_tags(
+            "tagged",
+            REMOTE,
+            10,
+            "hello",
+            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        ))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    // Simulate the post-migration state: tags_json is NULL for a row that has
+    // a last message.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET last_message_tags_json = NULL WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .expect("chat row");
+
+    let last_message = row.last_message.expect("last message");
+    assert_eq!(
+        last_message.tags,
+        vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        "tags should be rebuilt from the timeline after the NULL-tag rebuild"
+    );
+}
+
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
     let store = setup_store();
