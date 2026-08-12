@@ -338,7 +338,8 @@ struct RecordingAdapterInner {
     syncs: Mutex<Vec<TransportGroupSync>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
-    accepted_endpoint_sets: Mutex<VecDeque<Vec<TransportEndpoint>>>,
+    accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
+    error_endpoints: Mutex<Vec<TransportEndpoint>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -379,14 +380,17 @@ impl RecordingAdapter {
             .push_back(accepted_count);
     }
 
-    /// Accept exactly this endpoint subset of the next publish call,
-    /// regardless of where those endpoints sit in the request's target.
-    fn accept_endpoints_next(&self, endpoints: Vec<TransportEndpoint>) {
-        self.inner
-            .accepted_endpoint_sets
-            .lock()
-            .unwrap()
-            .push_back(endpoints);
+    /// Persistent endpoint accept policy: every publish call accepts exactly
+    /// the intersection of its target endpoints with this set. Deterministic
+    /// under concurrent single-endpoint publishes, unlike the FIFO knobs.
+    fn accept_only_endpoints(&self, endpoints: Vec<TransportEndpoint>) {
+        *self.inner.accept_policy.lock().unwrap() = Some(endpoints);
+    }
+
+    /// Persistent whole-call error policy: a publish call whose target
+    /// endpoints all sit in this set returns `Err` instead of a report.
+    fn error_for_endpoints(&self, endpoints: Vec<TransportEndpoint>) {
+        *self.inner.error_endpoints.lock().unwrap() = endpoints;
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -465,12 +469,21 @@ impl TransportAdapter for RecordingAdapter {
                 "injected ambiguous adapter failure".into(),
             ));
         }
-        let accepted_endpoints = self
-            .inner
-            .accepted_endpoint_sets
-            .lock()
-            .unwrap()
-            .pop_front();
+        {
+            let error_endpoints = self.inner.error_endpoints.lock().unwrap();
+            if !error_endpoints.is_empty()
+                && request
+                    .target
+                    .endpoints()
+                    .iter()
+                    .all(|endpoint| error_endpoints.contains(endpoint))
+            {
+                return Err(TransportAdapterError::Publish(
+                    "endpoint-policy adapter error".into(),
+                ));
+            }
+        }
+        let accepted_endpoints = self.inner.accept_policy.lock().unwrap().clone();
         if let Some(accepted_endpoints) = accepted_endpoints {
             return Ok(TransportPublishReport {
                 message_id: self
@@ -3334,9 +3347,13 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
         .unwrap();
 
     let adapter = RecordingAdapter::default();
-    // The commit's batched fanout call: group-a accepts, group-b does not.
-    // The welcome publish afterwards falls back to accept-all.
-    adapter.accept_endpoints_next(vec![TransportEndpoint("wss://group-a.example".into())]);
+    // Endpoint policy: group-a accepts the commit, group-b does not, and both
+    // carol inbox endpoints accept the welcome.
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group-a.example".into()),
+        TransportEndpoint("wss://carol-inbox-a.example".into()),
+        TransportEndpoint("wss://carol-inbox-b.example".into()),
+    ]);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)
@@ -3393,13 +3410,17 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
     );
 
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes.len(), 3);
     assert!(matches!(
         publishes[0].message.envelope,
         TransportEnvelope::GroupMessage { .. }
     ));
     assert!(matches!(
         publishes[1].message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ));
+    assert!(matches!(
+        publishes[2].message.envelope,
         TransportEnvelope::Welcome { .. }
     ));
 }

@@ -20,10 +20,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   the active blob remains memory-resident and one media request is bounded to
   512 MiB total.
 
-- One publish's relay fanout now goes out as a single concurrent batch instead
-  of one awaited relay at a time, so a slow relay no longer serially delays
-  every relay after it. The worst case drops from the sum of per-relay budgets
-  to one overall fanout budget per publish.
+- One publish's relay fanout now runs its per-relay attempts concurrently
+  instead of one awaited relay at a time, so a slow relay no longer serially
+  delays every relay after it. The worst case drops from the sum of per-relay
+  budgets to the slowest single relay's budget.
   ([#1397](https://github.com/marmot-protocol/mdk/pull/1397))
 
 - App-runtime encrypted-media secret caching now skips the MLS group load,

@@ -2490,47 +2490,50 @@ where
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if !remaining.is_empty() {
-            // One adapter call fans out to every retry-due endpoint
-            // concurrently; `required_acks` is the attempt count so the
-            // adapter does not abort the remainder once one relay accepts.
-            let target = publish_target_with_endpoints(&fanout.target, remaining.clone());
-            match self
-                .adapter
-                .publish(TransportPublishRequest {
-                    account_id: self.session.self_id(),
+            // Concurrent single-endpoint publishes with `required_acks: 1`,
+            // the per-endpoint contract the old sequential loop used; see
+            // `drive_outbound_fanout` for why a multi-endpoint batch would
+            // turn partial acceptance into a whole-call error.
+            let adapter = &self.adapter;
+            let account_id = self.session.self_id();
+            let attempts = remaining.iter().map(|endpoint| {
+                let request = TransportPublishRequest {
+                    account_id: account_id.clone(),
                     message: fanout.exact_message.clone(),
-                    target,
-                    required_acks: remaining.len(),
-                })
-                .await
-            {
-                Ok(report) => {
-                    apply_report_to_fanout(&mut fanout, &remaining, &report, self.wall_clock.now());
-                    for endpoint in &remaining {
-                        let accepted = report
-                            .accepted
-                            .iter()
-                            .any(|receipt| &receipt.endpoint == endpoint);
-                        if !accepted {
+                    target: publish_target_with_endpoints(&fanout.target, vec![endpoint.clone()]),
+                    required_acks: 1,
+                };
+                async move { (endpoint.clone(), adapter.publish(request).await) }
+            });
+            for (endpoint, result) in futures::future::join_all(attempts).await {
+                match result {
+                    Ok(report) => {
+                        apply_report_to_fanout(
+                            &mut fanout,
+                            std::slice::from_ref(&endpoint),
+                            &report,
+                            self.wall_clock.now(),
+                        );
+                        if !report.met_required_acks() {
                             output.failures.push(PublishFailure {
                                 message_id: report.message_id.clone(),
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
                         }
+                        output.reports.push(report);
                     }
-                    output.reports.push(report);
-                }
-                Err(_) => {
-                    fanout.possible_exposure = true;
-                    for target in fanout
-                        .targets
-                        .iter_mut()
-                        .filter(|target| remaining.contains(&target.endpoint))
-                    {
-                        target.attempt_count = target.attempt_count.saturating_add(1);
-                        target.last_attempt_at = Some(self.wall_clock.now());
-                        target.state = TransportFanoutAttemptState::AttemptedFailed;
-                        target.failure_code = Some("adapter_error".into());
+                    Err(_) => {
+                        fanout.possible_exposure = true;
+                        if let Some(target) = fanout
+                            .targets
+                            .iter_mut()
+                            .find(|target| target.endpoint == endpoint)
+                        {
+                            target.attempt_count = target.attempt_count.saturating_add(1);
+                            target.last_attempt_at = Some(self.wall_clock.now());
+                            target.state = TransportFanoutAttemptState::AttemptedFailed;
+                            target.failure_code = Some("adapter_error".into());
+                        }
                         output.failures.push(PublishFailure {
                             message_id: message_id.clone(),
                             reason: "fanout adapter error".into(),
@@ -2737,46 +2740,45 @@ where
             }
             self.session.put_outbound_fanout(&fanout)?;
 
-            // One adapter call fans out to every outstanding endpoint
-            // concurrently. `required_acks` is the attempt count — not the
-            // policy threshold — so the adapter waits for every endpoint
-            // instead of aborting the remainder once the threshold is met;
-            // the policy threshold is judged against the frozen record when
-            // the report below is built.
-            let attempt = TransportPublishRequest {
-                account_id: fanout.request().account_id.clone(),
-                message: fanout.request().message.clone(),
-                target: publish_target_with_endpoints(
-                    &fanout.request().target,
-                    outstanding
-                        .iter()
-                        .map(|&index| endpoints[index].clone())
-                        .collect(),
-                ),
-                required_acks: outstanding.len(),
-            };
-            match self.adapter.publish(attempt).await {
-                Ok(report) => {
-                    fanout.record_published_message_id(report.message_id)?;
-                    for &index in &outstanding {
-                        let accepted = report
+            // Publish every outstanding endpoint concurrently as
+            // single-endpoint requests with `required_acks: 1`, the same
+            // per-endpoint contract the old sequential loop used. A
+            // multi-endpoint batch cannot be used here: the adapter treats an
+            // unmet `required_acks` as a whole-call error that discards the
+            // successful receipts, so an ordinary partial acceptance would
+            // read as "every endpoint failed" and roll back a commit that
+            // already reached a relay. Per-endpoint requests keep each
+            // endpoint's outcome independent while removing the
+            // one-awaited-ack-at-a-time serialization.
+            let adapter = &self.adapter;
+            let account_id = fanout.request().account_id.clone();
+            let attempts = outstanding.iter().map(|&index| {
+                let attempt = TransportPublishRequest {
+                    account_id: account_id.clone(),
+                    message: fanout.request().message.clone(),
+                    target: publish_target_with_endpoints(
+                        &fanout.request().target,
+                        vec![endpoints[index].clone()],
+                    ),
+                    required_acks: 1,
+                };
+                async move { (index, adapter.publish(attempt).await) }
+            });
+            for (index, result) in futures::future::join_all(attempts).await {
+                let accepted = match result {
+                    Ok(report) => {
+                        fanout.record_published_message_id(report.message_id)?;
+                        report
                             .accepted
                             .iter()
-                            .any(|receipt| receipt.endpoint == endpoints[index]);
-                        if accepted {
-                            fanout.mark_target_accepted(index)?;
-                        } else {
-                            fanout.mark_target_failed(index)?;
-                        }
+                            .any(|receipt| receipt.endpoint == endpoints[index])
                     }
-                }
-                Err(_) => {
-                    // A whole-call adapter error is systemic (e.g. signing or
-                    // preparation), not endpoint-specific; per-endpoint
-                    // failures come back inside an `Ok` report.
-                    for &index in &outstanding {
-                        fanout.mark_target_failed(index)?;
-                    }
+                    Err(_) => false,
+                };
+                if accepted {
+                    fanout.mark_target_accepted(index)?;
+                } else {
+                    fanout.mark_target_failed(index)?;
                 }
             }
             self.session.put_outbound_fanout(&fanout)?;
