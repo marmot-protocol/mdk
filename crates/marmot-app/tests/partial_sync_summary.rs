@@ -41,6 +41,13 @@ fn open_store_with_boundary_failure(
     MarmotApp::with_relay_and_config(dir.path(), relay_url.to_owned(), config)
 }
 
+fn open_store_with_post_ack_failure(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
+    let config = MarmotAppConfig::default()
+        .with_allow_loopback_relay_endpoints(true)
+        .with_dev_fail_ingest_after_application_event_ack();
+    MarmotApp::with_relay_and_config(dir.path(), relay_url.to_owned(), config)
+}
+
 async fn wait_for_event<F>(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     mut matches_event: F,
@@ -194,6 +201,42 @@ async fn direct_sync_failure_returns_applied_prefix() {
             .iter()
             .any(|row| { row["kind"]["type"] == "sync_drain" && row["kind"]["deliveries"] == 1 }),
         "the failed drain must retain forensic span and completed-delivery evidence",
+    );
+}
+
+#[tokio::test]
+async fn failure_after_application_event_ack_replays_summary_exactly_once() {
+    let batch = pending_message_batch(vec!["applied before projection failure".to_owned()]).await;
+    let app_bob = open_store_with_post_ack_failure(&batch.bob_dir, &batch.relay_url);
+    let mut bob = app_bob.client("bob").await.unwrap();
+
+    let failure = bob
+        .sync_with_partial_progress()
+        .await
+        .expect_err("projection must fail after staging the application-event acknowledgement");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected failure after application-event acknowledgement")
+    );
+    assert!(
+        failure.partial_summary.messages.is_empty(),
+        "the failed delivery is not reportable until its engine event replays",
+    );
+    drop(bob);
+    drop(app_bob);
+
+    let app_bob_reopened = open_store(&batch.bob_dir, &batch.relay_url, None);
+    let mut bob_reopened = app_bob_reopened.client("bob").await.unwrap();
+    assert_eq!(
+        bob_reopened.sync().await.unwrap().messages.len(),
+        1,
+        "the unacknowledged engine event must replay after reopen",
+    );
+    assert!(
+        bob_reopened.sync().await.unwrap().messages.is_empty(),
+        "the replayed application event must be acknowledged exactly once",
     );
 }
 

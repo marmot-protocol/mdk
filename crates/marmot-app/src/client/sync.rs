@@ -201,9 +201,17 @@ impl AppClient {
     /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
     /// report the durably applied prefix of a failed catch-up pass.
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
-        self.sync_inner(None)
-            .await
-            .map_err(|failure| failure.source)
+        match self.sync_inner(None).await {
+            Ok(summary) => Ok(summary),
+            Err(failure) => {
+                // Compatibility callers cannot observe a failure summary.
+                // Retain any already-checkpointed prefix for their next
+                // successful sync instead of consuming it with the error.
+                self.pending_failed_sync_summary
+                    .merge(failure.partial_summary);
+                Err(failure.source)
+            }
+        }
     }
 
     /// Synchronize while retaining the durably applied prefix on failure.
@@ -262,7 +270,6 @@ impl AppClient {
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
             Err(error) => {
-                self.drain_epoch_stall_escalations(&mut summary);
                 return Err(SyncFailure::new(summary, error));
             }
         };
@@ -800,11 +807,6 @@ impl AppClient {
 
         summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
 
-        // Escalations describe a durable engine decision, not the re-derivable
-        // account projection. Once the prefix commits, move them alongside its
-        // summary before any fallible route work.
-        self.drain_epoch_stall_escalations(summary);
-
         if routes_dirty || routes_changed {
             self.sync_runtime_groups()
                 .await
@@ -821,13 +823,12 @@ impl AppClient {
         match error {
             SyncCheckpointError::BeforePersistence(source) => {
                 // Message/join projections from this drain are not reportable
-                // until their checkpoint commits. Epoch-stall escalations are
-                // already durable engine decisions and one-shot, so surface
-                // them rather than losing them when a managed client is rebuilt.
+                // until their checkpoint commits. Keep one-shot epoch-stall
+                // escalations pending here: partial-progress entry points drain
+                // them into the failure, while compatibility `sync()` leaves
+                // them available for the retained client's next success.
                 self.pending_failed_sync_summary.merge(summary);
-                let mut retained = SyncSummary::default();
-                self.drain_epoch_stall_escalations(&mut retained);
-                (retained, source)
+                (SyncSummary::default(), source)
             }
             SyncCheckpointError::AfterPersistence(source) => (summary, source),
         }
@@ -850,7 +851,28 @@ impl AppClient {
         self.arm_recovery_from_effects(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
-        let routes_dirty = self
+        // A delivery can contain several application events. If projection
+        // fails after an earlier event staged its acknowledgement, keep that
+        // event in the durable engine outbox so a retained or reopened client
+        // can replay its live summary. Recording only candidates absent before
+        // this delivery avoids cloning the whole accumulated acknowledgement
+        // set on every catch-up step.
+        let new_application_event_ack_candidates = effects
+            .effects
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                    Some(message_id.clone())
+                }
+                cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
+                    Some(via_welcome.clone())
+                }
+                _ => None,
+            })
+            .filter(|event_id| !self.pending_application_event_acks.contains(event_id))
+            .collect::<Vec<_>>();
+        let routes_dirty = match self
             .observe_account_device_effects(
                 &effects.effects,
                 display_names,
@@ -859,7 +881,16 @@ impl AppClient {
                 source_received_at,
                 Some(outer_transport_at),
             )
-            .await?;
+            .await
+        {
+            Ok(routes_dirty) => routes_dirty,
+            Err(error) => {
+                for event_id in new_application_event_ack_candidates {
+                    self.pending_application_event_acks.remove(&event_id);
+                }
+                return Err(error);
+            }
+        };
         // Publishing here is incidental work triggered by the inbound
         // delivery. A hard publish failure may roll that pending commit back,
         // but it must not discard the already-authenticated inbound message or
@@ -1529,6 +1560,13 @@ impl AppClient {
             };
             if can_ack_application_event {
                 self.prepare_pending_application_event_ack(event);
+                if cfg!(feature = "test-policy-overrides")
+                    && self.app.config.dev_fail_ingest_after_application_event_ack
+                {
+                    return Err(AppError::BlockingTask(
+                        "injected failure after application-event acknowledgement".to_owned(),
+                    ));
+                }
             }
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;

@@ -107,6 +107,11 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides`; this verifies that an uncommitted batch is
     /// excluded from the completed prefix and replayed from the engine outbox.
     pub dev_fail_sync_before_boundary_save: Option<u64>,
+    /// Dev/test-only fault injected after staging an application-event
+    /// acknowledgement during inbound delivery projection. Honored only with
+    /// `test-policy-overrides`; this exercises retention of the already-applied
+    /// event summary when a later step in the same delivery fails.
+    pub dev_fail_ingest_after_application_event_ack: bool,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -162,6 +167,7 @@ impl Default for MarmotAppConfig {
             dev_force_group_read_snapshot_failure: false,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
+            dev_fail_ingest_after_application_event_ack: false,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -268,6 +274,13 @@ impl MarmotAppConfig {
     /// builds ignore this field.
     pub fn with_dev_fail_sync_before_boundary_save(mut self, completed_deliveries: u64) -> Self {
         self.dev_fail_sync_before_boundary_save = Some(completed_deliveries);
+        self
+    }
+
+    /// Fail after staging an inbound application-event acknowledgement in
+    /// test-policy builds. Normal builds ignore this field.
+    pub fn with_dev_fail_ingest_after_application_event_ack(mut self) -> Self {
+        self.dev_fail_ingest_after_application_event_ack = true;
         self
     }
 }

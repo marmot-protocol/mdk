@@ -663,6 +663,65 @@ async fn escalation_from_completed_delivery_survives_later_sync_failure() {
     assert_eq!(escalation.arms, ESCALATION_ARM_THRESHOLD as u32);
 }
 
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn compatibility_sync_retains_escalation_after_failure() {
+    let dir_bob = tempfile::tempdir().unwrap();
+    let dir_alice = tempfile::tempdir().unwrap();
+    let config =
+        MarmotAppConfig::default().with_dev_fail_sync_before_delivery(BACKFILL_THRESHOLD as u64);
+    let mut live = stalled_bob_in_a_live_group_with_config(&dir_bob, &dir_alice, config).await;
+
+    for run in 0..(ESCALATION_ARM_THRESHOLD - 1) {
+        assert!(live.stall_bob_for_one_run(run).await.is_empty());
+        live.advance_bobs_epoch(&format!("compatibility-advanced-{run}"))
+            .await;
+    }
+
+    let stalled_epoch = live.bobs_epoch();
+    let created_at = test_unix_now_seconds();
+    for probe in 0..=BACKFILL_THRESHOLD {
+        publish_garbage_group_message_at(
+            &live.relay_url,
+            &live.nostr_group_id_hex,
+            created_at,
+            &format!("compatibility-failing-run-probe-{probe}"),
+        )
+        .await;
+    }
+
+    let error = live
+        .bob
+        .sync()
+        .await
+        .expect_err("the delivery after the threshold-crossing escalation must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("injected catch-up delivery failure")
+    );
+
+    let recovered = live
+        .bob
+        .sync()
+        .await
+        .expect("the retained client must surface the stashed escalation");
+    assert_eq!(recovered.epoch_stall_escalations.len(), 1);
+    let escalation = &recovered.epoch_stall_escalations[0];
+    assert_eq!(escalation.group_id, live.group_id);
+    assert_eq!(escalation.stalled_epoch, stalled_epoch);
+    assert_eq!(escalation.arms, ESCALATION_ARM_THRESHOLD as u32);
+    assert!(
+        live.bob
+            .sync()
+            .await
+            .unwrap()
+            .epoch_stall_escalations
+            .is_empty(),
+        "the retained escalation must be reported exactly once",
+    );
+}
+
 /// A failed app-projection checkpoint excludes that batch's message/join
 /// outputs, but it must not discard the one-shot escalation raised by a durable
 /// engine outcome in the same batch.
