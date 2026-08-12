@@ -1393,7 +1393,10 @@ impl ConvergenceSubject for EngineHarnessSubject {
     ) -> Result<(), SubjectError> {
         let sender = self.client_mut(action.sender)?;
         sender.name_next_scenario_input(action.action_id);
-        sender.send_app(action.payload.as_bytes().to_vec()).await;
+        sender
+            .try_send_app(action.payload.as_bytes().to_vec())
+            .await
+            .map_err(subject_engine_error)?;
         Ok(())
     }
 

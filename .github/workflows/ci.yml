@@ -372,6 +372,9 @@ jobs:
       - name: Validate convergence failure-corpus lifecycle
         run: just convergence-failure-corpus
 
+      - name: Run focused convergence regressions
+        run: just focused-convergence-regressions
+
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
 

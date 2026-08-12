@@ -148,6 +148,7 @@ export function createMarmotDeleteActionAdapter(
 ): ChannelMessageActionAdapter {
   return {
     describeMessageTool: () => ({ actions: ["delete"] }),
+    supportsAction: ({ action }) => action === "delete",
     handleAction: async (ctx: ChannelMessageActionContext) => {
       if (ctx.action !== "delete") {
         return jsonResult({ ok: false, error: `unsupported action: ${ctx.action}` });

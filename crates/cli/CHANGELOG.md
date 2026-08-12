@@ -19,9 +19,31 @@ versioning through the workspace version in the root `Cargo.toml`.
   upgrade to this compatibility cohort before downloading blobs above 64 MiB;
   the active blob remains memory-resident and one media request is bounded to
   512 MiB total.
+- App-runtime encrypted-media secret caching now skips the MLS group load,
+  exporter-secret derivation, and database write when the current epoch's
+  secret is already cached, and the cache sweep's `required` pre-check uses
+  the projected group record as a positive-only fast path, re-checking the
+  signed component only when the projection reports media disabled. Message
+  sends and group syncs no longer pay three MLS group loads per media group
+  per sweep.
+  ([#1396](https://github.com/marmot-protocol/mdk/pull/1396))
 
 ### Fixed
 
+- OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the
+  routed agent id, and beta message sends bypass the delete-only action adapter
+  so they reach durable delivery.
+- Local-only group deletion now survives account restart and historical relay
+  replay. A per-group deletion frontier suppresses projection reconciliation
+  until a causally newer chat message arrives, while a durable engine-to-app
+  delivery outbox makes that first crossing chat recoverable after a crash and
+  does not affect other locally deleted groups.
+- Nostr group-sync unsubscribe draining now keeps unresolved relay teardowns
+  queued until teardown is confirmed, so cancelling a sync after routing
+  state commits retries pending unsubscribes and converges removal metrics
+  without double-counting.
+- OpenCode harness idle-timeout regression test now keeps the mock child alive
+  past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.
@@ -41,6 +63,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Leave-proposal persistence now commits the signed proposal, durable leave
   request, and content-dedup marker atomically, so a storage failure cannot
   strand a same-epoch leave retry without a publishable proposal.
+- The Nostr SDK failed-signature regression test now observes EOSE under one
+  bounded CI-safe window, avoiding sharded CI flakes without weakening
+  failed-event non-emission and non-caching assertions.
 
 ## [0.9.11] - 2026-08-09
 

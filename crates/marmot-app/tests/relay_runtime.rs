@@ -2204,6 +2204,29 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         .await
         .unwrap();
 
+    let second_group_id = runtime
+        .create_group(
+            &alice_id,
+            "second local delete",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &second_group_id
+        )
+    })
+    .await;
+    runtime
+        .accept_group_invite(&bob_id, &second_group_id)
+        .await
+        .unwrap();
+    let second_group_id_hex = hex::encode(second_group_id.as_slice());
+
     runtime
         .send_message(&alice_id, &group_id, b"local rows must be wiped".to_vec())
         .await
@@ -2256,8 +2279,19 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             .await
             .unwrap()
     );
+    assert!(
+        runtime
+            .delete_group_local(&bob_id, &second_group_id)
+            .await
+            .unwrap()
+    );
 
     assert!(app.group(&bob_label, &group_id_hex).unwrap().is_none());
+    assert!(
+        app.group(&bob_label, &second_group_id_hex)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         app.visible_groups(&bob_label)
             .unwrap()
@@ -2286,6 +2320,75 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         .unwrap()
         .messages
         .is_empty()
+    );
+
+    // Foreground/process recreation must not mistake the deliberately absent
+    // projection for an engine/projection tear. Awaiting catch-up also replays
+    // the relay's historical group delivery and proves that replay is inert.
+    runtime.restart_account(&bob_id).await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        app.group(&bob_label, &group_id_hex).unwrap().is_none(),
+        "restart reconciliation must preserve the local deletion"
+    );
+    assert!(
+        app.group(&bob_label, &second_group_id_hex)
+            .unwrap()
+            .is_none(),
+        "restart reconciliation must preserve every deleted group"
+    );
+
+    // A full routing rebuild for unrelated account activity must preserve the
+    // hidden live routes that can receive a future resurrection message.
+    runtime.publish_key_package(&bob_id).await.unwrap();
+
+    // Authenticated MLS state changes are not chat activity and must not make
+    // the local projection visible again. The following fresh chat also proves
+    // that suppressing this event did not discard the hidden transport route.
+    runtime
+        .update_group_profile(
+            &alice_id,
+            &group_id,
+            Some("renamed while locally deleted".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        app.group(&bob_label, &group_id_hex).unwrap().is_none(),
+        "non-chat group updates must preserve the local deletion"
+    );
+
+    // A causally newer chat message is the explicit resurrection edge. It may
+    // arrive in the same wall-clock second because the frontier is the engine's
+    // durable ingress order, not a sender-controlled timestamp.
+    runtime
+        .send_message(
+            &alice_id,
+            &group_id,
+            b"fresh activity restores the projection".to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "fresh activity restores the projection"
+        )
+    })
+    .await;
+    assert!(
+        app.group(&bob_label, &group_id_hex).unwrap().is_some(),
+        "causally newer group activity must restore the app projection"
+    );
+    assert!(
+        app.group(&bob_label, &second_group_id_hex)
+            .unwrap()
+            .is_none(),
+        "fresh activity in one group must not clear another group's frontier"
     );
 
     let alice_members = runtime.group_members(&alice_id, &group_id).await.unwrap();
@@ -3704,6 +3807,17 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
             .iter()
             .any(|member| member.member_id_hex == bob_id),
         "bob should be absent from his retained tombstoned record after removal"
+    );
+
+    assert!(
+        runtime
+            .delete_group_local(&bob_id, &group_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        app.group(&bob_label, &group_id_hex).unwrap().is_none(),
+        "local deletion should hide the retained removed-group projection"
     );
 
     runtime

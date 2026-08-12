@@ -741,18 +741,36 @@ impl AppGroupRecord {
     }
 
     fn remember_prior_nostr_route(&mut self, last_epoch: u64) {
-        let relays = normalized_relays(&self.nostr_routing.relays);
-        if let Some(existing) = self.prior_nostr_routes.iter_mut().find(|route| {
-            route.nostr_group_id_hex == self.nostr_routing.nostr_group_id_hex
-                && normalized_relays(&route.relays) == relays
-        }) {
-            existing.last_epoch = existing.last_epoch.max(last_epoch);
-        } else {
-            self.prior_nostr_routes.push(AppPriorNostrRoute {
-                nostr_group_id_hex: self.nostr_routing.nostr_group_id_hex.clone(),
-                relays,
-                last_epoch,
-            });
+        self.merge_prior_nostr_routes(vec![AppPriorNostrRoute {
+            nostr_group_id_hex: self.nostr_routing.nostr_group_id_hex.clone(),
+            relays: normalized_relays(&self.nostr_routing.relays),
+            last_epoch,
+        }]);
+    }
+
+    /// Merge exact route history recovered from a local-deletion marker into a
+    /// newly recreated app projection. The current route is not prior history;
+    /// duplicate historical pairs retain the greatest authenticated epoch.
+    pub(crate) fn adopt_prior_nostr_routes(&mut self, mut routes: Vec<AppPriorNostrRoute>) {
+        let current_relays = normalized_relays(&self.nostr_routing.relays);
+        routes.retain(|route| {
+            route.nostr_group_id_hex != self.nostr_routing.nostr_group_id_hex
+                || normalized_relays(&route.relays) != current_relays
+        });
+        self.merge_prior_nostr_routes(routes);
+    }
+
+    fn merge_prior_nostr_routes(&mut self, routes: Vec<AppPriorNostrRoute>) {
+        for mut route in routes {
+            route.relays = normalized_relays(&route.relays);
+            if let Some(existing) = self.prior_nostr_routes.iter_mut().find(|existing| {
+                existing.nostr_group_id_hex == route.nostr_group_id_hex
+                    && normalized_relays(&existing.relays) == route.relays
+            }) {
+                existing.last_epoch = existing.last_epoch.max(route.last_epoch);
+            } else {
+                self.prior_nostr_routes.push(route);
+            }
         }
         self.prior_nostr_routes.sort_by(|left, right| {
             left.last_epoch
@@ -841,7 +859,10 @@ impl AppGroupRecord {
 }
 
 impl AppPriorNostrRoute {
-    fn subscription(&self, group_id: &GroupId) -> Result<TransportGroupSubscription, AppError> {
+    pub(crate) fn subscription(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<TransportGroupSubscription, AppError> {
         let transport_group_id = hex::decode(&self.nostr_group_id_hex)?;
         if transport_group_id.len() != 32 {
             return Err(AppError::InvalidNostrRouting(
@@ -1953,6 +1974,7 @@ pub(crate) fn observe_event(
             epoch,
             payload,
             retention,
+            ..
         } => {
             if let Some(projection) = group_projection {
                 add_group(

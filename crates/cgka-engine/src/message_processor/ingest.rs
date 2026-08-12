@@ -270,6 +270,15 @@ impl<S: StorageProvider> Engine<S> {
                         EpochId(0),
                         MessageState::Retryable,
                     )?;
+                    // Unknown-group traffic is deliberately not retained when
+                    // no group row exists (#740: unknown-route floods must
+                    // not consume storage), so this ignore is not terminal
+                    // evidence either. Keep the id out of the in-memory seen
+                    // cache: if this client later joins the group (a Welcome
+                    // that raced behind its commits), relay redelivery of the
+                    // same event must process instead of classifying as a
+                    // duplicate of a message that left no durable record.
+                    self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
                     return Ok(IngestOutcome::Ignored {
                         category: InputRejectionCategory::UnknownGroup,
                     });
@@ -1160,16 +1169,31 @@ impl<S: StorageProvider> Engine<S> {
                     {
                         self.audit_group(&group_id, decoded);
                     }
-                    self.events_buf.push_back(GroupEvent::MessageReceived {
+                    let event = GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
+                        message_id: msg.id.clone(),
                         sender,
                         epoch: msg_epoch,
                         payload,
                         retention: retention_seconds.map(|seconds| {
                             AppMessageRetentionDecision::new(app_event.created_at, seconds)
                         }),
-                    });
-                    self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    };
+                    let previous = self.storage.get_message(&msg.id).ok();
+                    self.storage.with_transaction(|storage| {
+                        storage.update_message_state(&msg.id, MessageState::Processed)?;
+                        storage.put_pending_application_event(&event)?;
+                        Ok::<_, EngineError>(())
+                    })?;
+                    let transition = crate::audit_helpers::message_state_transition_event(
+                        hex::encode(msg.id.as_slice()),
+                        previous.as_ref().map(|record| record.state),
+                        MessageState::Processed,
+                        previous.as_ref().map(|record| record.epoch),
+                        "state_update",
+                    );
+                    self.audit_group(&group_id, transition);
+                    self.events_buf.push_back(event);
                     // In-memory fast path mirrors the durable record, keyed on
                     // the content-derived id so a re-wrapped duplicate is caught
                     // before the durable lookup.
@@ -2609,7 +2633,13 @@ impl<S: StorageProvider> Engine<S> {
                 SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
             let (ctx, message_retention_seconds) =
                 match self.context_from_group_snapshot(group_id, &snapshot_name) {
-                    Ok(context) => context,
+                    Ok(Some(context)) => context,
+                    Ok(None) => {
+                        // Evicted-era snapshot: no exporter secret exists for
+                        // it. Restore live state and try the next snapshot.
+                        guard.commit()?;
+                        continue;
+                    }
                     Err(err) => {
                         // Drop on `guard` rolls back to live + releases.
                         guard.commit()?;
@@ -2732,15 +2762,20 @@ impl<S: StorageProvider> Engine<S> {
         Ok(snapshots)
     }
 
+    /// `Ok(None)` means the retained snapshot cannot serve as a peel source:
+    /// its own leaf is evicted, so OpenMLS refuses every exporter derivation
+    /// (`UseAfterEviction`). A re-added member keeps such snapshots from its
+    /// pre-removal era; they must be skipped like an undecryptable snapshot,
+    /// not surfaced as an ingest failure.
     fn context_from_group_snapshot(
         &self,
         group_id: &GroupId,
         snapshot_name: &str,
     ) -> Result<
-        (
+        Option<(
             cgka_traits::group_context::GroupContextSnapshot,
             Option<u64>,
-        ),
+        )>,
         EngineError,
     > {
         self.storage
@@ -2753,12 +2788,15 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        if !mls_group.is_active() {
+            return Ok(None);
+        }
         let message_retention_seconds =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?;
-        Ok((
+        Ok(Some((
             group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?,
             message_retention_seconds,
-        ))
+        )))
     }
 }
 

@@ -91,11 +91,12 @@ mod tests {
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
     use cgka_traits::capabilities::{Capability, GroupCapabilities};
+    use cgka_traits::engine::GroupEvent;
     use cgka_traits::storage::{
         CapabilityStorage, GroupStateCheckpointRef, GroupStorage, MemberValidationCacheStorage,
         MessageStorage, OutboundIntentStorage, StorageError, StorageProvider,
     };
-    use cgka_traits::types::EpochId;
+    use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 
     #[test]
@@ -127,6 +128,18 @@ mod tests {
         store
             .put_message(&sample_message(mid(2), g0.id.clone(), 1))
             .unwrap();
+        for message_id in [mid(1), mid(2)] {
+            store
+                .put_pending_application_event(&GroupEvent::MessageReceived {
+                    group_id: g0.id.clone(),
+                    message_id,
+                    sender: MemberId::new(vec![7; 32]),
+                    epoch: EpochId(0),
+                    payload: b"authenticated chat".to_vec(),
+                    retention: None,
+                })
+                .unwrap();
+        }
         store.delete_queued_outbound_intent(&mid(10)).unwrap();
         store
             .mls_storage()
@@ -141,6 +154,12 @@ mod tests {
         let msgs = store.list_messages(&g0.id, EpochId(0)).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].id, mid(1));
+        let pending = store.list_pending_application_events().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            GroupEvent::MessageReceived { message_id, .. } if *message_id == mid(1)
+        ));
         let queued = store.list_queued_outbound_intents(&g0.id).unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, mid(10));

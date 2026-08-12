@@ -3547,3 +3547,230 @@ async fn failed_invite_staging_does_not_poison_fork_detection_via_harness() {
     alice.confirm(probe_pending).await;
     assert_eq!(alice.epoch().0, 3);
 }
+
+#[tokio::test]
+async fn removed_member_rejoins_via_fresh_welcome() {
+    // Alice removes Carol, then re-invites her with a fresh KeyPackage. The
+    // re-add is product-legal (leaver.rb re-add leg); Carol must land on the
+    // new epoch and exchange application traffic again.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("readd", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let pending = alice.remove_members(vec![carol.member_id()]).await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob removal outcomes: {bob_outcomes:?}"
+    );
+    let carol_outcomes = carol.tick().await;
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol removal outcomes: {carol_outcomes:?}"
+    );
+    assert_eq!(alice.members().len(), 2);
+
+    let carol_kp2 = carol.fresh_key_package().await;
+    let pending = alice.invite(vec![carol_kp2]).await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob re-add outcomes: {bob_outcomes:?}"
+    );
+    let carol_outcomes = carol.tick().await;
+    assert!(
+        carol_outcomes.iter().all(Result::is_ok),
+        "carol re-add outcomes: {carol_outcomes:?}"
+    );
+
+    assert_eq!(alice.epoch().0, 3);
+    assert_eq!(carol.epoch().0, 3);
+    assert_eq!(alice.members().len(), 3);
+    assert_eq!(carol.members().len(), 3);
+
+    carol.send_app(b"carol is back".to_vec()).await;
+    bus.deliver_all();
+    let alice_outcomes = alice.tick().await;
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice app outcomes: {alice_outcomes:?}"
+    );
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .filter(|e| matches!(e, GroupEvent::MessageReceived { .. }))
+        .count();
+    assert_eq!(
+        received, 1,
+        "alice must receive carol's post-rejoin message"
+    );
+}
+
+#[tokio::test]
+async fn commit_missing_proposal_defers_and_applies_after_proposal_backfill() {
+    // Carol's SelfRemove proposal never reaches Bob (partition drop), so
+    // Alice's removal commit arrives at Bob referencing a proposal he does
+    // not hold. The commit must stay deferred, and a later re-delivery of
+    // the proposal (relay backfill) must complete the removal at Bob.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("missing-proposal", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    // Carol leaves while only Alice can hear her.
+    bus.set_partition(Some(vec![alice.bus_id]));
+    let proposal_msg = carol.leave_capture().await.expect("leave proposal");
+    bus.deliver_all();
+    bus.set_partition(None);
+    let alice_outcomes = alice.tick().await; // ingest proposal + auto-commit
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice outcomes: {alice_outcomes:?}"
+    );
+
+    // The removal commit reaches Bob without its proposal.
+    bus.deliver_all();
+    let bob_outcomes = bob.tick().await;
+    assert!(
+        bob_outcomes.iter().all(Result::is_ok),
+        "bob outcomes: {bob_outcomes:?}"
+    );
+    assert_eq!(alice.epoch().0, 2);
+    assert_eq!(
+        bob.epoch().0,
+        1,
+        "bob cannot apply a commit whose proposal he never saw"
+    );
+
+    // Relay backfill: the proposal is re-delivered, and Bob completes.
+    bus.send(carol.bus_id, proposal_msg);
+    bus.deliver_all();
+    let bob_backfill = bob.tick().await;
+    assert!(
+        bob_backfill.iter().all(Result::is_ok),
+        "bob backfill outcomes: {bob_backfill:?}"
+    );
+    let bob_settle = bob.tick().await;
+    assert!(
+        bob_settle.iter().all(Result::is_ok),
+        "bob settle outcomes: {bob_settle:?}"
+    );
+    assert_eq!(
+        bob.epoch().0,
+        2,
+        "backfilled proposal must let bob apply the retained commit"
+    );
+    assert_eq!(bob.members().len(), 2);
+}
+
+#[tokio::test]
+async fn late_welcome_join_catches_up_via_redelivered_commits() {
+    // Dave's Welcome is delayed while the group advances, so the commits
+    // reach him before he can resolve the group and are dropped without a
+    // durable record (#740 unknown-route posture). Once he joins, relay
+    // redelivery of those same events must process rather than dedup
+    // against the pre-join drop.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut dave = ClientBuilder::new(pad32(b"dave"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("late-welcome", vec![bob_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    // Invite Dave but delay his Welcome; the invite commit still broadcasts.
+    let dave_kp = dave.fresh_key_package().await;
+    let pending = alice.invite(vec![dave_kp]).await;
+    alice.confirm(pending).await;
+    assert!(bus.delay_queued(0, "dave-welcome"), "welcome sits first");
+    bus.deliver_all();
+    bob.tick().await;
+    dave.tick().await; // pre-join commit lands as unknown-group input
+
+    // The group moves on without Dave. Keep a delayed duplicate of every
+    // post-invite commit: it stands in for relay redelivery after his join.
+    for (name, backfill) in [("rename-1", "bf-1"), ("rename-2", "bf-2")] {
+        let pending = alice.update_group_data(name).await;
+        alice.confirm(pending).await;
+        assert!(bus.duplicate_queued(0), "commit sits first in the queue");
+        assert!(bus.delay_queued(1, backfill));
+        bus.deliver_all();
+        bob.tick().await;
+        dave.tick().await; // pre-join commit is dropped without a record
+    }
+    assert_eq!(alice.epoch().0, 4);
+
+    // The Welcome finally arrives; Dave joins at the invite epoch.
+    assert!(bus.release_delayed("dave-welcome"));
+    bus.deliver_all();
+    let join_outcomes = dave.tick().await;
+    assert!(
+        join_outcomes.iter().all(Result::is_ok),
+        "dave join outcomes: {join_outcomes:?}"
+    );
+    assert_eq!(dave.epoch().0, 2);
+
+    // Relay redelivery of the commits he dropped pre-join.
+    assert!(bus.release_delayed("bf-1"));
+    assert!(bus.release_delayed("bf-2"));
+    bus.deliver_all();
+    let catchup_outcomes = dave.tick().await;
+    assert!(
+        catchup_outcomes.iter().all(Result::is_ok),
+        "dave catchup outcomes: {catchup_outcomes:?}"
+    );
+    assert_eq!(
+        dave.epoch().0,
+        4,
+        "redelivered commits must catch dave up after his late join"
+    );
+    assert_eq!(dave.members().len(), 3);
+}

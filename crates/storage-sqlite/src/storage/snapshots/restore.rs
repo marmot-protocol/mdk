@@ -188,6 +188,21 @@ fn messages(
         )
         .storage()?;
     }
+    // A full snapshot replaces this group's protocol messages. Preserve
+    // pending application deliveries whose source messages were restored, but
+    // remove outbox rows for messages that the rollback discarded.
+    conn.execute(
+        "DELETE FROM pending_application_events
+         WHERE group_id = ?1
+           AND NOT EXISTS (
+                SELECT 1
+                FROM cgka_messages
+                WHERE cgka_messages.id = pending_application_events.message_id
+                  AND cgka_messages.group_id = pending_application_events.group_id
+           )",
+        params![group_id.as_slice()],
+    )
+    .storage()?;
     Ok(())
 }
 

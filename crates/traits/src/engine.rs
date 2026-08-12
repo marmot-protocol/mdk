@@ -416,6 +416,10 @@ pub enum GroupEvent {
     },
     MessageReceived {
         group_id: GroupId,
+        /// Content-derived transport message id. This binds application-layer
+        /// decisions to the engine's durable ingress order rather than to a
+        /// sender-controlled wall clock.
+        message_id: MessageId,
         sender: MemberId,
         epoch: EpochId,
         payload: Vec<u8>,

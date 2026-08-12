@@ -19,6 +19,9 @@ export function classifyInboundDispatchFailure(error: unknown): string {
   if (error instanceof Error && error.message === OPENCLAW_DISPATCH_LIFECYCLE_ERROR) {
     return "openclaw_dispatch_lifecycle_contract";
   }
+  if (error instanceof Error && error.name === "SessionStoreAgentIdRequiredError") {
+    return "openclaw_session_store_agent_id_required";
+  }
   if (error instanceof Error) {
     return "error";
   }

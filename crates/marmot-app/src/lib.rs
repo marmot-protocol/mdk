@@ -44,7 +44,8 @@ use cgka_traits::engine::{GroupEvent, KeyPackage};
 use cgka_traits::storage::{DisbandTombstoneStorage, KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    GroupId, MemberId, TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
+    GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
+    TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
@@ -1421,6 +1422,10 @@ impl MarmotApp {
             pending_applied_sync_summary: SyncSummary::default(),
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
+            pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
+            pending_application_event_acks: std::collections::HashSet::new(),
+            #[cfg(test)]
+            force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
             epoch_backfill_pending: false,
@@ -3953,11 +3958,34 @@ impl MarmotApp {
     /// `APP_RUNTIME_RELAY_REBUILD_LOOKBACK`. A deliberate cursor reset must be
     /// a dedicated named API; a raw save cannot lower the merged value.
     fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
+        self.save_state_clearing_local_group_deletion_frontiers(state, &[])
+    }
+
+    fn save_state_clearing_local_group_deletion_frontiers(
+        &self,
+        state: &AccountState,
+        frontiers_to_clear: &[(String, u64)],
+    ) -> Result<(), AppError> {
+        self.save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            state,
+            frontiers_to_clear,
+            &[],
+        )
+    }
+
+    fn save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+        &self,
+        state: &AccountState,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+    ) -> Result<(), AppError> {
         self.account_storage(&state.label)?
-            .save_account_projection_state(
+            .save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
                 &stored_state_from_account_state(state),
                 MAX_SEEN_EVENT_IDS,
                 TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+                frontiers_to_clear,
+                application_event_ids_to_ack,
             )?;
         self.chat_list_projection_stale
             .lock()

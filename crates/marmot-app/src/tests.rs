@@ -52,6 +52,7 @@ pub(crate) struct ScriptedPushRelayClient {
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
+    block_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     block_publish_count: std::sync::atomic::AtomicUsize,
     blocked_publish_count: std::sync::atomic::AtomicUsize,
@@ -63,6 +64,8 @@ pub(crate) struct ScriptedPushRelayClient {
     publish_release: tokio::sync::Notify,
     subscribe_started: tokio::sync::Notify,
     subscribe_release: tokio::sync::Notify,
+    unsubscribe_started: tokio::sync::Notify,
+    unsubscribe_release: tokio::sync::Notify,
 }
 
 impl ScriptedPushRelayClient {
@@ -149,6 +152,19 @@ impl ScriptedPushRelayClient {
 
     fn release_subscribe(&self) {
         self.subscribe_release.notify_waiters();
+    }
+
+    fn block_next_unsubscribe(&self) {
+        self.block_next_unsubscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_unsubscribe(&self) {
+        self.unsubscribe_started.notified().await;
+    }
+
+    fn release_unsubscribe(&self) {
+        self.unsubscribe_release.notify_waiters();
     }
 
     fn zero_ack_next_publish(&self) {
@@ -252,6 +268,13 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         _subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self
+            .block_next_unsubscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.unsubscribe_started.notify_one();
+            self.unsubscribe_release.notified().await;
+        }
         Ok(())
     }
 
@@ -5698,6 +5721,459 @@ fn reopening_account_restores_current_and_prior_group_routes() {
             .map(|route| route.transport_group_id.clone())
             .collect::<HashSet<_>>(),
         HashSet::from([vec![0x11; 32], vec![0x22; 32]])
+    );
+}
+
+#[tokio::test]
+async fn local_delete_compensation_preserves_primary_error_and_attempts_route_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("compensation", &[]).await.unwrap();
+    let routes_before = client.routing.snapshot().group_routes;
+
+    relay.block_next_unsubscribe();
+    let delete = tokio::spawn(async move {
+        let result = client.delete_group_local(&group_id).await;
+        (result, client.routing.snapshot().group_routes)
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_unsubscribe(),
+    )
+    .await
+    .unwrap();
+    app.close_storage().unwrap();
+    relay.fail_next_subscribe();
+    relay.release_unsubscribe();
+
+    let (result, routes_after) = delete.await.unwrap();
+    let error = format!("{:?}", result.unwrap_err());
+    assert!(
+        error.contains("Closed"),
+        "the original storage-delete failure must win over compensation failures: {error}"
+    );
+    assert_eq!(routes_after, routes_before);
+    assert!(
+        !relay
+            .fail_next_subscribe
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "runtime route restoration must still be attempted after storage compensation fails"
+    );
+}
+
+#[tokio::test]
+async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrection() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://old.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("rotated local delete", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let old_route = app
+        .group("alice", &group_id_hex)
+        .unwrap()
+        .unwrap()
+        .nostr_routing;
+
+    let current_route =
+        NostrRoutingV1::new([0x22; 32], vec!["wss://current.example".to_owned()]).unwrap();
+    let effects = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(&current_route).unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(!effects.reports.is_empty());
+    client.refresh_group(&group_id);
+    client.refresh_group_routes().unwrap();
+    app.save_state(&client.state).unwrap();
+
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+    let hidden_route =
+        NostrRoutingV1::new([0x33; 32], vec!["wss://hidden.example".to_owned()]).unwrap();
+    client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(&hidden_route).unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    client.refresh_group(&group_id);
+    client.refresh_group_routes().unwrap();
+    drop(client);
+
+    let mut reopened = app.client("alice").await.unwrap();
+    let routes = reopened
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group_id)
+        .map(|route| (route.transport_group_id, route.endpoints))
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        routes,
+        HashSet::from([
+            (
+                hex::decode(&old_route.nostr_group_id_hex).unwrap(),
+                vec![TransportEndpoint("wss://old.example".to_owned())],
+            ),
+            (
+                vec![0x22; 32],
+                vec![TransportEndpoint("wss://current.example".to_owned())],
+            ),
+            (
+                vec![0x33; 32],
+                vec![TransportEndpoint("wss://hidden.example".to_owned())],
+            ),
+        ]),
+        "a hidden group must keep each retained route paired with its authenticated relay set",
+    );
+
+    let sender = app.account_home().account("alice").unwrap().account_id_hex;
+    let fresh_payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Chat {
+                content: "fresh activity".to_owned(),
+            },
+            &sender,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = reopened
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: fresh_payload.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(fresh.failures.is_empty());
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: fresh.reports[0].message_id.clone(),
+            sender: MemberId::new(hex::decode(&sender).unwrap()),
+            epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
+            payload: fresh_payload,
+            retention: None,
+        }],
+        ..Default::default()
+    };
+    let summary = reopened
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    assert_eq!(summary.messages[0].plaintext, "fresh activity");
+
+    let resurrected = app.group("alice", &group_id_hex).unwrap().unwrap();
+    assert_eq!(
+        resurrected
+            .prior_nostr_routes
+            .iter()
+            .map(|route| (route.nostr_group_id_hex.clone(), route.relays.clone()))
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            (
+                old_route.nostr_group_id_hex,
+                vec!["wss://old.example".to_owned()],
+            ),
+            (
+                hex::encode([0x22; 32]),
+                vec!["wss://current.example".to_owned()],
+            ),
+        ]),
+        "resurrection must adopt the exact retained route history before clearing the marker",
+    );
+    let resurrected_routes = reopened
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group_id)
+        .map(|route| (route.transport_group_id, route.endpoints))
+        .collect::<HashSet<_>>();
+    assert_eq!(resurrected_routes, routes);
+}
+
+#[tokio::test]
+async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
+    for fresh_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("batch frontier", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+        let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
+
+        let historical_payload = crate::messages::encode_inner_event(
+            &build_inner_event(
+                &AppMessageIntent::Chat {
+                    content: "historical".to_owned(),
+                },
+                &sender_hex,
+                unix_now_seconds(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let historical = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: historical_payload.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(historical.failures.is_empty());
+        assert!(client.delete_group_local(&group_id).await.unwrap());
+
+        let fresh_payload = crate::messages::encode_inner_event(
+            &build_inner_event(
+                &AppMessageIntent::Chat {
+                    content: "fresh".to_owned(),
+                },
+                &sender_hex,
+                unix_now_seconds(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let fresh = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: fresh_payload.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(fresh.failures.is_empty());
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        let historical_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: historical.reports[0].message_id.clone(),
+            sender: sender.clone(),
+            epoch,
+            payload: historical_payload,
+            retention: None,
+        };
+        let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: fresh.reports[0].message_id.clone(),
+            sender,
+            epoch,
+            payload: fresh_payload,
+            retention: None,
+        };
+        let effects = marmot_account::AccountDeviceEffects {
+            events: if fresh_first {
+                vec![fresh_event, historical_event]
+            } else {
+                vec![historical_event, fresh_event]
+            },
+            ..Default::default()
+        };
+
+        let summary = client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.messages.len(), 1, "fresh_first={fresh_first}");
+        assert_eq!(summary.messages[0].plaintext, "fresh");
+        assert!(app.group("alice", &group_id_hex).unwrap().is_some());
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .local_group_deletion_frontier(&group_id_hex)
+                .unwrap(),
+            None,
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash() {
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+    let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
+
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+    let fresh_payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Chat {
+                content: "first fresh chat".to_owned(),
+            },
+            &sender_hex,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: fresh_payload.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(fresh.failures.is_empty());
+    let message_id = fresh.reports[0].message_id.clone();
+    let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        group_id: group_id.clone(),
+        message_id: message_id.clone(),
+        sender,
+        epoch: client.runtime.group_record(&group_id).unwrap().epoch,
+        payload: fresh_payload,
+        retention: None,
+    };
+    let storage = app.account_storage("alice").unwrap();
+    storage.put_pending_application_event(&event).unwrap();
+
+    // Simulate termination after the engine transaction committed its durable
+    // delivery but before the app observed or projected it.
+    drop(client);
+    let mut reopened = app.client("alice").await.unwrap();
+    assert!(app.group("alice", &group_id_hex).unwrap().is_none());
+    let recovered = reopened.drain_pending_session_events().await.unwrap();
+
+    assert_eq!(recovered.messages.len(), 1);
+    assert_eq!(recovered.messages[0].plaintext, "first fresh chat");
+    assert!(app.group("alice", &group_id_hex).unwrap().is_some());
+    assert!(
+        app.messages("alice")
+            .unwrap()
+            .iter()
+            .any(|message| message.plaintext == "first fresh chat"),
+        "account-open replay must persist the first crossing chat",
+    );
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .local_group_deletion_frontier(&group_id_hex)
+            .unwrap(),
+        None,
+    );
+}
+
+#[tokio::test]
+async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_unavailable() {
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+    let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
+
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+    let fresh_payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Chat {
+                content: "first fresh chat".to_owned(),
+            },
+            &sender_hex,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: fresh_payload.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(fresh.failures.is_empty());
+    let message_id = fresh.reports[0].message_id.clone();
+    let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        group_id: group_id.clone(),
+        message_id,
+        sender,
+        epoch: client.runtime.group_record(&group_id).unwrap().epoch,
+        payload: fresh_payload,
+        retention: None,
+    };
+    let storage = app.account_storage("alice").unwrap();
+    storage.put_pending_application_event(&event).unwrap();
+
+    // Simulate termination after the engine transaction committed, then make
+    // account-open replay take the best-effort projection path without
+    // disturbing the live protocol group.
+    drop(client);
+    let mut reopened = app.client("alice").await.unwrap();
+    reopened.force_event_group_projection_unavailable = true;
+    assert!(app.group("alice", &group_id_hex).unwrap().is_none());
+    let recovered = reopened.drain_pending_session_events().await.unwrap();
+
+    assert_eq!(recovered.messages.len(), 1);
+    assert_eq!(recovered.messages[0].plaintext, "first fresh chat");
+    assert!(app.group("alice", &group_id_hex).unwrap().is_none());
+    assert_eq!(
+        storage.list_pending_application_events().unwrap(),
+        vec![event]
+    );
+    assert!(
+        storage
+            .local_group_deletion_frontier(&group_id_hex)
+            .unwrap()
+            .is_some(),
+        "a replay that cannot restore the group must retain its deletion frontier",
     );
 }
 

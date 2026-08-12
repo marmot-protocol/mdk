@@ -687,6 +687,7 @@ fn snapshot_group_events() {
         "event_message_received",
         GroupEvent::MessageReceived {
             group_id: gid(),
+            message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
             payload: b"hi".to_vec(),
