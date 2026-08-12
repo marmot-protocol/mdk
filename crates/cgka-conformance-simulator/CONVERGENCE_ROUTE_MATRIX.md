@@ -45,6 +45,13 @@ still produced both complete equivalence and a two-branch protocol/probe split.
 The corrected-input characterization accepts only reviewed terminal surfaces;
 it is counterexample evidence, not passing assurance evidence.
 
+Its losing-branch surface is stated as a rule rather than an enumeration of
+observed shapes, because which participants transiently hold the losing branch
+is a delivery-order detail. Every participant that applies the losing commit
+synthesizes that commit's kind-1210 rename row and owes it a withdrawal on
+leaving the branch — the losing committer unconditionally, an observer that
+adopted the branch before the selected one displaced it, and no one else.
+
 ## Retired routes
 
 A deleted route is removed from the table and from `DecisionRouteId` rather
