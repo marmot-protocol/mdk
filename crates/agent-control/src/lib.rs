@@ -115,7 +115,7 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         target_message_id_hex: String,
     },
-    /// Add an arbitrary non-blank reaction to a durable message.
+    /// Add bounded, control-free, non-blank reaction content to a durable message.
     SendReaction {
         account_id_hex: String,
         group_id_hex: String,

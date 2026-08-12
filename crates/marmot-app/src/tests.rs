@@ -5491,6 +5491,45 @@ fn reaction_intent_rejects_empty_emoji() {
 }
 
 #[test]
+fn reaction_intent_rejects_control_characters_and_oversized_content() {
+    for emoji in ["👀\nspoof", "👀\u{001b}[31m"] {
+        let result = build_inner_event(
+            &AppMessageIntent::Reaction {
+                target_message_id: "abc123".to_owned(),
+                emoji: emoji.to_owned(),
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
+    }
+
+    let result = build_inner_event(
+        &AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: "👍".repeat(65),
+        },
+        SENDER_HEX,
+        1,
+    );
+    assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
+}
+
+#[test]
+fn reaction_intent_accepts_bounded_multi_scalar_emoji() {
+    let event = build_inner_event(
+        &AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: "👨‍👩‍👧‍👦".to_owned(),
+        },
+        SENDER_HEX,
+        1,
+    )
+    .unwrap();
+    assert_eq!(event.content, "👨‍👩‍👧‍👦");
+}
+
+#[test]
 fn delete_intent_builds_empty_kind_five_with_e_tag() {
     let event = build(AppMessageIntent::Delete {
         target_message_id: "abc123".to_owned(),

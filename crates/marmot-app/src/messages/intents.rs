@@ -27,6 +27,11 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// synchronous Markdown work before send/classification (mdk#654).
 const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
+/// Reactions are display metadata that flow into timelines and notification
+/// previews. Keep them compact and free of terminal/control sequences while
+/// still allowing arbitrary multi-scalar emoji clusters.
+const MAX_REACTION_CONTENT_CHARS: usize = 64;
+
 /// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
 /// a bare hex/npub), covering NIP-21 `npub` + `nprofile` and a raw hex pubkey.
 /// Event/coordinate references (`note`/`nevent`/`naddr`) are not pubkey mentions.
@@ -255,6 +260,16 @@ pub(crate) fn build_inner_event(
             if emoji.trim().is_empty() {
                 return Err(AppError::InvalidAppMessagePayload(
                     "reaction add requires a non-empty emoji".into(),
+                ));
+            }
+            if emoji.chars().any(char::is_control) {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "reaction content must not contain control characters".into(),
+                ));
+            }
+            if emoji.chars().count() > MAX_REACTION_CONTENT_CHARS {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "reaction content exceeds the maximum length".into(),
                 ));
             }
             Ok(event(
