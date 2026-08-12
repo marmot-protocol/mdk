@@ -44,6 +44,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   without double-counting.
 - OpenCode harness idle-timeout regression test now keeps the mock child alive
   past the idle deadline so CI load cannot race normal exit with `BackendIdle`.
+- Nostr group-subscription sync now registers new routes and telemetry before
+  issuing relay REQs, so immediate stored-event replay cannot be dropped as
+  unroutable; failed subscriptions roll the staged state back for clean retry.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.

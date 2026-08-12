@@ -94,6 +94,49 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
     }
 }
 
+#[derive(Default)]
+struct BlockingSubscribeRelayClient {
+    block_subscribes: AtomicBool,
+    started: Notify,
+}
+
+#[async_trait]
+impl NostrRelayClient for BlockingSubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.block_subscribes.load(Ordering::SeqCst) {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
 /// Simulates a relay holding stored events: the moment it sees a group REQ it
 /// streams a matching stored event back through `handle_relay_event`, before
 /// `subscribe` returns — i.e. inside the activation's subscribe window. The
@@ -102,12 +145,17 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
 #[derive(Default)]
 struct StoredReplayRelayClient {
     adapter: Mutex<Option<NostrTransportAdapter>>,
+    additional_replay: Mutex<Option<NostrRelayEvent>>,
     replayed_deliveries: AtomicUsize,
 }
 
 impl StoredReplayRelayClient {
     fn attach(&self, adapter: &NostrTransportAdapter) {
         *self.adapter.lock().unwrap() = Some(adapter.clone());
+    }
+
+    fn replay_alongside_next_subscribe(&self, relay_event: NostrRelayEvent) {
+        *self.additional_replay.lock().unwrap() = Some(relay_event);
     }
 }
 
@@ -131,15 +179,23 @@ impl NostrRelayClient for StoredReplayRelayClient {
             .unwrap()
             .clone()
             .expect("adapter attached before subscribe");
-        let delivered = adapter
-            .handle_relay_event(NostrRelayEvent {
-                endpoint: endpoints[0].clone(),
-                subscription_id: Some(subscription.subscription_id()),
-                event: group_event("30", transport_group_id),
-            })
-            .await?;
+        let endpoint = endpoints[0].clone();
+        let subscription_id = subscription.subscription_id();
+        let relay_event = NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(subscription_id.clone()),
+            event: group_event("30", transport_group_id),
+        };
+        adapter.observe_relay_event(relay_event.clone()).await;
+        let mut delivered = adapter.handle_relay_event(relay_event).await?;
+        let additional_replay = self.additional_replay.lock().unwrap().take();
+        if let Some(relay_event) = additional_replay {
+            adapter.observe_relay_event(relay_event.clone()).await;
+            delivered += adapter.handle_relay_event(relay_event).await?;
+        }
         self.replayed_deliveries
             .fetch_add(delivered, Ordering::SeqCst);
+        adapter.handle_relay_eose(endpoint, subscription_id).await;
         Ok(())
     }
 
@@ -834,6 +890,532 @@ async fn stored_event_replayed_during_activation_subscribe_is_delivered() {
         delivery.message.envelope,
         TransportEnvelope::GroupMessage { transport_group_id }
     );
+}
+
+// Regression for mdk#910: group-sync REQs must not outrun routing and telemetry
+// registration. A relay can replay stored events synchronously from subscribe;
+// both the newly-added and still-live old routes must remain deliverable inside
+// that window, and the new route must contribute first-event timing.
+#[tokio::test]
+async fn stored_events_replayed_during_group_sync_subscribe_are_delivered() {
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let old_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: old_group_id.clone(),
+                transport_group_id: old_transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("initial group sync succeeds");
+    let initial_delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(initial_delivery.group_id_hint, Some(old_group_id.clone()));
+    relay.replayed_deliveries.store(0, Ordering::SeqCst);
+    relay.replay_alongside_next_subscribe(NostrRelayEvent {
+        endpoint: endpoint.clone(),
+        subscription_id: Some("still-live-old-group-sub".into()),
+        event: group_event("31", &old_transport_group_id),
+    });
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: new_group_id.clone(),
+                transport_group_id: new_transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_700_000_100)),
+        })
+        .await
+        .expect("replacement group sync succeeds");
+
+    assert_eq!(
+        relay.replayed_deliveries.load(Ordering::SeqCst),
+        2,
+        "new catch-up and still-live old-route events must both route during subscribe"
+    );
+    let new_delivery = adapter.receive().await.unwrap().unwrap();
+    let old_delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(new_delivery.account_id, account_id);
+    assert_eq!(new_delivery.group_id_hint, Some(new_group_id));
+    assert_eq!(new_delivery.source.plane, TransportDeliveryPlane::Group);
+    assert_eq!(new_delivery.source.endpoint, Some(endpoint.clone()));
+    assert_eq!(
+        new_delivery.message.envelope,
+        TransportEnvelope::GroupMessage {
+            transport_group_id: new_transport_group_id
+        }
+    );
+    assert_eq!(old_delivery.group_id_hint, Some(old_group_id));
+    assert_eq!(old_delivery.source.endpoint, Some(endpoint));
+    assert_eq!(
+        old_delivery.message.envelope,
+        TransportEnvelope::GroupMessage {
+            transport_group_id: old_transport_group_id
+        }
+    );
+    let sync = adapter.relay_sync().await;
+    assert_eq!(sync.tracked_subscriptions, 2);
+    assert_eq!(sync.first_event.sample_count(), 2);
+}
+
+#[tokio::test]
+async fn reissued_live_subscription_keeps_synchronous_callbacks() {
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_transport_group_id = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let old_group = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter.receive().await.unwrap().unwrap();
+    relay.replayed_deliveries.store(0, Ordering::SeqCst);
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: new_transport_group_id.clone(),
+                    endpoints: vec![endpoint.clone()],
+                },
+                old_group,
+            ],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("group sync succeeds");
+
+    let old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id,
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let new_subscription_id = NostrSubscription::Group {
+        account_id,
+        group_id,
+        transport_group_id: new_transport_group_id,
+        endpoints: vec![endpoint],
+        since: None,
+    }
+    .subscription_id();
+    assert_eq!(relay.replayed_deliveries.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        adapter.subscription_synced(&old_subscription_id).await,
+        Some(true),
+        "the reissued live id must retain EOSE observed before subscribe returned"
+    );
+    assert_eq!(
+        adapter.subscription_synced(&new_subscription_id).await,
+        Some(true)
+    );
+    let sync = adapter.relay_sync().await;
+    assert_eq!(sync.tracked_subscriptions, 3);
+    assert_eq!(sync.synced_subscriptions, 2);
+    assert_eq!(sync.first_event.sample_count(), 3);
+    assert_eq!(sync.eose.sample_count(), 3);
+}
+
+#[tokio::test]
+async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
+    let relay = Arc::new(FlakySubscribeRelayClient::default());
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let old_group = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+    let group_sync = TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![
+            TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: new_transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            old_group.clone(),
+        ],
+        since: None,
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    adapter
+        .handle_relay_eose(endpoint.clone(), old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter.subscription_synced(&old_subscription_id).await,
+        Some(true)
+    );
+    let relay_sync_before_failure = adapter.relay_sync().await;
+
+    relay.fail_subscribes.store(true, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(group_sync.clone())
+        .await
+        .expect_err("group sync fails when relay subscribe fails");
+
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_group_subscriptions, 1);
+    assert_eq!(metrics.subscriptions_created, 2);
+    assert_eq!(adapter.relay_sync().await, relay_sync_before_failure);
+    let old_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(old_subscription_id),
+            event: group_event("31", &old_transport_group_id),
+        })
+        .await
+        .expect("old relay event handled");
+    let failed_new_delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("failed-new-group-sub".into()),
+            event: group_event("32", &new_transport_group_id),
+        })
+        .await
+        .expect("new relay event handled");
+    assert_eq!(old_delivered, 1, "failed sync must restore the old route");
+    assert_eq!(
+        failed_new_delivered, 0,
+        "failed sync must not leave the staged route"
+    );
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.group_id_hint, Some(group_id.clone()));
+
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(group_sync)
+        .await
+        .expect("retry succeeds from the prior group set");
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_group_subscriptions, 2);
+    assert_eq!(metrics.subscriptions_created, 4);
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 3);
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some("retried-group-sub".into()),
+            event: group_event("33", &new_transport_group_id),
+        })
+        .await
+        .expect("relay event handled");
+    assert_eq!(delivered, 1);
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.account_id, account_id);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+}
+
+#[tokio::test]
+async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
+    let relay = Arc::new(BlockingSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let old_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let old_transport_group_id = vec![0xC3; 32];
+    let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
+    let new_transport_group_id = vec![0xE5; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let old_group = TransportGroupSubscription {
+        group_id: old_group_id.clone(),
+        transport_group_id: old_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![old_group.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let relay_sync_before = adapter.relay_sync().await;
+    let new_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: new_group_id.clone(),
+        transport_group_id: new_transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    relay.block_subscribes.store(true, Ordering::SeqCst);
+    let cancelled_sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let account_id = account_id.clone();
+        let endpoint = endpoint.clone();
+        let new_group_id = new_group_id.clone();
+        let new_transport_group_id = new_transport_group_id.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id,
+                    group_subscriptions: vec![TransportGroupSubscription {
+                        group_id: new_group_id,
+                        transport_group_id: new_transport_group_id,
+                        endpoints: vec![endpoint],
+                    }],
+                    since: None,
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(concurrent_subscribe_timeout(), relay.started.notified())
+        .await
+        .expect("relay subscribe started");
+    let staged_event = NostrRelayEvent {
+        endpoint: endpoint.clone(),
+        subscription_id: Some(new_subscription_id.clone()),
+        event: group_event("34", &new_transport_group_id),
+    };
+    adapter.observe_relay_event(staged_event.clone()).await;
+    assert_eq!(adapter.handle_relay_event(staged_event).await.unwrap(), 1);
+    adapter.receive().await.unwrap().unwrap();
+
+    cancelled_sync.abort();
+    assert!(cancelled_sync.await.unwrap_err().is_cancelled());
+    relay.block_subscribes.store(false, Ordering::SeqCst);
+    // This call waits for the detached cancellation guard to finish cleanup,
+    // then proves no stale stage assertion/state survives into the next sync.
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![old_group],
+            since: None,
+        })
+        .await
+        .expect("sync after cancellation succeeds");
+
+    assert_eq!(adapter.relay_sync().await, relay_sync_before);
+    assert_eq!(
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("old-group-sub".into()),
+                event: group_event("35", &old_transport_group_id),
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint,
+                subscription_id: Some(new_subscription_id),
+                event: group_event("36", &new_transport_group_id),
+            })
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
+    let relay = Arc::new(BlockingSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let synced_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let unsynced_group_id = cgka_traits::GroupId::new(vec![0xB3; 32]);
+    let synced_old = TransportGroupSubscription {
+        group_id: synced_group_id.clone(),
+        transport_group_id: vec![0xC2; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let unsynced_old = TransportGroupSubscription {
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let synced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: synced_group_id.clone(),
+        transport_group_id: synced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let unsynced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: unsynced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![synced_old.clone(), unsynced_old.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter
+        .handle_relay_eose(endpoint.clone(), synced_old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(false)
+    );
+
+    relay.block_subscribes.store(true, Ordering::SeqCst);
+    let cancelled_sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let account_id = account_id.clone();
+        let endpoint = endpoint.clone();
+        let synced_group_id = synced_group_id.clone();
+        let unsynced_group_id = unsynced_group_id.clone();
+        let synced_old = synced_old.clone();
+        let unsynced_old = unsynced_old.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id,
+                    group_subscriptions: vec![
+                        TransportGroupSubscription {
+                            group_id: synced_group_id,
+                            transport_group_id: vec![0xD2; 32],
+                            endpoints: vec![endpoint.clone()],
+                        },
+                        synced_old,
+                        TransportGroupSubscription {
+                            group_id: unsynced_group_id,
+                            transport_group_id: vec![0xD3; 32],
+                            endpoints: vec![endpoint],
+                        },
+                        unsynced_old,
+                    ],
+                    since: Some(Timestamp(1_700_000_100)),
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(concurrent_subscribe_timeout(), relay.started.notified())
+        .await
+        .expect("reissued relay subscribe started");
+
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true),
+        "staging a replacement REQ must not regress an already-open live gate"
+    );
+    adapter
+        .handle_relay_eose(endpoint, unsynced_old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(false),
+        "an overlapping callback remains provisional until the batch outcome is known"
+    );
+
+    cancelled_sync.abort();
+    assert!(cancelled_sync.await.unwrap_err().is_cancelled());
+    relay.block_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![synced_old, unsynced_old],
+            since: None,
+        })
+        .await
+        .expect("follow-up sync waits for cancellation rollback");
+
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(true),
+        "EOSE observed during the failed reissue must open the retained live gate"
+    );
+    assert_eq!(adapter.relay_sync().await.eose.sample_count(), 2);
 }
 
 #[tokio::test]
