@@ -5,7 +5,9 @@ use cgka_traits::app_components::{
     GROUP_PROFILE_COMPONENT_ID,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditHumanActionContext, RelayRegistration,
+    AuditEventContext, AuditEventKind, AuditHumanActionContext, EpochBackfillActivationOutcome,
+    EpochBackfillDeferredReason, EpochBackfillExecutionSeam, EpochBackfillReplayScope,
+    EpochStallBackfillTrigger, RelayRegistration,
 };
 
 use crate::messages::AppMessageIntent;
@@ -14,6 +16,17 @@ use crate::{AppError, AppGroupRecord};
 use super::ObservedHumanActionAudit;
 
 use super::AppClient;
+
+pub(crate) struct EpochBackfillTerminalAudit {
+    pub retry_ordinal: u64,
+    pub duration_ms: u64,
+    pub activation_outcome: EpochBackfillActivationOutcome,
+    pub error_kind: Option<String>,
+    pub deliveries: u64,
+    pub local_epoch_before: u64,
+    pub local_epoch_after: u64,
+    pub group_advanced: bool,
+}
 
 impl AppClient {
     pub(crate) fn local_human_action_context(
@@ -190,16 +203,92 @@ impl AppClient {
     }
 
     /// Record an `epoch_stall_backfill_armed` forensic audit row at the arm
-    /// decision: the epoch the group was stalled at (`stalled_epoch`) and the
-    /// distinct-undecryptable threshold that armed the backfill (`threshold`).
-    /// Group-scoped, so `group_ref` carries the stalled group id.
-    pub(crate) fn record_epoch_stall_backfill_armed(&self, group_id: &GroupId, stalled_epoch: u64) {
+    /// decision: the epoch the group was stalled at (`stalled_epoch`), the
+    /// distinct-undecryptable threshold that armed the backfill (`threshold`),
+    /// and the typed trigger that crossed the policy. Group-scoped, so
+    /// `group_ref` carries the stalled group id. `context.operation_id`
+    /// correlates the arm with the execution lifecycle rows.
+    pub(crate) fn record_epoch_stall_backfill_armed(
+        &self,
+        group_id: &GroupId,
+        stalled_epoch: u64,
+        trigger: EpochStallBackfillTrigger,
+        context: &AuditEventContext,
+    ) {
         self.runtime.session().record_audit_event(
             Some(group_id),
-            None,
+            Some(context.clone()),
             AuditEventKind::EpochStallBackfillArmed {
                 stalled_epoch,
                 threshold: self.epoch_stall.threshold() as u64,
+                trigger: Some(trigger),
+            },
+        );
+    }
+
+    pub(crate) fn record_epoch_stall_backfill_started(
+        &self,
+        seam: EpochBackfillExecutionSeam,
+        retry_ordinal: u64,
+        context: &AuditEventContext,
+    ) {
+        self.runtime.session().record_audit_event(
+            None,
+            Some(context.clone()),
+            AuditEventKind::EpochStallBackfillStarted {
+                seam,
+                replay_scope: EpochBackfillReplayScope::AccountFullHistory,
+                retry_ordinal,
+            },
+        );
+    }
+
+    pub(crate) fn record_epoch_stall_backfill_terminal(
+        &self,
+        group_id: &GroupId,
+        succeeded: bool,
+        terminal: EpochBackfillTerminalAudit,
+        context: &AuditEventContext,
+    ) {
+        let kind = if succeeded {
+            AuditEventKind::EpochStallBackfillCompleted {
+                retry_ordinal: terminal.retry_ordinal,
+                duration_ms: terminal.duration_ms,
+                activation_outcome: terminal.activation_outcome,
+                deliveries: terminal.deliveries,
+                local_epoch_before: terminal.local_epoch_before,
+                local_epoch_after: terminal.local_epoch_after,
+                group_advanced: terminal.group_advanced,
+            }
+        } else {
+            AuditEventKind::EpochStallBackfillFailed {
+                retry_ordinal: terminal.retry_ordinal,
+                duration_ms: terminal.duration_ms,
+                activation_outcome: terminal.activation_outcome,
+                error_kind: terminal.error_kind,
+                deliveries: terminal.deliveries,
+                local_epoch_before: terminal.local_epoch_before,
+                local_epoch_after: terminal.local_epoch_after,
+                group_advanced: terminal.group_advanced,
+            }
+        };
+        self.runtime
+            .session()
+            .record_audit_event(Some(group_id), Some(context.clone()), kind);
+    }
+
+    pub(crate) fn record_epoch_stall_backfill_deferred(
+        &self,
+        reason: EpochBackfillDeferredReason,
+        retry_ordinal: u64,
+        context: &AuditEventContext,
+    ) {
+        self.runtime.session().record_audit_event(
+            None,
+            Some(context.clone()),
+            AuditEventKind::EpochStallBackfillDeferred {
+                reason,
+                retry_ordinal,
             },
         );
     }

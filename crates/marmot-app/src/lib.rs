@@ -135,7 +135,7 @@ pub use audit_log::{
     AuditLogUploadResult,
 };
 pub use client::AppClient;
-pub(crate) use client::ConvergenceScheduleState;
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
     MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
@@ -1428,7 +1428,8 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
-            epoch_backfill_pending: false,
+            pending_epoch_backfill: None,
+            queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
         };
         if !defer_group_hydration {
