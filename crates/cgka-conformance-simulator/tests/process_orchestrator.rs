@@ -1030,6 +1030,11 @@ async fn four_party_cross_route_recovery_reaches_app_runtime_equivalence() {
         .map(|client| format!("probe-from-{client}"))
         .collect::<BTreeSet<_>>();
     expected_payloads.insert("zeta-branch-witness".into());
+    // Only the author of the losing profile branch persists its invalidated
+    // kind-1210 system row. Pin that participant-local disposition shape
+    // rather than requiring the opaque, local message ids to match.
+    let expected_invalidated_counts =
+        BTreeMap::from([("alpha", 1), ("observer", 0), ("yankee", 0), ("zeta", 0)]);
     for client in &clients {
         let retained = retained_observations[client];
         let app = &app_observations[client];
@@ -1044,14 +1049,16 @@ async fn four_party_cross_route_recovery_reaches_app_runtime_equivalence() {
             2,
             "{client} retained route depth"
         );
-        let exact_roster =
-            app.protocol.member_identities == ["alpha", "observer", "yankee", "zeta"];
         assert_eq!(app.protocol.epoch, retained.epoch, "{client} epoch");
         assert_eq!(
             app.protocol.member_count, retained.member_count,
             "{client} roster size"
         );
-        assert!(exact_roster, "{client} exact roster");
+        assert_eq!(
+            app.protocol.member_identities,
+            ["alpha", "observer", "yankee", "zeta"],
+            "{client} exact roster"
+        );
         assert_eq!(
             app.protocol.group_name, retained.group_name,
             "{client} group name"
@@ -1072,9 +1079,11 @@ async fn four_party_cross_route_recovery_reaches_app_runtime_equivalence() {
             "{client} application payloads"
         );
         assert_eq!(app.application.visible_plaintexts.len(), app_payloads.len());
-        // The superseded profile commit correctly leaves invalidated kind-1210
-        // system rows. The exact visible chat set above proves that no witness
-        // or active probe was withdrawn or left without a disposition.
+        assert_eq!(
+            app.application.invalidated_message_ids.len(),
+            expected_invalidated_counts[client.as_str()],
+            "{client} invalidated dispositions"
+        );
         assert!(!app.application.pending_confirmation);
     }
 }

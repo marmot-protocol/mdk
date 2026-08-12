@@ -24,7 +24,7 @@ use nostr_relay_builder::prelude::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     ClientEventCounts, ClientObservation, ConvergenceSubject, ForkRecoveryObservation,
@@ -105,7 +105,7 @@ struct Participant {
 struct RecordingRelayDatabase {
     inner: MemoryDatabase,
     publication_log: Arc<Mutex<Vec<Event>>>,
-    hidden_event_ids: Arc<RwLock<BTreeSet<EventId>>>,
+    hidden_event_ids: Arc<Mutex<BTreeSet<EventId>>>,
 }
 
 impl NostrDatabase for RecordingRelayDatabase {
@@ -131,7 +131,7 @@ impl NostrDatabase for RecordingRelayDatabase {
         event_id: &'a EventId,
     ) -> BoxedFuture<'a, Result<DatabaseEventStatus, DatabaseError>> {
         Box::pin(async move {
-            if self.hidden_event_ids.read().await.contains(event_id) {
+            if self.hidden_event_ids.lock().await.contains(event_id) {
                 return Ok(DatabaseEventStatus::NotExistent);
             }
             self.inner.check_id(event_id).await
@@ -143,7 +143,7 @@ impl NostrDatabase for RecordingRelayDatabase {
         event_id: &'a EventId,
     ) -> BoxedFuture<'a, Result<Option<Event>, DatabaseError>> {
         Box::pin(async move {
-            if self.hidden_event_ids.read().await.contains(event_id) {
+            if self.hidden_event_ids.lock().await.contains(event_id) {
                 return Ok(None);
             }
             self.inner.event_by_id(event_id).await
@@ -151,18 +151,7 @@ impl NostrDatabase for RecordingRelayDatabase {
     }
 
     fn count(&self, filter: Filter) -> BoxedFuture<'_, Result<usize, DatabaseError>> {
-        Box::pin(async move {
-            let limit = filter.limit.unwrap_or(usize::MAX);
-            let mut database_filter = filter;
-            database_filter.limit = None;
-            let events = self.inner.query(database_filter).await?;
-            let hidden_event_ids = self.hidden_event_ids.read().await;
-            Ok(events
-                .iter()
-                .filter(|event| !hidden_event_ids.contains(&event.id))
-                .take(limit)
-                .count())
-        })
+        Box::pin(async move { Ok(self.query(filter).await?.len()) })
     }
 
     fn query(&self, filter: Filter) -> BoxedFuture<'_, Result<Events, DatabaseError>> {
@@ -173,7 +162,7 @@ impl NostrDatabase for RecordingRelayDatabase {
             let mut database_filter = filter.clone();
             database_filter.limit = None;
             let events = self.inner.query(database_filter).await?;
-            let hidden_event_ids = self.hidden_event_ids.read().await;
+            let hidden_event_ids = self.hidden_event_ids.lock().await;
             let mut visible = Events::new(&filter);
             visible.extend(
                 events
@@ -225,7 +214,7 @@ pub struct AppRuntimeHarness {
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
     relay_publication_log: Arc<Mutex<Vec<Event>>>,
     relay_action_events: BTreeMap<String, Vec<SequencedRelayEvent>>,
-    hidden_relay_event_ids: Arc<RwLock<BTreeSet<EventId>>>,
+    hidden_relay_event_ids: Arc<Mutex<BTreeSet<EventId>>>,
 }
 
 impl AppRuntimeHarness {
@@ -237,7 +226,7 @@ impl AppRuntimeHarness {
             max_events: Some(75_000),
         });
         let relay_publication_log = Arc::new(Mutex::new(Vec::new()));
-        let hidden_relay_event_ids = Arc::new(RwLock::new(BTreeSet::new()));
+        let hidden_relay_event_ids = Arc::new(Mutex::new(BTreeSet::new()));
         let relay = LocalRelay::new(RelayBuilder::default().database(RecordingRelayDatabase {
             inner: relay_database.clone(),
             publication_log: Arc::clone(&relay_publication_log),
@@ -383,7 +372,7 @@ impl AppRuntimeHarness {
                 )
             })?;
         if visible {
-            let removed = self.hidden_relay_event_ids.write().await.remove(&event.id);
+            let removed = self.hidden_relay_event_ids.lock().await.remove(&event.id);
             if !removed {
                 return Err(SubjectError::classified(
                     SubjectFailureCategory::ExpectedRefusal,
@@ -393,7 +382,7 @@ impl AppRuntimeHarness {
             }
             return Ok(());
         }
-        if self.hidden_relay_event_ids.read().await.contains(&event.id) {
+        if self.hidden_relay_event_ids.lock().await.contains(&event.id) {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "relay_event_already_removed",
@@ -421,7 +410,7 @@ impl AppRuntimeHarness {
                 "an event can be hidden from the shared relay only while every harness participant is offline",
             ));
         }
-        self.hidden_relay_event_ids.write().await.insert(event.id);
+        self.hidden_relay_event_ids.lock().await.insert(event.id);
         Ok(())
     }
 
@@ -1498,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn recording_database_preserves_successful_relay_admission_order() {
         let publication_log = Arc::new(Mutex::new(Vec::new()));
-        let hidden_event_ids = Arc::new(RwLock::new(BTreeSet::new()));
+        let hidden_event_ids = Arc::new(Mutex::new(BTreeSet::new()));
         let database = RecordingRelayDatabase {
             inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
                 events: true,
@@ -1527,7 +1516,7 @@ mod tests {
         assert_eq!(recorded[1].id, second.id);
         drop(recorded);
 
-        hidden_event_ids.write().await.insert(first.id);
+        hidden_event_ids.lock().await.insert(first.id);
         assert_eq!(
             database.check_id(&first.id).await.unwrap(),
             DatabaseEventStatus::NotExistent
@@ -1546,7 +1535,7 @@ mod tests {
             "the query limit must be applied after hidden events are filtered"
         );
 
-        assert!(hidden_event_ids.write().await.remove(&first.id));
+        assert!(hidden_event_ids.lock().await.remove(&first.id));
         assert_eq!(
             database
                 .query(one_group_event)
