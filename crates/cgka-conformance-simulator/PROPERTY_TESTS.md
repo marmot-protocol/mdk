@@ -152,7 +152,7 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
 
 - Runs: the four-participant cross-route topology through both the strict retained-engine subject and the full
   `MarmotAppRuntime` adapter. The app harness's real in-memory Nostr relay associates retained events with stable
-  Scenario IR action ids. After verifying every named recipient is offline, it removes a selected event from the
+  Scenario IR action ids. After verifying every harness participant is offline, it removes a selected event from the
   single shared relay database, making that event unavailable to every participant that has not already fetched it,
   and reinserts it before full-history repair. This is deliberately relay-wide rather than the strict retained-relay
   subject's per-recipient visibility model, and avoids treating process timing or a live relay race as controlled

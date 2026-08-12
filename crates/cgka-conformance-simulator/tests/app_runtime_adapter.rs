@@ -317,6 +317,58 @@ async fn retained_relay_control_resolves_immediate_app_publication_action_ids() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_wide_removal_refuses_an_omitted_online_participant() {
+    let clients = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+    let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+    subject.select_scenario_group("main", true).unwrap();
+    subject
+        .create_group(cgka_conformance_simulator::SubjectCreateGroup {
+            action_id: "create",
+            creator: "alice",
+            name: "relay-wide removal",
+            invitees: &["bob".into()],
+            required_features: &[],
+            initial_admins: &["alice".into()],
+            pending: "create",
+        })
+        .await
+        .unwrap();
+    subject.tick(&["alice".into(), "bob".into()]).await.unwrap();
+    subject
+        .send_application(cgka_conformance_simulator::SubjectSendApplication {
+            action_id: "send",
+            sender: "alice",
+            payload: "relay-wide event",
+        })
+        .await
+        .unwrap();
+    subject.set_online("alice", false).await.unwrap();
+    subject.set_online("bob", false).await.unwrap();
+
+    let selector = ScenarioMessageSelectorV2 {
+        action_id: Some("send".into()),
+        ..ScenarioMessageSelectorV2::default()
+    };
+    let named_subset = vec!["alice".into(), "bob".into()];
+    let error = subject
+        .set_relay_event_visibility("relay:shared", &selector, &named_subset, false)
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        "relay_removal_requires_all_participants_offline"
+    );
+
+    subject.set_online("carol", false).await.unwrap();
+    subject
+        .set_relay_event_visibility("relay:shared", &selector, &named_subset, false)
+        .unwrap();
+    subject
+        .set_relay_event_visibility("relay:shared", &selector, &named_subset, true)
+        .unwrap();
+    subject.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
     let clients = vec!["alice".to_owned(), "bob".to_owned()];
     let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();

@@ -436,6 +436,12 @@ fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
                 payload: "zeta-branch-witness".into(),
             },
         ),
+        ScenarioStep::SetClientOffline {
+            client: "zeta".into(),
+        },
+        ScenarioStep::SetClientOffline {
+            client: "yankee".into(),
+        },
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
@@ -444,9 +450,6 @@ fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
             },
             clients: vec!["alpha".into(), "observer".into()],
             visible: false,
-        },
-        ScenarioStep::SetClientOffline {
-            client: "yankee".into(),
         },
         ScenarioStep::ReconnectClient {
             client: "alpha".into(),
@@ -465,6 +468,9 @@ fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
             selection: Default::default(),
             outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
         },
+        ScenarioStep::ReconnectClient {
+            client: "zeta".into(),
+        },
         ScenarioStep::SyncRelayHistory {
             clients: vec!["zeta".into()],
             sync: ScenarioRelaySyncModeV2::Incremental,
@@ -472,10 +478,16 @@ fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
         ScenarioStep::Tick {
             clients: vec!["zeta".into()],
         },
+        ScenarioStep::SetClientOffline {
+            client: "alpha".into(),
+        },
+        ScenarioStep::SetClientOffline {
+            client: "zeta".into(),
+        },
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
-                action_id: Some("step-24:update_group_data@main".into()),
+                action_id: Some("step-25:update_group_data@main".into()),
                 ..Default::default()
             },
             clients: vec!["yankee".into(), "observer".into()],
@@ -487,9 +499,6 @@ fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
                 clients: clients.clone(),
             },
         ),
-        ScenarioStep::SetClientOffline {
-            client: "zeta".into(),
-        },
         ScenarioStep::ReconnectClient {
             client: "yankee".into(),
         },
@@ -525,11 +534,14 @@ fn cross_route_app_runtime_scenario(strict_engine_tail: bool) -> ScenarioSpec {
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
-                action_id: Some("step-24:update_group_data@main".into()),
+                action_id: Some("step-25:update_group_data@main".into()),
                 ..Default::default()
             },
             clients: vec!["yankee".into(), "observer".into()],
             visible: true,
+        },
+        ScenarioStep::ReconnectClient {
+            client: "alpha".into(),
         },
         ScenarioStep::ReconnectClient {
             client: "observer".into(),
@@ -968,11 +980,11 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
                 ScenarioInputDisposition::Accepted,
             ),
             (
-                "step-24:update_group_data@main",
+                "step-25:update_group_data@main",
                 ScenarioInputDisposition::Invalidated,
             ),
             (
-                "step-32:update_group_data@main",
+                "step-35:update_group_data@main",
                 ScenarioInputDisposition::Accepted,
             ),
         ] {
@@ -1036,7 +1048,10 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
             2,
             "{client} retained route depth"
         );
+        let exact_roster =
+            app.protocol.member_identities == ["alpha", "observer", "yankee", "zeta"];
         let non_epoch_equivalent = app.protocol.member_count == retained.member_count
+            && exact_roster
             && app.protocol.group_name == retained.group_name
             && app.protocol.group_description == retained.group_description;
         let client_protocol_equivalent =
@@ -1045,6 +1060,7 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
         protocol_equivalent_by_client.insert(client.clone(), client_protocol_equivalent);
         protocol_non_epoch_equivalent_by_client.insert(client.clone(), non_epoch_equivalent);
         assert_eq!(app.protocol.member_count, 4, "{client} roster size");
+        assert!(exact_roster, "{client} exact roster");
         assert_eq!(app.protocol.admin_identities, ["alpha", "yankee", "zeta"]);
         let app_payloads = app
             .application

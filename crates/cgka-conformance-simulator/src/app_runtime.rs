@@ -367,15 +367,25 @@ impl AppRuntimeHarness {
                 "the selected event is already removed from the shared relay",
             ));
         }
-        if clients.iter().any(|client| {
-            self.participants
-                .get(client)
-                .is_none_or(|participant| participant.online)
-        }) {
+        if clients
+            .iter()
+            .any(|client| !self.participants.contains_key(client))
+        {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
-                "relay_removal_requires_offline_clients",
-                "an event can be removed from the shared relay only while every named client is offline",
+                "unknown_relay_removal_client",
+                "every named relay-removal client must belong to the harness",
+            ));
+        }
+        if self
+            .participants
+            .values()
+            .any(|participant| participant.online)
+        {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_removal_requires_all_participants_offline",
+                "an event can be removed from the shared relay only while every harness participant is offline",
             ));
         }
         self.relay_database
