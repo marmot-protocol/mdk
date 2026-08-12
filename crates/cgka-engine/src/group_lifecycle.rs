@@ -566,11 +566,6 @@ impl<S: StorageProvider> Engine<S> {
         // Every other member lands in the group via `welcomes`, which carry
         // the post-commit state directly. Dropping the commit avoids a
         // welcome-before-commit `AlreadyAtEpoch` bounce.
-        //
-        // The context snapshot is built off the still-staged group; for
-        // welcomes, only the recipient pubkey matters at wrap time, so the
-        // pre-merge group context is sufficient.
-        let ctx = build_group_context_snapshot(&mls_group, &provider)?;
         let welcome_relays = welcome_relays_for_group(&mls_group)?;
 
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
@@ -797,8 +792,6 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(guard) = pending_commit_guard {
             guard.disarm();
         }
-
-        let _ = ctx;
 
         Ok((
             group_id,
