@@ -807,7 +807,24 @@ fn virtual_order_columns_match_the_rust_canonical_key() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(failed_class, 0);
+    assert_eq!(failed_class, 2);
+    drop(conn);
+
+    let head = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            pagination: TimelinePagination {
+                limit: Some(2),
+                ..TimelinePagination::default()
+            },
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(head.messages.last().unwrap().message_id_hex, "pending");
+    assert_eq!(
+        head.messages.last().unwrap().invalidation_status.as_deref(),
+        Some("local_publish_failed")
+    );
 }
 
 #[test]

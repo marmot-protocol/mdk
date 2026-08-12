@@ -1009,26 +1009,44 @@ fn read_marker_follows_pending_send_into_authenticated_history() {
 #[test]
 fn failed_pending_read_marker_does_not_hide_authenticated_history() {
     let store = setup_store();
+    for epoch in 1..=8 {
+        let mut accepted = chat(
+            &format!("accepted-{epoch}"),
+            REMOTE,
+            epoch * 10,
+            "accepted history",
+        );
+        accepted.source_epoch = Some(epoch);
+        store.record_app_event(&accepted).unwrap();
+    }
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
     let mut pending = chat("pending", LOCAL, 500, "optimistic send");
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
     store.record_app_event(&pending).unwrap();
     store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-
-    store
         .invalidate_app_event_by_message_id(GROUP, "pending", "local_publish_failed")
         .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("accepted-8"));
+
     let mut incoming = chat("incoming", REMOTE, 100, "authenticated message");
-    incoming.source_epoch = Some(8);
+    incoming.source_epoch = Some(9);
     store.record_app_event(&incoming).unwrap();
 
     let row = store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
-    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("pending"));
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("accepted-8"));
     assert_eq!(row.unread_count, 1);
     assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("incoming"));
 }

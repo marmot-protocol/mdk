@@ -249,6 +249,8 @@ struct ConversationReadState {
     last_read_timeline_at: Option<u64>,
     last_read_order_class: Option<u8>,
     last_read_order_primary: Option<u64>,
+    last_read_order_phase: Option<u8>,
+    last_read_order_at: Option<u64>,
     initialized_at: u64,
     manually_marked_unread: bool,
 }
@@ -258,8 +260,8 @@ impl ConversationReadState {
         Some((
             self.last_read_order_class?,
             self.last_read_order_primary?,
-            1,
-            self.last_read_timeline_at?,
+            self.last_read_order_phase?,
+            self.last_read_order_at?,
             self.last_read_message_id_hex.as_deref()?,
         ))
     }
@@ -566,19 +568,22 @@ impl SqliteAccountStorage {
                 };
 
                 if should_advance {
-                    let (order_class, order_primary, _phase, _at, _id) = target_order;
+                    let (order_class, order_primary, order_phase, order_at, _id) = target_order;
                     conn.execute(
                         "INSERT INTO conversation_read_state (
                             group_id_hex, last_read_message_id_hex, last_read_timeline_at,
                             last_read_order_class, last_read_order_primary,
+                            last_read_order_phase, last_read_order_at,
                             initialized_at, updated_at, manually_marked_unread
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0)
                          ON CONFLICT(group_id_hex) DO UPDATE SET
                             last_read_message_id_hex = excluded.last_read_message_id_hex,
                             last_read_timeline_at = excluded.last_read_timeline_at,
                             last_read_order_class = excluded.last_read_order_class,
                             last_read_order_primary = excluded.last_read_order_primary,
+                            last_read_order_phase = excluded.last_read_order_phase,
+                            last_read_order_at = excluded.last_read_order_at,
                             updated_at = excluded.updated_at,
                             manually_marked_unread = 0",
                         params![
@@ -587,6 +592,8 @@ impl SqliteAccountStorage {
                             u64_to_i64(target.timeline_at)?,
                             i64::from(order_class),
                             u64_to_i64(order_primary)?,
+                            i64::from(order_phase),
+                            u64_to_i64(order_at)?,
                             u64_to_i64(unix_now_seconds())?
                         ],
                     )
@@ -1450,7 +1457,12 @@ fn latest_kind9_message_tx(
                invalidation_status IS NULL
                OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
            )
-         ORDER BY timeline_order_class DESC,
+         ORDER BY CASE
+                      WHEN direction = 'sent'
+                       AND invalidation_status = 'local_publish_failed' THEN 0
+                      ELSE 1
+                  END DESC,
+                  timeline_order_class DESC,
                   timeline_order_primary DESC,
                   timeline_order_phase DESC,
                   timeline_order_at DESC,
@@ -1528,7 +1540,8 @@ fn insert_initial_read_state_tx(
     manually_marked_unread: bool,
 ) -> StorageResult<()> {
     let latest = latest_kind9_message_tx(tx, group_id_hex)?;
-    let (message_id, timeline_at, order_class, order_primary) = match latest {
+    let (message_id, timeline_at, order_class, order_primary, order_phase, order_at) = match latest
+    {
         Some(message) => {
             let marker =
                 timeline_message_for_read_marker_tx(tx, group_id_hex, &message.message_id_hex)?
@@ -1537,15 +1550,17 @@ fn insert_initial_read_state_tx(
                             "latest chat message disappeared while creating read state".to_owned(),
                         )
                     })?;
-            let (class, primary, _phase, _at, _id) = marker.canonical_order_key();
+            let (class, primary, phase, at, _id) = marker.canonical_order_key();
             (
                 Some(message.message_id_hex),
                 Some(message.timeline_at),
                 Some(class),
                 Some(primary),
+                Some(phase),
+                Some(at),
             )
         }
-        None => (None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
     // Match first-open semantics: with no retained kind-9 history there is no
     // read anchor yet, so a subsequently recorded message counts even when its
@@ -1555,15 +1570,18 @@ fn insert_initial_read_state_tx(
         "INSERT INTO conversation_read_state (
             group_id_hex, last_read_message_id_hex, last_read_timeline_at,
             last_read_order_class, last_read_order_primary,
+            last_read_order_phase, last_read_order_at,
             initialized_at, updated_at, manually_marked_unread
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             group_id_hex,
             message_id,
             optional_u64_to_i64(timeline_at)?,
             order_class.map(i64::from),
             optional_u64_to_i64(order_primary)?,
+            order_phase.map(i64::from),
+            optional_u64_to_i64(order_at)?,
             u64_to_i64(initialized_at)?,
             u64_to_i64(unix_now_seconds())?,
             bool_i64(manually_marked_unread),
@@ -1580,6 +1598,7 @@ fn read_state_tx(
     tx.query_row(
         "SELECT last_read_message_id_hex, last_read_timeline_at,
                 last_read_order_class, last_read_order_primary,
+                last_read_order_phase, last_read_order_at,
                 initialized_at, manually_marked_unread
          FROM conversation_read_state
          WHERE group_id_hex = ?1",
@@ -1596,8 +1615,14 @@ fn read_state_tx(
                 last_read_order_primary: row
                     .get::<_, Option<i64>>(3)?
                     .and_then(|value| value.try_into().ok()),
-                initialized_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
-                manually_marked_unread: row.get::<_, i64>(5)? != 0,
+                last_read_order_phase: row
+                    .get::<_, Option<i64>>(4)?
+                    .and_then(|value| value.try_into().ok()),
+                last_read_order_at: row
+                    .get::<_, Option<i64>>(5)?
+                    .and_then(|value| value.try_into().ok()),
+                initialized_at: row.get::<_, i64>(6)?.try_into().unwrap_or_default(),
+                manually_marked_unread: row.get::<_, i64>(7)? != 0,
             })
         },
     )

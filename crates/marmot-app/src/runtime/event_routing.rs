@@ -56,14 +56,12 @@ pub(crate) fn projection_update_matches_query(
 }
 
 pub(crate) fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
-    // Canonical source epochs are comparable only within one group. A global
-    // subscription keeps the store's wall-clock ordering by refreshing instead
-    // of locally merging per-group deltas.
-    query.group_id_hex.is_some()
-        && query
-            .search
-            .as_ref()
-            .is_none_or(|search| search.trim().is_empty())
+    // Projection application already derives canonical-vs-wall ordering from
+    // this field, so global windows can safely merge per-group deltas.
+    query
+        .search
+        .as_ref()
+        .is_none_or(|search| search.trim().is_empty())
         && query.pagination.before.is_none()
         && query.pagination.before_message_id.is_none()
         && query.pagination.after.is_none()

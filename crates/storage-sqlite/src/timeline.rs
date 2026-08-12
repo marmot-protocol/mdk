@@ -1677,7 +1677,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
     // changes when the send is reconciled to authenticated MLS history. Keep
     // the durable anchor synchronized with that row while it exists; if
     // retention later removes the row, the last synchronized key remains.
-    let (order_class, order_primary, _phase, _at, _id) = canonical_timeline_order_key(
+    let (order_class, order_primary, order_phase, order_at, _id) = canonical_timeline_order_key(
         row.source_message_id_hex.as_deref(),
         row.source_epoch,
         row.invalidation_status.as_deref(),
@@ -1690,7 +1690,9 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
          SET last_read_timeline_at = ?3,
              last_read_order_class = ?4,
              last_read_order_primary = ?5,
-             updated_at = ?6
+             last_read_order_phase = ?6,
+             last_read_order_at = ?7,
+             updated_at = ?8
          WHERE group_id_hex = ?1 AND last_read_message_id_hex = ?2",
         params![
             &row.group_id_hex,
@@ -1698,6 +1700,8 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             u64_to_i64(row.timeline_at)?,
             i64::from(order_class),
             u64_to_i64(order_primary)?,
+            i64::from(order_phase),
+            u64_to_i64(order_at)?,
             u64_to_i64(unix_now_seconds())?
         ],
     )
@@ -2674,16 +2678,17 @@ fn escape_like_literal(value: &str) -> String {
 pub(crate) fn canonical_timeline_order_key<'a>(
     source_message_id_hex: Option<&str>,
     source_epoch: Option<u64>,
-    invalidation_status: Option<&str>,
+    _invalidation_status: Option<&str>,
     kind: u64,
     timeline_at: u64,
     message_id_hex: &'a str,
 ) -> (u8, u64, u8, u64, &'a str) {
+    // All unresolved local projections, including failed sends, stay at the
+    // optimistic head. Chat-list preview selection independently deprioritizes
+    // permanent failures once accepted history exists.
     let (class, primary) = match source_epoch {
         Some(epoch) => (1, epoch),
-        None if source_message_id_hex.is_none() && invalidation_status.is_none() => {
-            (2, timeline_at)
-        }
+        None if source_message_id_hex.is_none() => (2, timeline_at),
         None => (0, timeline_at),
     };
     let phase = if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM

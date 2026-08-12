@@ -952,11 +952,17 @@ async fn pagination_refreshes_head_when_canonical_cursor_was_pruned() {
         )),
         Ok(timeline_test_page(&[("x", 40), ("y", 50)], true, false)),
     ]);
-    let handle = timeline_window_handle(
+    let mut handle = timeline_window_handle(
         &store,
         timeline_test_page(&[("a", 10), ("b", 20)], true, true),
         300,
     );
+    Arc::get_mut(&mut handle.inner)
+        .expect("exclusive window")
+        .get_mut()
+        .expect("window lock")
+        .base_query
+        .group_id_hex = Some("group-a".to_owned());
 
     let page = handle
         .paginate_backwards(2)
@@ -966,11 +972,13 @@ async fn pagination_refreshes_head_when_canonical_cursor_was_pruned() {
     assert_eq!(timeline_ids(&page), vec!["x", "y"]);
     let queries = store.recorded_queries();
     assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].group_id_hex.as_deref(), Some("group-a"));
     assert_eq!(queries[0].pagination.before, Some(10));
     assert_eq!(
         queries[0].pagination.before_message_id.as_deref(),
         Some("a")
     );
+    assert_eq!(queries[1].group_id_hex.as_deref(), Some("group-a"));
     assert_eq!(queries[1].pagination.before, None);
     assert_eq!(queries[1].pagination.after, None);
     assert_eq!(queries[1].pagination.limit, Some(2));

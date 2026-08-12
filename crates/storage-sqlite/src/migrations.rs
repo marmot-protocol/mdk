@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                ("failed".to_owned(), 0, 1_000, 1, 1_000),
+                ("failed".to_owned(), 2, 1_000, 1, 1_000),
                 ("marker".to_owned(), 1, 8, 1, 150),
                 ("pending".to_owned(), 2, 999, 1, 999),
             ]

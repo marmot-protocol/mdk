@@ -12,8 +12,7 @@ ALTER TABLE message_timeline
 ADD COLUMN timeline_order_class INTEGER GENERATED ALWAYS AS (
     CASE
         WHEN source_epoch IS NOT NULL THEN 1
-        WHEN source_message_id_hex IS NULL
-         AND invalidation_status IS NULL THEN 2
+        WHEN source_message_id_hex IS NULL THEN 2
         ELSE 0
     END
 ) VIRTUAL;
@@ -62,6 +61,12 @@ ADD COLUMN last_read_order_class INTEGER;
 ALTER TABLE conversation_read_state
 ADD COLUMN last_read_order_primary INTEGER;
 
+ALTER TABLE conversation_read_state
+ADD COLUMN last_read_order_phase INTEGER;
+
+ALTER TABLE conversation_read_state
+ADD COLUMN last_read_order_at INTEGER;
+
 UPDATE conversation_read_state
 SET last_read_order_class = (
         SELECT timeline.timeline_order_class
@@ -71,6 +76,18 @@ SET last_read_order_class = (
     ),
     last_read_order_primary = (
         SELECT timeline.timeline_order_primary
+        FROM message_timeline AS timeline
+        WHERE timeline.group_id_hex = conversation_read_state.group_id_hex
+          AND timeline.message_id_hex = conversation_read_state.last_read_message_id_hex
+    ),
+    last_read_order_phase = (
+        SELECT timeline.timeline_order_phase
+        FROM message_timeline AS timeline
+        WHERE timeline.group_id_hex = conversation_read_state.group_id_hex
+          AND timeline.message_id_hex = conversation_read_state.last_read_message_id_hex
+    ),
+    last_read_order_at = (
+        SELECT timeline.timeline_order_at
         FROM message_timeline AS timeline
         WHERE timeline.group_id_hex = conversation_read_state.group_id_hex
           AND timeline.message_id_hex = conversation_read_state.last_read_message_id_hex
