@@ -1277,6 +1277,148 @@ async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
 }
 
 #[tokio::test]
+async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
+    let relay = Arc::new(BlockingSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let synced_group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let unsynced_group_id = cgka_traits::GroupId::new(vec![0xB3; 32]);
+    let synced_old = TransportGroupSubscription {
+        group_id: synced_group_id.clone(),
+        transport_group_id: vec![0xC2; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let unsynced_old = TransportGroupSubscription {
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let synced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: synced_group_id.clone(),
+        transport_group_id: synced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let unsynced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: unsynced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![synced_old.clone(), unsynced_old.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter
+        .handle_relay_eose(endpoint.clone(), synced_old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(false)
+    );
+
+    relay.block_subscribes.store(true, Ordering::SeqCst);
+    let cancelled_sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let account_id = account_id.clone();
+        let endpoint = endpoint.clone();
+        let synced_group_id = synced_group_id.clone();
+        let unsynced_group_id = unsynced_group_id.clone();
+        let synced_old = synced_old.clone();
+        let unsynced_old = unsynced_old.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id,
+                    group_subscriptions: vec![
+                        TransportGroupSubscription {
+                            group_id: synced_group_id,
+                            transport_group_id: vec![0xD2; 32],
+                            endpoints: vec![endpoint.clone()],
+                        },
+                        synced_old,
+                        TransportGroupSubscription {
+                            group_id: unsynced_group_id,
+                            transport_group_id: vec![0xD3; 32],
+                            endpoints: vec![endpoint],
+                        },
+                        unsynced_old,
+                    ],
+                    since: Some(Timestamp(1_700_000_100)),
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(concurrent_subscribe_timeout(), relay.started.notified())
+        .await
+        .expect("reissued relay subscribe started");
+
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true),
+        "staging a replacement REQ must not regress an already-open live gate"
+    );
+    adapter
+        .handle_relay_eose(endpoint, unsynced_old_subscription_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(false),
+        "an overlapping callback remains provisional until the batch outcome is known"
+    );
+
+    cancelled_sync.abort();
+    assert!(cancelled_sync.await.unwrap_err().is_cancelled());
+    relay.block_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![synced_old, unsynced_old],
+            since: None,
+        })
+        .await
+        .expect("follow-up sync waits for cancellation rollback");
+
+    assert_eq!(
+        adapter
+            .subscription_synced(&synced_old_subscription_id)
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter
+            .subscription_synced(&unsynced_old_subscription_id)
+            .await,
+        Some(true),
+        "EOSE observed during the failed reissue must open the retained live gate"
+    );
+    assert_eq!(adapter.relay_sync().await.eose.sample_count(), 2);
+}
+
+#[tokio::test]
 async fn observe_relay_event_records_every_relay_copy_for_spread() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
