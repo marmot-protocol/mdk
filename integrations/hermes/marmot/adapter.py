@@ -3260,6 +3260,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             group_id_hex = event["group_id_hex"]
             sender_account_id_hex = event["sender_account_id_hex"]
             message_id_hex = event["message_id_hex"]
+            self._last_inbound_message_ids[group_id_hex] = message_id_hex
             if not await self._should_run_turn(event):
                 logger.debug("Marmot inbound not addressed; skipping turn (groupActivation=mention)")
                 return
@@ -3295,7 +3296,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     tz=timezone.utc,
                 ),
             )
-            self._last_inbound_message_ids[group_id_hex] = message_id_hex
             reply = event.get("reply_to")
             if isinstance(reply, dict):
                 reply_sender = reply.get("sender")

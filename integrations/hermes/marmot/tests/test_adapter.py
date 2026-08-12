@@ -5239,6 +5239,38 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
             "11" * 32, chat_id, explicit_id
         )
 
+    async def test_fallback_reaction_targets_latest_unmentioned_inbound_message(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+        adapter._should_run_turn = unittest.mock.AsyncMock(return_value=False)
+        chat_id = "22" * 32
+        latest_id = "33" * 32
+
+        await adapter._dispatch_inbound_message(
+            {
+                "account_id_hex": "11" * 32,
+                "group_id_hex": chat_id,
+                "message_id_hex": latest_id,
+                "sender_account_id_hex": "44" * 32,
+                "text": "not addressed to the agent",
+            }
+        )
+
+        self.assertEqual(
+            await adapter.add_reaction(chat_id, "👀"),
+            {"success": True, "emoji": "👀"},
+        )
+        client.send_reaction.assert_awaited_once_with(
+            "11" * 32, chat_id, latest_id, "👀"
+        )
+
     async def test_public_reaction_api_fails_cleanly_without_a_target_message(self):
         client = unittest.mock.AsyncMock()
         adapter = self.adapter_module.MarmotPlatformAdapter(

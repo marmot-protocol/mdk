@@ -5530,6 +5530,21 @@ fn reaction_intent_accepts_bounded_multi_scalar_emoji() {
 }
 
 #[test]
+fn reaction_intent_accepts_exact_maximum_scalar_count() {
+    let emoji = "👍".repeat(64);
+    let event = build_inner_event(
+        &AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: emoji.clone(),
+        },
+        SENDER_HEX,
+        1,
+    )
+    .unwrap();
+    assert_eq!(event.content, emoji);
+}
+
+#[test]
 fn delete_intent_builds_empty_kind_five_with_e_tag() {
     let event = build(AppMessageIntent::Delete {
         target_message_id: "abc123".to_owned(),
