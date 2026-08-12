@@ -115,14 +115,22 @@ pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 /// Upper bound on candidate branch states materialized as peel contexts in one
 /// deferred-peel sweep (`Engine::candidate_branch_peel`).
 ///
+/// A bound is required because nothing else caps the branch COUNT: one extra
+/// message posts one extra branch, `max_rewind_commits` bounds a path's LENGTH,
+/// and the pass's own `ReplayBudget` grows with the commit count
+/// (`commits × (max_rewind + 1) × 4 + 32`), so width alone never exhausts it.
+///
 /// Each context costs one bounded replay of its branch, and each is then
 /// offered to at most [`MAX_DEFERRED_ROWS_PER_SWEEP`] retained rows, so one
 /// sweep's worst case is `8 × 64` symmetric AEAD attempts on top of 8 replays —
 /// negligible next to the convergence pass itself, and reached only when a
-/// contested graph and a deferred backlog coincide. Eight comfortably exceeds
-/// the branch count any real fork produces: v1 `max_rewind_commits` is 5, and a
-/// graph wide enough to need more than eight branches is already failing the
-/// pass's own `ReplayBudget`.
+/// contested graph and a deferred backlog coincide.
+///
+/// Capping is safe because the kept subset is content-derived: candidates are
+/// ranked by tip epoch, then by path-digest branch id, so every peer holding
+/// the same evidence keeps the same branches. Branch *selection* is not capped
+/// — a branch past this prefix can still win a pass, and peels natively once
+/// adopted.
 pub(crate) const MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS: usize = 8;
 
 /// Per-group deferred-peel retry lifecycle state (mdk#339). Held on the
