@@ -1425,7 +1425,15 @@ impl TuiApp {
                 // point of adding from that screen is to watch the member land in
                 // its list. A browse search instead reveals the chat it changed.
                 if self.search_add_target().is_some() {
-                    return self.return_to_group_detail(&group_id);
+                    // The add has already published, so a failed refresh annotates
+                    // its confirmation instead of replacing it: a completed add
+                    // reported as an error would send the user to re-add a member
+                    // who is already in the group.
+                    if let Err(err) = self.return_to_group_detail(&group_id) {
+                        self.status =
+                            format!("{}; group detail refresh failed: {err}", self.status);
+                    }
+                    return Ok(());
                 }
                 self.select_chat_by_group_id(&group_id)?;
                 self.reveal_chat_from_search();

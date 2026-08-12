@@ -11381,6 +11381,14 @@ fn adding_a_found_user_from_group_detail_adds_them_and_returns_to_the_group() {
         Some("g1"),
         "the group detail reloads so the new member shows"
     );
+    // The add published, so the status must report that and not be displaced by
+    // the return that follows it. A completed add reported as anything else
+    // would send the user to re-add a member who is already in the group.
+    assert!(
+        app.status.contains("added member(s)"),
+        "the completed add is what the status reports; got: {:?}",
+        app.status
+    );
 }
 
 #[cfg(unix)]
