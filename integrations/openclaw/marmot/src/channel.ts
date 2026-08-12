@@ -115,8 +115,8 @@ async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<Marmo
   };
 }
 
-/** Dependencies the channel-owned `delete` action adapter needs. */
-export interface MarmotDeleteActionDeps {
+/** Dependencies the channel-owned message action adapter needs. */
+export interface MarmotMessageActionDeps {
   /** Resolve a sent message id to its group from the send-time cache. */
   deleteByMessageId: (
     targetMessageIdHex: string,
@@ -126,12 +126,23 @@ export interface MarmotDeleteActionDeps {
   resolveTarget: (
     cfg: unknown,
     accountId?: string | null,
-  ) => Promise<{ client: MarmotMessageDeleteClient; marmotAccountIdHex: string }>;
+  ) => Promise<{ client: MarmotMessageActionClient; marmotAccountIdHex: string }>;
 }
 
-/** Narrow view of the control client used by the explicit-group delete fallback. */
-export interface MarmotMessageDeleteClient {
+/** Narrow view of the control client used by message mutations. */
+export interface MarmotMessageActionClient {
   deleteMessage: (
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+  ) => Promise<unknown>;
+  sendReaction?: (
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    emoji: string,
+  ) => Promise<unknown>;
+  removeReaction?: (
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
@@ -143,13 +154,50 @@ export interface MarmotMessageDeleteClient {
  * `message(action:"delete", messageId, to)` reaches `handleAction`. Prefer the
  * send-time cache (no extra round-trip); fall back to an explicit `to` group.
  */
-export function createMarmotDeleteActionAdapter(
-  deps: MarmotDeleteActionDeps,
+export function createMarmotMessageActionAdapter(
+  deps: MarmotMessageActionDeps,
 ): ChannelMessageActionAdapter {
   return {
-    describeMessageTool: () => ({ actions: ["delete"] }),
-    supportsAction: ({ action }) => action === "delete",
+    describeMessageTool: () => ({ actions: ["delete", "react"] }),
+    supportsAction: ({ action }) => action === "delete" || action === "react",
     handleAction: async (ctx: ChannelMessageActionContext) => {
+      if (ctx.action === "react") {
+        const messageId =
+          typeof ctx.params.messageId === "string"
+            ? ctx.params.messageId
+            : String(ctx.toolContext?.currentMessageId ?? "");
+        const to =
+          typeof ctx.params.to === "string"
+            ? ctx.params.to
+            : ctx.toolContext?.currentMessagingTarget;
+        if (!messageId) {
+          return jsonResult({
+            ok: false,
+            error: "messageId required. Provide messageId explicitly or react to the current inbound message.",
+          });
+        }
+        if (!to) {
+          return jsonResult({ ok: false, error: "could not resolve group for this message id" });
+        }
+        const { client, marmotAccountIdHex } = await deps.resolveTarget(
+          ctx.cfg,
+          ctx.accountId ?? null,
+        );
+        const emoji = typeof ctx.params.emoji === "string" ? ctx.params.emoji : "";
+        const remove = ctx.params.remove === true || emoji.length === 0;
+        if (remove) {
+          if (!client.removeReaction) {
+            return jsonResult({ ok: false, error: "reaction removal unavailable" });
+          }
+          await client.removeReaction(marmotAccountIdHex, to, messageId);
+          return jsonResult({ ok: true, removed: true });
+        }
+        if (!client.sendReaction) {
+          return jsonResult({ ok: false, error: "reactions unavailable" });
+        }
+        await client.sendReaction(marmotAccountIdHex, to, messageId, emoji);
+        return jsonResult({ ok: true, added: emoji });
+      }
       if (ctx.action !== "delete") {
         return jsonResult({ ok: false, error: `unsupported action: ${ctx.action}` });
       }
@@ -188,7 +236,7 @@ export function createMarmotChannelPlugin() {
   // can reuse its send-time conversation cache via `deleteByMessageId`.
   const messageAdapter = createMarmotMessageAdapter({ resolveTarget });
 
-  const actions = createMarmotDeleteActionAdapter({
+  const actions = createMarmotMessageActionAdapter({
     deleteByMessageId: messageAdapter.deleteByMessageId,
     resolveTarget,
   });

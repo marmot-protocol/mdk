@@ -3,9 +3,9 @@ import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-co
 
 import {
   createMarmotChannelPlugin,
-  createMarmotDeleteActionAdapter,
+  createMarmotMessageActionAdapter,
   resolveMarmotChannelAccount,
-  type MarmotMessageDeleteClient,
+  type MarmotMessageActionClient,
 } from "../src/channel.js";
 import {
   markMarmotInboundReady,
@@ -31,6 +31,19 @@ function deleteCtx(params: Record<string, unknown>): ChannelMessageActionContext
     action: "delete",
     cfg: {},
     params,
+  } as unknown as ChannelMessageActionContext;
+}
+
+function reactCtx(
+  params: Record<string, unknown>,
+  toolContext: { currentMessageId?: string; currentMessagingTarget?: string } = {},
+): ChannelMessageActionContext {
+  return {
+    channel: "marmot",
+    action: "react",
+    cfg: {},
+    params,
+    toolContext,
   } as unknown as ChannelMessageActionContext;
 }
 
@@ -118,9 +131,9 @@ describe("resolveMarmotChannelAccount", () => {
   });
 });
 
-describe("createMarmotDeleteActionAdapter", () => {
-  it("owns only delete so core durable sends can fall through", () => {
-    const adapter = createMarmotDeleteActionAdapter({
+describe("createMarmotMessageActionAdapter", () => {
+  it("owns delete and react so core durable sends can fall through", () => {
+    const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: { deleteMessage: async () => undefined },
@@ -130,18 +143,20 @@ describe("createMarmotDeleteActionAdapter", () => {
 
     expect(adapter.supportsAction?.({ action: "delete" })).toBe(true);
     expect(adapter.supportsAction?.({ action: "send" })).toBe(false);
-    expect(adapter.supportsAction?.({ action: "react" })).toBe(false);
+    expect(adapter.supportsAction?.({ action: "react" })).toBe(true);
   });
 
-  it("declares the delete action through describeMessageTool", () => {
-    const adapter = createMarmotDeleteActionAdapter({
+  it("declares delete and react through describeMessageTool", () => {
+    const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: { deleteMessage: async () => undefined },
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
-    expect(adapter.describeMessageTool({ cfg: {} } as never)).toEqual({ actions: ["delete"] });
+    expect(adapter.describeMessageTool({ cfg: {} } as never)).toEqual({
+      actions: ["delete", "react"],
+    });
   });
 
   it("deletes via the send-time cache on a cache hit", async () => {
@@ -150,7 +165,7 @@ describe("createMarmotDeleteActionAdapter", () => {
       client: { deleteMessage: vi.fn(async () => undefined) },
       marmotAccountIdHex: HEX32("aa"),
     }));
-    const adapter = createMarmotDeleteActionAdapter({ deleteByMessageId, resolveTarget });
+    const adapter = createMarmotMessageActionAdapter({ deleteByMessageId, resolveTarget });
 
     const result = await adapter.handleAction!(deleteCtx({ messageId: HEX32("99") }));
 
@@ -166,13 +181,13 @@ describe("createMarmotDeleteActionAdapter", () => {
 
   it("falls back to the explicit `to` group on a cache miss", async () => {
     const calls: { account: string; group: string; id: string }[] = [];
-    const client: MarmotMessageDeleteClient = {
+    const client: MarmotMessageActionClient = {
       deleteMessage: async (account, group, id) => {
         calls.push({ account, group, id });
         return undefined;
       },
     };
-    const adapter = createMarmotDeleteActionAdapter({
+    const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({ client, marmotAccountIdHex: HEX32("aa") }),
     });
@@ -188,7 +203,7 @@ describe("createMarmotDeleteActionAdapter", () => {
   });
 
   it("returns an error when messageId is missing", async () => {
-    const adapter = createMarmotDeleteActionAdapter({
+    const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: { deleteMessage: async () => undefined },
@@ -203,7 +218,7 @@ describe("createMarmotDeleteActionAdapter", () => {
 
   it("errors on a cache miss with no `to` group to fall back to", async () => {
     const deleteMessage = vi.fn(async () => undefined);
-    const adapter = createMarmotDeleteActionAdapter({
+    const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: { deleteMessage },
@@ -217,8 +232,52 @@ describe("createMarmotDeleteActionAdapter", () => {
     expect(resultError(result)).toMatch(/could not resolve group/);
   });
 
+  it("adds a reaction to the current inbound message", async () => {
+    const sendReaction = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: { deleteMessage: async () => undefined, sendReaction },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      reactCtx(
+        { emoji: "👀" },
+        { currentMessageId: HEX32("99"), currentMessagingTarget: HEX32("cc") },
+      ),
+    );
+
+    expect(sendReaction).toHaveBeenCalledWith(
+      HEX32("aa"),
+      HEX32("cc"),
+      HEX32("99"),
+      "👀",
+    );
+    expect(resultOk(result)).toBe(true);
+  });
+
+  it("removes the bot's reaction when emoji is empty", async () => {
+    const removeReaction = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: { deleteMessage: async () => undefined, removeReaction },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      reactCtx({ messageId: HEX32("99"), to: HEX32("cc"), emoji: "" }),
+    );
+
+    expect(removeReaction).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("99"));
+    expect(resultOk(result)).toBe(true);
+  });
+
   it("rejects an unsupported action", async () => {
-    const adapter = createMarmotDeleteActionAdapter({
+    const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => true,
       resolveTarget: async () => ({
         client: { deleteMessage: async () => undefined },
@@ -226,7 +285,7 @@ describe("createMarmotDeleteActionAdapter", () => {
       }),
     });
 
-    const ctx = { ...deleteCtx({ messageId: HEX32("99") }), action: "react" } as ChannelMessageActionContext;
+    const ctx = { ...deleteCtx({ messageId: HEX32("99") }), action: "edit" } as ChannelMessageActionContext;
     const result = await adapter.handleAction!(ctx);
     expect(resultOk(result)).toBe(false);
     expect(resultError(result)).toMatch(/unsupported action/);

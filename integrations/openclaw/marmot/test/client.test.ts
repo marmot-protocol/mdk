@@ -79,7 +79,24 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       });
       break;
     case "delete_message":
-      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("de")] });
+      send(socket, id, {
+        type: "final_sent",
+        message_ids_hex: [HEX32("de")],
+      });
+      break;
+    case "send_reaction":
+      send(socket, id, {
+        type: "app_event_sent",
+        message_ids_hex: [HEX32("e1")],
+        echoed_request: req,
+      });
+      break;
+    case "remove_reaction":
+      send(socket, id, {
+        type: "app_event_sent",
+        message_ids_hex: [HEX32("e2")],
+        echoed_request: req,
+      });
       break;
     case "send_media":
       send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("11")] });
@@ -315,6 +332,31 @@ describe("MarmotAgentControlClient", () => {
   it("deletes a message and returns the deletion event ids", async () => {
     const res = await client.deleteMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"));
     expect(res.message_ids_hex).toEqual([HEX32("de")]);
+  });
+
+  it("adds and removes reactions with the agent-control v2 wire shape", async () => {
+    const added = (await client.sendReaction(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"), "👀",
+    )) as unknown as { message_ids_hex: string[]; echoed_request: Record<string, unknown> };
+    expect(added.message_ids_hex).toEqual([HEX32("e1")]);
+    expect(added.echoed_request).toMatchObject({
+      type: "send_reaction",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("dd"),
+      emoji: "👀",
+    });
+
+    const removed = (await client.removeReaction(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"),
+    )) as unknown as { message_ids_hex: string[]; echoed_request: Record<string, unknown> };
+    expect(removed.message_ids_hex).toEqual([HEX32("e2")]);
+    expect(removed.echoed_request).toMatchObject({
+      type: "remove_reaction",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("dd"),
+    });
   });
 
   it("uploads media and returns the durable message ids from send_media", async () => {

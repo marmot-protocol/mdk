@@ -614,6 +614,36 @@ export class MarmotAgentControlClient {
     })) as unknown as FinalSentResponse;
   }
 
+  /** Add arbitrary reaction content to a durable group message. */
+  async sendReaction(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    emoji: string,
+  ): Promise<AppEventSentResponse> {
+    return (await this.request({
+      type: "send_reaction",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
+      emoji: String(emoji),
+    })) as unknown as AppEventSentResponse;
+  }
+
+  /** Remove this account's active reaction from a durable group message. */
+  async removeReaction(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+  ): Promise<AppEventSentResponse> {
+    return (await this.request({
+      type: "remove_reaction",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
+    })) as unknown as AppEventSentResponse;
+  }
+
   async streamBegin(
     accountIdHex: string,
     groupIdHex: string,
