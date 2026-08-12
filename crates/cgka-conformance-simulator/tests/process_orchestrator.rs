@@ -1,6 +1,7 @@
 //! Long-lived multi-process convergence-orchestrator coverage.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
 use cgka_conformance_simulator::{
@@ -659,9 +660,9 @@ async fn run_app_runtime_adapter(
         "{app_report:#?}"
     );
     let app_observations = app
-        .observations(&spec.clients)
+        .await_observable_settlement(&spec.clients, Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap_or_else(|error| panic!("app-runtime settlement failed: {error}; {app_report:#?}"))
         .into_iter()
         .map(|observation| (observation.participant.clone(), observation))
         .collect::<BTreeMap<_, _>>();
