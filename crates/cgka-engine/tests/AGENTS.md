@@ -116,6 +116,23 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 cargo test -p cgka-engine
 ```
 
+Note: the default build pins the v1 convergence policy; suites that install custom policies need
+`cargo test -p cgka-engine --features test-policy-overrides` (CI runs the workspace with
+`wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks`, see `justfile`).
+
+## Benchmarks
+
+`benches/group_lifecycle.rs` (criterion) times the group-creation and welcome-join flows over
+in-memory SQLite with a pass-through peeler: `create_group` at 1/8/32 invitees, `join_welcome` at
+1/8/32 stored key packages, and `join_welcome_large_group` for 32-member joins. Run:
+
+```sh
+cargo bench -p cgka-engine --bench group_lifecycle
+```
+
+These benches are the measurement rail for engine-lifecycle performance work; extend them when a
+change claims a lifecycle speedup.
+
 ## Tier 3 — Harness scenarios + proptest
 
 **Where:** `crates/cgka-conformance-simulator/tests/`. Multi-client convergence under a deterministic in-memory bus.
