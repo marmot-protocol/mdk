@@ -17,7 +17,7 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AppError, AppGroupAdminPolicyComponent, AppMessageProjection, AppPerformanceTelemetry,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
     TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event, unix_now_seconds,
 };
 use marmot_forensics::{
@@ -88,6 +88,11 @@ pub(crate) enum ConvergenceScheduleState {
     /// on the fallback delay — but a healthy waiting queue is not unsettled
     /// convergence and never counts toward the re-arm cap.
     PendingOutbound,
+}
+
+enum SyncCheckpointError {
+    BeforePersistence(AppError),
+    AfterPersistence(AppError),
 }
 
 impl AppClient {
@@ -233,32 +238,68 @@ impl AppClient {
         registration
     }
 
+    /// Transport-first startup sync. All authenticated, newly-applied effects
+    /// are projected into app state; no historical replay cursor is maintained.
+    ///
+    /// This compatibility entry point preserves the original [`AppError`]
+    /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
+    /// report the durably applied prefix of a failed catch-up pass.
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
-        self.sync_inner(None).await
+        match self.sync_inner(None).await {
+            Ok(summary) => Ok(summary),
+            Err(failure) => {
+                // Compatibility callers cannot observe a failure summary.
+                // Retain any already-checkpointed prefix for their next
+                // successful sync instead of consuming it with the error.
+                self.pending_failed_sync_summary
+                    .merge(failure.partial_summary);
+                Err(failure.source)
+            }
+        }
+    }
+
+    /// Synchronize while retaining the durably applied prefix on failure.
+    pub async fn sync_with_partial_progress(&mut self) -> Result<SyncSummary, SyncFailure> {
+        match self.sync_inner(None).await {
+            Ok(summary) => Ok(summary),
+            Err(mut failure) => {
+                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
+                Err(failure)
+            }
+        }
     }
 
     pub(crate) async fn sync_with_startup_stage_telemetry(
         &mut self,
         telemetry: &AppPerformanceTelemetry,
-    ) -> Result<SyncSummary, AppError> {
-        self.sync_inner(Some(telemetry)).await
+    ) -> Result<SyncSummary, SyncFailure> {
+        match self.sync_inner(Some(telemetry)).await {
+            Ok(summary) => Ok(summary),
+            Err(mut failure) => {
+                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
+                Err(failure)
+            }
+        }
     }
 
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<SyncSummary, AppError> {
+    ) -> Result<SyncSummary, SyncFailure> {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
-        if self.refresh_group_routes()? {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()
+                .map_err(SyncFailure::from)?;
         }
         let rebuild_since_secs = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp)
             .map(|timestamp| timestamp.0);
-        self.prepare_transport_with_telemetry(telemetry).await?;
+        self.prepare_transport_with_telemetry(telemetry)
+            .await
+            .map_err(SyncFailure::from)?;
         // Both the inbox/group activation and the group-subscription refresh
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.
@@ -271,7 +312,12 @@ impl AppClient {
         // above, `sync_sdk_relay` never drained the engine, so these would stay
         // buffered and invisible to runtime subscribers until some later
         // unrelated send/ingest. Fold any pending events into this summary.
-        let drained = self.drain_pending_session_events().await?;
+        let drained = match self.drain_pending_session_events().await {
+            Ok(drained) => drained,
+            Err(error) => {
+                return Err(SyncFailure::new(summary, error));
+            }
+        };
         summary.merge(drained);
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
@@ -320,17 +366,25 @@ impl AppClient {
             return Ok(summary);
         }
         let display_names = self.app.display_names_by_id()?;
-        // Synthetic source identity: drained events have no inbound transport
-        // message. The empty id signals "no source message"; the audit recorder
-        // drops it rather than emitting a schema-invalid `message_ids` entry
-        // (see `schema_valid_message_ids`).
-        let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
         let mut gossip_message_ids = HashSet::new();
         for event in &effects.events {
+            // A replayed application event has no outer relay envelope, but its
+            // durable engine outbox key is stable and unique. Use that key as
+            // the synthetic source so a crash can replay several pending
+            // events in one drain without colliding on an empty source id.
+            let source_message_id_hex = match event {
+                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                    hex::encode(message_id.as_slice())
+                }
+                cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
+                    hex::encode(via_welcome.as_slice())
+                }
+                _ => String::new(),
+            };
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
                     local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
@@ -412,10 +466,20 @@ impl AppClient {
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
         let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
+        if (routes_dirty || routes_changed)
+            && let Err(error) = self.sync_runtime_groups().await
+        {
+            self.pending_failed_sync_summary.merge(summary);
+            return Err(error);
         }
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
+            // The engine outbox remains unacknowledged. A reopened client will
+            // replay it; a retained client instead checkpoints the projected
+            // state on its next sync and returns this deferred summary once.
+            self.pending_failed_sync_summary.merge(summary);
+            return Err(error);
+        }
+        summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -586,21 +650,28 @@ impl AppClient {
         let routes_dirty = self
             .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
+        // A membership-changing ingest is already durable. Persist its app
+        // projection before route reconciliation or subscription refresh can
+        // fail, matching the catch-up checkpoint below.
+        if routes_dirty {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
         let routes_changed = self.refresh_group_routes()?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
-    async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, AppError> {
-        let display_names = self.app.display_names_by_id()?;
+    async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, SyncFailure> {
+        let display_names = self.app.display_names_by_id().map_err(SyncFailure::from)?;
         let local_account_id_hex = self
             .app
             .account_home()
-            .account(&self.state.label)?
+            .account(&self.state.label)
+            .map_err(|source| SyncFailure::from(AppError::from(source)))?
             .account_id_hex;
         let mut summary = SyncSummary::default();
         let mut seen = self
@@ -626,11 +697,21 @@ impl AppClient {
                 SDK_DRAIN_WAIT
             };
             first_wait = false;
-
             let delivery = match timeout(wait, self.adapter.receive()).await {
                 Ok(Ok(Some(delivery))) => delivery,
                 Ok(Ok(None)) => break,
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(error)) => {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            *deliveries,
+                            error.into(),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
                 Err(_) => break,
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
@@ -640,16 +721,65 @@ impl AppClient {
             if seen.contains(&event_id) {
                 continue;
             }
+            if cfg!(feature = "test-policy-overrides")
+                && self
+                    .app
+                    .config
+                    .dev_fail_sync_before_delivery
+                    .is_some_and(|limit| *deliveries >= limit)
+            {
+                return Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        *deliveries,
+                        AppError::BlockingTask("injected catch-up delivery failure".to_owned()),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await);
+            }
+            let mut delivery_summary = SyncSummary::default();
+            let delivery_routes_dirty = match self
+                .ingest_delivery(delivery, &display_names, &mut delivery_summary)
+                .await
+            {
+                Ok(routes_dirty) => routes_dirty,
+                Err(error) => {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            *deliveries,
+                            error,
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            };
             remember_seen_event(&mut seen, &mut self.state, event_id);
-            routes_dirty |= self
-                .ingest_delivery(delivery, &display_names, &mut summary)
-                .await?;
-            *deliveries = deliveries.saturating_add(1);
+            *deliveries = (*deliveries).saturating_add(1);
+            summary.merge(delivery_summary);
+            routes_dirty |= delivery_routes_dirty;
         }
 
-        let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
+        if let Err(error) = self
+            .checkpoint_sync_prefix(&mut summary, routes_dirty, *deliveries)
+            .await
+        {
+            let cursor_after_secs = match &error {
+                SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
+                SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
+            };
+            let (summary, source) = self.checkpoint_failure_summary(summary, error);
+            self.record_sync_drain(
+                drain_started.elapsed().as_millis() as u64,
+                *deliveries,
+                cursor_before_secs,
+                cursor_after_secs,
+            );
+            return Err(SyncFailure::new(summary, source));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -657,8 +787,96 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         Ok(summary)
+    }
+
+    async fn finish_failed_sync_drain(
+        &mut self,
+        mut summary: SyncSummary,
+        routes_dirty: bool,
+        deliveries: u64,
+        original_error: AppError,
+        drain_started: std::time::Instant,
+        cursor_before_secs: Option<u64>,
+    ) -> SyncFailure {
+        let (source, cursor_after_secs) = match self
+            .checkpoint_sync_prefix(&mut summary, routes_dirty, deliveries)
+            .await
+        {
+            Ok(()) => (original_error, self.state.last_transport_timestamp),
+            Err(error) => {
+                let cursor_after_secs = match &error {
+                    SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
+                    SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
+                };
+                let (retained_summary, checkpoint_error) =
+                    self.checkpoint_failure_summary(summary, error);
+                summary = retained_summary;
+                (checkpoint_error, cursor_after_secs)
+            }
+        };
+        self.record_sync_drain(
+            drain_started.elapsed().as_millis() as u64,
+            deliveries,
+            cursor_before_secs,
+            cursor_after_secs,
+        );
+        SyncFailure::new(summary, source)
+    }
+
+    async fn checkpoint_sync_prefix(
+        &mut self,
+        summary: &mut SyncSummary,
+        routes_dirty: bool,
+        deliveries: u64,
+    ) -> Result<(), SyncCheckpointError> {
+        let routes_changed = self
+            .refresh_group_routes()
+            .map_err(SyncCheckpointError::BeforePersistence)?;
+        let checkpoint = if cfg!(feature = "test-policy-overrides")
+            && self
+                .app
+                .config
+                .dev_fail_sync_before_boundary_save
+                .is_some_and(|limit| deliveries > 0 && deliveries > limit)
+        {
+            Err(AppError::BlockingTask(
+                "injected catch-up boundary save failure".to_owned(),
+            ))
+        } else {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()
+        };
+        if let Err(error) = checkpoint {
+            return Err(SyncCheckpointError::BeforePersistence(error));
+        }
+
+        summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
+
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups()
+                .await
+                .map_err(SyncCheckpointError::AfterPersistence)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_failure_summary(
+        &mut self,
+        summary: SyncSummary,
+        error: SyncCheckpointError,
+    ) -> (SyncSummary, AppError) {
+        match error {
+            SyncCheckpointError::BeforePersistence(source) => {
+                // Message/join projections from this drain are not reportable
+                // until their checkpoint commits. Keep one-shot epoch-stall
+                // escalations pending here: partial-progress entry points drain
+                // them into the failure, while compatibility `sync()` leaves
+                // them available for the retained client's next success.
+                self.pending_failed_sync_summary.merge(summary);
+                (SyncSummary::default(), source)
+            }
+            SyncCheckpointError::AfterPersistence(source) => (summary, source),
+        }
     }
 
     async fn ingest_delivery(
@@ -678,7 +896,28 @@ impl AppClient {
         self.arm_recovery_from_effects(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
-        let routes_dirty = self
+        // A delivery can contain several application events. If projection
+        // fails after an earlier event staged its acknowledgement, keep that
+        // event in the durable engine outbox so a retained or reopened client
+        // can replay its live summary. Recording only candidates absent before
+        // this delivery avoids cloning the whole accumulated acknowledgement
+        // set on every catch-up step.
+        let new_application_event_ack_candidates = effects
+            .effects
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                    Some(message_id.clone())
+                }
+                cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
+                    Some(via_welcome.clone())
+                }
+                _ => None,
+            })
+            .filter(|event_id| !self.pending_application_event_acks.contains(event_id))
+            .collect::<Vec<_>>();
+        let routes_dirty = match self
             .observe_account_device_effects(
                 &effects.effects,
                 display_names,
@@ -687,17 +926,16 @@ impl AppClient {
                 source_received_at,
                 Some(outer_transport_at),
             )
-            .await?;
-        if routes_dirty {
-            // The engine join/leave is already durable; persist the matching
-            // app-state projection (a fresh join's pending invite row) before
-            // the callers' route-refresh network awaits. A process exit in
-            // that window would otherwise tear the durable membership change
-            // from its app-state row, and the consumed welcome is never
-            // re-emitted to repair it.
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        }
-
+            .await
+        {
+            Ok(routes_dirty) => routes_dirty,
+            Err(error) => {
+                for event_id in new_application_event_ack_candidates {
+                    self.pending_application_event_acks.remove(&event_id);
+                }
+                return Err(error);
+            }
+        };
         // Publishing here is incidental work triggered by the inbound
         // delivery. A hard publish failure may roll that pending commit back,
         // but it must not discard the already-authenticated inbound message or
@@ -855,11 +1093,12 @@ impl AppClient {
     ///
     /// Call this as the LAST step before `Ok(summary)`, at every outermost seam
     /// — the ones whose `Ok` is handed to a caller rather than followed by more
-    /// fallible work. An interior `?` returns before the move runs, so the stash
-    /// simply rides the next successful seam instead of being lost with the
-    /// failed pass's summary. Moving (not copying) is what keeps delivery
-    /// exactly-once. Because the stash is shared, a seam that omits this call
-    /// *defers* delivery to the next seam that does; it does not lose it.
+    /// fallible work. Partial-progress sync also calls it on `Err`, moving the
+    /// one-shot decision into `SyncFailure::partial_summary` before a managed
+    /// worker can discard and rebuild the client. The compatibility `sync()`
+    /// path leaves it stashed on failure because its `AppError` contract has no
+    /// partial-summary channel. Moving (not copying) keeps delivery exactly
+    /// once across either path.
     ///
     /// One nested case needs care: [`Self::drain_pending_session_events`] drains
     /// while nested inside `sync_inner`, so its escalations leave the stash and
@@ -869,19 +1108,6 @@ impl AppClient {
     /// also makes `sync_inner`'s own call belt-and-braces rather than
     /// load-bearing: the nested drain has already emptied the stash.)
     ///
-    /// Residual: the receive arm drops the whole client on a failed pass, so the
-    /// replacement starts with an empty stash and a fresh detector; the
-    /// `epoch_stall_backfill_escalated` row recorded just before the push is the
-    /// only trace that outlives them, and only where audit logging is on (opt-in,
-    /// off by default). Re-escalating then costs a whole fresh three-arm run, and
-    /// only its first arm can land at the epoch the device already sits at — an
-    /// arm at an epoch already fired at is a `Skip` — so arms two and three each
-    /// need the local epoch to genuinely advance. A group that is still advancing
-    /// therefore re-escalates roughly two epochs later, delayed rather than lost;
-    /// a group frozen at one local epoch arms once and never escalates again.
-    /// That second case is a pre-existing blind spot of the arm counter, not a
-    /// rebuild artifact — a group frozen from its first arm never escalates in a
-    /// fresh process either — and is tracked for a follow-up.
     fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations
@@ -1130,7 +1356,7 @@ impl AppClient {
                 let mut summary = match self.sync_sdk_relay(&mut deliveries).await {
                     Ok(summary) => summary,
                     Err(err) => {
-                        let terminal_error = err.privacy_safe_kind().to_string();
+                        let terminal_error = err.source.privacy_safe_kind().to_string();
                         self.finish_epoch_backfill_execution(
                             execution,
                             EpochBackfillActivationOutcome::Succeeded,
@@ -1138,7 +1364,8 @@ impl AppClient {
                             deliveries,
                             false,
                         );
-                        return Err(err);
+                        self.pending_failed_sync_summary.merge(err.partial_summary);
+                        return Err(err.source);
                     }
                 };
                 let drained = match self.drain_pending_session_events().await {
@@ -1185,9 +1412,10 @@ impl AppClient {
     /// participant that has no new traffic capable of arming epoch-stall
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
-    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, AppError> {
-        if self.refresh_group_routes()? {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
+        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()
+                .map_err(SyncFailure::from)?;
         }
         // Caller-directed repair is a fresh transport preparation, not an
         // assumption that startup ordering already installed the signer and
@@ -1205,7 +1433,8 @@ impl AppClient {
             for _ in 0..pending_intents {
                 match self
                     .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
-                    .await?
+                    .await
+                    .map_err(SyncFailure::from)?
                 {
                     EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
                     EpochBackfillRunOutcome::Deferred => continue,
@@ -1213,12 +1442,21 @@ impl AppClient {
                 }
             }
         }
-        self.runtime.activate_transport(None).await?;
-        self.sync_runtime_groups().await?;
+        self.runtime
+            .activate_transport(None)
+            .await
+            .map_err(|source| SyncFailure::from(AppError::from(source)))?;
+        self.sync_runtime_groups()
+            .await
+            .map_err(SyncFailure::from)?;
         self.record_subscription_rebuild(None).await;
         let mut deliveries = 0;
         let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
-        summary.merge(self.drain_pending_session_events().await?);
+        let drained = match self.drain_pending_session_events().await {
+            Ok(drained) => drained,
+            Err(error) => return Err(SyncFailure::new(summary, error)),
+        };
+        summary.merge(drained);
         Ok(summary)
     }
 
@@ -1471,10 +1709,12 @@ impl AppClient {
     }
 
     fn prepare_pending_application_event_ack(&mut self, event: &cgka_traits::engine::GroupEvent) {
-        if let cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } = event {
-            self.pending_application_event_acks
-                .insert(message_id.clone());
-        }
+        let event_id = match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => message_id,
+            cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => via_welcome,
+            _ => return,
+        };
+        self.pending_application_event_acks.insert(event_id.clone());
     }
 
     pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(
@@ -1683,6 +1923,13 @@ impl AppClient {
             };
             if can_ack_application_event {
                 self.prepare_pending_application_event_ack(event);
+                if cfg!(feature = "test-policy-overrides")
+                    && self.app.config.dev_fail_ingest_after_application_event_ack
+                {
+                    return Err(AppError::BlockingTask(
+                        "injected failure after application-event acknowledgement".to_owned(),
+                    ));
+                }
             }
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;

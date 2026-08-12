@@ -2064,12 +2064,17 @@ impl HarnessClient {
         let events = self.engine_mut().drain_events();
         let mut delivered_application_events = Vec::new();
         for event in events {
-            if let GroupEvent::GroupJoined { group_id, .. } = &event
-                && self.default_group.is_none()
-            {
-                self.default_group = Some(group_id.clone());
-            }
             match &event {
+                GroupEvent::GroupJoined {
+                    group_id,
+                    via_welcome,
+                    ..
+                } => {
+                    if self.default_group.is_none() {
+                        self.default_group = Some(group_id.clone());
+                    }
+                    delivered_application_events.push(via_welcome.clone());
+                }
                 GroupEvent::TransportObjectResourceRefused { message_id, .. } => {
                     // Deferred-peel storage is keyed by the raw transport id,
                     // but alternate peelers and migrated rows may report the

@@ -682,6 +682,37 @@ impl SyncSummary {
     }
 }
 
+/// A sync failure together with the prefix that was already durably applied.
+///
+/// Catch-up processes deliveries incrementally, so a later transport, engine,
+/// or projection error cannot roll back earlier deliveries. Callers of
+/// [`AppClient::sync_with_partial_progress`] must report or otherwise consume
+/// `partial_summary`; dropping it would hide durable progress until the host
+/// takes a fresh storage snapshot. The compatibility [`AppClient::sync`] entry
+/// point retains its original [`AppError`] result.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct SyncFailure {
+    pub partial_summary: SyncSummary,
+    #[source]
+    pub source: AppError,
+}
+
+impl SyncFailure {
+    pub fn new(partial_summary: SyncSummary, source: AppError) -> Self {
+        Self {
+            partial_summary,
+            source,
+        }
+    }
+}
+
+impl From<AppError> for SyncFailure {
+    fn from(source: AppError) -> Self {
+        Self::new(SyncSummary::default(), source)
+    }
+}
+
 /// A group that full-history replay is not repairing: it armed `arms` epoch-gap
 /// backfills without once passing cleanly through an epoch, so it is still
 /// stalled below the group's live epoch at `stalled_epoch`.
@@ -1420,6 +1451,7 @@ impl MarmotApp {
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
+            pending_failed_sync_summary: SyncSummary::default(),
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),

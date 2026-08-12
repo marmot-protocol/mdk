@@ -72,7 +72,7 @@ async fn encrypted_file_restart_closes_reopens_and_hydrates_group_state() {
 }
 
 #[tokio::test]
-async fn captured_application_event_is_not_replayed_after_restart() {
+async fn captured_application_events_are_not_replayed_after_restart() {
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice-outbox")).attach(&bus);
     let mut bob = ClientBuilder::new(pad32(b"bob-outbox")).attach(&bus);
@@ -84,7 +84,21 @@ async fn captured_application_event_is_not_replayed_after_restart() {
     alice.confirm(pending).await;
     bus.deliver_all();
     bob.tick().await;
-    bob.drain_events();
+    assert_eq!(
+        bob.drain_events()
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+            .count(),
+        1,
+    );
+
+    bob.restart();
+    assert!(
+        bob.drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::GroupJoined { .. })),
+        "captured Welcome delivery must be acknowledged before restart",
+    );
 
     alice.send_app(b"fresh chat".to_vec()).await;
     bus.deliver_all();

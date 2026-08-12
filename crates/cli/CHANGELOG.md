@@ -41,6 +41,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the
   routed agent id, and beta message sends bypass the delete-only action adapter
   so they reach durable delivery.
+- Runtime catch-up now emits live events and persists transport progress for
+  deliveries that completed before a later delivery fails the same relay batch.
+  Direct clients receive the applied prefix with the error, and `wn sync`
+  includes that prefix in its human and JSON error output. Successful and
+  partial JSON output now both report projection-update and epoch-stall
+  escalation counts.
 - Local-only group deletion now survives account restart and historical relay
   replay. A per-group deletion frontier suppresses projection reconciliation
   until a causally newer chat message arrives, while a durable engine-to-app
