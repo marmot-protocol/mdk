@@ -79,7 +79,36 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       });
       break;
     case "delete_message":
-      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("de")] });
+      send(socket, id, {
+        type: "final_sent",
+        message_ids_hex: [HEX32("de")],
+      });
+      break;
+    case "send_reaction":
+      if (req.emoji === "__wrong_type") {
+        send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("e1")] });
+      } else if (req.emoji === "__empty_ids") {
+        send(socket, id, { type: "app_event_sent", message_ids_hex: [] });
+      } else if (req.emoji === "__non_hex_id") {
+        send(socket, id, { type: "app_event_sent", message_ids_hex: ["z".repeat(64)] });
+      } else if (req.emoji === "__odd_id") {
+        send(socket, id, { type: "app_event_sent", message_ids_hex: ["a".repeat(63)] });
+      } else if (req.emoji === "__wrong_size_id") {
+        send(socket, id, { type: "app_event_sent", message_ids_hex: ["aa"] });
+      } else {
+        send(socket, id, {
+          type: "app_event_sent",
+          message_ids_hex: [HEX32("e1")],
+          echoed_request: req,
+        });
+      }
+      break;
+    case "remove_reaction":
+      send(socket, id, {
+        type: "app_event_sent",
+        message_ids_hex: [HEX32("e2")],
+        echoed_request: req,
+      });
       break;
     case "send_media":
       send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("11")] });
@@ -315,6 +344,58 @@ describe("MarmotAgentControlClient", () => {
   it("deletes a message and returns the deletion event ids", async () => {
     const res = await client.deleteMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"));
     expect(res.message_ids_hex).toEqual([HEX32("de")]);
+  });
+
+  it("adds and removes reactions with the agent-control v2 wire shape", async () => {
+    const added = (await client.sendReaction(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"), "👀",
+    )) as unknown as { message_ids_hex: string[]; echoed_request: Record<string, unknown> };
+    expect(added.message_ids_hex).toEqual([HEX32("e1")]);
+    expect(added.echoed_request).toMatchObject({
+      type: "send_reaction",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("dd"),
+      emoji: "👀",
+    });
+
+    const removed = (await client.removeReaction(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"),
+    )) as unknown as { message_ids_hex: string[]; echoed_request: Record<string, unknown> };
+    expect(removed.message_ids_hex).toEqual([HEX32("e2")]);
+    expect(removed.echoed_request).toMatchObject({
+      type: "remove_reaction",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("dd"),
+    });
+    expect(removed.echoed_request).not.toHaveProperty("emoji");
+
+    const removedExact = (await client.removeReaction(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"), "👀",
+    )) as unknown as { message_ids_hex: string[]; echoed_request: Record<string, unknown> };
+    expect(removedExact.message_ids_hex).toEqual([HEX32("e2")]);
+    expect(removedExact.echoed_request).toMatchObject({
+      type: "remove_reaction",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("dd"),
+      emoji: "👀",
+    });
+  });
+
+  it("rejects malformed durable reaction responses", async () => {
+    await expect(
+      client.sendReaction(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__wrong_type"),
+    ).rejects.toMatchObject({ code: "invalid_reaction_response" });
+    await expect(
+      client.sendReaction(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__empty_ids"),
+    ).rejects.toMatchObject({ code: "invalid_reaction_response" });
+    for (const emoji of ["__non_hex_id", "__odd_id", "__wrong_size_id"]) {
+      await expect(
+        client.sendReaction(HEX32("aa"), HEX32("cc"), HEX32("dd"), emoji),
+      ).rejects.toMatchObject({ code: "invalid_reaction_response" });
+    }
   });
 
   it("uploads media and returns the durable message ids from send_media", async () => {

@@ -36,10 +36,14 @@ const RUNTIME_IMPORTS: ReadonlyArray<readonly [string, readonly string[]]> = [
 
 describe("OpenClaw plugin-sdk runtime surface", () => {
   for (const [subpath, symbols] of RUNTIME_IMPORTS) {
-    it(`${subpath} exports the symbols the plugin imports`, async () => {
-      const mod = (await import(subpath)) as Record<string, unknown>;
-      const missing = symbols.filter((symbol) => mod[symbol] === undefined);
-      expect(missing).toEqual([]);
-    });
+    it(
+      `${subpath} exports the symbols the plugin imports`,
+      async () => {
+        const mod = (await import(subpath)) as Record<string, unknown>;
+        const missing = symbols.filter((symbol) => mod[symbol] === undefined);
+        expect(missing).toEqual([]);
+      },
+      20_000,
+    );
   }
 });

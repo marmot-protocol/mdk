@@ -65,6 +65,22 @@ export interface AppEventSentResponse {
   message_ids_hex: string[];
 }
 
+function requireAppEventSent(response: Envelope): AppEventSentResponse {
+  const isMessageId = (value: unknown): value is string =>
+    typeof value === "string" && /^[0-9a-fA-F]{64}$/.test(value);
+  if (
+    response.type !== "app_event_sent" ||
+    !Array.isArray(response.message_ids_hex) ||
+    response.message_ids_hex.length === 0 ||
+    response.message_ids_hex.some((value) => !isMessageId(value))
+  ) {
+    throw new AgentControlError("wn-agent returned invalid durable reaction response", {
+      code: "invalid_reaction_response",
+    });
+  }
+  return response as unknown as AppEventSentResponse;
+}
+
 export interface StreamBegunResponse {
   type: "stream_begun";
   stream_id_hex: string;
@@ -612,6 +628,43 @@ export class MarmotAgentControlClient {
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
     })) as unknown as FinalSentResponse;
+  }
+
+  /** Add arbitrary reaction content to a durable group message. */
+  async sendReaction(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    emoji: string,
+  ): Promise<AppEventSentResponse> {
+    const response = await this.request({
+      type: "send_reaction",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
+      emoji: String(emoji),
+    });
+    return requireAppEventSent(response);
+  }
+
+  /** Remove this account's active reaction from a durable group message. */
+  async removeReaction(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    emoji?: string,
+  ): Promise<AppEventSentResponse> {
+    const request: Record<string, unknown> = {
+      type: "remove_reaction",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
+    };
+    if (emoji !== undefined) {
+      request.emoji = String(emoji);
+    }
+    const response = await this.request(request);
+    return requireAppEventSent(response);
   }
 
   async streamBegin(

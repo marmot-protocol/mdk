@@ -11,6 +11,16 @@ local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
+The shared `message` tool exposes Marmot reaction add/remove through its
+`react` action. Reactions target durable message ids; omitting `messageId`
+targets the current inbound message. Removal requires explicit `remove: true`:
+a non-empty `emoji` removes that exact content, while an omitted or empty
+`emoji` removes all of the agent account's active reactions on the target.
+Missing, empty, or non-string emoji values never implicitly remove reactions.
+Repeating a removal is idempotent. Reaction content follows the
+agent-control v2 bound: non-blank, control-free, and at most 64 Unicode scalar
+values.
+
 For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
 materialized chat window and supplies it to OpenClaw with durable message ids,
 senders, timestamps, reply links, current reaction summaries, and
