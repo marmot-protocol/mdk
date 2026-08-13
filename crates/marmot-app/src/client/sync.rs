@@ -289,7 +289,11 @@ impl AppClient {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
-        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+        let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
+        // A routing-table delta lives in memory and obligates the subscription
+        // refresh below, not a state write; only route retirement mutates
+        // persisted group state.
+        if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(SyncFailure::from)?;
         }
@@ -465,7 +469,7 @@ impl AppClient {
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
-        let routes_changed = self.refresh_group_routes()?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
         if (routes_dirty || routes_changed)
             && let Err(error) = self.sync_runtime_groups().await
         {
@@ -520,7 +524,7 @@ impl AppClient {
                 None,
             )
             .await?;
-        let routes_changed = self.refresh_group_routes()?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
@@ -616,12 +620,6 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
-        let mut seen = self
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
 
         loop {
             let delivery = self
@@ -630,13 +628,12 @@ impl AppClient {
                 .await?
                 .ok_or(AppError::TransportClosed)?;
             let event_id = hex::encode(delivery.message.id.as_slice());
-            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 continue;
             }
-            if seen.contains(&event_id) {
+            if self.seen_events_index.contains(&event_id) {
                 continue;
             }
-            remember_seen_event(&mut seen, &mut self.state, event_id);
             return Ok(delivery);
         }
     }
@@ -647,18 +644,31 @@ impl AppClient {
     ) -> Result<SyncSummary, AppError> {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
+        let event_id = hex::encode(delivery.message.id.as_slice());
         let routes_dirty = self
             .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
+        // Mark the delivery seen only after durable ingest succeeds, matching
+        // the catch-up drain below. Marking at receive time would let a failed
+        // ingest poison the index, so a reused client would silently skip the
+        // redelivered event.
+        remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
         if routes_dirty {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
-        let routes_changed = self.refresh_group_routes()?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        if routes_dirty || routes_changed {
+        let refresh = self.refresh_group_routes()?;
+        // The routes-dirty save above already persisted this delivery's app
+        // projection; save again only when that first save did not run, or
+        // when route retirement just mutated persisted group state. The
+        // routing-table delta lives in memory and obligates a subscription
+        // refresh, not a second identical state write.
+        if !routes_dirty || refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        if routes_dirty || refresh.routing_changed {
             self.sync_runtime_groups().await?;
         }
         self.drain_epoch_stall_escalations(&mut summary);
@@ -674,12 +684,6 @@ impl AppClient {
             .map_err(|source| SyncFailure::from(AppError::from(source)))?
             .account_id_hex;
         let mut summary = SyncSummary::default();
-        let mut seen = self
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
         let mut first_wait = true;
         // Forensic drain accounting: wall-clock span, count of deliveries
         // actually ingested (echoes and already-seen duplicates are skipped and
@@ -715,10 +719,10 @@ impl AppClient {
                 Err(_) => break,
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
-            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 continue;
             }
-            if seen.contains(&event_id) {
+            if self.seen_events_index.contains(&event_id) {
                 continue;
             }
             if cfg!(feature = "test-policy-overrides")
@@ -758,7 +762,7 @@ impl AppClient {
                         .await);
                 }
             };
-            remember_seen_event(&mut seen, &mut self.state, event_id);
+            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
             *deliveries = (*deliveries).saturating_add(1);
             summary.merge(delivery_summary);
             routes_dirty |= delivery_routes_dirty;
@@ -832,7 +836,8 @@ impl AppClient {
     ) -> Result<(), SyncCheckpointError> {
         let routes_changed = self
             .refresh_group_routes()
-            .map_err(SyncCheckpointError::BeforePersistence)?;
+            .map_err(SyncCheckpointError::BeforePersistence)?
+            .routing_changed;
         let checkpoint = if cfg!(feature = "test-policy-overrides")
             && self
                 .app
@@ -1413,7 +1418,10 @@ impl AppClient {
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
     pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
-        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+        let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
+        // As in `sync_inner`: save only for persisted-state pruning, not for
+        // in-memory routing-table deltas.
+        if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(SyncFailure::from)?;
         }
@@ -1502,7 +1510,7 @@ impl AppClient {
                 None,
             )
             .await?;
-        let routes_changed = self.refresh_group_routes()?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }

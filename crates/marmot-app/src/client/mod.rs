@@ -82,6 +82,20 @@ where
     results.into_iter().map(|(_, result)| result).collect()
 }
 
+/// Outcome of one [`AppClient::refresh_group_routes`] pass, separating the
+/// in-memory routing-table delta from durable-state mutation: only the latter
+/// obligates a state save, only the former obligates a relay-subscription
+/// refresh.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GroupRouteRefresh {
+    /// The in-memory routing table changed; relay subscriptions need a
+    /// `sync_runtime_groups` refresh.
+    pub(crate) routing_changed: bool,
+    /// `prune_prior_nostr_routes` removed retired prior routes from persisted
+    /// group state; a save is required for the retirement to stick.
+    pub(crate) state_pruned: bool,
+}
+
 pub struct AppClient {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
@@ -93,6 +107,12 @@ pub struct AppClient {
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
     pub(crate) state: AccountState,
+    /// O(1) membership index over `state.seen_events`, kept in lockstep by
+    /// `remember_seen_event` (which removes pruned ring entries from it).
+    /// Derived state: rebuilt from the ordered ring at construction and never
+    /// persisted. Before this index existed, every inbound delivery and every
+    /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.
+    pub(crate) seen_events_index: HashSet<String>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
@@ -3229,8 +3249,8 @@ impl AppClient {
 
     /// Reconcile every group's current and still-live prior transport
     /// subscriptions, returning whether any installed route changed.
-    pub(crate) fn refresh_group_routes(&mut self) -> Result<bool, AppError> {
-        let mut changed = false;
+    pub(crate) fn refresh_group_routes(&mut self) -> Result<GroupRouteRefresh, AppError> {
+        let mut refresh = GroupRouteRefresh::default();
         for group in &mut self.state.groups {
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
                 tracing::warn!(
@@ -3248,7 +3268,7 @@ impl AppClient {
                 .is_ok_and(|group| group.disbanded.is_some())
             {
                 if self.routing.replace_group_routes(&group_id, Vec::new()) {
-                    changed = true;
+                    refresh.routing_changed = true;
                 }
                 continue;
             }
@@ -3262,7 +3282,7 @@ impl AppClient {
                 .unwrap_or(true)
                 && let Ok(group_record) = self.runtime.group_record(&group_id)
             {
-                group.prune_prior_nostr_routes(group_record.epoch.0);
+                refresh.state_pruned |= group.prune_prior_nostr_routes(group_record.epoch.0);
             }
             let Ok(subscriptions) = group.transport_subscriptions(&group_id) else {
                 tracing::warn!(
@@ -3274,10 +3294,10 @@ impl AppClient {
                 continue;
             };
             if self.routing.replace_group_routes(&group_id, subscriptions) {
-                changed = true;
+                refresh.routing_changed = true;
             }
         }
-        Ok(changed)
+        Ok(refresh)
     }
 
     fn refresh_routing(&mut self) -> Result<(), AppError> {
@@ -3293,13 +3313,9 @@ impl AppClient {
         if effects.reports.is_empty() {
             return;
         }
-        // The publish path holds no parallel lookup set (unlike the inbound
-        // `next_event`/`sync_sdk_relay` hot path), so build one once for this
-        // small report batch and reuse the shared O(1) recorder for each id.
-        let mut seen: HashSet<String> = self.state.seen_events.iter().cloned().collect();
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
-            remember_seen_event(&mut seen, &mut self.state, event_id);
+            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
         }
     }
 

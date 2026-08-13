@@ -7198,6 +7198,139 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
     );
 }
 
+/// A delivery whose ingest fails must stay retryable on the same reused
+/// client.
+///
+/// `receive_next_delivery` must not mark the id seen before
+/// `ingest_received_delivery` commits it: a pre-ingest mark would poison the
+/// seen-events index on failure, so the reused client would silently skip the
+/// event when the relay redelivers it.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    // One shared plane for both clients, so a publish fans out locally into
+    // the other account's registered routes (`deliver_local_publish`).
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    // Register bob's inbox route before the welcome publishes.
+    bob_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group("retryable failed ingest", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let inject = |event: NostrTransportEvent| {
+        let plane = plane.clone();
+        async move {
+            plane
+                .handle_relay_event_for_test(NostrRelayEvent {
+                    endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                    subscription_id: None,
+                    event,
+                })
+                .await
+        }
+    };
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "bob must join before the failing application message",
+    );
+
+    let published_before_send = relay.published_events.lock().unwrap().len();
+    alice
+        .send(&group_id, b"must survive a failed ingest")
+        .await
+        .unwrap();
+    let relay_event = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(published_before_send)
+        .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .cloned()
+        .expect("published group message backing the send");
+    bob_client
+        .app
+        .config
+        .dev_fail_ingest_after_application_event_ack = true;
+    let delivery = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+        .await
+        .expect("locally fanned-out application message")
+        .unwrap();
+    let event_id = hex::encode(delivery.message.id.as_slice());
+    assert_eq!(event_id, relay_event.id);
+    bob_client
+        .ingest_received_delivery(delivery)
+        .await
+        .expect_err("the injected post-ack failure must surface");
+    assert!(
+        !bob_client.seen_events_index.contains(&event_id),
+        "a failed ingest must not mark the delivery seen",
+    );
+
+    // The relay redelivers (for example on resubscribe); the reused client
+    // must return the delivery again instead of skipping it as already seen.
+    bob_client
+        .app
+        .config
+        .dev_fail_ingest_after_application_event_ack = false;
+    assert!(
+        inject(relay_event).await.expect("route the redelivery") >= 1,
+        "the group route must accept the redelivery",
+    );
+    let redelivery =
+        tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+            .await
+            .expect("redelivered application message")
+            .unwrap();
+    assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
+    let summary = bob_client
+        .ingest_received_delivery(redelivery)
+        .await
+        .expect("the retry must ingest the redelivered event");
+    assert!(
+        bob_client.seen_events_index.contains(&event_id),
+        "a successful ingest must mark the delivery seen",
+    );
+    // The first attempt durably projected the message before its injected
+    // post-ack failure, so the retried duplicate must not project it again.
+    // (Live-summary replay after a post-ack failure is pinned separately in
+    // `tests/partial_sync_summary.rs`.)
+    assert!(
+        summary.messages.is_empty(),
+        "the retried duplicate must not re-project the already-applied message",
+    );
+    assert_eq!(
+        app.messages("bob")
+            .unwrap()
+            .iter()
+            .map(|message| message.plaintext.as_str())
+            .collect::<Vec<_>>(),
+        vec!["must survive a failed ingest"],
+        "the failed delivery's message must be durably projected exactly once",
+    );
+}
+
 /// Every SQLite database this app can open, plus the root runtime lease, must
 /// be released by one `close_storage` call — that is the whole contract iOS
 /// depends on before it suspends the process (`0xdead10cc` is raised for *any*
