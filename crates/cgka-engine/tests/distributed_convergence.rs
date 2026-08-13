@@ -2438,8 +2438,13 @@ async fn retained_application_delivery_is_invariant_to_convergence_pass_partitio
         b"retained across active convergence".to_vec(),
     )
     .await;
+    let retention_limit =
+        usize::try_from(CanonicalizationPolicy::default().app_message_past_epoch_limit)
+            .expect("pinned application-retention limit fits usize");
+    let commit_count = retention_limit + 1;
+    let expected_tip = EpochId(1 + commit_count as u64);
     let mut commits = Vec::new();
-    for index in 0..6 {
+    for index in 0..commit_count {
         let identity = format!("partition-invitee-{index}");
         let (mut invitee, _invitee_storage) = build_client(identity.as_bytes());
         let invite = alice
@@ -2459,11 +2464,17 @@ async fn retained_application_delivery_is_invariant_to_convergence_pass_partitio
             .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
             .unwrap();
     }
+    // Inbound contested-pass handoff can retain a past-epoch wire message in
+    // a row stamped with the receiver's newer current epoch. Final apply must
+    // order by the authenticated wire source epoch, not this row metadata.
+    let mut one_pass_app_record = one_pass_storage.get_message(&content_id(&app)).unwrap();
+    one_pass_app_record.epoch = expected_tip;
+    one_pass_storage.put_message(&one_pass_app_record).unwrap();
     let one_pass_result = one_pass
         .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
 
-    for message in commits[..5].iter().chain([&app]) {
+    for message in commits[..retention_limit].iter().chain([&app]) {
         split_pass
             .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
             .unwrap();
@@ -2472,15 +2483,19 @@ async fn retained_application_delivery_is_invariant_to_convergence_pass_partitio
         .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     split_pass
-        .buffer_openmls_convergence_message_at(&group_id, commits[5].clone(), 2_000_000)
+        .buffer_openmls_convergence_message_at(
+            &group_id,
+            commits[retention_limit].clone(),
+            2_000_000,
+        )
         .unwrap();
     split_pass
         .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .unwrap();
 
-    assert_eq!(one_pass.epoch(&group_id).unwrap(), EpochId(7));
-    assert_eq!(split_pass.epoch(&group_id).unwrap(), EpochId(7));
-    assert_eq!(one_pass_result.accepted_commits.len(), 6);
+    assert_eq!(one_pass.epoch(&group_id).unwrap(), expected_tip);
+    assert_eq!(split_pass.epoch(&group_id).unwrap(), expected_tip);
+    assert_eq!(one_pass_result.accepted_commits.len(), commit_count);
     assert_eq!(
         one_pass_result.accepted_app_messages,
         vec![content_hex(&app)]
