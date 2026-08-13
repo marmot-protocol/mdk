@@ -335,7 +335,7 @@ pub fn generate_adversarial_reliability_case(seed: u64, case_index: u64) -> Gene
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "3".into(),
+        generator_version: "4".into(),
         seed,
         case_index,
         subject,
@@ -1785,12 +1785,16 @@ fn admin_policy_step(client: &str, admins: Vec<String>, pending: &str) -> Scenar
 }
 
 fn payload_absent_assert(client: &str, payload: &str) -> ScenarioStep {
+    payload_count_assert(client, payload, 0)
+}
+
+fn payload_count_assert(client: &str, payload: &str, count: usize) -> ScenarioStep {
     ScenarioStep::Assert {
         assertion: crate::ScenarioAssertionV2::Exactly {
             predicate: crate::ScenarioPredicateV2::PayloadCount {
                 client: client.into(),
                 payload: payload.into(),
-                count: 0,
+                count,
             },
         },
     }
@@ -2960,6 +2964,11 @@ fn adversarial_reliability_app_witness_value(
                 delta_ms: 30 * 24 * 60 * 60 * 1_000 + 1,
             },
             tick(["alice", "bob", "carol", "david", "eve", "frank"]),
+            // MLS does not define an order between different senders. Pin the
+            // exact payload multiset without inventing a cross-sender order.
+            payload_count_assert("carol", &format!("eve-witness-{case_index}"), 1),
+            payload_count_assert("carol", &format!("frank-witness-{case_index}"), 1),
+            payload_count_assert("carol", &format!("david-witness-{case_index}"), 0),
         ],
     };
     (
@@ -2971,15 +2980,14 @@ fn adversarial_reliability_app_witness_value(
             // Bob's branch carries two app witnesses against alice's one, so
             // witness-decided selection deterministically keeps eve's and
             // frank's payloads and never emits david's on carol.
-            client_state(
-                "carol",
-                2,
-                5,
-                vec![
-                    format!("eve-witness-{case_index}"),
-                    format!("frank-witness-{case_index}"),
-                ],
-            ),
+            TraceExpectation::ClientState {
+                client: "carol".into(),
+                epoch: 2,
+                member_count: 5,
+                received_payloads: None,
+                added_members: None,
+                removed_members: None,
+            },
         ],
     )
 }

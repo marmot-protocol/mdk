@@ -741,11 +741,14 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### Adversarial Reliability Catalog
 
-`adversarial-reliability/v1` (generator version `3`) rotates through twelve deterministic workload shapes: retained-history offline floods;
+`adversarial-reliability/v1` (generator version `4`) rotates through twelve deterministic workload shapes: retained-history offline floods;
 sustained app/proposal/commit traffic; self-update versus admin progress; a named unrecoverable losing-branch invite;
 unequal relay reconciliation; restart boundaries plus the engine's real SIGKILL durable-phase matrix; multi-group noisy
 neighbors; replay-budget exhaustion; shared-account multi-device witnesses; full-engine app-witness A/B selection;
 mixed-binary compatibility with mixed-policy preflight rejection; and clock, scheduler, timestamp, and cursor attacks.
+The app-witness case pins the exact payload multiplicity for each candidate branch but deliberately does not claim an
+order between messages from different senders; scenarios that inject a transport reorder continue to pin ordered
+`received_payloads` explicitly.
 
 The normal test target runs small headline regressions. The multi-round sustained case is ignored by default and is
 invoked explicitly; the report CLI runs any number of seeded cases with either in-memory or encrypted file-backed

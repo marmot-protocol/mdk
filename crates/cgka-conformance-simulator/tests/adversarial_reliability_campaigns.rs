@@ -32,7 +32,7 @@ fn generator_versions_track_the_renamed_output_contract() {
     assert!(
         generate_adversarial_reliability_family(7, 12)
             .iter()
-            .all(|case| case.generator_version == "3")
+            .all(|case| case.generator_version == "4")
     );
     for case in [
         generate_adversarial_reliability_offline_regression(7),
@@ -41,6 +41,57 @@ fn generator_versions_track_the_renamed_output_contract() {
     ] {
         assert_eq!(case.generator_version, "3-regression");
     }
+}
+
+#[test]
+fn app_witness_case_pins_payload_multiplicity_without_cross_sender_order() {
+    let case = generate_adversarial_reliability_case(7, 9);
+    let carol_payload_order = case.expected_outcomes.iter().find_map(|expectation| {
+        if let cgka_conformance_simulator::TraceExpectation::ClientState {
+            client,
+            received_payloads,
+            ..
+        } = expectation
+            && client == "carol"
+        {
+            return Some(received_payloads);
+        }
+        None
+    });
+    assert_eq!(carol_payload_order, Some(&None));
+
+    let payload_counts = case
+        .scenario
+        .steps
+        .iter()
+        .filter_map(|step| {
+            if let cgka_conformance_simulator::ScenarioStep::Assert {
+                assertion:
+                    cgka_conformance_simulator::ScenarioAssertionV2::Exactly {
+                        predicate:
+                            cgka_conformance_simulator::ScenarioPredicateV2::PayloadCount {
+                                client,
+                                payload,
+                                count,
+                            },
+                    },
+            } = step
+                && client == "carol"
+                && payload.ends_with("-witness-9")
+            {
+                return Some((payload.as_str(), *count));
+            }
+            None
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        payload_counts,
+        std::collections::BTreeMap::from([
+            ("david-witness-9", 0),
+            ("eve-witness-9", 1),
+            ("frank-witness-9", 1),
+        ])
+    );
 }
 
 async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator::ScenarioReport {
