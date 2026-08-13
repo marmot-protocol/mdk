@@ -2581,6 +2581,10 @@ pub(crate) struct StreamComposer {
     pub(crate) group_id: String,
     pub(crate) pending_text: String,
     pub(crate) last_flush: Instant,
+    /// Total bytes flushed to the compose session so far. Tracked locally
+    /// because the per-append ack no longer echoes the accumulated
+    /// transcript back.
+    pub(crate) flushed_bytes: usize,
 }
 
 pub(crate) fn subscription_event_from_json(envelope: Value) -> SubscriptionEvent {

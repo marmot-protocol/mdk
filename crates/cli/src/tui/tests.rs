@@ -1572,6 +1572,7 @@ fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
         group_id: stream_group.to_owned(),
         pending_text: String::new(),
         last_flush: Instant::now(),
+        flushed_bytes: 0,
     });
     app.input.set_value("hello");
 
@@ -2606,6 +2607,7 @@ fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
         group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
         pending_text: "queued".to_owned(),
         last_flush: stale_flush,
+        flushed_bytes: 0,
     });
 
     let first = app.flush_stream_append_if_due(first_due);
@@ -2641,6 +2643,7 @@ fn streaming_keys_capture_input_before_screen_dispatch() {
         group_id: "bb".repeat(32),
         pending_text: String::new(),
         last_flush: Instant::now(),
+        flushed_bytes: 0,
     });
 
     // Main view: a character queues on the stream composer.
@@ -2681,6 +2684,7 @@ fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
         group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
         pending_text: String::new(),
         last_flush: Instant::now(),
+        flushed_bytes: 0,
     });
     app.input.set_value("hello");
 
@@ -2726,6 +2730,7 @@ fn streaming_enter_failure_before_finish_preserves_composer() {
         group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
         pending_text: "queued".to_owned(),
         last_flush: Instant::now(),
+        flushed_bytes: 0,
     });
     app.input.set_value("queued");
 
@@ -9699,6 +9704,7 @@ fn handle_paste_while_streaming_appends_to_pending_text_and_updates_status() {
         group_id: "bb".repeat(32),
         pending_text: "typed".to_owned(),
         last_flush: Instant::now(),
+        flushed_bytes: 0,
     });
 
     app.handle_paste("PASTED".to_owned());

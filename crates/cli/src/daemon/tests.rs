@@ -457,7 +457,6 @@ async fn stream_compose_returns_local_transcript_when_broker_connect_is_pending(
         .expect("append should not wait for broker connect")
         .unwrap()
         .unwrap();
-    assert_eq!(appended.text, "hello ");
     assert_eq!(appended.chunk_count, 1);
 
     let (finish_tx, finish_rx) = oneshot::channel();

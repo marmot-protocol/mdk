@@ -731,6 +731,7 @@ impl TuiApp {
             group_id: preview_group_id.clone(),
             pending_text: String::new(),
             last_flush: Instant::now(),
+            flushed_bytes: 0,
         });
         self.input.clear();
         self.refresh_messages()?;
@@ -827,16 +828,15 @@ impl TuiApp {
                 return Err(err);
             }
         };
+        let _ = result;
+        let mut bytes = text.len();
         if let Some(streaming) = self.streaming.as_mut()
             && streaming.stream_id == stream_id
         {
             streaming.last_flush = Instant::now();
+            streaming.flushed_bytes += text.len();
+            bytes = streaming.flushed_bytes;
         }
-        let bytes = result
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or_default();
         self.status = format!("streaming {} bytes on {}", bytes, shorten(&stream_id, 18));
         Ok(())
     }

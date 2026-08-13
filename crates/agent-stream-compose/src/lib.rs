@@ -45,6 +45,43 @@ pub struct StreamComposeReport {
     pub error: Option<String>,
 }
 
+/// Per-command acknowledgement for `Append`/`Status`/`Progress`.
+///
+/// [`StreamComposeReport`] minus the accumulated `text`. The session still
+/// appends every chunk to its full transcript internally (`Finish` returns
+/// and validates it), but responding with the report cloned the entire
+/// transcript so far on every command — O(n²) bytes copied over a stream's
+/// life, for a value both the connector and the daemon discard. Callers that
+/// need the final text get it from `Finish`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamComposeAck {
+    pub account: Option<String>,
+    pub group_id: String,
+    pub stream_id: String,
+    pub start_message_id: String,
+    pub candidate: String,
+    pub status: String,
+    pub transcript_hash: Option<String>,
+    pub chunk_count: u64,
+    pub error: Option<String>,
+}
+
+impl StreamComposeAck {
+    fn from_report(report: &StreamComposeReport) -> Self {
+        Self {
+            account: report.account.clone(),
+            group_id: report.group_id.clone(),
+            stream_id: report.stream_id.clone(),
+            start_message_id: report.start_message_id.clone(),
+            candidate: report.candidate.clone(),
+            status: report.status.clone(),
+            transcript_hash: report.transcript_hash.clone(),
+            chunk_count: report.chunk_count,
+            error: report.error.clone(),
+        }
+    }
+}
+
 /// Caller-supplied final-transcript expectation, validated atomically inside
 /// the compose task before any teardown. On mismatch the session responds
 /// `Err` and keeps running, so finalize is retryable.
@@ -59,15 +96,15 @@ pub struct StreamFinishExpectation {
 pub enum StreamComposeCommand {
     Append {
         text: String,
-        respond: oneshot::Sender<Result<StreamComposeReport, String>>,
+        respond: oneshot::Sender<Result<StreamComposeAck, String>>,
     },
     Status {
         status: String,
-        respond: oneshot::Sender<Result<StreamComposeReport, String>>,
+        respond: oneshot::Sender<Result<StreamComposeAck, String>>,
     },
     Progress {
         text: String,
-        respond: oneshot::Sender<Result<StreamComposeReport, String>>,
+        respond: oneshot::Sender<Result<StreamComposeAck, String>>,
     },
     Finish {
         /// Optional final-transcript expectation. When set, it is validated
@@ -531,7 +568,7 @@ async fn append_stream_compose_text<P: LiveBrokerPublisher>(
     mut live: ComposeLiveSink<'_, P>,
     text: String,
     chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
+) -> Result<StreamComposeAck, String> {
     transcript.append_text(&text, chunk_bytes)?;
     report.text.push_str(&text);
     report.chunk_count = transcript.chunk_count();
@@ -548,7 +585,7 @@ async fn append_stream_compose_text<P: LiveBrokerPublisher>(
         report.error = Some(format!("live stream failed: {err}"));
     }
 
-    Ok(report.clone())
+    Ok(StreamComposeAck::from_report(report))
 }
 
 async fn append_stream_compose_status<P: LiveBrokerPublisher>(
@@ -557,7 +594,7 @@ async fn append_stream_compose_status<P: LiveBrokerPublisher>(
     live: ComposeLiveSink<'_, P>,
     status: String,
     chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
+) -> Result<StreamComposeAck, String> {
     report.status.clone_from(&status);
     append_stream_compose_non_text_record(
         report,
@@ -576,7 +613,7 @@ async fn append_stream_compose_progress<P: LiveBrokerPublisher>(
     live: ComposeLiveSink<'_, P>,
     text: String,
     chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
+) -> Result<StreamComposeAck, String> {
     append_stream_compose_non_text_record(
         report,
         transcript,
@@ -602,7 +639,7 @@ async fn append_stream_compose_non_text_record<P: LiveBrokerPublisher>(
     record_type: u8,
     text: String,
     chunk_bytes: usize,
-) -> Result<StreamComposeReport, String> {
+) -> Result<StreamComposeAck, String> {
     transcript.append_record_text(record_type, &text, chunk_bytes)?;
     report.chunk_count = transcript.chunk_count();
     report.transcript_hash = Some(transcript.transcript_hash());
@@ -612,7 +649,7 @@ async fn append_stream_compose_non_text_record<P: LiveBrokerPublisher>(
         report.error = Some(format!("live stream failed: {err}"));
     }
 
-    Ok(report.clone())
+    Ok(StreamComposeAck::from_report(report))
 }
 
 async fn append_live_record<P: LiveBrokerPublisher>(
