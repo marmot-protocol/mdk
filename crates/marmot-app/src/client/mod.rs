@@ -2078,6 +2078,9 @@ impl AppClient {
                 target_message_id,
                 emoji,
             } => {
+                if let Some(emoji) = emoji.as_deref() {
+                    crate::messages::validate_reaction_content(emoji)?;
+                }
                 let reaction_message_ids = self.own_reaction_event_ids(
                     group_id,
                     &sender,
@@ -2318,14 +2321,16 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
-        if let Ok(existing) =
-            self.own_reaction_event_ids(group_id, &sender, target_message_id, Some(emoji))
-        {
-            return Ok(SendSummary {
-                published: 0,
-                message_ids: vec![existing.last().expect("non-empty reaction ids").clone()],
-                maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
-            });
+        match self.own_reaction_event_ids(group_id, &sender, target_message_id, Some(emoji)) {
+            Ok(existing) => {
+                return Ok(SendSummary {
+                    published: 0,
+                    message_ids: vec![existing.last().expect("non-empty reaction ids").clone()],
+                    maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
+                });
+            }
+            Err(AppError::ReactionNotFound) => {}
+            Err(error) => return Err(error),
         }
         let (_event, summary) = self
             .send_app_event_with_local_projection(
