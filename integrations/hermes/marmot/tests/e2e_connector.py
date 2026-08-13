@@ -124,9 +124,13 @@ async def run() -> None:
 
     from gateway.config import PlatformConfig
 
-    # Keep Unix socket paths short for macOS sockaddr_un limits. Python's
-    # default temp dir can live under a long /var/folders/... path.
-    with tempfile.TemporaryDirectory(prefix="mhce-", dir="/tmp") as tmp:
+    # Keep Unix socket paths short for macOS sockaddr_un limits without using
+    # `/tmp`, whose canonical private-directory posture is intentionally
+    # rejected by fs-private. CI may supply another owner-controlled parent.
+    temp_parent = Path(
+        os.environ.get("MARMOT_CONNECTOR_E2E_TMPDIR") or Path.home()
+    ).expanduser()
+    with tempfile.TemporaryDirectory(prefix="mhce-", dir=temp_parent) as tmp:
         tmp_path = Path(tmp)
         marmot_home = tmp_path / "marmot-home"
         socket_path = tmp_path / "wn-agent.sock"
