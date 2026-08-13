@@ -232,7 +232,7 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(resultError(result)).toMatch(/could not resolve group/);
   });
 
-  it("adds a reaction to the current inbound message", async () => {
+  it("adds a reaction to the current inbound message with a prefixed target", async () => {
     const sendReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
@@ -245,7 +245,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const result = await adapter.handleAction!(
       reactCtx(
         { emoji: "👀" },
-        { currentMessageId: HEX32("99"), currentMessagingTarget: HEX32("cc") },
+        { currentMessageId: HEX32("99"), currentMessagingTarget: `marmot:${HEX32("cc")}` },
       ),
     );
 
@@ -283,7 +283,7 @@ describe("createMarmotMessageActionAdapter", () => {
     );
   });
 
-  it("removes the bot's reaction when emoji is empty", async () => {
+  it("removes the bot's reaction from a prefixed target when emoji is empty", async () => {
     const removeReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
@@ -294,7 +294,7 @@ describe("createMarmotMessageActionAdapter", () => {
     });
 
     const result = await adapter.handleAction!(
-      reactCtx({ messageId: HEX32("99"), to: HEX32("cc"), emoji: "" }),
+      reactCtx({ messageId: HEX32("99"), to: `marmot:${HEX32("cc")}`, emoji: "" }),
     );
 
     expect(removeReaction).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("99"));

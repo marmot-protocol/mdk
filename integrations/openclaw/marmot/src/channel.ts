@@ -168,10 +168,11 @@ export function createMarmotMessageActionAdapter(
             : typeof ctx.params.message_id === "string"
               ? ctx.params.message_id
             : String(ctx.toolContext?.currentMessageId ?? "");
-        const to =
+        const rawTo =
           typeof ctx.params.to === "string"
             ? ctx.params.to
             : ctx.toolContext?.currentMessagingTarget;
+        const to = rawTo?.startsWith("marmot:") ? rawTo.slice("marmot:".length) : rawTo;
         if (!messageId) {
           return jsonResult({
             ok: false,

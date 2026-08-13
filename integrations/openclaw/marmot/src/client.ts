@@ -66,11 +66,13 @@ export interface AppEventSentResponse {
 }
 
 function requireAppEventSent(response: Envelope): AppEventSentResponse {
+  const isMessageId = (value: unknown): value is string =>
+    typeof value === "string" && /^[0-9a-fA-F]{64}$/.test(value);
   if (
     response.type !== "app_event_sent" ||
     !Array.isArray(response.message_ids_hex) ||
     response.message_ids_hex.length === 0 ||
-    response.message_ids_hex.some((value) => typeof value !== "string" || value.length === 0)
+    response.message_ids_hex.some((value) => !isMessageId(value))
   ) {
     throw new AgentControlError("wn-agent returned invalid durable reaction response", {
       code: "invalid_reaction_response",
