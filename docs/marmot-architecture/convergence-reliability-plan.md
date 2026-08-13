@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-12
+updated: 2026-08-13
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -998,10 +998,14 @@ through app-runtime, process, retained-history, or distributed execution. Milest
 equivalence and cryptographic interoperability as first-class campaign properties rather than assuming that either the
 engine repair or scaling the existing corpus is sufficient.
 
-Status update (2026-08, option C route unification): the pairwise fork-recovery route has since been deleted — every
-member adjudicates a same-epoch rival through distributed convergence, so the specific committer-versus-observer
-asymmetry above no longer exists structurally. The 6.1 items below remain the assurance program for the routes that
-still exist (ordinary ingest, stored convergence, retained-history replay, crash/restart recovery).
+Status update (2026-08, option C route unification):
+[MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) deleted the pairwise fork-recovery route — every member
+now adjudicates a same-epoch rival through distributed convergence, so the specific committer-versus-observer
+asymmetry above no longer exists structurally. [MDK #1403](https://github.com/marmot-protocol/mdk/pull/1403) then
+closed the queued-outbound scheduling defect exposed by that unification. The 6.1 items below remain the assurance
+program for the routes that still exist (ordinary ingest, stored convergence, retained-history replay, and
+crash/restart recovery). The pre-unification app-runtime counterexample remains valuable historical evidence, but it
+must be rerun on the unified route before it can describe current `master`.
 
 ### 6.1 Decision-route assurance closure
 
@@ -1053,11 +1057,13 @@ reliably. Preserve and minimize that counterexample before changing production c
 dependency-closed input contract into process/container/VM execution and the remaining durable-transition
 permutations.
 
-[MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) has now merged the fail-closed missing-anchor behavior and
-Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) remains
-open and is not part of the oracle. The route inventory, assurance claims, and campaign inputs remain independently
-reviewable and runnable against current `master`; a production PR may change the implementation under test, but not
-silently redefine the expected result.
+[MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) merged the fail-closed missing-anchor behavior and
+Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) has now
+merged the single distributed same-epoch route, and [MDK #1403](https://github.com/marmot-protocol/mdk/pull/1403)
+repairs the durable queued-send scheduling edge it exposed. The route inventory, assurance claims, and campaign inputs
+remain independently reviewable and runnable against current `master`; a production PR may change the implementation
+under test, but not silently redefine the expected result. Revalidate the app-runtime counterexample after those
+production changes before deciding whether it is still a live defect or only pre-unification evidence.
 
 ### 6.2 Container and VM execution
 
@@ -1253,9 +1259,11 @@ residual gap.
    reference passes exact state, dispositions, pending-work, and decryptability checks. A focused
    hide/repair/restore/repair regression fixes and protects the original destructive event-id tombstone bug, but
    repeated corrected-input app runs still produce both complete equivalence and a two-branch protocol/probe split.
-   Route equivalence, active decryptability, and complete application disposition therefore remain open alongside
-   process/container/VM execution and durable-transition permutations. The decision-route inventory is machine
-   checked; keep the remaining assurance artifacts independent of #1293.
+   Those repeated executions predate the merged route unification and queued-send scheduling repair. Re-run the exact
+   corrected-input app-runtime scenario on current `master` before carrying its outcome into process/container/VM
+   execution. Route equivalence, active decryptability, complete application disposition, distributed execution, and
+   durable-transition permutations remain open. The decision-route inventory is machine checked against the unified
+   route.
 6. [x] Land and execute a focused current-`master` regression gate for the production convergence changes that landed
    after the reviewed 1,170-case snapshot. Cover #1329 missing-anchor halt and authenticated Welcome repair, #1360
    atomic self-removal persistence across injected write failures and restart, #1365 armed full-history backfill after
@@ -1430,6 +1438,9 @@ incorrect result.
 | 2026-08-11 | 6.1 app-runtime cross-route falsification | Added action-addressed event staging to the app-runtime harness's real retained Nostr relay so offline recipients cannot race the intended four-party branch topology. The strict retained-engine reference still reaches exact state, durable commit dispositions, no pending work, and twelve active decryptability edges; repeated app-runtime executions have three exact counterexample surfaces: Zeta one epoch behind, public agreement with Alpha's probe missing at Zeta, or an Alpha/Observer versus Yankee/Zeta protocol-and-probe split. A fourth shape or complete equivalence now fails the characterization. This is retained counterexample evidence, not passing route-equivalence evidence; no production convergence behavior changed. | `cross-route-app-runtime-recovery/v1`; `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; route-assurance claims reopened |
 | 2026-08-11 | 6.1 pairwise route retirement | Retired the `pairwise_fork_recovery` decision-route claim after the option C unification deleted the route: the inventory entry, enum variant, and matrix row were removed rather than re-pointed at distributed convergence, which already holds its own route claim and would have double-counted the same seam. The two surviving properties are cited under `stored_convergence` as the renamed engine regressions, and the abstract route-lifecycle mutant survives route-agnostically | [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293); `route_assurance`; `provisional_winner_terminalization`; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md) retired-routes record |
 | 2026-08-12 | 6.1 app-runtime cross-route corrected-input evidence | Replaced destructive event deletion with a reversible relay query-visibility layer and added a focused offline hide/repair/restore/repair regression. Repeated validation disproved the proposed positive-equivalence rewrite: corrected-input executions can reach full equivalence or retain a two-branch public/probe split even though the strict retained-engine reference reaches exact canonical state, accepted/invalidated/accepted commit dispositions, no pending work, and twelve decryptability edges. The corrected-input characterization passed 20/20 consecutive executions on commit `2461b874`, while the equivalence-only contract failed during its repetition sequence. The app-runtime route-equivalence, active-decryptability, and complete-application-disposition claims remain open; no production behavior changed. | `retained_relay_control_restores_hidden_history_for_offline_repair`; `four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes`; corrected simulator input contract plus retained falsification |
+| 2026-08-12 | 6.1 unified same-epoch route and queued-send repair | Merged option C: removed the pairwise committer-only fork route so every participant uses distributed convergence, added branch-relative peel contexts and route-equivalence evidence, then repaired the durable queued-outbound scheduling edge and runnable-work level signal exposed by the longer unified convergence window. The corrected-input app-runtime result above predates both changes and is retained as historical falsification evidence, not a characterization of current `master`; repeat it before assigning the next production defect. | [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293); [MDK #1403](https://github.com/marmot-protocol/mdk/pull/1403); unified-route engine and simulator regressions |
+| 2026-08-13 | Post-unification campaign performance baseline | Replaced full retained-message scans with indexed state probes, scoped retained-anchor snapshots to canonical group state while keeping legacy full-snapshot rollback compatibility, and point-queried Welcome key packages plus buffered replay states during join/create lifecycle work. These changes reduce the cost of long-history and participant-growth campaigns but do not close any route-equivalence or distributed evidence item by themselves. | [MDK #1405](https://github.com/marmot-protocol/mdk/pull/1405); [MDK #1406](https://github.com/marmot-protocol/mdk/pull/1406); [MDK #1416](https://github.com/marmot-protocol/mdk/pull/1416); storage and engine suites plus lifecycle benchmarks |
+| 2026-08-13 | Nightly cross-sender oracle correction | Diagnosed the scheduled lane failure as an invalid ordering claim in `adversarial-reliability/app-witness-value/v1`: both runs agreed on the selected branch, epoch, roster, and exact payload multiplicities, but MLS does not define a total order across independent senders. The scenario now asserts one Eve witness, one Frank witness, and no David witness without weakening scenarios that intentionally test ordered delivery. A failed nightly lane also emits the exact seed-7 adversarial reports and capsules before propagating failure, and the runner raises its memlock limit instead of flooding logs when SQLCipher locks sensitive allocations. | [MDK #1409](https://github.com/marmot-protocol/mdk/issues/1409); scheduled run `31669097875`; focused adversarial reliability tests; nightly artifact path |
 
 ## Capability Naming Cleanup
 

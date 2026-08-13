@@ -51,7 +51,32 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run nightly convergence lane
-        run: just convergence-nightly-lane
+        id: convergence_lane
+        continue-on-error: true
+        run: |
+          # SQLCipher deliberately locks sensitive allocations. Give the test
+          # process enough memlock headroom so the runner does not amplify one
+          # warning per allocation when its inherited limit is exhausted.
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          just convergence-nightly-lane
+
+      - name: Capture failed adversarial scenarios
+        if: steps.convergence_lane.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          cargo run -p cgka-conformance-simulator \
+            --bin cgka-conformance-simulator-report --locked -- \
+            --family adversarial-reliability/v1 \
+            --seed 7 \
+            --cases 12 \
+            --out target/cgka-conformance-simulator-nightly-reports \
+            --storage file \
+            --strict-oracle
+
+      - name: Propagate nightly convergence failure
+        if: steps.convergence_lane.outcome == 'failure'
+        run: exit 1
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
