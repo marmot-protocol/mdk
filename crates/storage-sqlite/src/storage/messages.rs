@@ -348,6 +348,10 @@ impl MessageStorage for SqliteAccountStorage {
         snapshots::create(self, group_id, name)
     }
 
+    fn create_group_state_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        snapshots::create_state_scoped(self, group_id, name)
+    }
+
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
         snapshots::list(self, group_id)
     }

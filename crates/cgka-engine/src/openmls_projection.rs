@@ -2666,8 +2666,15 @@ pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
         .epoch
         .0;
+    // State-scoped: this runs on every canonical advance, and the anchor is
+    // only ever consumed as an OpenMLS/group-state rewind base. The message
+    // ledger is deliberately not captured — the convergence probe works from
+    // pre-seeded inputs (`seed_stored_openmls_graph_inputs` runs before the
+    // rewind), and the historical apply restores the live message/queue sets
+    // over the rollback anyway (`restore_live_message_and_queue_records`).
+    // Capturing them would make every applied commit O(retained bytes).
     storage
-        .create_group_snapshot(group_id, &retained_anchor_snapshot_name(epoch))
+        .create_group_state_snapshot(group_id, &retained_anchor_snapshot_name(epoch))
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     prune_retained_anchor_snapshots(storage, group_id, epoch, max_retained_anchor_rewind)?;
     prune_group_state_checkpoints(storage, group_id, epoch, max_retained_anchor_rewind)
