@@ -2253,6 +2253,139 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     );
 }
 
+/// A frozen convergence pass already owns a bounded retained-anchor snapshot.
+/// Application inputs admitted while they are inside the app window must use
+/// that source-epoch state before later commits in the same pass advance far
+/// enough to prune it. Dividing the same retained input across passes must not
+/// decide whether the application is delivered (mdk#1171).
+#[tokio::test]
+async fn retained_application_delivery_is_invariant_to_convergence_pass_partition() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut one_pass, one_pass_storage) = build_client(b"one-pass");
+    let (mut split_pass, split_pass_storage) = build_client(b"split-pass");
+
+    let one_pass_kp = one_pass.fresh_key_package().await.unwrap();
+    let split_pass_kp = split_pass.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "retained-app-pass-partition".into(),
+            description: "".into(),
+            members: vec![one_pass_kp, split_pass_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    one_pass
+        .join_welcome(welcome_for(&welcomes, b"one-pass"))
+        .await
+        .unwrap();
+    split_pass
+        .join_welcome(welcome_for(&welcomes, b"split-pass"))
+        .await
+        .unwrap();
+    one_pass.drain_events();
+    split_pass.drain_events();
+
+    let app = send_app(
+        &mut alice,
+        &group_id,
+        b"retained across active convergence".to_vec(),
+    )
+    .await;
+    let mut commits = Vec::new();
+    for index in 0..6 {
+        let identity = format!("partition-invitee-{index}");
+        let (mut invitee, _invitee_storage) = build_client(identity.as_bytes());
+        let invite = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![invitee.fresh_key_package().await.unwrap()],
+            })
+            .await
+            .unwrap();
+        let (commit, pending) = evolution(invite);
+        alice.confirm_published(pending).await.unwrap();
+        commits.push(route(commit, &group_id));
+    }
+
+    for message in commits.iter().chain([&app]) {
+        one_pass
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
+            .unwrap();
+    }
+    let one_pass_result = one_pass
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+
+    for message in commits[..5].iter().chain([&app]) {
+        split_pass
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
+            .unwrap();
+    }
+    let split_first_result = split_pass
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    split_pass
+        .buffer_openmls_convergence_message_at(&group_id, commits[5].clone(), 2_000_000)
+        .unwrap();
+    split_pass
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .unwrap();
+
+    assert_eq!(one_pass.epoch(&group_id).unwrap(), EpochId(7));
+    assert_eq!(split_pass.epoch(&group_id).unwrap(), EpochId(7));
+    assert_eq!(one_pass_result.accepted_commits.len(), 6);
+    assert_eq!(
+        one_pass_result.accepted_app_messages,
+        vec![content_hex(&app)]
+    );
+    assert_eq!(
+        split_first_result.accepted_app_messages,
+        vec![content_hex(&app)]
+    );
+    assert_eq!(
+        one_pass_storage
+            .get_message(&content_id(&app))
+            .unwrap()
+            .state,
+        MessageState::Processed
+    );
+    assert_eq!(
+        split_pass_storage
+            .get_message(&content_id(&app))
+            .unwrap()
+            .state,
+        MessageState::Processed
+    );
+
+    for events in [one_pass.drain_events(), split_pass.drain_events()] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GroupEvent::MessageReceived { payload, .. }
+                        if app_content(payload) == b"retained across active convergence"
+                ))
+                .count(),
+            1,
+            "the admitted application must be delivered exactly once: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&app)
+        )));
+    }
+}
+
 /// Reuse-path sibling of `engine_materializes_multi_commit_path_from_stored_commits`: the same
 /// multi-commit chain but with NO pending application message buffered, so canonicalization takes
 /// the #635 reuse branch (BFS-materialized candidates are reused instead of re-materialized). The

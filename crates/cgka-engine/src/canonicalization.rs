@@ -797,9 +797,9 @@ fn attach_app_witnesses(
                 // Witness counting evaluates the retained app-payload window with
                 // the CANDIDATE's tip_epoch as the reference tip, not the global
                 // canonical tip (retained-history.md "App-payload retention" and
-                // convergence.md "App-payload witnesses"). Using current_tip_epoch
-                // here would count a different witness set than a spec-faithful
-                // client and select a different branch -> fork.
+                // convergence.md "App-payload witnesses"). Active convergence
+                // retains the ability to authenticate the frozen input at its
+                // source epoch; it does not make an expired witness eligible.
                 if app_message_expired(candidate.tip_epoch, policy, *epoch) {
                     continue;
                 }

@@ -172,9 +172,12 @@ The OpenMLS replay bridge MUST translate consumed `ProposalRef` values back to t
 before reporting proposal dispositions. When replay processes an application message on a candidate branch, that
 observation supplies the app message's decrypting branch set, sender, epoch, and stored payload reference for witness
 scoring and invalidation reporting. Candidate paths SHOULD be commit paths. The replay bridge is responsible for probing
-pending proposals before those commits and probing pending application messages after the candidate state is
-materialized. An application message that does not decrypt on a candidate branch is ignored for that branch, not treated
-as a branch materialization failure.
+pending proposals and application messages at their source epoch before the commit that advances that candidate to the
+next epoch. The frozen pass's retained anchor keeps that source-epoch state available as bounded active convergence work;
+branch-specific authentication observations survive until selection, but application delivery remains deferred until the
+selected branch is applied. Witness eligibility still uses the candidate tip and pinned app-payload window from the
+adopted protocol. An application message that does not decrypt on a candidate branch is ignored for that branch, not
+treated as a branch materialization failure.
 
 `outbound_intents` contains local work the application wants to publish:
 
