@@ -102,16 +102,17 @@ impl SqliteAccountStorage {
 
 #[cfg(test)]
 fn promotion_crash_pause(promoted: usize) {
-    use std::io::Write;
-
     let expected = promoted.to_string();
     if std::env::var("MDK_STORAGE_TEST_PROMOTION_CRASH_AFTER").as_deref() != Ok(expected.as_str()) {
         return;
     }
-    println!("MDK_STORAGE_TEST_CRASH_READY:promotion-{promoted}");
-    std::io::stdout()
-        .flush()
-        .expect("flush promotion crash point");
+    let ready = std::env::var_os("MDK_STORAGE_TEST_CRASH_READY_FILE")
+        .expect("promotion crash ready-file path");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(ready)
+        .expect("create promotion crash ready file");
     loop {
         std::thread::park();
     }

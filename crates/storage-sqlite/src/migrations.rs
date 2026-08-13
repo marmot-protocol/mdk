@@ -519,17 +519,18 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Storag
 
 #[cfg(test)]
 fn migration_crash_pause(version: i64) {
-    use std::io::Write;
-
     let expected = version.to_string();
     if std::env::var("MDK_STORAGE_TEST_MIGRATION_CRASH_VERSION").as_deref() != Ok(expected.as_str())
     {
         return;
     }
-    println!("MDK_STORAGE_TEST_CRASH_READY:migration-{version}");
-    std::io::stdout()
-        .flush()
-        .expect("flush migration crash point");
+    let ready = std::env::var_os("MDK_STORAGE_TEST_CRASH_READY_FILE")
+        .expect("migration crash ready-file path");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(ready)
+        .expect("create migration crash ready file");
     loop {
         std::thread::park();
     }
@@ -545,16 +546,16 @@ mod tests {
     };
     use cgka_traits::message::MessageRecord;
     use cgka_traits::storage::{GroupStorage, MessageStorage};
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::Read;
     use std::path::Path;
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     const CRASH_CHILD_ENV: &str = "MDK_STORAGE_TEST_CRASH_CHILD";
     const CRASH_DATABASE_ENV: &str = "MDK_STORAGE_TEST_CRASH_DATABASE";
+    const CRASH_READY_FILE_ENV: &str = "MDK_STORAGE_TEST_CRASH_READY_FILE";
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
-    const READY_PREFIX: &str = "MDK_STORAGE_TEST_CRASH_READY:";
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
@@ -634,47 +635,27 @@ mod tests {
         database: &Path,
         ready_suffix: &str,
     ) {
+        let ready_file = database.with_extension(format!("{ready_suffix}.ready"));
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", test_name, "--nocapture"])
             .env(CRASH_CHILD_ENV, child_mode)
             .env(CRASH_DATABASE_ENV, database)
+            .env(CRASH_READY_FILE_ENV, &ready_file)
             .env(crash_env, crash_value)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (line_tx, line_rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if line_tx.send(line).is_err() {
-                    return;
-                }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready_file.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
             }
-        });
-        let expected = format!("{READY_PREFIX}{ready_suffix}");
-        let mut output = Vec::new();
-        let ready = loop {
-            match line_rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(Ok(line)) => {
-                    let matches = line == expected;
-                    output.push(line);
-                    if matches {
-                        break true;
-                    }
-                }
-                Ok(Err(error)) => {
-                    output.push(format!("stdout error: {error}"));
-                    break false;
-                }
-                Err(_) => break false,
-            }
-        };
-        if !ready {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !ready_file.exists() {
             let _ = child.kill();
             let _ = child.wait();
-            drop(line_rx);
-            let _ = reader.join();
             let mut stderr = String::new();
             child
                 .stderr
@@ -682,15 +663,10 @@ mod tests {
                 .unwrap()
                 .read_to_string(&mut stderr)
                 .unwrap();
-            panic!(
-                "child did not reach {ready_suffix}; stdout:\n{}\nstderr:\n{stderr}",
-                output.join("\n")
-            );
+            panic!("child did not reach {ready_suffix}; stderr:\n{stderr}");
         }
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success());
-        drop(line_rx);
-        reader.join().unwrap();
     }
 
     #[test]
