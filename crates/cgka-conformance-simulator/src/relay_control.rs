@@ -13,6 +13,7 @@ use nostr_relay_builder::prelude::{
     MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder, SaveEventStatus,
 };
 use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant, sleep};
 
 use crate::ScenarioMessageSelectorV2;
 
@@ -172,6 +173,39 @@ impl RelayControl {
         Ok(recorded)
     }
 
+    pub async fn wait_for_action_events(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        include_welcomes: bool,
+        expected_publications: usize,
+        timeout: Duration,
+    ) -> Result<(), RelayControlError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let recorded = self
+                .record_action_events(action_events, action_id, before, include_welcomes)
+                .await?;
+            if recorded == expected_publications {
+                return Ok(());
+            }
+            if recorded > expected_publications {
+                return Err(RelayControlError {
+                    code: "relay_action_publication_count_mismatch",
+                    message: "the process action published more retained relay events than expected",
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayControlError {
+                    code: "relay_action_publication_timeout",
+                    message: "the process action did not publish its expected retained relay events before the deadline",
+                });
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn set_action_event_visibility(
         &self,
         action_events: &RelayActionEvents,
@@ -279,5 +313,88 @@ mod tests {
             Some(first.id),
             "restoring visibility must expose the original retained event"
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_welcome_remains_addressable_as_its_actions_explicit_occurrence() {
+        let control = RelayControl::new();
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&control.publication_log),
+            hidden_event_ids: Arc::clone(&control.hidden_event_ids),
+        };
+        let keys = nostr::Keys::generate();
+        let group_message = nostr::EventBuilder::new(Kind::MlsGroupMessage, "commit")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let welcome = nostr::EventBuilder::new(Kind::GiftWrap, "welcome")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            database
+                .save_event(&group_message)
+                .await
+                .unwrap()
+                .is_success()
+        );
+
+        let mut action_events = RelayActionEvents::new();
+        assert_eq!(
+            control
+                .record_action_events(&mut action_events, "invite", 0, true)
+                .await
+                .unwrap(),
+            1
+        );
+        let delayed_database = database.clone();
+        let delayed_welcome = welcome.clone();
+        let delayed_admission = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            assert!(
+                delayed_database
+                    .save_event(&delayed_welcome)
+                    .await
+                    .unwrap()
+                    .is_success()
+            );
+        });
+        control
+            .wait_for_action_events(
+                &mut action_events,
+                "invite",
+                0,
+                true,
+                2,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        delayed_admission.await.unwrap();
+
+        let selector = ScenarioMessageSelectorV2 {
+            action_id: Some("invite".into()),
+            occurrence: 1,
+            ..Default::default()
+        };
+        control
+            .set_action_event_visibility(&action_events, &selector, false)
+            .await
+            .unwrap();
+        assert!(database.event_by_id(&welcome.id).await.unwrap().is_none());
+        assert!(
+            database
+                .event_by_id(&group_message.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        control
+            .set_action_event_visibility(&action_events, &selector, true)
+            .await
+            .unwrap();
+        assert!(database.event_by_id(&welcome.id).await.unwrap().is_some());
     }
 }

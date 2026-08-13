@@ -491,6 +491,7 @@ impl ProcessOrchestrator {
         action_id: &str,
         cursors: BTreeMap<String, usize>,
         include_welcomes: bool,
+        expected_publications: usize,
     ) -> Result<(), ProcessOrchestratorError> {
         for (relay, before) in cursors {
             let control = self.relay_controls.get(&relay).ok_or_else(|| {
@@ -501,31 +502,20 @@ impl ProcessOrchestrator {
             })?;
             // A node acknowledges its command after the durable app-runtime
             // mutation, while the Nostr transport may still be admitting the
-            // resulting event on the relay task. Wait for that immediate
-            // publication so a later action-id selector cannot race an empty
-            // correlation entry.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let recorded = control
-                    .record_action_events(
-                        self.relay_action_events.entry(relay.clone()).or_default(),
-                        action_id,
-                        before,
-                        include_welcomes,
-                    )
-                    .await
-                    .map_err(process_relay_control_error)?;
-                if recorded > 0 {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ProcessOrchestratorError::new(
-                        "relay_action_publication_timeout",
-                        "the process action completed without an immediate retained relay publication",
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            // resulting events on the relay task. Wait for the action's known
+            // publication count so a delayed Welcome cannot be omitted from
+            // this action or admitted after the next action's cursor.
+            control
+                .wait_for_action_events(
+                    self.relay_action_events.entry(relay.clone()).or_default(),
+                    action_id,
+                    before,
+                    include_welcomes,
+                    expected_publications,
+                    Duration::from_secs(5),
+                )
+                .await
+                .map_err(process_relay_control_error)?;
         }
         Ok(())
     }
@@ -629,7 +619,7 @@ impl ProcessOrchestrator {
                     } => group_id,
                     body => return Err((Some(creator.clone()), unexpected_response(body))),
                 };
-                self.record_relay_action_events(action_id, relay_cursors, true)
+                self.record_relay_action_events(action_id, relay_cursors, true, invitees.len())
                     .await
                     .map_err(orchestrator_failure)?;
                 self.groups.insert(group.clone(), group_id.clone());
@@ -666,7 +656,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, true)
+                self.record_relay_action_events(action_id, relay_cursors, true, invitees.len() + 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(inviter, pending);
@@ -691,7 +681,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(remover, pending);
@@ -710,7 +700,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
@@ -734,7 +724,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
@@ -760,7 +750,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
@@ -785,7 +775,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
@@ -805,7 +795,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 Ok((vec![sender.clone()], ProcessActionStatusV1::Completed))
@@ -823,7 +813,7 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false)
+                self.record_relay_action_events(action_id, relay_cursors, false, 1)
                     .await
                     .map_err(orchestrator_failure)?;
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
