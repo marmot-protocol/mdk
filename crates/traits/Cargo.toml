@@ -19,4 +19,9 @@ sha2.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 insta.workspace = true
+
+[[bench]]
+name = "stored_message_codec"
+harness = false

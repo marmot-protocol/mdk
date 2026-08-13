@@ -1,5 +1,6 @@
 mod capture;
 mod checkpoints;
+mod format;
 mod lifecycle;
 mod restore;
 mod rows;
@@ -182,6 +183,55 @@ mod tests {
     }
 
     #[test]
+    fn new_snapshots_are_versioned_binary_and_unknown_versions_fail_closed() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 1);
+        store.put_group(&group).unwrap();
+        let mut message = sample_message(mid(1), group.id.clone(), 0);
+        message.payload = vec![0xA5; 16_727];
+        store.put_message(&message).unwrap();
+        store.create_group_snapshot(&group.id, "v2").unwrap();
+
+        let mut blob: Vec<u8> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT snapshot FROM cgka_group_snapshots
+                 WHERE group_id = ?1 AND name = 'v2'",
+                rusqlite::params![group.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(blob.starts_with(b"MDKS\0\x02"));
+        assert!(
+            blob.len() < 20_000,
+            "raw message bytes must not expand back into a JSON number array: {}",
+            blob.len()
+        );
+
+        blob[4..6].copy_from_slice(&3_u16.to_be_bytes());
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cgka_group_snapshots SET snapshot = ?1
+                 WHERE group_id = ?2 AND name = 'v2'",
+                rusqlite::params![blob, group.id.as_slice()],
+            )
+            .unwrap();
+        let error = store
+            .rollback_group_to_snapshot(&group.id, "v2")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported group snapshot version 3")
+        );
+        assert_eq!(store.get_group(&group.id).unwrap(), group);
+        assert_eq!(store.get_message(&message.id).unwrap(), message);
+    }
+
+    #[test]
     fn state_scoped_snapshot_rolls_back_group_state_without_touching_messages_or_queue() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g0 = sample_group(gid(1), 0, 1);
@@ -327,6 +377,17 @@ mod tests {
         store
             .create_group_state_checkpoint(&g1.id, &checkpoint)
             .unwrap();
+        let checkpoint_blob: Vec<u8> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT checkpoint FROM cgka_group_state_checkpoints
+                 WHERE group_id = ?1 AND checkpoint_id = ?2",
+                rusqlite::params![g1.id.as_slice(), checkpoint.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(checkpoint_blob.starts_with(b"MDKS\0\x02"));
         // Exact retry is idempotent.
         store
             .create_group_state_checkpoint(&g1.id, &checkpoint)
@@ -401,6 +462,39 @@ mod tests {
             store.list_group_state_checkpoints(&g2.id).unwrap(),
             vec![checkpoint]
         );
+    }
+
+    #[test]
+    fn legacy_json_group_state_checkpoint_remains_restorable() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let anchor = sample_group(gid(1), 1, 1);
+        store.put_group(&anchor).unwrap();
+        let legacy = crate::serialize(&super::rows::GroupStateCheckpoint {
+            group: anchor.clone(),
+            member_caps: Vec::new(),
+            validated_tree_marker: None,
+            openmls_values: Vec::new(),
+        })
+        .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_group_state_checkpoints
+                    (group_id, checkpoint_id, resulting_epoch, checkpoint)
+                 VALUES (?1, 'legacy-json', 1, ?2)",
+                rusqlite::params![anchor.id.as_slice(), legacy],
+            )
+            .unwrap();
+
+        store
+            .put_group(&sample_group(anchor.id.clone(), 2, 2))
+            .unwrap();
+        store
+            .restore_group_state_checkpoint(&anchor.id, "legacy-json")
+            .unwrap();
+
+        assert_eq!(store.get_group(&anchor.id).unwrap(), anchor);
     }
 
     #[test]

@@ -90,6 +90,8 @@ mod migration_0044_local_group_deletion_frontiers;
 mod migration_0045_timeline_canonical_order;
 #[path = "migrations/0046_message_group_state_epoch_index.rs"]
 mod migration_0046_message_group_state_epoch_index;
+#[path = "migrations/0047_normalized_message_records.rs"]
+mod migration_0047_normalized_message_records;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -332,6 +334,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0046_message_group_state_epoch_index",
         apply: migration_0046_message_group_state_epoch_index::apply,
     },
+    Migration {
+        version: 47,
+        name: "0047_normalized_message_records",
+        apply: migration_0047_normalized_message_records::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -558,6 +565,114 @@ mod tests {
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn normalized_message_migration_preserves_legacy_rows_without_backfill() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..46]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, ?2)",
+                params![&[0xaa_u8], b"group"],
+            )
+            .unwrap();
+        let legacy = br#"{"payload":[1,2,3]}"#;
+        connection
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 3, 4, ?3)",
+                params![&[0x01_u8], &[0xaa_u8], legacy],
+            )
+            .unwrap();
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let migrated = connection
+            .query_row(
+                "SELECT storage_format, record, payload, deferred_peel
+                 FROM cgka_messages WHERE id = ?1",
+                params![&[0x01_u8]],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(migrated, (1, legacy.to_vec(), None, None));
+    }
+
+    #[test]
+    fn normalized_message_migration_is_atomic_before_commit() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..46]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, ?2)",
+                params![&[0xaa_u8], b"group"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 3, 4, ?3)",
+                params![&[0x01_u8], &[0xaa_u8], b"legacy-record"],
+            )
+            .unwrap();
+
+        let tx = connection.transaction().unwrap();
+        migration_0047_normalized_message_records::apply(&tx).unwrap();
+        // Models termination after the schema/data rewrite but before the
+        // migration runner can commit its transaction.
+        tx.rollback().unwrap();
+
+        let columns = connection
+            .prepare("PRAGMA table_info(cgka_messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "storage_format"));
+        let record: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_messages WHERE id = ?1",
+                params![&[0x01_u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(record, b"legacy-record");
+
+        run(&mut connection, MIGRATIONS).unwrap();
+    }
+
+    #[test]
+    fn pre_format_v2_binary_refuses_migration_47_database() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let error = run(&mut connection, &MIGRATIONS[..46]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database was migrated by a newer storage-sqlite version: 47"),
+            "unexpected downgrade error: {error}"
+        );
+        assert_eq!(
+            applied_migrations_from_connection(&connection),
+            expected_migrations(),
+            "downgrade refusal must not mutate migration state"
+        );
     }
 
     #[test]

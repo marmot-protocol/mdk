@@ -153,6 +153,33 @@ not compiled into MarmotKit; apps supply them at runtime.
 
 The GitHub workflow repeats the release builds on clean runners. Local builds catch drift earlier.
 
+## Storage-Format Changes
+
+For a release that adds a `storage-sqlite` migration or changes an opaque
+storage artifact:
+
+1. Link the format definition and compatibility evidence from
+   `docs/marmot-architecture/storage-format-v2.md` in the release notes.
+2. Verify an older fixture opens and upgrades once, a current fixture reopens
+   without rewriting, and the prior binary refuses the new migration before
+   reading or writing account tables.
+3. Run crash/failure-injection tests at every multi-row transformation or
+   artifact replacement boundary. Schema migrations are transactional;
+   background promotion work must additionally be row-idempotent and bounded.
+4. State explicitly that downgrade across the migration is unsupported. The
+   remedies are to re-upgrade or restore a pre-upgrade account database/export;
+   never advise manually removing migration rows.
+5. Recommend a pre-upgrade backup/export in the cohort release notes when the
+   release rewrites existing durable data. Migration 47 only changes table
+   shape and retains legacy message rows, so it does not perform a history-size
+   open-time rewrite.
+6. Do not run `VACUUM` during automatic account open. If page reclamation is
+   useful, expose it as explicit keyed-connection maintenance and report its
+   expected duration and temporary free-space requirement.
+
+Storage migrations do not require a workspace version bump during feature
+development. The eventual release version remains a manual release operation.
+
 ## Whole-Workspace Release
 
 Use this for a versioned MDK source/library release.
