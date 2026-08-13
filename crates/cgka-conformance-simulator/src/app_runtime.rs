@@ -22,7 +22,8 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use crate::relay_control::{
-    RelayActionEvents, RelayActionExpectation, RelayControl, RelayControlError,
+    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation, RelayControl,
+    RelayControlError,
 };
 use crate::{
     ClientEventCounts, ClientObservation, ConvergenceSubject, ScenarioAdminPolicyObservation,
@@ -254,7 +255,7 @@ impl AppRuntimeHarness {
                     include_welcomes,
                     expected_publications,
                     expected_event_ids,
-                    timeout: Duration::from_secs(5),
+                    timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
                 },
             )
             .await

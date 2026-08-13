@@ -18,7 +18,8 @@ use crate::node_protocol::{
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::relay_control::{
-    RelayActionEvents, RelayActionExpectation, RelayControl, RelayControlError,
+    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation, RelayControl,
+    RelayControlError,
 };
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
@@ -517,7 +518,7 @@ impl ProcessOrchestrator {
                         include_welcomes,
                         expected_publications,
                         expected_event_ids,
-                        timeout: Duration::from_secs(5),
+                        timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
                     },
                 )
                 .await

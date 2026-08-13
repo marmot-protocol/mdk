@@ -17,6 +17,8 @@ use tokio::time::{Duration, Instant, sleep};
 
 use crate::ScenarioMessageSelectorV2;
 
+pub(crate) const RELAY_ACTION_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Debug)]
 struct RecordingRelayDatabase {
     inner: MemoryDatabase,
