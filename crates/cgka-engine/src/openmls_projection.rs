@@ -3051,6 +3051,34 @@ fn candidate_paths_with_pending_replay_messages(
                 let mut seen = BTreeSet::new();
                 let mut messages = Vec::new();
                 let mut final_epoch = None;
+                let mut first_commit_epoch = None;
+                for message in &path.messages {
+                    let projection = project_mls_message(&message.payload)?;
+                    if projection.kind == OpenMlsContentKind::Commit {
+                        first_commit_epoch = Some(projection.source_epoch.ok_or(
+                            OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                        )?);
+                        break;
+                    }
+                }
+                // A late application from common pre-fork history can be
+                // older than every commit in the candidate path. Probe it
+                // against the retained base state, before the first commit;
+                // that state owns the widest past-epoch decryption window.
+                // The observation is shared by every candidate and therefore
+                // cannot bias selection toward either fork.
+                if let Some(first_commit_epoch) = first_commit_epoch {
+                    for applications in applications_by_epoch
+                        .range(..first_commit_epoch)
+                        .map(|(_, applications)| applications)
+                    {
+                        for application in applications {
+                            if seen.insert(hex::encode(application.id.as_slice())) {
+                                messages.push(application.clone());
+                            }
+                        }
+                    }
+                }
                 for message in &path.messages {
                     let projection = project_mls_message(&message.payload)?;
                     if projection.kind == OpenMlsContentKind::Commit {

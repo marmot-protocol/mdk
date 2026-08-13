@@ -175,7 +175,9 @@ scoring and invalidation reporting. Candidate paths SHOULD be commit paths. The 
 pending proposals and application messages at their source epoch before the commit that advances that candidate to the
 next epoch. The frozen pass's retained anchor keeps that source-epoch state available as bounded active convergence work;
 branch-specific authentication observations survive until selection, but application delivery remains deferred until the
-selected branch is applied. Witness eligibility still uses the candidate tip and pinned app-payload window from the
+selected branch is applied. A retained application from common pre-fork history that predates the first commit in every
+candidate path is probed against the retained base state before that first commit and contributes the same observation to
+every decrypting candidate. Witness eligibility still uses the candidate tip and pinned app-payload window from the
 adopted protocol. An application message that does not decrypt on a candidate branch is ignored for that branch, not
 treated as a branch materialization failure.
 

@@ -858,6 +858,145 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     );
 }
 
+/// A late application from common history can enter convergence while a newer
+/// epoch is contested. Every candidate path starts at the fork epoch, so the
+/// application predates the first commit in every path. It must still be
+/// authenticated against the retained base state and delivered after branch
+/// selection rather than being invalidated without a decryption attempt.
+#[tokio::test]
+async fn contested_fork_delivers_late_pre_fork_application() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut common_invitee, _common_invitee_storage) = build_client(b"common-invitee");
+    let (mut alice_invitee, _alice_invitee_storage) = build_client(b"alice-invitee");
+    let (mut bob_invitee, _bob_invitee_storage) = build_client(b"bob-invitee");
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "late-pre-fork-application".into(),
+            description: "".into(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Hold this epoch-1 application until after the shared group has advanced
+    // and epoch 2 has forked.
+    let late_app = send_app(
+        &mut alice,
+        &group_id,
+        b"late shared-history application".to_vec(),
+    )
+    .await;
+
+    let common_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![common_invitee.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (common_commit, common_pending) = evolution(common_invite);
+    alice.confirm_published(common_pending).await.unwrap();
+    let common_commit = route(common_commit, &group_id);
+    assert!(matches!(
+        bob.ingest(common_commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("Bob applies the shared commit");
+    assert!(matches!(
+        carol.ingest(common_commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("Carol applies the shared commit");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    carol.drain_events();
+
+    let alice_fork = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![alice_invitee.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let bob_fork = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_invitee.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_fork);
+    let (bob_commit, _bob_pending) = evolution(bob_fork);
+    for message in [
+        route(alice_commit, &group_id),
+        route(bob_commit, &group_id),
+        late_app.clone(),
+    ] {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, message, 1_000)
+            .unwrap();
+    }
+
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("contested fork converges with late shared-history evidence");
+    let late_app_id = content_hex(&late_app);
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(result.accepted_app_messages, vec![late_app_id.clone()]);
+    assert!(
+        result
+            .invalidated_app_messages
+            .iter()
+            .all(|invalidated| invalidated.message_id != late_app_id)
+    );
+    assert_message_state(&carol_storage, &late_app, MessageState::Processed);
+
+    let events = carol.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                GroupEvent::MessageReceived { payload, .. }
+                    if app_content(payload) == b"late shared-history application"
+            ))
+            .count(),
+        1,
+        "late shared-history application must be delivered exactly once: {events:?}"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        GroupEvent::AppMessageInvalidated { message_id, .. }
+            if *message_id == content_id(&late_app)
+    )));
+}
+
 /// Regression for the Android-visible "This message is no longer valid"
 /// banner on a device's own sent message. OpenMLS cannot decrypt an own
 /// private-message ciphertext during candidate replay, so convergence must use

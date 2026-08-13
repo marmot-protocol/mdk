@@ -299,6 +299,7 @@ Engine integration and OpenMLS conformance tests also cover:
 - retained-anchor replay and stale invalidation after engine rebuild,
 - source-epoch application authentication before each advancing commit, including one-pass versus split-pass delivery
   equivalence at the six-advance app-retention boundary,
+- contested-fork delivery of late applications from retained common pre-fork history,
 - delayed past-epoch application messages peeled from retained epoch contexts,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients using the real Nostr peeler over an in-memory
   bus. This proves selected branch epoch/member events plus branch-aware retry for future-epoch raw transport messages:
