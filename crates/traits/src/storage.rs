@@ -267,6 +267,24 @@ pub trait MessageStorage {
     fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool>;
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
+
+    /// [`Self::create_group_snapshot`] scoped to canonical group state: the
+    /// group record, member capabilities, convergence policy, validation
+    /// marker, and group-scoped OpenMLS values — the message ledger and
+    /// outbound queue are not captured, and rolling back to such a snapshot
+    /// leaves those tables untouched. Use this for snapshots taken on every
+    /// canonical advance (retained anchors), where capturing the whole
+    /// retained message history would make each applied commit O(stored
+    /// bytes).
+    ///
+    /// Callers must not depend on the narrower scope for correctness: the
+    /// default implementation captures a full snapshot, whose rollback also
+    /// restores messages and queued outbound work (a superset image is always
+    /// an acceptable substitute).
+    fn create_group_state_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.create_group_snapshot(group_id, name)
+    }
+
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;

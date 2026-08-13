@@ -125,8 +125,15 @@ fn restore_snapshot(
     mls_group_key: &[u8],
 ) -> StorageResult<()> {
     group(conn, group_id, &snapshot.group)?;
-    messages(conn, group_id, &snapshot.messages)?;
-    queued_outbound(conn, group_id, &snapshot.queued_outbound)?;
+    // A state-scoped snapshot (`None`) never captured the message ledger or
+    // outbound queue, so rollback must leave the live rows alone rather than
+    // restore an empty image.
+    if let Some(snapshot_messages) = &snapshot.messages {
+        messages(conn, group_id, snapshot_messages)?;
+    }
+    if let Some(snapshot_queued) = &snapshot.queued_outbound {
+        queued_outbound(conn, group_id, snapshot_queued)?;
+    }
     member_capabilities(conn, group_id, &snapshot.member_caps)?;
     convergence_policy(conn, group_id, snapshot.convergence_policy.as_deref())?;
     validated_tree_marker(conn, group_id, snapshot.validated_tree_marker.as_deref())?;

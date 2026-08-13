@@ -13,7 +13,15 @@ pub(super) fn create(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
-    capture::create(store, group_id, name)
+    capture::create(store, group_id, name, capture::SnapshotScope::Full)
+}
+
+pub(super) fn create_state_scoped(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
+    capture::create(store, group_id, name, capture::SnapshotScope::GroupState)
 }
 
 pub(super) fn list(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<String>> {
@@ -171,6 +179,62 @@ mod tests {
         );
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
+    }
+
+    #[test]
+    fn state_scoped_snapshot_rolls_back_group_state_without_touching_messages_or_queue() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let g0 = sample_group(gid(1), 0, 1);
+        store.put_group(&g0).unwrap();
+        store
+            .put_message(&sample_message(mid(1), g0.id.clone(), 0))
+            .unwrap();
+        store
+            .put_queued_outbound_intent(&sample_queued_intent(mid(10), g0.id.clone()))
+            .unwrap();
+        let mls_group_id = openmls::group::GroupId::from_slice(g0.id.as_slice());
+        store
+            .mls_storage()
+            .write_group_state(&mls_group_id, &TestGroupState(b"epoch-0".to_vec()))
+            .unwrap();
+
+        store
+            .create_group_state_snapshot(&g0.id, "retained-anchor")
+            .unwrap();
+
+        let g1 = sample_group(gid(1), 1, 2);
+        store.put_group(&g1).unwrap();
+        store
+            .put_message(&sample_message(mid(2), g0.id.clone(), 1))
+            .unwrap();
+        store.delete_queued_outbound_intent(&mid(10)).unwrap();
+        let live_queued = sample_queued_intent(mid(11), g0.id.clone());
+        store.put_queued_outbound_intent(&live_queued).unwrap();
+        store
+            .mls_storage()
+            .write_group_state(&mls_group_id, &TestGroupState(b"epoch-1".to_vec()))
+            .unwrap();
+
+        store
+            .rollback_group_to_snapshot(&g0.id, "retained-anchor")
+            .unwrap();
+
+        // Canonical state rewinds to capture time...
+        assert_eq!(store.get_group(&g0.id).unwrap(), g0);
+        let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
+        assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
+        // ...while the live message ledger and outbound queue are untouched.
+        let ids: Vec<_> = store
+            .list_messages(&g0.id, EpochId(0))
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![mid(1), mid(2)]);
+        assert_eq!(
+            store.list_queued_outbound_intents(&g0.id).unwrap(),
+            vec![live_queued]
+        );
     }
 
     #[test]

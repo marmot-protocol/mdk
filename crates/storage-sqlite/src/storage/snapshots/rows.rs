@@ -11,8 +11,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {
     pub(super) group: Group,
-    pub(super) messages: Vec<OrderedMessage>,
-    pub(super) queued_outbound: Vec<OrderedQueuedOutbound>,
+    /// `None` marks a state-scoped snapshot: the message ledger was not
+    /// captured, and rollback leaves the live `cgka_messages` rows (and their
+    /// pending application events) untouched. Full snapshots — including
+    /// every blob written before state-scoped capture existed — carry `Some`
+    /// and keep their capture-time restore semantics.
+    pub(super) messages: Option<Vec<OrderedMessage>>,
+    /// Same contract as `messages`, for `cgka_queued_outbound`.
+    pub(super) queued_outbound: Option<Vec<OrderedQueuedOutbound>>,
     pub(super) member_caps: Vec<MemberCapabilitiesSnapshot>,
     pub(super) convergence_policy: Option<Vec<u8>>,
     pub(super) validated_tree_marker: Option<Vec<u8>>,

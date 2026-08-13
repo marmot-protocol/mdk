@@ -17,14 +17,27 @@ use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+/// What a snapshot captures — and therefore what its rollback later rewrites.
+#[derive(Clone, Copy)]
+pub(super) enum SnapshotScope {
+    /// Everything: group record, message ledger, outbound queue, member
+    /// capabilities, convergence policy, validation marker, OpenMLS values.
+    Full,
+    /// Canonical group state only. The message ledger and outbound queue are
+    /// not captured, and rolling back to such a snapshot leaves the live
+    /// `cgka_messages` / `cgka_queued_outbound` rows untouched.
+    GroupState,
+}
+
 pub(super) fn create(
     store: &SqliteAccountStorage,
     group_id: &GroupId,
     name: &str,
+    scope: SnapshotScope,
 ) -> StorageResult<()> {
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
-        return create_on_connection(&conn, group_id, name);
+        return create_on_connection(&conn, group_id, name, scope);
     }
 
     retry_on_busy(|| {
@@ -32,7 +45,7 @@ pub(super) fn create(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
-        create_on_connection(&tx, group_id, name)?;
+        create_on_connection(&tx, group_id, name, scope)?;
         tx.commit().storage()?;
         Ok(())
     })
@@ -42,8 +55,9 @@ fn create_on_connection(
     conn: &rusqlite::Connection,
     group_id: &GroupId,
     name: &str,
+    scope: SnapshotScope,
 ) -> StorageResult<()> {
-    let snapshot = capture_snapshot(conn, group_id)?;
+    let snapshot = capture_snapshot(conn, group_id, scope)?;
     let snapshot_blob = serialize_sensitive(&snapshot)?;
     conn.execute(
         "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
@@ -54,7 +68,11 @@ fn create_on_connection(
     Ok(())
 }
 
-fn capture_snapshot(conn: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Snapshot> {
+fn capture_snapshot(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    scope: SnapshotScope,
+) -> StorageResult<Snapshot> {
     let mls_group_key = mls_group_key(group_id)?;
     let group_blob: Vec<u8> = conn
         .query_row(
@@ -66,8 +84,13 @@ fn capture_snapshot(conn: &rusqlite::Connection, group_id: &GroupId) -> StorageR
         .storage()?
         .ok_or(StorageError::NotFound)?;
     let group = deserialize(&group_blob)?;
-    let messages = messages(conn, group_id)?;
-    let queued_outbound = queued_outbound(conn, group_id)?;
+    let (messages, queued_outbound) = match scope {
+        SnapshotScope::Full => (
+            Some(messages(conn, group_id)?),
+            Some(queued_outbound(conn, group_id)?),
+        ),
+        SnapshotScope::GroupState => (None, None),
+    };
     let member_caps = member_capabilities(conn, group_id)?;
     let convergence_policy = convergence_policy(conn, group_id)?;
     let validated_tree_marker = validated_tree_marker(conn, group_id)?;
@@ -122,7 +145,7 @@ pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> Storag
         .transpose()?;
     serialize(&ReplaySnapshot {
         version: REPLAY_SNAPSHOT_VERSION,
-        group: capture_snapshot(&conn, group_id)?,
+        group: capture_snapshot(&conn, group_id, SnapshotScope::Full)?,
         convergence_pass,
     })
 }
