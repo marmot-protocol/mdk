@@ -127,6 +127,63 @@ impl MessageStorage for SqliteAccountStorage {
         records.iter().map(|record| deserialize(record)).collect()
     }
 
+    fn has_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<bool> {
+        if states.is_empty() {
+            return Ok(false);
+        }
+        let sql = format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM cgka_messages
+                WHERE group_id = ?1 AND epoch >= ?2 AND state IN ({})
+             )",
+            state_placeholders(states)
+        );
+        let conn = self.lock()?;
+        conn.query_row(
+            &sql,
+            rusqlite::params_from_iter(state_query_params(group_id, at_or_after_epoch, states)?),
+            |row| row.get(0),
+        )
+        .storage()
+    }
+
+    fn list_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT record FROM cgka_messages
+             WHERE group_id = ?1 AND epoch >= ?2 AND state IN ({})
+             ORDER BY insert_order",
+            state_placeholders(states)
+        );
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql).storage()?;
+        let records = stmt
+            .query_map(
+                rusqlite::params_from_iter(state_query_params(
+                    group_id,
+                    at_or_after_epoch,
+                    states,
+                )?),
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        records.iter().map(|record| deserialize(record)).collect()
+    }
+
     fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()> {
         let (group_id, message_id) = match event {
             GroupEvent::MessageReceived {
@@ -302,6 +359,35 @@ impl MessageStorage for SqliteAccountStorage {
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::release(self, group_id, name)
     }
+}
+
+/// `?N` placeholder list for a state `IN (...)` clause, numbered after the
+/// fixed `?1` group-id and `?2` epoch parameters.
+fn state_placeholders(states: &[MessageState]) -> String {
+    (0..states.len())
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Positional parameters matching [`state_placeholders`]: group id, epoch
+/// floor, then one integer per requested state.
+fn state_query_params(
+    group_id: &GroupId,
+    at_or_after_epoch: EpochId,
+    states: &[MessageState],
+) -> StorageResult<Vec<rusqlite::types::Value>> {
+    let mut params = Vec::with_capacity(states.len() + 2);
+    params.push(rusqlite::types::Value::Blob(group_id.as_slice().to_vec()));
+    params.push(rusqlite::types::Value::Integer(epoch_to_i64(
+        at_or_after_epoch,
+    )?));
+    params.extend(
+        states
+            .iter()
+            .map(|state| rusqlite::types::Value::Integer(message_state_to_i64(*state))),
+    );
+    Ok(params)
 }
 
 /// Read-modify-write the stored state of a single message on an already-locked
@@ -599,6 +685,94 @@ mod tests {
             .delete_pending_application_events(&[committed.id])
             .unwrap();
         assert!(store.list_pending_application_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_filtered_queries_match_the_full_listing() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
+
+        let with_state = |id, group, epoch, state| {
+            let mut message = sample_message(id, group, epoch);
+            message.state = state;
+            store.put_message(&message).unwrap();
+        };
+        with_state(mid(1), gid(1), 0, MessageState::Created);
+        with_state(mid(2), gid(1), 5, MessageState::PeelDeferred);
+        with_state(mid(3), gid(1), 2, MessageState::Retryable);
+        with_state(mid(4), gid(1), 7, MessageState::Processed);
+        with_state(mid(5), gid(2), 0, MessageState::PeelDeferred);
+
+        let ids = |states: &[MessageState], epoch: u64| {
+            store
+                .list_messages_in_states(&gid(1), states, EpochId(epoch))
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&[MessageState::PeelDeferred], 0), vec![mid(2)]);
+        assert_eq!(
+            ids(&[MessageState::Created, MessageState::Retryable], 0),
+            vec![mid(1), mid(3)],
+            "insert order must be preserved",
+        );
+        assert_eq!(
+            ids(&[MessageState::Created, MessageState::Retryable], 1),
+            vec![mid(3)],
+            "epoch floor must apply",
+        );
+        assert_eq!(ids(&[], 0), Vec::<cgka_traits::MessageId>::new());
+
+        assert!(
+            store
+                .has_messages_in_states(&gid(1), &[MessageState::PeelDeferred], EpochId(0))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_messages_in_states(&gid(1), &[MessageState::PeelDeferred], EpochId(6))
+                .unwrap(),
+            "epoch floor must apply to the existence probe",
+        );
+        assert!(
+            !store
+                .has_messages_in_states(&gid(1), &[MessageState::Failed], EpochId(0))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_messages_in_states(&gid(1), &[], EpochId(0))
+                .unwrap()
+        );
+
+        // Parity with the trait's default (list + filter) semantics.
+        for states in [
+            &[MessageState::PeelDeferred][..],
+            &[MessageState::Created, MessageState::Retryable][..],
+            &[MessageState::Processed][..],
+        ] {
+            let expected: Vec<_> = store
+                .list_messages(&gid(1), EpochId(0))
+                .unwrap()
+                .into_iter()
+                .filter(|record| states.contains(&record.state))
+                .collect();
+            assert_eq!(
+                store
+                    .list_messages_in_states(&gid(1), states, EpochId(0))
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                store
+                    .has_messages_in_states(&gid(1), states, EpochId(0))
+                    .unwrap(),
+                !expected.is_empty()
+            );
+        }
     }
 
     #[test]
