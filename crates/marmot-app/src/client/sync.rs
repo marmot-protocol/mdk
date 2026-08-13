@@ -289,7 +289,8 @@ impl AppClient {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
-        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+        let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
+        if refresh.routing_changed || refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(SyncFailure::from)?;
         }
@@ -465,7 +466,7 @@ impl AppClient {
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
-        let routes_changed = self.refresh_group_routes()?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
         if (routes_dirty || routes_changed)
             && let Err(error) = self.sync_runtime_groups().await
         {
@@ -520,7 +521,7 @@ impl AppClient {
                 None,
             )
             .await?;
-        let routes_changed = self.refresh_group_routes()?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
@@ -650,9 +651,16 @@ impl AppClient {
         if routes_dirty {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
-        let routes_changed = self.refresh_group_routes()?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        if routes_dirty || routes_changed {
+        let refresh = self.refresh_group_routes()?;
+        // The routes-dirty save above already persisted this delivery's app
+        // projection; save again only when that first save did not run, or
+        // when route retirement just mutated persisted group state. The
+        // routing-table delta lives in memory and obligates a subscription
+        // refresh, not a second identical state write.
+        if !routes_dirty || refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        if routes_dirty || refresh.routing_changed {
             self.sync_runtime_groups().await?;
         }
         self.drain_epoch_stall_escalations(&mut summary);
@@ -820,7 +828,8 @@ impl AppClient {
     ) -> Result<(), SyncCheckpointError> {
         let routes_changed = self
             .refresh_group_routes()
-            .map_err(SyncCheckpointError::BeforePersistence)?;
+            .map_err(SyncCheckpointError::BeforePersistence)?
+            .routing_changed;
         let checkpoint = if cfg!(feature = "test-policy-overrides")
             && self
                 .app
@@ -1401,7 +1410,8 @@ impl AppClient {
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
     pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
-        if self.refresh_group_routes().map_err(SyncFailure::from)? {
+        let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
+        if refresh.routing_changed || refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(SyncFailure::from)?;
         }
@@ -1490,7 +1500,7 @@ impl AppClient {
                 None,
             )
             .await?;
-        let routes_changed = self.refresh_group_routes()?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }

@@ -84,6 +84,20 @@ where
     results.into_iter().map(|(_, result)| result).collect()
 }
 
+/// Outcome of one [`AppClient::refresh_group_routes`] pass, separating the
+/// in-memory routing-table delta from durable-state mutation: only the latter
+/// obligates a state save, only the former obligates a relay-subscription
+/// refresh.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GroupRouteRefresh {
+    /// The in-memory routing table changed; relay subscriptions need a
+    /// `sync_runtime_groups` refresh.
+    pub(crate) routing_changed: bool,
+    /// `prune_prior_nostr_routes` removed retired prior routes from persisted
+    /// group state; a save is required for the retirement to stick.
+    pub(crate) state_pruned: bool,
+}
+
 pub struct AppClient {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
@@ -3163,8 +3177,8 @@ impl AppClient {
 
     /// Reconcile every group's current and still-live prior transport
     /// subscriptions, returning whether any installed route changed.
-    pub(crate) fn refresh_group_routes(&mut self) -> Result<bool, AppError> {
-        let mut changed = false;
+    pub(crate) fn refresh_group_routes(&mut self) -> Result<GroupRouteRefresh, AppError> {
+        let mut refresh = GroupRouteRefresh::default();
         for group in &mut self.state.groups {
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
                 tracing::warn!(
@@ -3182,7 +3196,7 @@ impl AppClient {
                 .is_ok_and(|group| group.disbanded.is_some())
             {
                 if self.routing.replace_group_routes(&group_id, Vec::new()) {
-                    changed = true;
+                    refresh.routing_changed = true;
                 }
                 continue;
             }
@@ -3196,7 +3210,7 @@ impl AppClient {
                 .unwrap_or(true)
                 && let Ok(group_record) = self.runtime.group_record(&group_id)
             {
-                group.prune_prior_nostr_routes(group_record.epoch.0);
+                refresh.state_pruned |= group.prune_prior_nostr_routes(group_record.epoch.0);
             }
             let Ok(subscriptions) = group.transport_subscriptions(&group_id) else {
                 tracing::warn!(
@@ -3208,10 +3222,10 @@ impl AppClient {
                 continue;
             };
             if self.routing.replace_group_routes(&group_id, subscriptions) {
-                changed = true;
+                refresh.routing_changed = true;
             }
         }
-        Ok(changed)
+        Ok(refresh)
     }
 
     fn refresh_routing(&mut self) -> Result<(), AppError> {
