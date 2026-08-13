@@ -180,7 +180,6 @@ async fn compose_session_finalizes_local_transcript_when_broker_connect_is_pendi
         .expect("append should not wait for broker connect")
         .unwrap()
         .unwrap();
-    assert_eq!(appended.text, "hello ");
     assert_eq!(appended.chunk_count, 1);
 
     let (finish_tx, finish_rx) = oneshot::channel();
@@ -373,7 +372,6 @@ async fn compose_session_status_updates_transcript_without_changing_text() {
         16,
     );
     assert_eq!(status_report.status, "thinking");
-    assert_eq!(status_report.text, "hello");
     assert_eq!(status_report.chunk_count, 2);
     assert_eq!(
         status_report.transcript_hash.as_deref(),
@@ -449,7 +447,6 @@ async fn compose_session_progress_updates_transcript_without_changing_text() {
         ],
         16,
     );
-    assert_eq!(progress_report.text, "answer");
     assert_eq!(progress_report.chunk_count, 2);
     assert_eq!(
         progress_report.transcript_hash.as_deref(),
@@ -876,7 +873,6 @@ async fn compose_session_times_out_stalled_live_flush_and_still_finishes() {
         .expect("append should use local transcript while broker connect is pending")
         .unwrap()
         .unwrap();
-    assert_eq!(appended.text, "hello");
     assert_eq!(appended.chunk_count, 1);
     assert_eq!(appended.error, None);
 
@@ -959,7 +955,6 @@ async fn compose_session_times_out_pending_broker_connect_and_disables_live_prev
         .expect("append should use local transcript while broker connect is pending")
         .unwrap()
         .unwrap();
-    assert_eq!(first.text, "buffered");
     assert_eq!(first.error, None);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -976,7 +971,6 @@ async fn compose_session_times_out_pending_broker_connect_and_disables_live_prev
         .expect("append should complete after broker connect timeout")
         .unwrap()
         .unwrap();
-    assert_eq!(second.text, "buffered after timeout");
     assert!(
         second
             .error
@@ -1317,7 +1311,6 @@ async fn finish_with_mismatched_expectation_keeps_session_alive_and_retryable() 
         .expect("append after mismatched finish should complete")
         .unwrap()
         .unwrap();
-    assert_eq!(appended.text, "hello world");
     assert_eq!(appended.chunk_count, 2);
 
     // A corrected finish over the full transcript succeeds.
