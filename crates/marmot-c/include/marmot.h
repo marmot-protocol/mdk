@@ -19,7 +19,7 @@
 
 #pragma once
 
-/* Generated with cbindgen:0.29.4 */
+/* Generated with cbindgen:0.29.2 */
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -36,9 +36,9 @@
  * `marmot_last_error_message()`.
  */
 enum MarmotStatus
-#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+#ifdef __cplusplus
   : int32_t
-#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
  {
   MARMOT_STATUS_OK = 0,
   /**
@@ -110,11 +110,7 @@ enum MarmotStatus
   MARMOT_STATUS_GROUP_SEND_QUEUE_FULL = 54,
 };
 #ifndef __cplusplus
-#if __STDC_VERSION__ >= 202311L
-typedef enum MarmotStatus MarmotStatus;
-#else
 typedef int32_t MarmotStatus;
-#endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
 /**
@@ -2380,7 +2376,6 @@ typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_GROUP_STATE_CHANGED,
   MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_QUARANTINED,
   MARMOT_GROUP_EVENT_KIND_EPOCH_CHANGED,
-  MARMOT_GROUP_EVENT_KIND_FORK_RECOVERED,
   MARMOT_GROUP_EVENT_KIND_COMMIT_ROLLED_BACK,
   /**
    * Explicit withdrawal of every `GroupStateChanged` notification whose
@@ -2452,12 +2447,6 @@ typedef struct MarmotGroupEventKind_EpochChanged_Body {
   uint64_t to;
 } MarmotGroupEventKind_EpochChanged_Body;
 
-typedef struct MarmotGroupEventKind_ForkRecovered_Body {
-  uint64_t source_epoch;
-  uint64_t recovered_epoch;
-  char *invalidated_commit_id_hex;
-} MarmotGroupEventKind_ForkRecovered_Body;
-
 typedef struct MarmotGroupEventKind_CommitRolledBack_Body {
   char *invalidated_commit_id_hex;
 } MarmotGroupEventKind_CommitRolledBack_Body;
@@ -2486,7 +2475,6 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_GroupStateChanged_Body GROUP_STATE_CHANGED;
     MarmotGroupEventKind_GroupHydrationQuarantined_Body GROUP_HYDRATION_QUARANTINED;
     MarmotGroupEventKind_EpochChanged_Body EPOCH_CHANGED;
-    MarmotGroupEventKind_ForkRecovered_Body FORK_RECOVERED;
     MarmotGroupEventKind_CommitRolledBack_Body COMMIT_ROLLED_BACK;
     MarmotGroupEventKind_GroupStateInvalidated_Body GROUP_STATE_INVALIDATED;
     MarmotGroupEventKind_PendingCommitRecovered_Body PENDING_COMMIT_RECOVERED;
@@ -5302,8 +5290,16 @@ void marmot_background_notification_collection_free(struct MarmotBackgroundNotif
  */
 void marmot_push_registration_free(struct MarmotPushRegistration *registration);
 
+/**
+ * # Safety
+ * `outcome` must be NULL or an unfreed pointer returned by this library.
+ */
 void marmot_push_registration_share_outcome_free(struct MarmotPushRegistrationShareOutcome *outcome);
 
+/**
+ * # Safety
+ * `result` must be NULL or an unfreed pointer returned by this library.
+ */
 void marmot_push_registration_sync_result_free(struct MarmotPushRegistrationSyncResult *result);
 
 /**

@@ -57,11 +57,6 @@ pub enum MarmotGroupEventKind {
         from: u64,
         to: u64,
     },
-    ForkRecovered {
-        source_epoch: u64,
-        recovered_epoch: u64,
-        invalidated_commit_id_hex: *mut c_char,
-    },
     CommitRolledBack {
         invalidated_commit_id_hex: *mut c_char,
     },
@@ -137,15 +132,6 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 }
             }
             GroupEventKindFfi::EpochChanged { from, to } => Self::EpochChanged { from, to },
-            GroupEventKindFfi::ForkRecovered {
-                source_epoch,
-                recovered_epoch,
-                invalidated_commit_id_hex,
-            } => Self::ForkRecovered {
-                source_epoch,
-                recovered_epoch,
-                invalidated_commit_id_hex: owned_c_string(invalidated_commit_id_hex),
-            },
             GroupEventKindFfi::CommitRolledBack {
                 invalidated_commit_id_hex,
             } => Self::CommitRolledBack {
@@ -217,11 +203,7 @@ impl CFree for MarmotGroupEventKind {
                 free_c_string(*change);
                 free_c_string(*origin_commit_id_hex);
             },
-            Self::ForkRecovered {
-                invalidated_commit_id_hex,
-                ..
-            }
-            | Self::CommitRolledBack {
+            Self::CommitRolledBack {
                 invalidated_commit_id_hex,
             } => unsafe {
                 free_c_string(*invalidated_commit_id_hex);
