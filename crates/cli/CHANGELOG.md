@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `wn tui` group detail now has a lowercase `a` that searches for a member to
+  add, for when you do not have the pubkey to hand (`A` remains the paste-a-pubkey
+  path). The search it opens is aimed at that group: `a` on a result confirms
+  against it directly instead of asking which chat, `Esc` returns to the group
+  detail, and a completed add reopens and reloads it.
+
 ### Changed
 
 - Encrypted media and Hermes/WN Agent file delivery now accept blobs up to
@@ -94,6 +102,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The Nostr SDK failed-signature regression test now observes EOSE under one
   bounded CI-safe window, avoiding sharded CI flakes without weakening
   failed-event non-emission and non-caching assertions.
+- `wn tui` now scrolls the highlighted row into view on the account picker, the
+  profile, group-detail, and user-search panes, and the picker popup. Past
+  roughly a screenful of rows the highlight fell outside the drawn area, which
+  made the selection invisible rather than merely awkward — the marker and the
+  highlight are drawn inside each row.
 
 ## [0.9.11] - 2026-08-09
 
@@ -204,7 +217,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   observer-side resolution, branch-depth reversal, encrypted-SQLite restart,
   exact canonical agreement, durable input dispositions, and all twelve
   directed application-decryptability probes.
-  
+
 ### Fixed
 
 - Group creation now performs member KeyPackage lookup and founding Welcome
