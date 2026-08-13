@@ -27,7 +27,7 @@ impl SensitiveBytes {
         Self(Zeroizing::new(bytes))
     }
 
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self(Zeroizing::new(Vec::with_capacity(capacity)))
     }
 
@@ -51,6 +51,24 @@ impl SensitiveBytes {
             drop(previous);
         }
         self.0.push(byte);
+    }
+
+    pub(crate) fn extend_exact(&mut self, bytes: &[u8]) -> StorageResult<()> {
+        if bytes.len() > self.0.capacity().saturating_sub(self.0.len()) {
+            return Err(StorageError::Serialization(
+                "sensitive binary encoding exceeded its exact allocation".to_owned(),
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
     }
 }
 
@@ -229,6 +247,22 @@ pub(crate) fn message_state_to_i64(state: MessageState) -> i64 {
         MessageState::EpochInvalidated => 5,
         MessageState::PeelDeferred => 6,
         MessageState::ConvergenceDeferred => 7,
+    }
+}
+
+pub(crate) fn message_state_from_i64(state: i64) -> StorageResult<MessageState> {
+    match state {
+        0 => Ok(MessageState::Sent),
+        1 => Ok(MessageState::Created),
+        2 => Ok(MessageState::Processed),
+        3 => Ok(MessageState::Failed),
+        4 => Ok(MessageState::Retryable),
+        5 => Ok(MessageState::EpochInvalidated),
+        6 => Ok(MessageState::PeelDeferred),
+        7 => Ok(MessageState::ConvergenceDeferred),
+        _ => Err(StorageError::Serialization(format!(
+            "unknown stored message state {state}"
+        ))),
     }
 }
 

@@ -1,9 +1,7 @@
-use super::{capture, restore, rows::GroupStateCheckpoint};
+use super::{capture, format as snapshot_format, restore};
 use crate::{
-    SqliteAccountStorage, SqliteResultExt,
-    codec::{SensitiveBytes, serialize_sensitive},
-    connection::retry_on_busy,
-    deserialize, epoch_to_i64,
+    SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
+    epoch_to_i64,
 };
 use cgka_traits::storage::{GroupStateCheckpointRef, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId};
@@ -34,7 +32,7 @@ fn create_on_connection(
     checkpoint: &GroupStateCheckpointRef,
 ) -> StorageResult<()> {
     let state = capture::capture_group_state(conn, group_id)?;
-    let blob = serialize_sensitive(&state)?;
+    let blob = snapshot_format::encode_checkpoint(&state)?;
     let existing = conn
         .query_row(
             "SELECT resulting_epoch, checkpoint
@@ -46,10 +44,15 @@ fn create_on_connection(
         .optional()
         .storage()?;
     if let Some((resulting_epoch, existing_blob)) = existing {
-        if resulting_epoch == epoch_to_i64(checkpoint.resulting_epoch)?
-            && existing_blob == blob.as_slice()
-        {
-            return Ok(());
+        if resulting_epoch == epoch_to_i64(checkpoint.resulting_epoch)? {
+            // Existing checkpoints can remain as untagged legacy JSON after
+            // upgrade. Canonicalize their decoded state before comparing so
+            // an exact retry stays idempotent across storage formats.
+            let existing_state = snapshot_format::decode_checkpoint(&existing_blob)?;
+            let existing_blob = snapshot_format::encode_checkpoint(&existing_state)?;
+            if existing_blob.as_slice() == blob.as_slice() {
+                return Ok(());
+            }
         }
         return Err(StorageError::AlreadyExists);
     }
@@ -103,7 +106,7 @@ fn restore_on_connection(
         .storage()?
         .ok_or_else(|| StorageError::SnapshotMissing(checkpoint_id.to_owned()))?,
     );
-    let checkpoint: GroupStateCheckpoint = deserialize(blob.as_slice())?;
+    let checkpoint = snapshot_format::decode_checkpoint(blob.as_slice())?;
     restore::restore_group_state(conn, group_id, &checkpoint)
 }
 

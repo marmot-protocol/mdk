@@ -25,6 +25,7 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -160,13 +161,62 @@ impl TransportPeeler for BenchPeeler {
 // ── Engine construction ─────────────────────────────────────────────────────
 
 fn build_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    build_client_with_storage(identity, SqliteAccountStorage::in_memory().unwrap())
+}
+
+fn build_client_with_storage(
+    identity: &[u8],
+    storage: SqliteAccountStorage,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
         .peeler(Box::new(BenchPeeler))
         .build()
         .expect("build bench engine")
+}
+
+// ── retained-anchor snapshot capture ───────────────────────────────────────
+
+fn bench_retained_anchor_snapshot(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("retained_anchor_snapshot");
+    for invitees in [0_usize, 32] {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build_client_with_storage(
+            format!("bench-alice-snapshot-{invitees}").as_bytes(),
+            storage.clone(),
+        );
+        let key_packages = invitee_key_packages(invitees);
+        let (group_id, _) = rt
+            .block_on(alice.create_group(create_request(key_packages)))
+            .expect("create_group succeeds");
+
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{invitees} invitees")),
+            |b| {
+                b.iter(|| {
+                    storage
+                        .create_group_state_snapshot(&group_id, "bench-retained-anchor")
+                        .expect("snapshot capture succeeds")
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{invitees} invitees, full rollback")),
+            |b| {
+                b.iter(|| {
+                    storage
+                        .create_group_snapshot(&group_id, "bench-full-rollback")
+                        .expect("full snapshot capture succeeds")
+                });
+            },
+        );
+    }
+    group.finish();
 }
 
 /// Mint one fresh KeyPackage per invitee identity. Each identity gets its own
@@ -364,6 +414,7 @@ fn bench_join_welcome_large_group(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_create_group,
+    bench_retained_anchor_snapshot,
     bench_join_welcome,
     bench_join_welcome_large_group
 );

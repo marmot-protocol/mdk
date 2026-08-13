@@ -957,6 +957,7 @@ name = "cgka-traits"
 version = "0.9.12"
 dependencies = [
  "async-trait",
+ "criterion",
  "hex",
  "insta",
  "openmls_traits",

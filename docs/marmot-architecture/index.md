@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-07-30
+updated: 2026-08-13
 tags: [marmot, architecture, index]
 ---
 
@@ -146,6 +146,10 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Inventory of long-lived daemon/broker runtime structures (maps, counters, handle sets, temp
     artifacts) with their bounds and eviction/reclamation rules, plus the tracked-resource discipline for adding new
     ones.
+
+- **Doc:** [`storage-format-v2.md`](./storage-format-v2.md)
+  - **What it covers:** MDK-local storage versioning, normalized protocol-message rows, the explicit stored-message
+    binary envelope, legacy compatibility, snapshot-v2 decision gate, and upgrade/downgrade operations.
 
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.

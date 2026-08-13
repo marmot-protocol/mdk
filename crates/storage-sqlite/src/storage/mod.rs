@@ -11,7 +11,7 @@ mod groups;
 pub(crate) mod leave_requests;
 mod maintenance;
 mod member_validation_cache;
-mod messages;
+pub(crate) mod messages;
 mod outbound;
 pub(crate) mod snapshots;
 mod transport_routes;

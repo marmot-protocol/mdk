@@ -35,6 +35,11 @@ not "fix" it into the per-account database.
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Retained-anchor policy is engine/group policy. SQLite stores snapshots and policy bytes; the engine decides when to
   prune.
+- Follow `docs/marmot-architecture/storage-format-v2.md`: numbered schema migrations gate database compatibility;
+  independently decoded blobs carry artifact-local versions; new `cgka_messages` writes use normalized format 2;
+  legacy format-1 rows remain readable and promote atomically on mutation.
+- Never make `record` and normalized message columns competing authorities. In format 2, scalar columns, `payload`,
+  and `deferred_peel` are authoritative and `record` is `NULL`.
 - Migration file names use padded numeric prefixes, for example `0001_initial_schema.rs`.
 
 ## Verification

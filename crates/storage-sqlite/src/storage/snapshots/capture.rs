@@ -1,3 +1,4 @@
+use super::format as snapshot_format;
 use super::rows::{
     GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
     OrderedQueuedOutbound, Snapshot,
@@ -7,10 +8,9 @@ use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
 #[cfg(feature = "test-conformance-replay")]
 use crate::serialize;
+use crate::storage::messages::ordered_messages_on_connection;
 use crate::{
-    SqliteAccountStorage, SqliteResultExt,
-    codec::{SensitiveBytes, serialize_sensitive},
-    connection::retry_on_busy,
+    SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
     deserialize,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -58,7 +58,7 @@ fn create_on_connection(
     scope: SnapshotScope,
 ) -> StorageResult<()> {
     let snapshot = capture_snapshot(conn, group_id, scope)?;
-    let snapshot_blob = serialize_sensitive(&snapshot)?;
+    let snapshot_blob = snapshot_format::encode(&snapshot)?;
     conn.execute(
         "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
              VALUES (?1, ?2, ?3)",
@@ -151,28 +151,15 @@ pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> Storag
 }
 
 fn messages(tx: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Vec<OrderedMessage>> {
-    let mut stmt = tx
-        .prepare(
-            "SELECT insert_order, record FROM cgka_messages
-             WHERE group_id = ?1
-             ORDER BY insert_order",
-        )
-        .storage()?;
-    let rows = stmt
-        .query_map(params![group_id.as_slice()], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
-    rows.into_iter()
-        .map(|(insert_order, record)| {
-            Ok(OrderedMessage {
+    ordered_messages_on_connection(tx, group_id).map(|messages| {
+        messages
+            .into_iter()
+            .map(|(insert_order, record)| OrderedMessage {
                 insert_order,
-                record: deserialize(&record)?,
+                record,
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 fn queued_outbound(

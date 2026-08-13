@@ -1,13 +1,17 @@
+use super::format as snapshot_format;
 use super::rows::{
     GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
     OrderedQueuedOutbound, Snapshot,
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
+#[cfg(feature = "test-conformance-replay")]
+use crate::deserialize;
 use crate::openmls_storage::mls_group_key;
+use crate::storage::messages::put_message_on_connection;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
-    created_at_to_i64, deserialize, epoch_to_i64, message_state_to_i64, serialize,
+    created_at_to_i64, epoch_to_i64, serialize,
 };
 use cgka_traits::group::Group;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -62,7 +66,7 @@ fn rollback_snapshot(
         .storage()?
         .ok_or_else(|| StorageError::SnapshotMissing(name.to_string()))?,
     );
-    let snapshot: Snapshot = deserialize(snapshot_blob.as_slice())?;
+    let snapshot = snapshot_format::decode(snapshot_blob.as_slice())?;
     restore_snapshot(conn, group_id, &snapshot, mls_group_key)
 }
 
@@ -180,20 +184,7 @@ fn messages(
     )
     .storage()?;
     for message in messages {
-        conn.execute(
-            "INSERT INTO cgka_messages
-                (insert_order, id, group_id, epoch, state, record)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                message.insert_order,
-                message.record.id.as_slice(),
-                message.record.group_id.as_slice(),
-                epoch_to_i64(message.record.epoch)?,
-                message_state_to_i64(message.record.state),
-                serialize(&message.record)?
-            ],
-        )
-        .storage()?;
+        put_message_on_connection(conn, Some(message.insert_order), &message.record)?;
     }
     // A full snapshot replaces this group's protocol messages. Preserve
     // pending application deliveries whose source messages were restored, but
