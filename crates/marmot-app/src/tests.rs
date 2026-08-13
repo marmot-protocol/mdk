@@ -6515,6 +6515,85 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
     );
 }
 
+/// Issue #1177: the no-inbound drain seam owes the same terminal sweep as
+/// inbound ingest.
+///
+/// `restore_disband_tombstone` re-emits a stored group's `GroupDisbanded` from
+/// hydration, behind no delivery at all, and that replay is the only
+/// reconciliation left for a disband whose live-session projection never
+/// completed — a crash, or a batch that failed after the engine had already
+/// drained the event one-shot. If this seam skips the sweep, a send the engine
+/// accepted but never published survives the restart still claiming `Pending`.
+#[tokio::test]
+async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-disband.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("drained disband", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // A send the engine accepted and retained: no published source id, so it
+    // derives as pending until something resolves it.
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: "held".to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "hello".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(11),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: Some(MemberId::new(hex::decode(&account.account_id_hex).unwrap())),
+            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    let held = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|row| row.message_id_hex == "held")
+        .expect("the held send must still be on the timeline");
+    assert_eq!(
+        held.invalidation_status,
+        Some("local_publish_failed".to_owned()),
+        "a disband replayed without a delivery must still end the held send's wait"
+    );
+}
+
 #[test]
 fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {

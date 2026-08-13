@@ -241,6 +241,11 @@ pub enum SendResult {
 /// convergence input settles. A refused send never reaches this type at all —
 /// it returns an error instead.
 ///
+/// It is not an unconditional promise of publication, though. A group that goes
+/// terminal — disbanded, or this device's copy removed — discards its outbound
+/// queue wholesale, so anything still retained there never publishes. That
+/// teardown, not a timeout, is what ends a pending send's wait.
+///
 /// It exists so a host never has to infer acceptance from an empty published
 /// message-id list (mdk#1177).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

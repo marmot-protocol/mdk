@@ -371,6 +371,16 @@ impl AppClient {
         }
         let display_names = self.app.display_names_by_id()?;
         let source_received_at = unix_now_seconds();
+        // Hydration re-emits a stored group's `GroupDisbanded` on every open
+        // (`restore_disband_tombstone`), and that replay is the only reconciler
+        // left for a disband whose live-session projection never completed — a
+        // crash, or a batch that failed after the engine had already drained the
+        // event. So this seam owes the same terminal sweep as the inbound one.
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
@@ -445,6 +455,7 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
+            self.invalidate_terminal_pending_sends(event, &local_account_id_hex, &mut summary)?;
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
@@ -1748,6 +1759,37 @@ impl AppClient {
         self.pending_application_event_acks.clear();
         Ok(())
     }
+
+    /// Terminal disposition for accepted-but-unpublished sends (#1177).
+    ///
+    /// The engine purges the whole outbound queue at the seams
+    /// [`terminates_local_outbound_queue`] names, so every send it still held is
+    /// dead; without this sweep those rows derive as `pending` forever, which is
+    /// the one place the app cannot tell "still coming" from "never arriving".
+    /// Propagate the error rather than swallow it: a silently skipped sweep
+    /// leaves exactly the lie this fixes. The sweep ignores already-invalidated
+    /// rows, so the batch retry that error triggers is a no-op for anything it
+    /// already withdrew — which is also why every observation seam can run it.
+    fn invalidate_terminal_pending_sends(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+        local_account_id_hex: &str,
+        summary: &mut SyncSummary,
+    ) -> Result<(), AppError> {
+        if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id, change, ..
+        } = event
+            && terminates_local_outbound_queue(change, local_account_id_hex)
+            && let Some(projection_update) = self.app.invalidate_timeline_pending_sends_for_group(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+            )?
+        {
+            summary.projection_updates.push(projection_update);
+        }
+        Ok(())
+    }
+
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -1907,27 +1949,7 @@ impl AppClient {
                     self.app
                         .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
             }
-            // Terminal disposition for accepted-but-unpublished sends (#1177).
-            // The engine purges the whole outbound queue at both seams above, so
-            // every send it still held is dead; without this sweep those rows
-            // derive as `pending` forever, which is the one place the app cannot
-            // tell "still coming" from "never arriving". Propagate the error
-            // rather than swallow it: a silently skipped sweep leaves exactly
-            // the lie this fixes. The sweep ignores already-invalidated rows, so
-            // the batch retry that error triggers is a no-op for anything it
-            // already withdrew.
-            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
-                group_id, change, ..
-            } = event
-                && terminates_local_outbound_queue(change, &local_account_id_hex)
-                && let Some(projection_update) =
-                    self.app.invalidate_timeline_pending_sends_for_group(
-                        &self.state.label,
-                        &hex::encode(group_id.as_slice()),
-                    )?
-            {
-                summary.projection_updates.push(projection_update);
-            }
+            self.invalidate_terminal_pending_sends(event, &local_account_id_hex, summary)?;
             // A (re-)join or create restores the local account's membership so a
             // re-add after removal un-suppresses the group's unread count. Same
             // source-of-truth write as the departure path above: propagate the

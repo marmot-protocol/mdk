@@ -145,6 +145,10 @@ pub enum EngineError {
     /// verified repair returns it to `Stable`. Its one legal exit is an
     /// authenticated replacement Welcome from another member, so no local retry
     /// can clear it and the engine cannot heal itself.
+    /// [`SendIntent::Disband`](crate::engine::SendIntent::Disband) is the one
+    /// exception the refusal makes: it persists a durable teardown request
+    /// rather than preparing a Commit, so a halted group can still be torn down
+    /// without waiting on a repair that may never come.
     ///
     /// Intents accepted before the halt stay retained and publish after the
     /// repair; only *new* work is refused, and nothing was persisted for it.
