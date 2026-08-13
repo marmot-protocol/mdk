@@ -907,8 +907,20 @@ async fn app_runtime_and_process_adapters_recover_the_same_offline_projection() 
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes() {
+const APP_RUNTIME_ROUTE_EQUIVALENCE_SOAK_TRIALS: usize = 20;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum AppRuntimeCrossRouteOutcome {
+    FullyEquivalent,
+    ZetaOneEpochBehind,
+    ZetaMissingAlphaProbe,
+    ZetaMissingAlphaAndObserverProbes,
+    LegacySplit,
+    CorrectedSplit,
+    Uncharacterized,
+}
+
+async fn run_four_party_cross_route_app_runtime_trial() -> AppRuntimeCrossRouteOutcome {
     let strict_spec = cross_route_app_runtime_scenario(true);
     let clients = strict_spec.clients.clone();
     let mut expectations = clients
@@ -1221,14 +1233,55 @@ async fn four_party_cross_route_recovery_characterizes_corrected_app_runtime_out
             ])
         && app_payloads_by_client["zeta"] == app_payloads_by_client["yankee"];
 
-    assert!(
-        fully_equivalent
-            || zeta_one_epoch_behind
-            || missing_at_zeta_after_agreement(&["probe-from-alpha"])
-            || missing_at_zeta_after_agreement(&["probe-from-alpha", "probe-from-observer",])
-            || legacy_split
-            || corrected_split,
+    let observed_outcome = if fully_equivalent {
+        AppRuntimeCrossRouteOutcome::FullyEquivalent
+    } else if zeta_one_epoch_behind {
+        AppRuntimeCrossRouteOutcome::ZetaOneEpochBehind
+    } else if missing_at_zeta_after_agreement(&["probe-from-alpha"]) {
+        AppRuntimeCrossRouteOutcome::ZetaMissingAlphaProbe
+    } else if missing_at_zeta_after_agreement(&["probe-from-alpha", "probe-from-observer"]) {
+        AppRuntimeCrossRouteOutcome::ZetaMissingAlphaAndObserverProbes
+    } else if legacy_split {
+        AppRuntimeCrossRouteOutcome::LegacySplit
+    } else if corrected_split {
+        AppRuntimeCrossRouteOutcome::CorrectedSplit
+    } else {
+        AppRuntimeCrossRouteOutcome::Uncharacterized
+    };
+
+    assert_ne!(
+        observed_outcome,
+        AppRuntimeCrossRouteOutcome::Uncharacterized,
         "app-runtime route result was not a characterized corrected-input outcome; protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; invalidated={invalidated_counts_by_client:#?}; observations={app_observations:#?}"
+    );
+    observed_outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_party_cross_route_recovery_app_runtime_matches_unified_route() {
+    assert_eq!(
+        run_four_party_cross_route_app_runtime_trial().await,
+        AppRuntimeCrossRouteOutcome::FullyEquivalent,
+        "the unified current-master route must not retain any pre-unification app-runtime terminal split"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual twenty-trial app-runtime route-equivalence soak"]
+async fn four_party_cross_route_recovery_app_runtime_equivalence_soak() {
+    let mut outcomes = BTreeMap::new();
+    for _ in 0..APP_RUNTIME_ROUTE_EQUIVALENCE_SOAK_TRIALS {
+        *outcomes
+            .entry(run_four_party_cross_route_app_runtime_trial().await)
+            .or_insert(0usize) += 1;
+    }
+    assert_eq!(
+        outcomes,
+        BTreeMap::from([(
+            AppRuntimeCrossRouteOutcome::FullyEquivalent,
+            APP_RUNTIME_ROUTE_EQUIVALENCE_SOAK_TRIALS,
+        )]),
+        "the unified route produced a non-equivalent app-runtime terminal surface"
     );
 }
 
