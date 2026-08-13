@@ -909,6 +909,19 @@ impl<S: StorageProvider> Engine<S> {
             Err(e) => return Err(EngineError::Storage(e)),
         };
         let (anchor, ceiling) = self.convergence_gate_horizon(group_id, &group)?;
+        // Indexed fast path: `any_gating_convergence_input` can only report a
+        // gate when some retained row is in an outbound-gating state
+        // (`ClassifiedConvergenceInput::can_gate_outbound`). This runs on
+        // every send, so answer the common no-gating-work case with one
+        // existence probe instead of listing and decoding the group's whole
+        // retained window.
+        if !self.storage.has_messages_in_states(
+            group_id,
+            &crate::convergence_input::OUTBOUND_GATING_STATES,
+            EpochId(anchor),
+        )? {
+            return Ok(false);
+        }
         let records = self.storage.list_messages(group_id, EpochId(anchor))?;
         Ok(self.any_gating_convergence_input(anchor, ceiling, &records))
     }
@@ -1108,12 +1121,14 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let now = self.convergence_now();
-        let mut deferred: Vec<_> = self
-            .storage
-            .list_messages(group_id, EpochId(0))?
-            .into_iter()
-            .filter(|record| record.state == MessageState::PeelDeferred)
-            .collect();
+        // State-filtered listing: this sweep runs on every drain and the
+        // backlog is usually empty, so let the backend's index find the
+        // `PeelDeferred` rows instead of decoding the whole retained window.
+        let mut deferred = self.storage.list_messages_in_states(
+            group_id,
+            &[MessageState::PeelDeferred],
+            EpochId(0),
+        )?;
         if self.normalize_deferred_peel_lifecycles(&mut deferred, now)? {
             // Legacy initialization and restart rebasing are durable writes,
             // so migrate them in the same bounded slices as peel attempts.

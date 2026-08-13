@@ -88,6 +88,8 @@ mod migration_0043_transport_group_routes;
 mod migration_0044_local_group_deletion_frontiers;
 #[path = "migrations/0045_timeline_canonical_order.rs"]
 mod migration_0045_timeline_canonical_order;
+#[path = "migrations/0046_message_group_state_epoch_index.rs"]
+mod migration_0046_message_group_state_epoch_index;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -324,6 +326,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 45,
         name: "0045_timeline_canonical_order",
         apply: migration_0045_timeline_canonical_order::apply,
+    },
+    Migration {
+        version: 46,
+        name: "0046_message_group_state_epoch_index",
+        apply: migration_0046_message_group_state_epoch_index::apply,
     },
 ];
 

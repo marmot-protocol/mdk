@@ -208,6 +208,42 @@ pub trait MessageStorage {
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>>;
 
+    /// Whether any retained row for `group_id` at or after `at_or_after_epoch`
+    /// is in one of `states`. Hot-path gates (outbound send checks, sweep
+    /// short-circuits) call this before deciding whether a full
+    /// [`Self::list_messages`] scan is worth paying, so backends should answer
+    /// it with an indexed existence probe instead of materializing and
+    /// decoding rows. An empty `states` slice answers `false`.
+    fn has_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<bool> {
+        Ok(self
+            .list_messages(group_id, at_or_after_epoch)?
+            .iter()
+            .any(|record| states.contains(&record.state)))
+    }
+
+    /// [`Self::list_messages`] restricted to rows whose state is in `states`,
+    /// in the same deterministic replay order. Backends should push the state
+    /// filter into the query so callers interested in a rare state (for
+    /// example `PeelDeferred`) do not pay to materialize and decode every
+    /// retained row. An empty `states` slice returns no rows.
+    fn list_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        Ok(self
+            .list_messages(group_id, at_or_after_epoch)?
+            .into_iter()
+            .filter(|record| states.contains(&record.state))
+            .collect())
+    }
+
     /// Persist authenticated app-visible output until its app projection has
     /// committed. Implementations accept `MessageReceived` and `GroupJoined`,
     /// keyed by their source message or Welcome id, and reject other events.

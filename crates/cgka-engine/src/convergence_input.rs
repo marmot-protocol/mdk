@@ -52,9 +52,17 @@ impl ClassifiedConvergenceInput {
     }
 
     fn can_gate_outbound(self) -> bool {
-        matches!(self.state, MessageState::Created | MessageState::Retryable)
+        OUTBOUND_GATING_STATES.contains(&self.state)
     }
 }
+
+/// The stored message states in which a retained input can gate outbound
+/// sends. `Engine::has_unresolved_convergence_inputs` passes this list to an
+/// indexed storage existence probe before paying a full list-and-decode scan;
+/// defining [`ClassifiedConvergenceInput::can_gate_outbound`] in terms of the
+/// same constant keeps the fast path and the classifier in lockstep.
+pub(crate) const OUTBOUND_GATING_STATES: [MessageState; 2] =
+    [MessageState::Created, MessageState::Retryable];
 
 #[derive(Default)]
 pub(crate) struct ConvergenceInputContext {
@@ -181,6 +189,31 @@ mod tests {
             source_epoch,
             state,
             digest: [digest_byte; 32],
+        }
+    }
+
+    #[test]
+    fn outbound_gating_states_stay_in_lockstep_with_the_classifier() {
+        // The indexed send-gate fast path prunes on `OUTBOUND_GATING_STATES`
+        // before the full scan runs `can_gate_outbound`; a state that gates in
+        // the classifier but is missing from the constant would make the fast
+        // path silently unblock sends.
+        for state in [
+            MessageState::Sent,
+            MessageState::Created,
+            MessageState::Processed,
+            MessageState::Failed,
+            MessageState::Retryable,
+            MessageState::EpochInvalidated,
+            MessageState::PeelDeferred,
+            MessageState::ConvergenceDeferred,
+        ] {
+            let classified = input(ConvergencePassMemberRole::CommitEdge, 1, state, 1);
+            assert_eq!(
+                classified.can_gate_outbound(),
+                OUTBOUND_GATING_STATES.contains(&state),
+                "{state:?} disagrees between can_gate_outbound and OUTBOUND_GATING_STATES"
+            );
         }
     }
 
