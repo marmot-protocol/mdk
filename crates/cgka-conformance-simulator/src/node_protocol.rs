@@ -112,6 +112,12 @@ pub enum NodeCommandV1 {
     ClearEvents {
         action_id: String,
     },
+    PauseMaintenance {
+        action_id: String,
+    },
+    ResumeMaintenance {
+        action_id: String,
+    },
     Barrier {
         action_id: String,
         barrier: String,
@@ -579,6 +585,22 @@ impl NodeServer {
                 state.runtime_events_observed = 0;
                 state.previous_checkpoint = None;
                 state.stable_checkpoint_observations = 0;
+                Ok(ack(action_id, 0, None))
+            }
+            NodeCommandV1::PauseMaintenance { action_id } => {
+                state
+                    .runtime
+                    .pause_maintenance(&state.account_id)
+                    .await
+                    .map_err(app_node_error)?;
+                Ok(ack(action_id, 0, None))
+            }
+            NodeCommandV1::ResumeMaintenance { action_id } => {
+                state
+                    .runtime
+                    .resume_maintenance(&state.account_id)
+                    .await
+                    .map_err(app_node_error)?;
                 Ok(ack(action_id, 0, None))
             }
             NodeCommandV1::Barrier { action_id, barrier } => {

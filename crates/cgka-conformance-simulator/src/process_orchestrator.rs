@@ -602,40 +602,50 @@ impl ProcessOrchestrator {
                 let admins = self
                     .account_ids(admin_labels)
                     .map_err(orchestrator_failure)?;
-                let relay_cursors = self
-                    .relay_publication_cursors(creator)
+                self.set_all_maintenance_paused(action_id, true).await?;
+                let result = async {
+                    let relay_cursors = self
+                        .relay_publication_cursors(creator)
+                        .await
+                        .map_err(orchestrator_failure)?;
+                    let response = self
+                        .send(
+                            creator,
+                            NodeCommandV1::CreateGroup {
+                                action_id: action_id.into(),
+                                group: group.clone(),
+                                name: name.clone(),
+                                member_accounts: members,
+                                initial_admin_accounts: admins,
+                            },
+                        )
+                        .await?;
+                    let (group_id, admin_publications, message_ids) = match response {
+                        NodeResponseBodyV1::Ack {
+                            published,
+                            message_ids,
+                            group_id_hex: Some(group_id),
+                            ..
+                        } if published == message_ids.len() => (group_id, published, message_ids),
+                        body => return Err((Some(creator.clone()), unexpected_response(body))),
+                    };
+                    self.record_relay_action_events(
+                        action_id,
+                        relay_cursors,
+                        true,
+                        invitees.len() + admin_publications,
+                        &message_ids,
+                    )
                     .await
                     .map_err(orchestrator_failure)?;
-                let response = self
-                    .send(
-                        creator,
-                        NodeCommandV1::CreateGroup {
-                            action_id: action_id.into(),
-                            group: group.clone(),
-                            name: name.clone(),
-                            member_accounts: members,
-                            initial_admin_accounts: admins,
-                        },
-                    )
-                    .await?;
-                let (group_id, admin_publications, message_ids) = match response {
-                    NodeResponseBodyV1::Ack {
-                        published,
-                        message_ids,
-                        group_id_hex: Some(group_id),
-                        ..
-                    } if published == message_ids.len() => (group_id, published, message_ids),
-                    body => return Err((Some(creator.clone()), unexpected_response(body))),
+                    Ok(group_id)
                 };
-                self.record_relay_action_events(
-                    action_id,
-                    relay_cursors,
-                    true,
-                    invitees.len() + admin_publications,
-                    &message_ids,
-                )
-                .await
-                .map_err(orchestrator_failure)?;
+                let result = result.await;
+                let resume = self.set_all_maintenance_paused(action_id, false).await;
+                let group_id = match (result, resume) {
+                    (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+                    (Ok(group_id), Ok(())) => group_id,
+                };
                 self.groups.insert(group.clone(), group_id.clone());
                 let labels = self.running_labels();
                 for client in &labels {
@@ -825,28 +835,37 @@ impl ProcessOrchestrator {
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
                 self.select_group(sender, &group).await?;
-                let relay_cursors = self
-                    .relay_publication_cursors(sender)
-                    .await
-                    .map_err(orchestrator_failure)?;
-                let (published, message_ids) = self
-                    .expect_counted_publish_ack(
-                        sender,
-                        NodeCommandV1::SendApplication {
-                            action_id: action_id.into(),
-                            payload: payload.clone(),
-                        },
+                self.set_all_maintenance_paused(action_id, true).await?;
+                let result = async {
+                    let relay_cursors = self
+                        .relay_publication_cursors(sender)
+                        .await
+                        .map_err(orchestrator_failure)?;
+                    let (published, message_ids) = self
+                        .expect_counted_publish_ack(
+                            sender,
+                            NodeCommandV1::SendApplication {
+                                action_id: action_id.into(),
+                                payload: payload.clone(),
+                            },
+                        )
+                        .await?;
+                    self.record_relay_action_events(
+                        action_id,
+                        relay_cursors,
+                        false,
+                        published,
+                        &message_ids,
                     )
-                    .await?;
-                self.record_relay_action_events(
-                    action_id,
-                    relay_cursors,
-                    false,
-                    published,
-                    &message_ids,
-                )
-                .await
-                .map_err(orchestrator_failure)?;
+                    .await
+                    .map_err(orchestrator_failure)
+                }
+                .await;
+                let resume = self.set_all_maintenance_paused(action_id, false).await;
+                match (result, resume) {
+                    (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
+                    (Ok(()), Ok(())) => {}
+                }
                 Ok((vec![sender.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::Leave { client } => {
@@ -1251,6 +1270,47 @@ impl ProcessOrchestrator {
             NodeResponseBodyV1::Ack { .. } => Ok(()),
             body => Err((Some(client.into()), unexpected_response(body))),
         }
+    }
+
+    async fn set_all_maintenance_paused(
+        &mut self,
+        action_id: &str,
+        paused: bool,
+    ) -> Result<(), (Option<String>, NodeErrorV1)> {
+        let labels = self.running_labels();
+        let mut changed = Vec::new();
+        let mut first_resume_error = None;
+        for label in labels {
+            let command = if paused {
+                NodeCommandV1::PauseMaintenance {
+                    action_id: action_id.into(),
+                }
+            } else {
+                NodeCommandV1::ResumeMaintenance {
+                    action_id: action_id.into(),
+                }
+            };
+            match self.expect_ack(&label, command).await {
+                Ok(()) => changed.push(label),
+                Err(error) if paused => {
+                    for changed_label in changed.iter().rev() {
+                        let _ = self
+                            .expect_ack(
+                                changed_label,
+                                NodeCommandV1::ResumeMaintenance {
+                                    action_id: action_id.into(),
+                                },
+                            )
+                            .await;
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    first_resume_error.get_or_insert(error);
+                }
+            }
+        }
+        first_resume_error.map_or(Ok(()), Err)
     }
 
     async fn expect_publish_ack(

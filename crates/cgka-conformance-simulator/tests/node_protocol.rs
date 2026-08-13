@@ -60,6 +60,17 @@ async fn node_wraps_one_runtime_and_defines_observable_quiescence() {
     assert!(matches!(
         request(
             &mut server,
+            "pause-maintenance",
+            NodeCommandV1::PauseMaintenance {
+                action_id: "step-0:create_group@main".into(),
+            },
+        )
+        .await,
+        NodeResponseBodyV1::Ack { .. }
+    ));
+    assert!(matches!(
+        request(
+            &mut server,
             "create",
             NodeCommandV1::CreateGroup {
                 action_id: "step-0:create_group@main".into(),
@@ -74,6 +85,17 @@ async fn node_wraps_one_runtime_and_defines_observable_quiescence() {
             group_id_hex: Some(_),
             ..
         }
+    ));
+    assert!(matches!(
+        request(
+            &mut server,
+            "resume-maintenance",
+            NodeCommandV1::ResumeMaintenance {
+                action_id: "step-0:create_group@main".into(),
+            },
+        )
+        .await,
+        NodeResponseBodyV1::Ack { .. }
     ));
     assert!(matches!(
         request(

@@ -193,6 +193,43 @@ impl AppRuntimeHarness {
         self.relay_control.publication_cursor().await
     }
 
+    async fn set_all_maintenance_paused(&self, paused: bool) -> Result<(), SubjectError> {
+        let labels = self
+            .participants
+            .iter()
+            .filter(|(_, participant)| participant.online && participant.runtime.is_some())
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        let mut changed = Vec::new();
+        let mut first_resume_error = None;
+        for label in labels {
+            let participant = self.participant(&label)?;
+            let runtime = participant.runtime()?;
+            let result = if paused {
+                runtime.pause_maintenance(&participant.account_id).await
+            } else {
+                runtime.resume_maintenance(&participant.account_id).await
+            };
+            match result {
+                Ok(()) => changed.push(label),
+                Err(error) if paused => {
+                    for changed_label in changed.iter().rev() {
+                        let changed_participant = self.participant(changed_label)?;
+                        let _ = changed_participant
+                            .runtime()?
+                            .resume_maintenance(&changed_participant.account_id)
+                            .await;
+                    }
+                    return Err(app_error(error));
+                }
+                Err(error) => {
+                    first_resume_error.get_or_insert_with(|| app_error(error));
+                }
+            }
+        }
+        first_resume_error.map_or(Ok(()), Err)
+    }
+
     async fn record_relay_action_events(
         &mut self,
         action_id: &str,
@@ -748,31 +785,40 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 "app-runtime adapter does not synthesize feature-gated key packages",
             ));
         }
-        let before = self.relay_publication_cursor().await;
-        let invitees = self.account_ids(action.invitees)?;
-        let participant = self.participant(action.creator)?;
-        let group_id = participant
-            .runtime()?
-            .create_group(&participant.account_id, action.name, &invitees, None)
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let invitees = self.account_ids(action.invitees)?;
+            let participant = self.participant(action.creator)?;
+            let group_id = participant
+                .runtime()?
+                .create_group(&participant.account_id, action.name, &invitees, None)
+                .await
+                .map_err(app_error)?;
+            let group_label = self
+                .active_scenario_group
+                .clone()
+                .unwrap_or_else(|| "default".into());
+            self.scenario_groups.insert(group_label, group_id.clone());
+            let message_ids = self
+                .apply_admin_set(action.creator, &group_id, action.initial_admins)
+                .await?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.creator,
+                before,
+                true,
+                action.invitees.len() + message_ids.len(),
+                &message_ids,
+            )
             .await
-            .map_err(app_error)?;
-        let group_label = self
-            .active_scenario_group
-            .clone()
-            .unwrap_or_else(|| "default".into());
-        self.scenario_groups.insert(group_label, group_id.clone());
-        let message_ids = self
-            .apply_admin_set(action.creator, &group_id, action.initial_admins)
-            .await?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.creator,
-            before,
-            true,
-            action.invitees.len() + message_ids.len(),
-            &message_ids,
-        )
-        .await?;
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        match (result, resume) {
+            (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
         self.record_accepted_publication(action.creator, action.pending);
         Ok(())
     }
@@ -939,28 +985,36 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectSendApplication<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let participant = self.participant(action.sender)?;
-        let summary = participant
-            .runtime()?
-            .send_message(
-                &participant.account_id,
-                &group_id,
-                action.payload.as_bytes().to_vec(),
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let participant = self.participant(action.sender)?;
+            let summary = participant
+                .runtime()?
+                .send_message(
+                    &participant.account_id,
+                    &group_id,
+                    action.payload.as_bytes().to_vec(),
+                )
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.sender,
+                before,
+                false,
+                summary.published,
+                &[],
             )
             .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.sender,
-            before,
-            false,
-            summary.published,
-            &[],
-        )
-        .await?;
-        Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        match (result, resume) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     async fn leave(&mut self, action_id: &str, client: &str) -> Result<(), SubjectError> {
@@ -1396,11 +1450,15 @@ fn environment_error(error: impl std::fmt::Display) -> SubjectError {
 }
 
 fn relay_control_error(error: RelayControlError) -> SubjectError {
-    SubjectError::classified(
-        SubjectFailureCategory::ExpectedRefusal,
-        error.code,
-        error.message,
-    )
+    let category = match error.code {
+        "relay_publication_cursor_invalid"
+        | "relay_action_publication_timeout"
+        | "relay_action_publication_count_mismatch"
+        | "relay_action_publication_identity_mismatch"
+        | "relay_action_publication_identity_count_mismatch" => SubjectFailureCategory::Environment,
+        _ => SubjectFailureCategory::ExpectedRefusal,
+    };
+    SubjectError::classified(category, error.code, error.message)
 }
 
 fn block_on_subject<F>(future: F) -> Result<(), SubjectError>
@@ -1470,5 +1528,32 @@ mod tests {
 
         let resource = app_error(AppError::RuntimeBusy);
         assert_eq!(resource.category, SubjectFailureCategory::Resource);
+    }
+
+    #[test]
+    fn relay_publication_correlation_failures_are_environment_errors() {
+        for code in [
+            "relay_publication_cursor_invalid",
+            "relay_action_publication_timeout",
+            "relay_action_publication_count_mismatch",
+            "relay_action_publication_identity_mismatch",
+            "relay_action_publication_identity_count_mismatch",
+        ] {
+            let error = relay_control_error(RelayControlError {
+                code,
+                message: "normalized relay-control failure",
+            });
+            assert_eq!(error.code, code);
+            assert_eq!(error.category, SubjectFailureCategory::Environment);
+        }
+
+        let expected_refusal = relay_control_error(RelayControlError {
+            code: "unsupported_relay_selector",
+            message: "normalized relay-control refusal",
+        });
+        assert_eq!(
+            expected_refusal.category,
+            SubjectFailureCategory::ExpectedRefusal
+        );
     }
 }
