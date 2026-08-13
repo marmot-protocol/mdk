@@ -238,6 +238,71 @@ mod tests {
     }
 
     #[test]
+    fn legacy_full_snapshot_blob_with_plain_array_fields_still_restores() {
+        // Blobs written before state-scoped snapshots serialized `messages`
+        // and `queued_outbound` as plain JSON arrays (the fields were `Vec`,
+        // not `Option<Vec>`). Serde decodes those arrays as `Some(..)`, so a
+        // pre-change anchor keeps its capture-time restore semantics. This
+        // builds such a blob from scratch — no `Option` involved — and locks
+        // that compatibility in.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let anchor_group = sample_group(gid(1), 0, 1);
+        let anchor_message = sample_message(mid(1), anchor_group.id.clone(), 0);
+        store.put_group(&anchor_group).unwrap();
+
+        let legacy_blob = serde_json::to_vec(&serde_json::json!({
+            "group": serde_json::to_value(&anchor_group).unwrap(),
+            "messages": [{
+                "insert_order": 1,
+                "record": serde_json::to_value(&anchor_message).unwrap(),
+            }],
+            "queued_outbound": [],
+            "member_caps": [],
+            "convergence_policy": null,
+            "validated_tree_marker": null,
+            "openmls_values": [],
+        }))
+        .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_group_snapshots (group_id, name, snapshot)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    anchor_group.id.as_slice(),
+                    "legacy-full",
+                    legacy_blob.as_slice()
+                ],
+            )
+            .unwrap();
+
+        let live_group = sample_group(gid(1), 1, 2);
+        store.put_group(&live_group).unwrap();
+        store
+            .put_message(&sample_message(mid(2), live_group.id.clone(), 1))
+            .unwrap();
+
+        store
+            .rollback_group_to_snapshot(&live_group.id, "legacy-full")
+            .unwrap();
+
+        // Full-image semantics preserved: the legacy blob's ledger replaces
+        // the live rows, exactly as before the Option change.
+        assert_eq!(store.get_group(&anchor_group.id).unwrap(), anchor_group);
+        assert_eq!(
+            store.list_messages(&anchor_group.id, EpochId(0)).unwrap(),
+            vec![anchor_message]
+        );
+        assert!(
+            store
+                .list_queued_outbound_intents(&anchor_group.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn group_state_checkpoint_restores_canonical_state_without_rewinding_live_work() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 1, 1);
