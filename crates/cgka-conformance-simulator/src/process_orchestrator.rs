@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::LocalRelay;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,6 +17,7 @@ use crate::node_protocol::{
     NODE_OBSERVATION_SCHEMA_VERSION, NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1,
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
+use crate::relay_control::{RelayActionEvents, RelayControl, RelayControlError};
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
     ScenarioInputProvenanceV1, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
@@ -179,13 +180,16 @@ pub struct ProcessOrchestrator {
     run_root: tempfile::TempDir,
     artifact_directory: PathBuf,
     compiled: CompiledScenarioV2,
-    _relays: BTreeMap<String, MockRelay>,
+    _relays: BTreeMap<String, LocalRelay>,
+    relay_controls: BTreeMap<String, RelayControl>,
+    relay_action_events: BTreeMap<String, RelayActionEvents>,
     relay_urls: BTreeMap<String, String>,
     nodes: BTreeMap<String, NodeProcess>,
     account_ids: BTreeMap<String, String>,
     processes: BTreeMap<String, String>,
     process_relays: BTreeMap<String, Vec<String>>,
     groups: BTreeMap<String, String>,
+    offline_observations: BTreeMap<String, NodeObservationV1>,
     lifecycle: Vec<ProcessLifecycleEventV1>,
     input_provenance: Option<ScenarioInputProvenanceV1>,
     executed_scenario_ir_sha256: String,
@@ -200,7 +204,6 @@ struct NodeProcess {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_request: u64,
-    paused: bool,
 }
 
 impl ProcessOrchestrator {
@@ -245,11 +248,14 @@ impl ProcessOrchestrator {
         let compiled = compile_scenario(scenario).map_err(|error| {
             ProcessOrchestratorError::new("scenario_compile", error.to_string())
         })?;
-        preflight_process_compiled_scenario(&compiled, &process_subject_descriptor()).map_err(
-            |error| {
-                ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
-            },
-        )?;
+        let owns_relay_control = external_relay_urls.is_none();
+        preflight_process_compiled_scenario(
+            &compiled,
+            &process_subject_descriptor(owns_relay_control),
+        )
+        .map_err(|error| {
+            ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
+        })?;
         let artifact_directory = artifact_directory.as_ref().to_path_buf();
         fs_private::create_dir_all_private(&artifact_directory).map_err(environment_error)?;
         let run_root = tempfile::Builder::new()
@@ -269,6 +275,7 @@ impl ProcessOrchestrator {
                 .collect()
         };
         let mut relays = BTreeMap::new();
+        let mut relay_controls = BTreeMap::new();
         let relay_urls = if let Some(relay_urls) = external_relay_urls {
             let expected = relay_labels
                 .iter()
@@ -288,9 +295,12 @@ impl ProcessOrchestrator {
         } else {
             let mut relay_urls = BTreeMap::new();
             for label in relay_labels {
-                let relay = MockRelay::run().await.map_err(environment_error)?;
+                let relay_control = RelayControl::new();
+                let relay = LocalRelay::new(relay_control.relay_builder());
+                relay.run().await.map_err(environment_error)?;
                 relay_urls.insert(label.clone(), relay.url().await.to_string());
-                relays.insert(label, relay);
+                relays.insert(label.clone(), relay);
+                relay_controls.insert(label, relay_control);
             }
             relay_urls
         };
@@ -321,12 +331,15 @@ impl ProcessOrchestrator {
             artifact_directory,
             compiled,
             _relays: relays,
+            relay_controls,
+            relay_action_events: BTreeMap::new(),
             relay_urls,
             nodes: BTreeMap::new(),
             account_ids: BTreeMap::new(),
             processes,
             process_relays,
             groups: BTreeMap::new(),
+            offline_observations: BTreeMap::new(),
             lifecycle: Vec::new(),
             input_provenance: None,
             executed_scenario_ir_sha256,
@@ -446,9 +459,6 @@ impl ProcessOrchestrator {
         let labels = self.nodes.keys().cloned().collect::<Vec<_>>();
         for label in labels {
             if let Some(mut node) = self.nodes.remove(&label) {
-                if node.paused {
-                    let _ = resume_pid(node.child.id());
-                }
                 let _ = node.send(NodeCommandV1::Shutdown).await;
                 let _ = timeout(Duration::from_secs(5), node.child.wait()).await;
                 let _ = kill_process_group(&mut node.child).await;
@@ -461,6 +471,107 @@ impl ProcessOrchestrator {
             .entry(client.to_owned())
             .or_default()
             .insert(publication.to_owned());
+    }
+
+    async fn relay_publication_cursors(
+        &self,
+        client: &str,
+    ) -> Result<BTreeMap<String, usize>, ProcessOrchestratorError> {
+        let mut cursors = BTreeMap::new();
+        for label in self.relay_labels_for_client(client)? {
+            if let Some(control) = self.relay_controls.get(&label) {
+                cursors.insert(label, control.publication_cursor().await);
+            }
+        }
+        Ok(cursors)
+    }
+
+    async fn record_relay_action_events(
+        &mut self,
+        action_id: &str,
+        cursors: BTreeMap<String, usize>,
+        include_welcomes: bool,
+    ) -> Result<(), ProcessOrchestratorError> {
+        for (relay, before) in cursors {
+            let control = self.relay_controls.get(&relay).ok_or_else(|| {
+                ProcessOrchestratorError::new(
+                    "relay_control_unavailable",
+                    "the process adapter does not own the selected relay control",
+                )
+            })?;
+            // A node acknowledges its command after the durable app-runtime
+            // mutation, while the Nostr transport may still be admitting the
+            // resulting event on the relay task. Wait for that immediate
+            // publication so a later action-id selector cannot race an empty
+            // correlation entry.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let recorded = control
+                    .record_action_events(
+                        self.relay_action_events.entry(relay.clone()).or_default(),
+                        action_id,
+                        before,
+                        include_welcomes,
+                    )
+                    .await
+                    .map_err(process_relay_control_error)?;
+                if recorded > 0 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ProcessOrchestratorError::new(
+                        "relay_action_publication_timeout",
+                        "the process action completed without an immediate retained relay publication",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_relay_event_visibility(
+        &mut self,
+        relay: &str,
+        selector: &crate::ScenarioMessageSelectorV2,
+        clients: &[String],
+        visible: bool,
+    ) -> Result<(), ProcessOrchestratorError> {
+        if clients
+            .iter()
+            .any(|client| !self.compiled.clients.contains(client))
+        {
+            return Err(ProcessOrchestratorError::new(
+                "unknown_relay_removal_client",
+                "every named relay-removal client must belong to the process harness",
+            ));
+        }
+        if !visible
+            && self.compiled.clients.iter().any(|client| {
+                self.nodes.contains_key(client) || !self.offline_observations.contains_key(client)
+            })
+        {
+            return Err(ProcessOrchestratorError::new(
+                "relay_removal_requires_all_participants_offline",
+                "an event can be hidden from the relay only while every process participant is offline",
+            ));
+        }
+        let control = self.relay_controls.get(relay).ok_or_else(|| {
+            ProcessOrchestratorError::new(
+                "relay_control_unavailable",
+                "the process adapter does not own the selected relay control",
+            )
+        })?;
+        let action_events = self.relay_action_events.get(relay).ok_or_else(|| {
+            ProcessOrchestratorError::new(
+                "relay_event_not_found",
+                "the selected relay has no action-addressed publications",
+            )
+        })?;
+        control
+            .set_action_event_visibility(action_events, selector, visible)
+            .await
+            .map_err(process_relay_control_error)
     }
 
     async fn execute_action(
@@ -495,6 +606,10 @@ impl ProcessOrchestrator {
                 let admins = self
                     .account_ids(admin_labels)
                     .map_err(orchestrator_failure)?;
+                let relay_cursors = self
+                    .relay_publication_cursors(creator)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 let response = self
                     .send(
                         creator,
@@ -514,6 +629,9 @@ impl ProcessOrchestrator {
                     } => group_id,
                     body => return Err((Some(creator.clone()), unexpected_response(body))),
                 };
+                self.record_relay_action_events(action_id, relay_cursors, true)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.groups.insert(group.clone(), group_id.clone());
                 let labels = self.running_labels();
                 for client in &labels {
@@ -536,6 +654,10 @@ impl ProcessOrchestrator {
             } => {
                 self.select_group(inviter, &group).await?;
                 let member_accounts = self.account_ids(invitees).map_err(orchestrator_failure)?;
+                let relay_cursors = self
+                    .relay_publication_cursors(inviter)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     inviter,
                     NodeCommandV1::InviteMembers {
@@ -544,6 +666,9 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, true)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(inviter, pending);
                 Ok((vec![inviter.clone()], ProcessActionStatusV1::Completed))
             }
@@ -554,6 +679,10 @@ impl ProcessOrchestrator {
             } => {
                 self.select_group(remover, &group).await?;
                 let member_accounts = self.account_ids(members).map_err(orchestrator_failure)?;
+                let relay_cursors = self
+                    .relay_publication_cursors(remover)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     remover,
                     NodeCommandV1::RemoveMembers {
@@ -562,11 +691,18 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(remover, pending);
                 Ok((vec![remover.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::SelfUpdate { client, pending } => {
                 self.select_group(client, &group).await?;
+                let relay_cursors = self
+                    .relay_publication_cursors(client)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     client,
                     NodeCommandV1::SelfUpdate {
@@ -574,6 +710,9 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -583,6 +722,10 @@ impl ProcessOrchestrator {
                 pending,
             } => {
                 self.select_group(client, &group).await?;
+                let relay_cursors = self
+                    .relay_publication_cursors(client)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     client,
                     NodeCommandV1::UpdateGroupData {
@@ -591,6 +734,9 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -601,6 +747,10 @@ impl ProcessOrchestrator {
                 pending,
             } => {
                 self.select_group(client, &group).await?;
+                let relay_cursors = self
+                    .relay_publication_cursors(client)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     client,
                     NodeCommandV1::UpdateGroupProfile {
@@ -610,6 +760,9 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -620,6 +773,10 @@ impl ProcessOrchestrator {
             } => {
                 self.select_group(client, &group).await?;
                 let admin_accounts = self.account_ids(admins).map_err(orchestrator_failure)?;
+                let relay_cursors = self
+                    .relay_publication_cursors(client)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     client,
                     NodeCommandV1::UpdateAdminPolicy {
@@ -628,11 +785,18 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
                 self.select_group(sender, &group).await?;
+                let relay_cursors = self
+                    .relay_publication_cursors(sender)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     sender,
                     NodeCommandV1::SendApplication {
@@ -641,10 +805,17 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 Ok((vec![sender.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::Leave { client } => {
                 self.select_group(client, &group).await?;
+                let relay_cursors = self
+                    .relay_publication_cursors(client)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     client,
                     NodeCommandV1::Leave {
@@ -652,6 +823,9 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
+                self.record_relay_action_events(action_id, relay_cursors, false)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::DeliverAll => {
@@ -662,7 +836,7 @@ impl ProcessOrchestrator {
             ScenarioStep::Tick { clients } => {
                 let labels = clients
                     .iter()
-                    .filter(|client| self.nodes.get(*client).is_some_and(|node| !node.paused))
+                    .filter(|client| self.nodes.contains_key(*client))
                     .cloned()
                     .collect::<Vec<_>>();
                 self.catch_up(&labels, action_id, false).await?;
@@ -671,7 +845,7 @@ impl ProcessOrchestrator {
             ScenarioStep::SyncRelayHistory { clients, sync } => {
                 let clients = clients
                     .iter()
-                    .filter(|client| self.nodes.get(*client).is_some_and(|node| !node.paused))
+                    .filter(|client| self.nodes.contains_key(*client))
                     .cloned()
                     .collect::<Vec<_>>();
                 let full_history = matches!(
@@ -731,11 +905,11 @@ impl ProcessOrchestrator {
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::SetClientOffline { client } => {
-                self.pause_participant(client, action_id)?;
+                self.disconnect_participant(client, action_id).await?;
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::ReconnectClient { client } => {
-                self.resume_participant(client, action_id)?;
+                self.reconnect_participant(client, action_id).await?;
                 self.catch_up(std::slice::from_ref(client), action_id, false)
                     .await?;
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
@@ -768,6 +942,17 @@ impl ProcessOrchestrator {
                     )
                     .await?;
                 }
+                Ok((clients.clone(), ProcessActionStatusV1::Completed))
+            }
+            ScenarioStep::SetRelayEventVisibility {
+                relay,
+                selector,
+                clients,
+                visible,
+            } => {
+                self.set_relay_event_visibility(relay, selector, clients, *visible)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 Ok((clients.clone(), ProcessActionStatusV1::Completed))
             }
             unsupported => Err((
@@ -848,7 +1033,6 @@ impl ProcessOrchestrator {
             stdin,
             stdout: BufReader::new(stdout),
             next_request: 0,
-            paused: false,
         };
         let relay_urls = self.relay_urls_for_client(client)?;
         let response = node
@@ -909,7 +1093,10 @@ impl ProcessOrchestrator {
         Ok(())
     }
 
-    fn relay_urls_for_client(&self, client: &str) -> Result<Vec<String>, ProcessOrchestratorError> {
+    fn relay_labels_for_client(
+        &self,
+        client: &str,
+    ) -> Result<Vec<String>, ProcessOrchestratorError> {
         let process = self.processes.get(client).ok_or_else(|| {
             ProcessOrchestratorError::new("topology", "participant has no process mapping")
         })?;
@@ -919,16 +1106,31 @@ impl ProcessOrchestrator {
             .cloned()
             .unwrap_or_default();
         if labels.is_empty() {
-            return Ok(self.relay_urls.values().cloned().collect());
+            return Ok(self.relay_urls.keys().cloned().collect());
         }
-        labels
+        if labels
+            .iter()
+            .any(|label| !self.relay_urls.contains_key(label))
+        {
+            return Err(ProcessOrchestratorError::new(
+                "topology",
+                "process references unknown relay",
+            ));
+        }
+        Ok(labels)
+    }
+
+    fn relay_urls_for_client(&self, client: &str) -> Result<Vec<String>, ProcessOrchestratorError> {
+        Ok(self
+            .relay_labels_for_client(client)?
             .into_iter()
             .map(|label| {
-                self.relay_urls.get(&label).cloned().ok_or_else(|| {
-                    ProcessOrchestratorError::new("topology", "process references unknown relay")
-                })
+                self.relay_urls
+                    .get(&label)
+                    .cloned()
+                    .expect("validated label")
             })
-            .collect()
+            .collect())
     }
 
     fn account_ids(&self, labels: &[String]) -> Result<Vec<String>, ProcessOrchestratorError> {
@@ -979,17 +1181,6 @@ impl ProcessOrchestrator {
                 },
             )
         })?;
-        if node.paused {
-            return Err((
-                Some(client.into()),
-                NodeErrorV1 {
-                    code: "participant_paused".into(),
-                    category: SubjectFailureCategory::ExpectedRefusal,
-                    retryable: true,
-                    message: "participant process is paused".into(),
-                },
-            ));
-        }
         match node.send(command).await {
             Ok(NodeResponseBodyV1::Error(error)) => Err((Some(client.into()), error)),
             Ok(body) => Ok(body),
@@ -1042,6 +1233,23 @@ impl ProcessOrchestrator {
     ) -> Result<Vec<NodeObservationV1>, (Option<String>, NodeErrorV1)> {
         let mut observations = Vec::with_capacity(clients.len());
         for client in clients {
+            if !self.nodes.contains_key(client) {
+                let observation = self.offline_observations.get(client).ok_or_else(|| {
+                    (
+                        Some(client.clone()),
+                        NodeErrorV1 {
+                            code: "offline_observation_unavailable".into(),
+                            category: SubjectFailureCategory::Environment,
+                            retryable: false,
+                            message:
+                                "the process went offline without a public observation checkpoint"
+                                    .into(),
+                        },
+                    )
+                })?;
+                observations.push(observation.clone());
+                continue;
+            }
             match self
                 .send(
                     client,
@@ -1120,61 +1328,89 @@ impl ProcessOrchestrator {
     }
 
     fn running_labels(&self) -> Vec<String> {
-        self.nodes
-            .iter()
-            .filter(|(_, node)| !node.paused)
-            .map(|(label, _)| label.clone())
-            .collect()
+        self.nodes.keys().cloned().collect()
     }
 
-    fn pause_participant(
+    async fn disconnect_participant(
         &mut self,
         client: &str,
         action_id: &str,
     ) -> Result<(), (Option<String>, NodeErrorV1)> {
-        let node = self.nodes.get_mut(client).ok_or_else(|| {
+        let observation = match self
+            .send(
+                client,
+                NodeCommandV1::Observe {
+                    action_id: action_id.into(),
+                },
+            )
+            .await?
+        {
+            NodeResponseBodyV1::Observation { observation, .. } => *observation,
+            body => return Err((Some(client.into()), unexpected_response(body))),
+        };
+        let mut node = self.nodes.remove(client).ok_or_else(|| {
             orchestrator_failure(ProcessOrchestratorError::new(
                 "participant_not_running",
-                "cannot pause a stopped participant",
+                "cannot disconnect a stopped participant",
             ))
         })?;
-        pause_pid(node.child.id()).map_err(|error| {
-            orchestrator_failure(ProcessOrchestratorError::new(
-                "pause_failed",
-                error.to_string(),
-            ))
-        })?;
-        node.paused = true;
+        match node.send(NodeCommandV1::Shutdown).await {
+            Ok(NodeResponseBodyV1::Shutdown) => {}
+            Ok(body) => return Err((Some(client.into()), unexpected_response(body))),
+            Err(error) => return Err(orchestrator_failure(error)),
+        }
+        let _ = timeout(Duration::from_secs(5), node.child.wait()).await;
+        kill_process_group(&mut node.child)
+            .await
+            .map_err(|error| orchestrator_failure(environment_error(error)))?;
+        self.offline_observations.insert(client.into(), observation);
         self.lifecycle.push(ProcessLifecycleEventV1 {
             action_id: action_id.into(),
             participant: client.into(),
-            event: "paused".into(),
+            event: "disconnected".into(),
         });
         Ok(())
     }
 
-    fn resume_participant(
+    async fn reconnect_participant(
         &mut self,
         client: &str,
         action_id: &str,
     ) -> Result<(), (Option<String>, NodeErrorV1)> {
-        let node = self.nodes.get_mut(client).ok_or_else(|| {
-            orchestrator_failure(ProcessOrchestratorError::new(
-                "participant_not_running",
-                "cannot resume a stopped participant",
-            ))
-        })?;
-        resume_pid(node.child.id()).map_err(|error| {
-            orchestrator_failure(ProcessOrchestratorError::new(
-                "resume_failed",
-                error.to_string(),
-            ))
-        })?;
-        node.paused = false;
+        if self.nodes.contains_key(client) && !self.offline_observations.contains_key(client) {
+            self.lifecycle.push(ProcessLifecycleEventV1 {
+                action_id: action_id.into(),
+                participant: client.into(),
+                event: "already_connected".into(),
+            });
+            return Ok(());
+        }
+        if !self.offline_observations.contains_key(client) || self.nodes.contains_key(client) {
+            return Err(orchestrator_failure(ProcessOrchestratorError::new(
+                "participant_connectivity_inconsistent",
+                "participant process and offline checkpoint disagree",
+            )));
+        }
+        self.launch_participant(client, action_id)
+            .await
+            .map_err(orchestrator_failure)?;
+        self.configure_peers().await.map_err(orchestrator_failure)?;
+        let groups = self.groups.clone();
+        for (group, group_id_hex) in groups {
+            self.expect_ack(
+                client,
+                NodeCommandV1::SelectGroup {
+                    group,
+                    group_id_hex,
+                },
+            )
+            .await?;
+        }
+        self.offline_observations.remove(client);
         self.lifecycle.push(ProcessLifecycleEventV1 {
             action_id: action_id.into(),
             participant: client.into(),
-            event: "resumed".into(),
+            event: "reconnected".into(),
         });
         Ok(())
     }
@@ -1190,9 +1426,7 @@ impl ProcessOrchestrator {
                 "cannot crash a stopped participant",
             ))
         })?;
-        if node.paused {
-            let _ = resume_pid(node.child.id());
-        }
+        self.offline_observations.remove(client);
         kill_process_group(&mut node.child).await.map_err(|error| {
             orchestrator_failure(ProcessOrchestratorError::new(
                 "kill_failed",
@@ -1230,6 +1464,7 @@ impl ProcessOrchestrator {
             )
             .await?;
         }
+        self.offline_observations.remove(client);
         self.lifecycle.push(ProcessLifecycleEventV1 {
             action_id: action_id.into(),
             participant: client.into(),
@@ -1340,25 +1575,29 @@ fn decode_node_response(
     Ok(response)
 }
 
-fn process_subject_descriptor() -> SubjectDescriptor {
+fn process_subject_descriptor(owns_relay_control: bool) -> SubjectDescriptor {
+    let mut capabilities = BTreeSet::from([
+        SubjectCapability::GroupMutation,
+        SubjectCapability::ApplicationMessaging,
+        SubjectCapability::TransportDelivery,
+        SubjectCapability::EventObservation,
+        SubjectCapability::AdminPolicyObservation,
+        SubjectCapability::CrashReopen,
+        SubjectCapability::OutboundPublication,
+        SubjectCapability::StructuralProgress,
+        SubjectCapability::ParticipantConnectivity,
+        SubjectCapability::ProcessLifecycle,
+        SubjectCapability::MultiGroup,
+        SubjectCapability::RetainedRelayHistory,
+    ]);
+    if owns_relay_control {
+        capabilities.insert(SubjectCapability::RetainedRelayControl);
+    }
     SubjectDescriptor {
         adapter: "marmot_app_process".into(),
         adapter_version: "1".into(),
         storage_backend: "sqlcipher_per_process".into(),
-        capabilities: BTreeSet::from([
-            SubjectCapability::GroupMutation,
-            SubjectCapability::ApplicationMessaging,
-            SubjectCapability::TransportDelivery,
-            SubjectCapability::EventObservation,
-            SubjectCapability::AdminPolicyObservation,
-            SubjectCapability::CrashReopen,
-            SubjectCapability::OutboundPublication,
-            SubjectCapability::StructuralProgress,
-            SubjectCapability::ParticipantConnectivity,
-            SubjectCapability::ProcessLifecycle,
-            SubjectCapability::MultiGroup,
-            SubjectCapability::RetainedRelayHistory,
-        ]),
+        capabilities,
     }
 }
 
@@ -1406,6 +1645,10 @@ fn orchestrator_failure(error: ProcessOrchestratorError) -> (Option<String>, Nod
 
 fn environment_error(error: impl fmt::Display) -> ProcessOrchestratorError {
     ProcessOrchestratorError::new("process_environment", error.to_string())
+}
+
+fn process_relay_control_error(error: RelayControlError) -> ProcessOrchestratorError {
+    ProcessOrchestratorError::new(error.code, error.message)
 }
 
 fn action_participant(step: &ScenarioStep) -> Option<String> {
@@ -1456,44 +1699,6 @@ fn process_action_error(error: (Option<String>, NodeErrorV1)) -> ProcessOrchestr
 pub fn process_participant_token(label: &str) -> String {
     let digest = hex::encode(sha2::Sha256::digest(label.as_bytes()));
     format!("participant-{}", &digest[..16])
-}
-
-#[cfg(unix)]
-fn pause_pid(pid: Option<u32>) -> std::io::Result<()> {
-    signal_pid(pid, libc::SIGSTOP)
-}
-
-#[cfg(not(unix))]
-fn pause_pid(_pid: Option<u32>) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "process pause is unavailable on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn resume_pid(pid: Option<u32>) -> std::io::Result<()> {
-    signal_pid(pid, libc::SIGCONT)
-}
-
-#[cfg(not(unix))]
-fn resume_pid(_pid: Option<u32>) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "process resume is unavailable on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn signal_pid(pid: Option<u32>, signal: libc::c_int) -> std::io::Result<()> {
-    let pid = pid.ok_or_else(|| std::io::Error::other("child has no pid"))?;
-    let pid = i32::try_from(pid).map_err(std::io::Error::other)?;
-    // SAFETY: the pid belongs to a live direct child owned by this orchestrator.
-    if unsafe { libc::kill(pid, signal) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
@@ -1622,8 +1827,10 @@ mod tests {
 
     #[test]
     fn process_preflight_supports_observed_quiescence_without_claiming_virtual_time() {
-        let descriptor = process_subject_descriptor();
+        let descriptor = process_subject_descriptor(false);
         assert!(!descriptor.supports(SubjectCapability::VirtualTime));
+        assert!(!descriptor.supports(SubjectCapability::RetainedRelayControl));
+        assert!(process_subject_descriptor(true).supports(SubjectCapability::RetainedRelayControl));
 
         let await_spec = ScenarioSpec {
             name: "process-observed-quiescence".into(),

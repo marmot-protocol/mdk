@@ -933,7 +933,7 @@ the process contract.
 
 - [x] Allocate one isolated root per participant.
 - [x] Launch and barrier N participant processes.
-- [x] Kill, pause, resume, and restart individual participants.
+- [x] Kill, disconnect, durably reconnect, and restart individual participants.
 - [x] Connect all participants to controlled local relay topologies.
 - [x] Preserve the canonical Scenario IR action schedule and observation schema.
 
@@ -941,8 +941,9 @@ the process contract.
 and launches one `cgka-conformance-node` process for each account-device participant. Participant labels are hashed
 before they become filesystem components; each process gets a private root, private stderr file, and a stable durable
 identity across restart. On Unix each child is its own process-group leader, so crash actions kill and reap the entire
-owned group while offline/reconnect actions use real process suspension and resumption. The parent re-establishes peer
-aliases and scenario-group selections after a restart before continuing the canonical schedule.
+owned group. Offline actions first record the public checkpoint, then gracefully stop the runtime and child so an open
+relay subscription cannot buffer delivery across the declared disconnect; reconnect reopens the same durable root and
+re-establishes peer aliases plus scenario-group selections before continuing the canonical schedule.
 
 The process report retains the compiler's expanded action schedule, records an outcome for every executed action, and
 uses the node's versioned layered observation schema. Explicit topology relay labels become parent-owned local relay
@@ -960,8 +961,8 @@ It does not query engine queues or child databases.
 Milestone 5 is complete. `process_orchestrator` drives one canonical scenario through the engine,
 `MarmotAppRuntime`, and a real child process and compares epoch, roster size, signed group profile, and the normalized
 public app/process commitment. A two-participant, two-relay scenario proves stable convergence and visible-message
-projection with no invalidated output. Its lifecycle variant performs real pause, resume, process-group kill, durable
-restart, full-history repair, and settlement, then compares the final protocol and application projections with the
+projection with no invalidated output. Its lifecycle variant performs real disconnect, durable reconnect,
+process-group kill, restart, full-history repair, and settlement, then compares the final protocol and application projections with the
 uninterrupted run. The failure path writes an owner-only shareable capsule containing the scenario participant label,
 stable action id, `app_process` layer, normalized error classification, and replay instructions; a controlled marker
 test proves producer error text is not copied into it.
@@ -1006,7 +1007,7 @@ closed the queued-outbound scheduling defect exposed by that unification. The 6.
 program for the routes that still exist (ordinary ingest, stored convergence, retained-history replay, and
 crash/restart recovery). The pre-unification app-runtime counterexample remains valuable historical evidence. Its
 post-unification rerun now owns a positive public-equivalence oracle on current `master`; the stronger evidence that
-the app adapter cannot expose and the process/container/VM routes remain open below.
+the app/process adapters cannot expose and the container/VM routes remain open below.
 
 ### 6.1 Decision-route assurance closure
 
@@ -1038,8 +1039,10 @@ the app adapter cannot expose and the process/container/VM routes remain open be
     execution now exists as `cross-route-app-runtime-recovery/v1`. A reversible relay query layer fixes the original
     destructive event-id tombstone artifact. Revalidation after #1293 route unification and #1403 queued-send repair
     now requires complete public protocol/probe equivalence and rejects every pre-unification lag, missing-probe, and
-    branch-split surface. Keep this item open for process/container/VM execution, per-durable-transition restart
-    permutations, and exact evidence on adapters that can expose it.
+    branch-split surface. The exact same IR and digest now pass that public oracle in four isolated app processes using
+    runner-owned reversible relay control, a real disconnect/reopen boundary, and one post-displacement restart. Keep
+    this item open for container/VM execution, per-durable-transition restart permutations, and exact evidence on
+    adapters that can expose it.
 - [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
   disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
   comparison remains part of the open route-equivalence work above.
@@ -1054,10 +1057,10 @@ the app adapter cannot expose and the process/container/VM routes remain open be
 
 The remaining 6.1 work is assurance closure, not another speculative engine rewrite. #1285 is the implementation now
 on `master`; after #1293 and #1403, the retained-engine reference settles and the corrected-input app-runtime route is
-held to the same public terminal protocol/profile/probe result. Carry the same authenticated dependency-closed input
-contract into process/container/VM execution and the remaining durable-transition permutations. Do not project the
-app adapter's public evidence into exact cryptographic, durable-disposition, or active-decryptability claims that the
-adapter cannot expose.
+held to the same public terminal protocol/profile/probe result. The isolated-process adapter now carries that same
+input contract and public oracle. Carry it next into container/VM execution and the remaining durable-transition
+permutations. Do not project app/process public evidence into exact cryptographic, durable-disposition, or
+active-decryptability claims that those adapters cannot expose.
 
 [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) merged the fail-closed missing-anchor behavior and
 Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) has now
@@ -1249,7 +1252,8 @@ residual gap.
 5. [ ] Complete the #1285 cross-route regression across every capable adapter. The `CgkaEngine` checkpoint is now permanent
    as `cross-route-own-commit-recovery/v1` and pins exact cryptographic, decryptability, commit-disposition, pending-work,
    and projection agreement after restart. `cross-route-retained-history-recovery/v1` now establishes the same contract
-   through retained relay histories; full app-runtime, process, container, and VM evidence remains.
+   through retained relay histories; app-runtime and isolated-process public-projection evidence is now complete, while
+   container/VM execution and engine-private evidence unavailable through those public adapters remain open.
    [MDK #1372](https://github.com/marmot-protocol/mdk/pull/1372) completed the first capability-overlap slice: one
    profile/message/restart journey runs unchanged through the `CgkaEngine` harness and the full
    app-runtime/separate-process adapters, crossing the production-shaped `CgkaEngine`, `TransportPeeler`, and
@@ -1263,10 +1267,12 @@ residual gap.
    the earlier corrected-input app runs produced both complete equivalence and a two-branch protocol/probe split, but
    those executions predated the merged route unification and queued-send scheduling repair. The current-master
    app-runtime oracle now rejects every historical non-equivalent surface and requires complete public equivalence;
-   its explicit ignored soak repeats the full retained-control/app-runtime trial twenty times. Process/container/VM
-   execution, exact cryptographic and active-decryptability evidence on capable adapters, complete application
-   disposition, and durable-transition permutations remain open. The decision-route inventory is machine checked
-   against the unified route.
+   its explicit ignored soak repeats the full retained-control/app-runtime trial twenty times. The same IR and digest
+   now run through four isolated app processes with separate SQLCipher roots, runner-owned reversible relay control,
+   real transport disconnect/reopen, one post-displacement restart, strict public state/application assertions, and a
+   separate ignored twenty-trial soak. Container/VM execution, exact cryptographic and active-decryptability evidence
+   on capable adapters, complete application disposition, and durable-transition permutations remain open. The
+   decision-route inventory is machine checked against the unified route.
 6. [x] Land and execute a focused current-`master` regression gate for the production convergence changes that landed
    after the reviewed 1,170-case snapshot. Cover #1329 missing-anchor halt and authenticated Welcome repair, #1360
    atomic self-removal persistence across injected write failures and restart, #1365 armed full-history backfill after
@@ -1444,6 +1450,7 @@ incorrect result.
 | 2026-08-12 | 6.1 unified same-epoch route and queued-send repair | Merged option C: removed the pairwise committer-only fork route so every participant uses distributed convergence, added branch-relative peel contexts and route-equivalence evidence, then repaired the durable queued-outbound scheduling edge and runnable-work level signal exposed by the longer unified convergence window. The corrected-input app-runtime result above predates both changes and is retained as historical falsification evidence, not a characterization of current `master`; repeat it before assigning the next production defect. | [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293); [MDK #1403](https://github.com/marmot-protocol/mdk/pull/1403); unified-route engine and simulator regressions |
 | 2026-08-13 | 6.1 post-unification app-runtime route assurance | Re-ran the exact corrected-input four-party topology after #1293 and #1403, then replaced the permissive historical terminal-surface classifier with a positive public-equivalence oracle. The strict retained-engine control still owns exact canonical state, accepted/invalidated/accepted commit dispositions, no pending work, and twelve decryptability edges; the full `MarmotAppRuntime` path must now match its epoch, roster, administration, and depth-two profile with the complete duplicate-free probe set and no pending confirmation. Five consecutive pre-change current-master trials reached that result, followed by a 20/20 post-change run of the explicit ignored soak. Process/container/VM execution and evidence unavailable through the app projection remain open; no production code changed. | `four_party_cross_route_recovery_app_runtime_matches_unified_route`; `four_party_cross_route_recovery_app_runtime_equivalence_soak`; simulator/app-runtime assurance only |
 | 2026-08-13 | Post-unification campaign performance baseline | Replaced full retained-message scans with indexed state probes, scoped retained-anchor snapshots to canonical group state while keeping legacy full-snapshot rollback compatibility, and point-queried Welcome key packages plus buffered replay states during join/create lifecycle work. These changes reduce the cost of long-history and participant-growth campaigns but do not close any route-equivalence or distributed evidence item by themselves. | [MDK #1405](https://github.com/marmot-protocol/mdk/pull/1405); [MDK #1406](https://github.com/marmot-protocol/mdk/pull/1406); [MDK #1416](https://github.com/marmot-protocol/mdk/pull/1416); storage and engine suites plus lifecycle benchmarks |
+| 2026-08-13 | 6.1 isolated-process cross-route assurance | Extracted runner-owned reversible retained-relay control for reuse by app and process adapters, then executed the exact app-runtime four-party IR and digest through four child runtimes with separate encrypted roots. Replaced SIGSTOP offline simulation with public checkpoint plus graceful runtime/transport disconnect and durable reopen, preventing open subscriptions from buffering withheld events across the declared offline boundary. The strict process oracle pins the controlled split, canonical schedule, public terminal protocol/profile, complete duplicate-free application set, losing-branch withdrawal rule, no pending confirmation, and real Zeta reopen. Exact MLS state, durable input dispositions, and active decryptability remain unavailable through the public node protocol; container/VM and every-transition permutations remain open. No production engine or app behavior changed. | `four_party_cross_route_recovery_processes_match_unified_route`; `four_party_cross_route_recovery_process_equivalence_soak`; process-adapter capability preflight and focused simulator tests |
 | 2026-08-13 | Nightly cross-sender oracle correction | Diagnosed the scheduled lane failure as an invalid ordering claim in `adversarial-reliability/app-witness-value/v1`: both runs agreed on the selected branch, epoch, roster, and exact payload multiplicities, but MLS does not define a total order across independent senders. The scenario now asserts one Eve witness, one Frank witness, and no David witness without weakening scenarios that intentionally test ordered delivery. A failed nightly lane also emits the exact seed-7 adversarial reports and capsules before propagating failure, and the runner raises its memlock limit instead of flooding logs when SQLCipher locks sensitive allocations. | [MDK #1409](https://github.com/marmot-protocol/mdk/issues/1409); scheduled run `31669097875`; focused adversarial reliability tests; nightly artifact path |
 
 ## Capability Naming Cleanup

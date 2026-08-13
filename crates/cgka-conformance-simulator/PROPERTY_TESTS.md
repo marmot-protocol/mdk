@@ -173,11 +173,25 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   `four_party_cross_route_recovery_app_runtime_equivalence_soak` repeats the complete retained-control/app-runtime
   trial twenty times for reviewed evidence without adding that runtime to normal CI; the post-change PR run reached
   full public equivalence in all twenty trials.
-- Boundary: process, container, and VM adapters do not yet expose equivalent controlled retained-event staging. They
-  must not claim this topology from targeted catch-up alone because a live relay can deliver the competing root first.
-  The app adapter exposes public protocol and application projections, not exact MLS-state commitments, the strict
+- Boundary: the app adapter exposes public protocol and application projections, not exact MLS-state commitments, the strict
   subject's durable input ledger, or active decryptability probes; those stronger retained-engine checks remain a
   control rather than an app-runtime claim.
+
+### `four_party_cross_route_recovery_processes_match_unified_route`
+
+- Runs: the exact same `cross-route-app-runtime-recovery/v1` Scenario IR and digest through four child processes, each
+  owning one full `MarmotAppRuntime` and an isolated encrypted SQLite root. The parent owns the same reversible local
+  retained-relay control used by the in-process app harness. Offline actions checkpoint the public observation and
+  stop the child/runtime, so open subscriptions cannot buffer events across the intended transport disconnection;
+  reconnect reopens the same durable participant root.
+- Checks: exact expanded schedule and input digest, four complete public checkpoints, the controlled two-branch
+  intermediate state, final epoch/roster/admin/profile agreement, the complete duplicate-free five-message set, no
+  pending confirmation, participant-local losing-branch withdrawal rules, one public commitment, and a real durable
+  Zeta reopen. An ignored twenty-trial soak repeats the full process route outside normal CI.
+- Boundary: runner-owned local relays declare `retained_relay_control`; externally supplied relay URLs fail capability
+  preflight rather than pretending the runner can hide or restore their events. The process protocol still does not
+  expose exact MLS commitments, durable input dispositions, or active decryptability probes. Container and VM
+  execution of this Scenario IR remains open.
 
 ## Shared Generators
 

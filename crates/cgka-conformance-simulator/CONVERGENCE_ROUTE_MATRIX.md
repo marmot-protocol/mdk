@@ -13,12 +13,12 @@ below is deliberately not treated as passing evidence.
 
 | Route id | Production owner | Independent model | Mutation sentinel | Current campaign evidence | Current limitation |
 | --- | --- | --- | --- | --- | --- |
-| `ordinary_ingest` | `message_processor/ingest.rs` | partial: `reference_convergence::evaluate` | covered: cutoff admission and output invalidation | observer vectors, both strict cross-route regressions, the shared engine/app/process restart journey, and the app-runtime cross-route characterization | Corrected reversible relay input can still leave a two-branch public/probe split; process/distributed execution and exact app-runtime state remain open. |
-| `stored_convergence` | `distributed_convergence.rs` | partial: selector plus lifecycle models | covered: comparator and frozen membership | both strict cross-route regressions, app-runtime cross-route characterization, restart properties, convergence chaos, and the two reconsideration regressions inherited from the retired pairwise route | Route choice is not represented in the models, and app-runtime/process/distributed equivalence remains open. |
-| `candidate_materialization` | `openmls_projection.rs` | partial: dependency/disposition model | covered: retention and frozen membership | engine and retained-history cross-route recovery plus OpenMLS replay | Exact cryptographic and durable-disposition evidence remains limited to engine-capable subjects; app-runtime/process/distributed equivalence remains open. |
-| `retained_history_replay` | `message_processor/ingest.rs`, `openmls_projection.rs` | partial: unequal-history lifecycle | covered: retention and witness deduplication | `cross-route-retained-history-recovery/v1`, `cross-route-app-runtime-recovery/v1`, retained-relay equality, offline journeys, and shared app/process offline full-history recovery | Reversible relay-wide app-runtime history removes the tombstone artifact but does not reliably produce public or active-chat equivalence; process, multi-relay, retention-boundary, and distributed evidence remain open. |
-| `crash_restart_recovery` | `engine.rs`, `distributed_convergence.rs` | covered: crash/restart lifecycle | covered: frozen membership and scheduler re-arm | both strict cross-route encrypted-SQLite regressions, the app-runtime cross-route restart, durable-phase kill properties, and the shared engine/app/process restart journey | The adversarial app-runtime topology covers one post-displacement restart; every durable transition plus process/distributed adapters remain open. |
-| `application_disposition` | `message_processor/ingest.rs`, `openmls_projection.rs` | covered: reference dispositions | covered: output invalidation | scenario-input ledgers and bidirectional decryptability probes in both strict cross-route regressions; app-runtime corrected-input characterization | Corrected-input runs can split the known chat inputs by branch; exact durable dispositions on external adapters and the existing sender-visible branch-replacement gap remain open. |
+| `ordinary_ingest` | `message_processor/ingest.rs` | partial: `reference_convergence::evaluate` | covered: cutoff admission and output invalidation | observer vectors, both strict cross-route regressions, the shared engine/app/process restart journey, and positive app-runtime plus isolated-process cross-route runs | App/process evidence is limited to public projections; container/VM execution and exact external-adapter state remain open. |
+| `stored_convergence` | `distributed_convergence.rs` | partial: selector plus lifecycle models | covered: comparator and frozen membership | both strict cross-route regressions, positive app-runtime and isolated-process cross-route runs, restart properties, convergence chaos, and the two reconsideration regressions inherited from the retired pairwise route | Route choice is not represented in the models; exact external-adapter and distributed container/VM evidence remains open. |
+| `candidate_materialization` | `openmls_projection.rs` | partial: dependency/disposition model | covered: retention and frozen membership | engine and retained-history cross-route recovery plus OpenMLS replay | Exact cryptographic and durable-disposition evidence remains limited to engine-capable subjects; app-runtime/process/container/VM evidence is public-projection only. |
+| `retained_history_replay` | `message_processor/ingest.rs`, `openmls_projection.rs` | partial: unequal-history lifecycle | covered: retention and witness deduplication | `cross-route-retained-history-recovery/v1`, `cross-route-app-runtime-recovery/v1`, retained-relay equality, offline journeys, shared app/process offline full-history recovery, and the controlled four-process route | Runner-owned reversible retained history now produces public equivalence through app-runtime and isolated-process adapters; multi-relay, retention-boundary, external-relay, container, and VM evidence remain open. |
+| `crash_restart_recovery` | `engine.rs`, `distributed_convergence.rs` | covered: crash/restart lifecycle | covered: frozen membership and scheduler re-arm | both strict cross-route encrypted-SQLite regressions, app-runtime and isolated-process cross-route restart, durable-phase kill properties, and the shared engine/app/process restart journey | The adversarial production-shaped adapters cover one post-displacement restart; every durable transition plus container/VM adapters remain open. |
+| `application_disposition` | `message_processor/ingest.rs`, `openmls_projection.rs` | covered: reference dispositions | covered: output invalidation | scenario-input ledgers and bidirectional decryptability probes in both strict cross-route regressions; complete duplicate-free public app projections in app-runtime and process cross-route runs | Exact durable dispositions on external adapters and the existing sender-visible branch-replacement gap remain open. |
 
 ## Assurance claims
 
@@ -36,14 +36,18 @@ mutation, or replay counterexample reopens it. Later green runs are retained as
 evidence but cannot silently clear a known falsification; the falsification
 must be resolved by explicit reviewed evidence.
 
-`cross-route-app-runtime-recovery/v1` keeps `route_equivalence`,
-`active_bidirectional_decryptability`, and `complete_application_disposition`
-open. The original simulator did contain a real input-contract bug: destructive
+`cross-route-app-runtime-recovery/v1` now supplies positive public
+`route_equivalence` evidence through both the in-process app runtime and four
+isolated app processes. It does not close `exact_cryptographic_agreement`,
+`active_bidirectional_decryptability`, or `complete_application_disposition`
+for those black-box adapters because their public observation schema does not
+expose the required engine-private evidence. The original simulator did contain a real input-contract bug: destructive
 database deletion permanently tombstoned temporarily hidden event ids. After a
-reversible query-visibility layer removed that artifact, repeated executions
-still produced both complete equivalence and a two-branch protocol/probe split.
-The corrected-input characterization accepts only reviewed terminal surfaces;
-it is counterexample evidence, not passing assurance evidence.
+reversible query-visibility layer removed that artifact, historical
+pre-unification executions still produced both complete equivalence and a
+two-branch protocol/probe split. Those runs remain counterexample evidence for
+their tested snapshots; the post-unification positive app-runtime and process
+oracles reject every such terminal split.
 
 Its losing-branch surface is stated as a rule rather than an enumeration of
 observed shapes, because which participants transiently hold the losing branch
@@ -76,8 +80,7 @@ in the mutation catalog.
 
 ## Active production work
 
-MDK #1329 has merged the fail-closed missing-anchor behavior and Welcome-repair
-retirement. Its formerly stacked #1293 remains open. This inventory describes
-current `master` and does not encode #1293's proposed result as an oracle. If a
+MDK #1329 and the formerly stacked #1293 have both merged. This inventory
+describes current `master`, including #1293's unified same-epoch route. If a
 route is removed or its source marker changes, the source audit fails and the
 inventory must be reviewed before evidence is carried forward.

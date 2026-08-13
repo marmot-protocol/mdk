@@ -42,6 +42,7 @@ pub mod proptest_support;
 mod quiescence;
 pub mod reference_convergence;
 mod reference_subject;
+mod relay_control;
 pub mod report;
 mod retained_relay;
 pub mod route_assurance;
