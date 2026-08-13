@@ -217,18 +217,13 @@ fn bench_create_group(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| {
                     let alice = alice.clone();
                     async move {
-                        let __tc = std::time::Instant::now(); // TEMP-PROBE
                         let request = create_request(key_packages.clone());
-                        eprintln!("TEMP-PROBE closure clone: {:?}", __tc.elapsed()); // TEMP-PROBE
-                        let __tl = std::time::Instant::now(); // TEMP-PROBE
-                        let mut guard = alice.lock().await; // TEMP-PROBE
-                        eprintln!("TEMP-PROBE closure lock: {:?}", __tl.elapsed()); // TEMP-PROBE
-                        let __tg = std::time::Instant::now(); // TEMP-PROBE
-                        let (group_id, result) = guard
+                        let (group_id, result) = alice
+                            .lock()
+                            .await
                             .create_group(request)
                             .await
                             .expect("create_group succeeds");
-                        eprintln!("TEMP-PROBE closure create_group: {:?}", __tg.elapsed()); // TEMP-PROBE
                         // Sanity: founding creation returns one Welcome per invitee.
                         debug_assert!(matches!(result, SendResult::FoundingGroupCreated { .. }));
                         group_id
