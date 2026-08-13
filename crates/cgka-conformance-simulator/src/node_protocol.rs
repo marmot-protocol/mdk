@@ -13,6 +13,7 @@ use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppRuntime,
+    SendSummary,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,6 +138,8 @@ pub enum NodeResponseBodyV1 {
     Ack {
         action_id: String,
         published: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_id_hex: Option<String>,
     },
@@ -449,8 +452,12 @@ impl NodeServer {
                     .map_err(app_node_error)?;
                 state.groups.insert(group.clone(), group_id.clone());
                 state.active_group = Some(group);
-                set_admins(state, &group_id, &initial_admin_accounts).await?;
-                Ok(ack(action_id, 1, Some(hex::encode(group_id.as_slice()))))
+                let message_ids = set_admins(state, &group_id, &initial_admin_accounts).await?;
+                Ok(ack_with_message_ids(
+                    action_id,
+                    message_ids,
+                    Some(hex::encode(group_id.as_slice())),
+                ))
             }
             NodeCommandV1::InviteMembers {
                 action_id,
@@ -462,7 +469,7 @@ impl NodeServer {
                     .invite_members(&state.account_id, &group_id, &member_accounts)
                     .await
                     .map_err(app_node_error)?;
-                Ok(ack(action_id, summary.published, None))
+                Ok(ack_from_summary(action_id, summary, None))
             }
             NodeCommandV1::RemoveMembers {
                 action_id,
@@ -474,7 +481,7 @@ impl NodeServer {
                     .remove_members(&state.account_id, &group_id, &member_accounts)
                     .await
                     .map_err(app_node_error)?;
-                Ok(ack(action_id, summary.published, None))
+                Ok(ack_from_summary(action_id, summary, None))
             }
             NodeCommandV1::UpdateGroupData { action_id, name } => {
                 let group_id = active_group(state)?;
@@ -483,7 +490,7 @@ impl NodeServer {
                     .update_group_profile(&state.account_id, &group_id, Some(name), None)
                     .await
                     .map_err(app_node_error)?;
-                Ok(ack(action_id, summary.published, None))
+                Ok(ack_from_summary(action_id, summary, None))
             }
             NodeCommandV1::UpdateGroupProfile {
                 action_id,
@@ -496,15 +503,15 @@ impl NodeServer {
                     .update_group_profile(&state.account_id, &group_id, name, description)
                     .await
                     .map_err(app_node_error)?;
-                Ok(ack(action_id, summary.published, None))
+                Ok(ack_from_summary(action_id, summary, None))
             }
             NodeCommandV1::UpdateAdminPolicy {
                 action_id,
                 admin_accounts,
             } => {
                 let group_id = active_group(state)?;
-                set_admins(state, &group_id, &admin_accounts).await?;
-                Ok(ack(action_id, 1, None))
+                let message_ids = set_admins(state, &group_id, &admin_accounts).await?;
+                Ok(ack_with_message_ids(action_id, message_ids, None))
             }
             NodeCommandV1::SelfUpdate { action_id } => {
                 let group_id = active_group(state)?;
@@ -522,6 +529,10 @@ impl NodeServer {
                     .send_message(&state.account_id, &group_id, payload.into_bytes())
                     .await
                     .map_err(app_node_error)?;
+                // The public app API reports the canonical application-event
+                // id here, not the outer transport event id recorded by the
+                // relay. Preserve the publication count without pretending
+                // that the two identity domains are interchangeable.
                 Ok(ack(action_id, summary.published, None))
             }
             NodeCommandV1::Leave { action_id } => {
@@ -531,7 +542,7 @@ impl NodeServer {
                     .leave_group(&state.account_id, &group_id)
                     .await
                     .map_err(app_node_error)?;
-                Ok(ack(action_id, summary.published, None))
+                Ok(ack_from_summary(action_id, summary, None))
             }
             NodeCommandV1::CatchUp {
                 action_id,
@@ -805,7 +816,7 @@ async fn set_admins(
     state: &NodeRuntimeState,
     group_id: &GroupId,
     targets: &[String],
-) -> Result<(), NodeErrorV1> {
+) -> Result<Vec<String>, NodeErrorV1> {
     let group = state
         .app
         .group(&state.account_id, &hex::encode(group_id.as_slice()))
@@ -832,39 +843,51 @@ async fn set_admins(
         .into_iter()
         .collect::<BTreeSet<_>>();
     let mut applied = Vec::new();
+    let mut message_ids = Vec::new();
     for account in targets.difference(&current) {
-        if let Err(error) = state
+        let summary = match state
             .runtime
             .promote_admin(&state.account_id, group_id, account)
             .await
         {
-            return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
-        }
+            Ok(summary) => summary,
+            Err(error) => {
+                return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
+            }
+        };
+        message_ids.extend(summary.message_ids);
         applied.push(NodeAdminChange::Promoted(account.clone()));
     }
     for account in current
         .difference(&targets)
         .filter(|account| *account != &state.account_id)
     {
-        if let Err(error) = state
+        let summary = match state
             .runtime
             .demote_admin(&state.account_id, group_id, account)
             .await
         {
-            return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
-        }
+            Ok(summary) => summary,
+            Err(error) => {
+                return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
+            }
+        };
+        message_ids.extend(summary.message_ids);
         applied.push(NodeAdminChange::Demoted(account.clone()));
     }
-    if current.contains(&state.account_id)
-        && !targets.contains(&state.account_id)
-        && let Err(error) = state
+    if current.contains(&state.account_id) && !targets.contains(&state.account_id) {
+        match state
             .runtime
             .self_demote_admin(&state.account_id, group_id)
             .await
-    {
-        return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
+        {
+            Ok(summary) => message_ids.extend(summary.message_ids),
+            Err(error) => {
+                return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
+            }
+        }
     }
-    Ok(())
+    Ok(message_ids)
 }
 
 enum NodeAdminChange {
@@ -947,6 +970,33 @@ fn ack(
     NodeResponseBodyV1::Ack {
         action_id: action_id.into(),
         published,
+        message_ids: Vec::new(),
+        group_id_hex,
+    }
+}
+
+fn ack_from_summary(
+    action_id: impl Into<String>,
+    summary: SendSummary,
+    group_id_hex: Option<String>,
+) -> NodeResponseBodyV1 {
+    NodeResponseBodyV1::Ack {
+        action_id: action_id.into(),
+        published: summary.published,
+        message_ids: summary.message_ids,
+        group_id_hex,
+    }
+}
+
+fn ack_with_message_ids(
+    action_id: impl Into<String>,
+    message_ids: Vec<String>,
+    group_id_hex: Option<String>,
+) -> NodeResponseBodyV1 {
+    NodeResponseBodyV1::Ack {
+        action_id: action_id.into(),
+        published: message_ids.len(),
+        message_ids,
         group_id_hex,
     }
 }

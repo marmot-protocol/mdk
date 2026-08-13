@@ -112,6 +112,13 @@ pub(crate) struct RelayControlError {
     pub message: &'static str,
 }
 
+pub(crate) struct RelayActionExpectation<'a> {
+    pub include_welcomes: bool,
+    pub expected_publications: usize,
+    pub expected_event_ids: &'a [String],
+    pub timeout: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RelayControl {
     publication_log: Arc<Mutex<Vec<Event>>>,
@@ -178,16 +185,45 @@ impl RelayControl {
         action_events: &mut RelayActionEvents,
         action_id: &str,
         before: usize,
-        include_welcomes: bool,
-        expected_publications: usize,
-        timeout: Duration,
+        expectation: RelayActionExpectation<'_>,
     ) -> Result<(), RelayControlError> {
+        let RelayActionExpectation {
+            include_welcomes,
+            expected_publications,
+            expected_event_ids,
+            timeout,
+        } = expectation;
+        if expected_event_ids.len() > expected_publications {
+            return Err(RelayControlError {
+                code: "relay_action_publication_identity_count_mismatch",
+                message: "the action's expected relay event ids do not match its publication count",
+            });
+        }
+        let expected_event_ids = expected_event_ids.iter().cloned().collect::<BTreeSet<_>>();
         let deadline = Instant::now() + timeout;
         loop {
             let recorded = self
                 .record_action_events(action_events, action_id, before, include_welcomes)
                 .await?;
-            if recorded == expected_publications {
+            let observed_event_ids = action_events
+                .get(action_id)
+                .into_iter()
+                .flatten()
+                .map(|event| event.event.id.to_hex())
+                .collect::<BTreeSet<_>>();
+            if expected_event_ids.len() == expected_publications
+                && observed_event_ids
+                    .iter()
+                    .any(|event_id| !expected_event_ids.contains(event_id))
+            {
+                return Err(RelayControlError {
+                    code: "relay_action_publication_identity_mismatch",
+                    message: "a retained relay event admitted after the action cursor was not published by that action",
+                });
+            }
+            if recorded == expected_publications
+                && expected_event_ids.is_subset(&observed_event_ids)
+            {
                 return Ok(());
             }
             if recorded > expected_publications {
@@ -199,7 +235,7 @@ impl RelayControl {
             if Instant::now() >= deadline {
                 return Err(RelayControlError {
                     code: "relay_action_publication_timeout",
-                    message: "the process action did not publish its expected retained relay events before the deadline",
+                    message: "the action's expected retained relay publications were not admitted before the deadline",
                 });
             }
             sleep(Duration::from_millis(10)).await;
@@ -366,9 +402,12 @@ mod tests {
                 &mut action_events,
                 "invite",
                 0,
-                true,
-                2,
-                Duration::from_secs(1),
+                RelayActionExpectation {
+                    include_welcomes: true,
+                    expected_publications: 2,
+                    expected_event_ids: &[],
+                    timeout: Duration::from_secs(1),
+                },
             )
             .await
             .unwrap();
@@ -396,5 +435,49 @@ mod tests {
             .await
             .unwrap();
         assert!(database.event_by_id(&welcome.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn action_identity_rejects_a_delayed_publication_from_an_earlier_action() {
+        let control = RelayControl::new();
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&control.publication_log),
+            hidden_event_ids: Arc::clone(&control.hidden_event_ids),
+        };
+        let keys = nostr::Keys::generate();
+        let delayed_prior = nostr::EventBuilder::new(Kind::MlsGroupMessage, "prior action")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let current = nostr::EventBuilder::new(Kind::MlsGroupMessage, "current action")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            database
+                .save_event(&delayed_prior)
+                .await
+                .unwrap()
+                .is_success()
+        );
+
+        let error = control
+            .wait_for_action_events(
+                &mut RelayActionEvents::new(),
+                "current",
+                0,
+                RelayActionExpectation {
+                    include_welcomes: false,
+                    expected_publications: 1,
+                    expected_event_ids: &[current.id.to_hex()],
+                    timeout: Duration::from_secs(1),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "relay_action_publication_identity_mismatch");
     }
 }

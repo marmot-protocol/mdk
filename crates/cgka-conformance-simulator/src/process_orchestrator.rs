@@ -17,7 +17,9 @@ use crate::node_protocol::{
     NODE_OBSERVATION_SCHEMA_VERSION, NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1,
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
-use crate::relay_control::{RelayActionEvents, RelayControl, RelayControlError};
+use crate::relay_control::{
+    RelayActionEvents, RelayActionExpectation, RelayControl, RelayControlError,
+};
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
     ScenarioInputProvenanceV1, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
@@ -492,6 +494,7 @@ impl ProcessOrchestrator {
         cursors: BTreeMap<String, usize>,
         include_welcomes: bool,
         expected_publications: usize,
+        expected_event_ids: &[String],
     ) -> Result<(), ProcessOrchestratorError> {
         for (relay, before) in cursors {
             let control = self.relay_controls.get(&relay).ok_or_else(|| {
@@ -510,9 +513,12 @@ impl ProcessOrchestrator {
                     self.relay_action_events.entry(relay.clone()).or_default(),
                     action_id,
                     before,
-                    include_welcomes,
-                    expected_publications,
-                    Duration::from_secs(5),
+                    RelayActionExpectation {
+                        include_welcomes,
+                        expected_publications,
+                        expected_event_ids,
+                        timeout: Duration::from_secs(5),
+                    },
                 )
                 .await
                 .map_err(process_relay_control_error)?;
@@ -612,16 +618,24 @@ impl ProcessOrchestrator {
                         },
                     )
                     .await?;
-                let group_id = match response {
+                let (group_id, admin_publications, message_ids) = match response {
                     NodeResponseBodyV1::Ack {
+                        published,
+                        message_ids,
                         group_id_hex: Some(group_id),
                         ..
-                    } => group_id,
+                    } if published == message_ids.len() => (group_id, published, message_ids),
                     body => return Err((Some(creator.clone()), unexpected_response(body))),
                 };
-                self.record_relay_action_events(action_id, relay_cursors, true, invitees.len())
-                    .await
-                    .map_err(orchestrator_failure)?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    true,
+                    invitees.len() + admin_publications,
+                    &message_ids,
+                )
+                .await
+                .map_err(orchestrator_failure)?;
                 self.groups.insert(group.clone(), group_id.clone());
                 let labels = self.running_labels();
                 for client in &labels {
@@ -648,17 +662,24 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(inviter)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    inviter,
-                    NodeCommandV1::InviteMembers {
-                        action_id: action_id.into(),
-                        member_accounts,
-                    },
+                let message_ids = self
+                    .expect_publish_ack(
+                        inviter,
+                        NodeCommandV1::InviteMembers {
+                            action_id: action_id.into(),
+                            member_accounts,
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    true,
+                    message_ids.len(),
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, true, invitees.len() + 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(inviter, pending);
                 Ok((vec![inviter.clone()], ProcessActionStatusV1::Completed))
             }
@@ -673,26 +694,29 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(remover)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    remover,
-                    NodeCommandV1::RemoveMembers {
-                        action_id: action_id.into(),
-                        member_accounts,
-                    },
+                let message_ids = self
+                    .expect_publish_ack(
+                        remover,
+                        NodeCommandV1::RemoveMembers {
+                            action_id: action_id.into(),
+                            member_accounts,
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(remover, pending);
                 Ok((vec![remover.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::SelfUpdate { client, pending } => {
                 self.select_group(client, &group).await?;
-                let relay_cursors = self
-                    .relay_publication_cursors(client)
-                    .await
-                    .map_err(orchestrator_failure)?;
                 self.expect_ack(
                     client,
                     NodeCommandV1::SelfUpdate {
@@ -700,9 +724,6 @@ impl ProcessOrchestrator {
                     },
                 )
                 .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -716,17 +737,24 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(client)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    client,
-                    NodeCommandV1::UpdateGroupData {
-                        action_id: action_id.into(),
-                        name: name.clone(),
-                    },
+                let message_ids = self
+                    .expect_publish_ack(
+                        client,
+                        NodeCommandV1::UpdateGroupData {
+                            action_id: action_id.into(),
+                            name: name.clone(),
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -741,18 +769,25 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(client)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    client,
-                    NodeCommandV1::UpdateGroupProfile {
-                        action_id: action_id.into(),
-                        name: name.clone(),
-                        description: description.clone(),
-                    },
+                let message_ids = self
+                    .expect_publish_ack(
+                        client,
+                        NodeCommandV1::UpdateGroupProfile {
+                            action_id: action_id.into(),
+                            name: name.clone(),
+                            description: description.clone(),
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -767,17 +802,24 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(client)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    client,
-                    NodeCommandV1::UpdateAdminPolicy {
-                        action_id: action_id.into(),
-                        admin_accounts,
-                    },
+                let message_ids = self
+                    .expect_publish_ack(
+                        client,
+                        NodeCommandV1::UpdateAdminPolicy {
+                            action_id: action_id.into(),
+                            admin_accounts,
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 self.record_accepted_publication(client, pending);
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
@@ -787,17 +829,24 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(sender)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    sender,
-                    NodeCommandV1::SendApplication {
-                        action_id: action_id.into(),
-                        payload: payload.clone(),
-                    },
+                let (published, message_ids) = self
+                    .expect_counted_publish_ack(
+                        sender,
+                        NodeCommandV1::SendApplication {
+                            action_id: action_id.into(),
+                            payload: payload.clone(),
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    false,
+                    published,
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 Ok((vec![sender.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::Leave { client } => {
@@ -806,16 +855,23 @@ impl ProcessOrchestrator {
                     .relay_publication_cursors(client)
                     .await
                     .map_err(orchestrator_failure)?;
-                self.expect_ack(
-                    client,
-                    NodeCommandV1::Leave {
-                        action_id: action_id.into(),
-                    },
+                let message_ids = self
+                    .expect_publish_ack(
+                        client,
+                        NodeCommandV1::Leave {
+                            action_id: action_id.into(),
+                        },
+                    )
+                    .await?;
+                self.record_relay_action_events(
+                    action_id,
+                    relay_cursors,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
                 )
-                .await?;
-                self.record_relay_action_events(action_id, relay_cursors, false, 1)
-                    .await
-                    .map_err(orchestrator_failure)?;
+                .await
+                .map_err(orchestrator_failure)?;
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::DeliverAll => {
@@ -1197,6 +1253,36 @@ impl ProcessOrchestrator {
         }
     }
 
+    async fn expect_publish_ack(
+        &mut self,
+        client: &str,
+        command: NodeCommandV1,
+    ) -> Result<Vec<String>, (Option<String>, NodeErrorV1)> {
+        match self.send(client, command).await? {
+            NodeResponseBodyV1::Ack {
+                published,
+                message_ids,
+                ..
+            } if published == message_ids.len() => Ok(message_ids),
+            body => Err((Some(client.into()), unexpected_response(body))),
+        }
+    }
+
+    async fn expect_counted_publish_ack(
+        &mut self,
+        client: &str,
+        command: NodeCommandV1,
+    ) -> Result<(usize, Vec<String>), (Option<String>, NodeErrorV1)> {
+        match self.send(client, command).await? {
+            NodeResponseBodyV1::Ack {
+                published,
+                message_ids,
+                ..
+            } if message_ids.len() <= published => Ok((published, message_ids)),
+            body => Err((Some(client.into()), unexpected_response(body))),
+        }
+    }
+
     async fn catch_up(
         &mut self,
         clients: &[String],
@@ -1338,17 +1424,26 @@ impl ProcessOrchestrator {
             NodeResponseBodyV1::Observation { observation, .. } => *observation,
             body => return Err((Some(client.into()), unexpected_response(body))),
         };
-        let mut node = self.nodes.remove(client).ok_or_else(|| {
-            orchestrator_failure(ProcessOrchestratorError::new(
-                "participant_not_running",
-                "cannot disconnect a stopped participant",
-            ))
-        })?;
-        match node.send(NodeCommandV1::Shutdown).await {
+        let shutdown = self
+            .nodes
+            .get_mut(client)
+            .ok_or_else(|| {
+                orchestrator_failure(ProcessOrchestratorError::new(
+                    "participant_not_running",
+                    "cannot disconnect a stopped participant",
+                ))
+            })?
+            .send(NodeCommandV1::Shutdown)
+            .await;
+        match shutdown {
             Ok(NodeResponseBodyV1::Shutdown) => {}
             Ok(body) => return Err((Some(client.into()), unexpected_response(body))),
             Err(error) => return Err(orchestrator_failure(error)),
         }
+        let mut node = self
+            .nodes
+            .remove(client)
+            .expect("shutdown node remains tracked");
         let _ = timeout(Duration::from_secs(5), node.child.wait()).await;
         kill_process_group(&mut node.child)
             .await

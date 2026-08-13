@@ -21,7 +21,9 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
-use crate::relay_control::{RelayActionEvents, RelayControl, RelayControlError};
+use crate::relay_control::{
+    RelayActionEvents, RelayActionExpectation, RelayControl, RelayControlError,
+};
 use crate::{
     ClientEventCounts, ClientObservation, ConvergenceSubject, ScenarioAdminPolicyObservation,
     ScenarioInputLedgerEntry, SubjectCapability, SubjectCreateGroup, SubjectDescriptor,
@@ -197,22 +199,28 @@ impl AppRuntimeHarness {
         actor: &str,
         before: usize,
         include_welcomes: bool,
+        expected_publications: usize,
+        expected_event_ids: &[String],
     ) -> Result<(), SubjectError> {
         self.participant(actor)?;
-        // Scenario commands execute serially. Kind-445 outer authors are
-        // intentionally ephemeral, so the successful command boundary—not
-        // event.pubkey—is the actor attribution available at this layer.
-        // Filtering to group messages and action-local Welcome gift wraps
-        // excludes unrelated runtime projections.
+        // Scenario commands execute serially. Where the public app API exposes
+        // transport message ids, validate those exact relay events; chat sends
+        // expose only application-event ids, so they retain the bounded count
+        // fallback at this command boundary. Kind-445 outer authors are
+        // intentionally ephemeral and cannot identify the actor.
         self.relay_control
-            .record_action_events(
+            .wait_for_action_events(
                 &mut self.relay_action_events,
                 action_id,
                 before,
-                include_welcomes,
+                RelayActionExpectation {
+                    include_welcomes,
+                    expected_publications,
+                    expected_event_ids,
+                    timeout: Duration::from_secs(5),
+                },
             )
             .await
-            .map(|_| ())
             .map_err(relay_control_error)
     }
 
@@ -753,10 +761,18 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .clone()
             .unwrap_or_else(|| "default".into());
         self.scenario_groups.insert(group_label, group_id.clone());
-        self.apply_admin_set(action.creator, &group_id, action.initial_admins)
+        let message_ids = self
+            .apply_admin_set(action.creator, &group_id, action.initial_admins)
             .await?;
-        self.record_relay_action_events(action.action_id, action.creator, before, true)
-            .await?;
+        self.record_relay_action_events(
+            action.action_id,
+            action.creator,
+            before,
+            true,
+            action.invitees.len() + message_ids.len(),
+            &message_ids,
+        )
+        .await?;
         self.record_accepted_publication(action.creator, action.pending);
         Ok(())
     }
@@ -769,13 +785,20 @@ impl ConvergenceSubject for AppRuntimeHarness {
         let group_id = self.active_group()?;
         let invitees = self.account_ids(action.invitees)?;
         let participant = self.participant(action.inviter)?;
-        participant
+        let summary = participant
             .runtime()?
             .invite_members(&participant.account_id, &group_id, &invitees)
             .await
             .map_err(app_error)?;
-        self.record_relay_action_events(action.action_id, action.inviter, before, true)
-            .await?;
+        self.record_relay_action_events(
+            action.action_id,
+            action.inviter,
+            before,
+            true,
+            summary.published,
+            &summary.message_ids,
+        )
+        .await?;
         self.record_accepted_publication(action.inviter, action.pending);
         Ok(())
     }
@@ -787,7 +810,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(action.client)?;
-        participant
+        let summary = participant
             .runtime()?
             .update_group_profile(
                 &participant.account_id,
@@ -797,8 +820,15 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
-        self.record_relay_action_events(action.action_id, action.client, before, false)
-            .await?;
+        self.record_relay_action_events(
+            action.action_id,
+            action.client,
+            before,
+            false,
+            summary.published,
+            &summary.message_ids,
+        )
+        .await?;
         self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
@@ -811,19 +841,25 @@ impl ConvergenceSubject for AppRuntimeHarness {
         let group_id = self.active_group()?;
         let members = self.account_ids(action.members)?;
         let participant = self.participant(action.remover)?;
-        participant
+        let summary = participant
             .runtime()?
             .remove_members(&participant.account_id, &group_id, &members)
             .await
             .map_err(app_error)?;
-        self.record_relay_action_events(action.action_id, action.remover, before, false)
-            .await?;
+        self.record_relay_action_events(
+            action.action_id,
+            action.remover,
+            before,
+            false,
+            summary.published,
+            &summary.message_ids,
+        )
+        .await?;
         self.record_accepted_publication(action.remover, action.pending);
         Ok(())
     }
 
     async fn self_update(&mut self, action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(action.client)?;
         participant
@@ -831,8 +867,6 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .schedule_manual_self_update(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
-        self.record_relay_action_events(action.action_id, action.client, before, false)
-            .await?;
         self.record_accepted_publication(action.client, action.pending);
         Ok(())
     }
@@ -843,11 +877,19 @@ impl ConvergenceSubject for AppRuntimeHarness {
     ) -> Result<(), SubjectError> {
         let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
-        self.apply_admin_set(action.client, &group_id, action.admins)
+        let message_ids = self
+            .apply_admin_set(action.client, &group_id, action.admins)
             .await?;
         if let Some(action_id) = action.action_id {
-            self.record_relay_action_events(action_id, action.client, before, false)
-                .await?;
+            self.record_relay_action_events(
+                action_id,
+                action.client,
+                before,
+                false,
+                message_ids.len(),
+                &message_ids,
+            )
+            .await?;
         }
         if let Some(pending) = action.pending {
             self.record_accepted_publication(action.client, pending);
@@ -900,7 +942,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(action.sender)?;
-        participant
+        let summary = participant
             .runtime()?
             .send_message(
                 &participant.account_id,
@@ -909,8 +951,15 @@ impl ConvergenceSubject for AppRuntimeHarness {
             )
             .await
             .map_err(app_error)?;
-        self.record_relay_action_events(action.action_id, action.sender, before, false)
-            .await?;
+        self.record_relay_action_events(
+            action.action_id,
+            action.sender,
+            before,
+            false,
+            summary.published,
+            &[],
+        )
+        .await?;
         Ok(())
     }
 
@@ -918,13 +967,20 @@ impl ConvergenceSubject for AppRuntimeHarness {
         let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let participant = self.participant(client)?;
-        participant
+        let summary = participant
             .runtime()?
             .leave_group(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
-        self.record_relay_action_events(action_id, client, before, false)
-            .await?;
+        self.record_relay_action_events(
+            action_id,
+            client,
+            before,
+            false,
+            summary.published,
+            &summary.message_ids,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1034,7 +1090,7 @@ impl AppRuntimeHarness {
         actor: &str,
         group_id: &GroupId,
         target_labels: &[String],
-    ) -> Result<(), SubjectError> {
+    ) -> Result<Vec<String>, SubjectError> {
         let actor_participant = self.participant(actor)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let group = actor_participant
@@ -1067,45 +1123,72 @@ impl AppRuntimeHarness {
             .into_iter()
             .collect::<BTreeSet<_>>();
         let mut applied = Vec::new();
+        let mut message_ids = Vec::new();
         for account_id in targets.difference(&current) {
-            if let Err(error) = actor_participant
+            let summary = match actor_participant
                 .runtime()?
                 .promote_admin(&actor_participant.account_id, group_id, account_id)
                 .await
             {
-                return Err(
-                    compensate_admin_changes(actor_participant, group_id, &applied, error).await,
-                );
-            }
+                Ok(summary) => summary,
+                Err(error) => {
+                    return Err(compensate_admin_changes(
+                        actor_participant,
+                        group_id,
+                        &applied,
+                        error,
+                    )
+                    .await);
+                }
+            };
+            message_ids.extend(summary.message_ids);
             applied.push(AdminChange::Promoted(account_id.clone()));
         }
         for account_id in current
             .difference(&targets)
             .filter(|account_id| *account_id != &actor_participant.account_id)
         {
-            if let Err(error) = actor_participant
+            let summary = match actor_participant
                 .runtime()?
                 .demote_admin(&actor_participant.account_id, group_id, account_id)
                 .await
             {
-                return Err(
-                    compensate_admin_changes(actor_participant, group_id, &applied, error).await,
-                );
-            }
+                Ok(summary) => summary,
+                Err(error) => {
+                    return Err(compensate_admin_changes(
+                        actor_participant,
+                        group_id,
+                        &applied,
+                        error,
+                    )
+                    .await);
+                }
+            };
+            message_ids.extend(summary.message_ids);
             applied.push(AdminChange::Demoted(account_id.clone()));
         }
         if current.contains(&actor_participant.account_id)
             && !targets.contains(&actor_participant.account_id)
-            && let Err(error) = actor_participant
+        {
+            let summary = match actor_participant
                 .runtime()?
                 .self_demote_admin(&actor_participant.account_id, group_id)
                 .await
-        {
-            return Err(
-                compensate_admin_changes(actor_participant, group_id, &applied, error).await,
-            );
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    return Err(compensate_admin_changes(
+                        actor_participant,
+                        group_id,
+                        &applied,
+                        error,
+                    )
+                    .await);
+                }
+            };
+            message_ids.extend(summary.message_ids);
         }
-        Ok(())
+        Ok(message_ids)
     }
 }
 

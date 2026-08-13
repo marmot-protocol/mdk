@@ -1352,6 +1352,7 @@ fn validate_four_party_cross_route_process_report(
         .collect::<Vec<_>>();
     let baseline = &checkpoints[0];
     let routed = &checkpoints[1];
+    let first_settled = &checkpoints[2];
     let settled = &checkpoints[3];
     if routed["zeta"].protocol.epoch != 4
         || routed["alpha"].protocol.epoch != 4
@@ -1373,6 +1374,31 @@ fn validate_four_party_cross_route_process_report(
     let mut public_commitments = BTreeSet::new();
     for client in &spec.clients {
         let observation = settled[client.as_str()];
+        let prior = first_settled[client.as_str()];
+        if prior.protocol != observation.protocol
+            || prior.application != observation.application
+            || prior.progress.projection_checkpoint_sha256
+                != observation.progress.projection_checkpoint_sha256
+            || prior.progress.relay_inbound_events_seen
+                != observation.progress.relay_inbound_events_seen
+            || prior.progress.relay_inbound_events_delivered
+                != observation.progress.relay_inbound_events_delivered
+            || prior.progress.relay_publish_attempts != observation.progress.relay_publish_attempts
+            || prior.progress.relay_publish_failures != observation.progress.relay_publish_failures
+            || prior.progress.relay_directory_inflight_fetches != 0
+            || observation.progress.relay_directory_inflight_fetches != 0
+            || prior.progress.relay_directory_completed_fetches
+                != observation.progress.relay_directory_completed_fetches
+            || prior.progress.retry_timer_armed
+            || observation.progress.retry_timer_armed
+            || observation.progress.stable_checkpoint_observations
+                < prior.progress.stable_checkpoint_observations
+            || observation.progress.stable_checkpoint_observations < 2
+        {
+            return Err(format!(
+                "{client} did not preserve a stable final process checkpoint: {first_settled:#?} {settled:#?}"
+            ));
+        }
         if observation.protocol.epoch != 5
             || observation.protocol.member_count != 4
             || observation.protocol.member_identities != ["alpha", "observer", "yankee", "zeta"]
