@@ -1440,6 +1440,12 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
+        let seen_events_index = open
+            .state
+            .seen_events
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
@@ -1449,6 +1455,7 @@ impl MarmotApp {
             relay_plane: relay_plane.clone(),
             transport_signer: open.signer,
             state: open.state,
+            seen_events_index,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),

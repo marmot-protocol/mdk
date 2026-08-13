@@ -616,12 +616,6 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
-        let mut seen = self
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
 
         loop {
             let delivery = self
@@ -630,13 +624,13 @@ impl AppClient {
                 .await?
                 .ok_or(AppError::TransportClosed)?;
             let event_id = hex::encode(delivery.message.id.as_slice());
-            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 continue;
             }
-            if seen.contains(&event_id) {
+            if self.seen_events_index.contains(&event_id) {
                 continue;
             }
-            remember_seen_event(&mut seen, &mut self.state, event_id);
+            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
             return Ok(delivery);
         }
     }
@@ -674,12 +668,6 @@ impl AppClient {
             .map_err(|source| SyncFailure::from(AppError::from(source)))?
             .account_id_hex;
         let mut summary = SyncSummary::default();
-        let mut seen = self
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
         let mut first_wait = true;
         // Forensic drain accounting: wall-clock span, count of deliveries
         // actually ingested (echoes and already-seen duplicates are skipped and
@@ -715,10 +703,10 @@ impl AppClient {
                 Err(_) => break,
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
-            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 continue;
             }
-            if seen.contains(&event_id) {
+            if self.seen_events_index.contains(&event_id) {
                 continue;
             }
             if cfg!(feature = "test-policy-overrides")
@@ -758,7 +746,7 @@ impl AppClient {
                         .await);
                 }
             };
-            remember_seen_event(&mut seen, &mut self.state, event_id);
+            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
             *deliveries = (*deliveries).saturating_add(1);
             summary.merge(delivery_summary);
             routes_dirty |= delivery_routes_dirty;

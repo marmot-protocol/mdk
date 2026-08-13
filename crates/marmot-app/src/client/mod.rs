@@ -95,6 +95,12 @@ pub struct AppClient {
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
     pub(crate) state: AccountState,
+    /// O(1) membership index over `state.seen_events`, kept in lockstep by
+    /// `remember_seen_event` (which removes pruned ring entries from it).
+    /// Derived state: rebuilt from the ordered ring at construction and never
+    /// persisted. Before this index existed, every inbound delivery and every
+    /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.
+    pub(crate) seen_events_index: HashSet<String>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
@@ -3221,13 +3227,9 @@ impl AppClient {
         if effects.reports.is_empty() {
             return;
         }
-        // The publish path holds no parallel lookup set (unlike the inbound
-        // `next_event`/`sync_sdk_relay` hot path), so build one once for this
-        // small report batch and reuse the shared O(1) recorder for each id.
-        let mut seen: HashSet<String> = self.state.seen_events.iter().cloned().collect();
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
-            remember_seen_event(&mut seen, &mut self.state, event_id);
+            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
         }
     }
 
