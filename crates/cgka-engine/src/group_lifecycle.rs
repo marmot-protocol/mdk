@@ -42,6 +42,7 @@ use openmls::prelude::{
 };
 use openmls::treesync::Node;
 use openmls_traits::OpenMlsProvider as _;
+use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -565,11 +566,6 @@ impl<S: StorageProvider> Engine<S> {
         // Every other member lands in the group via `welcomes`, which carry
         // the post-commit state directly. Dropping the commit avoids a
         // welcome-before-commit `AlreadyAtEpoch` bounce.
-        //
-        // The context snapshot is built off the still-staged group; for
-        // welcomes, only the recipient pubkey matters at wrap time, so the
-        // pre-merge group context is sufficient.
-        let ctx = build_group_context_snapshot(&mls_group, &provider)?;
         let welcome_relays = welcome_relays_for_group(&mls_group)?;
 
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
@@ -797,8 +793,6 @@ impl<S: StorageProvider> Engine<S> {
             guard.disarm();
         }
 
-        let _ = ctx;
-
         Ok((
             group_id,
             SendResult::GroupCreated {
@@ -963,30 +957,25 @@ impl<S: StorageProvider> Engine<S> {
                 // Match in the same order OpenMLS uses: the first Welcome
                 // KeyPackageRef for which this account-device has a private
                 // bundle. Transport tags are deliberately outside this
-                // selection.
-                let local_bundle_keys = storage
-                    .stored_key_package_bundles()?
-                    .into_iter()
-                    .map(|stored| {
-                        let bundle = serde_json::from_slice::<KeyPackageBundle>(&stored.value)
-                            .map_err(|error| EngineError::Serialize(error.to_string()))?;
-                        let reference =
-                            bundle
-                                .key_package()
-                                .hash_ref(provider.crypto())
-                                .map_err(|error| {
-                                    EngineError::Backend(format!("key_package ref: {error:?}"))
-                                })?;
-                        Ok::<_, EngineError>(reference.as_slice().to_vec())
-                    })
-                    .collect::<Result<BTreeSet<_>, _>>()?;
-                let consumed_key_package_ref = welcome
-                    .secrets()
-                    .iter()
-                    .map(|secret| secret.new_member())
-                    .find(|reference| local_bundle_keys.contains(reference.as_slice()))
-                    .map(|reference| reference.as_slice().to_vec())
-                    .ok_or(EngineError::InvalidWelcome)?;
+                // selection. Point-query per candidate ref — the same lookup
+                // `ProcessedWelcome::new_from_welcome` performs internally —
+                // rather than enumerating, JSON-decoding, and re-hashing
+                // every stored bundle on each join.
+                let mut consumed_key_package_ref = None;
+                for secret in welcome.secrets() {
+                    let reference = secret.new_member();
+                    let bundle: Option<KeyPackageBundle> =
+                        OpenMlsStorageProvider::key_package(provider.storage(), &reference)
+                            .map_err(|error| {
+                                EngineError::Backend(format!("key_package lookup: {error:?}"))
+                            })?;
+                    if bundle.is_some() {
+                        consumed_key_package_ref = Some(reference.as_slice().to_vec());
+                        break;
+                    }
+                }
+                let consumed_key_package_ref =
+                    consumed_key_package_ref.ok_or(EngineError::InvalidWelcome)?;
                 let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                     &provider,
                     &join_config,

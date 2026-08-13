@@ -1732,7 +1732,18 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
-        let records = self.storage.list_messages(group_id, EpochId(0))?;
+        // Only states the loop below can act on; the storage backend skips
+        // fetching and decoding terminal/record-only rows entirely, which
+        // keeps a re-join from re-parsing the group's whole message history.
+        let records = self.storage.list_messages_in_states(
+            group_id,
+            &[
+                MessageState::Created,
+                MessageState::Retryable,
+                MessageState::PeelDeferred,
+            ],
+            EpochId(0),
+        )?;
         for record in records {
             if !matches!(
                 record.state,
