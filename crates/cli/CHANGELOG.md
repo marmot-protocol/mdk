@@ -9,7 +9,25 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-08-13
+
 ### Added
+
+- WN Agent's `marmot.agent-control.v2` protocol now supports adding and
+  removing durable message reactions. Hermes exposes the operations through
+  its Marmot tools, and OpenClaw exposes them through
+  `message(action="react")`, including current-message targeting, bounded
+  reaction content, exact or all-reaction removal, and idempotent missing
+  removal handling.
+  ([#1399](https://github.com/marmot-protocol/mdk/pull/1399),
+  [#1401](https://github.com/marmot-protocol/mdk/pull/1401))
+
+- MarmotKit releases now publish immutable SwiftPM-compatible XCFramework
+  archives, generated Swift source, checksums, and complete provenance
+  manifests. Exact-master snapshot releases use source-SHA identities so
+  pre-release app builds can pin bindings without replacing a versioned
+  artifact.
+  ([#1378](https://github.com/marmot-protocol/mdk/pull/1378))
 
 - `wn tui` group detail now has a lowercase `a` that searches for a member to
   add, for when you do not have the pubkey to hand (`A` remains the paste-a-pubkey
@@ -18,6 +36,40 @@ versioning through the workspace version in the root `Cargo.toml`.
   detail, and a completed add reopens and reloads it.
 
 ### Changed
+
+- Agent stream-compose append, status, and progress acknowledgements no longer
+  echo the accumulated transcript on every command. This removes quadratic
+  copying for long streams; `compose-append` JSON no longer contains `text`,
+  while finish responses still carry and validate the complete transcript and
+  the TUI tracks flushed bytes locally.
+  ([#1408](https://github.com/marmot-protocol/mdk/pull/1408))
+
+- Hot paths now avoid history-sized repeated work: outbound send gates use
+  indexed message-state probes, retained convergence anchors omit unused
+  message-ledger copies, Welcome joins use point lookups and filtered replay,
+  MarmotKit timeline windows reconvert only changed rows, and app clients keep
+  an incremental seen-event index. Existing databases remain compatible.
+  ([#1405](https://github.com/marmot-protocol/mdk/pull/1405),
+  [#1406](https://github.com/marmot-protocol/mdk/pull/1406),
+  [#1407](https://github.com/marmot-protocol/mdk/pull/1407),
+  [#1416](https://github.com/marmot-protocol/mdk/pull/1416),
+  [#1417](https://github.com/marmot-protocol/mdk/pull/1417))
+
+- Same-epoch fork resolution now uses one rule for every member: the
+  committer's pairwise fast-path is removed, and a committer adjudicates a
+  rival commit through the same distributed-convergence pass as an observer,
+  with its own commit materialized from the commit-addressed checkpoints
+  introduced in #1285. When the in-horizon recovery material (the retained
+  source-epoch anchor) is missing, the group fails closed loudly — durable
+  `Unrecoverable` halt plus a `GroupUnrecoverable` event — instead of
+  silently keeping a possibly losing branch. A committer's rival resolution
+  now waits for the convergence pass's quiescence window (~1 s); sends queue
+  during it. The `ForkRecovered` group event and its MarmotKit FFI variant
+  are removed (the convergence-path `CommitRolledBack` +
+  `GroupStateInvalidated` pair is the rollback signal); forensic audit logs
+  keep parsing the historical `fork_resolution` and `snapshot_created` rows,
+  which current engines no longer emit.
+  ([#1293](https://github.com/marmot-protocol/mdk/pull/1293))
 
 - Encrypted media and Hermes/WN Agent file delivery now accept blobs up to
   512 MiB (including the 16-byte authentication tag), enabling APKs and other
@@ -45,6 +97,23 @@ versioning through the workspace version in the root `Cargo.toml`.
   ([#1396](https://github.com/marmot-protocol/mdk/pull/1396))
 
 ### Fixed
+
+- Outbound application messages queued during an unsettled convergence pass
+  now durably arm their drain and remain visible as runnable or scheduled work,
+  preventing accepted sends from being stranded while the group appears idle.
+  ([#1403](https://github.com/marmot-protocol/mdk/pull/1403))
+
+- Removed members can rejoin through a fresh Welcome without evicted-era
+  snapshots aborting the past-epoch peel probe, and deliveries dropped before
+  a delayed Welcome are no longer remembered as seen so relay redelivery can
+  catch the new member up.
+  ([#1367](https://github.com/marmot-protocol/mdk/pull/1367),
+  [#1379](https://github.com/marmot-protocol/mdk/pull/1379))
+
+- Incident replay now recognizes manifest-less NDJSON stream remnants by their
+  type discriminator and fails closed instead of accepting a truncated error
+  stream as an empty healthy export.
+  ([#1140](https://github.com/marmot-protocol/mdk/pull/1140))
 
 - OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the
   routed agent id, and beta message sends bypass the delete-only action adapter
@@ -391,21 +460,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   `Sendable`/`Error` conformances; the dependency refresh also removes the
   audited `bincode`, `paste`, and `proc-macro-error2` paths and incorporates the
   `nostr` fix for RUSTSEC-2026-0219.
-
-- Same-epoch fork resolution now uses one rule for every member: the
-  committer's pairwise fast-path is removed, and a committer adjudicates a
-  rival commit through the same distributed-convergence pass as an observer,
-  with its own commit materialized from the commit-addressed checkpoints
-  introduced in #1285. When the in-horizon recovery material (the retained
-  source-epoch anchor) is missing, the group fails closed loudly — durable
-  `Unrecoverable` halt plus a `GroupUnrecoverable` event — instead of
-  silently keeping a possibly losing branch. A committer's rival resolution
-  now waits for the convergence pass's quiescence window (~1 s); sends queue
-  during it. The `ForkRecovered` group event and its MarmotKit FFI variant
-  are removed (the convergence-path `CommitRolledBack` +
-  `GroupStateInvalidated` pair is the rollback signal); forensic audit logs
-  keep parsing the historical `fork_resolution` and `snapshot_created` rows,
-  which current engines no longer emit.
 
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
   providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset
@@ -1458,7 +1512,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.12...HEAD
+[0.9.12]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/marmot-protocol/mdk/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/marmot-protocol/mdk/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/marmot-protocol/mdk/compare/v0.9.8...v0.9.9
