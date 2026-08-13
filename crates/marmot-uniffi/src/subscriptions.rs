@@ -13,15 +13,16 @@
 //! All inner state lives behind a `tokio::sync::Mutex` because UniFFI passes
 //! these objects via `Arc<Self>` and `recv()` requires `&mut`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::PoisonError;
 
 use marmot_app::{
     RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
-    UserSearchSubscription as AppUserSearchSubscription,
+    RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription, TimelineMessageRecord,
+    TimelinePage, TimelineWindowHandle, UserSearchSubscription as AppUserSearchSubscription,
 };
 use tokio::sync::Mutex;
 
@@ -29,7 +30,7 @@ use crate::MarmotKitError;
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
-    TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
+    TimelineMessageRecordFfi, TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -180,6 +181,53 @@ pub struct TimelineMessagesSubscription {
     snapshot: StdMutex<Option<TimelinePageFfi>>,
     window: TimelineWindowHandle,
     receiver: Mutex<RuntimeTimelineMessagesSubscription>,
+    /// Converted rows from the most recent window snapshot, keyed by
+    /// `message_id_hex`. Converting a row is expensive (Markdown parse,
+    /// imeta media resolution, reaction re-sort), and a live update usually
+    /// changes one row in a window of hundreds, so `next()` and the paginate
+    /// calls reuse the previous conversion for every row whose source record
+    /// is unchanged.
+    conversion_cache: StdMutex<HashMap<String, CachedTimelineRow>>,
+}
+
+struct CachedTimelineRow {
+    source: TimelineMessageRecord,
+    converted: TimelineMessageRecordFfi,
+}
+
+/// Convert a window snapshot to its FFI page, reusing cached conversions for
+/// rows whose source record equals the one that produced them. The cache is
+/// replaced with exactly the rows of this page, so rows that scrolled out of
+/// the window are dropped and the cache never outgrows the window cap.
+fn convert_timeline_page_cached(
+    cache: &StdMutex<HashMap<String, CachedTimelineRow>>,
+    page: TimelinePage,
+) -> TimelinePageFfi {
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut retained = HashMap::with_capacity(page.messages.len());
+    let messages = page
+        .messages
+        .into_iter()
+        .map(|record| {
+            let key = record.message_id_hex.clone();
+            let row = match cache.remove(&key) {
+                Some(cached) if cached.source == record => cached,
+                _ => CachedTimelineRow {
+                    source: record.clone(),
+                    converted: record.into(),
+                },
+            };
+            let converted = row.converted.clone();
+            retained.insert(key, row);
+            converted
+        })
+        .collect();
+    *cache = retained;
+    TimelinePageFfi {
+        messages,
+        has_more_before: page.has_more_before,
+        has_more_after: page.has_more_after,
+    }
 }
 
 impl TimelineMessagesSubscription {
@@ -191,11 +239,13 @@ impl TimelineMessagesSubscription {
         )
         .entered();
         let window = inner.window_handle();
-        let snapshot: TimelinePageFfi = inner.take_snapshot().into();
+        let conversion_cache = StdMutex::new(HashMap::new());
+        let snapshot = convert_timeline_page_cached(&conversion_cache, inner.take_snapshot());
         Arc::new(Self {
             snapshot: StdMutex::new(Some(snapshot)),
             window,
             receiver: Mutex::new(inner),
+            conversion_cache,
         })
     }
 }
@@ -214,7 +264,10 @@ impl TimelineMessagesSubscription {
     pub async fn next(&self) -> Option<TimelinePageFfi> {
         let mut receiver = self.receiver.lock().await;
         receiver.recv().await?;
-        Some(self.window.snapshot().into())
+        Some(convert_timeline_page_cached(
+            &self.conversion_cache,
+            self.window.snapshot(),
+        ))
     }
 
     pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi> {
@@ -231,7 +284,8 @@ impl TimelineMessagesSubscription {
     /// task can paginate without blocking (and this never blocks the UI thread,
     /// unlike the synchronous `Marmot::timeline_messages`).
     pub async fn paginate_backwards(&self, count: u32) -> Result<TimelinePageFfi, MarmotKitError> {
-        Ok(self.window.paginate_backwards(count as usize).await?.into())
+        let page = self.window.paginate_backwards(count as usize).await?;
+        Ok(convert_timeline_page_cached(&self.conversion_cache, page))
     }
 
     /// Extend the materialized window toward the live head by up to `count`
@@ -239,7 +293,8 @@ impl TimelineMessagesSubscription {
     /// window (`has_more_after` becomes false). Same windowing/threading
     /// guarantees as [`paginate_backwards`](Self::paginate_backwards).
     pub async fn paginate_forwards(&self, count: u32) -> Result<TimelinePageFfi, MarmotKitError> {
-        Ok(self.window.paginate_forwards(count as usize).await?.into())
+        let page = self.window.paginate_forwards(count as usize).await?;
+        Ok(convert_timeline_page_cached(&self.conversion_cache, page))
     }
 }
 
@@ -356,6 +411,80 @@ mod tests {
 
         assert_eq!(take_snapshot(&snapshot), Some("initial"));
         assert_eq!(take_snapshot(&snapshot), None);
+    }
+
+    #[test]
+    fn cached_conversion_reuses_unchanged_rows_and_never_serves_stale_content() {
+        use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+        use marmot_app::TimelineReactionSummary;
+
+        fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
+            TimelineMessageRecord {
+                message_id_hex: id.to_string(),
+                source_message_id_hex: None,
+                source_epoch: None,
+                retention_seconds: None,
+                retention_expires_at: None,
+                direction: "received".to_string(),
+                group_id_hex: "aa".to_string(),
+                sender: "bb".to_string(),
+                plaintext: plaintext.to_string(),
+                kind: MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                timeline_at: 1,
+                received_at: 1,
+                reply_to_message_id_hex: None,
+                reply_preview: None,
+                media: None,
+                agent_text_stream: None,
+                reactions: TimelineReactionSummary::default(),
+                deleted: false,
+                deleted_by_message_id_hex: None,
+                invalidation_status: None,
+            }
+        }
+
+        fn page(messages: Vec<TimelineMessageRecord>) -> TimelinePage {
+            TimelinePage {
+                messages,
+                has_more_before: false,
+                has_more_after: false,
+            }
+        }
+
+        let cache = StdMutex::new(HashMap::new());
+
+        let first = convert_timeline_page_cached(
+            &cache,
+            page(vec![record("m1", "hello"), record("m2", "world")]),
+        );
+        assert_eq!(first.messages.len(), 2);
+        assert_eq!(cache.lock().unwrap().len(), 2);
+
+        // Unchanged rows come back identical from the cache.
+        let second = convert_timeline_page_cached(
+            &cache,
+            page(vec![record("m1", "hello"), record("m2", "world")]),
+        );
+        assert_eq!(second.messages[0].plaintext, "hello");
+        assert_eq!(second.messages[1].plaintext, "world");
+
+        // A changed row is re-converted, never served stale: the new markdown
+        // shows up in the tokens, not just the plaintext.
+        let third = convert_timeline_page_cached(
+            &cache,
+            page(vec![record("m1", "edited **bold**"), record("m2", "world")]),
+        );
+        assert_eq!(third.messages[0].plaintext, "edited **bold**");
+        assert!(!third.messages[0].content_tokens.blocks.is_empty());
+
+        // Rows that leave the window are pruned so the cache tracks the
+        // window cap, not history.
+        let fourth = convert_timeline_page_cached(&cache, page(vec![record("m2", "world")]));
+        assert_eq!(fourth.messages.len(), 1);
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key("m2"));
     }
 
     // The timeline window's projection/cap/anchoring contract now lives and is
