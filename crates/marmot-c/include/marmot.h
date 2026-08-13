@@ -19,7 +19,7 @@
 
 #pragma once
 
-/* Generated with cbindgen:0.29.2 */
+/* Generated with cbindgen:0.29.4 */
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -36,9 +36,9 @@
  * `marmot_last_error_message()`.
  */
 enum MarmotStatus
-#ifdef __cplusplus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : int32_t
-#endif // __cplusplus
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   MARMOT_STATUS_OK = 0,
   /**
@@ -110,7 +110,11 @@ enum MarmotStatus
   MARMOT_STATUS_GROUP_SEND_QUEUE_FULL = 54,
 };
 #ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotStatus MarmotStatus;
+#else
 typedef int32_t MarmotStatus;
+#endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
 /**
