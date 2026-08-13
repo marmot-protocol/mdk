@@ -24,4 +24,5 @@ tempfile.workspace = true
 
 [features]
 extensions-draft = ["openmls_traits/extensions-draft"]
+storage-format-benchmarks = []
 test-conformance-replay = []

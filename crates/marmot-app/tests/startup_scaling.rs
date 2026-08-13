@@ -1,8 +1,9 @@
 //! Startup scaling benchmarks for the account-open critical path (mdk#1161).
 //!
-//! Each case builds an on-disk store with N groups (and M invited members per
-//! group), tears everything down, then measures a cold reopen the way a host
-//! app boots:
+//! Each case builds an on-disk store with N groups, M invited members per
+//! group, and P application messages per group. It records the resulting
+//! SQLCipher database footprint, tears everything down, then measures a cold
+//! reopen the way a host app boots:
 //!
 //! 1. `MarmotApp::chat_list` on a fresh app instance, **before** any runtime
 //!    exists — the persisted chat-projection read a host renders first.
@@ -34,6 +35,7 @@
 //! cached key package each to the mock relay and are referenced by account id
 //! when the bench account creates groups.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use marmot_account::AccountHome;
@@ -53,6 +55,11 @@ fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
 struct BenchReport {
     groups: usize,
     roster: usize,
+    messages_per_group: usize,
+    /// Main SQLCipher database file after fixture connections close.
+    database_bytes: u64,
+    /// Main database plus any SQLite WAL and shared-memory sidecars.
+    database_footprint_bytes: u64,
     /// Cold `MarmotApp::chat_list` read on a fresh app, before any runtime.
     chat_list: Duration,
     /// `MarmotAppRuntime::start()` wall clock on the same cold store.
@@ -73,12 +80,16 @@ struct BenchReport {
 impl BenchReport {
     fn print(&self, case: &str) {
         println!(
-            "MDK_BENCH startup_scaling case={case} groups={} roster={} \
-             chat_list_ms={} ready_ms={} group_read_ms={} account_open_wait_ms={} \
+            "MDK_BENCH startup_scaling case={case} groups={} roster={} messages_per_group={} \
+             database_bytes={} database_footprint_bytes={} chat_list_ms={} ready_ms={} \
+             group_read_ms={} account_open_wait_ms={} \
              session_open_ms={} group_hydration_ms={} profile_load_ms={} \
              read_snapshot_ms={}",
             self.groups,
             self.roster,
+            self.messages_per_group,
+            self.database_bytes,
+            self.database_footprint_bytes,
             self.chat_list.as_millis(),
             self.start_ready.as_millis(),
             self.group_read.as_millis(),
@@ -91,8 +102,23 @@ impl BenchReport {
     }
 }
 
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+fn database_footprint(path: &Path) -> (u64, u64) {
+    let database_bytes = file_bytes(path);
+    let mut wal_path = path.as_os_str().to_owned();
+    wal_path.push("-wal");
+    let mut shm_path = path.as_os_str().to_owned();
+    shm_path.push("-shm");
+    let footprint =
+        database_bytes + file_bytes(Path::new(&wal_path)) + file_bytes(Path::new(&shm_path));
+    (database_bytes, footprint)
+}
+
 /// Build the fixture store, then cold-reopen it and measure. See module docs.
-async fn run_case(groups: usize, roster: usize) -> BenchReport {
+async fn run_case(groups: usize, roster: usize, messages_per_group: usize) -> BenchReport {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
 
@@ -119,14 +145,28 @@ async fn run_case(groups: usize, roster: usize) -> BenchReport {
         let mut client = app_fixture.client(BENCH_ACCOUNT).await.unwrap();
         let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
         for group in 0..groups {
-            group_ids.push(
+            let group_id = client
+                .create_group(&format!("bench group {group}"), &member_refs)
+                .await
+                .unwrap();
+            for message in 0..messages_per_group {
                 client
-                    .create_group(&format!("bench group {group}"), &member_refs)
+                    .send(
+                        &group_id,
+                        format!("bench group {group} message {message}").as_bytes(),
+                    )
                     .await
-                    .unwrap(),
-            );
+                    .unwrap();
+            }
+            group_ids.push(group_id);
         }
     }
+    let database_path = home_bench.account_dir(BENCH_ACCOUNT).join("session.sqlite");
+    let (database_bytes, database_footprint_bytes) = database_footprint(&database_path);
+    assert!(
+        database_bytes > 0,
+        "fixture database must exist and be non-empty"
+    );
 
     // --- cold reopen: durable chat projection first, then full readiness ---
     let app = open_store(&dir_bench, &url);
@@ -166,6 +206,9 @@ async fn run_case(groups: usize, roster: usize) -> BenchReport {
     let report = BenchReport {
         groups,
         roster,
+        messages_per_group,
+        database_bytes,
+        database_footprint_bytes,
         chat_list,
         start_ready,
         group_read,
@@ -182,7 +225,7 @@ async fn run_case(groups: usize, roster: usize) -> BenchReport {
 /// Bench bodies compose many app boots and MLS commits; debug builds need
 /// more than libtest's default 2 MiB stack (same shape as
 /// `cursor_persistence.rs`).
-fn run_bench(name: &'static str, groups: usize, roster: usize) {
+fn run_bench(name: &'static str, groups: usize, roster: usize, messages_per_group: usize) {
     let thread = std::thread::Builder::new()
         .name(name.to_owned())
         .stack_size(8 * 1024 * 1024)
@@ -191,7 +234,7 @@ fn run_bench(name: &'static str, groups: usize, roster: usize) {
                 .enable_all()
                 .build()
                 .unwrap();
-            let report = test_runtime.block_on(run_case(groups, roster));
+            let report = test_runtime.block_on(run_case(groups, roster, messages_per_group));
             report.print(name);
         })
         .unwrap();
@@ -202,41 +245,47 @@ fn run_bench(name: &'static str, groups: usize, roster: usize) {
 /// working in every CI run without the full matrix's cost.
 #[test]
 fn startup_scaling_smoke() {
-    run_bench("smoke", 3, 1);
+    run_bench("smoke", 3, 1, 0);
 }
 
 #[test]
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_groups_0() {
-    run_bench("groups_0", 0, 0);
+    run_bench("groups_0", 0, 0, 0);
 }
 
 #[test]
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_groups_10() {
-    run_bench("groups_10", 10, 1);
+    run_bench("groups_10", 10, 1, 0);
 }
 
 #[test]
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_groups_100() {
-    run_bench("groups_100", 100, 1);
+    run_bench("groups_100", 100, 1, 0);
 }
 
 #[test]
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_groups_1000() {
-    run_bench("groups_1000", 1000, 1);
+    run_bench("groups_1000", 1000, 1, 0);
 }
 
 #[test]
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_roster_8() {
-    run_bench("roster_8", 10, 8);
+    run_bench("roster_8", 10, 8, 0);
 }
 
 #[test]
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_roster_64() {
-    run_bench("roster_64", 10, 64);
+    run_bench("roster_64", 10, 64, 0);
+}
+
+#[test]
+#[ignore = "startup scaling benchmark; run via `just bench-startup`"]
+fn startup_scaling_messages_32() {
+    run_bench("messages_32", 10, 1, 32);
 }

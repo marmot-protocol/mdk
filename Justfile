@@ -47,9 +47,10 @@ test-default:
 test-otlp:
     cargo nextest run --workspace --features {{otlp-features}},{{test-features}}
 
-# Startup scaling benchmarks (mdk#1161): builds stores with 0/10/100/1000
-# groups and 8/64-member rosters, cold-reopens each, and prints stable
-# `MDK_BENCH ...` lines separating chat-projection readiness from full
+# Startup scaling benchmarks (mdk#1161, mdk#1413): builds stores with
+# 0/10/100/1000 groups, 8/64-member rosters, and a message-heavy case;
+# reports the SQLCipher database footprint, cold-reopens each, and prints
+# stable `MDK_BENCH ...` lines separating chat-projection readiness from full
 # account-command readiness. Release profile so timings reflect shipped code.
 bench-startup:
     cargo test --release -p marmot-app --test startup_scaling -- --ignored --nocapture --test-threads=1
