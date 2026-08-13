@@ -43,6 +43,11 @@ fi
 
 source "$dev_root/env.sh"
 
+# Keep the test's socket-startup deadline focused on wn-agent startup rather
+# than including an arbitrarily long first Cargo build in a fresh worktree.
+cd "$MDK_REPO"
+cargo build -q -p agent-connector --bin wn-agent
+
 cd "$OPENCLAW_PLUGIN_SRC"
 pnpm build
 exec env MARMOT_OPENCLAW_CONNECTOR_E2E=1 pnpm exec vitest run test/e2e-connector.test.ts
