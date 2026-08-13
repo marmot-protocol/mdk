@@ -7,6 +7,7 @@ import {
   resolveMarmotChannelAccount,
   type MarmotMessageActionClient,
 } from "../src/channel.js";
+import { AgentControlError } from "../src/client.js";
 import {
   markMarmotInboundReady,
   markMarmotInboundReceived,
@@ -301,6 +302,33 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(resultOk(result)).toBe(true);
   });
 
+  it("treats an already-absent reaction as an idempotent removal", async () => {
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: {
+          deleteMessage: async () => undefined,
+          removeReaction: async () => {
+            throw new AgentControlError("reaction was not active", {
+              code: "reaction_not_found",
+            });
+          },
+        },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      reactCtx(
+        { remove: true, emoji: "👀" },
+        { currentMessageId: HEX32("99"), currentMessagingTarget: HEX32("cc") },
+      ),
+    );
+
+    expect(resultOk(result)).toBe(true);
+    expect((result.details as { removed?: boolean }).removed).toBe(true);
+  });
+
   it("removes the bot's reaction when remove is true even with an emoji", async () => {
     const removeReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
@@ -318,7 +346,12 @@ describe("createMarmotMessageActionAdapter", () => {
       ),
     );
 
-    expect(removeReaction).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("99"));
+    expect(removeReaction).toHaveBeenCalledWith(
+      HEX32("aa"),
+      HEX32("cc"),
+      HEX32("99"),
+      "👀",
+    );
     expect(resultOk(result)).toBe(true);
   });
 

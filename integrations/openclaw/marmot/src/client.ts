@@ -652,13 +652,18 @@ export class MarmotAgentControlClient {
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
+    emoji?: string,
   ): Promise<AppEventSentResponse> {
-    const response = await this.request({
+    const request: Record<string, unknown> = {
       type: "remove_reaction",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
-    });
+    };
+    if (emoji !== undefined) {
+      request.emoji = String(emoji);
+    }
+    const response = await this.request(request);
     return requireAppEventSent(response);
   }
 

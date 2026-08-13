@@ -369,6 +369,19 @@ describe("MarmotAgentControlClient", () => {
       group_id_hex: HEX32("cc"),
       target_message_id_hex: HEX32("dd"),
     });
+    expect(removed.echoed_request).not.toHaveProperty("emoji");
+
+    const removedExact = (await client.removeReaction(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"), "👀",
+    )) as unknown as { message_ids_hex: string[]; echoed_request: Record<string, unknown> };
+    expect(removedExact.message_ids_hex).toEqual([HEX32("e2")]);
+    expect(removedExact.echoed_request).toMatchObject({
+      type: "remove_reaction",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("dd"),
+      emoji: "👀",
+    });
   });
 
   it("rejects malformed durable reaction responses", async () => {

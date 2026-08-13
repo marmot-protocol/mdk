@@ -14,7 +14,9 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 The shared `message` tool exposes Marmot reaction add/remove through its
 `react` action. Reactions target durable message ids; omitting `messageId`
 targets the current inbound message, while `remove: true` or an empty `emoji`
-removes the agent account's active reaction. Reaction content follows the
+removes reactions. A non-empty `emoji` with `remove: true` removes that exact
+content; an empty `emoji` removes all of the agent account's active reactions
+on the target. Repeating a removal is idempotent. Reaction content follows the
 agent-control v2 bound: non-blank, control-free, and at most 64 Unicode scalar
 values.
 

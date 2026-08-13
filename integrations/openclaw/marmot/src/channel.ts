@@ -29,6 +29,7 @@ import {
   type ResolvedMarmotAccount,
 } from "./config.js";
 import { startMarmotGatewayAccount } from "./gateway.js";
+import { AgentControlError } from "./client.js";
 import { createMarmotMessagingAdapter } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
 import {
@@ -146,6 +147,7 @@ export interface MarmotMessageActionClient {
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
+    emoji?: string,
   ) => Promise<unknown>;
 }
 
@@ -193,7 +195,11 @@ export function createMarmotMessageActionAdapter(
             if (!client.removeReaction) {
               return jsonResult({ ok: false, error: "reaction removal unavailable" });
             }
-            await client.removeReaction(marmotAccountIdHex, to, messageId);
+            if (emoji.length > 0) {
+              await client.removeReaction(marmotAccountIdHex, to, messageId, emoji);
+            } else {
+              await client.removeReaction(marmotAccountIdHex, to, messageId);
+            }
             return jsonResult({ ok: true, removed: true });
           }
           if (!client.sendReaction) {
@@ -201,7 +207,14 @@ export function createMarmotMessageActionAdapter(
           }
           await client.sendReaction(marmotAccountIdHex, to, messageId, emoji);
           return jsonResult({ ok: true, added: emoji });
-        } catch {
+        } catch (error) {
+          if (
+            remove &&
+            error instanceof AgentControlError &&
+            error.code === "reaction_not_found"
+          ) {
+            return jsonResult({ ok: true, removed: true });
+          }
           return jsonResult({ ok: false, error: "reaction operation failed" });
         }
       }
