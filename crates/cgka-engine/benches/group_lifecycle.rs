@@ -217,13 +217,18 @@ fn bench_create_group(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| {
                     let alice = alice.clone();
                     async move {
+                        let __tc = std::time::Instant::now(); // TEMP-PROBE
                         let request = create_request(key_packages.clone());
-                        let (group_id, result) = alice
-                            .lock()
-                            .await
+                        eprintln!("TEMP-PROBE closure clone: {:?}", __tc.elapsed()); // TEMP-PROBE
+                        let __tl = std::time::Instant::now(); // TEMP-PROBE
+                        let mut guard = alice.lock().await; // TEMP-PROBE
+                        eprintln!("TEMP-PROBE closure lock: {:?}", __tl.elapsed()); // TEMP-PROBE
+                        let __tg = std::time::Instant::now(); // TEMP-PROBE
+                        let (group_id, result) = guard
                             .create_group(request)
                             .await
                             .expect("create_group succeeds");
+                        eprintln!("TEMP-PROBE closure create_group: {:?}", __tg.elapsed()); // TEMP-PROBE
                         // Sanity: founding creation returns one Welcome per invitee.
                         debug_assert!(matches!(
                             result,
@@ -305,5 +310,65 @@ fn bench_join_welcome(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_create_group, bench_join_welcome);
+/// Joining a larger group: every join ends with a buffered-message replay
+/// scan over the group's stored messages. The just-persisted Welcome record
+/// alone is ~180KB of JSON at this size; a re-join additionally carries the
+/// group's whole prior history.
+fn bench_join_welcome_large_group(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("join_welcome_large_group");
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_millis(300));
+    group.sample_size(10);
+    const PREGENERATED_WELCOMES: usize = 400;
+    const OTHER_MEMBERS: usize = 31;
+    let mut bob = build_client(b"bench-bob-join-large");
+    let bob_kp = rt
+        .block_on(bob.fresh_key_package())
+        .expect("mint bob key package");
+    let other_key_packages = invitee_key_packages(OTHER_MEMBERS);
+    let mut alice = build_client(b"bench-alice-join-large");
+    let mut welcomes = Vec::with_capacity(PREGENERATED_WELCOMES);
+    for _ in 0..PREGENERATED_WELCOMES {
+        let mut members = other_key_packages.clone();
+        members.push(bob_kp.clone());
+        let (_group_id, result) = rt
+            .block_on(alice.create_group(create_request(members)))
+            .expect("create_group succeeds");
+        match result {
+            SendResult::FoundingGroupCreated { welcomes: mut wrapped } => {
+                // bob's KeyPackage was last, so his Welcome is last.
+                welcomes.push(wrapped.remove(wrapped.len() - 1));
+            }
+            other => panic!("expected FoundingGroupCreated, got {other:?}"),
+        }
+    }
+    let bob = std::sync::Arc::new(tokio::sync::Mutex::new(bob));
+    group.bench_function("32 members", |b| {
+        b.to_async(&rt).iter_batched(
+            || welcomes.pop().expect("pre-generated welcome pool"),
+            |welcome| {
+                let bob = bob.clone();
+                async move {
+                    bob.lock()
+                        .await
+                        .join_welcome(welcome)
+                        .await
+                        .expect("join succeeds")
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_create_group,
+    bench_join_welcome,
+    bench_join_welcome_large_group
+);
 criterion_main!(benches);
