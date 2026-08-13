@@ -148,8 +148,8 @@ branch (`set_stable`) and emits `GroupEvent::EpochChanged { from, to }`. A **pos
 a group has applied a canonical branch while `Settled`, a later canonicalization pass — triggered by a commit that
 arrived *after* that settle, with a `fork_epoch` at or above the retained anchor (i.e. within `max_rewind_commits`) —
 selects a *different* canonical branch that diverges at or below the previously-applied tip. This is the engine's
-existing fork-recovery path (`GroupEvent::ForkRecovered { source_epoch, recovered_epoch, winner, invalidated }`,
-`crates/cgka-engine/src/fork_recovery.rs`); losing-branch app messages are re-dispositioned
+fork-resolution path (distributed convergence; `GroupEvent::CommitRolledBack` +
+`GroupEvent::GroupStateInvalidated` mark the superseded commit); losing-branch app messages are re-dispositioned
 `InvalidatedAppMessageReason::LosingBranch`.
 
 A normal forward advance — where the selected branch extends the previously-applied one — is **not** a reorg. The engine

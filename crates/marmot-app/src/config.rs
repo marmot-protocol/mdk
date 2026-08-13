@@ -97,6 +97,21 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this exercises the account
     /// worker's degraded catch-up path without corrupting a real database.
     pub dev_force_group_read_snapshot_failure: bool,
+    /// Dev/test-only fault injected before the next delivery after this many
+    /// completed catch-up deliveries. Honored only with
+    /// `test-policy-overrides`; this exercises truthful partial-progress
+    /// reporting when delivery N+1 fails before ingest.
+    pub dev_fail_sync_before_delivery: Option<u64>,
+    /// Dev/test-only fault injected before checkpointing an accumulated sync
+    /// prefix after more than this many deliveries completed. Honored only with
+    /// `test-policy-overrides`; this verifies that an uncommitted batch is
+    /// excluded from the completed prefix and replayed from the engine outbox.
+    pub dev_fail_sync_before_boundary_save: Option<u64>,
+    /// Dev/test-only fault injected after staging an application-event
+    /// acknowledgement during inbound delivery projection. Honored only with
+    /// `test-policy-overrides`; this exercises retention of the already-applied
+    /// event summary when a later step in the same delivery fails.
+    pub dev_fail_ingest_after_application_event_ack: bool,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -150,6 +165,9 @@ impl Default for MarmotAppConfig {
             dev_scheduled_convergence_delay_ms: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
+            dev_fail_sync_before_delivery: None,
+            dev_fail_sync_before_boundary_save: None,
+            dev_fail_ingest_after_application_event_ack: false,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -241,6 +259,28 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
         self.dev_force_group_read_snapshot_failure = enabled;
+        self
+    }
+
+    /// Fail before the next catch-up delivery after `deliveries` completed in
+    /// test-policy builds. Normal builds ignore this field.
+    pub fn with_dev_fail_sync_before_delivery(mut self, deliveries: u64) -> Self {
+        self.dev_fail_sync_before_delivery = Some(deliveries);
+        self
+    }
+
+    /// Fail before checkpointing a sync prefix after more than
+    /// `completed_deliveries` were accumulated in test-policy builds. Normal
+    /// builds ignore this field.
+    pub fn with_dev_fail_sync_before_boundary_save(mut self, completed_deliveries: u64) -> Self {
+        self.dev_fail_sync_before_boundary_save = Some(completed_deliveries);
+        self
+    }
+
+    /// Fail after staging an inbound application-event acknowledgement in
+    /// test-policy builds. Normal builds ignore this field.
+    pub fn with_dev_fail_ingest_after_application_event_ack(mut self) -> Self {
+        self.dev_fail_ingest_after_application_event_ack = true;
         self
     }
 }

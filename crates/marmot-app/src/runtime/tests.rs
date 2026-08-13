@@ -354,12 +354,16 @@ fn timeline_ids(page: &TimelinePage) -> Vec<String> {
 /// pagination/refresh call issued.
 #[derive(Clone, Default)]
 struct ScriptedTimelineStore {
-    responses: Arc<StdMutex<std::collections::VecDeque<TimelinePage>>>,
+    responses: Arc<StdMutex<std::collections::VecDeque<Result<TimelinePage, AppError>>>>,
     queries: Arc<StdMutex<Vec<TimelineMessageQuery>>>,
 }
 
 impl ScriptedTimelineStore {
     fn new(responses: Vec<TimelinePage>) -> Self {
+        Self::new_results(responses.into_iter().map(Ok).collect())
+    }
+
+    fn new_results(responses: Vec<Result<TimelinePage, AppError>>) -> Self {
         Self {
             responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
             queries: Arc::new(StdMutex::new(Vec::new())),
@@ -371,12 +375,11 @@ impl ScriptedTimelineStore {
         let queries = self.queries.clone();
         Arc::new(move |query: TimelineMessageQuery| {
             queries.lock().expect("queries lock").push(query);
-            let page = responses
+            responses
                 .lock()
                 .expect("responses lock")
                 .pop_front()
-                .expect("scripted timeline store exhausted");
-            Ok(page)
+                .expect("scripted timeline store exhausted")
         })
     }
 
@@ -499,11 +502,42 @@ fn timeline_subscription_take_snapshot_retains_window_for_pagination() {
 }
 
 #[test]
+fn merge_timeline_window_orders_epoch_boundaries_canonically() {
+    let mut system_seven = timeline_test_record("system-7", 900);
+    system_seven.source_epoch = Some(7);
+    system_seven.kind = 1210;
+    let mut message_seven = timeline_test_record("message-7", 200);
+    message_seven.source_epoch = Some(7);
+    let mut system_eight = timeline_test_record("system-8", 901);
+    system_eight.source_epoch = Some(8);
+    system_eight.kind = 1210;
+    let mut message_eight = timeline_test_record("message-8", 150);
+    message_eight.source_epoch = Some(8);
+    let mut window = TimelinePage {
+        messages: vec![message_eight, system_seven],
+        has_more_before: false,
+        has_more_after: false,
+    };
+    let incoming = TimelinePage {
+        messages: vec![system_eight, message_seven],
+        has_more_before: false,
+        has_more_after: false,
+    };
+
+    merge_timeline_window_with_order(&mut window, incoming, TimelineWindowEdge::Newer, 300, true);
+
+    assert_eq!(
+        timeline_ids(&window),
+        ["system-7", "message-7", "system-8", "message-8"]
+    );
+}
+
+#[test]
 fn merge_timeline_window_prepends_older_and_keeps_head_flag() {
     let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
     let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);
 
-    merge_timeline_window(&mut window, older, TimelineWindowEdge::Older, 300);
+    merge_timeline_window_with_order(&mut window, older, TimelineWindowEdge::Older, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c", "d"]);
     // The store reported no more history before; the head side is untouched.
@@ -516,7 +550,7 @@ fn merge_timeline_window_older_caps_by_dropping_newest() {
     let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
     let older = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
 
-    merge_timeline_window(&mut window, older, TimelineWindowEdge::Older, 3);
+    merge_timeline_window_with_order(&mut window, older, TimelineWindowEdge::Older, 3, true);
 
     // Cap forces dropping the newest row, opening a gap to the head.
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
@@ -529,7 +563,7 @@ fn merge_timeline_window_newer_caps_by_dropping_oldest() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let newer = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
 
-    merge_timeline_window(&mut window, newer, TimelineWindowEdge::Newer, 3);
+    merge_timeline_window_with_order(&mut window, newer, TimelineWindowEdge::Newer, 3, true);
 
     assert_eq!(timeline_ids(&window), vec!["b", "c", "d"]);
     assert!(window.has_more_before);
@@ -542,7 +576,7 @@ fn merge_timeline_window_dedupes_overlap() {
     let mut window = timeline_test_page(&[("b", 20), ("c", 30)], true, false);
     let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);
 
-    merge_timeline_window(&mut window, older, TimelineWindowEdge::Older, 300);
+    merge_timeline_window_with_order(&mut window, older, TimelineWindowEdge::Older, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
 }
@@ -562,7 +596,7 @@ fn apply_projection_appends_new_message_when_anchored() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], false, false);
     let update = projection_for(vec![timeline_test_record("c", 30)]);
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
     assert!(!window.has_more_after);
@@ -573,7 +607,7 @@ fn apply_projection_suppresses_new_head_message_when_detached() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let update = projection_for(vec![timeline_test_record("c", 30)]);
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     // Detached window stays put; the new head message is dropped.
     assert_eq!(timeline_ids(&window), vec!["a", "b"]);
@@ -587,7 +621,7 @@ fn apply_projection_applies_in_window_edit_when_detached() {
     edited.plaintext = "edited".to_owned();
     let update = projection_for(vec![edited]);
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b"]);
     assert_eq!(window.messages[1].plaintext, "edited");
@@ -601,7 +635,7 @@ fn apply_projection_suppresses_same_second_head_when_detached() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let update = projection_for(vec![timeline_test_record("c", 20)]);
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b"]);
     assert!(window.has_more_after);
@@ -614,7 +648,7 @@ fn apply_projection_applies_same_second_in_range_message_when_detached() {
     let mut window = timeline_test_page(&[("a", 10), ("c", 20)], true, true);
     let update = projection_for(vec![timeline_test_record("b", 20)]);
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
 }
@@ -626,7 +660,7 @@ fn apply_projection_suppresses_new_message_when_detached_window_empty() {
     let mut window = timeline_test_page(&[], true, true);
     let update = projection_for(vec![timeline_test_record("a", 10)]);
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     assert!(window.messages.is_empty());
     assert!(window.has_more_after);
@@ -646,7 +680,7 @@ fn apply_projection_removes_message() {
         chat_list_trigger: Default::default(),
     };
 
-    apply_projection_to_window(&mut window, &update, 300);
+    apply_projection_to_window(&mut window, &update, 300, true);
 
     assert_eq!(timeline_ids(&window), vec!["b"]);
 }
@@ -656,11 +690,94 @@ fn apply_projection_caps_anchored_window_by_dropping_oldest() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20), ("c", 30)], false, false);
     let update = projection_for(vec![timeline_test_record("d", 40)]);
 
-    apply_projection_to_window(&mut window, &update, 3);
+    apply_projection_to_window(&mut window, &update, 3, true);
 
     assert_eq!(timeline_ids(&window), vec!["b", "c", "d"]);
     assert!(window.has_more_before);
     assert!(!window.has_more_after);
+}
+
+#[test]
+fn apply_projection_preserves_wall_clock_order_for_global_windows() {
+    let mut older_epoch = timeline_test_record("older-epoch", 200);
+    older_epoch.source_epoch = Some(7);
+    let mut newer_epoch = timeline_test_record("newer-epoch", 100);
+    newer_epoch.source_epoch = Some(8);
+    let mut window = TimelinePage {
+        messages: vec![older_epoch, newer_epoch],
+        has_more_before: false,
+        has_more_after: false,
+    };
+
+    apply_projection_to_window(&mut window, &projection_for(Vec::new()), 300, false);
+
+    assert_eq!(timeline_ids(&window), ["newer-epoch", "older-epoch"]);
+}
+
+#[test]
+fn apply_projection_scopes_global_window_changes_by_group() {
+    let mut group_a = timeline_test_record("shared-id", 10);
+    group_a.group_id_hex = "group-a".to_owned();
+    let mut group_b = timeline_test_record("shared-id", 20);
+    group_b.group_id_hex = "group-b".to_owned();
+    let mut window = TimelinePage {
+        messages: vec![group_a, group_b],
+        has_more_before: false,
+        has_more_after: false,
+    };
+
+    let mut edited_group_a = timeline_test_record("shared-id", 30);
+    edited_group_a.group_id_hex = "group-a".to_owned();
+    edited_group_a.plaintext = "edited group A".to_owned();
+    let edit = AppProjectionUpdate {
+        group_id_hex: "group-a".to_owned(),
+        timeline_messages: Vec::new(),
+        timeline_changes: vec![TimelineMessageChange::Upsert {
+            trigger: crate::TimelineUpdateTrigger::MessageEditedOrReprojected,
+            message: Box::new(edited_group_a),
+        }],
+        chat_list_row: None,
+        chat_list_trigger: Default::default(),
+    };
+
+    apply_projection_to_window(&mut window, &edit, 300, false);
+
+    assert_eq!(window.messages.len(), 2);
+    assert_eq!(
+        window
+            .messages
+            .iter()
+            .find(|message| message.group_id_hex == "group-a")
+            .expect("group A row")
+            .plaintext,
+        "edited group A"
+    );
+    assert_eq!(
+        window
+            .messages
+            .iter()
+            .find(|message| message.group_id_hex == "group-b")
+            .expect("group B row")
+            .plaintext,
+        "shared-id"
+    );
+
+    let remove = AppProjectionUpdate {
+        group_id_hex: "group-a".to_owned(),
+        timeline_messages: Vec::new(),
+        timeline_changes: vec![TimelineMessageChange::Remove {
+            message_id_hex: "shared-id".to_owned(),
+            reason: crate::TimelineRemoveReason::Invalidated,
+        }],
+        chat_list_row: None,
+        chat_list_trigger: Default::default(),
+    };
+
+    apply_projection_to_window(&mut window, &remove, 300, false);
+
+    assert_eq!(window.messages.len(), 1);
+    assert_eq!(window.messages[0].group_id_hex, "group-b");
+    assert_eq!(window.messages[0].message_id_hex, "shared-id");
 }
 
 #[tokio::test]
@@ -894,6 +1011,46 @@ async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
 }
 
 #[tokio::test]
+async fn pagination_refreshes_head_when_canonical_cursor_was_pruned() {
+    let store = ScriptedTimelineStore::new_results(vec![
+        Err(AppError::Storage(
+            cgka_traits::storage::StorageError::TimelineCursorExpired,
+        )),
+        Ok(timeline_test_page(&[("x", 40), ("y", 50)], true, false)),
+    ]);
+    let mut handle = timeline_window_handle(
+        &store,
+        timeline_test_page(&[("a", 10), ("b", 20)], true, true),
+        300,
+    );
+    Arc::get_mut(&mut handle.inner)
+        .expect("exclusive window")
+        .get_mut()
+        .expect("window lock")
+        .base_query
+        .group_id_hex = Some("group-a".to_owned());
+
+    let page = handle
+        .paginate_backwards(2)
+        .await
+        .expect("expired cursor refreshes the window");
+
+    assert_eq!(timeline_ids(&page), vec!["x", "y"]);
+    let queries = store.recorded_queries();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].group_id_hex.as_deref(), Some("group-a"));
+    assert_eq!(queries[0].pagination.before, Some(10));
+    assert_eq!(
+        queries[0].pagination.before_message_id.as_deref(),
+        Some("a")
+    );
+    assert_eq!(queries[1].group_id_hex.as_deref(), Some("group-a"));
+    assert_eq!(queries[1].pagination.before, None);
+    assert_eq!(queries[1].pagination.after, None);
+    assert_eq!(queries[1].pagination.limit, Some(2));
+}
+
+#[tokio::test]
 async fn refresh_install_is_dropped_when_window_paginated_during_query() {
     // Deterministic model of the P1(b) race: a refresh captures the window
     // generation before its store read; a pagination completes during that
@@ -912,7 +1069,7 @@ async fn refresh_install_is_dropped_when_window_paginated_during_query() {
 
     // recv() captures the refresh request (a generation snapshot) before
     // awaiting the store.
-    let (_query_fn, _query, generation) = handle.refresh_request();
+    let (_query_fn, _query, _head_query, generation) = handle.refresh_request();
 
     // A concurrent pagination lands while the refresh query is "in flight".
     let paginated = handle.paginate_backwards(2).await.expect("paginate");

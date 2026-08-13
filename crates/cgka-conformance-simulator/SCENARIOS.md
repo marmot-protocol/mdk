@@ -91,29 +91,32 @@ These are the scenarios another implementation should be able to load from JSON 
 - File: `vectors/group-data-fork-recovery.v1.json`
 - Setup: Alice and Bob both update group data from the same epoch.
 - Pressure: same-epoch group-data commit race.
-- Expected: the engine chooses one branch, rolls the loser back, and both clients converge at epoch 2.
+- Expected: distributed convergence selects one branch, reorgs the loser onto it, and both clients converge at epoch 2 with a settled convergence decision recorded.
 
 ### `concurrent-invite-fork-recovery/v1`
 
 - File: `vectors/concurrent-invite-fork-recovery.v1.json`
 - Setup: Alice and Bob both invite a different member from the same epoch.
 - Pressure: same-epoch invite commit race.
-- Expected: one invite branch wins, the other is invalidated, and active clients converge on the same member set.
+- Expected: one invite branch wins branch selection, the other is parked off the canonical branch, and active clients converge on the same member set with a settled convergence decision recorded.
 
 ### `cross-route-own-commit-recovery/v1`
 
 - File: `vectors/cross-route-own-commit-recovery.v1.json`
 - Setup: Zeta and Alpha author simultaneous privileged profile commits from epoch 1. Alpha's lower authenticated
-  ordering key first displaces Zeta's own branch through pairwise fork recovery. Yankee has already applied Zeta's
-  root and extends it, while Observer retains the complete competing input set without authoring either root. The
-  pairwise choice follows authenticated committer bytes from deterministic scenario identities, not lexical labels.
-- Pressure: the pairwise winner and stored-convergence winner deliberately disagree once Zeta's branch becomes deeper.
-  Zeta restarts after losing its own root and before the deeper child arrives, forcing commit-addressed checkpoint
-  recovery rather than in-memory or epoch-addressed rollback.
-- Expected: all four clients select Zeta's depth-two branch at epoch 3, expose exact canonical cryptographic equality,
-  retain accepted dispositions for the selected root and child plus an invalidated disposition for Alpha's root, have
-  no pending work, and decrypt active application probes in all twelve directions. App-runtime, process, container,
-  and VM permutations remain separate Milestone 6 evidence.
+  ordering key first displaces Zeta's own branch, and the ordering follows authenticated committer bytes from
+  deterministic scenario identities, not lexical labels. Yankee has already applied Zeta's root and extends it, while
+  Observer retains the complete competing input set without authoring either root.
+- Pressure: the early ordering winner and the eventual convergence winner deliberately disagree once Zeta's branch
+  becomes deeper. Zeta restarts after losing its own root and before the deeper child arrives, forcing
+  commit-addressed checkpoint recovery rather than in-memory or epoch-addressed rollback.
+- Expected: all four clients record a settled convergence decision at tip epoch 3 and project Zeta's depth-two branch
+  name (pinned per client, so agreement is not mistaken for attribution), expose exact canonical cryptographic
+  equality, retain accepted dispositions for the selected root and child plus an invalidated disposition for Alpha's
+  root, have no pending work, and decrypt active application probes in all twelve directions. Alpha's epoch trace
+  pins the displacement itself — it leaves the epoch-1 fork source, lands on the winner at epoch 2, and follows it to
+  epoch 3 — and the focused Rust regression pins Alpha's own root carrying both withdrawal events. App-runtime,
+  process, container, and VM permutations remain separate Milestone 6 evidence.
 
 ### `cross-route-retained-history-recovery/v1`
 
@@ -122,35 +125,35 @@ These are the scenarios another implementation should be able to load from JSON 
 - Setup: the same four participants and competing source-epoch profile commits as
   `cross-route-own-commit-recovery/v1`, with an explicit one-relay deployment topology.
 - Pressure: relay visibility and incremental cursors give Yankee only Zeta's root, then give Zeta Alpha's competing
-  root while hiding Yankee's deeper child. Zeta restarts after pairwise displacement. The hidden events are then made
+  root while hiding Yankee's deeper child. Zeta restarts after being displaced. The hidden events are then made
   visible and every participant performs a full-history query, which is required because the earlier incremental
   queries advanced beyond the temporarily hidden events.
-- Expected: the retained-history path reaches the same epoch-3 Zeta branch with exact canonical cryptographic equality,
+- Expected: the retained-history path reaches the same epoch-3 Zeta branch — a settled convergence decision at tip
+  epoch 3 and the winning branch name pinned per client — with exact canonical cryptographic equality,
   accepted/invalidated/accepted commit dispositions, no pending work, and active decryptability in all twelve
   directions. The regression also requires all four final full-history queries to inject retained objects, so a passing
   result cannot be explained by the packet bus healing the delivery schedule. The saved input's portable outcomes own
-  the state, profile, recovery, pending-work, and decryptability contract; the focused Rust regression owns the
-  retained-injection observations and stable commit-disposition subset.
+  the state, profile, convergence-decision, epoch-trace, pending-work, and decryptability contract; the focused Rust
+  regression owns the retained-injection observations, the stable commit-disposition subset, and Alpha's own-commit
+  withdrawal event pair.
 
 ### `cross-route-app-runtime-recovery/v1`
 
-- File: constructed by `four_party_cross_route_recovery_records_app_runtime_equivalence_falsification`; promotion to a
-  portable saved input waits until the falsified oracle has a reviewed resolution.
+- File: constructed by `four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes`; promotion to a portable saved
+  input still requires an adapter-neutral representation of reversible retained-event staging.
 - Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
   `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
   Nostr relay.
 - Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
-  The harness removes Zeta's root from the whole shared-relay history before Alpha reconnects and authors its competing
-  root, removes Alpha's root relay-wide before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both
+  The harness reversibly hides Zeta's root from whole-relay queries before Alpha reconnects and authors its competing
+  root, hides Alpha's root before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both retained
   roots, and performs repeated full-history repair. Every harness participant must be offline before relay-wide
-  removal; the step's named clients are not a per-recipient visibility filter.
-- Current result: exact retained-engine settlement passes. Across repeated app-runtime executions, Zeta can remain one
-  epoch behind; public protocol state can agree while Alpha's later application probe remains absent and
-  non-invalidated at Zeta; or Alpha and Observer can remain on the competing root and baseline respectively while only
-  Yankee/Zeta reach the retained reference branch, with application probes split along those branch boundaries. Each
-  shape is asserted exactly, so a fourth shape or complete equivalence forces review. This is a retained counterexample
-  and keeps route equivalence, active decryptability, and complete application disposition open outside the
-  engine/retained reference.
+  hiding; the step's named clients are not a per-recipient visibility filter.
+- Current result: exact retained-engine settlement passes. The reversible relay layer fixes the former destructive
+  tombstone artifact, but repeated app-runtime executions still alternate between complete equivalence and reviewed
+  non-equivalent terminal surfaces, including a two-branch protocol/probe split. Route equivalence, active
+  decryptability, complete application disposition, process/container/VM execution, and per-durable-transition
+  permutations remain open.
 
 ### `convergence-committer-selected/v1`
 
@@ -208,6 +211,25 @@ These are the scenarios another implementation should be able to load from JSON 
 - Setup: Alice creates a group with Bob and Carol. Bob sends Alice an app message.
 - Pressure: Bob's message is delayed, Alice restarts, and the released message is duplicated and reordered.
 - Expected: Alice hydrates the stable group after restart and receives Bob's payload once.
+
+### `route-equivalence/v1`
+
+- File: `vectors/route-equivalence.v1.json`
+- Setup: Alice creates a group with Bob, Carol, and Dave. Alice and Bob (both admins) race same-epoch
+  `UpdateGroupData` commits and both confirm publication; both commits are withheld, then Bob — the
+  deterministic ordering winner — restarts before either sibling is released, so he consumes the fork over
+  durable storage with a fresh engine.
+- Pressure: the same depth-1 fork is resolved by every member shape — the live committer (Alice, the
+  ordering loser), the restarted committer over hydrated storage (Bob), and the passive observers (Carol and
+  Dave) — all through the one distributed-convergence route. Both withheld commits are released in reversed
+  order before anyone consumes the sibling branch.
+- Expected: all four clients converge at epoch 2 with four members, each projecting the ordering winner's branch
+  (`bob branch`, pinned per client so agreement is not mistaken for attribution),
+  pass exact canonical equivalence, bidirectional decryptability in every direction, and no-pending-work, and each of
+  the four records a settled convergence decision at tip epoch 2. The decryptability probe runs before the terminal
+  `observe_exact` — it is a mutating probe, and a later observation is what the per-client convergence-decision pins
+  read. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
+  route agreed; flipped into the unified-route acceptance pin when the pairwise route was deleted.
 
 ### `conversation/v1`
 
@@ -338,8 +360,8 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 - Setup: two clients create a group, then raise competing group-data commits from the same epoch — the concurrent-fork
   shape the adapter derives from a fork-recovery incident.
 - Pressure: same-epoch group-data commit race with deferred delivery (no partition needed; the commits are concurrent).
-- Expected: the engine fork-recovers on delivery, the designated winner's branch survives, and both clients converge at
-  epoch 2 with the full recovery summary matching the recorded incident.
+- Expected: distributed convergence resolves the race on delivery, the designated winner's branch survives, and both
+  clients converge at epoch 2 with a settled convergence decision at that tip recorded as the resolution evidence.
 
 ### `membership-fork-recovery-incident/v1`
 
@@ -347,11 +369,11 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 - Setup: two committers create a group, then raise competing membership commits (an invite race) from the same epoch,
   with the two invitees held out by a partition — the membership-fork shape the adapter derives from a fork-recovery
   incident whose contested tip is a membership/admin commit (`member_added`/`member_removed`/`admin_added`/`admin_removed`).
-- Pressure: same-epoch membership commit race with deferred delivery; the fork-recovery seam — not the convergence
-  selector — resolves it.
-- Expected: the engine fork-recovers on delivery and both committers converge at epoch 2 with `member_count == 3` — the
-  winner-agnostic proof that exactly one branch's invite survived — and the full recovery summary matching the recorded
-  incident. Unlike the group-data fork, the recovery is winner-agnostic (no branch-name label search), because real
+- Pressure: same-epoch membership commit race with deferred delivery, resolved by the convergence selector.
+- Expected: distributed convergence resolves the race on delivery and both committers converge at epoch 2 with
+  `member_count == 3` — the winner-agnostic proof that exactly one branch's invite survived — and a settled
+  convergence decision at that tip recorded as the resolution evidence. Unlike the group-data fork, the resolution
+  expectation is winner-agnostic (no branch-name label search), because real
   observer-recorded exports cannot join a commit's publisher (`account_ref`, the observing engine) to its committer
   (`actor_member_ref`, an MLS member id).
 
@@ -481,9 +503,9 @@ These are real simulator scenarios that are still tied to Rust harness details.
 ### `deliberate_fork_via_harness`
 
 - Setup: Alice and Bob concurrently invite different new members while a partition hides each branch.
-- Expected: one branch wins by deterministic ordering. One peer rolls back, and Alice and Bob end on the same member
-  set.
-- Reason: the test inspects recovery observations and exact branch ordering keys.
+- Expected: one branch wins by deterministic ordering. One peer reorgs onto it, and Alice and Bob end on the same
+  member set.
+- Reason: the test inspects harness tick outcomes and exact membership directly.
 
 ### `failed_invite_staging_does_not_poison_fork_detection_via_harness`
 
@@ -492,9 +514,9 @@ These are real simulator scenarios that are still tied to Rust harness details.
   source epoch.
 - Expected: the sibling commit is adjudicated deterministically (stale losing branch or reorg onto the winner) — never
   a fail-closed `ForkedEpoch` — and Alice's group stays usable for a follow-up invite.
-- Reason: regression guard for the phantom `committed_from` bookkeeping bug (fixed by recording it only inside
-  `begin_pending`); mirrors the cgka-engine test `failed_invite_staging_does_not_poison_fork_detection` at the
-  multi-client bus level.
+- Reason: regression guard for the historical phantom fork-detection bookkeeping bug (routing no longer consults
+  committer-side bookkeeping at all); mirrors the cgka-engine test
+  `failed_invite_staging_does_not_poison_fork_detection` at the multi-client bus level.
 
 ### `convergence-e2e-group-events/v1`
 
@@ -603,6 +625,30 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   `no_pending_work_except_retained_join_commit` assertion: a welcome-joined member currently retains exactly its own
   join commit as a permanently deferred transport input, and any other pending work still fails the case. The
   retained join commit itself is tracked as a harness coverage gap.
+### `bounded-convergence-pressure/v1`
+
+- Generator: `generate_bounded_convergence_pressure_family` (generator version `1`).
+- Setup: four clients, Alice and Bob admins. Both admins race same-epoch `update_group_data` commits and both confirm
+  publication; each rival commit is withheld, then released in a seed-derived order so every member ingests the fork.
+- Pressure: **finite** and deliberately so. One application send per client is issued after the rival branch is ingested
+  — inside the quiescence window the committers wait out — then one committer restarts mid-resolution and a further send
+  follows. The settled tail applies exactly three self-updates, one profile commit, and one admin-policy commit, ordered
+  by seed.
+- Time discipline: an explicit `advance_time` before the race activates controlled virtual time, so the quiescence
+  window is a real deadline rather than the far-future tick shortcut. Every settle from that point on is
+  `await_quiescence`; the bare ticks that remain deliberately wake participants *without* settling them.
+- Expected: eventual quiescence, exact canonical equivalence and no pending work across all four clients, the pinned
+  post-race group profile and admin set, and bidirectional decryptability. The decryptability probe runs before the
+  terminal `observe_exact` for the reason given in the `route-equivalence/v1` row. Bounded queue behavior is a
+  `scenario_inputs_pending` resource assertion at peak pressure; bounded time is the `await_quiescence` watchdog budget
+  itself, whose `TimedOut` status is a failure — no separate metric is invented.
+- Scope fence: the campaign claims eventual quiescence for **bounded** input only. It makes no progress claim under an
+  unbounded self-update stream (reliability plan PDR-2/L3), which is a deliberate non-guarantee.
+- Status: `bounded_convergence_pressure_family_generates_the_declared_campaign_shape` gates the generator in CI. The
+  runnable gate `bounded_convergence_pressure_family_settles_every_seeded_permutation` is `#[ignore]`d because it fails
+  on engine behavior, not on the campaign: an application message accepted while the group is resolving a same-epoch
+  fork is queued durably and then stranded, because nothing re-arms the retained-intent drain once the pass completes.
+  Do not weaken the assertions to make it pass.
 
 ### `convergence-chaos/v1`
 

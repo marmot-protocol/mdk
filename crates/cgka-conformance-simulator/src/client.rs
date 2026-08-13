@@ -2064,12 +2064,17 @@ impl HarnessClient {
         let events = self.engine_mut().drain_events();
         let mut delivered_application_events = Vec::new();
         for event in events {
-            if let GroupEvent::GroupJoined { group_id, .. } = &event
-                && self.default_group.is_none()
-            {
-                self.default_group = Some(group_id.clone());
-            }
             match &event {
+                GroupEvent::GroupJoined {
+                    group_id,
+                    via_welcome,
+                    ..
+                } => {
+                    if self.default_group.is_none() {
+                        self.default_group = Some(group_id.clone());
+                    }
+                    delivered_application_events.push(via_welcome.clone());
+                }
                 GroupEvent::TransportObjectResourceRefused { message_id, .. } => {
                     // Deferred-peel storage is keyed by the raw transport id,
                     // but alternate peelers and migrated rows may report the
@@ -2101,19 +2106,6 @@ impl HarnessClient {
                     if let Some(scenario_input) = self.bus.scenario_input_for_content(message_id) {
                         self.scenario_input_tracker
                             .record_app_invalidated(&scenario_input, *reason);
-                    }
-                }
-                GroupEvent::ForkRecovered {
-                    invalidated_commit_id,
-                    ..
-                } => {
-                    if let Some(scenario_input) = self
-                        .bus
-                        .scenario_input_for_transport(invalidated_commit_id)
-                        .or_else(|| self.bus.scenario_input_for_content(invalidated_commit_id))
-                    {
-                        self.scenario_input_tracker
-                            .record_commit_invalidated(&scenario_input, "fork_recovered");
                     }
                 }
                 GroupEvent::CommitRolledBack {

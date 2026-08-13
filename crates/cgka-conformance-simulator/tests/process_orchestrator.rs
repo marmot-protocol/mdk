@@ -908,7 +908,7 @@ async fn app_runtime_and_process_adapters_recover_the_same_offline_projection() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsification() {
+async fn four_party_cross_route_recovery_characterizes_corrected_app_runtime_outcomes() {
     let strict_spec = cross_route_app_runtime_scenario(true);
     let clients = strict_spec.clients.clone();
     let mut expectations = clients
@@ -1034,6 +1034,7 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
     let mut protocol_equivalent_by_client = BTreeMap::new();
     let mut protocol_non_epoch_equivalent_by_client = BTreeMap::new();
     let mut app_payloads_by_client = BTreeMap::new();
+    let mut invalidated_counts_by_client = BTreeMap::new();
     for client in &clients {
         let retained = retained_observations[client];
         let app = &app_observations[client];
@@ -1048,10 +1049,8 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
             2,
             "{client} retained route depth"
         );
-        let exact_roster =
-            app.protocol.member_identities == ["alpha", "observer", "yankee", "zeta"];
         let non_epoch_equivalent = app.protocol.member_count == retained.member_count
-            && exact_roster
+            && app.protocol.member_identities == ["alpha", "observer", "yankee", "zeta"]
             && app.protocol.group_name == retained.group_name
             && app.protocol.group_description == retained.group_description;
         let client_protocol_equivalent =
@@ -1060,7 +1059,11 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
         protocol_equivalent_by_client.insert(client.clone(), client_protocol_equivalent);
         protocol_non_epoch_equivalent_by_client.insert(client.clone(), non_epoch_equivalent);
         assert_eq!(app.protocol.member_count, 4, "{client} roster size");
-        assert!(exact_roster, "{client} exact roster");
+        assert_eq!(
+            app.protocol.member_identities,
+            ["alpha", "observer", "yankee", "zeta"],
+            "{client} exact roster"
+        );
         assert_eq!(app.protocol.admin_identities, ["alpha", "yankee", "zeta"]);
         let app_payloads = app
             .application
@@ -1074,9 +1077,73 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
         );
         assert_eq!(app.application.visible_plaintexts.len(), app_payloads.len());
         app_payloads_by_client.insert(client.clone(), app_payloads);
-        assert!(app.application.invalidated_message_ids.is_empty());
+        invalidated_counts_by_client.insert(
+            client.clone(),
+            app.application.invalidated_message_ids.len(),
+        );
         assert!(!app.application.pending_confirmation);
     }
+
+    // Applying Alpha's losing `alpha-root` commit synthesizes one kind-1210
+    // rename row stamped with that commit's id; reorging onto the selected
+    // branch rolls the commit back and `GroupStateInvalidated` withdraws that
+    // row. The retained tombstone is therefore each participant's own evidence
+    // that it once held the losing branch, so the rule below is per participant
+    // and never compares ids across them — a reorged peer's row is unattributed
+    // where Alpha's names itself, so the two are not even the same canonical id.
+    //
+    // Alpha published and confirmed the commit, so it always holds the row and
+    // owes a withdrawal exactly when it ends off that branch. Zeta is the rival
+    // same-epoch committer and defers only to a deeper branch; Yankee is already
+    // two commits deep on the selected branch before `step-25` reaches it.
+    // Neither ever synthesizes the row. Observer holds no branch of its own when
+    // both commits arrive, so whether it adopts Alpha's before the selected
+    // branch displaces it is a delivery-order detail: it may or may not carry
+    // the withdrawal, but only after leaving the losing branch.
+    for client in &clients {
+        let app = &app_observations[client];
+        let invalidated = invalidated_counts_by_client[client];
+        let left_the_losing_branch = app.protocol.group_name != "alpha-root"
+            && app.protocol.epoch > app_baseline[client.as_str()].epoch;
+        assert!(
+            invalidated <= 1,
+            "{client} withdrew more than the losing commit's one row: {invalidated_counts_by_client:#?}"
+        );
+        assert!(
+            invalidated == 0 || left_the_losing_branch,
+            "{client} withdrew a losing-branch row without leaving that branch: {app:#?}"
+        );
+        if client == "alpha" {
+            assert_eq!(
+                invalidated,
+                usize::from(left_the_losing_branch),
+                "alpha owes its own confirmed alpha-root row a withdrawal exactly when it leaves that branch: {app:#?}"
+            );
+        }
+        if client == "yankee" || client == "zeta" {
+            assert_eq!(
+                invalidated, 0,
+                "{client} never adopted alpha's branch yet withdrew a row: {app:#?}"
+            );
+        }
+        let visible = app
+            .application
+            .visible_message_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            app.application
+                .invalidated_message_ids
+                .iter()
+                .all(|id| !visible.contains(id)),
+            "{client} projected a withdrawn row as delivered: {app:#?}"
+        );
+    }
+
+    let fully_equivalent = protocol_equivalent
+        && app_payloads_by_client
+            .values()
+            .all(|payloads| payloads == &expected_payloads);
 
     let zeta_one_epoch_behind = clients.iter().all(|client| {
         if client == "zeta" {
@@ -1091,17 +1158,21 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
         .values()
         .all(|payloads| payloads == &expected_payloads);
 
-    let mut zeta_missing_alpha_probe = expected_payloads.clone();
-    assert!(zeta_missing_alpha_probe.remove("probe-from-alpha"));
-    let missing_probe_after_agreement = protocol_equivalent
-        && clients.iter().all(|client| {
-            let expected = if client == "zeta" {
-                &zeta_missing_alpha_probe
-            } else {
-                &expected_payloads
-            };
-            &app_payloads_by_client[client] == expected
-        });
+    let missing_at_zeta_after_agreement = |missing: &[&str]| {
+        let mut expected_at_zeta = expected_payloads.clone();
+        for payload in missing {
+            assert!(expected_at_zeta.remove(*payload));
+        }
+        protocol_equivalent
+            && clients.iter().all(|client| {
+                let expected = if client == "zeta" {
+                    &expected_at_zeta
+                } else {
+                    &expected_payloads
+                };
+                &app_payloads_by_client[client] == expected
+            })
+    };
 
     let payload_set = |payloads: &[&str]| {
         payloads
@@ -1109,32 +1180,55 @@ async fn four_party_cross_route_recovery_records_app_runtime_equivalence_falsifi
             .map(|payload| (*payload).to_owned())
             .collect::<BTreeSet<_>>()
     };
-    let split_protocol_and_probe_surface = {
-        let alpha = &app_observations["alpha"];
-        let observer = &app_observations["observer"];
-        alpha.protocol.epoch == app_baseline["alpha"].epoch + 1
-            && alpha.protocol.group_name == "alpha-root"
-            && alpha.protocol.group_description.is_empty()
-            && observer.protocol.epoch == app_baseline["observer"].epoch
-            && observer.protocol.group_name == "cross-route"
-            && observer.protocol.group_description.is_empty()
-            && protocol_equivalent_by_client["yankee"]
-            && protocol_equivalent_by_client["zeta"]
-            && app_payloads_by_client["alpha"]
-                == payload_set(&["probe-from-alpha", "probe-from-observer"])
-            && app_payloads_by_client["observer"] == payload_set(&["probe-from-observer"])
-            && app_payloads_by_client["yankee"]
-                == payload_set(&[
-                    "probe-from-observer",
-                    "probe-from-yankee",
-                    "probe-from-zeta",
-                    "zeta-branch-witness",
-                ])
-            && app_payloads_by_client["zeta"] == app_payloads_by_client["yankee"]
+    let alpha_branch = |client: &str| {
+        let app = &app_observations[client];
+        app.protocol.epoch == app_baseline[client].epoch + 1
+            && app.protocol.group_name == "alpha-root"
+            && app.protocol.group_description.is_empty()
     };
+    let legacy_split = alpha_branch("alpha")
+        && app_observations["observer"].protocol.epoch == app_baseline["observer"].epoch
+        && app_observations["observer"].protocol.group_name == "cross-route"
+        && app_observations["observer"]
+            .protocol
+            .group_description
+            .is_empty()
+        && protocol_equivalent_by_client["yankee"]
+        && protocol_equivalent_by_client["zeta"]
+        && app_payloads_by_client["alpha"]
+            == payload_set(&["probe-from-alpha", "probe-from-observer"])
+        && app_payloads_by_client["observer"] == payload_set(&["probe-from-observer"])
+        && app_payloads_by_client["yankee"]
+            == payload_set(&[
+                "probe-from-observer",
+                "probe-from-yankee",
+                "probe-from-zeta",
+                "zeta-branch-witness",
+            ])
+        && app_payloads_by_client["zeta"] == app_payloads_by_client["yankee"];
+    let corrected_split = alpha_branch("alpha")
+        && alpha_branch("observer")
+        && protocol_equivalent_by_client["yankee"]
+        && protocol_equivalent_by_client["zeta"]
+        && app_payloads_by_client["alpha"]
+            == payload_set(&["probe-from-alpha", "probe-from-observer"])
+        && app_payloads_by_client["observer"] == app_payloads_by_client["alpha"]
+        && app_payloads_by_client["yankee"]
+            == payload_set(&[
+                "probe-from-yankee",
+                "probe-from-zeta",
+                "zeta-branch-witness",
+            ])
+        && app_payloads_by_client["zeta"] == app_payloads_by_client["yankee"];
+
     assert!(
-        zeta_one_epoch_behind || missing_probe_after_agreement || split_protocol_and_probe_surface,
-        "app-runtime route result was neither documented counterexample shape; protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; observations={app_observations:#?}"
+        fully_equivalent
+            || zeta_one_epoch_behind
+            || missing_at_zeta_after_agreement(&["probe-from-alpha"])
+            || missing_at_zeta_after_agreement(&["probe-from-alpha", "probe-from-observer",])
+            || legacy_split
+            || corrected_split,
+        "app-runtime route result was not a characterized corrected-input outcome; protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; invalidated={invalidated_counts_by_client:#?}; observations={app_observations:#?}"
     );
 }
 

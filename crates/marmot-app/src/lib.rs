@@ -135,7 +135,7 @@ pub use audit_log::{
     AuditLogUploadResult,
 };
 pub use client::AppClient;
-pub(crate) use client::ConvergenceScheduleState;
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
     MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
@@ -679,6 +679,37 @@ impl SyncSummary {
         self.projection_updates.extend(other.projection_updates);
         self.epoch_stall_escalations
             .extend(other.epoch_stall_escalations);
+    }
+}
+
+/// A sync failure together with the prefix that was already durably applied.
+///
+/// Catch-up processes deliveries incrementally, so a later transport, engine,
+/// or projection error cannot roll back earlier deliveries. Callers of
+/// [`AppClient::sync_with_partial_progress`] must report or otherwise consume
+/// `partial_summary`; dropping it would hide durable progress until the host
+/// takes a fresh storage snapshot. The compatibility [`AppClient::sync`] entry
+/// point retains its original [`AppError`] result.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct SyncFailure {
+    pub partial_summary: SyncSummary,
+    #[source]
+    pub source: AppError,
+}
+
+impl SyncFailure {
+    pub fn new(partial_summary: SyncSummary, source: AppError) -> Self {
+        Self {
+            partial_summary,
+            source,
+        }
+    }
+}
+
+impl From<AppError> for SyncFailure {
+    fn from(source: AppError) -> Self {
+        Self::new(SyncSummary::default(), source)
     }
 }
 
@@ -1420,6 +1451,7 @@ impl MarmotApp {
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
+            pending_failed_sync_summary: SyncSummary::default(),
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
@@ -1428,7 +1460,8 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
-            epoch_backfill_pending: false,
+            pending_epoch_backfill: None,
+            queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
         };
         if !defer_group_hydration {
@@ -1922,6 +1955,17 @@ impl MarmotApp {
         .entered();
         self.ensure_account_state(label)?;
         Ok(self.account_storage(label)?.message_timeline(query)?)
+    }
+
+    pub(crate) fn timeline_messages_by_wall_clock_with_query(
+        &self,
+        label: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .message_timeline_by_wall_clock(query)?)
     }
 
     pub fn timeline_message(
@@ -4520,9 +4564,9 @@ impl MarmotApp {
     ///   branch"): every kind-1210 system row stamped with the superseded
     ///   commit's `origin_commit_id` is invalidated — including rows the
     ///   account's own published-and-confirmed commit synthesized. The engine
-    ///   pairs this event with both commit-rollback seams (`ForkRecovered`,
-    ///   `CommitRolledBack`), so those commit-level events intentionally do
-    ///   NOT dispatch here: one rollback must tombstone once, with one reason.
+    ///   pairs this event with the commit-rollback seam (`CommitRolledBack`),
+    ///   so that commit-level event intentionally does NOT dispatch here: one
+    ///   rollback must tombstone once, with one reason.
     ///
     /// Every other event carries no timeline invalidation and returns `None`.
     pub(crate) fn projection_update_for_invalidation_event(

@@ -13,7 +13,7 @@ use crate::export::{AgentStateExport, EventKind, ForkWinner};
 /// competing-invite race). The fork-recovery mechanism is content-independent —
 /// what matters is that two committers raced a commit at the same epoch and one
 /// branch was invalidated — so a membership-changing commit race reproduces the
-/// same `RecoverySummary` (outcome-equivalence, as the convergence path does).
+/// same settled outcome (outcome-equivalence, as the convergence path does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkCommitKind {
     /// A group-metadata commit (topic/name/avatar/retention) → `UpdateGroupData`.
@@ -27,10 +27,11 @@ pub enum ForkCommitKind {
 /// The minimal, reproducible facts of a recovered fork.
 ///
 /// The winning committer is recovered as a *gate* (rule 3) but is not stored:
-/// the synthesized vector uses synthetic labels and asserts the winner-agnostic
-/// `RecoverySummary`, so the identity of the real committer never leaves this
-/// step. What downstream needs is the source epoch (normalized to the sim's
-/// range) and the commit kind to race.
+/// the synthesized vector asserts the surviving branch only through synthetic
+/// labels (a `GroupProfile` pin on the group-data arm, `member_count == 3` on
+/// the winner-agnostic membership arm), so the identity of the real committer
+/// never leaves this step. What downstream needs is the source epoch
+/// (normalized to the sim's range) and the commit kind to race.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredFork {
     pub source_epoch: u64,

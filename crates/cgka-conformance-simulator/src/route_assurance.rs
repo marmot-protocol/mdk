@@ -7,11 +7,18 @@ use serde::{Deserialize, Serialize};
 
 pub const ROUTE_ASSURANCE_SCHEMA_VERSION: &str = "1";
 
+/// Decision routes that exist in production today.
+///
+/// A route that production deletes is removed from this enum rather than
+/// re-pointed at a surviving seam: re-pointing would let one seam carry two
+/// route claims and count its evidence twice. Removal is deliberately
+/// disruptive — the source-marker audit fails first, forcing a review that
+/// decides where the retired route's surviving properties are cited.
+/// `CONVERGENCE_ROUTE_MATRIX.md` keeps the human-readable retirement record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionRouteId {
     OrdinaryIngest,
-    PairwiseForkRecovery,
     StoredConvergence,
     CandidateMaterialization,
     RetainedHistoryReplay,
@@ -19,12 +26,11 @@ pub enum DecisionRouteId {
     ApplicationDisposition,
 }
 
-const DECISION_ROUTE_VARIANT_COUNT: usize = 7;
+const DECISION_ROUTE_VARIANT_COUNT: usize = 6;
 
 impl DecisionRouteId {
     pub const ALL: [Self; DECISION_ROUTE_VARIANT_COUNT] = [
         Self::OrdinaryIngest,
-        Self::PairwiseForkRecovery,
         Self::StoredConvergence,
         Self::CandidateMaterialization,
         Self::RetainedHistoryReplay,
@@ -35,7 +41,6 @@ impl DecisionRouteId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OrdinaryIngest => "ordinary_ingest",
-            Self::PairwiseForkRecovery => "pairwise_fork_recovery",
             Self::StoredConvergence => "stored_convergence",
             Self::CandidateMaterialization => "candidate_materialization",
             Self::RetainedHistoryReplay => "retained_history_replay",
@@ -118,11 +123,11 @@ impl RouteLifecycleStateV1 {
         self
     }
 
-    /// Deliberately inconsistent route used only by mutation adequacy. It
-    /// terminalizes the pairwise provisional result rather than reconsidering
-    /// the complete durable branch set.
-    pub(crate) fn settle_with_terminal_pairwise_loser(mut self) -> Self {
-        if self.volatile_route == Some(DecisionRouteId::PairwiseForkRecovery) {
+    /// Deliberately inconsistent rule used only by mutation adequacy. It
+    /// terminalizes whatever provisional result a volatile route observed
+    /// rather than reconsidering the complete durable branch set.
+    pub(crate) fn settle_with_terminal_provisional_winner(mut self) -> Self {
+        if self.volatile_route.is_some() {
             self.canonical_winner = self.volatile_provisional_winner;
             return self;
         }
@@ -191,16 +196,6 @@ const ORDINARY_INGEST_SITES: &[ProductionDecisionSiteV1] = &[ProductionDecisionS
     path: "crates/cgka-engine/src/message_processor/ingest.rs",
     marker: "let commit_should_enter_convergence =",
 }];
-const PAIRWISE_FORK_RECOVERY_SITES: &[ProductionDecisionSiteV1] = &[
-    ProductionDecisionSiteV1 {
-        path: "crates/cgka-engine/src/message_processor/ingest.rs",
-        marker: ".resolve_fork_candidate(",
-    },
-    ProductionDecisionSiteV1 {
-        path: "crates/cgka-engine/src/fork_recovery.rs",
-        marker: "struct ForkRecoveryManager",
-    },
-];
 const STORED_CONVERGENCE_SITES: &[ProductionDecisionSiteV1] = &[ProductionDecisionSiteV1 {
     path: "crates/cgka-engine/src/distributed_convergence.rs",
     marker: "fn converge_stored_openmls_messages_with_time(",
@@ -261,26 +256,9 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         ),
     },
     DecisionRouteInventoryEntryV1 {
-        route: DecisionRouteId::PairwiseForkRecovery,
-        production_sites: PAIRWISE_FORK_RECOVERY_SITES,
-        adopted_rule: "A pairwise winner is provisional and every authenticated eligible loser remains reconsiderable by the shared closed-input selector.",
-        reference_model: AssuranceOwnerV1::partial(
-            "route_assurance::RouteLifecycleStateV1",
-            "Models closed-input route volatility abstractly; it is not exhaustively explored or compared against production routing.",
-        ),
-        mutation_sentinel: AssuranceOwnerV1::partial(
-            "pairwise_losing_branch_terminalization",
-            "The sibling-model mutant proves the witness distinguishes two abstract rules, not that production takes the adopted transition.",
-        ),
-        campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, pairwise_incumbent_defers_to_deeper_convergence_branch, and pairwise_candidate_win_leaves_old_incumbent_reconsiderable",
-            "The four-party engine and retained-history scenarios cover pairwise displacement followed by deeper-branch reconsideration; app-runtime, distributed, and durable-transition permutations remain open.",
-        ),
-    },
-    DecisionRouteInventoryEntryV1 {
         route: DecisionRouteId::StoredConvergence,
         production_sites: STORED_CONVERGENCE_SITES,
-        adopted_rule: "Freeze one dependency-closed durable input set, select with the adopted comparator, and apply state plus dispositions atomically.",
+        adopted_rule: "Freeze one dependency-closed durable input set, select with the adopted comparator, and apply state plus dispositions atomically; a displaced own commit stays an eligible input that a later pass reconsiders.",
         reference_model: AssuranceOwnerV1::partial(
             "reference_convergence::evaluate and lifecycle_model",
             "Selection and frozen-pass lifecycle are modeled separately; route equivalence is not yet a modeled transition.",
@@ -289,8 +267,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "selector_comparison_order and frozen_member_persistence",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, stored convergence restart properties, and convergence-chaos/v1",
-            "The engine and retained-history routes participate in a four-party committer-versus-observer comparison; app-runtime and distributed equivalence remain open.",
+            "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, stored convergence restart properties, convergence-chaos/v1, incumbent_committer_defers_to_deeper_convergence_branch, and rival_win_leaves_displaced_own_commit_reconsiderable",
+            "The engine and retained-history routes participate in a four-party committer-versus-observer comparison, and the two reconsideration regressions inherited from the retired pairwise route now run against this one; app-runtime and distributed equivalence remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -306,7 +284,7 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         ),
         campaign: AssuranceOwnerV1::partial(
             "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, openmls_replay_probe, and replay-budget repair tests",
-            "Commit-addressed own-branch materialization agrees with live pairwise routing through engine and retained-history delivery; app-runtime and distributed equivalence remain open.",
+            "Commit-addressed own-branch materialization agrees with live convergence routing through engine and retained-history delivery; app-runtime and distributed equivalence remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -335,7 +313,7 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         ),
         campaign: AssuranceOwnerV1::partial(
             "cross-route-own-commit-recovery/v1, cross-route-retained-history-recovery/v1, durable-phase kill matrix, and stored convergence restart properties",
-            "Encrypted-SQLite restart after pairwise displacement is covered for engine and retained-history delivery, but every durable transition and external adapter has not yet been crossed.",
+            "Encrypted-SQLite restart after same-epoch rival displacement is covered for engine and retained-history delivery, but every durable transition and external adapter has not yet been crossed.",
         ),
     },
     DecisionRouteInventoryEntryV1 {

@@ -429,11 +429,11 @@ impl From<StorageError> for OpenMlsProjectionError {
 /// segments during stored-convergence materialization.
 ///
 /// MLS cannot process a device's own commit through `process_message`, so a
-/// candidate path containing one cannot be materialized by replay alone: after
-/// a restart clears the in-memory `committed_from` guard, the own commit's
-/// branch would silently drop out of branch selection and the device could be
-/// reorged onto a losing sibling (or, with two restarted committers, the group
-/// could fork permanently). Instead, an own `Processed` commit whose ordering
+/// candidate path containing one cannot be materialized by replay alone: the
+/// own commit's branch would silently drop out of branch selection and the
+/// device could be reorged onto a losing sibling (or, with two forked
+/// committers, the group could fork permanently). Instead, an own `Processed`
+/// commit whose ordering
 /// stamp was persisted at confirm time is realized from its immutable,
 /// commit-addressed canonical-state checkpoint, and its `CommitStaged`
 /// observation is synthesized from that stamp.
@@ -1074,119 +1074,20 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     options: StoredCanonicalizationOptions<'_>,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let profile_policy = options.replay_profile;
-    let current_epoch = storage
-        .get_group(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-        .epoch
-        .0;
-    let records = storage
-        .list_messages(group_id, EpochId(0))
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    let mut commit_messages = Vec::new();
-    let mut pending_messages = Vec::new();
-    let mut already_delivered_app_ids = BTreeSet::new();
-    let mut stale_commit_drops = Vec::new();
-    let mut own_commits = PrevalidatedOwnCommits::default();
-
-    for record in records {
-        if options
-            .admitted_message_ids
-            .is_some_and(|admitted| !admitted.contains(&record.id))
-        {
-            continue;
-        }
-        if !record_state_can_contribute_to_openmls_graph(record.state) {
-            continue;
-        }
-        let payload = StoredMessagePayload::decode(&record.payload)
-            .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
-        let own_commit_stamp = payload.own_commit_stamp().cloned();
-        let own_application_stamp = payload.own_application_stamp().cloned();
-        let Some(message) = payload.as_openmls_wire().cloned() else {
-            continue;
-        };
-        if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-            continue;
-        }
-        let projection = project_mls_message(&message.payload)?;
-        let source_epoch = projection.source_epoch;
-        match projection.kind {
-            OpenMlsContentKind::Commit => {
-                let Some(source_epoch) = source_epoch else {
-                    continue;
-                };
-                if source_epoch < state.retained_anchor_epoch {
-                    if unresolved_commit_state(record.state) {
-                        stale_commit_drops.push(DroppedMessage {
-                            message_id: hex::encode(message.id.as_slice()),
-                            kind: MessageKind::Commit,
-                            reason: DroppedMessageReason::BeyondAnchor,
-                            rejection_category: None,
-                        });
-                    }
-                    continue;
-                }
-                if record.state == MessageState::Processed {
-                    own_commits.insert_canonical(projection.message_digest);
-                }
-                // Confirmed own commits remain prevalidated while canonical or
-                // parked for convergence. Terminal states must not regain
-                // checkpoint-based eligibility.
-                if matches!(
-                    record.state,
-                    MessageState::Processed | MessageState::ConvergenceDeferred
-                ) && let Some(stamp) = own_commit_stamp
-                {
-                    own_commits.insert_stamped(projection.message_digest, stamp);
-                }
-                commit_messages.push(StoredCommitMessage {
-                    message,
-                    source_epoch,
-                    digest: projection.message_digest,
-                    state: record.state,
-                });
-            }
-            OpenMlsContentKind::Proposal
-                if record_state_is_canonicalization_input(record.state)
-                    && source_epoch.is_some_and(|epoch| epoch >= state.retained_anchor_epoch) =>
-            {
-                pending_messages.push(message)
-            }
-            // App messages within the retained window are admitted for scoring
-            // when fresh (`Created`/`Retryable`/`Sent`, to be delivered) AND when
-            // already `Processed` on a prior pass. A `Processed` app is re-admitted
-            // for witness scoring only (tracked in `already_delivered_app_ids` so
-            // it is never re-delivered): without it, a same-epoch fork resolved
-            // *after* the app was delivered loses that app's witness weight, so
-            // branch selection would depend on local arrival order (the
-            // convergence contract requires order-independence).
-            OpenMlsContentKind::Application
-                if record_state_can_contribute_to_openmls_graph(record.state)
-                    && source_epoch.is_some_and(|epoch| epoch >= state.retained_anchor_epoch) =>
-            {
-                if let Some(stamp) = own_application_stamp {
-                    own_commits.insert_application(message.id.clone(), stamp);
-                }
-                if record.state == MessageState::Processed {
-                    already_delivered_app_ids.insert(hex::encode(message.id.as_slice()));
-                }
-                pending_messages.push(message)
-            }
-            OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => {}
-            OpenMlsContentKind::Proposal | OpenMlsContentKind::Application => {}
-        }
-    }
-
-    let historical_start_epoch = historical_replay_start_epoch(&commit_messages, current_epoch);
-    let replay_start_epoch = historical_start_epoch.unwrap_or(current_epoch);
-    let commit_messages: Vec<_> = if historical_start_epoch.is_some() {
-        commit_messages
-    } else {
-        commit_messages
-            .into_iter()
-            .filter(|commit| unresolved_commit_state(commit.state))
-            .collect()
-    };
+    let StoredOpenMlsGraphInputs {
+        commit_messages,
+        pending_messages,
+        already_delivered_app_ids,
+        own_commits,
+        stale_commit_drops,
+        current_epoch,
+        replay_start_epoch,
+    } = seed_stored_openmls_graph_inputs(
+        storage,
+        group_id,
+        state.retained_anchor_epoch,
+        options.admitted_message_ids,
+    )?;
 
     if replay_start_epoch < current_epoch {
         let mut result = canonicalize_stored_openmls_messages_from_retained_anchor(
@@ -1231,6 +1132,159 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
     Ok(result)
+}
+
+/// Stored rows classified into the inputs the candidate-path BFS consumes.
+///
+/// Seeding is shared by the canonicalization pass and by
+/// [`candidate_branch_peel`], so both classify a given row identically.
+/// They do not necessarily see the same rows: the pass passes its frozen
+/// batch as `admitted_message_ids` and context collection passes `None`, so
+/// context collection may enumerate branches off commits the pass in flight has
+/// not admitted. That is deliberate — a peel context is a *readability* probe,
+/// and reading a branch's traffic earlier than the pass adjudicates it only
+/// feeds the next pass more evidence. What must not drift is the classification
+/// itself; a second copy of it would let branch-relative peeling reason about a
+/// differently-shaped graph than the pass that adjudicates it.
+struct StoredOpenMlsGraphInputs {
+    commit_messages: Vec<StoredCommitMessage>,
+    pending_messages: Vec<TransportMessage>,
+    already_delivered_app_ids: BTreeSet<String>,
+    own_commits: PrevalidatedOwnCommits,
+    /// Commits below the retained-anchor horizon, to be reported dropped.
+    stale_commit_drops: Vec<DroppedMessage>,
+    current_epoch: u64,
+    /// Where replay must start: the oldest unresolved commit's source epoch,
+    /// or the live tip when every unresolved commit forks from it.
+    replay_start_epoch: u64,
+}
+
+fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    retained_anchor_epoch: u64,
+    admitted_message_ids: Option<&HashSet<MessageId>>,
+) -> Result<StoredOpenMlsGraphInputs, OpenMlsProjectionError> {
+    let current_epoch = storage
+        .get_group(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .epoch
+        .0;
+    let records = storage
+        .list_messages(group_id, EpochId(0))
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    let mut commit_messages = Vec::new();
+    let mut pending_messages = Vec::new();
+    let mut already_delivered_app_ids = BTreeSet::new();
+    let mut stale_commit_drops = Vec::new();
+    let mut own_commits = PrevalidatedOwnCommits::default();
+
+    for record in records {
+        if admitted_message_ids.is_some_and(|admitted| !admitted.contains(&record.id)) {
+            continue;
+        }
+        if !record_state_can_contribute_to_openmls_graph(record.state) {
+            continue;
+        }
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
+        let own_commit_stamp = payload.own_commit_stamp().cloned();
+        let own_application_stamp = payload.own_application_stamp().cloned();
+        let Some(message) = payload.as_openmls_wire().cloned() else {
+            continue;
+        };
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            continue;
+        }
+        let projection = project_mls_message(&message.payload)?;
+        let source_epoch = projection.source_epoch;
+        match projection.kind {
+            OpenMlsContentKind::Commit => {
+                let Some(source_epoch) = source_epoch else {
+                    continue;
+                };
+                if source_epoch < retained_anchor_epoch {
+                    if unresolved_commit_state(record.state) {
+                        stale_commit_drops.push(DroppedMessage {
+                            message_id: hex::encode(message.id.as_slice()),
+                            kind: MessageKind::Commit,
+                            reason: DroppedMessageReason::BeyondAnchor,
+                            rejection_category: None,
+                        });
+                    }
+                    continue;
+                }
+                if record.state == MessageState::Processed {
+                    own_commits.insert_canonical(projection.message_digest);
+                }
+                // Confirmed own commits remain prevalidated while canonical or
+                // parked for convergence. Terminal states must not regain
+                // checkpoint-based eligibility.
+                if matches!(
+                    record.state,
+                    MessageState::Processed | MessageState::ConvergenceDeferred
+                ) && let Some(stamp) = own_commit_stamp
+                {
+                    own_commits.insert_stamped(projection.message_digest, stamp);
+                }
+                commit_messages.push(StoredCommitMessage {
+                    message,
+                    source_epoch,
+                    digest: projection.message_digest,
+                    state: record.state,
+                });
+            }
+            OpenMlsContentKind::Proposal
+                if record_state_is_canonicalization_input(record.state)
+                    && source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
+            {
+                pending_messages.push(message)
+            }
+            // App messages within the retained window are admitted for scoring
+            // when fresh (`Created`/`Retryable`/`Sent`, to be delivered) AND when
+            // already `Processed` on a prior pass. A `Processed` app is re-admitted
+            // for witness scoring only (tracked in `already_delivered_app_ids` so
+            // it is never re-delivered): without it, a same-epoch fork resolved
+            // *after* the app was delivered loses that app's witness weight, so
+            // branch selection would depend on local arrival order (the
+            // convergence contract requires order-independence).
+            OpenMlsContentKind::Application
+                if record_state_can_contribute_to_openmls_graph(record.state)
+                    && source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
+            {
+                if let Some(stamp) = own_application_stamp {
+                    own_commits.insert_application(message.id.clone(), stamp);
+                }
+                if record.state == MessageState::Processed {
+                    already_delivered_app_ids.insert(hex::encode(message.id.as_slice()));
+                }
+                pending_messages.push(message)
+            }
+            OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => {}
+            OpenMlsContentKind::Proposal | OpenMlsContentKind::Application => {}
+        }
+    }
+
+    let historical_start_epoch = historical_replay_start_epoch(&commit_messages, current_epoch);
+    let replay_start_epoch = historical_start_epoch.unwrap_or(current_epoch);
+    let commit_messages: Vec<_> = if historical_start_epoch.is_some() {
+        commit_messages
+    } else {
+        commit_messages
+            .into_iter()
+            .filter(|commit| unresolved_commit_state(commit.state))
+            .collect()
+    };
+
+    Ok(StoredOpenMlsGraphInputs {
+        commit_messages,
+        pending_messages,
+        already_delivered_app_ids,
+        own_commits,
+        stale_commit_drops,
+        current_epoch,
+        replay_start_epoch,
+    })
 }
 
 fn append_dropped_messages(
@@ -1318,16 +1372,20 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     result
 }
 
-/// Recover the live state captured before a retained-anchor probe that was
-/// interrupted by process termination.
+/// Recover the live state captured before a rewind probe that was interrupted
+/// by process termination.
 ///
-/// The probe snapshot is created before the durable rollback to the historical
-/// anchor. A surviving snapshot therefore always contains the newer live state
-/// that must win on the next open. More than one probe snapshot is not expected:
-/// convergence for a group is serialized and hydrate runs before new work. If
+/// Two rewinds take this shape — the convergence pass's rewind to the retained
+/// anchor and the deferred-peel sweep's rewind to enumerate candidate branches.
+/// Each creates its probe snapshot before the durable rollback, so a surviving
+/// snapshot of either kind always holds the newer live state that must win on
+/// the next open.
+///
+/// More than one probe snapshot is not expected: convergence for a group is
+/// serialized, the two rewinds never nest, and hydrate runs before new work. If
 /// storage contains several, fail closed instead of guessing which live state
 /// is newest.
-pub(crate) fn recover_interrupted_retained_anchor_probe<S: StorageProvider>(
+pub(crate) fn recover_interrupted_rewind_probe<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
 ) -> Result<(), OpenMlsProjectionError> {
@@ -1335,7 +1393,7 @@ pub(crate) fn recover_interrupted_retained_anchor_probe<S: StorageProvider>(
         .list_group_snapshots(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
         .into_iter()
-        .filter(|name| name.starts_with(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX))
+        .filter(|name| is_rewind_probe_snapshot(name))
         .collect::<Vec<_>>();
 
     let Some(snapshot) = probes.first() else {
@@ -1343,7 +1401,7 @@ pub(crate) fn recover_interrupted_retained_anchor_probe<S: StorageProvider>(
     };
     if probes.len() != 1 {
         return Err(OpenMlsProjectionError::Snapshot(
-            "multiple interrupted retained-anchor probes".into(),
+            "multiple interrupted rewind probes".into(),
         ));
     }
 
@@ -1523,6 +1581,362 @@ fn missing_required_state_result(
         replay_probe_count: 0,
         selection_trace: None,
     }
+}
+
+/// One candidate branch tip's peel context.
+///
+/// Post-fork traffic is sealed under the **sender's** branch state, and the
+/// transport carries no epoch hint, so a device that adopted a different branch
+/// cannot peel that traffic from any state it has itself entered. Materializing
+/// a candidate branch produces exactly the context that unseals it, which is
+/// what lets branch depth and app witnesses be counted over evidence this
+/// device has not adopted. Without it, every committer scores only its own
+/// branch and a same-epoch fork is a permanent split.
+///
+/// The context is an owned value with the exporter secret already derived, so
+/// the transient candidate state is rolled back before any peel runs against
+/// it. Nothing peeled here is trusted: it re-enters through ordinary ingest and
+/// is authenticated by the next pass's OpenMLS replay like any other inbound
+/// message.
+pub(crate) struct CandidateBranchPeelContext {
+    /// Path-digest branch id, derived the same way as a selection trace's
+    /// branch ids. It matches a trace's id when the pass enumerated the same
+    /// path; because context collection admits every stored commit and a pass
+    /// admits only its frozen batch, the two need not enumerate the same set.
+    pub(crate) branch_id: String,
+    pub(crate) tip_epoch: u64,
+    pub(crate) context: cgka_traits::group_context::GroupContextSnapshot,
+}
+
+/// What a deferred-peel sweep learns about this group's convergence graph.
+///
+/// The two fields answer different questions and are deliberately independent.
+/// Contested-ness is a property of the STORED COMMIT GRAPH, decided before any
+/// replay; the contexts are what enumeration managed to MATERIALIZE from it.
+/// Enumeration halts for reasons that say nothing about whether the graph is
+/// split — a released anchor, a missing own-commit checkpoint, an exhausted
+/// replay budget — so a halt loses the contexts and never the split.
+pub(crate) struct CandidateBranchPeel {
+    /// Two stored commits fork from the same source epoch.
+    pub(crate) contested: bool,
+    /// Tip contexts enumeration captured, at most `max_contexts` of them.
+    /// Empty on every halt, and empty for an uncontested graph.
+    pub(crate) contexts: Vec<CandidateBranchPeelContext>,
+}
+
+impl CandidateBranchPeel {
+    /// No two stored commits fork from the same source epoch, so there is no
+    /// rival branch to materialize.
+    const UNCONTESTED: Self = Self {
+        contested: false,
+        contexts: Vec::new(),
+    };
+
+    /// Whatever enumeration captured from a graph already known to be split.
+    fn contested_over(contexts: Vec<CandidateBranchPeelContext>) -> Self {
+        Self {
+            contested: true,
+            contexts,
+        }
+    }
+}
+
+/// Survey the branches a convergence graph offers: whether it is contested, and
+/// the peel context of each candidate branch tip that could be materialized.
+///
+/// Best-effort by contract for the CONTEXTS: the pass — not this helper — owns
+/// every verdict, so an inability to enumerate branches (no retained anchor, no
+/// own-commit checkpoint, exhausted replay budget) yields no contexts rather
+/// than an error. Storage and snapshot faults still propagate; they mean the
+/// caller's own state is in doubt.
+///
+/// Contested-ness is NOT best-effort. It is decided by the shared-source-epoch
+/// check below, ahead of every path that can lose contexts.
+pub(crate) fn candidate_branch_peel<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    retained_anchor_epoch: u64,
+    max_rewind_commits: u64,
+    profile_policy: ReplayProfilePolicy,
+    max_contexts: usize,
+) -> Result<CandidateBranchPeel, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+
+    let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)?;
+    // Cheap contested-graph gate ahead of any replay: competing branches exist
+    // only where two commits share a source epoch. An uncontested graph pays
+    // the seeding scan and nothing more. This is also the ONLY answer to
+    // "contested?"; everything past it can only lose contexts.
+    if !commits_share_a_source_epoch(&inputs.commit_messages) {
+        return Ok(CandidateBranchPeel::UNCONTESTED);
+    }
+    if inputs.replay_start_epoch >= inputs.current_epoch {
+        return candidate_branch_peel_contexts_from_current(
+            storage,
+            group_id,
+            inputs,
+            max_rewind_commits,
+            profile_policy,
+            max_contexts,
+        )
+        .map(CandidateBranchPeel::contested_over);
+    }
+
+    // Same rewind shape as the pass: probe-snapshot the live state, roll back
+    // to the retained anchor, enumerate, then restore. The guard restores on
+    // every path, and an interrupted probe is recovered by
+    // `recover_interrupted_rewind_probe` exactly as the pass's is — under this
+    // sweep's own probe name, so two interrupted probes stay distinguishable.
+    let probe_snapshot = candidate_branch_probe_snapshot_name(group_id, inputs.replay_start_epoch);
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), probe_snapshot)
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
+    let contexts = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
+        Ok(()) => candidate_branch_peel_contexts_from_current(
+            storage,
+            group_id,
+            inputs,
+            max_rewind_commits,
+            profile_policy,
+            max_contexts,
+        ),
+        Err(StorageError::SnapshotMissing(_)) => Ok(Vec::new()),
+        Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+    };
+    guard
+        .commit()
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    contexts.map(CandidateBranchPeel::contested_over)
+}
+
+/// Whether two distinct stored commits fork from the same source epoch — the
+/// structural precondition for more than one candidate branch.
+fn commits_share_a_source_epoch(commits: &[StoredCommitMessage]) -> bool {
+    let mut by_epoch: BTreeMap<u64, BTreeSet<[u8; 32]>> = BTreeMap::new();
+    for commit in commits {
+        if by_epoch
+            .entry(commit.source_epoch)
+            .or_default()
+            .insert(commit.digest)
+            && by_epoch[&commit.source_epoch].len() > 1
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Enumerate and capture branch tips from the state currently restored.
+///
+/// Only ever called once the graph is known contested, so every early return
+/// here means "captured nothing", never "nothing to capture" — the caller
+/// stamps `contested` on whatever comes back.
+fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    inputs: StoredOpenMlsGraphInputs,
+    max_rewind_commits: u64,
+    profile_policy: ReplayProfilePolicy,
+    max_contexts: usize,
+) -> Result<Vec<CandidateBranchPeelContext>, OpenMlsProjectionError> {
+    let mut budget = ReplayBudget::for_pass(inputs.commit_messages.len(), max_rewind_commits);
+    let path_result = match build_stored_openmls_candidate_paths(
+        storage,
+        group_id,
+        inputs.commit_messages,
+        &inputs.pending_messages,
+        inputs.replay_start_epoch,
+        &inputs.own_commits,
+        profile_policy,
+        &mut budget,
+    ) {
+        Ok(result) => result,
+        // The pass, not this helper, owns every verdict, so an inability to
+        // enumerate branches yields no contexts. The graph stays contested
+        // either way — the caller reads that from the source-epoch check, not
+        // from this set — but a halt is still worth a greppable line, because
+        // it is the fork this device has stopped being able to see.
+        Err(
+            err @ (OpenMlsProjectionError::MissingOwnCommitCheckpoint
+            | OpenMlsProjectionError::ReplayBudgetExceeded),
+        ) => {
+            tracing::debug!(
+                target: "cgka_engine::openmls_projection",
+                method = "candidate_branch_peel",
+                reason = candidate_branch_enumeration_halt_reason(&err),
+                "no candidate branch peel contexts: branch enumeration halted"
+            );
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+    if path_result.candidate_paths.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let pending_proposals = pending_proposal_messages(&inputs.pending_messages)?;
+    let ranked =
+        candidate_paths_ranked_for_peel(&path_result.candidate_paths, &path_result.materialized);
+    let mut contexts = Vec::with_capacity(max_contexts.min(ranked.len()));
+    // Each tip context costs one replay of its path. The BFS already replayed
+    // every node to enumerate the paths; capturing the contexts inside that
+    // walk would have to carry exporter material through
+    // `OpenMlsMaterializedCandidate` and into every canonicalization result, so
+    // this pays a bounded second replay to keep secrets out of those types.
+    for path in ranked.into_iter().take(max_contexts) {
+        match candidate_path_peel_context(
+            storage,
+            group_id,
+            path,
+            &pending_proposals,
+            &inputs.own_commits,
+            profile_policy,
+            &mut budget,
+        ) {
+            Ok(Some(context)) => contexts.push(context),
+            Ok(None) => {}
+            Err(err @ OpenMlsProjectionError::ReplayBudgetExceeded) => {
+                tracing::debug!(
+                    target: "cgka_engine::openmls_projection",
+                    method = "candidate_branch_peel",
+                    reason = candidate_branch_enumeration_halt_reason(&err),
+                    captured = contexts.len() as u64,
+                    "candidate branch peel contexts truncated"
+                );
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(contexts)
+}
+
+/// Order candidate paths by how much a peel context on each is worth, so the
+/// context cap keeps the branches most likely to unseal retained traffic.
+///
+/// The BFS completes paths in level order, so the raw vector runs shallowest
+/// first and a prefix would keep exactly the wrong branches: a handful of
+/// one-commit rivals — the cheapest fork there is to post — would evict every
+/// branch that actually carries post-fork traffic. Deeper tips rank first.
+///
+/// Both keys are content-derived: `tip_epoch` comes from replaying the stored
+/// commits, `branch_id` from their digests. Peers holding the same evidence
+/// therefore keep the same branches, which is what makes capping safe at all.
+fn candidate_paths_ranked_for_peel<'a>(
+    candidate_paths: &'a [OpenMlsCandidatePath],
+    materialized: &[OpenMlsMaterializedCandidate],
+) -> Vec<&'a OpenMlsCandidatePath> {
+    // Joined on `branch_id` rather than position: `materialized` is parallel to
+    // `candidate_paths` by construction but is allowed to come back short, and
+    // a silent index skew would rank branches by another branch's depth.
+    let tip_epochs: BTreeMap<&str, u64> = materialized
+        .iter()
+        .map(|candidate| (candidate.branch_id.as_str(), candidate.tip_epoch))
+        .collect();
+    let mut ranked: Vec<&OpenMlsCandidatePath> = candidate_paths.iter().collect();
+    ranked.sort_by(|a, b| {
+        tip_epochs
+            .get(b.branch_id.as_str())
+            .cmp(&tip_epochs.get(a.branch_id.as_str()))
+            .then_with(|| a.branch_id.cmp(&b.branch_id))
+    });
+    ranked
+}
+
+/// Stable low-cardinality label for a halt that yields no (or fewer) candidate
+/// branch peel contexts. Aggregate diagnostics only — never group or message
+/// identifiers (observability.md).
+fn candidate_branch_enumeration_halt_reason(err: &OpenMlsProjectionError) -> &'static str {
+    match err {
+        OpenMlsProjectionError::MissingOwnCommitCheckpoint => "missing_own_commit_checkpoint",
+        OpenMlsProjectionError::ReplayBudgetExceeded => "replay_budget_exceeded",
+        _ => "other",
+    }
+}
+
+// Same shared-context argument set as `build_stored_openmls_candidate_paths`.
+#[allow(clippy::too_many_arguments)]
+fn candidate_path_peel_context<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    path: &OpenMlsCandidatePath,
+    pending_proposals: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+    budget: &mut ReplayBudget,
+) -> Result<Option<CandidateBranchPeelContext>, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+
+    let replay_paths = candidate_paths_with_pending_replay_messages(
+        std::slice::from_ref(path),
+        pending_proposals,
+    )?;
+    let Some(replay_path) = replay_paths.first() else {
+        return Ok(None);
+    };
+    budget.consume()?;
+
+    let snapshot = replay_snapshot_name(group_id, &replay_path.messages);
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let captured = capture_candidate_tip_context(
+        storage,
+        group_id,
+        &replay_path.messages,
+        own_commits,
+        profile_policy,
+    );
+    guard
+        .commit()
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+
+    Ok(captured?.map(|tip| CandidateBranchPeelContext {
+        branch_id: path.branch_id.clone(),
+        tip_epoch: tip.epoch,
+        context: tip.context,
+    }))
+}
+
+/// State read off a materialized candidate branch's tip.
+struct CandidateTipState {
+    context: cgka_traits::group_context::GroupContextSnapshot,
+    epoch: u64,
+}
+
+/// Replay `messages` onto the restored base state and read the resulting tip's
+/// exporter context. Runs inside a [`SnapshotRollbackGuard`]; the caller
+/// restores the live state before the returned context is used.
+fn capture_candidate_tip_context<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<Option<CandidateTipState>, OpenMlsProjectionError> {
+    // A path that fails to replay is simply not a reachable branch state; the
+    // BFS already reported that outcome for adjudication.
+    if process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let Some(mls_group) = MlsGroup::load(
+        <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+        &mls_gid,
+    )
+    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+    else {
+        return Ok(None);
+    };
+    let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    Ok(Some(CandidateTipState {
+        context,
+        epoch: mls_group.epoch().as_u64(),
+    }))
 }
 
 // The last two arguments carry independent replay context; folding them into a
@@ -2471,7 +2885,16 @@ fn record_state_is_canonicalization_input(state: MessageState) -> bool {
     )
 }
 
-fn record_state_can_contribute_to_openmls_graph(state: MessageState) -> bool {
+/// Whether a stored row in this state is an input to the OpenMLS graph the
+/// convergence pass builds — the unresolved canonicalization inputs plus
+/// already-applied (`Processed`) rows, which are re-admitted for scoring.
+///
+/// The single owner of that classification. `seed_stored_openmls_graph_inputs`
+/// exists so no caller re-derives it; anything that must agree with the graph's
+/// membership (the deferred-peel sweep's context fingerprint, for one) calls
+/// this rather than restating the match. A restatement drifts silently: the
+/// graph and its describer disagree, and nothing fails.
+pub(crate) fn record_state_can_contribute_to_openmls_graph(state: MessageState) -> bool {
     record_state_is_canonicalization_input(state) || state == MessageState::Processed
 }
 
@@ -3373,17 +3796,37 @@ pub(crate) fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64
 }
 
 fn retained_anchor_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String {
+    rewind_probe_snapshot_name(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX, group_id, epoch)
+}
+
+/// Probe name for the deferred-peel sweep's rewind.
+///
+/// Deliberately distinct from the pass's probe name. Both rewinds capture the
+/// same live state at the same `(group, epoch)`, so a shared name hashes to the
+/// same string — and `create_group_snapshot` is INSERT OR REPLACE, so a second
+/// interrupted probe would overwrite the first instead of leaving two rows for
+/// `recover_interrupted_rewind_probe` to fail closed on. Distinct prefixes keep
+/// that detector armed.
+fn candidate_branch_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String {
+    rewind_probe_snapshot_name(CANDIDATE_BRANCH_PROBE_SNAPSHOT_PREFIX, group_id, epoch)
+}
+
+fn rewind_probe_snapshot_name(prefix: &str, group_id: &GroupId, epoch: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(group_id.as_slice());
     hasher.update(epoch.to_be_bytes());
     let digest = hasher.finalize();
-    format!(
-        "{RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX}{}",
-        hex::encode(&digest[..8])
-    )
+    format!("{prefix}{}", hex::encode(&digest[..8]))
 }
 
 const RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX: &str = "openmls-retained-probe-";
+const CANDIDATE_BRANCH_PROBE_SNAPSHOT_PREFIX: &str = "openmls-branch-probe-";
+
+/// Whether `name` is a rewind probe of either kind.
+fn is_rewind_probe_snapshot(name: &str) -> bool {
+    name.starts_with(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX)
+        || name.starts_with(CANDIDATE_BRANCH_PROBE_SNAPSHOT_PREFIX)
+}
 
 fn replay_snapshot_name(group_id: &GroupId, messages: &[TransportMessage]) -> String {
     let mut hasher = Sha256::new();
@@ -3731,5 +4174,539 @@ mod checkpoint_prefix_tests {
             "a sibling at the same epoch must not resolve to another commit's checkpoint"
         );
         assert!(prefix.commit_ids.is_empty());
+    }
+}
+
+/// Producer-side coverage for [`candidate_branch_peel`]: a stored graph that is
+/// contested stays contested through every enumeration halt.
+///
+/// These fixtures build a real forked graph out of real OpenMLS commits and
+/// drive the helper into each halt for real, because the property under test is
+/// exactly the one a hand-built [`CandidateBranchPeel`] cannot show: that the
+/// verdict survives losing the contexts. How the sweep reads the two fields
+/// apart is pinned separately, over constructed values, in
+/// `message_processor::ingest`.
+#[cfg(test)]
+mod candidate_branch_peel_halt_tests {
+    use super::{
+        CANDIDATE_REPLAY_BUDGET_FLOOR, CANDIDATE_REPLAY_BUDGET_SLACK, CandidateBranchPeel,
+        ReplayProfilePolicy, candidate_branch_peel, own_commit_checkpoint_id,
+    };
+    use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
+    use crate::convergence::V1_MAX_REWIND_COMMITS;
+    use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
+    use crate::provider::EngineOpenMlsProvider;
+    use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+    use async_trait::async_trait;
+    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+    use cgka_traits::error::PeelerError;
+    use cgka_traits::group_context::GroupContextSnapshot;
+    use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+    use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+    use cgka_traits::peeler::TransportPeeler;
+    use cgka_traits::storage::{
+        AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+    };
+    use cgka_traits::transport::{
+        EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+    };
+    use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+    use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
+    use openmls::group::MlsGroup;
+    use openmls::prelude::{MlsMessageIn, ProcessedMessageContent};
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::RustCrypto;
+    use openmls_traits::OpenMlsProvider as _;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use storage_sqlite::SqliteAccountStorage;
+    use tls_codec::{Deserialize as _, Serialize as _};
+
+    // --- Test devices --------------------------------------------------------
+
+    /// Deterministic BIP-340 key for a seed label. Marmot credential identities
+    /// MUST be a valid 32-byte x-only secp256k1 public key, so identities are
+    /// derived rather than invented.
+    fn signing_key(seed: &[u8]) -> SigningKey {
+        for counter in 0u64.. {
+            let mut material = [0u8; 32];
+            let mut hasher = Sha256::new();
+            hasher.update(b"cgka-engine-test-identity-v1");
+            hasher.update(seed);
+            hasher.update(counter.to_be_bytes());
+            material.copy_from_slice(&hasher.finalize());
+            if let Ok(key) = SigningKey::from_bytes(&material) {
+                return key;
+            }
+        }
+        unreachable!("a signing key is found within u64 counters")
+    }
+
+    fn member_id(seed: &[u8]) -> MemberId {
+        MemberId::new(signing_key(seed).verifying_key().to_bytes().to_vec())
+    }
+
+    struct SeedProofSigner(SigningKey);
+
+    impl AccountIdentityProofSigner for SeedProofSigner {
+        fn sign_account_identity_proof(
+            &self,
+            request: &AccountIdentityProofRequest,
+        ) -> Result<[u8; 64], String> {
+            Ok(self
+                .0
+                .sign_prehash(&request.proof_event_id()?)
+                .map_err(|e| e.to_string())?
+                .to_bytes())
+        }
+    }
+
+    /// Transport is not under test here: every message is carried verbatim.
+    struct PassthroughPeeler;
+
+    #[async_trait]
+    impl TransportPeeler for PassthroughPeeler {
+        async fn peel_group_message(
+            &self,
+            msg: &TransportMessage,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<PeeledMessage, PeelerError> {
+            Ok(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::MlsMessage {
+                    bytes: msg.payload.clone(),
+                },
+                origin: msg.clone(),
+            })
+        }
+
+        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+            Ok(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::Welcome {
+                    bytes: msg.payload.clone(),
+                },
+                origin: msg.clone(),
+            })
+        }
+
+        async fn wrap_group_message(
+            &self,
+            payload: &EncryptedPayload,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<TransportMessage, PeelerError> {
+            Ok(transport_message(
+                &payload.ciphertext,
+                TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![],
+                },
+            ))
+        }
+
+        async fn wrap_welcome(
+            &self,
+            payload: &EncryptedPayload,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            Ok(transport_message(
+                &payload.ciphertext,
+                TransportEnvelope::Welcome {
+                    recipient: recipient.clone(),
+                },
+            ))
+        }
+    }
+
+    fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
+        TransportMessage {
+            id: MessageId::new(Sha256::digest(payload).to_vec()),
+            payload: payload.to_vec(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("candidate-branch-peel-test".into()),
+            envelope,
+        }
+    }
+
+    fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let engine = EngineBuilder::new(storage.clone())
+            .legacy_compatibility_profile()
+            .identity(member_id(seed).as_slice().to_vec())
+            .account_identity_proof_signer(Arc::new(SeedProofSigner(signing_key(seed))))
+            .peeler(Box::new(PassthroughPeeler))
+            .build()
+            .unwrap();
+        (engine, storage)
+    }
+
+    async fn group_with(
+        creator: &mut Engine<SqliteAccountStorage>,
+        joiners: &mut [&mut Engine<SqliteAccountStorage>],
+    ) -> GroupId {
+        let mut key_packages = Vec::new();
+        for joiner in joiners.iter_mut() {
+            key_packages.push(joiner.fresh_key_package().await.unwrap());
+        }
+        let (group_id, created) = creator
+            .create_group(CreateGroupRequest {
+                name: "candidate branch peel".into(),
+                description: String::new(),
+                members: key_packages,
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![creator.self_id()],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated { pending, welcomes } = created else {
+            panic!("expected GroupCreated");
+        };
+        creator.confirm_published(pending).await.unwrap();
+        for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
+            joiner.join_welcome(welcome).await.unwrap();
+        }
+        group_id
+    }
+
+    // --- Graph fixtures ------------------------------------------------------
+
+    /// Grind one more valid commit out of a device's live state without
+    /// advancing it: the pending commit is cleared, so the next call forks from
+    /// the same epoch again. This is how a wide same-epoch fork is built.
+    fn rival_commit(
+        storage: &SqliteAccountStorage,
+        sender: &MemberId,
+        group_id: &GroupId,
+    ) -> TransportMessage {
+        let crypto = RustCrypto::default();
+        let provider =
+            EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+        let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
+            .expect("load rival MLS group")
+            .expect("rival has group state");
+        let binding = storage
+            .account_device_signer(sender)
+            .expect("load signer binding")
+            .expect("signer binding exists");
+        let signer = SignatureKeyPair::read(
+            storage.mls_storage(),
+            &binding.mls_signature_public_key,
+            DEFAULT_CIPHERSUITE.signature_algorithm(),
+        )
+        .expect("MLS signer exists");
+
+        let bundle = mls_group
+            .commit_builder()
+            .load_psks(provider.storage())
+            .expect("load PSKs")
+            .build(provider.rand(), provider.crypto(), &signer, |_| true)
+            .expect("build rival self-update commit")
+            .stage_commit(&provider)
+            .expect("stage rival self-update commit");
+        let (commit, _welcome, _group_info) = bundle.into_contents();
+        let bytes = commit
+            .tls_serialize_detached()
+            .expect("serialize rival self-update commit");
+        mls_group
+            .clear_pending_commit(provider.storage())
+            .expect("clear the rival's pending commit");
+
+        transport_message(
+            &bytes,
+            TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        )
+    }
+
+    /// Apply a commit to a device's stored state, putting it on that branch.
+    /// Grinding successors out of a device ([`rival_commit`]) needs it standing
+    /// where those successors fork from.
+    fn adopt_branch(storage: &SqliteAccountStorage, group_id: &GroupId, commit: &TransportMessage) {
+        let crypto = RustCrypto::default();
+        let provider =
+            EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+        let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
+            .expect("load adopting MLS group")
+            .expect("adopter has group state");
+        let message = MlsMessageIn::tls_deserialize_exact(commit.payload.as_slice())
+            .expect("adopted commit deserializes")
+            .try_into_protocol_message()
+            .expect("adopted commit is a protocol message");
+        let processed = mls_group
+            .process_message(&provider, message)
+            .expect("adopted commit processes");
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("expected a staged commit");
+        };
+        mls_group
+            .merge_staged_commit(&provider, *staged)
+            .expect("merge the adopted commit");
+
+        let mut group = storage.get_group(group_id).unwrap();
+        group.epoch = EpochId(mls_group.epoch().as_u64());
+        storage.put_group(&group).unwrap();
+    }
+
+    /// Admit a rival commit into the observer's graph in the state ingest
+    /// leaves behind for a peeled commit that convergence has not adjudicated.
+    fn admit_rival(
+        storage: &SqliteAccountStorage,
+        group_id: &GroupId,
+        commit: &TransportMessage,
+        source_epoch: u64,
+    ) {
+        storage
+            .put_message(&MessageRecord {
+                id: commit.id.clone(),
+                group_id: group_id.clone(),
+                epoch: EpochId(source_epoch),
+                state: MessageState::ConvergenceDeferred,
+                payload: StoredMessagePayload::openmls_wire(commit.clone())
+                    .encode()
+                    .unwrap(),
+                deferred_peel: None,
+            })
+            .unwrap();
+    }
+
+    /// Survey the observer's graph exactly as the deferred-peel sweep does,
+    /// under the rewind allowance the caller wants to give enumeration.
+    fn peel(
+        storage: &SqliteAccountStorage,
+        group_id: &GroupId,
+        max_rewind_commits: u64,
+    ) -> CandidateBranchPeel {
+        let epoch = storage.get_group(group_id).unwrap().epoch.0;
+        candidate_branch_peel(
+            storage,
+            group_id,
+            epoch.saturating_sub(max_rewind_commits),
+            max_rewind_commits,
+            ReplayProfilePolicy::default(),
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+        )
+        .expect("a branch survey over healthy storage")
+    }
+
+    // --- The halts -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
+        let (mut alice, alice_storage) = build_client(b"peel-halt-alice");
+        let (mut bob, bob_storage) = build_client(b"peel-halt-bob");
+        let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+
+        // Alice commits at epoch 1 and advances; Bob forks from the same epoch.
+        let own_commit = match alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { msg, pending, .. } => {
+                alice.confirm_published(pending).await.unwrap();
+                msg
+            }
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+        let rival = rival_commit(&bob_storage, &member_id(b"peel-halt-bob"), &group_id);
+        admit_rival(&alice_storage, &group_id, &rival, 1);
+
+        // Control: with the checkpoint in place both branches materialize, so
+        // the halt below is what empties the contexts — not a graph that never
+        // had two branches to enumerate.
+        let enumerated = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+        assert!(enumerated.contested);
+        assert!(
+            enumerated.contexts.len() > 1,
+            "a two-way epoch-1 fork offers a context per branch"
+        );
+
+        // MLS cannot replay this device's own path-bearing commit from the
+        // public wire echo, so losing its post-merge checkpoint costs
+        // enumeration the branch it is standing on.
+        let checkpoint = own_commit_checkpoint_id(&alice_storage, &own_commit.id).unwrap();
+        alice_storage
+            .release_group_state_checkpoint(&group_id, &checkpoint)
+            .unwrap();
+
+        let halted = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+        assert!(
+            halted.contexts.is_empty(),
+            "a missing own-commit checkpoint must halt enumeration"
+        );
+        assert!(
+            halted.contested,
+            "the fork is in the stored graph, not in what enumeration managed to read"
+        );
+    }
+
+    /// A same-epoch fork wide enough that probing it costs more replays than
+    /// the enumeration budget allows.
+    ///
+    /// Every rival at the fork epoch becomes a frontier path, and every commit
+    /// at the next epoch is probed against every one of those paths: the budget
+    /// is linear in the commit count, the probes are its product.
+    const WIDTH: usize = 10;
+    const DEPTH: usize = 13;
+
+    /// `WIDTH * (1 + DEPTH)` probes against the smallest budget a legal rewind
+    /// allowance can produce. Held at compile time so that raising either
+    /// budget constant lands here, with the arithmetic in view, rather than as
+    /// a mystifying empty-context assertion.
+    const _: () = assert!(
+        (WIDTH * (1 + DEPTH)) as u64
+            > CANDIDATE_REPLAY_BUDGET_SLACK * (WIDTH + DEPTH) as u64
+                + CANDIDATE_REPLAY_BUDGET_FLOOR
+    );
+
+    #[tokio::test]
+    async fn an_exhausted_replay_budget_halts_enumeration_and_keeps_the_fork() {
+        let (mut alice, alice_storage) = build_client(b"peel-budget-alice");
+        let (mut bob, bob_storage) = build_client(b"peel-budget-bob");
+        let (mut carol, carol_storage) = build_client(b"peel-budget-carol");
+        let group_id = group_with(&mut alice, &mut [&mut bob, &mut carol]).await;
+
+        // Bob forks the epoch WIDTH ways. Alice never leaves epoch 1, so every
+        // rival is a branch she has to enumerate.
+        let bob_id = member_id(b"peel-budget-bob");
+        let mut fork = Vec::new();
+        for _ in 0..WIDTH {
+            let commit = rival_commit(&bob_storage, &bob_id, &group_id);
+            admit_rival(&alice_storage, &group_id, &commit, 1);
+            fork.push(commit);
+        }
+
+        // Carol adopts one branch and commits on it DEPTH times. Those commits
+        // are valid only on that branch, but enumeration cannot know that
+        // without probing each of them against every branch.
+        adopt_branch(&carol_storage, &group_id, &fork[0]);
+        assert_eq!(
+            carol_storage.get_group(&group_id).unwrap().epoch,
+            EpochId(2)
+        );
+        let carol_id = member_id(b"peel-budget-carol");
+        for _ in 0..DEPTH {
+            let commit = rival_commit(&carol_storage, &carol_id, &group_id);
+            admit_rival(&alice_storage, &group_id, &commit, 2);
+        }
+
+        // Control: the same graph under the production rewind allowance has
+        // budget to spare, so it enumerates instead of halting.
+        let enumerated = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+        assert!(enumerated.contested);
+        assert!(
+            enumerated.contexts.len() > 1,
+            "a {WIDTH}-way fork offers a context per branch"
+        );
+
+        let halted = peel(&alice_storage, &group_id, 0);
+        assert!(
+            halted.contexts.is_empty(),
+            "an exhausted replay budget must halt enumeration"
+        );
+        assert!(
+            halted.contested,
+            "the fork is in the stored graph, not in what enumeration managed to read"
+        );
+    }
+
+    // --- The cap -------------------------------------------------------------
+
+    /// The epoch every device in these fixtures is standing on when the fork
+    /// happens, so a one-commit branch tips at `FORK_EPOCH + 1` and the
+    /// two-commit branch at `FORK_EPOCH + 2`.
+    const FORK_EPOCH: u64 = 1;
+
+    /// Wide enough that the surviving branches outnumber the cap: one rival per
+    /// width, minus the one Carol extends, plus her deeper branch.
+    const WIDE_FORK_WIDTH: usize = MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS + 2;
+
+    /// A fork wider than the cap, with one branch carried a commit deeper, as
+    /// stored by two devices that never left the fork epoch.
+    ///
+    /// Bob forks [`WIDE_FORK_WIDTH`] ways and Carol adopts one rival and commits
+    /// on it, so each observer holds `WIDE_FORK_WIDTH - 1` one-commit branches
+    /// plus one two-commit branch. Both observers are given the same evidence,
+    /// which is what lets a peer comparison mean anything.
+    async fn wide_fork_with_one_deep_branch()
+    -> (GroupId, SqliteAccountStorage, SqliteAccountStorage) {
+        let (mut alice, alice_storage) = build_client(b"peel-rank-alice");
+        let (mut bob, bob_storage) = build_client(b"peel-rank-bob");
+        let (mut carol, carol_storage) = build_client(b"peel-rank-carol");
+        let (mut dave, dave_storage) = build_client(b"peel-rank-dave");
+        let group_id = group_with(&mut alice, &mut [&mut bob, &mut carol, &mut dave]).await;
+
+        let bob_id = member_id(b"peel-rank-bob");
+        let mut fork = Vec::new();
+        for _ in 0..WIDE_FORK_WIDTH {
+            let commit = rival_commit(&bob_storage, &bob_id, &group_id);
+            for observer in [&alice_storage, &dave_storage] {
+                admit_rival(observer, &group_id, &commit, FORK_EPOCH);
+            }
+            fork.push(commit);
+        }
+
+        adopt_branch(&carol_storage, &group_id, &fork[0]);
+        let deeper = rival_commit(&carol_storage, &member_id(b"peel-rank-carol"), &group_id);
+        for observer in [&alice_storage, &dave_storage] {
+            admit_rival(observer, &group_id, &deeper, FORK_EPOCH + 1);
+        }
+
+        (group_id, alice_storage, dave_storage)
+    }
+
+    fn branch_ids(survey: &CandidateBranchPeel) -> Vec<String> {
+        survey
+            .contexts
+            .iter()
+            .map(|context| context.branch_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_fork_wider_than_the_cap_keeps_the_same_branches_on_every_peer() {
+        let (group_id, alice_storage, dave_storage) = wide_fork_with_one_deep_branch().await;
+
+        let alice = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+        let dave = peel(&dave_storage, &group_id, V1_MAX_REWIND_COMMITS);
+
+        assert!(alice.contested && dave.contested);
+        assert_eq!(
+            alice.contexts.len(),
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+            "a graph offering more branches than the cap must fill it exactly"
+        );
+        assert_eq!(
+            branch_ids(&alice),
+            branch_ids(&dave),
+            "the capped subset is content-derived, so peers holding the same \
+             evidence must keep the same branches in the same order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deeper_branch_outranks_shallow_rivals_for_the_capped_contexts() {
+        let (group_id, alice_storage, _dave_storage) = wide_fork_with_one_deep_branch().await;
+
+        let survey = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+
+        assert_eq!(
+            survey.contexts.iter().map(|c| c.tip_epoch).max(),
+            Some(FORK_EPOCH + 2),
+            "a branch carried two commits deep holds traffic the one-commit \
+             rivals cannot unseal, so filling the cap with rivals must not \
+             evict it"
+        );
     }
 }

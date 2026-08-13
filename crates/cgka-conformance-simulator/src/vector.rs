@@ -9,10 +9,7 @@ use crate::{
     ScenarioInputLedgerEntry, ScenarioSpec,
 };
 use cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot;
-use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
-    GroupStateChange,
-};
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
 use marmot_forensics::AuditEventKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -186,28 +183,9 @@ pub enum TraceExpectation {
         client: String,
         changes: Vec<EpochChangeObservation>,
     },
-    ClientRecoveries {
-        client: String,
-        count: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_epoch: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        recovered_epoch: Option<u64>,
-        #[serde(default)]
-        winner_differs_from_invalidated: bool,
-    },
-    RecoverySummary {
-        count: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_epoch: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        recovered_epoch: Option<u64>,
-        #[serde(default)]
-        winner_differs_from_invalidated: bool,
-    },
     /// Assert against the client's **settled** convergence decision: the last
-    /// convergence pass that actually evaluated a candidate set. Not count-based
-    /// like [`Self::RecoverySummary`], and deliberately not any-match — the
+    /// convergence pass that actually evaluated a candidate set. Not
+    /// count-based, and deliberately not any-match — the
     /// engine emits one decision per settle pass, and an earlier pass can select
     /// a branch a later pass supersedes, so any-match would let a vector bind to
     /// a superseded intermediate (or a trailing no-candidate pass). A field left
@@ -734,53 +712,6 @@ impl TraceExpectation {
                     None => missing_client(client, self, mismatches),
                 }
             }
-            TraceExpectation::ClientRecoveries {
-                client,
-                count,
-                source_epoch,
-                recovered_epoch,
-                winner_differs_from_invalidated,
-            } => match client_observation(observed, client) {
-                Some(observation) => {
-                    compare_recoveries(
-                        RecoveryExpectation {
-                            scope: "client",
-                            label: client,
-                            recoveries: &observation.recoveries,
-                            count: *count,
-                            source_epoch: *source_epoch,
-                            recovered_epoch: *recovered_epoch,
-                            winner_differs_from_invalidated: *winner_differs_from_invalidated,
-                        },
-                        mismatches,
-                    );
-                }
-                None => missing_client(client, self, mismatches),
-            },
-            TraceExpectation::RecoverySummary {
-                count,
-                source_epoch,
-                recovered_epoch,
-                winner_differs_from_invalidated,
-            } => {
-                let recoveries = observed
-                    .observations
-                    .iter()
-                    .flat_map(|observation| observation.recoveries.iter().cloned())
-                    .collect::<Vec<_>>();
-                compare_recoveries(
-                    RecoveryExpectation {
-                        scope: "trace",
-                        label: &observed.name,
-                        recoveries: &recoveries,
-                        count: *count,
-                        source_epoch: *source_epoch,
-                        recovered_epoch: *recovered_epoch,
-                        winner_differs_from_invalidated: *winner_differs_from_invalidated,
-                    },
-                    mismatches,
-                );
-            }
             TraceExpectation::ConvergenceDecision {
                 client,
                 selected_branch_id,
@@ -842,83 +773,6 @@ fn clear_wall_clock_ledger_measurements(trace: &mut ScenarioTrace) {
             if let Some(entry) = &mut probe.recipient_ledger {
                 entry.blocked_send_duration_us = 0;
             }
-        }
-    }
-}
-
-struct RecoveryExpectation<'a> {
-    scope: &'static str,
-    label: &'a str,
-    recoveries: &'a [ForkRecoveryObservation],
-    count: usize,
-    source_epoch: Option<u64>,
-    recovered_epoch: Option<u64>,
-    winner_differs_from_invalidated: bool,
-}
-
-fn compare_recoveries(
-    expected_recovery: RecoveryExpectation<'_>,
-    mismatches: &mut Vec<ExpectationFailure>,
-) {
-    let RecoveryExpectation {
-        scope,
-        label,
-        recoveries,
-        count,
-        source_epoch,
-        recovered_epoch,
-        winner_differs_from_invalidated,
-    } = expected_recovery;
-
-    if recoveries.len() != count {
-        mismatches.push(ExpectationFailure {
-            kind: format!("{scope}_recovery_count_mismatch"),
-            message: format!(
-                "{scope} {label} recorded {} recoveries, expected {count}",
-                recoveries.len()
-            ),
-            expected: json!({
-                "count": count,
-                "source_epoch": source_epoch,
-                "recovered_epoch": recovered_epoch,
-                "winner_differs_from_invalidated": winner_differs_from_invalidated,
-            }),
-            actual: json!(recoveries),
-        });
-        return;
-    }
-    for recovery in recoveries {
-        if source_epoch.is_some_and(|expected| recovery.source_epoch != expected) {
-            mismatches.push(ExpectationFailure {
-                kind: format!("{scope}_recovery_source_epoch_mismatch"),
-                message: format!(
-                    "{scope} {label} recovery source epoch was {}",
-                    recovery.source_epoch
-                ),
-                expected: json!(source_epoch),
-                actual: json!(recovery),
-            });
-        }
-        if recovered_epoch.is_some_and(|expected| recovery.recovered_epoch != expected) {
-            mismatches.push(ExpectationFailure {
-                kind: format!("{scope}_recovery_epoch_mismatch"),
-                message: format!(
-                    "{scope} {label} recovered to epoch {}",
-                    recovery.recovered_epoch
-                ),
-                expected: json!(recovered_epoch),
-                actual: json!(recovery),
-            });
-        }
-        if winner_differs_from_invalidated && recovery.winner == recovery.invalidated {
-            mismatches.push(ExpectationFailure {
-                kind: format!("{scope}_recovery_ordering_mismatch"),
-                message: format!(
-                    "{scope} {label} recovery used the same winner and invalidated key"
-                ),
-                expected: json!({"winner_differs_from_invalidated": true}),
-                actual: json!(recovery),
-            });
         }
     }
 }
@@ -1089,7 +943,6 @@ pub struct ClientObservation {
     pub epoch_changes: Vec<EpochChangeObservation>,
     #[serde(default)]
     pub app_invalidations: Vec<AppInvalidationObservation>,
-    pub recoveries: Vec<ForkRecoveryObservation>,
     /// Convergence decisions the engine emitted, captured via the forensic
     /// recorder (no `GroupEvent` carries them). Defaulted for backward
     /// compatibility with serialized traces that predate the field.
@@ -1104,7 +957,6 @@ pub struct ClientEventCounts {
     pub member_removed: usize,
     pub epoch_changed: usize,
     pub app_invalidated: usize,
-    pub fork_recovered: usize,
 }
 
 fn client_observation<'a>(
@@ -1181,22 +1033,6 @@ pub struct AppInvalidationObservation {
     pub epoch: u64,
     pub reason: String,
     pub payload_ref: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkRecoveryObservation {
-    pub source_epoch: u64,
-    pub recovered_epoch: u64,
-    pub winner: RecoveryOrderingKeyObservation,
-    pub invalidated: RecoveryOrderingKeyObservation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct RecoveryOrderingKeyObservation {
-    pub source_epoch: u64,
-    pub priority: CommitOrderingPriority,
-    pub committer: String,
-    pub commit_digest: String,
 }
 
 /// A convergence decision projected from an
@@ -1300,10 +1136,6 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
             .iter()
             .filter(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. }))
             .count(),
-        fork_recovered: events
-            .iter()
-            .filter(|event| matches!(event, GroupEvent::ForkRecovered { .. }))
-            .count(),
     };
     ClientObservation {
         client: label.into(),
@@ -1373,24 +1205,6 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
                 _ => None,
             })
             .collect(),
-        recoveries: events
-            .iter()
-            .filter_map(|e| match e {
-                GroupEvent::ForkRecovered {
-                    source_epoch,
-                    recovered_epoch,
-                    winner,
-                    invalidated,
-                    ..
-                } => Some(ForkRecoveryObservation {
-                    source_epoch: source_epoch.0,
-                    recovered_epoch: recovered_epoch.0,
-                    winner: observe_key(winner),
-                    invalidated: observe_key(invalidated),
-                }),
-                _ => None,
-            })
-            .collect(),
         convergence_decisions: captured_decisions
             .iter()
             .filter_map(observe_convergence_decision)
@@ -1440,15 +1254,6 @@ fn observe_app_invalidation_reason(reason: AppMessageInvalidationReason) -> Stri
     .into()
 }
 
-fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
-    RecoveryOrderingKeyObservation {
-        source_epoch: key.source_epoch.0,
-        priority: key.priority,
-        committer: hex::encode(key.committer.as_slice()),
-        commit_digest: hex::encode(key.commit_digest),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1471,7 +1276,6 @@ mod tests {
             removed_members: Vec::new(),
             epoch_changes: Vec::new(),
             app_invalidations: Vec::new(),
-            recoveries: Vec::new(),
             convergence_decisions: Vec::new(),
         }
     }

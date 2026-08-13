@@ -128,15 +128,23 @@ impl MessageStorage for SqliteAccountStorage {
     }
 
     fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()> {
-        let GroupEvent::MessageReceived {
-            group_id,
-            message_id,
-            ..
-        } = event
-        else {
-            return Err(StorageError::Backend(
-                "pending application outbox accepts only MessageReceived events".to_owned(),
-            ));
+        let (group_id, message_id) = match event {
+            GroupEvent::MessageReceived {
+                group_id,
+                message_id,
+                ..
+            } => (group_id, message_id),
+            GroupEvent::GroupJoined {
+                group_id,
+                via_welcome,
+                ..
+            } => (group_id, via_welcome),
+            _ => {
+                return Err(StorageError::Backend(
+                    "pending application outbox accepts only MessageReceived and GroupJoined events"
+                        .to_owned(),
+                ));
+            }
         };
         let record = serialize(event)?;
         let write = || {

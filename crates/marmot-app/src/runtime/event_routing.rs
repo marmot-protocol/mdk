@@ -56,6 +56,8 @@ pub(crate) fn projection_update_matches_query(
 }
 
 pub(crate) fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
+    // Projection application already derives canonical-vs-wall ordering from
+    // this field, so global windows can safely merge per-group deltas.
     query
         .search
         .as_ref()
@@ -126,7 +128,6 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             }
             GroupEvent::GroupStateChanged { .. }
             | GroupEvent::EpochChanged { .. }
-            | GroupEvent::ForkRecovered { .. }
             | GroupEvent::CommitRolledBack { .. }
             | GroupEvent::GroupStateInvalidated { .. }
             | GroupEvent::GroupUnrecoverable { .. }
@@ -161,7 +162,6 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
-        | GroupEvent::ForkRecovered { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupStateInvalidated { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }

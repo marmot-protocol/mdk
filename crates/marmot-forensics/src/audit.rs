@@ -214,6 +214,46 @@ pub enum ConvergencePhase {
     Unrecoverable,
 }
 
+/// What armed an epoch-gap backfill for one stalled group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochStallBackfillTrigger {
+    UndecryptableThreshold,
+    ResourceRefusal,
+}
+
+/// Worker seam that executed a pending epoch-gap backfill replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillExecutionSeam {
+    Startup,
+    Receive,
+    ExplicitCatchUp,
+    Maintenance,
+}
+
+/// Scope of the transport replay issued for epoch-gap recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillReplayScope {
+    AccountFullHistory,
+}
+
+/// Typed outcome of `activate_transport(None)` during epoch-gap recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillActivationOutcome {
+    Succeeded,
+    Failed,
+}
+
+/// Why a pending epoch-gap replay was not executed on this pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillDeferredReason {
+    GroupEpochUnavailable,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditHumanActionContext {
     pub action: String,
@@ -853,8 +893,10 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state_digest: Option<DigestHex>,
     },
-    /// `ForkRecoveryManager::resolve` returned a verdict for a same-epoch
-    /// candidate.
+    /// A pairwise same-epoch fork resolution verdict. Emitted only by
+    /// pre-unification engine versions (the pairwise fork-resolution route
+    /// was deleted in favor of distributed convergence); the kind is kept so
+    /// historical JSONL exports remain parseable.
     ForkResolution {
         source_epoch: u64,
         candidate_digest: DigestHex,
@@ -982,9 +1024,9 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relay_results: Vec<RelayRegistration>,
     },
-    /// The transport drain loop (`sync_sdk_relay`) finished draining inbound
-    /// deliveries and is about to persist state. Records how long the drain ran
-    /// (`duration_ms`, true wall-clock), how many deliveries it ingested
+    /// The transport drain loop (`sync_sdk_relay`) reached a success or failure
+    /// exit. Records how long the drain ran (`duration_ms`, true wall-clock),
+    /// how many deliveries it ingested
     /// (`deliveries`), and the durable transport cursor immediately before and
     /// after the drain (`cursor_before_secs` / `cursor_after_secs`; `None`
     /// before any delivery has ever advanced the cursor).
@@ -1018,9 +1060,57 @@ pub enum AuditEventKind {
     /// the distinct-undecryptable count that armed the backfill, carried so an
     /// export is self-describing when the constant is retuned across builds.
     ///
-    /// Privacy: two scalar counts only — no ids, relay URLs, message ids, or
-    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
-    EpochStallBackfillArmed { stalled_epoch: u64, threshold: u64 },
+    /// Privacy: scalar counts plus a closed trigger enum only — no ids, relay
+    /// URLs, message ids, or payloads — so nothing here needs scrubbing in
+    /// either [`AuditDataMode`]. `trigger` is optional only so existing v2 rows
+    /// emitted before this field was added remain readable.
+    EpochStallBackfillArmed {
+        stalled_epoch: u64,
+        threshold: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<EpochStallBackfillTrigger>,
+    },
+    /// A pending epoch-gap backfill replay began executing. Account-scoped:
+    /// the replay is account-wide even when multiple groups armed it.
+    /// Correlated with the arm and terminal rows via `context.operation_id`.
+    EpochStallBackfillStarted {
+        seam: EpochBackfillExecutionSeam,
+        replay_scope: EpochBackfillReplayScope,
+        retry_ordinal: u64,
+    },
+    /// A pending epoch-gap backfill replay finished after activation and drain.
+    /// Group-scoped: `group_ref` is the armed group whose local epoch is
+    /// compared before and after the replay. `group_advanced` is true only when
+    /// that group's observed local epoch increased across the attempt.
+    EpochStallBackfillCompleted {
+        retry_ordinal: u64,
+        duration_ms: u64,
+        activation_outcome: EpochBackfillActivationOutcome,
+        deliveries: u64,
+        local_epoch_before: u64,
+        local_epoch_after: u64,
+        group_advanced: bool,
+    },
+    /// A pending epoch-gap backfill replay failed or could not recover the
+    /// armed group. Group-scoped for the same epoch observation semantics as
+    /// [`Self::EpochStallBackfillCompleted`]. Pending recovery is retained.
+    EpochStallBackfillFailed {
+        retry_ordinal: u64,
+        duration_ms: u64,
+        activation_outcome: EpochBackfillActivationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        deliveries: u64,
+        local_epoch_before: u64,
+        local_epoch_after: u64,
+        group_advanced: bool,
+    },
+    /// A pending epoch-gap backfill replay was not executed on this pass.
+    /// Account-scoped; does not clear pending recovery.
+    EpochStallBackfillDeferred {
+        reason: EpochBackfillDeferredReason,
+        retry_ordinal: u64,
+    },
     /// A group armed `arms` epoch-gap backfills without ever passing cleanly
     /// through an epoch: full-history replay keeps recovering some backlog while
     /// the device stays behind the group. Emitted once per unrecovered run, at
@@ -1114,6 +1204,10 @@ impl AuditEventKind {
             AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
             AuditEventKind::SyncDrain { .. } => "sync_drain",
             AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
+            AuditEventKind::EpochStallBackfillStarted { .. } => "epoch_stall_backfill_started",
+            AuditEventKind::EpochStallBackfillCompleted { .. } => "epoch_stall_backfill_completed",
+            AuditEventKind::EpochStallBackfillFailed { .. } => "epoch_stall_backfill_failed",
+            AuditEventKind::EpochStallBackfillDeferred { .. } => "epoch_stall_backfill_deferred",
             AuditEventKind::EpochStallBackfillEscalated { .. } => "epoch_stall_backfill_escalated",
             AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
         }

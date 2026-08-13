@@ -7,7 +7,7 @@
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::engine::{CommitOrderingKey, SendResult};
+use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
 use cgka_traits::error::EngineError;
 use cgka_traits::maintenance::{
@@ -129,7 +129,6 @@ impl<S: StorageProvider> Engine<S> {
             target_epoch: EpochId(source_epoch.0.saturating_add(1)),
             phase: GroupEvolutionPhase::Preparing,
             semantic,
-            recovery_snapshot: None,
             own_leaf_before_hash: Some(own_leaf_before_hash),
             removal_members: Vec::new(),
             signed_message_id: None,
@@ -139,21 +138,8 @@ impl<S: StorageProvider> Engine<S> {
         maintenance_storage.put_group_evolution(&evolution)?;
         let preparation_guard = PreparingEvolutionGuard::arm(&self.storage, evolution_id.clone());
 
-        let mut pending_commit_guard =
+        let pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        let recovery_snapshot =
-            self.fork_recovery
-                .create_snapshot(&self.storage, &group_id, source_epoch)?;
-        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
-        evolution.recovery_snapshot = Some(recovery_snapshot.clone());
-        self.maintenance_storage()?
-            .put_group_evolution(&evolution)?;
-        self.audit_snapshot_created(
-            &group_id,
-            &recovery_snapshot,
-            source_epoch,
-            "pre_self_update_commit",
-        );
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -187,8 +173,6 @@ impl<S: StorageProvider> Engine<S> {
             staged_commit,
             mls_group.own_leaf_index(),
         )?;
-        let commit_priority =
-            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -225,19 +209,7 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        self.track_pending_commit_for_recovery(
-            pending_ref,
-            group_id.clone(),
-            source_epoch,
-            wrapped.id.clone(),
-            CommitOrderingKey::from_commit_bytes(
-                source_epoch,
-                commit_priority,
-                self.identity.self_id().clone(),
-                &commit_bytes,
-            ),
-            recovery_snapshot,
-        );
+        self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
         pending_commit_guard.disarm();
         preparation_guard.disarm();
 

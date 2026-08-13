@@ -7,7 +7,7 @@ use crate::{
         replace_encrypted_media_secret_references_tx,
         retire_unreferenced_encrypted_media_secret_epochs_tx,
     },
-    optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
+    i64_to_u64, optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_event::{
     AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
@@ -21,19 +21,32 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The ONE display order for the materialized message-timeline / chat-list
-/// surface: `(timeline_at, message_id_hex)` (#736 boundary contract 1). This is
-/// the cross-client user-visible order (`timeline_at == recorded_at` at
-/// projection). It is a SEPARATE surface from the raw-event replay cursor
-/// (`AppEventReplayCursor`, which additionally tie-breaks on the LOCAL
-/// `insert_order` and is used only for lag-recovery watermark/suppression). Keep
-/// the two distinct: the replay cursor MUST NOT be applied to timeline
-/// pagination. Timeline record queries alias the materialized table as
-/// `timeline` and reference these constants; a few other lookups and the
-/// keyset-pagination predicates express the SAME order inline.
-pub(crate) const TIMELINE_ORDER_BY_ASC: &str =
+/// Canonical per-group display order for the materialized timeline. Authenticated
+/// source epochs establish the durable boundaries: a kind-1210 row establishing
+/// epoch N sorts before application rows authenticated in N, and every row in N
+/// sorts before the state row for N+1. The local observation timestamp remains a
+/// display/retention value, not the group-history authority.
+///
+/// The leading class keeps pre-source-epoch legacy and failed-local rows ahead of
+/// canonical history, while unresolved optimistic local rows (no source id, no
+/// epoch, and no invalidation) remain at the head.
+/// Global, cross-group queries retain wall-clock order because epochs are local
+/// to a group and therefore cannot be compared across groups.
+pub(crate) const TIMELINE_GROUP_ORDER_BY_ASC: &str = "ORDER BY
+     timeline.timeline_order_class ASC,
+     timeline.timeline_order_primary ASC,
+     timeline.timeline_order_phase ASC,
+     timeline.timeline_order_at ASC,
+     timeline.message_id_hex ASC";
+pub(crate) const TIMELINE_GROUP_ORDER_BY_DESC: &str = "ORDER BY
+     timeline.timeline_order_class DESC,
+     timeline.timeline_order_primary DESC,
+     timeline.timeline_order_phase DESC,
+     timeline.timeline_order_at DESC,
+     timeline.message_id_hex DESC";
+pub(crate) const TIMELINE_WALL_ORDER_BY_ASC: &str =
     "ORDER BY timeline.timeline_at ASC, timeline.message_id_hex ASC";
-pub(crate) const TIMELINE_ORDER_BY_DESC: &str =
+pub(crate) const TIMELINE_WALL_ORDER_BY_DESC: &str =
     "ORDER BY timeline.timeline_at DESC, timeline.message_id_hex DESC";
 
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
@@ -128,6 +141,21 @@ pub struct TimelineMessageRecord {
     /// tombstone instead of silently disappearing. Carries the engine invalidation
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+}
+
+impl TimelineMessageRecord {
+    /// Stable per-group order derived only from accepted history plus the
+    /// authenticated inner event time. Local receive time never participates.
+    pub fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
+        canonical_timeline_order_key(
+            self.source_message_id_hex.as_deref(),
+            self.source_epoch,
+            self.invalidation_status.as_deref(),
+            self.kind,
+            self.timeline_at,
+            &self.message_id_hex,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,11 +342,14 @@ enum CursorDirection {
     After,
 }
 
+type OwnedTimelineOrderKey = (u8, u64, u8, u64, String);
+
 #[derive(Clone, Debug)]
 struct ValidatedPagination {
     direction: CursorDirection,
     cursor_at: Option<u64>,
     cursor_message_id_hex: Option<String>,
+    cursor_order: Option<OwnedTimelineOrderKey>,
     /// Inclusive upper bound for a `Before` cursor (see
     /// [`TimelinePagination::before_inclusive`]); ignored for other directions.
     inclusive: bool,
@@ -504,7 +535,7 @@ impl SqliteAccountStorage {
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
-                    source_message_id_hex = excluded.source_message_id_hex,
+                    source_message_id_hex = COALESCE(app_events.source_message_id_hex, excluded.source_message_id_hex),
                     source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
@@ -795,9 +826,40 @@ impl SqliteAccountStorage {
     }
 
     pub fn message_timeline(&self, query: TimelineMessageQuery) -> StorageResult<TimelinePage> {
-        let pagination = validate_pagination(&query.pagination)?;
-        let (sql, params) = timeline_query_sql(&query, &pagination)?;
+        self.message_timeline_ordered(query, true)
+    }
+
+    /// Query by the legacy wall-clock tuple regardless of group source epochs.
+    /// Retention uses this because expiry cutoffs are timestamps, not display
+    /// cursors; ordinary group timelines should use [`Self::message_timeline`].
+    pub fn message_timeline_by_wall_clock(
+        &self,
+        query: TimelineMessageQuery,
+    ) -> StorageResult<TimelinePage> {
+        self.message_timeline_ordered(query, false)
+    }
+
+    fn message_timeline_ordered(
+        &self,
+        query: TimelineMessageQuery,
+        canonical_group_order: bool,
+    ) -> StorageResult<TimelinePage> {
+        let canonical_group_order = canonical_group_order && query.group_id_hex.is_some();
+        let mut pagination = validate_pagination(&query.pagination)?;
         let conn = self.lock()?;
+        if canonical_group_order
+            && let (Some(group_id_hex), Some(cursor_message_id_hex)) = (
+                query.group_id_hex.as_deref(),
+                pagination.cursor_message_id_hex.as_deref(),
+            )
+        {
+            pagination.cursor_order = Some(timeline_order_cursor_tx(
+                &conn,
+                group_id_hex,
+                cursor_message_id_hex,
+            )?);
+        }
+        let (sql, params) = timeline_query_sql(&query, &pagination, canonical_group_order)?;
         let rows = {
             let _span = tracing::debug_span!(
                 target: "storage_sqlite::timeline",
@@ -1111,25 +1173,29 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
+    let sql = format!(
+        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
+                media_json,
+                CASE
+                    WHEN direction != 'sent' THEN 'not_applicable'
+                    WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
+                    WHEN source_message_id_hex IS NULL THEN 'pending'
+                    ELSE 'delivered'
+                END
+         FROM message_timeline
+         WHERE group_id_hex = ?1
+           AND kind = ?2
+           AND (
+               invalidation_status IS NULL
+               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+           )
+         ORDER BY {}
+         LIMIT 1",
+        crate::chat_list::CHAT_LIST_PREVIEW_ORDER_DESC
+    );
     let latest = tx
         .query_row(
-            "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                    media_json,
-                    CASE
-                        WHEN direction != 'sent' THEN 'not_applicable'
-                        WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
-                        WHEN source_message_id_hex IS NULL THEN 'pending'
-                        ELSE 'delivered'
-                    END
-             FROM message_timeline
-             WHERE group_id_hex = ?1
-               AND kind = ?2
-               AND (
-                   invalidation_status IS NULL
-                   OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
-               )
-             ORDER BY timeline_at DESC, message_id_hex DESC
-             LIMIT 1",
+            &sql,
             params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
             |row| {
                 Ok((
@@ -1604,6 +1670,39 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             if row.deleted { 1_i64 } else { 0_i64 },
             &row.deleted_by_message_id_hex,
             &row.invalidation_status,
+        ],
+    )
+    .storage()?;
+    // A read marker can point at an optimistic local row whose canonical key
+    // changes when the send is reconciled to authenticated MLS history. Keep
+    // the durable anchor synchronized with that row while it exists; if
+    // retention later removes the row, the last synchronized key remains.
+    let (order_class, order_primary, order_phase, order_at, _id) = canonical_timeline_order_key(
+        row.source_message_id_hex.as_deref(),
+        row.source_epoch,
+        row.invalidation_status.as_deref(),
+        row.kind,
+        row.timeline_at,
+        &row.message_id_hex,
+    );
+    tx.execute(
+        "UPDATE conversation_read_state
+         SET last_read_timeline_at = ?3,
+             last_read_order_class = ?4,
+             last_read_order_primary = ?5,
+             last_read_order_phase = ?6,
+             last_read_order_at = ?7,
+             updated_at = ?8
+         WHERE group_id_hex = ?1 AND last_read_message_id_hex = ?2",
+        params![
+            &row.group_id_hex,
+            &row.message_id_hex,
+            u64_to_i64(row.timeline_at)?,
+            i64::from(order_class),
+            u64_to_i64(order_primary)?,
+            i64::from(order_phase),
+            u64_to_i64(order_at)?,
+            u64_to_i64(unix_now_seconds())?
         ],
     )
     .storage()?;
@@ -2340,11 +2439,59 @@ fn timeline_records_by_ids_tx(
             .storage()?;
         messages.extend(chunk_messages);
     }
-    messages.sort_by(|left, right| {
-        (left.timeline_at, &left.message_id_hex).cmp(&(right.timeline_at, &right.message_id_hex))
-    });
+    messages.sort_by(|left, right| left.canonical_order_key().cmp(&right.canonical_order_key()));
     attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
+}
+
+fn timeline_order_cursor_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<OwnedTimelineOrderKey> {
+    let row = tx
+        .query_row(
+            "SELECT source_message_id_hex, source_epoch, invalidation_status,
+                    kind, timeline_at, message_id_hex
+             FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .storage()?;
+    let Some((
+        source_message_id_hex,
+        source_epoch,
+        invalidation_status,
+        kind,
+        timeline_at,
+        message_id_hex,
+    )) = row
+    else {
+        return Err(StorageError::TimelineCursorExpired);
+    };
+    let source_epoch = source_epoch.map(i64_to_u64).transpose()?;
+    let kind = i64_to_u64(kind)?;
+    let timeline_at = i64_to_u64(timeline_at)?;
+    let (class, primary, phase, at, _) = canonical_timeline_order_key(
+        source_message_id_hex.as_deref(),
+        source_epoch,
+        invalidation_status.as_deref(),
+        kind,
+        timeline_at,
+        &message_id_hex,
+    );
+    Ok((class, primary, phase, at, message_id_hex))
 }
 
 fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<ValidatedPagination> {
@@ -2383,14 +2530,32 @@ fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<Validat
         direction,
         cursor_at,
         cursor_message_id_hex,
+        cursor_order: None,
         inclusive: pagination.before_inclusive,
         limit,
     })
 }
 
+fn canonical_cursor_params(
+    class: u8,
+    primary: u64,
+    phase: u8,
+    timeline_at: u64,
+    message_id_hex: &str,
+) -> StorageResult<Vec<rusqlite::types::Value>> {
+    Ok(vec![
+        rusqlite::types::Value::Integer(i64::from(class)),
+        rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+        rusqlite::types::Value::Integer(i64::from(phase)),
+        rusqlite::types::Value::Integer(u64_to_i64(timeline_at)?),
+        rusqlite::types::Value::Text(message_id_hex.to_owned()),
+    ])
+}
+
 fn timeline_query_sql(
     query: &TimelineMessageQuery,
     pagination: &ValidatedPagination,
+    canonical_group_order: bool,
 ) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
     let mut clauses = Vec::new();
     let mut params = Vec::new();
@@ -2410,10 +2575,32 @@ fn timeline_query_sql(
             escape_like_literal(search)
         )));
     }
-    match pagination.direction {
-        CursorDirection::Before => {
-            // An inclusive cursor returns the row equal to the bound too, so the
-            // tie-break comparison flips from `<` to `<=`.
+    match (pagination.direction, pagination.cursor_order.as_ref()) {
+        (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
+            let comparison = if pagination.inclusive { "<=" } else { "<" };
+            clauses.push(format!(
+                "(timeline.timeline_order_class,
+                  timeline.timeline_order_primary,
+                  timeline.timeline_order_phase,
+                  timeline.timeline_order_at,
+                  timeline.message_id_hex) {comparison} (?, ?, ?, ?, ?)"
+            ));
+            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+        }
+        (CursorDirection::After, Some((class, primary, phase, at, id))) => {
+            clauses.push(
+                "(timeline.timeline_order_class,
+                  timeline.timeline_order_primary,
+                  timeline.timeline_order_phase,
+                  timeline.timeline_order_at,
+                  timeline.message_id_hex) > (?, ?, ?, ?, ?)"
+                    .to_owned(),
+            );
+            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+        }
+        (CursorDirection::Before, None) if !canonical_group_order => {
+            // Wall-clock-only queries retain the timestamp cursor semantics.
+            // Canonical group queries resolve a retained row above instead.
             let id_comparison = if pagination.inclusive { "<=" } else { "<" };
             clauses.push(format!(
                 "(timeline.timeline_at < ? OR (timeline.timeline_at = ? AND timeline.message_id_hex {id_comparison} ?))"
@@ -2425,7 +2612,7 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        CursorDirection::After => {
+        (CursorDirection::After, None) if !canonical_group_order => {
             clauses.push(
                 "(timeline.timeline_at > ? OR (timeline.timeline_at = ? AND timeline.message_id_hex > ?))"
                     .to_owned(),
@@ -2437,7 +2624,10 @@ fn timeline_query_sql(
                 pagination.cursor_message_id_hex.clone().unwrap_or_default(),
             ));
         }
-        CursorDirection::None => {}
+        (CursorDirection::Before | CursorDirection::After, None) => {
+            return Err(StorageError::TimelineCursorExpired);
+        }
+        (CursorDirection::None, _) => {}
     }
     params.push(rusqlite::types::Value::Integer(
         i64::try_from(pagination.limit + 1).unwrap_or(i64::MAX),
@@ -2447,9 +2637,11 @@ fn timeline_query_sql(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    let order_sql = match pagination.direction {
-        CursorDirection::After => TIMELINE_ORDER_BY_ASC,
-        CursorDirection::None | CursorDirection::Before => TIMELINE_ORDER_BY_DESC,
+    let order_sql = match (canonical_group_order, pagination.direction) {
+        (true, CursorDirection::After) => TIMELINE_GROUP_ORDER_BY_ASC,
+        (true, CursorDirection::None | CursorDirection::Before) => TIMELINE_GROUP_ORDER_BY_DESC,
+        (false, CursorDirection::After) => TIMELINE_WALL_ORDER_BY_ASC,
+        (false, CursorDirection::None | CursorDirection::Before) => TIMELINE_WALL_ORDER_BY_DESC,
     };
     Ok((
         format!(
@@ -2481,6 +2673,34 @@ fn escape_like_literal(value: &str) -> String {
         escaped.push(ch);
     }
     escaped
+}
+
+pub(crate) fn canonical_timeline_order_key<'a>(
+    source_message_id_hex: Option<&str>,
+    source_epoch: Option<u64>,
+    _invalidation_status: Option<&str>,
+    kind: u64,
+    timeline_at: u64,
+    message_id_hex: &'a str,
+) -> (u8, u64, u8, u64, &'a str) {
+    // All unresolved local projections, including failed sends, stay at the
+    // optimistic head. Chat-list preview selection independently deprioritizes
+    // permanent failures once accepted history exists.
+    let (class, primary) = match source_epoch {
+        Some(epoch) => (1, epoch),
+        None if source_message_id_hex.is_none() => (2, timeline_at),
+        None => (0, timeline_at),
+    };
+    let phase = if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+        && source_message_id_hex.is_none()
+        && source_epoch.is_some()
+    {
+        0
+    } else {
+        1
+    };
+    let intra_epoch_at = if phase == 0 { 0 } else { timeline_at };
+    (class, primary, phase, intra_epoch_at, message_id_hex)
 }
 
 fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {

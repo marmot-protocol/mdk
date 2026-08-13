@@ -53,7 +53,7 @@ semantic_mutations! {
     PublicationAcknowledgement => "publication_acknowledgement",
     RetainedHistoryExpirationBoundary => "retained_history_expiration_boundary",
     GroupProfileProjection => "group_profile_projection",
-    PairwiseLosingBranchTerminalization => "pairwise_losing_branch_terminalization",
+    ProvisionalWinnerTerminalization => "provisional_winner_terminalization",
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,8 +89,8 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
         SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel().await,
         SemanticMutation::RetainedHistoryExpirationBoundary => expiration_sentinel(),
         SemanticMutation::GroupProfileProjection => group_profile_projection_sentinel().await,
-        SemanticMutation::PairwiseLosingBranchTerminalization => {
-            pairwise_loser_terminalization_sentinel()
+        SemanticMutation::ProvisionalWinnerTerminalization => {
+            provisional_winner_terminalization_sentinel()
         }
     };
     MutationSentinelResult {
@@ -100,7 +100,7 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
     }
 }
 
-fn pairwise_loser_terminalization_sentinel() -> (String, String) {
+fn provisional_winner_terminalization_sentinel() -> (String, String) {
     let routed = RouteLifecycleStateV1::new(vec![
         RouteBranchV1 {
             id: 1,
@@ -113,10 +113,10 @@ fn pairwise_loser_terminalization_sentinel() -> (String, String) {
             ordering_key: 1,
         },
     ])
-    .observe_route(DecisionRouteId::PairwiseForkRecovery, Some(1));
+    .observe_route(DecisionRouteId::StoredConvergence, Some(1));
     let baseline = routed.clone().settle().canonical_winner;
     let mutant = routed
-        .settle_with_terminal_pairwise_loser()
+        .settle_with_terminal_provisional_winner()
         .canonical_winner;
     (format!("winner:{baseline:?}"), format!("winner:{mutant:?}"))
 }

@@ -1,0 +1,287 @@
+{
+  "scenario_name": "route-equivalence/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.11",
+  "seed": null,
+  "scenario": {
+    "name": "route-equivalence/v1",
+    "spec_version": "2",
+    "clients": [
+      "alice",
+      "bob",
+      "carol",
+      "dave"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "route-equivalence",
+        "invitees": [
+          "bob",
+          "carol",
+          "dave"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "alice",
+        "name": "alice branch",
+        "pending": "alice-update"
+      },
+      {
+        "type": "update_group_data",
+        "client": "bob",
+        "name": "bob branch",
+        "pending": "bob-update"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "alice-update",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "bob-update",
+        "outcome": "accepted"
+      },
+      {
+        "type": "withhold_message",
+        "selector": {
+          "publication": "alice-update",
+          "class": "commit"
+        },
+        "label": "alice-branch-commit"
+      },
+      {
+        "type": "withhold_message",
+        "selector": {
+          "publication": "bob-update",
+          "class": "commit"
+        },
+        "label": "bob-branch-commit"
+      },
+      {
+        "type": "restart_client",
+        "client": "bob"
+      },
+      {
+        "type": "release_withheld",
+        "label": "bob-branch-commit"
+      },
+      {
+        "type": "release_withheld",
+        "label": "alice-branch-commit"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "dave",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
+        "type": "probe_bidirectional_decryptability",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 7,
+      "client": "alice",
+      "pending": "alice-update",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "bob",
+      "pending": "bob-update",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "clients_converged",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "dave"
+      ],
+      "epoch": 2,
+      "member_count": 4
+    },
+    {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "carol",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "dave",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "dave"
+      ]
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "dave"
+      ]
+    },
+    {
+      "type": "convergence_decision",
+      "client": "alice",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "bob",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "carol",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "dave",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "clients_bidirectionally_decryptable",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "dave"
+      ]
+    }
+  ]
+}

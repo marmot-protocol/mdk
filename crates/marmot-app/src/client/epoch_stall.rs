@@ -17,21 +17,14 @@
 //! [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`], so the runtime can report a group
 //! that full-history replay cannot repair instead of retrying it silently.
 //!
-//! All of this state is process-local, like the stall counts it extends: a
-//! restart — or the client rebuild the runtime performs after a failed receive
-//! pass — forgets an escalated run entirely. Re-escalating then costs a whole
-//! fresh run of [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] arms, and only the
-//! first of those can land at the epoch the device already sits at, because an
-//! arm at an epoch already fired at is skipped: every further arm needs a real
-//! local epoch advance. A group whose epoch is still advancing therefore
-//! escalates again two epochs later at the default threshold — delayed, not
-//! lost — while a group frozen at one local epoch arms once and never escalates
-//! again. That second case is a pre-existing blind spot of the arm counter, not
-//! a restart artifact — a group frozen from its first arm never escalates in a
-//! fresh process either — and is tracked for a follow-up. The
-//! `epoch_stall_backfill_escalated` audit row the caller writes is the only
-//! record that outlives the process, and only where audit logging is enabled
-//! (opt-in, off by default).
+//! All detector state is process-local, like the stall counts it extends.
+//! `sync_with_partial_progress` moves a one-shot escalation into either its
+//! success summary or its failure prefix before the managed runtime can rebuild
+//! the client. The compatibility `sync()` API instead leaves it stashed after
+//! an error so a caller retaining that client receives it on the next successful
+//! seam. A caller that discards such a client also discards the detector run;
+//! the opt-in `epoch_stall_backfill_escalated` audit row is then the only durable
+//! trace.
 //!
 //! The policy is deliberately I/O-free so it can be unit-tested in isolation;
 //! the recovery action it triggers — a full-history transport replay — lives in
@@ -40,6 +33,8 @@
 use std::collections::{HashMap, HashSet};
 
 use cgka_traits::{EpochId, GroupId};
+use marmot_forensics::EpochBackfillDeferredReason;
+use rand::RngCore;
 
 /// Distinct undecryptable messages a group may accumulate at one stalled epoch
 /// before the runtime reads it as stuck and triggers an epoch-gap backfill.
@@ -306,6 +301,64 @@ impl Default for EpochStallDetector {
     }
 }
 
+/// One armed group participating in a coalesced account-wide epoch-gap replay.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingEpochBackfillGroup {
+    pub(crate) stalled_epoch: u64,
+}
+
+/// In-memory deferral seam identity for epoch-gap replay audit debouncing.
+///
+/// Never emitted on the forensic wire; bounded by the pending group's armed set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EpochBackfillDeferredSnapshot {
+    pub(crate) reason: EpochBackfillDeferredReason,
+    pub(crate) retry_ordinal: u64,
+    /// Armed group identity paired with the latest observed local epoch, if any.
+    /// Sorted by opaque group-id bytes for stable comparison.
+    pub(crate) group_epochs: Vec<(GroupId, Option<u64>)>,
+}
+
+/// Pending epoch-gap recovery intent: one opaque attempt id correlates every
+/// lifecycle row for the current arm, and additional groups coalesce into the
+/// same account-wide replay without minting a second attempt.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingEpochBackfill {
+    pub(crate) attempt_id: String,
+    pub(crate) groups: HashMap<GroupId, PendingEpochBackfillGroup>,
+    /// How many execution tries have started for this pending intent.
+    pub(crate) execution_attempts: u32,
+    /// Last deferred audit evidence keyed by the exact deferral seam snapshot.
+    pub(crate) last_deferred_audit: Option<EpochBackfillDeferredSnapshot>,
+}
+
+impl PendingEpochBackfill {
+    pub(crate) fn new() -> Self {
+        Self {
+            attempt_id: new_recovery_attempt_id(),
+            groups: HashMap::new(),
+            execution_attempts: 0,
+            last_deferred_audit: None,
+        }
+    }
+}
+
+fn new_recovery_attempt_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let encoded = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &encoded[0..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+        &encoded[20..32]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +498,26 @@ mod tests {
         assert_eq!(
             detector.observe_undecryptable(b, "b5".into(), EpochId(7)),
             BackfillDecision::ArmAndEscalate { arms: 2 }
+        );
+    }
+
+    #[test]
+    fn deferred_snapshot_distinguishes_observed_epoch_at_same_cardinality() {
+        let g = group(0x01);
+        let phantom = group(0xde);
+        let unchanged = EpochBackfillDeferredSnapshot {
+            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
+            retry_ordinal: 0,
+            group_epochs: vec![(g.clone(), Some(5)), (phantom.clone(), None)],
+        };
+        let epoch_advanced = EpochBackfillDeferredSnapshot {
+            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
+            retry_ordinal: 0,
+            group_epochs: vec![(g, Some(6)), (phantom, None)],
+        };
+        assert_ne!(
+            unchanged, epoch_advanced,
+            "observed local epoch transitions must change the deferral snapshot"
         );
     }
 

@@ -27,6 +27,13 @@ cargo insta review
 `MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted file-backed
 backend on the same rail.
 
+**Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
+production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
+carries no epoch hint, so a device that never entered that epoch state reads opaque bytes. Tests whose subject is
+*what a device can see* must opt into `support::epoch_sealed_peeler::EpochSealedPeeler`, which models that sealing
+(`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
+epoch-scoped readability; `MockPeeler` stays right for everything else.
+
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation; `Box<dyn CgkaEngine>` witness
 
@@ -46,7 +53,8 @@ backend on the same rail.
   - **Owns:** Phase 4.6/4.7 + 5.4 — `feature_status`, capability cache, capability matrix
 
 - **File:** `fork_detection.rs`
-  - **Owns:** Phase 4.5 — deterministic same-epoch fork recovery plus the unrecoverable `ForkedEpoch` boundary
+  - **Owns:** same-epoch fork resolution through the unified distributed-convergence route (committer, observer,
+    and restarted-committer shapes) plus the missing-anchor fail-closed halt
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, and retained-anchor behavior
@@ -96,6 +104,11 @@ backend on the same rail.
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
 
+- **File:** `epoch_sealed_transport.rs`
+  - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
+    model's own semantics plus the fork shapes that only appear when post-fork traffic on an unadopted branch is
+    unreadable
+
 - **File:** `audit_log.rs`
   - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and no-op default behavior
 
@@ -109,7 +122,7 @@ cargo test -p cgka-engine
 
 - **File:** `canonical_scenarios.rs`
   - **Owns:** Scripted + portable harness scenarios: 3-client happy path, welcome-before-commit, SelfRemove convergence,
-    deliberate fork with recovery observation, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family
+    deliberate fork with convergence resolution, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family
     reports
 
 - **File:** `proptest_invariants.rs`
@@ -185,6 +198,6 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
 Testing engine behavior requires an `Engine<S>` instance which requires a storage backend, so engine-behavior assertions
 go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless the test explicitly needs
 encrypted file-backed persistence. The exceptions are `src/identity.rs`, `src/engine_metrics.rs`, `src/epoch_manager.rs`,
-`src/fork_recovery.rs`, `src/app_components.rs`, `src/canonicalization.rs`, and `src/group_state_changes.rs`, which carry
+`src/app_components.rs`, `src/canonicalization.rs`, and `src/group_state_changes.rs`, which carry
 small in-crate `#[cfg(test)]` modules for pure-data logic (state transitions, diff helpers, policy ordering) that needs
 no `Engine` instance.

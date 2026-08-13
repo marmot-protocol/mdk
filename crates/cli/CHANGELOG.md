@@ -19,6 +19,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   upgrade to this compatibility cohort before downloading blobs above 64 MiB;
   the active blob remains memory-resident and one media request is bounded to
   512 MiB total.
+
+- One publish's relay fanout now runs its per-relay attempts concurrently
+  instead of one awaited relay at a time, so a slow relay no longer serially
+  delays every relay after it. Fanout duration can approach the slowest
+  individual attempt's budget when the transport makes concurrent progress,
+  instead of the sum of per-relay budgets.
+  ([#1397](https://github.com/marmot-protocol/mdk/pull/1397))
+
 - App-runtime encrypted-media secret caching now skips the MLS group load,
   exporter-secret derivation, and database write when the current epoch's
   secret is already cached, and the cache sweep's `required` pre-check uses
@@ -33,6 +41,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - OpenClaw Marmot inbound turns now resolve agent-scoped session stores with the
   routed agent id, and beta message sends bypass the delete-only action adapter
   so they reach durable delivery.
+- Runtime catch-up now emits live events and persists transport progress for
+  deliveries that completed before a later delivery fails the same relay batch.
+  Direct clients receive the applied prefix with the error, and `wn sync`
+  includes that prefix in its human and JSON error output. Successful and
+  partial JSON output now both report projection-update and epoch-stall
+  escalation counts.
 - Local-only group deletion now survives account restart and historical relay
   replay. A per-group deletion frontier suppresses projection reconciliation
   until a causally newer chat message arrives, while a durable engine-to-app
@@ -50,10 +64,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Engine fork-detection integration tests now exercise the pinned v1
   five-commit rewind horizon in normal builds instead of overriding
   `max_rewind_commits` to one.
+- Group timelines now derive their durable order from authenticated MLS source
+  epochs instead of local receive time. State-change rows lead the application
+  messages they authorize, pagination/live windows and read markers share that
+  order, and delayed catch-up converges to the same sequence on every device.
 - Runtime catch-up, key-package maintenance, and every other incremental sync
   seam now execute an armed epoch-gap full-history replay immediately instead of
   waiting for unrelated later relay traffic. Explicit full-history repair also
   consumes a pending replay without issuing the same account-wide query twice.
+- Epoch-gap backfill forensic audit rows now continue past `armed` with typed
+  `started`, `completed`/`failed`, and optional `deferred` lifecycle evidence
+  correlated by `operation_id`, including replay seam, delivery count, transport
+  activation outcome, and per-group local epoch before/after observation. In-flight
+  arms minted during a replay are queued instead of being overwritten when the
+  current attempt fails, and identical deferred evidence is debounced until the
+  observable group-epoch state changes.
 - KeyPackage NIP-09 deletions now surface privacy-safe per-relay rejection
   categories (for example `blocked` or `auth-required`) instead of repeating a
   generic `relay rejected event` summary, while successful deletions still
@@ -353,6 +378,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   `Sendable`/`Error` conformances; the dependency refresh also removes the
   audited `bincode`, `paste`, and `proc-macro-error2` paths and incorporates the
   `nostr` fix for RUSTSEC-2026-0219.
+
+- Same-epoch fork resolution now uses one rule for every member: the
+  committer's pairwise fast-path is removed, and a committer adjudicates a
+  rival commit through the same distributed-convergence pass as an observer,
+  with its own commit materialized from the commit-addressed checkpoints
+  introduced in #1285. When the in-horizon recovery material (the retained
+  source-epoch anchor) is missing, the group fails closed loudly — durable
+  `Unrecoverable` halt plus a `GroupUnrecoverable` event — instead of
+  silently keeping a possibly losing branch. A committer's rival resolution
+  now waits for the convergence pass's quiescence window (~1 s); sends queue
+  during it. The `ForkRecovered` group event and its MarmotKit FFI variant
+  are removed (the convergence-path `CommitRolledBack` +
+  `GroupStateInvalidated` pair is the rollback signal); forensic audit logs
+  keep parsing the historical `fork_resolution` and `snapshot_created` rows,
+  which current engines no longer emit.
 
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
   providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset

@@ -1417,10 +1417,10 @@ async fn openmls_rejects_bare_gce_dictionary_tampering_at_construction() {
 /// `GroupEvent::CommitRolledBack` for the losing commit so the app can tombstone
 /// the kind-1210 rows that losing commit synthesized.
 ///
-/// Unlike the direct staged-commit seam (which fires `ForkRecovered`), this path
-/// routes commits into convergence (`msg_epoch >= current_epoch`), so before
-/// this fix the losing branch's synthesized rows had `origin_commit_id = NULL`
-/// and no event ever targeted them — leaving stale contradictory history.
+/// This path routes commits into convergence (`msg_epoch >= current_epoch`),
+/// so before this fix the losing branch's synthesized rows had
+/// `origin_commit_id = NULL` and no event ever targeted them — leaving stale
+/// contradictory history.
 #[tokio::test]
 async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
     let (mut alice, _alice_storage) = build_client(b"alice");
@@ -1540,7 +1540,7 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
     let events = carol.drain_events();
 
     // (b) The losing commit emits CommitRolledBack so the app can tombstone the
-    // kind-1210 rows it synthesized — there is no ForkRecovered on this path.
+    // kind-1210 rows it synthesized.
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -1576,15 +1576,6 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
         )),
         "the accepted commit must not be named by a withdrawal, got {events:?}"
     );
-    // No ForkRecovered fires here: this is the convergence path, not the direct
-    // staged-commit seam.
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, GroupEvent::ForkRecovered { .. })),
-        "convergence path must not emit ForkRecovered, got {events:?}"
-    );
-
     // (a) The winning branch's MemberAdded row is attributed to the accepted
     // commit, so a later rollback of *that* commit could tombstone it too.
     let selected_invitee = if app_branch_index == 0 {
@@ -1802,8 +1793,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         )),
         "expected CommitRolledBack for the superseded removal, got {events:?}"
     );
-    // The winning rename is never withdrawn, and no direct-seam ForkRecovered
-    // fires on the stored-convergence path.
+    // The winning rename is never withdrawn.
     assert!(
         !events.iter().any(|event| matches!(
             event,
@@ -1811,12 +1801,6 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
                 if *invalidated_commit_id == content_id(&rename_commit)
         )),
         "the accepted rename must not be withdrawn, got {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, GroupEvent::ForkRecovered { .. })),
-        "stored convergence must not emit ForkRecovered, got {events:?}"
     );
     // Roster correction: the reorg diff re-announces our membership relative
     // to the previously presented (removed) roster, attributed to the
@@ -4474,6 +4458,175 @@ async fn a_verified_repair_schedules_the_drain_for_retained_intents_without_a_re
     carol
         .confirm_queued_outbound_intent(&intent_id)
         .expect("the drained intent is the one that was queued before the halt");
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "test-conformance-snapshot")]
+#[tokio::test]
+async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
+    // Retention across a halt is the dramatic case; this is the ordinary one.
+    // A `Stable` observer inside an open convergence pass also retains an app
+    // message, and the same promise applies: something must bring the drain
+    // back, and the engine's own progress projection must say so.
+    //
+    // Two signals carry that, and a host needs both. The schedule edge tells a
+    // running host to drain now; the structural-progress projection is the
+    // level state a scheduler re-reads after it has consumed that edge. A drain
+    // that consumes the edge without releasing the intent — because the pass
+    // had not settled yet — must not leave the projection claiming the group is
+    // idle while a user's message is still durable and unsent.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+    let mut david = build_client(b"david").0;
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "queued-intent-scheduling".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, invite_pending) = evolution(invite);
+    alice.confirm_published(invite_pending).await.unwrap();
+    assert!(matches!(
+        carol.ingest(route(commit, &group_id)).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_eq!(
+        carol_storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .expect("the buffered commit opens a pass")
+            .cutoff_monotonic_ms(),
+        2_000
+    );
+
+    // A running host has already taken everything the ingest produced, so what
+    // the assertions below observe is what the send itself left behind.
+    carol.drain_events();
+    let scheduled_before_send = carol.drain_pending_convergence_groups();
+
+    let queued = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"typed inside the pass window"),
+        })
+        .await
+        .unwrap();
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("an unsettled pass retains the send, got {other:?}"),
+    };
+    assert!(
+        carol.drain_pending_convergence_groups().contains(&group_id),
+        "queueing a durable outbound intent must schedule the drain that releases \
+         it; scheduled before the send: {scheduled_before_send:?}"
+    );
+
+    // The pass is still inside its quiescence window, so the intent's exit is
+    // the cutoff, not a drain that can run now.
+    let waiting = carol
+        .conformance_structural_progress_snapshot(&group_id)
+        .expect("read-only conformance progress");
+    assert_eq!(waiting.pending_work.queued_outbound_intents, 1);
+    assert_eq!(waiting.earliest_next_wake_monotonic_ms, Some(2_000));
+    assert_eq!(
+        waiting.runnable_work, 0,
+        "an intent waiting on an open pass rides the cutoff wake and must not \
+         report work a drain would refuse: {waiting:?}"
+    );
+
+    // The host wakes at the cutoff and settles the pass — the ordinary prepass a
+    // runtime runs before it drains. That settles convergence without releasing
+    // the intent, and the schedule edge above has already been consumed.
+    clock.advance_ms(1_500);
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group_id, 2_500)
+            .await
+            .unwrap(),
+        "the cutoff has passed, so the pass settles"
+    );
+    carol.drain_events();
+
+    let settled = carol
+        .conformance_structural_progress_snapshot(&group_id)
+        .expect("read-only conformance progress");
+    assert_eq!(settled.pending_work.queued_outbound_intents, 1);
+    assert!(
+        settled.runnable_work > 0 || settled.earliest_next_wake_monotonic_ms.is_some(),
+        "a durable intent nobody has published yet must keep the group armed, \
+         not report an idle group: {settled:?}"
+    );
+
+    // And that is a message, not bookkeeping: the drain publishes it under the
+    // post-settlement epoch and Alice reads it.
+    let mut drained = carol
+        .advance_convergence(&group_id)
+        .await
+        .expect("the armed drain releases the retained intent");
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected exactly the retained message, got {drained:?}"
+    );
+    let SendResult::ApplicationMessage {
+        msg, source_epoch, ..
+    } = drained.remove(0)
+    else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert_eq!(source_epoch, carol.epoch(&group_id).unwrap());
+    assert!(matches!(
+        alice.ingest(route(msg, &group_id)).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            GroupEvent::MessageReceived {
+                sender, payload, ..
+            } => Some((sender, payload)),
+            _ => None,
+        })
+        .expect("alice observes the retained message");
+    assert_eq!(received.0, carol.self_id());
+    assert_eq!(app_content(&received.1), b"typed inside the pass window");
+
+    carol
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("the drained intent is the one the pass window retained");
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)

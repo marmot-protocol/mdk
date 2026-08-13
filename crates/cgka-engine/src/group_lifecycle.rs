@@ -1181,6 +1181,13 @@ impl<S: StorageProvider> Engine<S> {
                 })?;
                 storage.put_ingress_dedup_marker(&welcome_id)?;
                 storage.put_ingress_dedup_marker(&content_id)?;
+                storage.put_pending_application_event(
+                    &cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id: group_id.clone(),
+                        via_welcome: welcome_id.clone(),
+                        welcomer: Some(welcome_sender_id.clone()),
+                    },
+                )?;
 
                 let own_leaf_baseline_hash = mls_group
                     .own_leaf_node()

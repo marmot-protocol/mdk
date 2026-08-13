@@ -61,9 +61,9 @@ use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 // Re-exported so the crate's `tests` module can keep calling
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
-pub(crate) use sync::ConvergenceScheduleState;
 #[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
+pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
 
@@ -107,14 +107,19 @@ pub struct AppClient {
     /// sync summary so live chat-list/group-state subscriptions observe the
     /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
+    /// App-visible outputs ingested during a sync whose account-projection
+    /// checkpoint failed. A retained client keeps the matching projected state
+    /// and outbox acknowledgements, then returns this summary after its next
+    /// successful checkpoint. A reopened client recovers the same outputs from
+    /// the durable engine outbox instead.
+    pub(crate) pending_failed_sync_summary: crate::SyncSummary,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
     /// The detector latches `escalated` one-shot per unrecovered run, so an
     /// escalation dropped by a later `?` on the recording pass is never raised
-    /// again — the run keeps arming in silence. Escalations therefore land here
-    /// rather than on whatever `SyncSummary` the recording pass happened to be
-    /// building, and move onto a summary only at a seam that is returning `Ok`
+    /// again. Escalations therefore land here and move onto either a successful
+    /// summary or a partial-progress failure before a managed client is rebuilt
     /// (see `Self::drain_epoch_stall_escalations`).
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
@@ -140,9 +145,12 @@ pub struct AppClient {
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
     pub(crate) epoch_stall: EpochStallDetector,
-    /// Set when [`epoch_stall`] arms a backfill during ingest; drained after the
-    /// sync by running the full-history transport replay.
-    pub(crate) epoch_backfill_pending: bool,
+    /// Armed epoch-gap recovery intent awaiting its account-wide replay.
+    pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
+    /// when a replay failure must not overwrite a newer arm minted in flight.
+    pub(crate) queued_epoch_backfills:
+        std::collections::VecDeque<epoch_stall::PendingEpochBackfill>,
     /// Temporary full-history subscriptions installed only while a post-join
     /// maintenance obligation is waiting for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:

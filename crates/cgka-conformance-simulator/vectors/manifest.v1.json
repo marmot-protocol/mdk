@@ -142,7 +142,8 @@
       "artifact": "cross-route-own-commit-recovery.v1.json",
       "coverage": [
         "four-participant same-source-epoch commit race",
-        "pairwise committer recovery versus observer-side stored convergence",
+        "settled convergence_decision assertion per participant",
+        "displaced own commit withdrawn by branch selection",
         "ordering-key winner displaced by deeper branch growth",
         "commit-addressed own-branch recovery after encrypted SQLite restart",
         "exact canonical cryptographic agreement",
@@ -236,6 +237,19 @@
         "single app payload emission after replay"
       ],
       "next": "Use as the restart-plus-delivery-fault fixture."
+    },
+    {
+      "id": "route-equivalence/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "route-equivalence.v1.json",
+      "coverage": [
+        "same-epoch group-data commit race resolved by the unified convergence route in one trace",
+        "live committer, observer, and restarted committer agreeing at depth 1",
+        "restarted committer resolving the same fork through convergence over hydrated storage",
+        "strict exact-equivalence, per-client winning-branch profile pins, bidirectional decryptability, and no-pending-work tail"
+      ],
+      "next": "Route-unification acceptance pin (option C Slice B->C, flipped with the pairwise-route deletion): committer, observer, and restarted committer all resolve through distributed convergence and stay exactly equivalent."
     },
     {
       "id": "fork-recovery-incident/v1",

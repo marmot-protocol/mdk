@@ -11,7 +11,8 @@ use cgka_conformance_simulator::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
     ScenarioMessageSelectorV2, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
     ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
-    compare_trace_expectations, generate_admin_churn_family, generate_convergence_chaos_family,
+    compare_trace_expectations, compile_scenario, generate_admin_churn_family,
+    generate_bounded_convergence_pressure_family, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
     observe_client_exact, run_generated_case_report, run_generated_case_report_with_storage_mode,
     run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
@@ -21,7 +22,7 @@ use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::MessageState;
@@ -878,7 +879,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
@@ -899,7 +899,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
@@ -920,7 +919,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
             ],
@@ -1499,6 +1497,157 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
             "send/leave case {} failed strict expectations: {:?}",
             case.case_index,
             report.expectation_failures
+        );
+    }
+}
+
+/// The bounded convergence-pressure campaign generates a deterministic,
+/// schedule-legal case per seed index, and every case carries the full shape
+/// the campaign is defined by: a same-epoch commit race, application sends
+/// issued inside the quiescence window, a committer restart taken
+/// mid-resolution, a finite self-update/profile/admin tail, a bounded-queue
+/// resource assertion, and an active decryptability probe placed before the
+/// terminal `observe_exact`.
+#[test]
+fn bounded_convergence_pressure_family_generates_the_declared_campaign_shape() {
+    let cases = generate_bounded_convergence_pressure_family(2026, 6);
+
+    assert_eq!(cases, generate_bounded_convergence_pressure_family(2026, 6));
+    assert_eq!(cases.len(), 6);
+    for (case_index, case) in cases.iter().enumerate() {
+        assert_eq!(case.family_name, "bounded-convergence-pressure/v1");
+        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.seed, 2026);
+        assert_eq!(case.case_index, case_index as u64);
+        compile_scenario(&case.scenario)
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+    }
+
+    for case in &cases {
+        let steps = &case.scenario.steps;
+        let position = |predicate: fn(&ScenarioStep) -> bool| {
+            steps.iter().position(predicate).unwrap_or_else(|| {
+                panic!("{} is missing a required campaign step", case.scenario.name)
+            })
+        };
+
+        // A same-epoch rival race, both branches withheld until release.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::WithholdMessage { .. }))
+                .count(),
+            2,
+            "{} must withhold both rival commits",
+            case.scenario.name
+        );
+        // Application sends land after the rival branch is ingested, so they sit
+        // inside the quiescence window the committers wait out.
+        let window_open = position(|step| matches!(step, ScenarioStep::ReleaseWithheld { .. }));
+        let first_send = position(|step| matches!(step, ScenarioStep::SendAppMessage { .. }));
+        let restart = position(|step| matches!(step, ScenarioStep::RestartClient { .. }));
+        assert!(
+            window_open < first_send && first_send < restart,
+            "{}: sends must open inside the window and precede the mid-resolution restart",
+            case.scenario.name
+        );
+        // Finite pressure, never an unbounded stream.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::SelfUpdate { .. }))
+                .count(),
+            3,
+            "{} must apply exactly the finite self-update budget",
+            case.scenario.name
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::UpdateAdminPolicy { .. })),
+            "{} must apply an admin-policy commit",
+            case.scenario.name
+        );
+        // Bounded queue behavior, and the bounded-time claim carried by the
+        // quiescence driver's own watchdog budget.
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::Assert { .. })),
+            "{} must bound the pending-input queue",
+            case.scenario.name
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::AwaitQuiescence { .. })),
+            "{} must settle through the bounded quiescence driver",
+            case.scenario.name
+        );
+        // The probe mutates, so it must precede the terminal exact observation.
+        let probe =
+            position(|step| matches!(step, ScenarioStep::ProbeBidirectionalDecryptability { .. }));
+        let observe_exact = steps
+            .iter()
+            .rposition(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+            .expect("the strict oracle appends a terminal exact observation");
+        assert!(
+            probe < observe_exact,
+            "{}: the mutating probe must run before the terminal observe_exact",
+            case.scenario.name
+        );
+
+        assert!(
+            case.expected_outcomes.iter().any(|expectation| matches!(
+                expectation,
+                TraceExpectation::ClientsExactlyEquivalent { .. }
+            )),
+            "{} must pin exact canonical equivalence",
+            case.scenario.name
+        );
+        assert!(
+            case.expected_outcomes
+                .iter()
+                .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. })),
+            "{} must pin no-pending-work",
+            case.scenario.name
+        );
+    }
+}
+
+/// Runnable acceptance gate for the unified fork-resolution route under
+/// **finite** pressure. Every seed must reach quiescence with exact canonical
+/// equivalence, active bidirectional decryptability, and a bounded input queue.
+/// It deliberately claims nothing about progress under an unbounded
+/// self-update stream.
+///
+/// IGNORED — this currently fails on engine behavior, not on the campaign. An
+/// application message accepted while the group is resolving a same-epoch fork
+/// is queued durably and then stranded: once the pass completes, nothing
+/// re-arms the retained-intent drain, and the engine's own conformance
+/// structural progress reports `runnable_work = 0` with no next wake while
+/// `pending_work.queued_outbound_intents > 0`. The quiescence driver therefore
+/// reports `Blocked { subsystems: ["scenario_inputs"] }` and the payload is
+/// never published. Un-ignore once the retained-intent drain is re-armed after
+/// a completed pass; do not weaken the assertions below to make it pass.
+#[ignore = "engine strands application sends accepted inside the convergence quiescence window"]
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_convergence_pressure_family_settles_every_seeded_permutation() {
+    for case in &generate_bounded_convergence_pressure_family(2026, 6) {
+        let report = run_generated_case_report(case, None)
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+        assert!(
+            report.expectation_failures.is_empty(),
+            "{} expectation failures: {:#?}",
+            case.scenario.name,
+            report.expectation_failures
+        );
+        assert!(
+            report.invariant_failures.is_empty(),
+            "{} invariant failures: {:#?}",
+            case.scenario.name,
+            report.invariant_failures
         );
     }
 }
@@ -2108,7 +2257,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
 }
 
 #[tokio::test]
-async fn scenario_report_records_trace_log_recoveries_and_failures() {
+async fn scenario_report_records_trace_log_and_failures() {
     let spec = deliberate_fork_recovery_spec();
 
     let report = run_scenario_report(&spec, None)
@@ -2124,12 +2273,6 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
             .iter()
             .all(|entry| entry.status.is_completed())
     );
-    assert_eq!(report.recovery_observations.len(), 1);
-    let recovery = &report.recovery_observations[0];
-    assert_eq!(recovery.source_epoch, 1);
-    assert_eq!(recovery.recovered_epoch, 2);
-    assert_ne!(recovery.winner, recovery.invalidated);
-    assert!(recovery.winner < recovery.invalidated);
     assert!(report.invariant_failures.is_empty());
 
     let json = serde_json::to_value(&report).expect("report serializes");
@@ -2160,16 +2303,6 @@ async fn group_data_fork_recovery_fixture_uses_semantic_outcomes() {
         assert_eq!(observation.epoch, 2);
         assert_eq!(observation.member_count, 2);
     }
-    let recoveries = trace
-        .observations
-        .iter()
-        .flat_map(|observation| observation.recoveries.iter())
-        .collect::<Vec<_>>();
-    assert_eq!(recoveries.len(), 1);
-    assert_ne!(
-        recoveries[0].winner, recoveries[0].invalidated,
-        "semantic recovery fixture should not depend on exact commit digest bytes"
-    );
 }
 
 #[tokio::test]
@@ -2589,31 +2722,6 @@ async fn deliberate_fork_via_harness() {
         alice_members, bob_members,
         "alice outcomes: {alice_outcomes:?}; bob outcomes: {bob_outcomes:?}"
     );
-    let trace = ScenarioTrace {
-        name: "deliberate-fork-recovery/v1".into(),
-        pending_resolutions: vec![],
-        errors: vec![],
-        admin_policies: vec![],
-        decryptability_probes: vec![],
-        observations: vec![
-            observe_client("alice", &mut alice),
-            observe_client("bob", &mut bob),
-        ],
-    };
-    let recoveries: Vec<_> = trace
-        .observations
-        .iter()
-        .flat_map(|o| o.recoveries.iter())
-        .collect();
-    assert_eq!(
-        recoveries.len(),
-        1,
-        "exactly one peer should roll back to the deterministic winner: {trace:#?}"
-    );
-    assert_eq!(recoveries[0].source_epoch, 1);
-    assert_eq!(recoveries[0].recovered_epoch, 2);
-    assert_ne!(recoveries[0].winner, recoveries[0].invalidated);
-    assert!(recoveries[0].winner < recoveries[0].invalidated);
     let has_david = alice_members.iter().any(|m| m.id == david.member_id());
     let has_eve = alice_members.iter().any(|m| m.id == eve.member_id());
     assert_ne!(has_david, has_eve);
@@ -2759,8 +2867,11 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         );
     }
 
-    let deferred_trace = ScenarioTrace {
-        name: "convergence-e2e/deferred-losing-transport".into(),
+    // The losing branch leaves nothing behind. Its transport object is peeled
+    // under its own branch state, adjudicated, and resolved, so both observers
+    // end the schedule fully quiescent.
+    let settled_trace = ScenarioTrace {
+        name: "convergence-e2e/settled-losing-transport".into(),
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
@@ -2770,19 +2881,19 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
             observe_client_exact("frank", &mut frank),
         ],
     };
-    for observation in &deferred_trace.observations {
+    for observation in &settled_trace.observations {
         let pending = observation
             .pending_work
             .as_ref()
             .expect("exact pending snapshot");
-        assert!(
-            pending.engine.stored_transport_deferred_messages > 0,
-            "{} should expose the retained unpeeled transport object: {pending:#?}",
+        assert_eq!(
+            pending.engine.stored_transport_deferred_messages, 0,
+            "{} should retain no unpeeled transport object: {pending:#?}",
             observation.client
         );
-        assert!(
-            pending.scenario_inputs_pending > 0,
-            "{} should expose the unresolved scenario input: {pending:#?}",
+        assert_eq!(
+            pending.scenario_inputs_pending, 0,
+            "{} should leave no unresolved scenario input: {pending:#?}",
             observation.client
         );
     }
@@ -2791,17 +2902,11 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         &[TraceExpectation::NoPendingWork {
             clients: vec!["carol".into(), "frank".into()],
         }],
-        &deferred_trace,
-    );
-    assert_eq!(
-        failures.len(),
-        2,
-        "each observer should fail quiescence while transport work remains: {failures:#?}"
+        &settled_trace,
     );
     assert!(
-        failures
-            .iter()
-            .all(|failure| failure.kind == "pending_work_remaining")
+        failures.is_empty(),
+        "both observers should reach quiescence: {failures:#?}"
     );
 }
 
@@ -2816,7 +2921,18 @@ async fn scenario_report_records_convergence_e2e_group_events() {
     assert!(report.invariant_failures.is_empty());
     assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
     assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
-    assert!(report.app_invalidation_observations.is_empty());
+    // Each observer retracts bob's losing-branch payload exactly once; the
+    // report must attribute both retractions.
+    assert_eq!(
+        report
+            .app_invalidation_observations
+            .iter()
+            .map(|invalidation| (invalidation.client.as_str(), invalidation.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("carol", "losing_branch"), ("frank", "losing_branch")],
+        "{:#?}",
+        report.app_invalidation_observations
+    );
     assert!(
         report
             .step_log
@@ -2994,20 +3110,48 @@ fn assert_tick_reached_convergence(
     );
 }
 
+/// Pins this client's application timeline across branch selection: exactly the
+/// selected branch's payload reaches the application, it is never taken back,
+/// and the rival branch's payload is retracted explicitly.
+///
+/// Branch-relative peel makes the rival branch's traffic decryptable under that
+/// branch's own state, so the losing payload is now decrypted and adjudicated
+/// instead of sitting undecryptable. That turns "no invalidation ever" into a
+/// live obligation: convergence owes the application a `LosingBranch`
+/// retraction for it.
 fn assert_canonical_application_event(
     client: &str,
     events: Vec<GroupEvent>,
     expected_payload: &[u8],
     losing_payload: &[u8],
 ) {
-    let received_payloads: Vec<Vec<u8>> = events
+    let delivered: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => {
-                Some(cgka_conformance_simulator::client::decode_harness_app_payload(payload))
-            }
+            GroupEvent::MessageReceived {
+                message_id,
+                payload,
+                ..
+            } => Some((
+                message_id,
+                cgka_conformance_simulator::client::decode_harness_app_payload(payload),
+            )),
             _ => None,
         })
+        .collect();
+    let retractions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::AppMessageInvalidated {
+                message_id, reason, ..
+            } => Some((message_id, *reason)),
+            _ => None,
+        })
+        .collect();
+
+    let received_payloads: Vec<Vec<u8>> = delivered
+        .iter()
+        .map(|(_, payload)| payload.clone())
         .collect();
     assert_eq!(
         received_payloads,
@@ -3020,11 +3164,28 @@ fn assert_canonical_application_event(
             .any(|payload| payload == losing_payload),
         "{client} should not receive losing branch payload: {events:?}"
     );
+    // A payload the application was shown and then lost is a failure here,
+    // retracted or not: on this schedule the selected branch is the only one
+    // that ever reaches delivery, so its delivery must stand. A schedule that
+    // legitimately delivers the rival branch first trips this by design.
+    for (message_id, _) in &delivered {
+        assert!(
+            !retractions
+                .iter()
+                .any(|(retracted, _)| retracted == message_id),
+            "{client} retracted a payload it had already delivered: {events:?}"
+        );
+    }
+    assert_eq!(
+        retractions.len(),
+        1,
+        "{client} should retract the losing branch payload exactly once: {events:?}"
+    );
     assert!(
-        !events
+        retractions
             .iter()
-            .any(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. })),
-        "{client} invalidations: {events:?}"
+            .all(|(_, reason)| matches!(reason, AppMessageInvalidationReason::LosingBranch)),
+        "{client} should retract only for losing-branch selection: {events:?}"
     );
     assert!(
         events.iter().any(|event| {
@@ -3041,12 +3202,15 @@ fn assert_canonical_application_event(
     );
 }
 
+/// Pins the settled branch every legacy observation in the convergence-E2E
+/// shape must report: alice's branch carries two invites to bob's one, so
+/// depth decides it for every observer that has been handed both.
 fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
     // The settle tail observes the founders with `observe_client_exact` after
     // canonical branch selection; those snapshots must agree with each other,
     // and the family's own `clients_exactly_equivalent` expectation carries
-    // the exact claim. The branch-shape match below applies to the
-    // mid-schedule legacy observations only.
+    // the exact claim. The branch-shape checks below apply to the legacy
+    // observations only.
     let settled = trace
         .observations
         .iter()
@@ -3062,33 +3226,53 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
         if observation.canonical_state.is_some() {
             continue;
         }
-        match observation.received_payloads.as_slice() {
-            [payload] if payload == "alice canonical payload" => {
-                assert_eq!(observation.epoch, 3);
-                assert_eq!(observation.member_count, 6);
-                assert_eq!(observation.added_members, vec!["david", "grace"]);
-                assert_eq!(
-                    observation.epoch_changes,
-                    vec![
-                        EpochChangeObservation { from: 1, to: 2 },
-                        EpochChangeObservation { from: 2, to: 3 },
-                    ]
-                );
-            }
-            [payload] if payload == "bob losing payload" => {
-                assert_eq!(observation.epoch, 2);
-                assert_eq!(observation.member_count, 5);
-                assert_eq!(observation.added_members, vec!["eve"]);
-                assert_eq!(
-                    observation.epoch_changes,
-                    vec![EpochChangeObservation { from: 1, to: 2 }]
-                );
-            }
-            _ => panic!("unexpected convergence trace observation: {observation:?}"),
+        // Every observer here has been handed both branches and ticked, so it
+        // has settled on the deeper one: alice's two invites, epoch 3, and her
+        // payload as the only application output.
+        assert_eq!(
+            observation.received_payloads,
+            vec!["alice canonical payload"],
+            "{observation:?}"
+        );
+        assert_eq!(observation.epoch, 3, "{observation:?}");
+        assert_eq!(observation.member_count, 6, "{observation:?}");
+        assert_eq!(
+            observation.epoch_changes,
+            vec![
+                EpochChangeObservation { from: 1, to: 2 },
+                EpochChangeObservation { from: 2, to: 3 },
+            ],
+            "{observation:?}"
+        );
+        // Whether the rival branch was adopted first is a delivery-order
+        // detail, so the membership claim is the net diff: anything withdrawn
+        // must be something this client had adopted, and what survives is
+        // exactly the selected branch's addition.
+        for removed in &observation.removed_members {
+            assert!(
+                observation.added_members.contains(removed),
+                "{observation:?}"
+            );
         }
-        assert!(observation.removed_members.is_empty());
-        assert!(observation.app_invalidations.is_empty());
-        assert!(observation.recoveries.is_empty());
+        let net_added: Vec<&str> = observation
+            .added_members
+            .iter()
+            .filter(|member| !observation.removed_members.contains(member))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(net_added, vec!["david", "grace"], "{observation:?}");
+        // Bob's payload decrypts under his own branch state, so it must be
+        // retracted rather than silently dropped.
+        let invalidation_reasons: Vec<&str> = observation
+            .app_invalidations
+            .iter()
+            .map(|invalidation| invalidation.reason.as_str())
+            .collect();
+        assert_eq!(
+            invalidation_reasons,
+            vec!["losing_branch"],
+            "{observation:?}"
+        );
     }
 }
 
@@ -3327,6 +3511,43 @@ async fn cross_route_own_commit_recovery_survives_restart_with_exact_agreement()
             );
         }
     }
+    assert_own_commit_was_withdrawn(&trace, "alpha", "step-6:update_group_data");
+}
+
+/// Pin the own-commit withdrawal as the engine's event pair, not just as a
+/// terminal disposition.
+///
+/// `Invalidated` alone is reachable from several ledger transitions (an epoch
+/// invalidation observed on a peer, an expiry that lost its race). The property
+/// a cross-route recovery vector claims is narrower: the displaced commit's own
+/// author observed `GroupEvent::CommitRolledBack` *and*
+/// `GroupEvent::GroupStateInvalidated { reason: SupersededByBranchSelection }`
+/// for that exact commit. `client.rs` records those two events under the
+/// reasons asserted here, so requiring both names the pair by the only
+/// portable handle the ledger carries.
+fn assert_own_commit_was_withdrawn(
+    trace: &cgka_conformance_simulator::ScenarioTrace,
+    committer: &str,
+    scenario_id: &str,
+) {
+    let observation = trace
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.client == committer)
+        .unwrap_or_else(|| panic!("missing observation for {committer}"));
+    let entry = observation
+        .scenario_input_ledger
+        .iter()
+        .find(|entry| entry.scenario_id == scenario_id)
+        .unwrap_or_else(|| panic!("{committer} missing ledger entry for {scenario_id}"));
+    for reason in ["commit_rolled_back", "group_state_invalidated_superseded"] {
+        assert!(
+            entry.invalidated.iter().any(|observed| observed == reason),
+            "{committer}'s own {scenario_id} must record {reason}; recorded {:?}",
+            entry.invalidated
+        );
+    }
 }
 
 #[tokio::test]
@@ -3428,6 +3649,7 @@ async fn cross_route_recovery_uses_retained_history_after_restart() {
             );
         }
     }
+    assert_own_commit_was_withdrawn(&trace, "alpha", "step-6:update_group_data");
 }
 
 #[tokio::test]

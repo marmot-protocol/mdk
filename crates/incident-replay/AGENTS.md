@@ -74,8 +74,11 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     the simulator's `1 → 2` range; the convergence assertion is winner-agnostic.
 - **Module:** `src/accept.rs`
   - **Role:** `accept` (fork) dispatches on the commit kind. A **group-data** fork
-    tries both label orderings and returns the vector only when the full
-    `RecoverySummary` matches **and** the designated winner's branch survives. A
+    tries both label orderings and returns the vector only when every expectation
+    matches — winner survival among them, since a per-client `GroupProfile`
+    expectation pins the winner's group name, so the ordering search and the
+    acceptance gate are one comparison and the persisted vector carries the
+    winner check into CI. A
     **membership** fork is a single run-and-compare (winner-agnostic ⇒ no label
     search): `member_count == 3` is the survival proof. `accept_convergence` is a
     single run-and-compare (winner-agnostic

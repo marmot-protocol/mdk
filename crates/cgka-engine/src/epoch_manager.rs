@@ -6,7 +6,6 @@
 //! - Owns the `epoch_states` map.
 //! - Issues `PendingStateRef`s and tracks the reverse `pending_ref → group_id`
 //!   index.
-//! - Records pre-commit epochs for fork detection.
 //! - Wraps the legal transitions on [`EpochState`] so engine subsystems
 //!   can't construct non-`Stable` variants directly.
 //!
@@ -17,10 +16,9 @@
 
 use cgka_traits::engine_state::{EpochState, PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::types::{EpochId, GroupId};
 use marmot_forensics::AuditEventContext;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 /// Per-pending sidecar so `confirm_publish` / `rollback_publish` can find
 /// the originating group AND the epoch to revert to on failure. Replaces
@@ -35,14 +33,6 @@ struct PendingMeta {
     /// rows, which are emitted on a later publish-confirm call after the
     /// engine's ambient context has cleared.
     audit_context: Option<AuditEventContext>,
-    /// Whether `begin_pending` newly inserted `prior_epoch` into
-    /// `committed_from` for this pending. A group holds at most one live
-    /// pending, so a fresh insert is owned solely by it and must be removed
-    /// again on `rollback_publish` — otherwise the phantom entry poisons
-    /// fork detection for later same-epoch siblings. `false` means the epoch
-    /// was already owned (e.g. by a previously confirmed commit after a
-    /// fork rollback), and rollback must leave that incumbent in place.
-    owns_committed_from: bool,
 }
 
 /// Discriminator the engine uses when emitting the post-confirm event.
@@ -60,11 +50,6 @@ pub(crate) struct EpochManager {
     states: HashMap<GroupId, EpochState>,
     pending_counter: u64,
     pending: HashMap<PendingStateRef, PendingMeta>,
-    /// Pre-commit epochs from which we ourselves committed. Used by the
-    /// fork-detection path: when a WrongEpoch arrives for an epoch we
-    /// committed from, AND we've since advanced, the histories have
-    /// forked.
-    committed_from: HashMap<GroupId, BTreeSet<EpochId>>,
 }
 
 impl EpochManager {
@@ -106,13 +91,6 @@ impl EpochManager {
         self.states.get(group_id).is_none_or(|s| s.can_ingest())
     }
 
-    pub(crate) fn we_committed_from(&self, group_id: &GroupId, epoch: EpochId) -> bool {
-        self.committed_from
-            .get(group_id)
-            .map(|s| s.contains(&epoch))
-            .unwrap_or(false)
-    }
-
     // ── Mutation: pending-ref allocation ────────────────────────────────────
 
     pub(crate) fn next_pending_ref(&mut self) -> PendingStateRef {
@@ -144,10 +122,8 @@ impl EpochManager {
     /// Begin a pending publish for the given group. Caller must have
     /// allocated the `pending_ref` via `next_pending_ref` first.
     ///
-    /// Records `pre_commit_epoch` in `committed_from` so the fork-detection
-    /// path can later distinguish "we committed at this epoch" from "this
-    /// is a benign late-arriving commit." Also stashes `pre_commit_epoch`
-    /// as the rollback target for `rollback_publish`.
+    /// Stashes `pre_commit_epoch` as the rollback target for
+    /// `rollback_publish`.
     // Each argument is a distinct piece of the pending-publish transition; a
     // wrapper struct would only move the same fields behind a name.
     #[allow(clippy::too_many_arguments)]
@@ -164,11 +140,11 @@ impl EpochManager {
         // Atomic in the state map (mirrors the Sm1 fix applied to
         // confirm_publish / rollback_publish): clone the prior state and run
         // the fallible transition BEFORE mutating any of self.states /
-        // self.committed_from / self.pending. A failing inner transition (e.g.
-        // a non-Stable prev → InvalidTransition) must leave every map untouched
-        // so the group's EpochState entry is never orphaned. Previously the
-        // entry was removed before the transition and never re-inserted on
-        // error, dropping the group to UnknownGroup (mdk#146).
+        // self.pending. A failing inner transition (e.g. a non-Stable prev →
+        // InvalidTransition) must leave every map untouched so the group's
+        // EpochState entry is never orphaned. Previously the entry was
+        // removed before the transition and never re-inserted on error,
+        // dropping the group to UnknownGroup (mdk#146).
         let prev = self
             .states
             .get(&group_id)
@@ -177,11 +153,6 @@ impl EpochManager {
         let new_state = prev.begin_pending(new_epoch, pending, pending_ref)?;
 
         // The transition succeeded — commit every mutation together.
-        let owns_committed_from = self
-            .committed_from
-            .entry(group_id.clone())
-            .or_default()
-            .insert(pre_commit_epoch);
         self.states.insert(group_id.clone(), new_state);
         self.pending.insert(
             pending_ref,
@@ -190,7 +161,6 @@ impl EpochManager {
                 prior_epoch: pre_commit_epoch,
                 kind,
                 audit_context,
-                owns_committed_from,
             },
         );
         Ok(())
@@ -284,9 +254,7 @@ impl EpochManager {
     /// only handles the state-machine bookkeeping.
     ///
     /// Atomic in the state map: a failed `rollback_pending` leaves
-    /// `pending`, `states`, and `committed_from` untouched. On success the
-    /// provisional `committed_from` entry inserted by this pending's
-    /// `begin_pending` is removed (a pre-existing incumbent survives).
+    /// `pending` and `states` untouched.
     ///
     /// Returns `(group_id, prior_epoch)` so the caller can target the
     /// matching MLS group.
@@ -308,49 +276,8 @@ impl EpochManager {
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let stable = prev.rollback_pending(prior_epoch)?;
         self.pending.remove(&pending);
-        // Drop the provisional `committed_from` ownership recorded by
-        // `begin_pending` — the commit never reached anyone, so a later
-        // same-epoch sibling is a benign race, not a fork. Only the entry
-        // this pending itself inserted is removed; a pre-existing confirmed
-        // incumbent stays.
-        if meta.owns_committed_from
-            && let Some(epochs) = self.committed_from.get_mut(&group_id)
-        {
-            epochs.remove(&prior_epoch);
-            if epochs.is_empty() {
-                self.committed_from.remove(&group_id);
-            }
-        }
         self.states.insert(group_id.clone(), stable);
         Ok((group_id, prior_epoch))
-    }
-
-    pub(crate) fn prune_committed_from_before(
-        &mut self,
-        group_id: &GroupId,
-        oldest_retained_epoch: EpochId,
-    ) {
-        let should_remove = if let Some(epochs) = self.committed_from.get_mut(group_id) {
-            let retained = epochs.split_off(&oldest_retained_epoch);
-            *epochs = retained;
-            epochs.is_empty()
-        } else {
-            false
-        };
-        if should_remove {
-            self.committed_from.remove(group_id);
-        }
-    }
-
-    /// Transition the named group into `Recovering` due to a detected fork.
-    /// Always legal regardless of current state.
-    pub(crate) fn detect_fork(&mut self, group_id: &GroupId, buffered: Vec<PeeledMessage>) {
-        let prev = self
-            .states
-            .remove(group_id)
-            .unwrap_or_else(|| EpochState::stable(EpochId(0)));
-        let new = prev.detect_fork(buffered);
-        self.states.insert(group_id.clone(), new);
     }
 
     /// Transition the named group into `Unrecoverable`. Always legal. Called
@@ -456,21 +383,20 @@ mod tests {
     }
 
     /// Regression for mdk#146: `begin_pending` from a non-Stable state
-    /// must be atomic. A failing inner transition (Recovering →
-    /// InvalidTransition) must leave `states`, `committed_from`, and `pending`
-    /// untouched so the group is never orphaned to UnknownGroup.
+    /// must be atomic. A failing inner transition (Unrecoverable →
+    /// InvalidTransition) must leave `states` and `pending` untouched so the
+    /// group is never orphaned to UnknownGroup.
     #[test]
     fn begin_pending_failure_leaves_state_intact() {
         let mut em = EpochManager::new();
         let group_id = gid();
 
-        // Drive the group into Recovering — a state from which begin_pending is
-        // illegal but which still reports can_ingest() == true.
+        // Drive the group into Unrecoverable — a state from which
+        // begin_pending is illegal.
         em.set_stable(group_id.clone(), EpochId(3));
-        em.detect_fork(&group_id, vec![]);
-        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Recovering"));
+        em.mark_unrecoverable(&group_id);
+        assert!(em.is_unrecoverable(&group_id));
         assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
-        assert!(em.can_ingest(&group_id));
 
         let pending_ref = em.next_pending_ref();
         let result = em.begin_pending(
@@ -484,22 +410,21 @@ mod tests {
         );
 
         // The transition is rejected ...
-        assert!(result.is_err(), "begin_pending from Recovering must fail");
+        assert!(
+            result.is_err(),
+            "begin_pending from Unrecoverable must fail"
+        );
         // ... and crucially the group's state map entry survives unchanged.
-        assert_eq!(
-            em.state(&group_id).map(|s| s.name()),
-            Some("Recovering"),
+        assert!(
+            em.is_unrecoverable(&group_id),
             "state must not be orphaned on failed begin_pending"
         );
         assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
         // The pending meta was never inserted, so the ref is unknown.
         assert!(em.group_for_pending(pending_ref).is_none());
-        // committed_from was not advanced for a transition that did not happen.
-        assert!(!em.we_committed_from(&group_id, EpochId(3)));
     }
 
-    /// The happy path still records committed_from + pending and enters
-    /// PendingPublish.
+    /// The happy path records the pending meta and enters PendingPublish.
     #[test]
     fn begin_pending_success_records_all_bookkeeping() {
         let mut em = EpochManager::new();
@@ -524,14 +449,12 @@ mod tests {
         );
         assert_eq!(em.epoch(&group_id), Some(EpochId(8)));
         assert_eq!(em.group_for_pending(pending_ref), Some(group_id.clone()));
-        assert!(em.we_committed_from(&group_id, EpochId(7)));
     }
 
-    /// `rollback_publish` must remove the provisional `committed_from` entry
-    /// its `begin_pending` inserted — the commit reached no one, so a later
-    /// same-epoch sibling is a benign race, not a fork.
+    /// `rollback_publish` restores the pre-stage Stable state and frees the
+    /// pending slot.
     #[test]
-    fn rollback_publish_removes_provisional_committed_from() {
+    fn rollback_publish_restores_prior_stable_state() {
         let mut em = EpochManager::new();
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(7));
@@ -547,7 +470,6 @@ mod tests {
             None,
         )
         .expect("begin_pending from Stable succeeds");
-        assert!(em.we_committed_from(&group_id, EpochId(7)));
 
         let (rolled_group, prior) = em
             .rollback_publish(pending_ref)
@@ -556,57 +478,7 @@ mod tests {
         assert_eq!(prior, EpochId(7));
         assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
         assert_eq!(em.epoch(&group_id), Some(EpochId(7)));
-        assert!(
-            !em.we_committed_from(&group_id, EpochId(7)),
-            "rolled-back pending must not leave a phantom committed_from entry"
-        );
-    }
-
-    /// A `committed_from` epoch already owned by an earlier confirmed commit
-    /// must survive a later rollback of a pending staged from the same epoch
-    /// (reachable via fork-recovery rewinding to that epoch).
-    #[test]
-    fn rollback_publish_preserves_confirmed_committed_from_incumbent() {
-        let mut em = EpochManager::new();
-        let group_id = gid();
-
-        // Confirmed commit from epoch 7 → committed_from owns 7 legitimately.
-        em.set_stable(group_id.clone(), EpochId(7));
-        let first = em.next_pending_ref();
-        em.begin_pending(
-            group_id.clone(),
-            EpochId(7),
-            EpochId(8),
-            handle(),
-            first,
-            PendingKind::GroupEvolution,
-            None,
-        )
-        .expect("first begin_pending succeeds");
-        em.confirm_publish(first).expect("confirm_publish succeeds");
-        assert!(em.we_committed_from(&group_id, EpochId(7)));
-
-        // Fork recovery rewinds the group to epoch 7; a second commit is
-        // staged from the same epoch and then rolled back.
-        em.set_stable(group_id.clone(), EpochId(7));
-        let second = em.next_pending_ref();
-        em.begin_pending(
-            group_id.clone(),
-            EpochId(7),
-            EpochId(8),
-            handle(),
-            second,
-            PendingKind::GroupEvolution,
-            None,
-        )
-        .expect("second begin_pending succeeds");
-        em.rollback_publish(second)
-            .expect("rollback_publish succeeds");
-
-        assert!(
-            em.we_committed_from(&group_id, EpochId(7)),
-            "rollback must not clear the confirmed incumbent's committed_from entry"
-        );
+        assert!(em.group_for_pending(pending_ref).is_none());
     }
 
     /// mdk#971: `set_stable` must not silently clear Unrecoverable.

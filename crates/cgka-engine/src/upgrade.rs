@@ -141,26 +141,9 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
-        // Fork-detection bookkeeping.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        // Arm the cleanup guard before creating the snapshot so the snapshot is
-        // released on early return / cancellation even before a pending commit
-        // is staged.
-        let mut pending_commit_guard =
+        let pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        let recovery_snapshot =
-            self.fork_recovery
-                .create_snapshot(&self.storage, group_id, pre_commit_epoch)?;
-        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
-        self.audit_snapshot_created(
-            group_id,
-            &recovery_snapshot,
-            pre_commit_epoch,
-            "pre_upgrade_commit",
-        );
-        // `committed_from` is recorded atomically by `begin_pending` after
-        // staging succeeds — never here, where a staging failure would leave
-        // a phantom entry behind (see do_send_invite).
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -274,10 +257,11 @@ impl<S: StorageProvider> Engine<S> {
 
         // State: PendingPublish at the projected post-merge epoch (+1).
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("upgrade produced no pending commit".into()))?;
+        if mls_group.pending_commit().is_none() {
+            return Err(EngineError::Backend(
+                "upgrade produced no pending commit".into(),
+            ));
+        }
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.epoch_manager.begin_pending(
@@ -302,19 +286,7 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             ),
         );
-        self.track_pending_commit_for_recovery(
-            pending_ref,
-            group_id.clone(),
-            pre_commit_epoch,
-            wrapped.id.clone(),
-            cgka_traits::engine::CommitOrderingKey::from_commit_bytes(
-                pre_commit_epoch,
-                commit_priority,
-                self.identity.self_id().clone(),
-                &commit_bytes,
-            ),
-            recovery_snapshot,
-        );
+        self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
         pending_commit_guard.disarm();
 
         let _ = upgradeable;
