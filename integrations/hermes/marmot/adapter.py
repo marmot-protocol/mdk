@@ -3995,14 +3995,6 @@ def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
                 adapter.remove_reaction(group_id_hex, message_id_hex, emoji or None)
             )
         return json.dumps({"ok": bool(result.get("success")), **result})
-    except AgentControlError as exc:
-        return json.dumps(
-            {
-                "ok": False,
-                "error": "Marmot reaction request failed",
-                "code": exc.code or "unknown",
-            }
-        )
     except Exception as exc:
         return json.dumps(
             {

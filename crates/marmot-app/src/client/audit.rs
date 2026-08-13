@@ -147,6 +147,15 @@ impl AppClient {
         );
     }
 
+    pub(crate) fn record_human_action_noop_succeeded(
+        &self,
+        group_id: &GroupId,
+        context: &AuditEventContext,
+        message_ids: Vec<String>,
+    ) {
+        self.record_human_action(group_id, context, "succeeded", message_ids, None, None);
+    }
+
     /// Record a `subscription_rebuild` forensic audit row for the just-completed
     /// relay-plane activation: the `since` floor requested (`since_secs`; `None`
     /// = full-history replay), the lookback subtracted from the durable cursor

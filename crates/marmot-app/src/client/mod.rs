@@ -2315,6 +2315,7 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
+        self.ensure_group_application_messages_allowed(group_id)?;
         crate::messages::validate_reaction_content(emoji)?;
         let sender = self
             .app
@@ -2323,9 +2324,22 @@ impl AppClient {
             .account_id_hex;
         match self.own_reaction_event_ids(group_id, &sender, target_message_id, Some(emoji)) {
             Ok(existing) => {
+                let existing_id = existing.last().expect("non-empty reaction ids").clone();
+                if let Some(context) =
+                    Self::message_human_action_context(&AppMessageIntent::Reaction {
+                        target_message_id: target_message_id.to_owned(),
+                        emoji: emoji.to_owned(),
+                    })
+                {
+                    self.record_human_action_noop_succeeded(
+                        group_id,
+                        &context,
+                        vec![existing_id.clone()],
+                    );
+                }
                 return Ok(SendSummary {
                     published: 0,
-                    message_ids: vec![existing.last().expect("non-empty reaction ids").clone()],
+                    message_ids: vec![existing_id],
                     maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
                 });
             }

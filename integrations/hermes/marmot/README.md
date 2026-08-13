@@ -249,7 +249,10 @@ just hermes-dev-e2e-connector
 
 This test starts a real `wn-agent` process with debug controls enabled, injects
 one inbound message through its local control socket, and verifies the fixed
-Hermes response is sent back through `wn-agent`.
+Hermes response is sent back through `wn-agent`. Its private temporary root
+defaults to the current user's home directory because `wn-agent` rejects shared
+`/tmp` ancestry on macOS; set `MARMOT_CONNECTOR_E2E_TMPDIR` to use another
+private, user-owned parent.
 
 Run the services in foreground terminals:
 

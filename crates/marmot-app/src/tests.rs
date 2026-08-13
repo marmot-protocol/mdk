@@ -5491,6 +5491,22 @@ fn reaction_intent_rejects_empty_emoji() {
 }
 
 #[test]
+fn reaction_intent_rejects_padded_content() {
+    for emoji in [" 👀", "👀 ", "\t👀"] {
+        let error = build_inner_event(
+            &AppMessageIntent::Reaction {
+                target_message_id: "target-message".to_owned(),
+                emoji: emoji.to_owned(),
+            },
+            SENDER_HEX,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("leading or trailing whitespace"));
+    }
+}
+
+#[test]
 fn reaction_intent_rejects_control_characters_and_oversized_content() {
     for emoji in ["👀\nspoof", "👀\u{001b}[31m"] {
         let result = build_inner_event(

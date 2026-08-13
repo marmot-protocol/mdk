@@ -557,6 +557,11 @@ pub(crate) fn validate_reaction_content(emoji: &str) -> Result<(), AppError> {
             "reaction add requires a non-empty emoji".into(),
         ));
     }
+    if emoji.trim() != emoji {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content must not have leading or trailing whitespace".into(),
+        ));
+    }
     if emoji.chars().any(char::is_control) {
         return Err(AppError::InvalidAppMessagePayload(
             "reaction content must not contain control characters".into(),

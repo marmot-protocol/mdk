@@ -73,7 +73,7 @@ impl Marmot {
         Ok(summary.into())
     }
 
-    /// Remove this account's reaction from `target_message_id`.
+    /// Remove all of this account's active reactions from `target_message_id`.
     pub async fn unreact_from_message(
         &self,
         account_ref: String,

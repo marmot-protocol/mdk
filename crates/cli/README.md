@@ -279,6 +279,10 @@ wn --account <npub-or-hex> messages timeline search <group-hex> <query> --limit 
 wn --account <npub-or-hex> messages timeline subscribe <group-hex>
 ```
 
+`messages react` is idempotent for an already-active reaction and reports
+`published=0` in that case. `messages unreact` removes all of the account's
+active reactions from the target in one deletion event.
+
 `messages send --reply-to <message-id>` sends the text as a reply to an existing message. It uses the same wire
 format other Marmot clients produce, so recipients see the row with its reply reference and a hydrated reply preview
 of the parent. Pass the group with `--group` and put `--reply-to` before the text when replying: the message text uses
