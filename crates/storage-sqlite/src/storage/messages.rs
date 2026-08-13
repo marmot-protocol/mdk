@@ -74,9 +74,16 @@ impl SqliteAccountStorage {
                     .storage()?
             };
             let promoted = rows.len();
+            #[cfg(test)]
+            let mut promoted_so_far = 0;
             for columns in rows {
                 let record = decode_message_columns(columns)?;
                 put_message_on_connection(&tx, None, &record)?;
+                #[cfg(test)]
+                {
+                    promoted_so_far += 1;
+                    promotion_crash_pause(promoted_so_far);
+                }
             }
             let has_more = tx
                 .query_row(
@@ -90,6 +97,23 @@ impl SqliteAccountStorage {
             tx.commit().storage()?;
             Ok(MessageFormatPromotionProgress { promoted, has_more })
         })
+    }
+}
+
+#[cfg(test)]
+fn promotion_crash_pause(promoted: usize) {
+    use std::io::Write;
+
+    let expected = promoted.to_string();
+    if std::env::var("MDK_STORAGE_TEST_PROMOTION_CRASH_AFTER").as_deref() != Ok(expected.as_str()) {
+        return;
+    }
+    println!("MDK_STORAGE_TEST_CRASH_READY:promotion-{promoted}");
+    std::io::stdout()
+        .flush()
+        .expect("flush promotion crash point");
+    loop {
+        std::thread::park();
     }
 }
 

@@ -512,13 +512,49 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Storag
         params![migration.version, migration.name],
     )
     .storage()?;
+    #[cfg(test)]
+    migration_crash_pause(migration.version);
     tx.commit().storage()
+}
+
+#[cfg(test)]
+fn migration_crash_pause(version: i64) {
+    use std::io::Write;
+
+    let expected = version.to_string();
+    if std::env::var("MDK_STORAGE_TEST_MIGRATION_CRASH_VERSION").as_deref() != Ok(expected.as_str())
+    {
+        return;
+    }
+    println!("MDK_STORAGE_TEST_CRASH_READY:migration-{version}");
+    std::io::stdout()
+        .flush()
+        .expect("flush migration crash point");
+    loop {
+        std::thread::park();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqlCipherKey, SqliteAccountStorage};
+    use crate::storage::test_support::{gid, mid, sample_group, sample_message};
+    use crate::{
+        SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, epoch_to_i64, message_state_to_i64,
+        open_hardened_sqlcipher, serialize,
+    };
+    use cgka_traits::message::MessageRecord;
+    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use std::io::{BufRead, BufReader, Read};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const CRASH_CHILD_ENV: &str = "MDK_STORAGE_TEST_CRASH_CHILD";
+    const CRASH_DATABASE_ENV: &str = "MDK_STORAGE_TEST_CRASH_DATABASE";
+    const TEST_DATABASE_KEY: &str = "storage format migration crash key";
+    const READY_PREFIX: &str = "MDK_STORAGE_TEST_CRASH_READY:";
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
@@ -536,6 +572,150 @@ mod tests {
             .iter()
             .map(|migration| (migration.version, migration.name.to_string()))
             .collect()
+    }
+
+    fn keyed_connection(path: &Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        let _: String = connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        connection
+    }
+
+    fn seed_file_backed_v1_database(path: &Path, message_count: u8) -> Vec<MessageRecord> {
+        let mut connection = keyed_connection(path);
+        run(&mut connection, &MIGRATIONS[..46]).unwrap();
+        let group = sample_group(gid(1), 0, 0);
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, ?2, ?3)",
+                params![
+                    group.id.as_slice(),
+                    epoch_to_i64(group.epoch).unwrap(),
+                    serialize(&group).unwrap()
+                ],
+            )
+            .unwrap();
+        let messages = (1..=message_count)
+            .map(|id| {
+                let mut message = sample_message(mid(id), group.id.clone(), 0);
+                message.payload = vec![id; 16_727];
+                connection
+                    .execute(
+                        "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            message.id.as_slice(),
+                            message.group_id.as_slice(),
+                            epoch_to_i64(message.epoch).unwrap(),
+                            message_state_to_i64(message.state),
+                            serialize(&message).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                message
+            })
+            .collect();
+        drop(connection);
+        messages
+    }
+
+    fn kill_child_at(
+        test_name: &str,
+        child_mode: &str,
+        crash_env: &str,
+        crash_value: &str,
+        database: &Path,
+        ready_suffix: &str,
+    ) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .env(CRASH_CHILD_ENV, child_mode)
+            .env(CRASH_DATABASE_ENV, database)
+            .env(crash_env, crash_value)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (line_tx, line_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let expected = format!("{READY_PREFIX}{ready_suffix}");
+        let mut output = Vec::new();
+        let ready = loop {
+            match line_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(line)) => {
+                    let matches = line == expected;
+                    output.push(line);
+                    if matches {
+                        break true;
+                    }
+                }
+                Ok(Err(error)) => {
+                    output.push(format!("stdout error: {error}"));
+                    break false;
+                }
+                Err(_) => break false,
+            }
+        };
+        if !ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(line_rx);
+            let _ = reader.join();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "child did not reach {ready_suffix}; stdout:\n{}\nstderr:\n{stderr}",
+                output.join("\n")
+            );
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        drop(line_rx);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawned by file-backed migration crash test"]
+    fn storage_format_migration_crash_child() {
+        if std::env::var(CRASH_CHILD_ENV).as_deref() != Ok("migration") {
+            return;
+        }
+        let path = std::env::var_os(CRASH_DATABASE_ENV).unwrap();
+        let mut connection = keyed_connection(Path::new(&path));
+        run(&mut connection, MIGRATIONS).unwrap();
+        panic!("migration crash point was not reached");
+    }
+
+    #[test]
+    #[ignore = "spawned by file-backed promotion crash test"]
+    fn storage_format_promotion_crash_child() {
+        if std::env::var(CRASH_CHILD_ENV).as_deref() != Ok("promotion") {
+            return;
+        }
+        let path = std::env::var_os(CRASH_DATABASE_ENV).unwrap();
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(Path::new(&path), &key).unwrap();
+        store.promote_legacy_message_rows(3).unwrap();
+        panic!("promotion crash point was not reached");
     }
 
     fn semantic_chat_list_timestamps(store: &SqliteAccountStorage) -> Vec<(String, u64, u64)> {
@@ -565,6 +745,129 @@ mod tests {
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn file_backed_v1_database_upgrades_once_and_refuses_downgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("v1-upgrade.sqlite3");
+        let expected = seed_file_backed_v1_database(&database, 1);
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+
+        let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        assert_eq!(
+            store.get_group(&gid(1)).unwrap(),
+            sample_group(gid(1), 0, 0)
+        );
+        assert_eq!(store.get_message(&mid(1)).unwrap(), expected[0]);
+        assert_eq!(applied_migrations(&store), expected_migrations());
+        store.close().unwrap();
+
+        let mut older_connection = keyed_connection(&database);
+        let before: i64 = older_connection
+            .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
+            .unwrap();
+        let error = run(&mut older_connection, &MIGRATIONS[..46]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database was migrated by a newer storage-sqlite version: 47")
+        );
+        let after: i64 = older_connection
+            .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "downgrade refusal must not touch account rows"
+        );
+    }
+
+    #[test]
+    fn process_kill_mid_migration_reopens_and_upgrades_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("migration-kill.sqlite3");
+        let expected = seed_file_backed_v1_database(&database, 2);
+
+        kill_child_at(
+            "migrations::tests::storage_format_migration_crash_child",
+            "migration",
+            "MDK_STORAGE_TEST_MIGRATION_CRASH_VERSION",
+            "47",
+            &database,
+            "migration-47",
+        );
+
+        let connection = keyed_connection(&database);
+        assert_eq!(applied_name(&connection, 47).unwrap(), None);
+        let storage_format_columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('cgka_messages') WHERE name = 'storage_format'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(storage_format_columns, 0);
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "killed migration must retain every v1 row");
+        drop(connection);
+
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        assert_eq!(store.get_message(&mid(1)).unwrap(), expected[0]);
+        assert_eq!(store.get_message(&mid(2)).unwrap(), expected[1]);
+        assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn process_kill_mid_promotion_rolls_back_and_retry_converges() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("promotion-kill.sqlite3");
+        let expected = seed_file_backed_v1_database(&database, 3);
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        SqliteAccountStorage::open_encrypted(&database, &key)
+            .unwrap()
+            .close()
+            .unwrap();
+
+        kill_child_at(
+            "migrations::tests::storage_format_promotion_crash_child",
+            "promotion",
+            "MDK_STORAGE_TEST_PROMOTION_CRASH_AFTER",
+            "1",
+            &database,
+            "promotion-1",
+        );
+
+        let connection = keyed_connection(&database);
+        let legacy: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM cgka_messages WHERE storage_format = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 3, "killed promotion batch must roll back every row");
+        drop(connection);
+
+        let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let progress = store.promote_legacy_message_rows(3).unwrap();
+        assert_eq!(progress.promoted, 3);
+        assert!(!progress.has_more);
+        for (index, message) in expected.iter().enumerate() {
+            assert_eq!(&store.get_message(&mid(index as u8 + 1)).unwrap(), message);
+        }
+        let normalized: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM cgka_messages WHERE storage_format = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized, 3);
     }
 
     #[test]
