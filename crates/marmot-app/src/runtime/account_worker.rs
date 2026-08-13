@@ -2235,17 +2235,39 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let send_started_at = Instant::now();
-            let result = client
-                .send_app_event_with_local_projection(&group_id, intent, |update| {
-                    publish_app_runtime_projection_update(
-                        events,
-                        account_id_hex,
-                        account_label,
-                        update,
-                    );
-                })
-                .await
-                .map(|(_event, summary)| summary);
+            let result = match intent {
+                AppMessageIntent::Reaction {
+                    target_message_id,
+                    emoji,
+                } => {
+                    client
+                        .react_to_message_with_local_projection(
+                            &group_id,
+                            &target_message_id,
+                            &emoji,
+                            |update| {
+                                publish_app_runtime_projection_update(
+                                    events,
+                                    account_id_hex,
+                                    account_label,
+                                    update,
+                                );
+                            },
+                        )
+                        .await
+                }
+                intent => client
+                    .send_app_event_with_local_projection(&group_id, intent, |update| {
+                        publish_app_runtime_projection_update(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            update,
+                        );
+                    })
+                    .await
+                    .map(|(_event, summary)| summary),
+            };
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),

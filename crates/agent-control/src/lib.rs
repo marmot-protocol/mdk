@@ -122,12 +122,16 @@ pub enum AgentControlRequest {
         target_message_id_hex: String,
         emoji: String,
     },
-    /// Retract this account's most recent active reaction to a durable message,
-    /// whichever reaction content it carries.
+    /// Retract this account's active reactions from a durable message. When
+    /// `emoji` is present, only active reactions with that exact content are
+    /// retracted; when absent, all of this account's active reactions on the
+    /// target are retracted in one durable delete event.
     RemoveReaction {
         account_id_hex: String,
         group_id_hex: String,
         target_message_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
     },
     StreamBegin {
         account_id_hex: String,
@@ -967,6 +971,7 @@ mod tests {
             account_id_hex: account(),
             group_id_hex: group(),
             target_message_id_hex: message(),
+            emoji: None,
         };
         let value = serde_json::to_value(&remove).unwrap();
         assert_eq!(value["type"], "remove_reaction");
@@ -974,6 +979,19 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AgentControlRequest>(value).unwrap(),
             remove
+        );
+
+        let matching_remove = AgentControlRequest::RemoveReaction {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+            emoji: Some("👀".to_owned()),
+        };
+        let value = serde_json::to_value(&matching_remove).unwrap();
+        assert_eq!(value["emoji"], "👀");
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            matching_remove
         );
     }
 
@@ -1322,6 +1340,7 @@ mod tests {
                     account_id_hex: account(),
                     group_id_hex: group(),
                     target_message_id_hex: message(),
+                    emoji: None,
                 },
                 "remove_reaction",
             ),

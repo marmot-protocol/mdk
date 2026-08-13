@@ -13,9 +13,11 @@ model-callable `marmot_history` tool can fetch one exact message id or page olde
 messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
 lookup is best-effort and never drops the current inbound message if it fails.
 
-The adapter also exposes Marmot reaction add/remove primitives to Hermes. They
-target durable message ids and accept arbitrary non-blank, control-free reaction
-content of at most 64 Unicode scalar values;
+The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
+reaction add/remove primitives to Hermes. They target an exact durable message
+id or the latest inbound message and accept arbitrary non-blank, control-free
+reaction content of at most 64 Unicode scalar values. Adds are idempotent;
+removal can target exact content or clear all active own reactions atomically;
 processing-status reaction policy remains a separate host concern.
 
 For live previews, the plugin retries `stream_begin` with one stable v2 request

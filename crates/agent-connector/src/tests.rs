@@ -1193,13 +1193,50 @@ async fn connector_socket_subscribes_to_inbound_messages() {
     assert_eq!(reaction_message_ids.len(), 1);
     assert!(!reaction_message_ids[0].is_empty());
 
+    let repeated_add = send_control_request(
+        &socket,
+        "req-agent-reaction-add-retry",
+        AgentControlRequest::SendReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: "👀".to_owned(),
+        },
+    )
+    .await;
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex: repeated_message_ids,
+        ..
+    } = repeated_add.payload
+    else {
+        panic!("expected idempotent reaction add response");
+    };
+    assert_eq!(repeated_message_ids, reaction_message_ids);
+
+    let completion_added = send_control_request(
+        &socket,
+        "req-agent-reaction-add-completion",
+        AgentControlRequest::SendReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: "✅".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        completion_added.payload,
+        AgentControlResponse::AppEventSent { .. }
+    ));
+
     let reaction_removed = send_control_request(
         &socket,
-        "req-agent-reaction-remove",
+        "req-agent-reaction-remove-matching",
         AgentControlRequest::RemoveReaction {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             target_message_id_hex: human_message_id_hex.clone(),
+            emoji: Some("👀".to_owned()),
         },
     )
     .await;
@@ -1215,16 +1252,49 @@ async fn connector_socket_subscribes_to_inbound_messages() {
 
     let repeated_removal = send_control_request(
         &socket,
-        "req-agent-reaction-remove-repeat",
+        "req-agent-reaction-remove-matching-repeat",
         AgentControlRequest::RemoveReaction {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             target_message_id_hex: human_message_id_hex.clone(),
+            emoji: Some("👀".to_owned()),
         },
     )
     .await;
     let AgentControlResponse::Error { code, .. } = repeated_removal.payload else {
         panic!("expected missing-reaction error on repeated removal");
+    };
+    assert_eq!(code, "reaction_not_found");
+
+    let remaining_removed = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-all",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        remaining_removed.payload,
+        AgentControlResponse::AppEventSent { .. }
+    ));
+
+    let repeated_remove_all = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-all-repeat",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = repeated_remove_all.payload else {
+        panic!("expected missing-reaction error after removing all reactions");
     };
     assert_eq!(code, "reaction_not_found");
 

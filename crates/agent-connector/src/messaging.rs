@@ -310,6 +310,7 @@ impl AgentConnector {
         account_id_hex: &str,
         group_id_hex: &str,
         target_message_id_hex: &str,
+        emoji: Option<&str>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
@@ -317,7 +318,7 @@ impl AgentConnector {
         let target_message_id = normalize_hex(target_message_id_hex)?;
         let summary = self
             .runtime
-            .unreact_from_message(&account.label, &group_id, &target_message_id)
+            .unreact_from_message_matching(&account.label, &group_id, &target_message_id, emoji)
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,

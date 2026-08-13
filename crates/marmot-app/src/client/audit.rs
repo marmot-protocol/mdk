@@ -79,6 +79,7 @@ impl AppClient {
             AppMessageIntent::Edit { .. } => ("edit_message", None),
             AppMessageIntent::Reaction { .. } => ("react", None),
             AppMessageIntent::Unreact { .. } => ("unreact", None),
+            AppMessageIntent::DeleteReactions { .. } => ("unreact", None),
             AppMessageIntent::Delete { .. } => ("delete_message", None),
             AppMessageIntent::Media { attachments, .. } => {
                 ("send_media", Some(attachments.len() as u64))

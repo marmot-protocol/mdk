@@ -1308,17 +1308,19 @@ class MarmotAgentControlClient:
         account_id_hex: str,
         group_id_hex: str,
         target_message_id_hex: str,
+        emoji: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "remove_reaction",
-                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
-                "target_message_id_hex": _normalize_hex(
-                    target_message_id_hex, "target_message_id_hex"
-                ),
-            }
-        )
+        payload = {
+            "type": "remove_reaction",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            "target_message_id_hex": _normalize_hex(
+                target_message_id_hex, "target_message_id_hex"
+            ),
+        }
+        if emoji is not None:
+            payload["emoji"] = str(emoji)
+        return await self.request(payload)
 
     async def group_info(self, account_id_hex: str, group_id_hex: str) -> Dict[str, Any]:
         return await self.request(
@@ -2779,10 +2781,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return {"success": False, "error": "Marmot reaction failed"}
         return {"success": True, "message_id": target_message_id}
 
-    async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
+    async def _remove_reaction(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: Optional[str] = None,
+    ) -> bool:
         try:
             account_id = await self._ensure_account_id()
-            response = await self.client.remove_reaction(account_id, chat_id, message_id)
+            if emoji is None:
+                response = await self.client.remove_reaction(account_id, chat_id, message_id)
+            else:
+                response = await self.client.remove_reaction(
+                    account_id,
+                    chat_id,
+                    message_id,
+                    emoji,
+                )
             return response.get("type") == "app_event_sent" and bool(
                 response.get("message_ids_hex")
             )
@@ -2801,12 +2816,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         message_id: Optional[str] = None,
+        emoji: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Remove this account's reaction from a durable message."""
+        """Remove matching or all own reactions from a durable message."""
         target_message_id = message_id or self._last_inbound_message_ids.get(chat_id)
         if not target_message_id:
             return {"success": False, "error": "No Marmot message is available to unreact"}
-        success = await self._remove_reaction(chat_id, target_message_id)
+        success = await self._remove_reaction(chat_id, target_message_id, emoji)
         if not success:
             return {"success": False, "error": "Marmot unreact failed"}
         return {"success": True, "message_id": target_message_id}
@@ -3946,6 +3962,57 @@ def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
+def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
+    action = str(args.get("action") or "").strip().lower()
+    group_id_hex = str(args.get("group_id_hex") or "").strip()
+    message_id_hex = str(args.get("message_id_hex") or "").strip() or None
+    emoji = str(args.get("emoji") or "")
+    if action not in {"add", "remove"}:
+        return json.dumps({"ok": False, "error": "action must be add or remove"})
+    if not group_id_hex:
+        return json.dumps({"ok": False, "error": "group_id_hex required"})
+    if action == "add" and not emoji:
+        return json.dumps({"ok": False, "error": "emoji required for add"})
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from model_tools import _run_async
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        if adapter is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "marmot_reaction requires a live Marmot adapter",
+                }
+            )
+        if action == "add":
+            result = _run_async(adapter.add_reaction(group_id_hex, emoji, message_id_hex))
+        else:
+            result = _run_async(
+                adapter.remove_reaction(group_id_hex, message_id_hex, emoji or None)
+            )
+        return json.dumps({"ok": bool(result.get("success")), **result})
+    except AgentControlError as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "Marmot reaction request failed",
+                "code": exc.code or "unknown",
+            }
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "Marmot reaction request failed",
+                "kind": type(exc).__name__,
+            }
+        )
+
+
 def register(ctx):
     """Hermes plugin entry point."""
     ctx.register_platform(
@@ -3965,7 +4032,8 @@ def register(ctx):
             "You are chatting through Marmot, an end-to-end encrypted group "
             "messaging protocol. Chat ids are Marmot group ids and user ids "
             "are Marmot account pubkeys. Use marmot_history with the current "
-            "chat id for exact durable message ids or older transcript pages."
+            "chat id for exact durable message ids or older transcript pages, "
+            "and marmot_reaction to add or remove durable message reactions."
         ),
         emoji="",
     )
@@ -4025,6 +4093,41 @@ def register(ctx):
                 "required": ["group_id_hex"],
             },
             handler=_marmot_history_tool,
+        )
+        register_tool(
+            name="marmot_reaction",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "remove"],
+                        "description": "Whether to add or remove a reaction.",
+                    },
+                    "group_id_hex": {
+                        "type": "string",
+                        "description": "Marmot group id hex from the current conversation.",
+                    },
+                    "message_id_hex": {
+                        "type": "string",
+                        "description": (
+                            "Optional durable target message id. Omit to use the latest "
+                            "inbound message in this group."
+                        ),
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": (
+                            "Reaction content. Required for add; optional for remove. "
+                            "Omitting it from remove clears all own reactions on the target."
+                        ),
+                    },
+                },
+                "required": ["action", "group_id_hex"],
+            },
+            handler=_marmot_reaction_tool,
         )
 
 

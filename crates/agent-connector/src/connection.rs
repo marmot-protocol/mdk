@@ -306,11 +306,13 @@ impl AgentConnector {
                 account_id_hex,
                 group_id_hex,
                 target_message_id_hex,
+                emoji,
             } => {
                 self.remove_reaction_response(
                     &account_id_hex,
                     &group_id_hex,
                     &target_message_id_hex,
+                    emoji.as_deref(),
                 )
                 .await
             }

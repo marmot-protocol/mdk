@@ -561,6 +561,7 @@ pub(crate) fn notification_trigger_for_intent(
         }
         AppMessageIntent::Reaction { .. }
         | AppMessageIntent::Unreact { .. }
+        | AppMessageIntent::DeleteReactions { .. }
         | AppMessageIntent::Edit { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::StreamStart { .. }

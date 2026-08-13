@@ -271,6 +271,32 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_remove_reaction_includes_optional_emoji_only_when_supplied(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "app_event_sent",
+                    "message_ids_hex": ["44" * 32],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.remove_reaction("11" * 32, "22" * 32, "33" * 32)
+        await client.remove_reaction("11" * 32, "22" * 32, "33" * 32, "👀")
+
+        self.assertNotIn("emoji", requests[0])
+        self.assertEqual(requests[1]["emoji"], "👀")
+
     async def test_send_media_includes_idempotency_key_only_when_supplied(self):
         requests = []
 
@@ -5613,7 +5639,7 @@ class PluginRegistrationTests(unittest.TestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_marmot_history_as_a_platform_tool(self):
+    def test_register_exposes_marmot_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -5633,6 +5659,10 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
         self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
+        reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
+        self.assertEqual(reaction["toolset"], "platform")
+        self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
+        self.assertIs(reaction["handler"], self.adapter_module._marmot_reaction_tool)
 
     def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []
@@ -5683,6 +5713,66 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["type"], "timeline_message")
         self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
+
+    def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
+        calls = []
+
+        class FakeAdapter:
+            async def add_reaction(self, group_id_hex, emoji, message_id_hex):
+                calls.append(("add", group_id_hex, message_id_hex, emoji))
+                return {"success": True, "message_id": message_id_hex}
+
+            async def remove_reaction(self, group_id_hex, message_id_hex, emoji):
+                calls.append(("remove", group_id_hex, message_id_hex, emoji))
+                return {"success": True, "message_id": message_id_hex}
+
+        class AdapterMap:
+            def get(self, _platform):
+                return FakeAdapter()
+
+        gateway_run = types.ModuleType("gateway.run")
+        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
+            adapters=AdapterMap()
+        )
+        model_tools = types.ModuleType("model_tools")
+        model_tools._run_async = asyncio.run
+        sys.modules["gateway.run"] = gateway_run
+        sys.modules["model_tools"] = model_tools
+
+        try:
+            added = json.loads(
+                self.adapter_module._marmot_reaction_tool(
+                    {
+                        "action": "add",
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                        "emoji": "👀",
+                    }
+                )
+            )
+            removed = json.loads(
+                self.adapter_module._marmot_reaction_tool(
+                    {
+                        "action": "remove",
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                        "emoji": "👀",
+                    }
+                )
+            )
+        finally:
+            sys.modules.pop("gateway.run", None)
+            sys.modules.pop("model_tools", None)
+
+        self.assertTrue(added["ok"])
+        self.assertTrue(removed["ok"])
+        self.assertEqual(
+            calls,
+            [
+                ("add", "22" * 32, "33" * 32, "👀"),
+                ("remove", "22" * 32, "33" * 32, "👀"),
+            ],
+        )
 
 
 class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):

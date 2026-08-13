@@ -2013,12 +2013,24 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
+        self.unreact_from_message_matching(account_ref, group_id, target_message_id, None)
+            .await
+    }
+
+    pub async fn unreact_from_message_matching(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: Option<&str>,
+    ) -> Result<SendSummary, AppError> {
         self.accounts
             .send_app_event(
                 account_ref,
                 group_id,
                 AppMessageIntent::Unreact {
                     target_message_id: target_message_id.to_owned(),
+                    emoji: emoji.map(str::to_owned),
                 },
             )
             .await

@@ -5555,6 +5555,19 @@ fn delete_intent_builds_empty_kind_five_with_e_tag() {
 }
 
 #[test]
+fn delete_reactions_intent_builds_one_kind_five_with_all_e_tags() {
+    let event = build(AppMessageIntent::DeleteReactions {
+        reaction_message_ids: vec!["reaction-one".to_owned(), "reaction-two".to_owned()],
+    });
+    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_DELETE);
+    assert_eq!(event.content, "");
+    assert_eq!(
+        tag_values(&event.tags, EVENT_REF_TAG),
+        vec!["reaction-one", "reaction-two"]
+    );
+}
+
+#[test]
 fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
     let event = build(AppMessageIntent::Reply {
         target_message_id: "parent".to_owned(),
