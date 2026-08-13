@@ -169,16 +169,20 @@ storage artifact:
 4. State explicitly that downgrade across the migration is unsupported. The
    remedies are to re-upgrade or restore a pre-upgrade account database/export;
    never advise manually removing migration rows.
-5. Recommend a pre-upgrade backup/export in the cohort release notes when the
-   release rewrites existing durable data. Migration 47 only changes table
-   shape and retains legacy message rows, so it does not perform a history-size
-   open-time rewrite.
+5. Recommend a pre-upgrade backup/export for the migration-47 cohort. Although
+   it preserves legacy row bytes and defers per-row format promotion, its
+   transactional table rebuild physically copies the complete message history.
+   Validate upgrade duration, WAL growth, and temporary free-space requirements
+   on a representative large account before release.
 6. Do not run `VACUUM` during automatic account open. If page reclamation is
    useful, expose it as explicit keyed-connection maintenance and report its
    expected duration and temporary free-space requirement.
 
 Storage migrations do not require a workspace version bump during feature
 development. The eventual release version remains a manual release operation.
+
+Before pushing, run `just fast-ci`. Let GitHub CI run the full `just ci` test
+matrix.
 
 ## Whole-Workspace Release
 

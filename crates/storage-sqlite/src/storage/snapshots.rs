@@ -498,6 +498,40 @@ mod tests {
     }
 
     #[test]
+    fn identical_legacy_json_group_state_checkpoint_retry_is_idempotent() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let anchor = sample_group(gid(1), 1, 1);
+        store.put_group(&anchor).unwrap();
+        let legacy = crate::serialize(&super::rows::GroupStateCheckpoint {
+            group: anchor.clone(),
+            member_caps: Vec::new(),
+            validated_tree_marker: None,
+            openmls_values: Vec::new(),
+        })
+        .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_group_state_checkpoints
+                    (group_id, checkpoint_id, resulting_epoch, checkpoint)
+                 VALUES (?1, 'legacy-json', 1, ?2)",
+                rusqlite::params![anchor.id.as_slice(), legacy],
+            )
+            .unwrap();
+
+        store
+            .create_group_state_checkpoint(
+                &anchor.id,
+                &GroupStateCheckpointRef {
+                    id: "legacy-json".into(),
+                    resulting_epoch: EpochId(1),
+                },
+            )
+            .expect("logical equality must be format-independent");
+    }
+
+    #[test]
     fn releasing_missing_group_state_checkpoint_reports_snapshot_missing() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 1, 1);

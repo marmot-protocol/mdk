@@ -62,11 +62,14 @@ Migration `0047_normalized_message_records` supports two row formats:
 | `payload` | `NULL` | exact `MessageRecord.payload` bytes |
 | `deferred_peel` | `NULL`; represented inside `record` | optional JSON `DeferredPeelLifecycle` metadata |
 
-Existing rows remain format 1 at migration time so opening a large account does
-not perform an unbounded history rewrite. Current writes are format 2. Updating
-a legacy row promotes it atomically; updating a format-2 state changes only the
-scalar `state` and, when leaving `PeelDeferred`, clears `deferred_peel`. It does
-not read, decode, copy, or rewrite `payload`.
+Migration 47 preserves existing rows as format 1, so account open does not
+decode or promote each legacy payload. It does, however, rebuild
+`cgka_messages` with a one-time physical row copy inside the migration
+transaction. That I/O, exclusive-write duration, WAL growth, and temporary
+free-space requirement scale with message history. Current writes are format
+2. Updating a legacy row promotes it atomically; updating a format-2 state
+changes only the scalar `state` and, when leaving `PeelDeferred`, clears
+`deferred_peel`. It does not read, decode, copy, or rewrite `payload`.
 
 The retained legacy `record` column is a compatibility read path, not an
 ongoing second authority. `promote_legacy_message_rows` promotes at most 256
@@ -130,21 +133,25 @@ work. Their 32-invitee capture cost measured roughly 1.23 ms. Full rollback
 snapshots still include the live message ledger and measured roughly 11.0 ms,
 so that path justified a binary format.
 
-Snapshot and group-state checkpoint v2 start with `MDKS`, network-order `uint16` version `2`, and then
-length-delimited group JSON, optional normalized message rows, optional queued
-outbound rows, member capabilities, optional convergence-policy and validation
-bytes, and raw OpenMLS key/value rows. Message ids, group ids, payloads, and
-OpenMLS fields remain raw bytes rather than JSON number arrays. The exact
-encoded length is computed before allocating the zeroizing output buffer; the
-encoder cannot grow it. Temporary list bodies that can contain secret material
-also use zeroizing ownership.
+Snapshot and group-state checkpoint v2 start with `MDKS` and network-order
+`uint16` version `2`. A full rollback snapshot then contains length-delimited
+group JSON, normalized message rows, queued outbound rows, member capabilities,
+optional convergence-policy and validation bytes, and raw OpenMLS key/value
+rows. A state-scoped snapshot intentionally marks the message and queue fields
+absent, so restoring it leaves the live message ledger, pending application
+events, and outbound queue untouched. A branch-addressed checkpoint is also
+canonical-state-only and additionally omits convergence policy. Message ids,
+group ids, payloads, and OpenMLS fields remain raw bytes rather than JSON number
+arrays. The exact encoded length is computed before allocating the zeroizing
+output buffer; the encoder cannot grow it. Temporary list bodies that can
+contain secret material also use zeroizing ownership.
 
 A blob without `MDKS` is decoded as the corresponding unversioned JSON v1
 snapshot or checkpoint. A blob with `MDKS` never falls back following a v2
 error. Full snapshots, state-scoped snapshots, and branch-addressed checkpoints
-use the envelope. State-scoped snapshots and checkpoints encode the message and
-queue options as absent; checkpoints additionally reject rollback-only message,
-queue, or convergence-policy fields during decoding.
+use the envelope. Decoders preserve the scope distinction: checkpoints reject
+rollback-only message, queue, or convergence-policy fields rather than silently
+accepting a full snapshot as canonical-state-only.
 
 ## Decision evidence
 
@@ -181,8 +188,11 @@ the obsolete pre-#1406 claim that retained anchors still contain messages.
 - Upgrade is automatic through numbered transactional migrations.
 - Downgrade across migration 47 is unsupported: an older binary refuses the
   newer migration before reading account data.
-- Migration 47 changes table shape atomically but does not backfill history, so
-  session-open time is bounded independently of message-history size.
+- Migration 47 changes table shape atomically through a one-time physical copy
+  proportional to message-history size. It performs no per-row payload decode
+  or format-2 promotion, but the first upgrade still needs history-scaled lock
+  time, WAL growth, and temporary free space. Large-account duration and disk
+  requirements must be measured before the release cohort is promoted.
 - The promotion sweep uses batches of at most 256 rows, aggregate privacy-safe
   progress, and an idempotent transaction; malformed input rolls back the
   whole batch.
