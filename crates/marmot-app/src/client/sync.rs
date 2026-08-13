@@ -290,7 +290,10 @@ impl AppClient {
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
         let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
-        if refresh.routing_changed || refresh.state_pruned {
+        // A routing-table delta lives in memory and obligates the subscription
+        // refresh below, not a state write; only route retirement mutates
+        // persisted group state.
+        if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(SyncFailure::from)?;
         }
@@ -631,7 +634,6 @@ impl AppClient {
             if self.seen_events_index.contains(&event_id) {
                 continue;
             }
-            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
             return Ok(delivery);
         }
     }
@@ -642,9 +644,15 @@ impl AppClient {
     ) -> Result<SyncSummary, AppError> {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
+        let event_id = hex::encode(delivery.message.id.as_slice());
         let routes_dirty = self
             .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
+        // Mark the delivery seen only after durable ingest succeeds, matching
+        // the catch-up drain below. Marking at receive time would let a failed
+        // ingest poison the index, so a reused client would silently skip the
+        // redelivered event.
+        remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
@@ -1411,7 +1419,9 @@ impl AppClient {
     /// operation and therefore does not mutate the detector's debounce state.
     pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
         let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
-        if refresh.routing_changed || refresh.state_pruned {
+        // As in `sync_inner`: save only for persisted-state pruning, not for
+        // in-memory routing-table deltas.
+        if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(SyncFailure::from)?;
         }
