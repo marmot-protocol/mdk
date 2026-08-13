@@ -6401,9 +6401,19 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
 /// Issue #1177: a send the engine accepted but never published derives as
 /// `Pending`, which is truthful only while convergence can still release it.
 /// Once the group is terminal the queue is purged, so the sweep the sync loop
-/// runs at that seam must make the app-facing delivery state say `Failed`
-/// instead of claiming `Pending` forever — and must leave a published send's
-/// `Delivered` alone.
+/// runs at that seam must stop the row claiming `Pending` forever — and must
+/// leave a published send's `Delivered` alone.
+///
+/// The swept row's terminal outcome is asserted where it is stored, on the row
+/// itself. #1384 deliberately demotes a failed local send out of the chat
+/// preview ("keep failed local sends visible without letting them pin chat
+/// previews", `CHAT_LIST_PREVIEW_ORDER_DESC` in `storage-sqlite/src/chat_list.rs`),
+/// so once a send that did reach the relay exists the preview falls back to it
+/// rather than rendering the swept row's `Failed`. That fallback is asserted
+/// here too, because it is the same thing this test guards: after the sweep
+/// nothing in the group may still say `Pending`. A swept row rendering `Failed`
+/// when it *is* the preview is pinned by `storage-sqlite`'s
+/// `latest_preview_carries_exact_media_and_delivery_projection`.
 #[test]
 fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
     let dir = tempfile::tempdir().unwrap();
@@ -6452,17 +6462,16 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
     app.record_account_app_event("alice", &sent("held", None, 11))
         .unwrap();
 
-    let delivery_state = || {
+    let preview = || {
         app.chat_list_row("alice", "aa")
             .unwrap()
             .expect("chat-list row")
             .last_message
             .expect("last message")
-            .delivery_state
     };
     assert_eq!(
-        delivery_state(),
-        ChatListMessageDeliveryState::Pending,
+        (preview().message_id_hex, preview().delivery_state),
+        ("held".to_owned(), ChatListMessageDeliveryState::Pending),
         "a retained send is pending while convergence can still release it"
     );
 
@@ -6471,9 +6480,13 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
         .expect("a held row must produce a projection update");
 
     assert_eq!(
-        delivery_state(),
-        ChatListMessageDeliveryState::Failed,
-        "the swept send must report a terminal outcome, not pending forever"
+        (preview().message_id_hex, preview().delivery_state),
+        (
+            "published".to_owned(),
+            ChatListMessageDeliveryState::Delivered
+        ),
+        "the swept send must stop pinning the preview as pending; the last send \
+         that actually reached the relay takes over"
     );
     let rows = app
         .timeline_messages_with_query(
