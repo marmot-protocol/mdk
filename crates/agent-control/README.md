@@ -27,6 +27,15 @@ begin inputs is an error, and trying to begin another active stream with an occu
 - Provides newline-delimited JSON framing with a 1 MiB per-frame cap.
 - Stays dependency-light: `serde` and Tokio IO only.
 
+`send_reaction` adds arbitrary non-blank, control-free reaction content of at
+most 64 Unicode scalar values to a durable message. Repeating the same content
+from the same account on the same target is idempotent and returns the existing
+reaction id instead of publishing a duplicate.
+`remove_reaction` takes the original target message id; callers do not need to
+discover reaction event ids. An optional `emoji` retracts all of the calling
+account's active reactions with that exact content. Omitting `emoji` retracts
+all of the account's active reactions on the target in one durable delete event.
+
 ## Materialized timeline reads
 
 `timeline_message_get` resolves one durable message id and `timeline_list` pages a

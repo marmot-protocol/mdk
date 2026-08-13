@@ -27,6 +27,11 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// synchronous Markdown work before send/classification (mdk#654).
 const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
+/// Reactions are display metadata that flow into timelines and notification
+/// previews. Keep them compact and free of terminal/control sequences while
+/// still allowing arbitrary multi-scalar emoji clusters.
+const MAX_REACTION_CONTENT_CHARS: usize = 64;
+
 /// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
 /// a bare hex/npub), covering NIP-21 `npub` + `nprofile` and a raw hex pubkey.
 /// Event/coordinate references (`note`/`nevent`/`naddr`) are not pubkey mentions.
@@ -166,6 +171,10 @@ pub(crate) enum AppMessageIntent {
     },
     Unreact {
         target_message_id: String,
+        emoji: Option<String>,
+    },
+    DeleteReactions {
+        reaction_message_ids: Vec<String>,
     },
     Reply {
         target_message_id: String,
@@ -225,8 +234,8 @@ pub(crate) enum AppMessageIntent {
 }
 
 /// Build the inner Marmot app event for `intent`, authored by `sender_pubkey_hex`
-/// at `created_at`. `Unreact` must be resolved to a `Delete` of the reaction
-/// event id before this is called.
+/// at `created_at`. `Unreact` must be resolved to `DeleteReactions` before this
+/// is called.
 pub(crate) fn build_inner_event(
     intent: &AppMessageIntent,
     sender_pubkey_hex: &str,
@@ -252,11 +261,7 @@ pub(crate) fn build_inner_event(
             emoji,
         } => {
             validate_message_ref(target_message_id)?;
-            if emoji.trim().is_empty() {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "reaction add requires a non-empty emoji".into(),
-                ));
-            }
+            validate_reaction_content(emoji)?;
             Ok(event(
                 MARMOT_APP_EVENT_KIND_REACTION,
                 vec![event_ref_tag(target_message_id)],
@@ -294,12 +299,7 @@ pub(crate) fn build_inner_event(
             tags.extend(mention_p_tags(content));
             Ok(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
         }
-        AppMessageIntent::Unreact { .. } | AppMessageIntent::Delete { .. } => {
-            let target_message_id = match intent {
-                AppMessageIntent::Delete { target_message_id }
-                | AppMessageIntent::Unreact { target_message_id } => target_message_id,
-                _ => unreachable!(),
-            };
+        AppMessageIntent::Delete { target_message_id } => {
             validate_message_ref(target_message_id)?;
             Ok(event(
                 MARMOT_APP_EVENT_KIND_DELETE,
@@ -307,6 +307,22 @@ pub(crate) fn build_inner_event(
                 String::new(),
             ))
         }
+        AppMessageIntent::DeleteReactions {
+            reaction_message_ids,
+        } => {
+            if reaction_message_ids.is_empty() {
+                return Err(AppError::ReactionNotFound);
+            }
+            let mut tags = Vec::with_capacity(reaction_message_ids.len());
+            for reaction_message_id in reaction_message_ids {
+                validate_message_ref(reaction_message_id)?;
+                tags.push(event_ref_tag(reaction_message_id));
+            }
+            Ok(event(MARMOT_APP_EVENT_KIND_DELETE, tags, String::new()))
+        }
+        AppMessageIntent::Unreact { .. } => Err(AppError::InvalidAppMessagePayload(
+            "unreact must be resolved before event construction".into(),
+        )),
         AppMessageIntent::Media {
             attachments,
             caption,
@@ -533,6 +549,30 @@ pub(crate) fn build_inner_event(
             content.clone(),
         )),
     }
+}
+
+pub(crate) fn validate_reaction_content(emoji: &str) -> Result<(), AppError> {
+    if emoji.trim().is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction add requires a non-empty emoji".into(),
+        ));
+    }
+    if emoji.trim() != emoji {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content must not have leading or trailing whitespace".into(),
+        ));
+    }
+    if emoji.chars().any(char::is_control) {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content must not contain control characters".into(),
+        ));
+    }
+    if emoji.chars().count() > MAX_REACTION_CONTENT_CHARS {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content exceeds the maximum length".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn event_ref_tag(target_message_id: &str) -> Vec<String> {

@@ -13,6 +13,13 @@ model-callable `marmot_history` tool can fetch one exact message id or page olde
 messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
 lookup is best-effort and never drops the current inbound message if it fails.
 
+The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
+reaction add/remove primitives to Hermes. They target an exact durable message
+id or the latest inbound message and accept arbitrary non-blank, control-free
+reaction content of at most 64 Unicode scalar values. Adds are idempotent;
+removal can target exact content or clear all active own reactions atomically;
+processing-status reaction policy remains a separate host concern.
+
 For live previews, the plugin retries `stream_begin` with one stable v2 request
 id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must
@@ -242,7 +249,10 @@ just hermes-dev-e2e-connector
 
 This test starts a real `wn-agent` process with debug controls enabled, injects
 one inbound message through its local control socket, and verifies the fixed
-Hermes response is sent back through `wn-agent`.
+Hermes response is sent back through `wn-agent`. Its private temporary root
+defaults to the current user's home directory because `wn-agent` rejects shared
+`/tmp` ancestry on macOS; set `MARMOT_CONNECTOR_E2E_TMPDIR` to use another
+private, user-owned parent.
 
 Run the services in foreground terminals:
 

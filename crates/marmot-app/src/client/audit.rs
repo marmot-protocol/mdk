@@ -79,6 +79,7 @@ impl AppClient {
             AppMessageIntent::Edit { .. } => ("edit_message", None),
             AppMessageIntent::Reaction { .. } => ("react", None),
             AppMessageIntent::Unreact { .. } => ("unreact", None),
+            AppMessageIntent::DeleteReactions { .. } => ("unreact", None),
             AppMessageIntent::Delete { .. } => ("delete_message", None),
             AppMessageIntent::Media { attachments, .. } => {
                 ("send_media", Some(attachments.len() as u64))
@@ -144,6 +145,15 @@ impl AppClient {
             None,
             None,
         );
+    }
+
+    pub(crate) fn record_human_action_noop_succeeded(
+        &self,
+        group_id: &GroupId,
+        context: &AuditEventContext,
+        message_ids: Vec<String>,
+    ) {
+        self.record_human_action(group_id, context, "succeeded", message_ids, None, None);
     }
 
     /// Record a `subscription_rebuild` forensic audit row for the just-completed

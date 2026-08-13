@@ -5491,6 +5491,76 @@ fn reaction_intent_rejects_empty_emoji() {
 }
 
 #[test]
+fn reaction_intent_rejects_padded_content() {
+    for emoji in [" 👀", "👀 ", "\t👀"] {
+        let error = build_inner_event(
+            &AppMessageIntent::Reaction {
+                target_message_id: "target-message".to_owned(),
+                emoji: emoji.to_owned(),
+            },
+            SENDER_HEX,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("leading or trailing whitespace"));
+    }
+}
+
+#[test]
+fn reaction_intent_rejects_control_characters_and_oversized_content() {
+    for emoji in ["👀\nspoof", "👀\u{001b}[31m"] {
+        let result = build_inner_event(
+            &AppMessageIntent::Reaction {
+                target_message_id: "abc123".to_owned(),
+                emoji: emoji.to_owned(),
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
+    }
+
+    let result = build_inner_event(
+        &AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: "👍".repeat(65),
+        },
+        SENDER_HEX,
+        1,
+    );
+    assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
+}
+
+#[test]
+fn reaction_intent_accepts_bounded_multi_scalar_emoji() {
+    let event = build_inner_event(
+        &AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: "👨‍👩‍👧‍👦".to_owned(),
+        },
+        SENDER_HEX,
+        1,
+    )
+    .unwrap();
+    assert_eq!(event.content, "👨‍👩‍👧‍👦");
+}
+
+#[test]
+fn reaction_intent_accepts_exact_maximum_scalar_count() {
+    let emoji = "👍".repeat(64);
+    let event = build_inner_event(
+        &AppMessageIntent::Reaction {
+            target_message_id: "abc123".to_owned(),
+            emoji: emoji.clone(),
+        },
+        SENDER_HEX,
+        1,
+    )
+    .unwrap();
+    assert_eq!(event.content, emoji);
+}
+
+#[test]
 fn delete_intent_builds_empty_kind_five_with_e_tag() {
     let event = build(AppMessageIntent::Delete {
         target_message_id: "abc123".to_owned(),
@@ -5498,6 +5568,19 @@ fn delete_intent_builds_empty_kind_five_with_e_tag() {
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_DELETE);
     assert_eq!(event.content, "");
     assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("abc123"));
+}
+
+#[test]
+fn delete_reactions_intent_builds_one_kind_five_with_all_e_tags() {
+    let event = build(AppMessageIntent::DeleteReactions {
+        reaction_message_ids: vec!["reaction-one".to_owned(), "reaction-two".to_owned()],
+    });
+    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_DELETE);
+    assert_eq!(event.content, "");
+    assert_eq!(
+        tag_values(&event.tags, EVENT_REF_TAG),
+        vec!["reaction-one", "reaction-two"]
+    );
 }
 
 #[test]

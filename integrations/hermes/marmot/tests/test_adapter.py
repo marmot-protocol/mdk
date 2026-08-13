@@ -128,6 +128,12 @@ def install_fake_hermes_modules():
             # the keyword even when they ignore it (#836).
             raise NotImplementedError
 
+        async def add_reaction(self, chat_id, emoji, message_id=None):
+            raise NotImplementedError
+
+        async def remove_reaction(self, chat_id, message_id=None):
+            raise NotImplementedError
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
@@ -264,6 +270,32 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["idempotency_key"], "key-1")
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
+
+    async def test_remove_reaction_includes_optional_emoji_only_when_supplied(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "app_event_sent",
+                    "message_ids_hex": ["44" * 32],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.remove_reaction("11" * 32, "22" * 32, "33" * 32)
+        await client.remove_reaction("11" * 32, "22" * 32, "33" * 32, "👀")
+
+        self.assertNotIn("emoji", requests[0])
+        self.assertEqual(requests[1]["emoji"], "👀")
 
     async def test_send_media_includes_idempotency_key_only_when_supplied(self):
         requests = []
@@ -5132,6 +5164,199 @@ class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ReactionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    async def test_adapter_reaction_primitives_use_inbound_target(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["44" * 32],
+        }
+        client.remove_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        self.assertTrue(await adapter._add_reaction("22" * 32, "33" * 32, "👀"))
+        self.assertTrue(await adapter._remove_reaction("22" * 32, "33" * 32))
+
+        client.send_reaction.assert_awaited_once_with(
+            "11" * 32, "22" * 32, "33" * 32, "👀"
+        )
+        client.remove_reaction.assert_awaited_once_with(
+            "11" * 32, "22" * 32, "33" * 32
+        )
+
+    async def test_reaction_primitives_reject_non_durable_responses(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": [],
+        }
+        client.remove_reaction.return_value = {
+            "type": "final_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        self.assertFalse(await adapter._add_reaction("22" * 32, "33" * 32, "👀"))
+        self.assertFalse(await adapter._remove_reaction("22" * 32, "33" * 32))
+
+    async def test_reaction_failures_do_not_log_exception_text(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.side_effect = RuntimeError("sensitive-local-path")
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        with self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs:
+            self.assertFalse(await adapter._add_reaction("22" * 32, "33" * 32, "👀"))
+        self.assertNotIn("sensitive-local-path", "\n".join(logs.output))
+
+    async def test_missing_reaction_is_idempotent_for_adapter_remove(self):
+        client = unittest.mock.AsyncMock()
+        client.remove_reaction.side_effect = self.adapter_module.AgentControlError(
+            "no matching reaction", code="reaction_not_found"
+        )
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        self.assertTrue(await adapter._remove_reaction("22" * 32, "33" * 32))
+
+    async def test_public_reaction_api_targets_explicit_or_latest_inbound_message(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        client.remove_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["66" * 32],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+        chat_id = "22" * 32
+        latest_id = "33" * 32
+        explicit_id = "44" * 32
+        adapter._last_inbound_message_ids[chat_id] = latest_id
+
+        self.assertEqual(
+            await adapter.add_reaction(chat_id, "👀"),
+            {"success": True, "message_id": latest_id},
+        )
+        self.assertEqual(
+            await adapter.remove_reaction(chat_id),
+            {"success": True, "message_id": latest_id},
+        )
+        self.assertEqual(
+            await adapter.remove_reaction(chat_id, explicit_id),
+            {"success": True, "message_id": explicit_id},
+        )
+
+        client.send_reaction.assert_awaited_once_with(
+            "11" * 32, chat_id, latest_id, "👀"
+        )
+        self.assertEqual(
+            client.remove_reaction.await_args_list,
+            [
+                unittest.mock.call("11" * 32, chat_id, latest_id),
+                unittest.mock.call("11" * 32, chat_id, explicit_id),
+            ],
+        )
+
+    async def test_fallback_reaction_targets_latest_unmentioned_inbound_message(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["55" * 32],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+        adapter._should_run_turn = unittest.mock.AsyncMock(return_value=False)
+        chat_id = "22" * 32
+        latest_id = "33" * 32
+
+        await adapter._dispatch_inbound_message(
+            {
+                "account_id_hex": "11" * 32,
+                "group_id_hex": chat_id,
+                "message_id_hex": latest_id,
+                "sender_account_id_hex": "44" * 32,
+                "text": "not addressed to the agent",
+            }
+        )
+
+        self.assertEqual(
+            await adapter.add_reaction(chat_id, "👀"),
+            {"success": True, "message_id": latest_id},
+        )
+        client.send_reaction.assert_awaited_once_with(
+            "11" * 32, chat_id, latest_id, "👀"
+        )
+
+    async def test_public_reaction_api_fails_cleanly_without_a_target_message(self):
+        client = unittest.mock.AsyncMock()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        self.assertFalse((await adapter.add_reaction("22" * 32, "👀"))["success"])
+        self.assertFalse((await adapter.remove_reaction("22" * 32))["success"])
+        client.send_reaction.assert_not_awaited()
+        client.remove_reaction.assert_not_awaited()
+
+    async def test_public_reaction_api_returns_error_for_failed_send(self):
+        client = unittest.mock.AsyncMock()
+        client.send_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": [],
+        }
+        client.remove_reaction.return_value = {
+            "type": "app_event_sent",
+            "message_ids_hex": [],
+        }
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=client,
+        )
+
+        added = await adapter.add_reaction("22" * 32, "👀", "33" * 32)
+        removed = await adapter.remove_reaction("22" * 32, "33" * 32)
+        self.assertFalse(added["success"])
+        self.assertIn("error", added)
+        self.assertFalse(removed["success"])
+        self.assertIn("error", removed)
+
+    async def test_disconnect_clears_latest_inbound_reaction_targets(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=unittest.mock.AsyncMock(),
+        )
+        adapter._last_inbound_message_ids["22" * 32] = "33" * 32
+
+        await adapter.disconnect()
+
+        self.assertEqual(adapter._last_inbound_message_ids, {})
+
+
 class GroupActivationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter_module = load_adapter_module()
@@ -5414,7 +5639,7 @@ class PluginRegistrationTests(unittest.TestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_marmot_history_as_a_platform_tool(self):
+    def test_register_exposes_marmot_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -5434,6 +5659,10 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
         self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
+        reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
+        self.assertEqual(reaction["toolset"], "platform")
+        self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
+        self.assertIs(reaction["handler"], self.adapter_module._marmot_reaction_tool)
 
     def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []
@@ -5484,6 +5713,66 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["type"], "timeline_message")
         self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
+
+    def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
+        calls = []
+
+        class FakeAdapter:
+            async def add_reaction(self, group_id_hex, emoji, message_id_hex):
+                calls.append(("add", group_id_hex, message_id_hex, emoji))
+                return {"success": True, "message_id": message_id_hex}
+
+            async def remove_reaction(self, group_id_hex, message_id_hex, emoji):
+                calls.append(("remove", group_id_hex, message_id_hex, emoji))
+                return {"success": True, "message_id": message_id_hex}
+
+        class AdapterMap:
+            def get(self, _platform):
+                return FakeAdapter()
+
+        gateway_run = types.ModuleType("gateway.run")
+        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
+            adapters=AdapterMap()
+        )
+        model_tools = types.ModuleType("model_tools")
+        model_tools._run_async = asyncio.run
+        sys.modules["gateway.run"] = gateway_run
+        sys.modules["model_tools"] = model_tools
+
+        try:
+            added = json.loads(
+                self.adapter_module._marmot_reaction_tool(
+                    {
+                        "action": "add",
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                        "emoji": "👀",
+                    }
+                )
+            )
+            removed = json.loads(
+                self.adapter_module._marmot_reaction_tool(
+                    {
+                        "action": "remove",
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                        "emoji": "👀",
+                    }
+                )
+            )
+        finally:
+            sys.modules.pop("gateway.run", None)
+            sys.modules.pop("model_tools", None)
+
+        self.assertTrue(added["ok"])
+        self.assertTrue(removed["ok"])
+        self.assertEqual(
+            calls,
+            [
+                ("add", "22" * 32, "33" * 32, "👀"),
+                ("remove", "22" * 32, "33" * 32, "👀"),
+            ],
+        )
 
 
 class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):

@@ -14,9 +14,7 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
-use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
-};
+use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
@@ -36,18 +34,18 @@ use crate::media::{
     download_encrypted_media, fetch_group_image, is_loopback_http_endpoint, upload_encrypted_media,
     upload_group_image,
 };
-use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
+use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
     AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
-    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    AppInitialGroupImage, AppPerformanceTelemetry, AppQuarantinedGroup, AppRoutingState,
+    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
+    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
+    remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -2064,22 +2062,33 @@ impl AppClient {
     {
         self.ensure_group_application_messages_allowed(group_id)?;
         // Capture the human-action descriptor before `Unreact` is rewritten to
-        // `Delete` below, so the audit log records the user's actual intent.
+        // `DeleteReactions` below, so the audit log records the user's actual
+        // intent.
         let audit_context = Self::message_human_action_context(&intent);
         let sender = self
             .app
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
-        // NIP-25 has no native un-react: a kind-7 reaction is retracted with a
-        // kind-5 delete of that reaction event. Resolve the user's own reaction
-        // event id from the projection before building the tombstone.
+        // NIP-25 has no native un-react: kind-7 reactions are retracted with a
+        // kind-5 delete. Resolve every matching active own reaction from the
+        // projection and place all ids in one tombstone so remove-all is atomic.
         let intent = match intent {
-            AppMessageIntent::Unreact { target_message_id } => {
-                let reaction_id =
-                    self.own_reaction_event_id(group_id, &sender, &target_message_id)?;
-                AppMessageIntent::Delete {
-                    target_message_id: reaction_id,
+            AppMessageIntent::Unreact {
+                target_message_id,
+                emoji,
+            } => {
+                if let Some(emoji) = emoji.as_deref() {
+                    crate::messages::validate_reaction_content(emoji)?;
+                }
+                let reaction_message_ids = self.own_reaction_event_ids(
+                    group_id,
+                    &sender,
+                    &target_message_id,
+                    emoji.as_deref(),
+                )?;
+                AppMessageIntent::DeleteReactions {
+                    reaction_message_ids,
                 }
             }
             other => other,
@@ -2253,34 +2262,37 @@ impl AppClient {
         }
     }
 
-    /// Most recent kind-7 reaction this account authored that targets
-    /// `target_message_id`, identified by its own message id. Used to build the
-    /// kind-5 retraction for an un-react.
-    fn own_reaction_event_id(
+    /// Active reactions this account authored on `target_message_id`, filtered
+    /// by exact content when requested and identified by their message ids.
+    fn own_reaction_event_ids(
         &self,
         group_id: &GroupId,
         sender: &str,
         target_message_id: &str,
-    ) -> Result<String, AppError> {
+        emoji: Option<&str>,
+    ) -> Result<Vec<String>, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let messages = self.app.messages_with_query(
-            &self.state.label,
-            AppMessageQuery {
-                group_id_hex: Some(group_id_hex),
-                limit: None,
-            },
-        )?;
-        messages
-            .into_iter()
-            .rev()
-            .find(|message| {
-                message.kind == MARMOT_APP_EVENT_KIND_REACTION
-                    && message.sender == sender
-                    && tag_value(&message.tags, EVENT_REF_TAG) == Some(target_message_id)
-                    && !message.message_id_hex.is_empty()
+        let reaction_message_ids = self
+            .app
+            .timeline_message(&self.state.label, &group_id_hex, target_message_id)?
+            .map(|message| {
+                message
+                    .reactions
+                    .user_reactions
+                    .into_iter()
+                    .filter(|reaction| {
+                        reaction.sender == sender
+                            && emoji.is_none_or(|expected| reaction.emoji == expected)
+                    })
+                    .map(|reaction| reaction.reaction_message_id_hex)
+                    .collect::<Vec<_>>()
             })
-            .map(|message| message.message_id_hex)
-            .ok_or(AppError::ReactionNotFound)
+            .unwrap_or_default();
+        if reaction_message_ids.is_empty() {
+            Err(AppError::ReactionNotFound)
+        } else {
+            Ok(reaction_message_ids)
+        }
     }
 
     pub async fn react_to_message(
@@ -2289,13 +2301,59 @@ impl AppClient {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
+        self.react_to_message_with_local_projection(group_id, target_message_id, emoji, |_| {})
+            .await
+    }
+
+    pub(crate) async fn react_to_message_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: &str,
+        on_local_projection: F,
+    ) -> Result<SendSummary, AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        self.ensure_group_application_messages_allowed(group_id)?;
+        crate::messages::validate_reaction_content(emoji)?;
+        let sender = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        match self.own_reaction_event_ids(group_id, &sender, target_message_id, Some(emoji)) {
+            Ok(existing) => {
+                let existing_id = existing.last().expect("non-empty reaction ids").clone();
+                if let Some(context) =
+                    Self::message_human_action_context(&AppMessageIntent::Reaction {
+                        target_message_id: target_message_id.to_owned(),
+                        emoji: emoji.to_owned(),
+                    })
+                {
+                    self.record_human_action_noop_succeeded(
+                        group_id,
+                        &context,
+                        vec![existing_id.clone()],
+                    );
+                }
+                return Ok(SendSummary {
+                    published: 0,
+                    message_ids: vec![existing_id],
+                    maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
+                });
+            }
+            Err(AppError::ReactionNotFound) => {}
+            Err(error) => return Err(error),
+        }
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_with_local_projection(
                 group_id,
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
                 },
+                on_local_projection,
             )
             .await?;
         Ok(summary)
@@ -2306,11 +2364,25 @@ impl AppClient {
         group_id: &GroupId,
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
+        self.unreact_from_message_matching(group_id, target_message_id, None)
+            .await
+    }
+
+    pub async fn unreact_from_message_matching(
+        &mut self,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: Option<&str>,
+    ) -> Result<SendSummary, AppError> {
+        if let Some(emoji) = emoji {
+            crate::messages::validate_reaction_content(emoji)?;
+        }
         let (_event, summary) = self
             .send_app_event(
                 group_id,
                 AppMessageIntent::Unreact {
                     target_message_id: target_message_id.to_owned(),
+                    emoji: emoji.map(str::to_owned),
                 },
             )
             .await?;

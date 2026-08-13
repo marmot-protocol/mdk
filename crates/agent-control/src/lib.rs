@@ -115,6 +115,24 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         target_message_id_hex: String,
     },
+    /// Add bounded, control-free, non-blank reaction content to a durable message.
+    SendReaction {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        emoji: String,
+    },
+    /// Retract this account's active reactions from a durable message. When
+    /// `emoji` is present, only active reactions with that exact content are
+    /// retracted; when absent, all of this account's active reactions on the
+    /// target are retracted in one durable delete event.
+    RemoveReaction {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
     StreamBegin {
         account_id_hex: String,
         group_id_hex: String,
@@ -933,6 +951,51 @@ mod tests {
     }
 
     #[test]
+    fn reaction_requests_have_stable_wire_shapes() {
+        let send = AgentControlRequest::SendReaction {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+            emoji: "👀".to_owned(),
+        };
+        let value = serde_json::to_value(&send).unwrap();
+        assert_eq!(value["type"], "send_reaction");
+        assert_eq!(value["emoji"], "👀");
+        assert_eq!(value["target_message_id_hex"], message());
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            send
+        );
+
+        let remove = AgentControlRequest::RemoveReaction {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+            emoji: None,
+        };
+        let value = serde_json::to_value(&remove).unwrap();
+        assert_eq!(value["type"], "remove_reaction");
+        assert!(value.get("emoji").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            remove
+        );
+
+        let matching_remove = AgentControlRequest::RemoveReaction {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+            emoji: Some("👀".to_owned()),
+        };
+        let value = serde_json::to_value(&matching_remove).unwrap();
+        assert_eq!(value["emoji"], "👀");
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            matching_remove
+        );
+    }
+
+    #[test]
     fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
         // Optional field: omitted from the wire when None; present and
         // round-tripping when
@@ -1262,6 +1325,24 @@ mod tests {
                     target_message_id_hex: message(),
                 },
                 "delete_message",
+            ),
+            (
+                AgentControlRequest::SendReaction {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                    emoji: "👀".to_owned(),
+                },
+                "send_reaction",
+            ),
+            (
+                AgentControlRequest::RemoveReaction {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                    emoji: None,
+                },
+                "remove_reaction",
             ),
             (
                 AgentControlRequest::StreamBegin {

@@ -192,11 +192,16 @@ pub(crate) async fn message_command_with_runtime(
             let summary = runtime
                 .react_to_message(&account.label, &group_id, &message_id, &emoji)
                 .await?;
-            Ok(CommandOutput {
-                plain: format!(
+            let plain = if summary.published == 0 {
+                format!("reaction {emoji} already active on {message_id} published=0")
+            } else {
+                format!(
                     "reacted {emoji} to {message_id} published={}",
                     summary.published
-                ),
+                )
+            };
+            Ok(CommandOutput {
+                plain,
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
