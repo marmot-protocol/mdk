@@ -16,6 +16,17 @@ import {
 
 const HEX32 = (b: string) => b.repeat(32);
 
+function messageActionClient(
+  overrides: Partial<MarmotMessageActionClient> = {},
+): MarmotMessageActionClient {
+  return {
+    deleteMessage: async () => undefined,
+    sendReaction: async () => undefined,
+    removeReaction: async () => undefined,
+    ...overrides,
+  };
+}
+
 /** Read the `ok` flag from a `jsonResult`-shaped tool result's details payload. */
 function resultOk(result: { details: unknown }): boolean {
   return (result.details as { ok?: boolean }).ok === true;
@@ -137,7 +148,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined },
+        client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -151,7 +162,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined },
+        client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -163,7 +174,7 @@ describe("createMarmotMessageActionAdapter", () => {
   it("deletes via the send-time cache on a cache hit", async () => {
     const deleteByMessageId = vi.fn(async () => true);
     const resolveTarget = vi.fn(async () => ({
-      client: { deleteMessage: vi.fn(async () => undefined) },
+      client: messageActionClient({ deleteMessage: vi.fn(async () => undefined) }),
       marmotAccountIdHex: HEX32("aa"),
     }));
     const adapter = createMarmotMessageActionAdapter({ deleteByMessageId, resolveTarget });
@@ -182,12 +193,12 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("falls back to the explicit `to` group on a cache miss", async () => {
     const calls: { account: string; group: string; id: string }[] = [];
-    const client: MarmotMessageActionClient = {
+    const client = messageActionClient({
       deleteMessage: async (account, group, id) => {
         calls.push({ account, group, id });
         return undefined;
       },
-    };
+    });
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({ client, marmotAccountIdHex: HEX32("aa") }),
@@ -207,7 +218,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined },
+        client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -222,7 +233,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage },
+        client: messageActionClient({ deleteMessage }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -238,7 +249,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined, sendReaction },
+        client: messageActionClient({ sendReaction }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -264,7 +275,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined, sendReaction },
+        client: messageActionClient({ sendReaction }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -284,36 +295,81 @@ describe("createMarmotMessageActionAdapter", () => {
     );
   });
 
-  it("removes the bot's reaction from a prefixed target when emoji is empty", async () => {
+  it("removes all reactions only when remove is explicit and emoji is empty", async () => {
     const removeReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined, removeReaction },
+        client: messageActionClient({ removeReaction }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
 
     const result = await adapter.handleAction!(
-      reactCtx({ messageId: HEX32("99"), to: `marmot:${HEX32("cc")}`, emoji: "" }),
+      reactCtx({
+        messageId: HEX32("99"),
+        to: `  MARMOT:0X${"C".repeat(64)}  `,
+        remove: true,
+        emoji: "",
+      }),
     );
 
     expect(removeReaction).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("99"));
     expect(resultOk(result)).toBe(true);
   });
 
+  it("rejects missing, empty, and non-string emoji without explicit removal", async () => {
+    const resolveTarget = vi.fn(async () => ({
+      client: messageActionClient(),
+      marmotAccountIdHex: HEX32("aa"),
+    }));
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget,
+    });
+    const toolContext = {
+      currentMessageId: HEX32("99"),
+      currentMessagingTarget: HEX32("cc"),
+    };
+
+    for (const params of [{}, { emoji: "" }, { emoji: 7 }]) {
+      const result = await adapter.handleAction!(reactCtx(params, toolContext));
+      expect(resultOk(result)).toBe(false);
+      expect(resultError(result)).toMatch(/emoji/);
+    }
+    expect(resolveTarget).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid explicit reaction target before resolving a client", async () => {
+    const resolveTarget = vi.fn(async () => ({
+      client: messageActionClient(),
+      marmotAccountIdHex: HEX32("aa"),
+    }));
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget,
+    });
+
+    const result = await adapter.handleAction!(
+      reactCtx({ messageId: HEX32("99"), to: "marmot:not-hex", emoji: "👀" }),
+    );
+
+    expect(resultOk(result)).toBe(false);
+    expect(resultError(result)).toBe("could not resolve group for this message id");
+    expect(resolveTarget).not.toHaveBeenCalled();
+  });
+
   it("treats an already-absent reaction as an idempotent removal", async () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: {
-          deleteMessage: async () => undefined,
+        client: messageActionClient({
           removeReaction: async () => {
             throw new AgentControlError("reaction was not active", {
               code: "reaction_not_found",
             });
           },
-        },
+        }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -334,7 +390,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined, removeReaction },
+        client: messageActionClient({ removeReaction }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -359,10 +415,9 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
-        client: {
-          deleteMessage: async () => undefined,
+        client: messageActionClient({
           sendReaction: async () => { throw new Error("secret socket detail"); },
-        },
+        }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
@@ -401,7 +456,7 @@ describe("createMarmotMessageActionAdapter", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => true,
       resolveTarget: async () => ({
-        client: { deleteMessage: async () => undefined },
+        client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });

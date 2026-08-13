@@ -30,7 +30,7 @@ import {
 } from "./config.js";
 import { startMarmotGatewayAccount } from "./gateway.js";
 import { AgentControlError } from "./client.js";
-import { createMarmotMessagingAdapter } from "./messaging.js";
+import { createMarmotMessagingAdapter, normalizeMarmotTarget } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
 import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
@@ -137,13 +137,13 @@ export interface MarmotMessageActionClient {
     groupIdHex: string,
     targetMessageIdHex: string,
   ) => Promise<unknown>;
-  sendReaction?: (
+  sendReaction: (
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
     emoji: string,
   ) => Promise<unknown>;
-  removeReaction?: (
+  removeReaction: (
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
@@ -170,11 +170,15 @@ export function createMarmotMessageActionAdapter(
             : typeof ctx.params.message_id === "string"
               ? ctx.params.message_id
             : String(ctx.toolContext?.currentMessageId ?? "");
+        // `deleteByMessageId` mutates immediately and only returns a boolean;
+        // it cannot safely recover a cached group for a reaction. Current
+        // inbound reactions inherit the tool context, while reactions to an
+        // earlier outbound message therefore require an explicit `to`.
         const rawTo =
           typeof ctx.params.to === "string"
             ? ctx.params.to
             : ctx.toolContext?.currentMessagingTarget;
-        const to = rawTo?.startsWith("marmot:") ? rawTo.slice("marmot:".length) : rawTo;
+        const to = normalizeMarmotTarget(rawTo ?? "");
         if (!messageId) {
           return jsonResult({
             ok: false,
@@ -184,26 +188,26 @@ export function createMarmotMessageActionAdapter(
         if (!to) {
           return jsonResult({ ok: false, error: "could not resolve group for this message id" });
         }
+        const remove = ctx.params.remove === true;
+        if (ctx.params.emoji !== undefined && typeof ctx.params.emoji !== "string") {
+          return jsonResult({ ok: false, error: "emoji must be a string" });
+        }
         const emoji = typeof ctx.params.emoji === "string" ? ctx.params.emoji : "";
-        const remove = ctx.params.remove === true || emoji.length === 0;
+        if (!remove && emoji.length === 0) {
+          return jsonResult({ ok: false, error: "emoji required unless remove is true" });
+        }
         try {
           const { client, marmotAccountIdHex } = await deps.resolveTarget(
             ctx.cfg,
             ctx.accountId ?? null,
           );
           if (remove) {
-            if (!client.removeReaction) {
-              return jsonResult({ ok: false, error: "reaction removal unavailable" });
-            }
             if (emoji.length > 0) {
               await client.removeReaction(marmotAccountIdHex, to, messageId, emoji);
             } else {
               await client.removeReaction(marmotAccountIdHex, to, messageId);
             }
             return jsonResult({ ok: true, removed: true });
-          }
-          if (!client.sendReaction) {
-            return jsonResult({ ok: false, error: "reactions unavailable" });
           }
           await client.sendReaction(marmotAccountIdHex, to, messageId, emoji);
           return jsonResult({ ok: true, added: emoji });
