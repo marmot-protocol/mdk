@@ -920,7 +920,12 @@ enum AppRuntimeCrossRouteOutcome {
     Uncharacterized,
 }
 
-async fn run_four_party_cross_route_app_runtime_trial() -> AppRuntimeCrossRouteOutcome {
+struct AppRuntimeCrossRouteTrial {
+    outcome: AppRuntimeCrossRouteOutcome,
+    diagnostics: String,
+}
+
+async fn run_four_party_cross_route_app_runtime_trial() -> AppRuntimeCrossRouteTrial {
     let strict_spec = cross_route_app_runtime_scenario(true);
     let clients = strict_spec.clients.clone();
     let mut expectations = clients
@@ -1249,20 +1254,27 @@ async fn run_four_party_cross_route_app_runtime_trial() -> AppRuntimeCrossRouteO
         AppRuntimeCrossRouteOutcome::Uncharacterized
     };
 
-    assert_ne!(
-        observed_outcome,
-        AppRuntimeCrossRouteOutcome::Uncharacterized,
-        "app-runtime route result was not a characterized corrected-input outcome; protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; invalidated={invalidated_counts_by_client:#?}; observations={app_observations:#?}"
-    );
-    observed_outcome
+    let diagnostics = if observed_outcome == AppRuntimeCrossRouteOutcome::FullyEquivalent {
+        String::new()
+    } else {
+        format!(
+            "protocol_match={protocol_equivalent_by_client:#?}; payloads={app_payloads_by_client:#?}; invalidated={invalidated_counts_by_client:#?}; observations={app_observations:#?}"
+        )
+    };
+    AppRuntimeCrossRouteTrial {
+        outcome: observed_outcome,
+        diagnostics,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_party_cross_route_recovery_app_runtime_matches_unified_route() {
+    let trial = run_four_party_cross_route_app_runtime_trial().await;
     assert_eq!(
-        run_four_party_cross_route_app_runtime_trial().await,
+        trial.outcome,
         AppRuntimeCrossRouteOutcome::FullyEquivalent,
-        "the unified current-master route must not retain any pre-unification app-runtime terminal split"
+        "the unified current-master route must not retain any pre-unification app-runtime terminal split; {}",
+        trial.diagnostics
     );
 }
 
@@ -1270,10 +1282,13 @@ async fn four_party_cross_route_recovery_app_runtime_matches_unified_route() {
 #[ignore = "manual twenty-trial app-runtime route-equivalence soak"]
 async fn four_party_cross_route_recovery_app_runtime_equivalence_soak() {
     let mut outcomes = BTreeMap::new();
-    for _ in 0..APP_RUNTIME_ROUTE_EQUIVALENCE_SOAK_TRIALS {
-        *outcomes
-            .entry(run_four_party_cross_route_app_runtime_trial().await)
-            .or_insert(0usize) += 1;
+    let mut failures = Vec::new();
+    for trial_index in 0..APP_RUNTIME_ROUTE_EQUIVALENCE_SOAK_TRIALS {
+        let trial = run_four_party_cross_route_app_runtime_trial().await;
+        *outcomes.entry(trial.outcome).or_insert(0usize) += 1;
+        if trial.outcome != AppRuntimeCrossRouteOutcome::FullyEquivalent {
+            failures.push((trial_index + 1, trial.diagnostics));
+        }
     }
     assert_eq!(
         outcomes,
@@ -1281,7 +1296,7 @@ async fn four_party_cross_route_recovery_app_runtime_equivalence_soak() {
             AppRuntimeCrossRouteOutcome::FullyEquivalent,
             APP_RUNTIME_ROUTE_EQUIVALENCE_SOAK_TRIALS,
         )]),
-        "the unified route produced a non-equivalent app-runtime terminal surface"
+        "the unified route produced a non-equivalent app-runtime terminal surface: {failures:#?}"
     );
 }
 

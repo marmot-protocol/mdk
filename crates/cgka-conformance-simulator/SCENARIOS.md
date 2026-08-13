@@ -150,11 +150,12 @@ These are the scenarios another implementation should be able to load from JSON 
   roots, and performs repeated full-history repair. Every harness participant must be offline before relay-wide
   hiding; the step's named clients are not a per-recipient visibility filter.
 - Current result: exact retained-engine settlement passes. On the unified same-epoch route with the queued-send
-  scheduling repair, the app-runtime oracle now requires the same public epoch, roster, depth-two profile, and complete
-  duplicate-free probe set at every participant. The prior lag, missing-probe, and two-branch surfaces are historical
-  pre-unification counterexamples and now fail the test. Exact app-runtime cryptographic commitment,
-  active-decryptability, complete application disposition, process/container/VM execution, and
-  per-durable-transition permutations remain open.
+  scheduling repair, the app-runtime oracle now requires the same public epoch, roster, administration, depth-two
+  profile, and complete duplicate-free probe set at every participant. The prior lag, missing-probe, and two-branch
+  surfaces are historical pre-unification counterexamples and now fail the test; the reviewed post-change soak reached
+  full public equivalence in all twenty trials. Exact app-runtime cryptographic commitment, active-decryptability,
+  complete application disposition, process/container/VM execution, and per-durable-transition permutations remain
+  open.
 
 ### `convergence-committer-selected/v1`
 

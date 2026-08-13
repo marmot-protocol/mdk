@@ -161,9 +161,9 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   self-update) are not action-addressable on this adapter.
 - Checks: the retained-engine reference reaches exact canonical equality, durable accepted/invalidated/accepted commit
   dispositions, no pending work, and all twelve active decryptability edges. The app run pins the intended split at
-  the intermediate checkpoint, then requires every participant to reach the reference epoch, roster, and depth-two
-  profile with the complete, duplicate-free probe set and no pending confirmation. Participant-local invalidated-row
-  evidence still follows the losing-branch withdrawal rule without comparing opaque local ids.
+  the intermediate checkpoint, then requires every participant to reach the reference epoch, roster, administration,
+  and depth-two profile with the complete, duplicate-free probe set and no pending confirmation. Participant-local
+  invalidated-row evidence still follows the losing-branch withdrawal rule without comparing opaque local ids.
 - Regression: the original harness used the Nostr database's destructive `delete` operation for temporary
   invisibility. That permanently tombstoned the event id, and a later unchecked `save_event` could not restore it. The
   old runs therefore did not prove the claimed restored-input contract. The focused
@@ -171,7 +171,8 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   unification and the queued-send scheduling repair, the positive oracle rejects every previously reviewed lag,
   missing-probe, and branch-split terminal surface. The ignored
   `four_party_cross_route_recovery_app_runtime_equivalence_soak` repeats the complete retained-control/app-runtime
-  trial twenty times for reviewed evidence without adding that runtime to normal CI.
+  trial twenty times for reviewed evidence without adding that runtime to normal CI; the post-change PR run reached
+  full public equivalence in all twenty trials.
 - Boundary: process, container, and VM adapters do not yet expose equivalent controlled retained-event staging. They
   must not claim this topology from targeted catch-up alone because a live relay can deliver the competing root first.
   The app adapter exposes public protocol and application projections, not exact MLS-state commitments, the strict
