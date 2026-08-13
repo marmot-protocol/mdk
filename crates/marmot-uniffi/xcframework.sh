@@ -29,7 +29,9 @@ source "$TOOL_DIR/marmotkit-release-profile.env"
 WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
 CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 TARGET_DIR="$WORKSPACE_DIR/target"
-BUILD_DIR="$CRATE_DIR/build"
+# Scoped to build/ios, not build/, so cleaning this script's scratch space
+# cannot take xcframework-macos.sh's build/macos with it.
+BUILD_DIR="$CRATE_DIR/build/ios"
 OUT_DIR="$CRATE_DIR/output"
 
 # Set public first-party endpoint defaults for values compiled via option_env!.
@@ -55,6 +57,9 @@ cd "$WORKSPACE_DIR"
 echo "==> Cleaning previous build artifacts"
 rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift"
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
+
+echo "==> Ensuring iOS targets are installed"
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 echo "==> Building host dylib (used for binding generation)"
 cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}

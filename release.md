@@ -306,8 +306,9 @@ The workflow lives at:
 ```
 
 It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
-`marmotkit-v0.9.0`, builds both binding bundles, and creates the matching immutable GitHub Release. It can also be
-dispatched with a full commit SHA reachable from `master` to create an immutable iOS-only TestFlight snapshot.
+`marmotkit-v0.9.0`, builds the iOS, macOS, and Android binding bundles, and creates the matching immutable GitHub
+Release. It can also be dispatched with a full commit SHA reachable from `master` to create an immutable iOS + macOS
+snapshot; Android bindings are published only for formal tags.
 
 Create the tag:
 
@@ -321,22 +322,39 @@ For releases that should include the matching MDK source and WN Agent tracks, pr
 
 The release job creates these assets:
 
-- `MarmotKitFFI-<version>.xcframework.zip`
+- `MarmotKitFFI-<version>.xcframework.zip` (iOS)
 - `MarmotKitFFI-<version>.xcframework.zip.sha256`
 - `MarmotKitFFI-<version>.xcframework.zip.swiftpm-checksum`
-- `MarmotKit-<version>.swift`
 - `marmotkit-ios-<version>.manifest.json`
 - `marmotkit-ios-<version>.checksums.txt`
 - `marmotkit-ios-<version>.zip`
 - `marmotkit-ios-<version>.zip.sha256`
+- `MarmotKitFFI-macos-<version>.xcframework.zip` (macOS, Apple Silicon)
+- `MarmotKitFFI-macos-<version>.xcframework.zip.sha256`
+- `MarmotKitFFI-macos-<version>.xcframework.zip.swiftpm-checksum`
+- `marmotkit-macos-<version>.manifest.json`
+- `marmotkit-macos-<version>.checksums.txt`
+- `marmotkit-macos-<version>.zip`
+- `marmotkit-macos-<version>.zip.sha256`
+- `MarmotKit-<version>.swift` (shared by iOS and macOS)
 - `marmotkit-android-<version>.zip`
 - `marmotkit-android-<version>.zip.sha256`
+
+The generated Swift binding is platform-independent, so it is published exactly once, by the iOS job. There is no
+`MarmotKit-macos-<version>.swift`; macOS consumers use the same `MarmotKit-<version>.swift` from the same release.
+Publishing fails if the iOS and macOS jobs ever generate different Swift from one source SHA.
 
 Snapshot assets use `snapshot-<full-sha>` in place of `<version>` and are published under the exact
 `marmotkit-snapshot-<full-sha>` release tag. The binary-only ZIP contains `MarmotKit.xcframework` at its archive root
 for SwiftPM. See `crates/marmot-uniffi/DISTRIBUTION.md` for URL and consumer examples.
 
 The iOS zip contains:
+
+- `MarmotKit.xcframework`
+- `MarmotKit.swift`
+- `manifest.json`
+
+The macOS zip contains:
 
 - `MarmotKit.xcframework`
 - `MarmotKit.swift`
