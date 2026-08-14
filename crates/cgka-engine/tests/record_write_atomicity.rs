@@ -124,7 +124,7 @@ impl TransportPeeler for MockPeeler {
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
-            source: TransportSource("auto-commit-atomicity".into()),
+            source: TransportSource("record-write-atomicity".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
             },
@@ -141,7 +141,7 @@ impl TransportPeeler for MockPeeler {
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
-            source: TransportSource("auto-commit-atomicity".into()),
+            source: TransportSource("record-write-atomicity".into()),
             envelope: TransportEnvelope::Welcome {
                 recipient: recipient.clone(),
             },

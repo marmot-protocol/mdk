@@ -344,7 +344,7 @@ convergence-failure-corpus:
 focused-convergence-regressions:
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=restarted_committer_without_source_anchor_halts_through_convergence)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=verified_welcome_repair_survives_the_next_convergence_drain)'
-    cargo nextest run -p cgka-engine --test auto_commit_atomicity --locked -E 'test(=leave_persistence_failure_rolls_back_every_transactional_write)'
+    cargo nextest run -p cgka-engine --test record_write_atomicity --locked -E 'test(=leave_persistence_failure_rolls_back_every_transactional_write)'
     cargo nextest run -p marmot-app --lib --locked -E 'test(=tests::explicit_catch_up_arms_and_replays_without_later_traffic)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork)'
 
