@@ -348,6 +348,9 @@ pub(crate) enum AccountWorkerCommand {
     RetryPushRegistration {
         respond: oneshot::Sender<bool>,
     },
+    RetryRuntimeGroupSubscriptions {
+        respond: oneshot::Sender<bool>,
+    },
     DeleteAuditLog {
         path: std::path::PathBuf,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -470,14 +473,17 @@ async fn run_app_runtime_account_worker(
         scheduled_convergence_test_delay(&app),
     );
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
+    let mut scheduled_runtime_group_subscription_refresh =
+        ScheduledRuntimeGroupSubscriptionRefresh::new();
 
     // The session's cheap open pass has seeded every stored group. Signal
     // command-readiness *now*: the hydration pipeline right below enters its
     // command-serving loop immediately, so "ready" genuinely means "serving
     // commands" — group reads (`Members` / `MemberIdsPage` / `GroupMlsState` /
     // `GroupRoster` / `QuarantinedGroups`) issued from this point hydrate the
-    // group(s) they name and answer live. Everything else
-    // joins the startup deferral. `AccountOpen` (recorded by `reconcile` as the ready-wait)
+    // group(s) they name and answer live; projection-only invite acceptance
+    // also runs immediately. Everything else joins the startup deferral.
+    // `AccountOpen` (recorded by `reconcile` as the ready-wait)
     // measures the seeded open; the mdk#1161 stage telemetry attributes it
     // (`AccountSessionOpen` / `AccountGroupHydration` for the open the
     // worker just awaited, with the pipeline and snapshot capture measured
@@ -505,8 +511,9 @@ async fn run_app_runtime_account_worker(
     // seeded stored groups, so fully hydrate them now — chat-list recency
     // first — while serving commands. Group reads for a not-yet-hydrated
     // group hydrate that one group and answer live ("waits for that group
-    // only"); mutations and catch-ups join the same startup deferral the
-    // catch-up window has always used and replay in arrival order after it.
+    // only"); projection-only invite acceptance also runs live. Other
+    // mutations and catch-ups join the same startup deferral the catch-up
+    // window has always used and replay in arrival order after it.
     let mut deferred: Vec<DeferredStartupCommand> = Vec::new();
     match run_startup_hydration_pipeline(
         &app,
@@ -563,8 +570,9 @@ async fn run_app_runtime_account_worker(
     // registration, and initial catch-up only after local readiness has been
     // signalled. The sync future holds `&mut client` for its whole lifetime, so
     // while it is in flight the command loop must not touch the live session:
-    // read commands are answered from `read_snapshot`, and every other command
-    // is deferred and replayed on live state once catch-up lands, in arrival
+    // read commands are answered from `read_snapshot`, invite acceptance gets
+    // a typed definitely-not-started busy response, and every other command is
+    // deferred and replayed on live state once catch-up lands, in arrival
     // order. `CatchUp` requests that arrive during the initial sync are
     // coalesced onto it.
     let sync_started_at = Instant::now();
@@ -644,6 +652,13 @@ async fn run_app_runtime_account_worker(
                                 ))),
                             }
                         }
+                        Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) => {
+                            // `initial_sync` owns `&mut client`, so the command
+                            // cannot start here. Report that fact explicitly
+                            // instead of retaining the oneshot behind an
+                            // unbounded catch-up.
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                        }
                         Some(AccountWorkerCommand::CatchUp { respond }) => {
                             // Coalesce onto the in-flight initial catch-up rather
                             // than starting a second sync; fulfilled in arrival
@@ -666,6 +681,14 @@ async fn run_app_runtime_account_worker(
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            start_post_join_history_after_visibility(
+                &mut client,
+                &summary,
+                &events,
+                &account_id_hex,
+                &account_label,
+            )
+            .await;
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
             let backfill_result = run_pending_epoch_backfill_reporting_arm(
                 &mut client,
@@ -690,6 +713,14 @@ async fn run_app_runtime_account_worker(
                 &shared,
                 "startup_sync",
             );
+            start_post_join_history_after_visibility(
+                &mut client,
+                &failure.partial_summary,
+                &events,
+                &account_id_hex,
+                &account_label,
+            )
+            .await;
             // A failed initial catch-up surfaces as an account error but must not
             // fail worker readiness — readiness was already signalled above.
             let message = account_error_message("runtime startup receive failed", &failure.source);
@@ -708,6 +739,14 @@ async fn run_app_runtime_account_worker(
             match client.drain_pending_session_events().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                    start_post_join_history_after_visibility(
+                        &mut client,
+                        &summary,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                    )
+                    .await;
                 }
                 Err(drain_error) => {
                     publish_app_runtime_account_error(
@@ -944,6 +983,18 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        start_post_join_history_after_visibility(
+                            &mut client,
+                            &summary,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        )
+                        .await;
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -1069,6 +1120,14 @@ async fn run_app_runtime_account_worker(
                                                 &account_label,
                                                 &summary,
                                             );
+                                            start_post_join_history_after_visibility(
+                                                &mut reopened,
+                                                &summary,
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                            )
+                                            .await;
                                         }
                                         Err(error) => {
                                             publish_app_runtime_account_error(
@@ -1139,6 +1198,14 @@ async fn run_app_runtime_account_worker(
                                 &account_label,
                                 &summary,
                             );
+                            start_post_join_history_after_visibility(
+                                &mut client,
+                                &summary,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            )
+                            .await;
                             publish_client_pending_projection_updates(
                                 &mut client,
                                 &events,
@@ -1159,6 +1226,14 @@ async fn run_app_runtime_account_worker(
                                 &shared,
                                 "key_package_maintenance_catch_up",
                             );
+                            start_post_join_history_after_visibility(
+                                &mut client,
+                                &failure.partial_summary,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            )
+                            .await;
                             publish_app_runtime_account_error(
                                 &events,
                                 &account_id_hex,
@@ -1335,6 +1410,20 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(Ok(snapshot.quarantined_groups()));
                 }
+                AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
+                    // The pinned sync exclusively owns the live client. This
+                    // mutation was definitely not started, so a caller may
+                    // safely retry after catch-up rather than waiting behind
+                    // an arbitrarily slow relay drain.
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
+                AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
+                    // This is worker-owned maintenance, not caller work. Keep
+                    // its retry armed without placing it in the deferred FIFO;
+                    // otherwise it would unnecessarily force later snapshot
+                    // reads to wait behind the whole catch-up.
+                    let _ = respond.send(true);
+                }
                 AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
                     catch_up_responders.push(respond);
                 }
@@ -1350,6 +1439,14 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
                 &summary,
             );
+            start_post_join_history_after_visibility(
+                client,
+                &summary,
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+            )
+            .await;
             let backfill_result = run_pending_epoch_backfill_reporting_arm(
                 client,
                 context.events,
@@ -1373,6 +1470,14 @@ async fn handle_account_worker_catch_up(
                 context.shared,
                 "catch_up",
             );
+            start_post_join_history_after_visibility(
+                client,
+                &failure.partial_summary,
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+            )
+            .await;
             let message = account_error_message("runtime catch-up failed", &failure.source);
             publish_app_runtime_account_error(
                 context.events,
@@ -1526,8 +1631,9 @@ fn run_legacy_message_promotion_batch_with(
 /// Fully hydrate every group the deferred session open only seeded, in
 /// chat-list recency order, while serving commands between batches
 /// (mdk#1161). Group reads hydrate their one group and answer live;
-/// mutations and catch-ups join `deferred` and replay in arrival order after
-/// the initial catch-up, exactly like the catch-up window's own deferral.
+/// projection-only invite acceptance runs immediately; other mutations and
+/// catch-ups join `deferred` and replay in arrival order after the initial
+/// catch-up, exactly like the catch-up window's own deferral.
 /// Recovery events surface incrementally after each batch. A storage-level
 /// pipeline failure stops the pipeline but not the worker: remaining groups
 /// stay gated with the retryable not-hydrated state and still promote on
@@ -1581,7 +1687,15 @@ async fn run_startup_hydration_pipeline(
                     _ = &mut *shutdown => return StartupHydrationOutcome::Shutdown,
                     command = commands.recv() => match command {
                         Some(command) => {
-                            handle_startup_hydration_command(client, command, deferred).await;
+                            handle_startup_hydration_command(
+                                client,
+                                command,
+                                deferred,
+                                events,
+                                account_id_hex,
+                                account_label,
+                            )
+                            .await;
                         }
                         None => return StartupHydrationOutcome::Shutdown,
                     },
@@ -1593,7 +1707,15 @@ async fn run_startup_hydration_pipeline(
             match commands.try_recv() {
                 Ok(command) => {
                     commands_served += 1;
-                    handle_startup_hydration_command(client, command, deferred).await;
+                    handle_startup_hydration_command(
+                        client,
+                        command,
+                        deferred,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    )
+                    .await;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1676,12 +1798,16 @@ async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError
 /// running. Group-local reads answer live — hydrating exactly the group
 /// they name first, so a read "waits for that group only". The quarantine
 /// list answers the incrementally-growing set; later additions reach
-/// subscribers through their `GroupHydrationQuarantined` events. Everything
-/// else joins the startup deferral in arrival order.
+/// subscribers through their `GroupHydrationQuarantined` events. Invite
+/// acceptance also runs live; everything else joins the startup deferral in
+/// arrival order.
 async fn handle_startup_hydration_command(
     client: &mut AppClient,
     command: AccountWorkerCommand,
     deferred: &mut Vec<DeferredStartupCommand>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
 ) {
     match command {
         AccountWorkerCommand::Members { group_id, respond } => {
@@ -1706,6 +1832,22 @@ async fn handle_startup_hydration_command(
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
+        }
+        AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => {
+            // Invite confirmation is a projection-only mutation and does not
+            // need the remaining MLS groups to finish hydrating. Apply and
+            // publish it immediately so a locally visible invite cannot be
+            // held behind unrelated startup work.
+            let result = client.accept_group_invite(&group_id);
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
         }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
@@ -1739,6 +1881,24 @@ async fn handle_account_worker_command(
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
             let _ = respond.send(());
+        }
+        AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
+            let pending = match client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    publish_app_runtime_account_error(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        account_error_message("runtime group subscription refresh failed", &error),
+                    );
+                    true
+                }
+            };
+            let _ = respond.send(pending);
         }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
@@ -2802,6 +2962,93 @@ impl Drop for ScheduledPushRegistrationRetry {
     }
 }
 
+fn runtime_group_subscription_retry_base_delay() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(25)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+fn runtime_group_subscription_retry_max_delay() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(1_600)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+fn runtime_group_subscription_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let multiplier = 1u32 << shift;
+    runtime_group_subscription_retry_base_delay()
+        .saturating_mul(multiplier)
+        .min(runtime_group_subscription_retry_max_delay())
+}
+
+/// Bounded retry for an ordinary group-subscription rebuild that follows a
+/// durable live ingest. The task speaks through the worker queue so it never
+/// races the engine-owning [`AppClient`]; successful refresh disarms it.
+struct ScheduledRuntimeGroupSubscriptionRefresh {
+    timer_task: Option<JoinHandle<()>>,
+}
+
+impl ScheduledRuntimeGroupSubscriptionRefresh {
+    fn new() -> Self {
+        Self { timer_task: None }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.timer_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    fn observe_pending(&mut self, pending: bool, commands: &mpsc::Sender<AccountWorkerCommand>) {
+        if !pending {
+            self.disarm();
+        } else if !self.is_armed() {
+            self.arm(commands.clone());
+        }
+    }
+
+    fn arm(&mut self, commands: mpsc::Sender<AccountWorkerCommand>) {
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+        }
+        self.timer_task = Some(tokio::spawn(async move {
+            let mut attempt = 1u32;
+            loop {
+                sleep(runtime_group_subscription_retry_delay(attempt)).await;
+                let (respond, response) = oneshot::channel();
+                if commands
+                    .send(AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                match response.await {
+                    Ok(true) => attempt = attempt.saturating_add(1),
+                    Ok(false) | Err(_) => return,
+                }
+            }
+        }));
+    }
+
+    fn disarm(&mut self) {
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for ScheduledRuntimeGroupSubscriptionRefresh {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
 /// Extra delay beyond the engine quiescence window before the first scheduled
 /// convergence tick fires. Avoids off-by-one-ms races where the timer fires
 /// while `ConvergenceStatus` is still `Syncing` (mdk#494).
@@ -3077,6 +3324,31 @@ fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
         // pass often ingests only undecryptable traffic), so it must trip the
         // gate on its own.
         || !summary.epoch_stall_escalations.is_empty()
+}
+
+/// Start the temporary full-history subscription only after the caller has
+/// published the summary containing `GroupJoined`. This ordering makes the
+/// durable group visible even when relay subscription installation is slow or
+/// fails; the existing maintenance tick retries any obligation still in its
+/// `CatchUp` phase without changing the engine's grace/quiet/jitter policy.
+async fn start_post_join_history_after_visibility(
+    client: &mut AppClient,
+    summary: &SyncSummary,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if summary.joined_groups.is_empty() {
+        return;
+    }
+    if let Err(error) = client.advance_post_join_maintenance_subscriptions().await {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("post-join maintenance subscription failed", &error),
+        );
+    }
 }
 
 fn publish_sync_summary_with_audit(
@@ -3959,6 +4231,37 @@ mod tests {
         tokio::task::yield_now().await;
 
         scheduled.schedule_after_attempt(false, &commands);
+        assert!(!scheduled.is_armed());
+    }
+
+    #[tokio::test]
+    async fn runtime_group_subscription_retry_is_bounded_and_disarms_when_refreshed() {
+        assert_eq!(
+            runtime_group_subscription_retry_delay(1),
+            runtime_group_subscription_retry_base_delay()
+        );
+        assert_eq!(
+            runtime_group_subscription_retry_delay(u32::MAX),
+            runtime_group_subscription_retry_max_delay()
+        );
+
+        let (commands, mut received_commands) = mpsc::channel(2);
+        let mut scheduled = ScheduledRuntimeGroupSubscriptionRefresh::new();
+        scheduled.observe_pending(true, &commands);
+        assert!(scheduled.is_armed());
+
+        let first = received_commands.recv().await.unwrap();
+        let AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } = first else {
+            panic!("timer must enqueue an internal group-subscription retry")
+        };
+        respond.send(true).unwrap();
+
+        let second = received_commands.recv().await.unwrap();
+        let AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } = second else {
+            panic!("pending refresh must enqueue a backed-off retry")
+        };
+        respond.send(false).unwrap();
+        scheduled.observe_pending(false, &commands);
         assert!(!scheduled.is_armed());
     }
 

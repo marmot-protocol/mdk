@@ -128,6 +128,15 @@ pub enum AppError {
     /// owns the account's in-memory engine session.
     #[error("marmot account session is already in use")]
     AccountSessionBusy,
+    /// The managed account worker is in an exclusive catch-up phase and did
+    /// not start this command. Retrying after the catch-up completes is safe.
+    #[error("marmot account worker is busy catching up; operation was not started")]
+    AccountWorkerBusy,
+    /// The worker accepted the command, but its response did not arrive within
+    /// the operation-class deadline. Completion is unknown; callers must
+    /// refresh authoritative state before deciding whether to retry.
+    #[error("marmot account worker response timed out; operation completion is unknown")]
+    AccountWorkerResponseTimedOut,
     /// An account database predates the durable setup journal and has no
     /// recoverable stable KeyPackage slot. Local evidence cannot prove that a
     /// previously signed package was never exposed, so automatic rotation is
@@ -227,6 +236,8 @@ impl AppError {
             Self::BlockingTask(_) => "blocking_task",
             Self::RuntimeBusy => "runtime_busy",
             Self::AccountSessionBusy => "account_session_busy",
+            Self::AccountWorkerBusy => "account_worker_busy",
+            Self::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
             Self::AccountSetupRecoveryRequired => "account_setup_recovery_required",
             Self::AccountSetupRetryRequired => "account_setup_retry_required",
             Self::AccountSetupResetNotApplicable => "account_setup_reset_not_applicable",

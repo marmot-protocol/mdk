@@ -158,6 +158,13 @@ pub struct AppClient {
     /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
     /// committed with the account projection and any frontier clear.
     pub(crate) pending_application_event_acks: HashSet<MessageId>,
+    /// A live ingest changed the in-memory transport routing table after its
+    /// durable projection was committed. The account worker publishes the
+    /// resulting app summary before it asks the relay plane to rebuild its
+    /// ordinary group subscriptions; failures remain armed here for bounded
+    /// background retry instead of turning the already-applied ingest into an
+    /// apparent receive failure.
+    pub(crate) pending_runtime_group_subscription_refresh: bool,
     /// Unit-test fault injection for the account-open replay path. This keeps
     /// the live protocol group intact while exercising a missing best-effort
     /// app projection.

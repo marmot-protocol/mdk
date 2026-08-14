@@ -1052,8 +1052,12 @@ trait IntoAppNodeError {
 impl IntoAppNodeError for AppError {
     fn into_node_error(self) -> NodeErrorV1 {
         let retryable = is_retryable_app_error(&self);
+        let resource_failure =
+            retryable || matches!(&self, AppError::AccountWorkerResponseTimedOut);
         let code = match self {
             AppError::AccountSessionBusy => "account_session_busy",
+            AppError::AccountWorkerBusy => "account_worker_busy",
+            AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
             AppError::RuntimeBusy => "runtime_busy",
             AppError::RuntimeStopping => "runtime_stopping",
             AppError::TransportClosed => "transport_closed",
@@ -1064,7 +1068,7 @@ impl IntoAppNodeError for AppError {
         };
         NodeErrorV1 {
             code: code.into(),
-            category: if retryable {
+            category: if resource_failure {
                 SubjectFailureCategory::Resource
             } else {
                 SubjectFailureCategory::Environment
@@ -1090,6 +1094,7 @@ fn is_retryable_app_error(error: &AppError) -> bool {
     matches!(
         error,
         AppError::AccountSessionBusy
+            | AppError::AccountWorkerBusy
             | AppError::RuntimeBusy
             | AppError::RuntimeStopping
             | AppError::TransportClosed

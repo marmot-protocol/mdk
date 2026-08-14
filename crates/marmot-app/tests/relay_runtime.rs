@@ -6,13 +6,13 @@ use std::sync::{Arc, Once};
 
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
-use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
     STREAM_TAG,
 };
 use cgka_traits::engine::KeyPackage;
+use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppError, AppMessageQuery, AuditDataMode,
@@ -62,6 +62,23 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
             .with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
+}
+
+async fn accept_group_invite_retrying_busy(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    group_id: &GroupId,
+) -> Result<marmot_app::AppGroupRecord, AppError> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match runtime.accept_group_invite(account_ref, group_id).await {
+                Err(AppError::AccountWorkerBusy) => sleep(Duration::from_millis(10)).await,
+                result => return result,
+            }
+        }
+    })
+    .await
+    .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
 }
 
 async fn group_message_blocking_app(
@@ -2199,8 +2216,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         )
     })
     .await;
-    runtime
-        .accept_group_invite(&bob_id, &group_id)
+    accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .unwrap();
 
@@ -2221,8 +2237,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         )
     })
     .await;
-    runtime
-        .accept_group_invite(&bob_id, &second_group_id)
+    accept_group_invite_retrying_busy(&runtime, &bob_id, &second_group_id)
         .await
         .unwrap();
     let second_group_id_hex = hex::encode(second_group_id.as_slice());
@@ -3702,10 +3717,10 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
         Some(alice.account.account_id_hex.as_str())
     );
 
-    let accepted = runtime
-        .accept_group_invite(&bob.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let accepted =
+        accept_group_invite_retrying_busy(&runtime, &bob.account.account_id_hex, &group_id)
+            .await
+            .unwrap();
     assert!(!accepted.pending_confirmation);
     assert!(!accepted.archived);
 
@@ -3759,8 +3774,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     let first_pending = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert!(first_pending.pending_confirmation);
     let first_welcome_id = first_pending.via_welcome_message_id_hex.clone();
-    runtime
-        .accept_group_invite(&bob_id, &group_id)
+    accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .unwrap();
     let accepted = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
@@ -3859,8 +3873,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         "bob should be a member again after the re-add; got {bob_members:?}"
     );
 
-    runtime
-        .accept_group_invite(&bob_id, &group_id)
+    accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .unwrap();
     runtime

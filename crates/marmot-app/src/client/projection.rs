@@ -882,6 +882,10 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::BlockingTask(_) => "read_marker_failed:blocking_task",
         AppError::RuntimeBusy => "read_marker_failed:runtime_busy",
         AppError::AccountSessionBusy => "read_marker_failed:account_session_busy",
+        AppError::AccountWorkerBusy => "read_marker_failed:account_worker_busy",
+        AppError::AccountWorkerResponseTimedOut => {
+            "read_marker_failed:account_worker_response_timed_out"
+        }
         AppError::AccountSetupRecoveryRequired => {
             "read_marker_failed:account_setup_recovery_required"
         }

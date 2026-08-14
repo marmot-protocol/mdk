@@ -199,6 +199,36 @@ impl AppClient {
         Ok(())
     }
 
+    pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
+        self.pending_runtime_group_subscription_refresh
+    }
+
+    /// Retry an ordinary group-subscription rebuild that was deliberately
+    /// moved behind live-ingest visibility. A successful rebuild disarms the
+    /// intent; an error leaves it armed so the worker's bounded backoff can
+    /// try again without replaying the durable delivery.
+    pub(crate) async fn retry_pending_runtime_group_subscription_refresh(
+        &mut self,
+    ) -> Result<bool, AppError> {
+        if !self.pending_runtime_group_subscription_refresh {
+            return Ok(false);
+        }
+        if let Err(error) = self.sync_runtime_groups().await {
+            if error.is_account_not_active() {
+                // A relay notification gap or overlapping account-adapter
+                // teardown can retire the activation between durable ingest
+                // and this background retry. Re-activation installs both the
+                // account inbox and the current complete group set, satisfying
+                // the same refresh intent without replaying the delivery.
+                self.prepare_transport().await?;
+            } else {
+                return Err(error);
+            }
+        }
+        self.pending_runtime_group_subscription_refresh = false;
+        Ok(false)
+    }
+
     pub(crate) async fn prepare_transport(&self) -> Result<(), AppError> {
         self.prepare_transport_with_telemetry(None).await
     }
@@ -608,6 +638,13 @@ impl AppClient {
         loop {
             let delivery = self.receive_next_delivery().await?;
             let summary = self.ingest_received_delivery(delivery).await?;
+            // A directly-owned AppClient has no account-worker scheduler to
+            // perform the post-visibility retry. Preserve its historical
+            // contract by completing the pending rebuild before handing the
+            // summary to its caller; the managed worker uses the lower-level
+            // ingest method and owns the background retry instead.
+            self.retry_pending_runtime_group_subscription_refresh()
+                .await?;
             if summary.joined_groups.is_empty()
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
@@ -684,9 +721,7 @@ impl AppClient {
         if !routes_dirty || refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
-        if routes_dirty || refresh.routing_changed {
-            self.sync_runtime_groups().await?;
-        }
+        self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }

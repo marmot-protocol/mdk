@@ -29,6 +29,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Welcome joins now become durable and publish `GroupJoined` before ordinary
+  relay subscriptions rebuild, with failed rebuilds retried in the background.
+  Invite acceptance runs during startup hydration and returns a typed
+  `AccountWorkerBusy` response when catch-up definitely prevented it from
+  starting; every app-facing worker response also has an operation-class deadline whose
+  `AccountWorkerResponseTimedOut` result tells hosts to refresh state before
+  retrying. MarmotKit and `wn --json` preserve both distinct outcomes.
+  ([#1438](https://github.com/marmot-protocol/mdk/issues/1438))
+
 - Messages left waiting when a group is disbanded, or when this device is
   removed from it, no longer report as pending forever. The group's queue is
   gone in both cases, so those messages are now marked failed and hosts can show

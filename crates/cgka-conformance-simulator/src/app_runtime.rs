@@ -1353,6 +1353,8 @@ fn drain_runtime_events(participant: &mut Participant) {
 fn record_failure(participant: &mut Participant, error: &AppError) {
     let kind = match error {
         AppError::AccountSessionBusy => "account_session_busy",
+        AppError::AccountWorkerBusy => "account_worker_busy",
+        AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
         AppError::TransportClosed => "transport_closed",
@@ -1367,7 +1369,10 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
     participant.last_error_kind = Some(kind);
     if matches!(
         error,
-        AppError::AccountSessionBusy | AppError::RuntimeBusy | AppError::TransportClosed
+        AppError::AccountSessionBusy
+            | AppError::AccountWorkerBusy
+            | AppError::RuntimeBusy
+            | AppError::TransportClosed
     ) {
         participant.retryable_failures = participant.retryable_failures.saturating_add(1);
     } else {
@@ -1379,6 +1384,8 @@ fn app_error(error: AppError) -> SubjectError {
     let category = match error {
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
+        | AppError::AccountWorkerBusy
+        | AppError::AccountWorkerResponseTimedOut
         | AppError::RuntimeStopping
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)
