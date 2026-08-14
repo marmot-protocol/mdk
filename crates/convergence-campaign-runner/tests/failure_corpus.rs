@@ -188,6 +188,7 @@ fn distributed_product_failures_are_saved_with_a_process_reduction_candidate() {
             namespace: "failure-test".into(),
             allow_mutable_image_references: true,
             allow_cleartext_isolated_relay: true,
+            enable_retained_relay_control: false,
             default_participant_image: "current".into(),
             relay_image: "current".into(),
             relay_command: vec!["relay".into()],

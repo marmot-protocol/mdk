@@ -23,6 +23,11 @@ the property-test registry. This file is the agent-facing model.
     and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
     `GroupEvolution`.
 
+- **Module:** `src/cross_route_scenario.rs`
+  - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The
+    engine-capable form adds exact state and active decryptability; app-runtime, process, container, and VM adapters
+    reuse the public form and must not privately reconstruct its action schedule or terminal assertions.
+
 - **Module:** `src/scenario_input_ledger.rs`
   - **Role:** Simulator-owned per-client commit, proposal, and application-input accounting. Joins stable scenario
     action ids to outer transport and peeled MLS content ids; application entries also retain the inner Marmot event id.

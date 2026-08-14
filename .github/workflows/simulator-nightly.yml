@@ -87,10 +87,11 @@ jobs:
       - name: Run selected real-container convergence campaign
         env:
           CGKA_CONVERGENCE_IMAGE: marmot-conformance:local
+          CGKA_DISTRIBUTED_ARTIFACTS_DIR: ${{ github.workspace }}/target/cgka-distributed-container-evidence
         run: |
           cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
             --run-ignored ignored-only --no-tests fail \
-            -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state)'
+            -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state) | test(=four_party_cross_route_recovery_containers_match_unified_route)'
 
       - name: Run encrypted file-backed vector report
         run: |
@@ -107,7 +108,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cgka-conformance-simulator-nightly-reports
-          path: target/cgka-conformance-simulator-nightly-reports
+          path: |
+            target/cgka-conformance-simulator-nightly-reports
+            target/cgka-distributed-container-evidence
           if-no-files-found: warn
           retention-days: 30
 

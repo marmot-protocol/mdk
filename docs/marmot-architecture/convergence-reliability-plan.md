@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-13
+updated: 2026-08-14
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -1042,9 +1042,11 @@ the app/process adapters cannot expose and the container/VM routes remain open b
     destructive event-id tombstone artifact. Revalidation after #1293 route unification and #1403 queued-send repair
     now requires complete public protocol/probe equivalence and rejects every pre-unification lag, missing-probe, and
     branch-split surface. The exact same IR and digest now pass that public oracle in four isolated app processes using
-    runner-owned reversible relay control, a real disconnect/reopen boundary, and one post-displacement restart. Keep
-    this item open for container/VM execution, per-durable-transition restart permutations, and exact evidence on
-    adapters that can expose it.
+    runner-owned reversible relay control, a real disconnect/reopen boundary, and one post-displacement restart. The
+    shared scenario and oracle are also the input to a scheduled four-container checkpoint with retained manifests,
+    reports, receipts, and failure-corpus entries. Encrypted participant roots and the relay control plane remain
+    ephemeral. Keep this item open for VM execution, per-durable-transition restart
+    permutations, and exact evidence on adapters that can expose it.
 - [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
   disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
   comparison remains part of the open route-equivalence work above.
@@ -1060,9 +1062,9 @@ the app/process adapters cannot expose and the container/VM routes remain open b
 The remaining 6.1 work is assurance closure, not another speculative engine rewrite. #1285 is the implementation now
 on `master`; after #1293 and #1403, the retained-engine reference settles and the corrected-input app-runtime route is
 held to the same public terminal protocol/profile/probe result. The isolated-process adapter now carries that same
-input contract and public oracle. Carry it next into container/VM execution and the remaining durable-transition
-permutations. Do not project app/process public evidence into exact cryptographic, durable-disposition, or
-active-decryptability claims that those adapters cannot expose.
+input contract and public oracle. The container checkpoint now consumes that shared contract; carry it next into VM
+execution and the remaining durable-transition permutations. Do not project app/process/container public evidence
+into exact cryptographic, durable-disposition, or active-decryptability claims that those adapters cannot expose.
 
 [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) merged the fail-closed missing-anchor behavior and
 Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) has now
@@ -1254,8 +1256,9 @@ residual gap.
 5. [ ] Complete the #1285 cross-route regression across every capable adapter. The `CgkaEngine` checkpoint is now permanent
    as `cross-route-own-commit-recovery/v1` and pins exact cryptographic, decryptability, commit-disposition, pending-work,
    and projection agreement after restart. `cross-route-retained-history-recovery/v1` now establishes the same contract
-   through retained relay histories; app-runtime and isolated-process public-projection evidence is now complete, while
-   container/VM execution and engine-private evidence unavailable through those public adapters remain open.
+   through retained relay histories; app-runtime and isolated-process public-projection evidence is now complete, and
+   the scheduled container checkpoint consumes the same public scenario/oracle while retaining its distributed
+   artifacts. VM execution and engine-private evidence unavailable through those public adapters remain open.
    [MDK #1372](https://github.com/marmot-protocol/mdk/pull/1372) completed the first capability-overlap slice: one
    profile/message/restart journey runs unchanged through the `CgkaEngine` harness and the full
    app-runtime/separate-process adapters, crossing the production-shaped `CgkaEngine`, `TransportPeeler`, and
@@ -1272,9 +1275,16 @@ residual gap.
    its explicit ignored soak repeats the full retained-control/app-runtime trial twenty times. The same IR and digest
    now run through four isolated app processes with separate SQLCipher roots, runner-owned reversible relay control,
    real transport disconnect/reopen, one post-displacement restart, strict public state/application assertions, and a
-   separate ignored twenty-trial soak. Container/VM execution, exact cryptographic and active-decryptability evidence
-   on capable adapters, complete application disposition, and durable-transition permutations remain open. The
-   decision-route inventory is machine checked against the unified route.
+   separate ignored twenty-trial soak. The scheduled four-container checkpoint runs the same builder, IR digest, and
+   strict public report oracle and retains its exact scenario, normalized manifest, process report, command receipt,
+   and failure-corpus entry. VM execution, exact cryptographic and active-decryptability evidence on capable
+   adapters, complete application disposition, and durable-transition permutations remain open. The decision-route
+   inventory is machine checked against the unified route.
+
+   The reviewed twenty-trial process soak belongs to the #1424 merge snapshot. Later storage/runtime changes, including
+   #1433 and #1435, do not inherit that result. The scheduled container checkpoint executes the current source revision
+   and retains its exact normalized manifest and report; every future evidence claim must continue to name its tested
+   revision rather than carrying an older green soak forward.
 6. [x] Land and execute a focused current-`master` regression gate for the production convergence changes that landed
    after the reviewed 1,170-case snapshot. Cover #1329 missing-anchor halt and authenticated Welcome repair, #1360
    atomic self-removal persistence across injected write failures and restart, #1365 armed full-history backfill after
@@ -1306,8 +1316,9 @@ rerun remains useful release evidence and must still identify its own exact sour
 
 - [ ] Every inventoried convergence decision route has a named model/test/campaign owner, and no unexplained
   route-dependent outcome remains.
-- [ ] The #1285 same-source-epoch cross-route regression passes across engine, app-runtime, process, and distributed
-  adapters with exact cryptographic agreement, active decryptability, and complete application-input dispositions.
+- [ ] The #1285 same-source-epoch cross-route regression passes across engine, app-runtime, process, container, and VM
+  adapters using the shared public oracle, while every engine-capable adapter additionally proves exact cryptographic
+  agreement, active decryptability, and complete application-input dispositions.
 - [ ] Campaigns are repeatable from saved configuration and artifact manifests.
 - [ ] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
 - [ ] Resource and flake budgets prevent silent campaign degradation.
@@ -1431,7 +1442,7 @@ incorrect result.
 | 2026-08-06 | 6.1 commit-addressed own-branch recovery | Replaced the unmerged #1236 recovery design with immutable wire-digest-addressed checkpoints, reconsiderable same-epoch losers, fail-closed missing-checkpoint handling, and an engine restart regression; retained cross-adapter route-equivalence as open assurance work | [MDK #1285](https://github.com/marmot-protocol/mdk/pull/1285); feature-enabled engine suite; storage and snapshot tests; `just fast-ci` |
 | 2026-08-05 | E9 outbound retention bound | Bounded the per-group durable outbound-intent retention queue at its single insertion point, covering every path that retains — the locally staged publication path, the pre-existing stable-but-unsettled path, and the offline outbox — the over-cap send is refused with a typed non-transient `EngineError` surfaced as a distinct FFI variant, and already-retained intents still drain and reclaim capacity once a publish is accepted | `cargo test -p cgka-engine --features test-policy-overrides --test publish_lifecycle`; `cargo test -p cgka-traits`; `cargo test -p cgka-conformance-simulator --test protocol_decision_gate`; `cargo test -p marmot-uniffi`; `just convergence-ledger-gate` |
 | 2026-08-06 | 6.3 lane policy and evidence foundations | Added single-source PR, nightly, weekly/manual, and release-hardening policy manifests; fail-closed standalone wall/CPU/RSS/disk/artifact/retention/flake evaluation; nonempty byte-verified evidence artifacts; and scheduled entry points without claiming workflow-owned measurement or incident-corpus execution yet | [MDK #1271](https://github.com/marmot-protocol/mdk/pull/1271); `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
-| 2026-08-06 | L2 terminal disposition for accepted sends | Closed the "terminated with an explicit outcome" half of L2: an accepted send now reports whether it published or is retained, a halted group refuses new sends with a typed error instead of engine-bug error text, and the two transitions that permanently discard a retained intent (disband, local copy removed) withdraw the group's unpublished sends so they stop reporting as pending. The pending-to-delivered flip also became a distinct delivery-state signal on both the publish and the explicit-retry path. The "released, regenerated" half still awaits M3.1 crash/failure workloads, so L2 stays `partially-covered` | `cargo test -p storage-sqlite`; `cargo test -p marmot-app --lib`; `cargo test -p cgka-engine --features test-policy-overrides`; `cargo test -p marmot-uniffi`; `just fast-ci` |
+| 2026-08-06 | L2 terminal disposition for accepted sends | Closed the "terminated with an explicit outcome" half of L2: an accepted send now reports whether it published or is retained, a halted group refuses new sends with a typed error instead of engine-bug error text, and the two transitions that permanently discard a retained intent (disband, local copy removed) withdraw the group's unpublished sends so they stop reporting as pending. The pending-to-delivered flip also became a distinct delivery-state signal on both the publish and the explicit-retry path. The "released, regenerated" half still awaits M3.1 crash/failure workloads, so L2 stays `partially-covered` | [MDK #1426](https://github.com/marmot-protocol/mdk/pull/1426); `cargo test -p storage-sqlite`; `cargo test -p marmot-app --lib`; `cargo test -p cgka-engine --features test-policy-overrides`; `cargo test -p marmot-uniffi`; `just fast-ci` |
 | 2026-08-07 | 6.4 failure corpus lifecycle | Unified simulator/process/distributed failure indexing with the four reviewed classifications, semantic dependency-aware reduction, cross-adapter reduction candidates, safe vector promotion, recurrence counts, and time-to-diagnosis as a separate layer over the campaign runner | [MDK #1272](https://github.com/marmot-protocol/mdk/pull/1272); `failure_corpus`; `semantic_reduction`; `convergence-failure-corpus` |
 | 2026-08-07 | Capability naming cleanup | Renamed long-lived simulator/process artifacts around their owned capability and added a fast-CI gate rejecting any tracked filename whose basename contains `milestone`, case-insensitively | [MDK #1273](https://github.com/marmot-protocol/mdk/pull/1273); `just naming-gate`; required GitHub CI |
 | 2026-08-07 | 6.5 stateful canonical journeys | Added deterministic legality-aware Scenario IR v3 journeys with modeled membership, admin, profile, connectivity, epoch, and delivery outcomes; separated late-membership from founding-member offline history so pre-admission retry state is not mislabeled; and saved owner-only, subject-preserving inputs before execution | [MDK #1302](https://github.com/marmot-protocol/mdk/pull/1302); `stateful_generator`; `chat-journey/v1`; strict eight-case/two-profile rotation plus retained-input replay |
@@ -1453,8 +1464,10 @@ incorrect result.
 | 2026-08-12 | 6.1 unified same-epoch route and queued-send repair | Merged option C: removed the pairwise committer-only fork route so every participant uses distributed convergence, added branch-relative peel contexts and route-equivalence evidence, then repaired the durable queued-outbound scheduling edge and runnable-work level signal exposed by the longer unified convergence window. The corrected-input app-runtime result above predates both changes and is retained as historical falsification evidence, not a characterization of current `master`; repeat it before assigning the next production defect. | [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293); [MDK #1403](https://github.com/marmot-protocol/mdk/pull/1403); unified-route engine and simulator regressions |
 | 2026-08-13 | 6.1 post-unification app-runtime route assurance | Re-ran the exact corrected-input four-party topology after #1293 and #1403, then replaced the permissive historical terminal-surface classifier with a positive public-equivalence oracle. The strict retained-engine control still owns exact canonical state, accepted/invalidated/accepted commit dispositions, no pending work, and twelve decryptability edges; the full `MarmotAppRuntime` path must now match its epoch, roster, administration, and depth-two profile with the complete duplicate-free probe set and no pending confirmation. Five consecutive pre-change current-master trials reached that result, followed by a 20/20 post-change run of the explicit ignored soak. Process/container/VM execution and evidence unavailable through the app projection remain open; no production code changed. | `four_party_cross_route_recovery_app_runtime_matches_unified_route`; `four_party_cross_route_recovery_app_runtime_equivalence_soak`; simulator/app-runtime assurance only |
 | 2026-08-13 | Post-unification campaign performance baseline | Replaced full retained-message scans with indexed state probes, scoped retained-anchor snapshots to canonical group state while keeping legacy full-snapshot rollback compatibility, and point-queried Welcome key packages plus buffered replay states during join/create lifecycle work. These changes reduce the cost of long-history and participant-growth campaigns but do not close any route-equivalence or distributed evidence item by themselves. | [MDK #1405](https://github.com/marmot-protocol/mdk/pull/1405); [MDK #1406](https://github.com/marmot-protocol/mdk/pull/1406); [MDK #1416](https://github.com/marmot-protocol/mdk/pull/1416); storage and engine suites plus lifecycle benchmarks |
-| 2026-08-13 | 6.1 isolated-process cross-route assurance | Extracted runner-owned reversible retained-relay control for reuse by app and process adapters, then executed the exact app-runtime four-party IR and digest through four child runtimes with separate encrypted roots. Replaced SIGSTOP offline simulation with public checkpoint plus graceful runtime/transport disconnect and durable reopen, preventing open subscriptions from buffering withheld events across the declared offline boundary. The strict process oracle pins the controlled split, canonical schedule, public terminal protocol/profile, complete duplicate-free application set, losing-branch withdrawal rule, no pending confirmation, and real Zeta reopen. Exact MLS state, durable input dispositions, and active decryptability remain unavailable through the public node protocol; container/VM and every-transition permutations remain open. No production engine or app behavior changed. | `four_party_cross_route_recovery_processes_match_unified_route`; `four_party_cross_route_recovery_process_equivalence_soak`; process-adapter capability preflight and focused simulator tests |
 | 2026-08-13 | Nightly cross-sender oracle correction | Diagnosed the scheduled lane failure as an invalid ordering claim in `adversarial-reliability/app-witness-value/v1`: both runs agreed on the selected branch, epoch, roster, and exact payload multiplicities, but MLS does not define a total order across independent senders. The scenario now asserts one Eve witness, one Frank witness, and no David witness without weakening scenarios that intentionally test ordered delivery. A failed nightly lane also emits the exact seed-7 adversarial reports and capsules before propagating failure, and the runner raises its memlock limit instead of flooding logs when SQLCipher locks sensitive allocations. | [MDK #1409](https://github.com/marmot-protocol/mdk/issues/1409); scheduled run `31669097875`; focused adversarial reliability tests; nightly artifact path |
+| 2026-08-14 | Source-epoch application replay invariance | Reordered candidate and selected-branch replay so proposals and applications are authenticated at their source epoch before the commit advancing that epoch prunes required OpenMLS material. This closes the observed pass-partition-dependent delivery defect without broadening the adopted application-witness eligibility horizon. | [MDK #1423](https://github.com/marmot-protocol/mdk/pull/1423); one-pass versus split-pass six-advance regression; canonical-branch delivery and branch-witness tests |
+| 2026-08-14 | 6.1 isolated-process cross-route assurance | Extracted runner-owned reversible retained-relay control for reuse by app and process adapters, then executed the exact app-runtime four-party IR and digest through four child runtimes with separate encrypted roots. Replaced SIGSTOP offline simulation with public checkpoint plus graceful runtime/transport disconnect and durable reopen, preventing open subscriptions from buffering withheld events across the declared offline boundary. The strict process oracle pins the controlled split, canonical schedule, public terminal protocol/profile, complete duplicate-free application set, losing-branch withdrawal rule, no pending confirmation, and real Zeta reopen. Exact MLS state, durable input dispositions, and active decryptability remain unavailable through the public node protocol; container/VM and every-transition permutations remain open. No production engine or app behavior changed. | [MDK #1424](https://github.com/marmot-protocol/mdk/pull/1424); `four_party_cross_route_recovery_processes_match_unified_route`; `four_party_cross_route_recovery_process_equivalence_soak`; process-adapter capability preflight and focused simulator tests |
+| 2026-08-14 | 6.1 scheduled container cross-route checkpoint | Extracted the four-party public scenario and strict process-report oracle into one shared assurance fixture, selected that exact IR and digest through the distributed manifest, and added a real four-container checkpoint with one non-root participant container and encrypted root per member. A source-built local Docker run completed the exact checkpoint in 61.20 seconds with clean teardown. Nightly and weekly/manual workflows retain the exact scenario, normalized manifest, process report, distributed receipt, and failure corpus on success or failure; encrypted participant roots and the opaque-token relay control plane remain ephemeral. Exact engine-private evidence and VM/per-transition permutations remain open. | `container_manifest_selects_the_shared_four_party_cross_route_ir`; `four_party_cross_route_recovery_containers_match_unified_route`; `target/cgka-distributed-container-evidence` |
 
 ## Capability Naming Cleanup
 

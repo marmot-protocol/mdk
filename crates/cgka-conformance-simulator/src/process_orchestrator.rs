@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_relay_builder::LocalRelay;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::node_protocol::{
@@ -62,6 +64,96 @@ impl ProcessNodeLaunchV1 {
 #[async_trait::async_trait]
 pub trait ProcessBarrierHook: Send {
     async fn before_barrier(&mut self, name: &str) -> Result<(), ProcessOrchestratorError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessRelayControlError {
+    pub code: String,
+    pub message: String,
+}
+
+#[async_trait::async_trait]
+pub trait ProcessRelayControl: Send + Sync {
+    async fn publication_cursor(&self) -> Result<usize, ProcessRelayControlError>;
+
+    async fn wait_for_action_events(
+        &self,
+        action_id: &str,
+        before: usize,
+        include_welcomes: bool,
+        expected_publications: usize,
+        expected_event_ids: &[String],
+        timeout: Duration,
+    ) -> Result<(), ProcessRelayControlError>;
+
+    async fn set_action_event_visibility(
+        &self,
+        selector: &crate::ScenarioMessageSelectorV2,
+        visible: bool,
+    ) -> Result<(), ProcessRelayControlError>;
+}
+
+struct LocalProcessRelayControl {
+    control: RelayControl,
+    action_events: Mutex<RelayActionEvents>,
+}
+
+impl LocalProcessRelayControl {
+    fn new() -> Self {
+        Self {
+            control: RelayControl::new(),
+            action_events: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn relay_builder(&self) -> nostr_relay_builder::RelayBuilder {
+        self.control.relay_builder()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessRelayControl for LocalProcessRelayControl {
+    async fn publication_cursor(&self) -> Result<usize, ProcessRelayControlError> {
+        Ok(self.control.publication_cursor().await)
+    }
+
+    async fn wait_for_action_events(
+        &self,
+        action_id: &str,
+        before: usize,
+        include_welcomes: bool,
+        expected_publications: usize,
+        expected_event_ids: &[String],
+        timeout: Duration,
+    ) -> Result<(), ProcessRelayControlError> {
+        let mut action_events = self.action_events.lock().await;
+        self.control
+            .wait_for_action_events(
+                &mut action_events,
+                action_id,
+                before,
+                RelayActionExpectation {
+                    include_welcomes,
+                    expected_publications,
+                    expected_event_ids,
+                    timeout,
+                },
+            )
+            .await
+            .map_err(process_relay_control_error_value)
+    }
+
+    async fn set_action_event_visibility(
+        &self,
+        selector: &crate::ScenarioMessageSelectorV2,
+        visible: bool,
+    ) -> Result<(), ProcessRelayControlError> {
+        let action_events = self.action_events.lock().await;
+        self.control
+            .set_action_event_visibility(&action_events, selector, visible)
+            .await
+            .map_err(process_relay_control_error_value)
+    }
 }
 
 struct NoopProcessBarrierHook;
@@ -184,8 +276,7 @@ pub struct ProcessOrchestrator {
     artifact_directory: PathBuf,
     compiled: CompiledScenarioV2,
     _relays: BTreeMap<String, LocalRelay>,
-    relay_controls: BTreeMap<String, RelayControl>,
-    relay_action_events: BTreeMap<String, RelayActionEvents>,
+    relay_controls: BTreeMap<String, Arc<dyn ProcessRelayControl>>,
     relay_urls: BTreeMap<String, String>,
     nodes: BTreeMap<String, NodeProcess>,
     account_ids: BTreeMap<String, String>,
@@ -246,12 +337,29 @@ impl ProcessOrchestrator {
         scenario: &ScenarioSpec,
         artifact_directory: impl AsRef<Path>,
     ) -> Result<Self, ProcessOrchestratorError> {
+        Self::launch_with_relay_controls(
+            node_launch,
+            external_relay_urls,
+            None,
+            scenario,
+            artifact_directory,
+        )
+        .await
+    }
+
+    pub async fn launch_with_relay_controls(
+        node_launch: ProcessNodeLaunchV1,
+        external_relay_urls: Option<BTreeMap<String, String>>,
+        external_relay_controls: Option<BTreeMap<String, Arc<dyn ProcessRelayControl>>>,
+        scenario: &ScenarioSpec,
+        artifact_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProcessOrchestratorError> {
         let executed_scenario_ir_sha256 = canonical_scenario_ir_sha256(scenario)
             .map_err(|error| ProcessOrchestratorError::new("scenario_digest", error.to_string()))?;
         let compiled = compile_scenario(scenario).map_err(|error| {
             ProcessOrchestratorError::new("scenario_compile", error.to_string())
         })?;
-        let owns_relay_control = external_relay_urls.is_none();
+        let owns_relay_control = external_relay_urls.is_none() || external_relay_controls.is_some();
         preflight_process_compiled_scenario(
             &compiled,
             &process_subject_descriptor(owns_relay_control),
@@ -278,7 +386,7 @@ impl ProcessOrchestrator {
                 .collect()
         };
         let mut relays = BTreeMap::new();
-        let mut relay_controls = BTreeMap::new();
+        let mut relay_controls = BTreeMap::<String, Arc<dyn ProcessRelayControl>>::new();
         let relay_urls = if let Some(relay_urls) = external_relay_urls {
             let expected = relay_labels
                 .iter()
@@ -294,11 +402,30 @@ impl ProcessOrchestrator {
                     "external relay map must exactly match the scenario topology",
                 ));
             }
+            if let Some(external_relay_controls) = external_relay_controls {
+                let actual = external_relay_controls
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                if actual != expected {
+                    return Err(ProcessOrchestratorError::new(
+                        "missing_external_relay_control",
+                        "external relay control map must exactly match the scenario topology",
+                    ));
+                }
+                relay_controls = external_relay_controls;
+            }
             relay_urls
         } else {
+            if external_relay_controls.is_some() {
+                return Err(ProcessOrchestratorError::new(
+                    "external_relay_control_without_relay",
+                    "external relay controls require external relay URLs",
+                ));
+            }
             let mut relay_urls = BTreeMap::new();
             for label in relay_labels {
-                let relay_control = RelayControl::new();
+                let relay_control = Arc::new(LocalProcessRelayControl::new());
                 let relay = LocalRelay::new(relay_control.relay_builder());
                 relay.run().await.map_err(environment_error)?;
                 relay_urls.insert(label.clone(), relay.url().await.to_string());
@@ -335,7 +462,6 @@ impl ProcessOrchestrator {
             compiled,
             _relays: relays,
             relay_controls,
-            relay_action_events: BTreeMap::new(),
             relay_urls,
             nodes: BTreeMap::new(),
             account_ids: BTreeMap::new(),
@@ -369,6 +495,26 @@ impl ProcessOrchestrator {
         let mut orchestrator = Self::launch_with(
             node_launch,
             external_relay_urls,
+            &input.scenario,
+            artifact_directory,
+        )
+        .await?;
+        orchestrator.input_provenance = Some(input.provenance.clone());
+        orchestrator.expected_outcomes = input.expected_outcomes.clone();
+        Ok(orchestrator)
+    }
+
+    pub async fn launch_resolved_with_relay_controls(
+        node_launch: ProcessNodeLaunchV1,
+        external_relay_urls: BTreeMap<String, String>,
+        external_relay_controls: BTreeMap<String, Arc<dyn ProcessRelayControl>>,
+        input: &ResolvedScenarioInputV1,
+        artifact_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProcessOrchestratorError> {
+        let mut orchestrator = Self::launch_with_relay_controls(
+            node_launch,
+            Some(external_relay_urls),
+            Some(external_relay_controls),
             &input.scenario,
             artifact_directory,
         )
@@ -483,7 +629,13 @@ impl ProcessOrchestrator {
         let mut cursors = BTreeMap::new();
         for label in self.relay_labels_for_client(client)? {
             if let Some(control) = self.relay_controls.get(&label) {
-                cursors.insert(label, control.publication_cursor().await);
+                cursors.insert(
+                    label,
+                    control
+                        .publication_cursor()
+                        .await
+                        .map_err(process_relay_control_error)?,
+                );
             }
         }
         Ok(cursors)
@@ -511,15 +663,12 @@ impl ProcessOrchestrator {
             // this action or admitted after the next action's cursor.
             control
                 .wait_for_action_events(
-                    self.relay_action_events.entry(relay.clone()).or_default(),
                     action_id,
                     before,
-                    RelayActionExpectation {
-                        include_welcomes,
-                        expected_publications,
-                        expected_event_ids,
-                        timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
-                    },
+                    include_welcomes,
+                    expected_publications,
+                    expected_event_ids,
+                    RELAY_ACTION_PUBLICATION_TIMEOUT,
                 )
                 .await
                 .map_err(process_relay_control_error)?;
@@ -559,14 +708,8 @@ impl ProcessOrchestrator {
                 "the process adapter does not own the selected relay control",
             )
         })?;
-        let action_events = self.relay_action_events.get(relay).ok_or_else(|| {
-            ProcessOrchestratorError::new(
-                "relay_event_not_found",
-                "the selected relay has no action-addressed publications",
-            )
-        })?;
         control
-            .set_action_event_visibility(action_events, selector, visible)
+            .set_action_event_visibility(selector, visible)
             .await
             .map_err(process_relay_control_error)
     }
@@ -1793,7 +1936,14 @@ fn environment_error(error: impl fmt::Display) -> ProcessOrchestratorError {
     ProcessOrchestratorError::new("process_environment", error.to_string())
 }
 
-fn process_relay_control_error(error: RelayControlError) -> ProcessOrchestratorError {
+fn process_relay_control_error_value(error: RelayControlError) -> ProcessRelayControlError {
+    ProcessRelayControlError {
+        code: error.code.into(),
+        message: error.message.into(),
+    }
+}
+
+fn process_relay_control_error(error: ProcessRelayControlError) -> ProcessOrchestratorError {
     ProcessOrchestratorError::new(error.code, error.message)
 }
 
