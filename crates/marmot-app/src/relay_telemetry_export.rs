@@ -188,6 +188,12 @@ pub mod metric_names {
         "app_account_setup_advisory_step_successes";
     pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES: &str =
         "app_account_setup_advisory_step_failures";
+    /// Interrupted-migration recovery probes executed (each is one full keyed
+    /// SQLCipher open paying the passphrase KDF, mdk#1439).
+    pub const APP_SQLCIPHER_MIGRATION_PROBE_RUNS: &str = "app_sqlcipher_migration_probe_runs";
+    /// Existing-database opens that skipped the recovery probe via a cached
+    /// v2-open verdict (each avoided one passphrase KDF derivation, mdk#1439).
+    pub const APP_SQLCIPHER_MIGRATION_PROBE_SKIPS: &str = "app_sqlcipher_migration_probe_skips";
     /// One-sided outbound message send duration histogram.
     pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
     /// One-sided outbound message send attempts.
@@ -1001,6 +1007,25 @@ fn append_app_performance_points(
         metric_names::APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES,
         metric_names::APP_HOST_FOREGROUND_LOCAL_READY_FAILURES,
     );
+    // Process-wide SQLCipher probe counters (mdk#1439): runs are keyed opens
+    // paying the passphrase KDF, skips are KDF derivations avoided via cached
+    // verdicts. Population-level only, no labels.
+    for (name, value) in [
+        (
+            metric_names::APP_SQLCIPHER_MIGRATION_PROBE_RUNS,
+            app_performance.sqlcipher_migration_probe_runs,
+        ),
+        (
+            metric_names::APP_SQLCIPHER_MIGRATION_PROBE_SKIPS,
+            app_performance.sqlcipher_migration_probe_skips,
+        ),
+    ] {
+        points.push(ExportMetricPoint {
+            name,
+            relay: None,
+            value: ExportMetricValue::Counter(value),
+        });
+    }
 }
 
 fn append_app_operation_points(

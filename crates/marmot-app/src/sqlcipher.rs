@@ -5,10 +5,24 @@
 //! v2 key derivation, the legacy (v1) key derivation kept for migration, the
 //! crash-safe salt-write/rekey sequence, and recovery for interrupted or
 //! pre-fix bricked migrations.
+//!
+//! Every one of those recovery opens pays the full SQLCipher passphrase KDF
+//! (PBKDF2-HMAC-SHA512, 256k iterations at the pinned `cipher_compatibility =
+//! 4`). To keep the healthy steady state from paying that KDF twice per open,
+//! a successful "this database opens under the v2 key" verdict is cached
+//! in-process per database file and salt (mdk#1439). The cache is advisory
+//! only: a durable migration marker or a missing verdict always re-runs the
+//! recovery probe, so the crash windows keep the mdk#568 self-heal. Key
+//! presentation (passphrase vs raw key) and the KDF work factor are unchanged;
+//! that decision is recorded in
+//! `docs/marmot-architecture/storage-format-v2.md`.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -25,6 +39,143 @@ const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
 const SQLCIPHER_SALT_LEN: usize = 32;
 const SQLCIPHER_KEY_LEN: usize = 32;
+
+/// Bound on the in-process v2-open verdict cache. Three databases per account
+/// (session, account projection, directory cache), so this covers ~85 accounts
+/// per process; overflow evicts oldest-first and an evicted entry simply pays
+/// one recovery probe on its next open. Tracked per the long-lived-state
+/// discipline in `docs/marmot-architecture/runtime-state-bounds.md`.
+const SQLCIPHER_V2_VERDICT_CACHE_CAPACITY: usize = 256;
+
+/// Aggregate, privacy-safe counters for the opt-in app-performance export:
+/// every run of the interrupted-migration probe is one full keyed open paying
+/// the SQLCipher passphrase KDF, and every skip is one KDF avoided via a
+/// cached verdict (mdk#1439). Counts only — no paths, accounts, or keys.
+static SQLCIPHER_MIGRATION_PROBE_RUNS: AtomicU64 = AtomicU64::new(0);
+static SQLCIPHER_MIGRATION_PROBE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-local cache of probe verdicts: database file -> salt whose derived
+/// v2 key was *observed* to open that database earlier in this process (a
+/// successful probe, or a legacy -> v2 rekey this process performed). A verdict
+/// lets the healthy steady-state path skip the recovery probe — a full second
+/// keyed open that pays the same 256k-iteration passphrase KDF as the real open
+/// (mdk#1439).
+///
+/// Safety rules:
+/// - A verdict is recorded only after the database at that path was observed
+///   opening under the v2 key derived from that exact salt. Never on the
+///   fresh-database path, where no database file has been observed yet.
+/// - A durable migration marker always forces the probe, verdict or not: the
+///   marker means a migration may have been interrupted, and those crash
+///   windows must keep the mdk#568 self-heal.
+/// - A cache miss, an invalidated entry, or any doubt means probe. Eviction
+///   and removal-invalidation only ever cause an *extra* probe.
+static SQLCIPHER_V2_VERDICTS: LazyLock<Mutex<SqlcipherV2VerdictCache>> =
+    LazyLock::new(|| Mutex::new(SqlcipherV2VerdictCache::new()));
+
+/// Aggregate probe run/skip counts since process start
+/// `(runs, skips)`, exported via the app-performance telemetry snapshot.
+pub(crate) fn sqlcipher_migration_probe_counters() -> (u64, u64) {
+    (
+        SQLCIPHER_MIGRATION_PROBE_RUNS.load(Ordering::Relaxed),
+        SQLCIPHER_MIGRATION_PROBE_SKIPS.load(Ordering::Relaxed),
+    )
+}
+
+struct SqlcipherV2VerdictCache {
+    by_path: HashMap<PathBuf, [u8; SQLCIPHER_SALT_LEN]>,
+    insertion_order: VecDeque<PathBuf>,
+}
+
+impl SqlcipherV2VerdictCache {
+    fn new() -> Self {
+        Self {
+            by_path: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, db_path: &Path, salt: &[u8; SQLCIPHER_SALT_LEN]) -> bool {
+        self.by_path.get(db_path) == Some(salt)
+    }
+
+    fn record(&mut self, db_path: PathBuf, salt: [u8; SQLCIPHER_SALT_LEN]) {
+        if self.by_path.insert(db_path.clone(), salt).is_none() {
+            self.insertion_order.push_back(db_path);
+        }
+        while self.by_path.len() > SQLCIPHER_V2_VERDICT_CACHE_CAPACITY {
+            let Some(evicted) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.by_path.remove(&evicted);
+        }
+    }
+
+    fn invalidate(&mut self, db_path: &Path) {
+        if self.by_path.remove(db_path).is_some() {
+            self.insertion_order.retain(|path| path != db_path);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_path.len()
+    }
+}
+
+/// Cache key for verdicts. Canonicalizing merges spellings of the same file
+/// (e.g. symlinked roots such as `/var` vs `/private/var`); on any failure the
+/// literal path is used, which can only split an entry into two — never merge
+/// two different databases into one verdict.
+fn sqlcipher_verdict_cache_key(db_path: &Path) -> PathBuf {
+    fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf())
+}
+
+fn lock_sqlcipher_v2_verdicts() -> std::sync::MutexGuard<'static, SqlcipherV2VerdictCache> {
+    SQLCIPHER_V2_VERDICTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn sqlcipher_v2_verdict_cached(db_path: &Path, salt: &[u8; SQLCIPHER_SALT_LEN]) -> bool {
+    lock_sqlcipher_v2_verdicts().contains(&sqlcipher_verdict_cache_key(db_path), salt)
+}
+
+fn sqlcipher_v2_verdict_record(db_path: &Path, salt: &[u8; SQLCIPHER_SALT_LEN]) {
+    lock_sqlcipher_v2_verdicts().record(sqlcipher_verdict_cache_key(db_path), *salt);
+}
+
+fn sqlcipher_v2_verdict_invalidate(db_path: &Path) {
+    lock_sqlcipher_v2_verdicts().invalidate(&sqlcipher_verdict_cache_key(db_path));
+}
+
+/// Test-only per-path count of recovery probes actually executed, so tests can
+/// assert how often the full keyed probe open ran for one database regardless
+/// of other tests sharing this process (the aggregate counters above are
+/// process-global and would race under parallel test execution).
+#[cfg(test)]
+static PROBE_ATTEMPTS_BY_PATH: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_probe_attempt_for_test(db_path: &Path) {
+    let mut attempts = PROBE_ATTEMPTS_BY_PATH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *attempts
+        .entry(sqlcipher_verdict_cache_key(db_path))
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+fn probe_attempts_for_test(db_path: &Path) -> usize {
+    PROBE_ATTEMPTS_BY_PATH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&sqlcipher_verdict_cache_key(db_path))
+        .copied()
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SqlcipherDatabaseKind {
@@ -150,18 +301,32 @@ impl MarmotApp {
             //   * a marker is present — an interrupted migration started by the
             //     crash-safe path below, or
             //   * NO marker is present, but the database is still legacy-keyed —
-            //     the pre-fix #219 bricked state, where the salt was written
+            //     the pre-fix mdk#568 bricked state, where the salt was written
             //     before the rekey and the process crashed in between. No marker
             //     was written back then, so a marker check alone never recovers
             //     these already-bricked accounts.
             // `finish_interrupted_sqlcipher_migration` probes the v2 key first
-            // (a cheap no-op when the database is already migrated or freshly
-            // v2-keyed) and only re-runs the legacy -> v2 rekey when that probe
-            // fails. Running it on every existing-database open therefore both
-            // finishes interrupted migrations and self-heals the pre-fix bricked
-            // state, without changing behavior for healthy databases.
+            // (a cheap no-op logically when the database is already migrated or
+            // freshly v2-keyed — but a full keyed open paying the passphrase KDF
+            // physically) and only re-runs the legacy -> v2 rekey when that
+            // probe fails.
+            //
+            // The probe must run whenever the migration marker exists or this
+            // process has not yet established that this database opens under
+            // the v2 key for this salt — those are the crash windows the mdk#568
+            // self-heal exists for. Once a verdict has been established, the
+            // healthy steady-state path skips the probe so a repeated open of
+            // the same database pays the SQLCipher KDF once, not twice
+            // (mdk#1439).
             if db_path.exists() {
-                finish_interrupted_sqlcipher_migration(label, keys, db_path, kind, &salt)?;
+                if !marker_path.exists() && sqlcipher_v2_verdict_cached(db_path, &salt) {
+                    SQLCIPHER_MIGRATION_PROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    finish_interrupted_sqlcipher_migration(label, keys, db_path, kind, &salt)?;
+                    // Success means the database was just observed opening
+                    // under the v2 key (the probe) or was just rekeyed to it.
+                    sqlcipher_v2_verdict_record(db_path, &salt);
+                }
             }
             let _ = fs::remove_file(&marker_path);
             return Ok(salt);
@@ -194,6 +359,9 @@ impl MarmotApp {
                 let _ = fs::remove_file(&marker_path);
                 return Err(err);
             }
+            // The rekey committed: the database is now v2-keyed under this
+            // salt, so later opens in this process can skip the probe.
+            sqlcipher_v2_verdict_record(db_path, &salt);
             let _ = fs::remove_file(&marker_path);
         } else {
             // Fresh database: no rekey needed. Persist the salt atomically so a
@@ -326,13 +494,18 @@ fn finish_interrupted_sqlcipher_migration(
 
     let new_key = SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, salt, kind)?)?;
 
-    // Does the database already open under the v2 key?
-    {
-        let conn = Connection::open(db_path)?;
-        if open_hardened_sqlcipher(&conn, &new_key, SqlCipherHardening::cipher_only()).is_ok() {
-            return Ok(());
-        }
+    // Does the database already open under the v2 key? This probe is a full
+    // keyed open and pays the complete SQLCipher passphrase KDF (mdk#1439), so
+    // it is counted for the aggregate telemetry counters and only runs when no
+    // cached verdict covers this database+salt pair.
+    let conn = Connection::open(db_path)?;
+    SQLCIPHER_MIGRATION_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_probe_attempt_for_test(db_path);
+    if open_hardened_sqlcipher(&conn, &new_key, SqlCipherHardening::cipher_only()).is_ok() {
+        return Ok(());
     }
+    drop(conn);
 
     // Still legacy-keyed: re-run the rekey. `PRAGMA rekey` is transactional, so
     // a crash here simply leaves the marker in place for the next attempt.
@@ -419,6 +592,8 @@ fn rekey_legacy_sqlcipher_database(
 }
 
 pub(crate) fn remove_sqlite_file_set(path: &Path) -> Result<(), AppError> {
+    // The database file is going away: any cached verdict for it is stale.
+    sqlcipher_v2_verdict_invalidate(path);
     for candidate in [
         path.to_path_buf(),
         PathBuf::from(format!("{}-wal", path.display())),
@@ -709,7 +884,7 @@ mod tests {
 
     #[test]
     fn sqlcipher_recovers_pre_fix_bricked_db_with_salt_present_no_marker() {
-        // The pre-fix #219 bricked state: the vulnerable code wrote the salt to
+        // The pre-fix mdk#568 bricked state: the vulnerable code wrote the salt to
         // disk and then crashed before `PRAGMA rekey` committed, so the database
         // is still legacy-keyed. Crucially that code never wrote a migration
         // marker, so the salt-present branch sees `.salt` with NO `.salt-migrating`
@@ -814,5 +989,359 @@ mod tests {
             let name = name.to_string_lossy();
             assert!(!name.contains(".tmp."), "unexpected temp residue: {name}");
         }
+    }
+
+    /// Write a durable v2 salt and create a database already keyed with the
+    /// derived v2 key — the healthy steady state every open lands in once a
+    /// database has been migrated or created fresh.
+    fn create_healthy_v2_database(
+        label: &str,
+        keys: &nostr::Keys,
+        db_path: &Path,
+        kind: SqlcipherDatabaseKind,
+    ) {
+        let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        write_sqlcipher_salt(&sqlcipher_salt_path(db_path), &salt).unwrap();
+        let v2_key =
+            SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, &salt, kind).unwrap())
+                .unwrap();
+        let conn = Connection::open(db_path).unwrap();
+        open_hardened_sqlcipher(&conn, &v2_key, SqlCipherHardening::cipher_only()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE marker (value TEXT NOT NULL);
+             INSERT INTO marker (value) VALUES ('kept');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sqlcipher_probe_runs_at_most_once_for_healthy_v2_database_across_opens() {
+        // mdk#1439 acceptance: a healthy v2-keyed database opened repeatedly in
+        // one process runs the interrupted-migration probe — a full keyed open
+        // paying the 256k-iteration passphrase KDF — at most once. The first
+        // open establishes the verdict; later opens reuse it.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let projection_path = app.legacy_account_projection_path("alice");
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+        create_healthy_v2_database(
+            "alice",
+            &keys,
+            &projection_path,
+            SqlcipherDatabaseKind::AccountProjection,
+        );
+
+        let first_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(
+            probe_attempts_for_test(&projection_path),
+            1,
+            "the first open of a database with no cached verdict must probe"
+        );
+
+        for _ in 0..3 {
+            let key = app
+                .sqlcipher_key(
+                    "alice",
+                    &keys,
+                    &projection_path,
+                    SqlcipherDatabaseKind::AccountProjection,
+                )
+                .unwrap();
+            assert_eq!(key.as_secret_str(), first_key.as_secret_str());
+        }
+        assert_eq!(
+            probe_attempts_for_test(&projection_path),
+            1,
+            "steady-state reopens of the same database must skip the probe"
+        );
+    }
+
+    #[test]
+    fn sqlcipher_probe_reruns_whenever_migration_marker_is_present() {
+        // mdk#1439 acceptance: a durable migration marker always forces the
+        // recovery probe, even when a verdict for this database+salt is already
+        // cached — the marker means a migration may have been interrupted, and
+        // those crash windows keep the mdk#568 self-heal.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let projection_path = app.legacy_account_projection_path("alice");
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+        create_healthy_v2_database(
+            "alice",
+            &keys,
+            &projection_path,
+            SqlcipherDatabaseKind::AccountProjection,
+        );
+
+        let _ = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(probe_attempts_for_test(&projection_path), 1);
+
+        // Stale marker: the rekey committed but the process died before the
+        // marker was cleared. The cached verdict must not suppress the probe.
+        write_sqlcipher_migration_marker(&sqlcipher_migration_marker_path(&projection_path))
+            .unwrap();
+        let _ = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(
+            probe_attempts_for_test(&projection_path),
+            2,
+            "a marker-present open must re-run the recovery probe even with a cached verdict"
+        );
+        assert!(!sqlcipher_migration_marker_path(&projection_path).exists());
+
+        // Marker cleared: the steady-state skip applies again.
+        let _ = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(probe_attempts_for_test(&projection_path), 2);
+    }
+
+    #[test]
+    fn sqlcipher_verdict_invalidation_forces_reprobe_after_file_set_removal() {
+        // A cached verdict must never cause a legacy-keyed database to be
+        // opened with the wrong assumption. Removing the database file set
+        // invalidates the verdict, so when a legacy-keyed database later
+        // appears at the same path (with the salt still durable), the probe
+        // runs again and self-heals it.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let projection_path = app.legacy_account_projection_path("alice");
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+        create_healthy_v2_database(
+            "alice",
+            &keys,
+            &projection_path,
+            SqlcipherDatabaseKind::AccountProjection,
+        );
+
+        let _ = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(probe_attempts_for_test(&projection_path), 1);
+
+        // The database goes away (account/cache reset); the salt survives.
+        remove_sqlite_file_set(&projection_path).unwrap();
+        assert!(!projection_path.exists());
+
+        // A legacy-keyed database appears at the same path.
+        let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
+            "alice",
+            &keys,
+            SqlcipherDatabaseKind::AccountProjection,
+        ))
+        .unwrap();
+        {
+            let conn = Connection::open(&projection_path).unwrap();
+            conn.pragma_update(None, "key", legacy_key.as_secret_str())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE marker (value TEXT NOT NULL);
+                 INSERT INTO marker (value) VALUES ('restored');",
+            )
+            .unwrap();
+        }
+
+        let recovered_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(
+            probe_attempts_for_test(&projection_path),
+            2,
+            "an invalidated verdict must force the probe again"
+        );
+        let conn = Connection::open(&projection_path).unwrap();
+        conn.pragma_update(None, "key", recovered_key.as_secret_str())
+            .unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "restored");
+    }
+
+    #[test]
+    fn sqlcipher_probe_runs_when_database_appears_after_salt_only_open() {
+        // The fresh-database path (salt durable, no database file yet) must not
+        // record a verdict: no database has been observed opening under the v2
+        // key. If a legacy-keyed database then appears at that path, the probe
+        // still runs and heals it.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let projection_path = app.legacy_account_projection_path("alice");
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+        let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        write_sqlcipher_salt(&sqlcipher_salt_path(&projection_path), &salt).unwrap();
+
+        let _ = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(
+            probe_attempts_for_test(&projection_path),
+            0,
+            "no database file means no probe and no verdict"
+        );
+
+        let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
+            "alice",
+            &keys,
+            SqlcipherDatabaseKind::AccountProjection,
+        ))
+        .unwrap();
+        {
+            let conn = Connection::open(&projection_path).unwrap();
+            conn.pragma_update(None, "key", legacy_key.as_secret_str())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE marker (value TEXT NOT NULL);
+                 INSERT INTO marker (value) VALUES ('appeared');",
+            )
+            .unwrap();
+        }
+
+        let recovered_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        assert_eq!(
+            probe_attempts_for_test(&projection_path),
+            1,
+            "a database never observed under the v2 key must be probed"
+        );
+        let conn = Connection::open(&projection_path).unwrap();
+        conn.pragma_update(None, "key", recovered_key.as_secret_str())
+            .unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "appeared");
+    }
+
+    #[test]
+    fn sqlcipher_v2_verdict_cache_is_salt_scoped() {
+        let mut cache = SqlcipherV2VerdictCache::new();
+        let path = PathBuf::from("/tmp/mdk-verdict-cache-salt-scope.sqlite");
+        let salt_a = [0xaa; SQLCIPHER_SALT_LEN];
+        let salt_b = [0xbb; SQLCIPHER_SALT_LEN];
+
+        cache.record(path.clone(), salt_a);
+        assert!(cache.contains(&path, &salt_a));
+        assert!(
+            !cache.contains(&path, &salt_b),
+            "a verdict for one salt must not vouch for another salt"
+        );
+
+        // A salt rotation replaces the verdict rather than stacking.
+        cache.record(path.clone(), salt_b);
+        assert!(!cache.contains(&path, &salt_a));
+        assert!(cache.contains(&path, &salt_b));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn sqlcipher_v2_verdict_cache_is_bounded_and_evicts_oldest_first() {
+        let mut cache = SqlcipherV2VerdictCache::new();
+        let salt = [0x5a; SQLCIPHER_SALT_LEN];
+        for index in 0..(SQLCIPHER_V2_VERDICT_CACHE_CAPACITY + 10) {
+            cache.record(
+                PathBuf::from(format!("/tmp/mdk-verdict-cache-churn-{index}.sqlite")),
+                salt,
+            );
+        }
+
+        assert_eq!(cache.len(), SQLCIPHER_V2_VERDICT_CACHE_CAPACITY);
+        for index in 0..10 {
+            assert!(
+                !cache.contains(
+                    &PathBuf::from(format!("/tmp/mdk-verdict-cache-churn-{index}.sqlite")),
+                    &salt
+                ),
+                "the oldest entries must be evicted first"
+            );
+        }
+        for index in 10..(SQLCIPHER_V2_VERDICT_CACHE_CAPACITY + 10) {
+            assert!(
+                cache.contains(
+                    &PathBuf::from(format!("/tmp/mdk-verdict-cache-churn-{index}.sqlite")),
+                    &salt
+                ),
+                "recent entries must survive eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlcipher_v2_verdict_cache_invalidate_removes_the_entry() {
+        let mut cache = SqlcipherV2VerdictCache::new();
+        let path = PathBuf::from("/tmp/mdk-verdict-cache-invalidate.sqlite");
+        let other = PathBuf::from("/tmp/mdk-verdict-cache-invalidate-other.sqlite");
+        let salt = [0x5a; SQLCIPHER_SALT_LEN];
+
+        cache.record(path.clone(), salt);
+        cache.record(other.clone(), salt);
+        cache.invalidate(&path);
+
+        assert!(!cache.contains(&path, &salt));
+        assert!(cache.contains(&other, &salt));
+        // Re-recording after invalidation works and keeps the bound intact.
+        cache.record(path.clone(), salt);
+        assert!(cache.contains(&path, &salt));
+        assert_eq!(cache.len(), 2);
     }
 }

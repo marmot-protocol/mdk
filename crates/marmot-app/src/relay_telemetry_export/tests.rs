@@ -254,6 +254,8 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failures: 1,
             duration_ms: hist(3),
         },
+        sqlcipher_migration_probe_runs: 7,
+        sqlcipher_migration_probe_skips: 42,
         ..Default::default()
     };
     let batch = build_export_batch_with_app_performance(
@@ -304,6 +306,16 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS
             && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_SQLCIPHER_MIGRATION_PROBE_RUNS
+            && point.relay.is_none()
+            && point.value == ExportMetricValue::Counter(7)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_SQLCIPHER_MIGRATION_PROBE_SKIPS
+            && point.relay.is_none()
+            && point.value == ExportMetricValue::Counter(42)
     }));
     for metric_name in [
         metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,

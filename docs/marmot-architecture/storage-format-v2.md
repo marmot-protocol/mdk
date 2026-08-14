@@ -250,3 +250,56 @@ rows require 64 ticks, or about 16 minutes while the account remains usable.
 The benchmark executes those batches continuously only to measure their total
 database work and worst observed transaction duration. Page reclamation is not
 required for correctness and remains a separately scheduled maintenance choice.
+
+## SQLCipher key presentation and KDF work factor (decision record, mdk#1439)
+
+Every `storage-sqlite` database is keyed with 256-bit key material derived by
+HKDF over the account secret and a stable per-database salt
+(`crates/marmot-app/src/sqlcipher.rs`). The derived bytes are hex-encoded and
+presented to SQLCipher as a *passphrase*. With `cipher_compatibility = 4`
+pinned and no `cipher_kdf_iterations` override anywhere in the workspace,
+SQLCipher then runs PBKDF2-HMAC-SHA512 with 256,000 iterations on every keyed
+open. That KDF exists to resist dictionary attacks on human passphrases; the
+HKDF-derived input is already uniform high-entropy key material, so the
+stretching adds no effective security on this path — its cost is pure latency
+(~50–500 ms per derivation depending on device class).
+
+**Decision (2026-08-14): keep passphrase presentation and the compat-4 KDF
+work factor unchanged.** Do not adopt raw `x'…'` key presentation or a reduced
+`cipher_kdf_iterations` as part of the mdk#1439 performance work. The measured
+win ships without touching on-disk cipher parameters: the in-process v2-open
+verdict cache makes each existing-database open pay the KDF once instead of
+twice, and the remaining open-count reduction is tracked by mdk#1436.
+
+Rationale for rejecting the key-presentation change in this context:
+
+1. **It is a storage-format change, not a tuning change.** Raw-key presentation
+   or a reduced iteration count changes the on-disk cipher parameters of every
+   existing database. That requires a numbered, crash-safe `PRAGMA rekey`
+   migration with the same marker/sidecar discipline as the salt migration,
+   plus a rollback plan — and a reduced iteration count additionally becomes a
+   de-facto open parameter that must be pinned before keying on *every* open
+   path (account storage, hardened cache opens, probe/rekey opens, and external
+   tooling).
+2. **It requires explicit security sign-off.** Raw presentation is sound only
+   because every presented key is HKDF-derived 256-bit uniform material; that
+   invariant must be enforced by construction (a typed raw-key variant of
+   `SqlCipherKey` that no user-supplied passphrase can ever reach) before
+   adoption. A lowered `cipher_kdf_iterations` would instead weaken brute-force
+   resistance for any future low-entropy passphrase that reaches the same
+   pragma path.
+3. **The trade is nil in both directions today, so measure first.** With the
+   verdict cache, per-open KDF count is observable in the fleet via
+   `app_sqlcipher_migration_probe_runs`/`app_sqlcipher_migration_probe_skips`
+   and the `app_account_open`/`app_account_session_open` duration buckets
+   (`telemetry.md`). If those numbers still show open-latency pain after
+   mdk#1436 lands, the accept path below can be evaluated on evidence rather
+   than stacked silently into a performance fix.
+
+Accept path, if revisited: a versioned rekey migration guarded by a durable
+marker (mirroring the salt migration's crash windows), no change to hardening
+semantics (`cipher_compatibility` pin, `cipher_memory_security`,
+`secure_delete`, `synchronous=FULL`), a downgrade story (rekey back to
+passphrase presentation), typed raw-key construction in `storage-sqlite`, and
+updated forensic/tooling docs (raw-keyed databases need raw-key open syntax in
+the `sqlcipher` CLI).

@@ -35,6 +35,11 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
   the upload client, and the `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path
   validation/resolution/removal, and HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+- Keep SQLCipher key derivation, per-database salt persistence, legacy-key migration/recovery, and the in-process
+  v2-open probe-verdict cache (mdk#1439) in `src/sqlcipher.rs`. The verdict cache is advisory only: a durable
+  migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their
+  self-heal. Key presentation and the passphrase KDF work factor follow the decision record in
+  `docs/marmot-architecture/storage-format-v2.md`.
 - Keep the user-directory domain in the `src/directory/` module instead of regrowing `src/lib.rs`. It splits along these
   seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
   `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
