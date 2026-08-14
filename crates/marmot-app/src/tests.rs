@@ -6398,6 +6398,202 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     );
 }
 
+/// Issue #1177: a send the engine accepted but never published derives as
+/// `Pending`, which is truthful only while convergence can still release it.
+/// Once the group is terminal the queue is purged, so the sweep the sync loop
+/// runs at that seam must stop the row claiming `Pending` forever — and must
+/// leave a published send's `Delivered` alone.
+///
+/// The swept row's terminal outcome is asserted where it is stored, on the row
+/// itself. #1384 deliberately demotes a failed local send out of the chat
+/// preview ("keep failed local sends visible without letting them pin chat
+/// previews", `CHAT_LIST_PREVIEW_ORDER_DESC` in `storage-sqlite/src/chat_list.rs`),
+/// so once a send that did reach the relay exists the preview falls back to it
+/// rather than rendering the swept row's `Failed`. That fallback is asserted
+/// here too, because it is the same thing this test guards: after the sweep
+/// nothing in the group may still say `Pending`. A swept row rendering `Failed`
+/// when it *is* the preview is pinned by `storage-sqlite`'s
+/// `latest_preview_carries_exact_media_and_delivery_projection`.
+#[test]
+fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "alpha".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )],
+    })
+    .unwrap();
+
+    let sent = |message_id_hex: &str, source_message_id_hex: Option<String>, recorded_at: u64| {
+        AppMessageProjection {
+            message_id_hex: message_id_hex.to_owned(),
+            source_message_id_hex,
+            direction: "sent".to_owned(),
+            group_id_hex: "aa".to_owned(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "hello".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(2),
+            retention: None,
+            recorded_at: Some(recorded_at),
+            origin_commit_id: None,
+            moderation_grant: false,
+        }
+    };
+    // An earlier send that reached the relay, then one the engine retained.
+    app.record_account_app_event("alice", &sent("published", Some("bb".repeat(32)), 10))
+        .unwrap();
+    app.record_account_app_event("alice", &sent("held", None, 11))
+        .unwrap();
+
+    let preview = || {
+        app.chat_list_row("alice", "aa")
+            .unwrap()
+            .expect("chat-list row")
+            .last_message
+            .expect("last message")
+    };
+    assert_eq!(
+        (preview().message_id_hex, preview().delivery_state),
+        ("held".to_owned(), ChatListMessageDeliveryState::Pending),
+        "a retained send is pending while convergence can still release it"
+    );
+
+    app.invalidate_timeline_pending_sends_for_group("alice", "aa")
+        .unwrap()
+        .expect("a held row must produce a projection update");
+
+    assert_eq!(
+        (preview().message_id_hex, preview().delivery_state),
+        (
+            "published".to_owned(),
+            ChatListMessageDeliveryState::Delivered
+        ),
+        "the swept send must stop pinning the preview as pending; the last send \
+         that actually reached the relay takes over"
+    );
+    let rows = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some("aa".to_owned()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(
+        status("held"),
+        Some(Some("local_publish_failed".to_owned())),
+        "the held row must carry the terminal outcome the app renders as failed"
+    );
+    assert_eq!(
+        status("published"),
+        Some(None),
+        "a send that already reached the relay stays delivered"
+    );
+}
+
+/// Issue #1177: the no-inbound drain seam owes the same terminal sweep as
+/// inbound ingest.
+///
+/// `restore_disband_tombstone` re-emits a stored group's `GroupDisbanded` from
+/// hydration, behind no delivery at all, and that replay is the only
+/// reconciliation left for a disband whose live-session projection never
+/// completed — a crash, or a batch that failed after the engine had already
+/// drained the event one-shot. If this seam skips the sweep, a send the engine
+/// accepted but never published survives the restart still claiming `Pending`.
+#[tokio::test]
+async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-disband.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("drained disband", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // A send the engine accepted and retained: no published source id, so it
+    // derives as pending until something resolves it.
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: "held".to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "hello".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(11),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: Some(MemberId::new(hex::decode(&account.account_id_hex).unwrap())),
+            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    let held = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|row| row.message_id_hex == "held")
+        .expect("the held send must still be on the timeline");
+    assert_eq!(
+        held.invalidation_status,
+        Some("local_publish_failed".to_owned()),
+        "a disband replayed without a delivery must still end the held send's wait"
+    );
+}
+
 #[test]
 fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {
@@ -7659,4 +7855,60 @@ async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown
     runtime.shutdown_and_close().await.unwrap();
     runtime.shutdown().await;
     runtime.shutdown_and_close().await.unwrap();
+}
+
+/// #1177: an accepted send whose intent the engine retained in the group's
+/// durable queue must say so. Reporting `published: 0` with no message ids
+/// forces the host to infer acceptance from an empty list, which is exactly
+/// the inference the criterion forbids.
+#[test]
+fn a_retained_send_reports_accepted_pending_rather_than_an_empty_publish() {
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.queued.push(cgka_session::QueuedIntentRef {
+        group_id: cgka_traits::GroupId::new(vec![0x11; 16]),
+        intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
+    });
+
+    let summary = crate::groups::send_summary_from_effects(&effects);
+
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::AcceptedPending,
+        "a retained intent is accepted work, not a silent no-op"
+    );
+}
+
+/// The published half of #1177's criterion, end to end: a send that reaches the
+/// transport must report `Published`, so `AcceptedPending` stays a signal a host
+/// can act on rather than the value every send happens to carry.
+#[tokio::test]
+async fn a_send_that_reaches_the_transport_reports_published() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://accept-disposition.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("alice").await.unwrap();
+    let group_id = setup_client
+        .create_group("accept disposition", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let summary = runtime
+        .send_message("alice", &group_id, b"published now".to_vec())
+        .await
+        .expect("a send with a healthy transport must publish");
+
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published,
+        "the message reached the transport, so nothing is being held"
+    );
+
+    runtime.shutdown().await;
 }

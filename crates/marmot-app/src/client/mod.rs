@@ -2199,6 +2199,10 @@ impl AppClient {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
+        // Discarded deliberately, unlike on the convergence-retry path: the
+        // re-record below reprojects the same row with its new source id and
+        // hands that update to `on_local_projection`, so forwarding these too
+        // would emit the flip twice.
         let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let published = effects.published_app_messages.iter().find(|published| {
             published.group_id == *group_id && published.app_event_id == app_event_id
@@ -2243,6 +2247,17 @@ impl AppClient {
             SendSummary {
                 published: effects.reports.len(),
                 message_ids: vec![app_event_id],
+                // Per-message, not per-pass: `published` above matched this
+                // exact `app_event_id` in `effects.published_app_messages`. A
+                // send that folded peer commits can publish other work in the
+                // same pass, so counting `effects.reports` or the group-wide
+                // queue would misreport this row. Absent means the engine
+                // accepted and retained it (mdk#1177).
+                accept_disposition: if published.is_some() {
+                    cgka_traits::SendAcceptDisposition::Published
+                } else {
+                    cgka_traits::SendAcceptDisposition::AcceptedPending
+                },
                 maintenance_disposition: effects.maintenance_disposition,
             },
         ))
@@ -2267,7 +2282,7 @@ impl AppClient {
             &self.state.label,
             group_id_hex,
             app_event_id,
-            "local_publish_failed",
+            crate::LOCAL_PUBLISH_FAILED_REASON,
         ) {
             Ok(Some(update)) => on_local_projection(update),
             Ok(None) => {}
@@ -2360,6 +2375,11 @@ impl AppClient {
                 return Ok(SendSummary {
                     published: 0,
                     message_ids: vec![existing_id],
+                    // Idempotent no-op, not a retained intent: the reaction is
+                    // already canonical group output and `message_ids` names
+                    // it. Nothing is being held for a later drain, so there is
+                    // nothing pending to report (mdk#1177).
+                    accept_disposition: cgka_traits::SendAcceptDisposition::Published,
                     maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
                 });
             }
@@ -2866,7 +2886,15 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
-        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        // This is the path that releases sends the engine had retained, so its
+        // finalize updates carry the pending -> delivered flip for each of them.
+        // Unlike the send path — which drops the same updates because it
+        // immediately re-records the row and hands that update to the caller —
+        // there is nothing here to re-emit them, so buffer them for the account
+        // worker to broadcast. Dropping them leaves storage delivered while
+        // every timeline and chat-list subscriber still shows pending.
+        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        self.pending_projection_updates.extend(finalize_updates);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
@@ -2945,6 +2973,7 @@ impl AppClient {
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
+            accept_disposition: crate::groups::accept_disposition_from_effects(&effects),
             maintenance_disposition: effects.maintenance_disposition,
         })
     }

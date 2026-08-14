@@ -141,6 +141,27 @@ pub enum EngineError {
     #[error("queued outbound retention is at capacity for this group")]
     QueuedOutboundAtCapacity { group_id: GroupId },
 
+    /// The group is halted `Unrecoverable` and refuses new work until a
+    /// verified repair returns it to `Stable`. Its one legal exit is an
+    /// authenticated replacement Welcome from another member, so no local retry
+    /// can clear it and the engine cannot heal itself.
+    /// [`SendIntent::Disband`](crate::engine::SendIntent::Disband) is the one
+    /// exception the refusal makes: it persists a durable teardown request
+    /// rather than preparing a Commit, so a halted group can still be torn down
+    /// without waiting on a repair that may never come.
+    ///
+    /// Intents accepted before the halt stay retained and publish after the
+    /// repair; only *new* work is refused, and nothing was persisted for it.
+    ///
+    /// Deliberately **not** [`is_transient`](EngineError::is_transient), for the
+    /// same reason as [`EngineError::QueuedOutboundAtCapacity`]: that predicate
+    /// drives automatic retry loops, and this clears on a remote member's
+    /// schedule rather than on any timer this call could pick. Typed rather than
+    /// [`EngineError::InvalidTransition`] because a halted group is a durable,
+    /// host-actionable condition, not an engine bug (mdk#1177).
+    #[error("group is unrecoverable and needs a verified repair before it can send")]
+    GroupUnrecoverableRepairRequired { group_id: GroupId },
+
     /// Illegal state-machine transition (from
     /// [`crate::engine_state::InvalidTransition`]). Indicates an engine bug.
     #[error(transparent)]

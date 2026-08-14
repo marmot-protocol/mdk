@@ -232,6 +232,33 @@ pub enum SendResult {
     FoundingGroupCreated { welcomes: Vec<TransportMessage> },
 }
 
+/// What happened to a send the engine *accepted*, as reported back to the
+/// application.
+///
+/// This is the app-facing projection of the [`SendResult::Queued`] versus
+/// "published now" split. `AcceptedPending` is deliberately **not** a failure:
+/// the intent is durable, survives restart, and publishes once the group's
+/// convergence input settles. A refused send never reaches this type at all —
+/// it returns an error instead.
+///
+/// It is not an unconditional promise of publication, though. A group that goes
+/// terminal — disbanded, or this device's copy removed — discards its outbound
+/// queue wholesale, so anything still retained there never publishes. That
+/// teardown, not a timeout, is what ends a pending send's wait.
+///
+/// It exists so a host never has to infer acceptance from an empty published
+/// message-id list (mdk#1177).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendAcceptDisposition {
+    /// The send reached the transport during this call.
+    #[default]
+    Published,
+    /// The send was accepted and retained in the group's durable outbound
+    /// queue. It publishes on a later convergence drain.
+    AcceptedPending,
+}
+
 /// Group evolution produced as a side effect of inbound processing.
 ///
 /// Auto-publish work follows the same publish-before-apply contract as

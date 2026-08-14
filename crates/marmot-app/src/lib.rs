@@ -248,6 +248,11 @@ const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection
 /// `account_groups.self_membership` from current engine state for rows that
 /// predate migration 0018 (where every row defaulted to `'member'`).
 const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
+/// Invalidation reason for a sent app event that will never reach anyone,
+/// whether it was refused at send time or its group turned terminal while the
+/// engine still held it. The derived-state SQL keys the app-facing `Failed`
+/// delivery state off this exact literal, so both producers must share it.
+pub(crate) const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
 const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
@@ -835,6 +840,10 @@ pub struct AppMessageQuery {
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,
+    /// Whether the accepted send reached the transport or is retained in the
+    /// group's durable queue. Distinguishes accepted-pending from published
+    /// without inferring either from `message_ids` being empty (mdk#1177).
+    pub accept_disposition: cgka_traits::SendAcceptDisposition,
     pub maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
 }
 
@@ -4556,6 +4565,36 @@ impl MarmotApp {
         let update = self
             .account_storage(label)?
             .invalidate_app_events_by_origin_commit(origin_commit_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Withdraw every accepted-but-unpublished send in a group whose outbound
+    /// queue the engine has permanently discarded.
+    ///
+    /// A retained send derives as `pending`, which stays truthful for as long as
+    /// convergence can still release it — including across an `Unrecoverable`
+    /// halt, which a verified repair drains. Only the terminal changes named by
+    /// [`terminates_local_outbound_queue`](crate::client) break that promise,
+    /// and there the row would otherwise claim `pending` forever.
+    ///
+    /// The reason is [`LOCAL_PUBLISH_FAILED_REASON`], shared with the send-time
+    /// retraction path: both mean "this send will never reach anyone", the
+    /// app-facing state is identically `Failed`, and a distinct literal would
+    /// have to be added to every derived-state allow-list in SQL to render the
+    /// same thing. Splitting the reasons is a diagnostic-granularity follow-up.
+    pub(crate) fn invalidate_timeline_pending_sends_for_group(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .invalidate_pending_sent_app_events_for_group(
+                group_id_hex,
+                LOCAL_PUBLISH_FAILED_REASON,
+            )?;
         update
             .map(|update| self.app_projection_update(label, update))
             .transpose()

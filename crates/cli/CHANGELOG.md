@@ -9,6 +9,41 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Sending a message now reports whether it reached the relay or is waiting in
+  the group's durable queue. MarmotKit's send summary carries an explicit
+  `accept_disposition` of `published` or `accepted_pending`, so a host no longer
+  has to read an empty message-id list as "something went wrong" when the
+  message was in fact accepted and is waiting on the group's convergence.
+  ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
+
+- A group that needs a repair before it can send again now refuses new messages
+  with the typed `GroupUnrecoverableRepairRequired` error instead of opaque
+  engine error text. The group id comes with it, and like `GroupSendQueueFull`
+  it is deliberately not retried automatically: the group stays blocked until
+  another member re-admits this device, so a host should say so rather than
+  spin. Messages already queued are not discarded — they publish after the
+  repair.
+  ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
+
+### Fixed
+
+- Messages left waiting when a group is disbanded, or when this device is
+  removed from it, no longer report as pending forever. The group's queue is
+  gone in both cases, so those messages are now marked failed and hosts can show
+  a terminal state instead of a spinner that never resolves. This also holds
+  when the disband is only reconciled on the next account open.
+  ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
+
+- A message moving from pending to delivered now reaches subscribers as a
+  delivery-state change rather than as new content, so a host can update a
+  delivery indicator without re-reading the conversation. The same flip caused
+  by an explicit convergence retry was previously recorded but never broadcast
+  at all, leaving timelines and chat lists showing pending until some unrelated
+  event woke them.
+  ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
+
 ## [0.9.12] - 2026-08-13
 
 ### Added

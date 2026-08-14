@@ -371,6 +371,16 @@ impl AppClient {
         }
         let display_names = self.app.display_names_by_id()?;
         let source_received_at = unix_now_seconds();
+        // Hydration re-emits a stored group's `GroupDisbanded` on every open
+        // (`restore_disband_tombstone`), and that replay is the only reconciler
+        // left for a disband whose live-session projection never completed — a
+        // crash, or a batch that failed after the engine had already drained the
+        // event. So this seam owes the same terminal sweep as the inbound one.
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
@@ -445,6 +455,7 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
+            self.invalidate_terminal_pending_sends(event, &local_account_id_hex, &mut summary)?;
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
@@ -1748,6 +1759,37 @@ impl AppClient {
         self.pending_application_event_acks.clear();
         Ok(())
     }
+
+    /// Terminal disposition for accepted-but-unpublished sends (#1177).
+    ///
+    /// The engine purges the whole outbound queue at the seams
+    /// [`terminates_local_outbound_queue`] names, so every send it still held is
+    /// dead; without this sweep those rows derive as `pending` forever, which is
+    /// the one place the app cannot tell "still coming" from "never arriving".
+    /// Propagate the error rather than swallow it: a silently skipped sweep
+    /// leaves exactly the lie this fixes. The sweep ignores already-invalidated
+    /// rows, so the batch retry that error triggers is a no-op for anything it
+    /// already withdrew — which is also why every observation seam can run it.
+    fn invalidate_terminal_pending_sends(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+        local_account_id_hex: &str,
+        summary: &mut SyncSummary,
+    ) -> Result<(), AppError> {
+        if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id, change, ..
+        } = event
+            && terminates_local_outbound_queue(change, local_account_id_hex)
+            && let Some(projection_update) = self.app.invalidate_timeline_pending_sends_for_group(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+            )?
+        {
+            summary.projection_updates.push(projection_update);
+        }
+        Ok(())
+    }
+
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -1907,6 +1949,7 @@ impl AppClient {
                     self.app
                         .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
             }
+            self.invalidate_terminal_pending_sends(event, &local_account_id_hex, summary)?;
             // A (re-)join or create restores the local account's membership so a
             // re-add after removal un-suppresses the group's unread count. Same
             // source-of-truth write as the departure path above: propagate the
@@ -2069,6 +2112,107 @@ fn member_departure(
         GroupStateChange::MemberLeft { member } => Some((member, SelfMembership::Left)),
         GroupStateChange::MemberRemoved { member } => Some((member, SelfMembership::Removed)),
         _ => None,
+    }
+}
+
+/// Does this group state change permanently discard the local account's
+/// retained outbound work for the group?
+///
+/// Convergence normally releases a retained intent eventually, which is why a
+/// held row truthfully derives as `pending`. Exactly two changes break that
+/// promise, and both purge the engine's queue wholesale rather than per intent:
+/// a disband tears the group down for everyone, and losing the local copy —
+/// evicted (`MemberRemoved`) or departed voluntarily (`MemberLeft`) — discards
+/// the queue silently. A peer's departure does neither.
+///
+/// The self-subject test is shared with the sibling membership write at the same
+/// seam, so the two cannot disagree about who left.
+fn terminates_local_outbound_queue(
+    change: &cgka_traits::engine::GroupStateChange,
+    local_account_id_hex: &str,
+) -> bool {
+    match change {
+        cgka_traits::engine::GroupStateChange::GroupDisbanded => true,
+        _ => member_departure(change).is_some_and(|(member, _)| {
+            hex::encode(member.as_slice()).eq_ignore_ascii_case(local_account_id_hex)
+        }),
+    }
+}
+
+#[cfg(test)]
+mod terminal_outbound_queue_tests {
+    use super::terminates_local_outbound_queue;
+    use cgka_traits::MemberId;
+    use cgka_traits::engine::GroupStateChange;
+
+    const SELF: &str = "aa";
+    const PEER: &str = "bb";
+
+    fn member(id_hex: &str) -> MemberId {
+        MemberId::new(hex::decode(id_hex).unwrap())
+    }
+
+    #[test]
+    fn a_disband_terminates_the_queue_for_every_member() {
+        assert!(terminates_local_outbound_queue(
+            &GroupStateChange::GroupDisbanded,
+            SELF
+        ));
+    }
+
+    #[test]
+    fn losing_the_local_copy_terminates_the_queue_however_it_was_lost() {
+        for change in [
+            GroupStateChange::MemberRemoved {
+                member: member(SELF),
+            },
+            GroupStateChange::MemberLeft {
+                member: member(SELF),
+            },
+        ] {
+            assert!(
+                terminates_local_outbound_queue(&change, SELF),
+                "{change:?} discards the local queue"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_departure_leaves_the_local_queue_alive() {
+        // The group carries on without them and our retained sends still
+        // deliver, so nothing may be swept.
+        for change in [
+            GroupStateChange::MemberRemoved {
+                member: member(PEER),
+            },
+            GroupStateChange::MemberLeft {
+                member: member(PEER),
+            },
+            GroupStateChange::MemberAdded {
+                member: member(SELF),
+            },
+            GroupStateChange::AdminAdded {
+                member: member(SELF),
+            },
+        ] {
+            assert!(
+                !terminates_local_outbound_queue(&change, SELF),
+                "{change:?} must not terminate the local queue"
+            );
+        }
+    }
+
+    #[test]
+    fn the_self_subject_test_ignores_hex_case() {
+        // Member ids reach this comparison as independently encoded hex; the
+        // sibling membership write at the same seam is case-insensitive, and a
+        // case split here would silently skip the sweep.
+        assert!(terminates_local_outbound_queue(
+            &GroupStateChange::MemberRemoved {
+                member: member("ab"),
+            },
+            "AB"
+        ));
     }
 }
 

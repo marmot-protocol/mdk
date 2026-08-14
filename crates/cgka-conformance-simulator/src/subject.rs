@@ -2086,7 +2086,12 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
         | EngineError::UnsupportedCiphersuite { .. }
-        | EngineError::InvalidAppMessagePayload(_) => SubjectFailureCategory::ExpectedRefusal,
+        | EngineError::InvalidAppMessagePayload(_)
+        // A halted group refusing new work is deliberate, not a protocol
+        // violation: the state is durable and names its own repair path.
+        | EngineError::GroupUnrecoverableRepairRequired { .. } => {
+            SubjectFailureCategory::ExpectedRefusal
+        }
     };
     (category, observe_engine_error(error))
 }
@@ -2130,6 +2135,9 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::InvalidWelcome => "invalid_welcome",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::InvalidTransition(_) => "invalid_transition",
+        EngineError::GroupUnrecoverableRepairRequired { .. } => {
+            "group_unrecoverable_repair_required"
+        }
         EngineError::UnknownGroup(_) => "unknown_group",
         EngineError::GroupNotHydrated(_) => "group_not_hydrated",
         EngineError::UnknownMember { .. } => "unknown_member",

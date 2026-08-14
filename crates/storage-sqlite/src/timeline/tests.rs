@@ -2377,3 +2377,202 @@ fn many_reactions_retract_across_bind_parameter_chunk_boundary() {
     );
     assert!(message.reactions.by_emoji.is_empty());
 }
+
+/// A locally accepted send whose intent the engine retained: the row exists
+/// optimistically but has never been published, so `source_message_id_hex` is
+/// still NULL and the derived delivery state is `pending`.
+fn pending_sent(group_id_hex: &str, id: &str, at: u64) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: group_id_hex.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: None,
+        source_epoch: None,
+        direction: "sent".to_owned(),
+        sender: "self".to_owned(),
+        plaintext: "held".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+        moderation_grant: false,
+    }
+}
+
+#[test]
+fn sweeping_a_terminal_group_invalidates_only_its_own_unpublished_sends() {
+    // Disband and local removal purge the whole outbound queue, so every one of
+    // the group's accepted-but-unpublished sends is dead at once. The sweep must
+    // reach exactly those rows: not the group's delivered sends, not received
+    // rows, and not another group's held sends.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let dead_group = "11".repeat(32);
+    let live_group = "22".repeat(32);
+    store
+        .record_app_event(&pending_sent(&dead_group, "held-a", 10))
+        .unwrap();
+    store
+        .record_app_event(&pending_sent(&dead_group, "held-b", 11))
+        .unwrap();
+    store
+        .record_app_event(&chat("delivered", "self", 12, "published"))
+        .unwrap();
+    store
+        .record_app_event(&chat("received", "peer", 13, "from a peer"))
+        .unwrap();
+    store
+        .record_app_event(&pending_sent(&live_group, "other-group-held", 14))
+        .unwrap();
+
+    let update = store
+        .invalidate_pending_sent_app_events_for_group(&dead_group, "local_publish_failed")
+        .unwrap()
+        .expect("held rows should produce an update");
+    assert_eq!(update.group_id_hex, dead_group);
+
+    let status = |group_id_hex: &str, id: &str| {
+        store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.to_owned()),
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status)
+    };
+    assert_eq!(
+        status(&dead_group, "held-a"),
+        Some(Some("local_publish_failed".to_owned()))
+    );
+    assert_eq!(
+        status(&dead_group, "held-b"),
+        Some(Some("local_publish_failed".to_owned()))
+    );
+    assert_eq!(status(&dead_group, "delivered"), Some(None));
+    assert_eq!(status(&dead_group, "received"), Some(None));
+    assert_eq!(status(&live_group, "other-group-held"), Some(None));
+}
+
+#[test]
+fn sweeping_a_group_with_no_unpublished_sends_reports_nothing() {
+    // A group that disbands with an empty outbound queue — the common case —
+    // must not manufacture a projection update for subscribers to react to.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    store
+        .record_app_event(&chat("delivered", "self", 10, "published"))
+        .unwrap();
+
+    assert!(
+        store
+            .invalidate_pending_sent_app_events_for_group(&group_id_hex, "local_publish_failed")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sweeping_a_group_twice_leaves_the_first_outcome_intact() {
+    // The sweep runs from the sync ingest loop, whose error path retries the
+    // whole batch. A second pass over already-swept rows must be inert: no
+    // rewritten reason, and no redundant update for live subscribers.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    store
+        .record_app_event(&pending_sent(&group_id_hex, "held", 10))
+        .unwrap();
+
+    assert!(
+        store
+            .invalidate_pending_sent_app_events_for_group(&group_id_hex, "local_publish_failed")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .invalidate_pending_sent_app_events_for_group(&group_id_hex, "something_else")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        list(&store)
+            .into_iter()
+            .find(|row| row.message_id_hex == "held")
+            .map(|row| row.invalidation_status),
+        Some(Some("local_publish_failed".to_owned()))
+    );
+}
+
+#[test]
+fn publishing_a_held_send_reports_a_delivery_state_change_not_a_new_message() {
+    // The pending -> delivered flip is the whole point of the delivery badge,
+    // but it reached subscribers indistinguishable from a brand-new message, so
+    // a client could not update the badge without re-reading the row.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    store
+        .record_app_event(&pending_sent(&group_id_hex, "held", 10))
+        .unwrap();
+
+    let finalized = store
+        .finalize_app_event_source_retention(
+            &group_id_hex,
+            "held",
+            Some("source-held"),
+            9,
+            AppMessageRetentionDecision::new(10, 300),
+        )
+        .unwrap()
+        .expect("finalization update");
+    let trigger = finalized
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message }
+                if message.message_id_hex == "held" =>
+            {
+                Some(trigger.clone())
+            }
+            _ => None,
+        })
+        .expect("the finalized row must be reported as changed");
+    assert_eq!(trigger, TimelineUpdateTrigger::DeliveryOrSendStateChanged);
+}
+
+#[test]
+fn finalizing_an_already_published_send_is_not_a_delivery_state_change() {
+    // A row that already carried a source id was already `delivered`; a later
+    // retention finalization changes no delivery state and must keep reporting
+    // whatever its content warranted.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    store
+        .record_app_event(&chat("published", "alice", 10, "already delivered"))
+        .unwrap();
+
+    let finalized = store
+        .finalize_app_event_source_retention(
+            &group_id_hex,
+            "published",
+            Some("source-published"),
+            9,
+            AppMessageRetentionDecision::new(10, 300),
+        )
+        .unwrap()
+        .expect("finalization update");
+    let trigger = finalized
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message }
+                if message.message_id_hex == "published" =>
+            {
+                Some(trigger.clone())
+            }
+            _ => None,
+        })
+        .expect("the finalized row must be reported as changed");
+    assert_ne!(trigger, TimelineUpdateTrigger::DeliveryOrSendStateChanged);
+}

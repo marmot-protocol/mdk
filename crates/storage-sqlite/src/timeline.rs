@@ -409,9 +409,9 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let exists: Option<i64> = conn
+            let existing_source: Option<Option<String>> = conn
                 .query_row(
-                    "SELECT 1
+                    "SELECT source_message_id_hex
                      FROM app_events
                      WHERE group_id_hex = ?1
                        AND message_id_hex = ?2
@@ -422,9 +422,14 @@ impl SqliteAccountStorage {
                 )
                 .optional()
                 .storage()?;
-            if exists.is_none() {
+            let Some(existing_source) = existing_source else {
                 return Ok(None);
-            }
+            };
+            // A row whose source id is about to go NULL -> Some is a send moving
+            // from `pending` to `delivered`. That is a delivery-state change, not
+            // new content, and subscribers need to tell the two apart to update a
+            // badge without re-reading the row.
+            let publishes_held_send = existing_source.is_none() && source_message_id_hex.is_some();
             let updated = conn
                 .execute(
                     "UPDATE app_events
@@ -473,7 +478,7 @@ impl SqliteAccountStorage {
             }
             let messages =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
-            let changes = timeline_changes_for_event(
+            let mut changes = timeline_changes_for_event(
                 message_id_hex,
                 kind,
                 &tags,
@@ -481,6 +486,18 @@ impl SqliteAccountStorage {
                 &affected_message_ids,
                 &messages,
             );
+            if publishes_held_send {
+                // Only the published row's own delivery state changed. Rows it
+                // merely affects (a reply preview, say) keep the trigger their
+                // own content warrants.
+                for change in &mut changes {
+                    if let TimelineMessageChange::Upsert { trigger, message } = change
+                        && message.message_id_hex == message_id_hex
+                    {
+                        *trigger = TimelineUpdateTrigger::DeliveryOrSendStateChanged;
+                    }
+                }
+            }
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex: group_id_hex.to_owned(),
                 messages,
@@ -746,6 +763,105 @@ impl SqliteAccountStorage {
             dedup_timeline_changes(&mut changes);
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex,
+                messages,
+                changes,
+            }))
+        })
+    }
+
+    /// Invalidate every accepted-but-unpublished sent app event in a group.
+    ///
+    /// This is the terminal-disposition sweep. A send the engine accepted but
+    /// retained has no `source_message_id_hex` yet, so it derives as `pending`
+    /// — truthfully, because a retained intent still delivers once convergence
+    /// resolves. When the group instead reaches a terminal state (disband, or
+    /// the local copy being removed) the whole outbound queue is purged and
+    /// those rows would otherwise claim `pending` forever.
+    ///
+    /// No other invalidation primitive can reach them:
+    /// `invalidate_app_event_by_source` matches on `source_message_id_hex`,
+    /// which is NULL here, and `invalidate_app_events_by_origin_commit` matches
+    /// on `origin_commit_id`, which sent app events never carry. Hence a
+    /// dedicated **1:N** group-scoped predicate.
+    ///
+    /// Already-invalidated rows are excluded so a repeated sweep (the sync
+    /// ingest loop retries its batch on error) neither rewrites a recorded
+    /// reason nor emits a redundant projection update. Rows are kept and marked,
+    /// matching the keep-invalidated-records storage invariant.
+    pub fn invalidate_pending_sent_app_events_for_group(
+        &self,
+        group_id_hex: &str,
+        reason: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let rows: Vec<(String, u64, Vec<Vec<String>>)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT message_id_hex, kind, tags_json
+                         FROM app_events
+                         WHERE group_id_hex = ?1
+                           AND direction = 'sent'
+                           AND source_message_id_hex IS NULL
+                           AND invalidated = 0",
+                    )
+                    .storage()?;
+                stmt.query_map(params![group_id_hex], |row| {
+                    let kind = row.get::<_, i64>(1)?.try_into().unwrap_or_default();
+                    let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+                    Ok((row.get(0)?, kind, tags))
+                })
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+            };
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let mut affected_message_ids = BTreeSet::new();
+            for (message_id_hex, kind, tags) in &rows {
+                affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
+                    &conn,
+                    group_id_hex,
+                    message_id_hex,
+                    *kind,
+                    tags,
+                )?);
+            }
+            let before =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            conn.execute(
+                "UPDATE app_events
+                 SET invalidated = 1, invalidation_reason = ?2
+                 WHERE group_id_hex = ?1
+                   AND direction = 'sent'
+                   AND source_message_id_hex IS NULL
+                   AND invalidated = 0",
+                params![group_id_hex, reason],
+            )
+            .storage()?;
+            rebuild_message_timeline_for_group_tx(&conn, group_id_hex)?;
+            let messages =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            let mut changes = Vec::new();
+            for (message_id_hex, kind, tags) in &rows {
+                changes.extend(timeline_changes_for_invalidation(
+                    message_id_hex,
+                    *kind,
+                    tags,
+                    &before,
+                    &messages,
+                ));
+            }
+            dedup_timeline_changes(&mut changes);
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex: group_id_hex.to_owned(),
                 messages,
                 changes,
             }))

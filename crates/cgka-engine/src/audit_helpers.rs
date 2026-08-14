@@ -660,6 +660,9 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
         EngineError::ForkedEpoch { .. } => "forked_epoch",
         EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
+        EngineError::GroupUnrecoverableRepairRequired { .. } => {
+            "group_unrecoverable_repair_required"
+        }
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::Storage(_) => "storage",
         EngineError::Peeler(_) => "peeler",

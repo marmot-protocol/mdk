@@ -45,6 +45,7 @@ impl From<AccountUnread> for AccountUnreadFfi {
 pub struct SendSummaryFfi {
     pub published: u32,
     pub message_ids: Vec<String>,
+    pub accept_disposition: SendAcceptDispositionFfi,
     pub maintenance_disposition: SendMaintenanceDispositionFfi,
 }
 
@@ -54,11 +55,29 @@ pub enum SendMaintenanceDispositionFfi {
     PostJoinRotationPendingRetryable,
 }
 
+/// Whether an accepted send published or is retained pending convergence.
+///
+/// `AcceptedPending` is not an error: the message is durable and publishes
+/// later. Hosts should show it as still sending rather than as failed.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum SendAcceptDispositionFfi {
+    Published,
+    AcceptedPending,
+}
+
 impl From<SendSummary> for SendSummaryFfi {
     fn from(value: SendSummary) -> Self {
         Self {
             published: super::saturating_u32(value.published),
             message_ids: value.message_ids,
+            accept_disposition: match value.accept_disposition {
+                cgka_traits::SendAcceptDisposition::Published => {
+                    SendAcceptDispositionFfi::Published
+                }
+                cgka_traits::SendAcceptDisposition::AcceptedPending => {
+                    SendAcceptDispositionFfi::AcceptedPending
+                }
+            },
             maintenance_disposition: match value.maintenance_disposition {
                 cgka_traits::SendMaintenanceDisposition::Ready => {
                     SendMaintenanceDispositionFfi::Ready
@@ -254,5 +273,32 @@ impl From<SignOutOutcome> for SignOutOutcomeFfi {
                 .collect(),
             local_cleanup: value.local_cleanup.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A disposition the host cannot read is not a signal. #1177 is only closed
+    // if `accepted_pending` survives the FFI boundary as a typed value rather
+    // than being flattened away with the rest of the summary.
+    #[test]
+    fn accepted_pending_crosses_ffi_as_a_typed_disposition() {
+        let ffi = SendSummaryFfi::from(SendSummary {
+            published: 0,
+            message_ids: vec!["abc".to_owned()],
+            accept_disposition: cgka_traits::SendAcceptDisposition::AcceptedPending,
+            maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
+        });
+
+        assert!(
+            matches!(
+                ffi.accept_disposition,
+                SendAcceptDispositionFfi::AcceptedPending
+            ),
+            "a retained send must stay distinguishable across the boundary; got {:?}",
+            ffi.accept_disposition
+        );
     }
 }
