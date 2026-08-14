@@ -1170,51 +1170,10 @@ impl MarmotAppRuntime {
             }
         }
 
-        let app = self.accounts.app.clone();
-        // #639: one resolver shared across the drained batch so repeated
-        // settings/group/directory-user lookups (same account, group, or sender
-        // across many events) are memoized instead of re-opening the SQLCipher /
-        // directory caches per event.
-        let mut resolver = notifications::NotificationResolver::default();
-        let drain_until = Instant::now() + remaining;
-        loop {
-            match events.try_recv() {
-                Ok(event) => {
-                    collect_notification_update_from_event(
-                        &app,
-                        &mut resolver,
-                        &event,
-                        &mut notifications,
-                    );
-                }
-                Err(broadcast::error::TryRecvError::Empty) => {
-                    if Instant::now() >= drain_until {
-                        break;
-                    }
-                    match timeout(
-                        drain_until.saturating_duration_since(Instant::now()),
-                        events.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(event)) => {
-                            collect_notification_update_from_event(
-                                &app,
-                                &mut resolver,
-                                &event,
-                                &mut notifications,
-                            );
-                        }
-                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                        Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
-                    }
-                }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(broadcast::error::TryRecvError::Closed) => break,
-            }
-        }
-
-        let notifications = notifications::dedupe_notification_updates(notifications);
+        let drained = drain_wake_notification_events(&mut events, remaining).await;
+        let notifications = project_wake_notification_events(self.accounts.app.clone(), drained)
+            .await
+            .unwrap_or_default();
         BackgroundNotificationCollection {
             status: if notifications.is_empty() {
                 NotificationCollectionStatus::NoData
@@ -5034,6 +4993,55 @@ where
     tokio::task::spawn_blocking(task)
         .await
         .map_err(|err| AppError::BlockingTask(err.to_string()))?
+}
+
+async fn drain_wake_notification_events(
+    events: &mut broadcast::Receiver<MarmotAppEvent>,
+    remaining: Duration,
+) -> Vec<MarmotAppEvent> {
+    let mut drained = Vec::new();
+    let drain_until = Instant::now() + remaining;
+    loop {
+        match events.try_recv() {
+            Ok(event) => drained.push(event),
+            Err(broadcast::error::TryRecvError::Empty) => {
+                if Instant::now() >= drain_until {
+                    break;
+                }
+                match timeout(
+                    drain_until.saturating_duration_since(Instant::now()),
+                    events.recv(),
+                )
+                .await
+                {
+                    Ok(Ok(event)) => drained.push(event),
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    drained
+}
+
+async fn project_wake_notification_events(
+    app: MarmotApp,
+    events: Vec<MarmotAppEvent>,
+) -> Result<Vec<NotificationUpdate>, AppError> {
+    blocking_app_task(move || {
+        // #639: one resolver shared across the drained batch so repeated
+        // settings/group/directory-user lookups are memoized instead of
+        // re-opening SQLCipher / directory caches per event.
+        let mut resolver = notifications::NotificationResolver::default();
+        let mut notifications = Vec::new();
+        for event in &events {
+            collect_notification_update_from_event(&app, &mut resolver, event, &mut notifications);
+        }
+        Ok(notifications::dedupe_notification_updates(notifications))
+    })
+    .await
 }
 
 fn collect_notification_update_from_event(
