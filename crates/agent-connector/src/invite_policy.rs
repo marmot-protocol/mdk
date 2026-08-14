@@ -184,6 +184,10 @@ impl AgentConnector {
             welcomer_allowlisted,
         );
         if allowed {
+            // A catch-up-owned worker returns AccountWorkerBusy as a
+            // definitely-not-started result. Propagating it here is
+            // deliberate: apply_invite_policy_candidate records the failure
+            // in its per-invite bounded backoff and retries safely.
             self.runtime
                 .accept_group_invite(&account.label, group_id)
                 .await?;

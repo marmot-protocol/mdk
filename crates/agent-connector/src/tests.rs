@@ -19,7 +19,7 @@ use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::{EpochId, GroupId, MessageId};
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountSetupRequest, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
+    AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
     RuntimeAgentStreamMessage, RuntimeMessageReceived,
 };
 use nostr_relay_builder::MockRelay;
@@ -57,6 +57,24 @@ fn connector_media_limits_follow_the_marmot_app_blob_limit() {
 }
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn accept_group_invite_retrying_busy(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    group_id: &GroupId,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match runtime.accept_group_invite(account_ref, group_id).await {
+                Ok(_) => return,
+                Err(AppError::AccountWorkerBusy) => sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!("invite acceptance failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("invite acceptance should outlive the startup catch-up window");
+}
 
 #[tokio::test]
 async fn control_operation_timeout_bounds_a_stalled_whole_operation() {
@@ -1017,10 +1035,8 @@ async fn connector_socket_subscribes_to_inbound_messages() {
         )
         .await
         .unwrap();
-    setup_runtime
-        .accept_group_invite(&human.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    accept_group_invite_retrying_busy(&setup_runtime, &human.account.account_id_hex, &group_id)
+        .await;
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());

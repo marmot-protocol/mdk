@@ -2080,6 +2080,15 @@ async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn account_worker_response_deadline_reports_unknown_completion() {
+    let (_respond, response) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+    let error = account_worker_response_with_wait(response, Duration::from_millis(1))
+        .await
+        .expect_err("an open response channel must not wait forever");
+    assert!(matches!(error, AppError::AccountWorkerResponseTimedOut));
+}
+
 #[test]
 fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_categories() {
     use crate::KeyPackageDeletionResult;

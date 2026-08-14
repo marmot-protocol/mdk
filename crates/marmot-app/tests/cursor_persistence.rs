@@ -40,9 +40,11 @@ use marmot_app::{
 use nostr_relay_builder::MockRelay;
 use tokio::time::sleep;
 
-/// How long a cold boot's initial catch-up is allowed to take. Generous
-/// relative to the crate's own `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`.
-const CATCH_UP_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a cold boot's initial catch-up is allowed to take. The integration
+/// test runs inside a workspace-wide nextest partition, where concurrent
+/// crypto, SQLite, and relay tests can delay the current-thread runtime well
+/// beyond the relay adapter's own waits without indicating a stuck catch-up.
+const CATCH_UP_DEADLINE: Duration = Duration::from_secs(30);
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -84,6 +86,7 @@ async fn wait_for_wall_clock_past(reference: u64) {
 
 async fn wait_for_event<F>(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    stage: &'static str,
     mut matches_event: F,
 ) where
     F: FnMut(&MarmotAppEvent) -> bool,
@@ -97,7 +100,7 @@ async fn wait_for_event<F>(
         }
     })
     .await
-    .expect("runtime event");
+    .unwrap_or_else(|_| panic!("runtime event did not arrive during {stage}"));
 }
 
 /// Poll for a cold boot's first catch-up to complete: `start` returns once the
@@ -216,7 +219,7 @@ async fn frozen_wake_collection_body() {
         .create_group("cursor persistence", &[bob_id.as_str()])
         .await
         .unwrap();
-    wait_for_event(&mut events_boot1, |event| {
+    wait_for_event(&mut events_boot1, "boot 1 group join", |event| {
         matches!(
             event,
             MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
@@ -224,11 +227,17 @@ async fn frozen_wake_collection_body() {
         )
     })
     .await;
+    // GroupJoined deliberately publishes as soon as the durable projection is
+    // visible; it no longer implies that the background ordinary-subscription
+    // rebuild has finished. This test cares about cursor persistence, so await
+    // an explicit catch-up boundary before using live delivery to establish
+    // boot 1's baseline cursor.
+    runtime_bob_boot1.catch_up_accounts().await.unwrap();
     alice_client
         .send(&group_id, b"ordinary traffic advances the cursor")
         .await
         .unwrap();
-    wait_for_event(&mut events_boot1, |event| {
+    wait_for_event(&mut events_boot1, "boot 1 ordinary message", |event| {
         matches!(
             event,
             MarmotAppEvent::MessageReceived(message)
@@ -264,7 +273,7 @@ async fn frozen_wake_collection_body() {
     let mut events_boot2 = runtime_bob_boot2.subscribe();
     runtime_bob_boot2.start().await.unwrap();
     wait_for_first_catch_up(&runtime_bob_boot2).await;
-    wait_for_event(&mut events_boot2, |event| {
+    wait_for_event(&mut events_boot2, "boot 2 frozen message", |event| {
         matches!(
             event,
             MarmotAppEvent::MessageReceived(message)
@@ -367,7 +376,7 @@ async fn frozen_wake_collection_body() {
     let mut events_boot3 = runtime_bob_boot3.subscribe();
     runtime_bob_boot3.start().await.unwrap();
     wait_for_first_catch_up(&runtime_bob_boot3).await;
-    wait_for_event(&mut events_boot3, |event| {
+    wait_for_event(&mut events_boot3, "boot 3 advancing message", |event| {
         matches!(
             event,
             MarmotAppEvent::MessageReceived(message)

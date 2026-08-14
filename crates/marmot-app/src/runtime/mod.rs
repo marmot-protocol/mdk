@@ -32,8 +32,9 @@ use crate::messages::AppMessageIntent;
 use crate::notifications;
 use crate::{
     ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
-    APP_RUNTIME_RELAY_REBUILD_LOOKBACK, AccountKeyPackageRecord, AccountRelayListBootstrap,
-    AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
+    APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
+    APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountKeyPackageRecord,
+    AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
     AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
@@ -4025,7 +4026,7 @@ impl AccountManager {
                 .await
                 .is_ok()
             {
-                let _ = response.await;
+                let _ = timeout(APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, response).await;
             }
         }
     }
@@ -4057,7 +4058,7 @@ impl AccountManager {
                 .await
                 .is_ok()
             {
-                let _ = response.await;
+                let _ = timeout(APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, response).await;
             }
         }
     }
@@ -5022,7 +5023,40 @@ fn directory_discovery_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
 pub(crate) async fn account_worker_response<T>(
     response: oneshot::Receiver<Result<T, AppError>>,
 ) -> Result<T, AppError> {
-    response.await.map_err(|_| AppError::TransportClosed)?
+    account_worker_response_with_wait(response, APP_RUNTIME_WORKER_RESPONSE_WAIT).await
+}
+
+pub(crate) async fn local_account_worker_response<T>(
+    response: oneshot::Receiver<Result<T, AppError>>,
+) -> Result<T, AppError> {
+    account_worker_response_with_wait(response, APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT).await
+}
+
+pub(crate) async fn long_account_worker_response<T>(
+    response: oneshot::Receiver<Result<T, AppError>>,
+) -> Result<T, AppError> {
+    account_worker_response_with_wait(response, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT).await
+}
+
+pub(crate) async fn long_account_worker_catch_up_response(
+    response: oneshot::Receiver<Result<(), String>>,
+) -> Result<(), AppError> {
+    match timeout(APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT, response).await {
+        Ok(Ok(result)) => result.map_err(AppError::AccountCatchUp),
+        Ok(Err(_)) => Err(AppError::TransportClosed),
+        Err(_) => Err(AppError::AccountWorkerResponseTimedOut),
+    }
+}
+
+async fn account_worker_response_with_wait<T>(
+    response: oneshot::Receiver<Result<T, AppError>>,
+    wait: Duration,
+) -> Result<T, AppError> {
+    match timeout(wait, response).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(AppError::TransportClosed),
+        Err(_) => Err(AppError::AccountWorkerResponseTimedOut),
+    }
 }
 
 pub(crate) async fn blocking_app_task<T>(

@@ -47,9 +47,11 @@ pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
+    subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     block_subscribe_count: std::sync::atomic::AtomicUsize,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
+    group_subscribe_attempts: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_unsubscribe: std::sync::atomic::AtomicBool,
@@ -58,6 +60,7 @@ pub(crate) struct ScriptedPushRelayClient {
     blocked_publish_count: std::sync::atomic::AtomicUsize,
     block_account_subscribe_after_next_publish: std::sync::Mutex<Option<Vec<u8>>>,
     block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
+    block_account_group_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -92,6 +95,16 @@ impl ScriptedPushRelayClient {
             .block_account_subscribe_after_next_publish
             .lock()
             .unwrap() = Some(account_id);
+    }
+
+    fn block_account_inbox_subscribe(&self, account_id: Vec<u8>) {
+        *self.block_account_subscribe.lock().unwrap() = Some(account_id);
+    }
+
+    fn block_and_fail_account_group_subscribe(&self, account_id: Vec<u8>) {
+        *self.block_account_group_subscribe.lock().unwrap() = Some(account_id);
+        self.fail_blocked_subscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn block_next_subscribe(&self) {
@@ -209,6 +222,49 @@ impl ScriptedPushRelayClient {
             })
             .count()
     }
+
+    fn group_subscription_count(
+        &self,
+        expected_account_id: &MemberId,
+        expected_group_id: &GroupId,
+    ) -> usize {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::Group { account_id, group_id, .. }
+                        if account_id == expected_account_id && group_id == expected_group_id
+                )
+            })
+            .count()
+    }
+
+    fn group_subscribe_attempts(&self) -> usize {
+        self.group_subscribe_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn matching_group_subscribe_attempts(
+        &self,
+        expected_account_id: &MemberId,
+        expected_group_id: &GroupId,
+    ) -> usize {
+        self.subscription_attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::Group { account_id, group_id, .. }
+                        if account_id == expected_account_id && group_id == expected_group_id
+                )
+            })
+            .count()
+    }
 }
 
 #[async_trait]
@@ -217,6 +273,14 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscription_attempts
+            .lock()
+            .unwrap()
+            .push(subscription.clone());
+        if matches!(&subscription, NostrSubscription::Group { .. }) {
+            self.group_subscribe_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if self
             .fail_next_subscribe
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -227,7 +291,20 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         }
         let block_for_account = {
             let mut blocked_account = self.block_account_subscribe.lock().unwrap();
-            if blocked_account.as_deref() == Some(subscription.account_id().as_slice()) {
+            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let block_for_account_group = {
+            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
+            if matches!(&subscription, NostrSubscription::Group { .. })
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
                 blocked_account.take();
                 true
             } else {
@@ -235,6 +312,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             }
         };
         let blocked = block_for_account
+            || block_for_account_group
             || self
                 .block_next_subscribe
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -1661,6 +1739,122 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     .await
     .expect("detached post-mutation catch-up should finish after the relay unblocks");
     runtime.shutdown().await;
+}
+
+#[test]
+fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_during_catch_up() {
+    run_composed_app_runtime_test("invite-catch-up-ordering", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let _alice = home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let bob_member = MemberId::new(hex::decode(&bob.account_id_hex).unwrap());
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        let mut events = runtime.subscribe();
+
+        // The first ordinary group-subscription rebuild will park and fail.
+        // The distinct post-join full-history subscription remains available,
+        // so this isolates the visibility boundary the regression cares about.
+        relay.block_and_fail_account_group_subscribe(bob_member.as_slice().to_vec());
+        let group_id = runtime
+            .create_group(
+                "alice",
+                "invite catch-up ordering",
+                std::slice::from_ref(&bob.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Ok(MarmotAppEvent::GroupJoined {
+                        account_id_hex,
+                        group_id: joined,
+                        ..
+                    }) if account_id_hex == bob.account_id_hex && joined == group_id => break,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("runtime event stream closed before GroupJoined")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("GroupJoined must publish without waiting for the ordinary subscription rebuild");
+
+        let group_id_hex = hex::encode(group_id.as_slice());
+        assert!(
+            app.group("bob", &group_id_hex)
+                .unwrap()
+                .expect("joined group projection")
+                .pending_confirmation,
+            "the durable invite projection must be queryable at GroupJoined"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_subscribe())
+            .await
+            .expect("ordinary group subscription refresh should run in the background");
+        relay.release_subscribe();
+
+        // The parked attempt fails after release. Its durable retry intent must
+        // rebuild the ordinary subscription without unrelated worker traffic.
+        let retry_result = tokio::time::timeout(Duration::from_secs(5), async {
+            while relay.group_subscription_count(&bob_member, &group_id) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            retry_result.is_ok(),
+            "failed ordinary group subscription must retry with bounded backoff (all_group_attempts={}, matching_attempts={})",
+            relay.group_subscribe_attempts(),
+            relay.matching_group_subscribe_attempts(&bob_member, &group_id),
+        );
+
+        // Pin Bob's next explicit catch-up at the account-inbox subscription.
+        // Accept must be rejected as definitely-not-started, not retained
+        // behind the relay operation or reported with ambiguous completion.
+        relay.block_account_inbox_subscribe(bob_member.as_slice().to_vec());
+        let catch_up_runtime = runtime.clone();
+        let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_subscribe())
+            .await
+            .expect("explicit catch-up should reach the pinned subscription");
+
+        let accept_error = tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.accept_group_invite("bob", &group_id),
+        )
+        .await
+        .expect("accept must answer promptly while catch-up is pinned")
+        .expect_err("accept cannot start while catch-up owns the account client");
+        assert!(matches!(accept_error, AppError::AccountWorkerBusy));
+        assert!(
+            app.group("bob", &group_id_hex)
+                .unwrap()
+                .expect("invite remains visible")
+                .pending_confirmation,
+            "busy means the accept mutation definitely did not run"
+        );
+
+        relay.release_subscribe();
+        tokio::time::timeout(Duration::from_secs(5), catch_up)
+            .await
+            .expect("catch-up should finish after release")
+            .expect("catch-up task should not panic")
+            .expect("catch-up should succeed");
+
+        let accepted = runtime.accept_group_invite("bob", &group_id).await.unwrap();
+        assert!(!accepted.pending_confirmation);
+        runtime.shutdown().await;
+    });
 }
 
 async fn concurrent_invites_keep_projections_readable_body() {
