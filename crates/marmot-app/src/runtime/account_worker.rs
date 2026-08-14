@@ -2123,6 +2123,16 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::LeaveGroup { group_id, respond } => {
             let result = client.leave_group(&group_id).await;
+            // Drain the kind-1210 "member left" row this commit queued. Sibling
+            // mutators (invite/remove/profile) already flush
+            // `pending_projection_updates`; without this the live timeline stays
+            // stale until some later unrelated command emits the row mis-timed.
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
             // Published regardless of outcome. The engine records the durable
             // leave request before it publishes, so a leave that failed at the
             // relay still changed what subscribers should render: the group is
@@ -2171,6 +2181,12 @@ async fn handle_account_worker_command(
         AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => {
             let result = client.decline_group_invite(&group_id).await;
             if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
                 publish_app_runtime_group_state_updated(
                     events,
                     account_id_hex,

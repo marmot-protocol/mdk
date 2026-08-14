@@ -4110,6 +4110,15 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     assert_eq!(declined.summary.published, 1);
     assert!(!declined.group.pending_confirmation);
     assert!(declined.group.archived);
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::ProjectionUpdated(update)
+                if update.account_id_hex == bob_id
+                    && update.update.group_id_hex == group_id_hex
+        )
+    })
+    .await;
 
     let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert!(!reloaded.pending_confirmation);
