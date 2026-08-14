@@ -139,11 +139,12 @@ These are the scenarios another implementation should be able to load from JSON 
 
 ### `cross-route-app-runtime-recovery/v1`
 
-- File: constructed by `four_party_cross_route_recovery_app_runtime_matches_unified_route`; promotion to a portable
+- File: constructed by `four_party_cross_route_recovery_app_runtime_matches_unified_route` and executed unchanged by
+  `four_party_cross_route_recovery_processes_match_unified_route`; promotion to a portable
   saved input still requires an adapter-neutral representation of reversible retained-event staging.
 - Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
-  `MarmotAppRuntime` commands and projections with separate encrypted SQLite roots per participant and a real local
-  Nostr relay.
+  `MarmotAppRuntime` commands and projections either in-process or in four isolated child processes. Every participant
+  has a separate encrypted SQLite root and uses a real runner-owned local Nostr relay.
 - Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
   The harness reversibly hides Zeta's root from whole-relay queries before Alpha reconnects and authors its competing
   root, hides Alpha's root before Yankee reconnects and extends Zeta's branch, restarts Zeta, restores both retained
@@ -153,9 +154,10 @@ These are the scenarios another implementation should be able to load from JSON 
   scheduling repair, the app-runtime oracle now requires the same public epoch, roster, administration, depth-two
   profile, and complete duplicate-free probe set at every participant. The prior lag, missing-probe, and two-branch
   surfaces are historical pre-unification counterexamples and now fail the test; the reviewed post-change soak reached
-  full public equivalence in all twenty trials. Exact app-runtime cryptographic commitment, active-decryptability,
-  complete application disposition, process/container/VM execution, and per-durable-transition permutations remain
-  open.
+  full public equivalence in all twenty trials. The process adapter now enforces the same public oracle after real
+  child-runtime disconnect/reopen boundaries; its twenty-trial soak remains opt-in. Exact external-adapter
+  cryptographic commitment, active-decryptability, complete application disposition, container/VM execution, and
+  per-durable-transition permutations remain open.
 
 ### `convergence-committer-selected/v1`
 

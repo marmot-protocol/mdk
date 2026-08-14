@@ -2,14 +2,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
+use cgka_conformance_simulator::process_orchestrator::{
+    ProcessActionStatusV1, ProcessNodeLaunchV1, ProcessOrchestrator, ProcessScenarioReportV1,
+};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeObservationV1, GeneratedScenarioCase, GeneratedScenarioInputV1,
     GeneratedSubjectKind, HarnessStorageMode, RetainedRelaySubject, ScenarioAccountV2,
     ScenarioDeviceV2, ScenarioInputDisposition, ScenarioMessageSelectorV2, ScenarioProcessV2,
     ScenarioRelaySyncModeV2, ScenarioRelayV2, ScenarioSpec, ScenarioStep, ScenarioTopologyV2,
-    TraceExpectation, compile_scenario, node_protocol::NodeObservationV1,
-    resolve_scenario_input_bytes, run_scenario_report, run_scenario_report_with_subject,
+    TraceExpectation, canonical_scenario_ir_sha256, compile_scenario,
+    node_protocol::NodeObservationV1, resolve_scenario_input_bytes, run_scenario_report,
+    run_scenario_report_with_subject,
 };
 use cgka_traits::group::ProtocolProfile;
 
@@ -1300,6 +1303,219 @@ async fn four_party_cross_route_recovery_app_runtime_equivalence_soak() {
     );
 }
 
+const PROCESS_ROUTE_EQUIVALENCE_SOAK_TRIALS: usize = 20;
+
+fn validate_four_party_cross_route_process_report(
+    spec: &ScenarioSpec,
+    report: &ProcessScenarioReportV1,
+) -> Result<(), String> {
+    if !report.completed || !report.failure_capsules.is_empty() {
+        return Err(format!(
+            "process execution did not complete cleanly; last action={:?}, lifecycle tail={:?}, failure capsules={:?}",
+            report.actions.last(),
+            report.lifecycle.iter().rev().take(6).collect::<Vec<_>>(),
+            report.failure_capsules,
+        ));
+    }
+    let schedule = compile_scenario(spec).map_err(|error| error.to_string())?;
+    if report.canonical_schedule != schedule.expanded_schedule()
+        || report.actions.len() != report.canonical_schedule.len()
+        || report
+            .actions
+            .iter()
+            .any(|action| action.status == ProcessActionStatusV1::Failed)
+    {
+        return Err(format!(
+            "process execution did not preserve the canonical schedule: {report:#?}"
+        ));
+    }
+    let expected_digest = canonical_scenario_ir_sha256(spec).map_err(|error| error.to_string())?;
+    if report.executed_scenario_ir_sha256.as_deref() != Some(expected_digest.as_str()) {
+        return Err(format!(
+            "process execution reported the wrong Scenario IR digest: {report:#?}"
+        ));
+    }
+    if report.observations.len() != spec.clients.len() * 4 {
+        return Err(format!(
+            "expected four complete process checkpoints: {report:#?}"
+        ));
+    }
+    let checkpoints = report
+        .observations
+        .chunks_exact(spec.clients.len())
+        .map(|observations| {
+            observations
+                .iter()
+                .map(|observation| (observation.participant.as_str(), observation))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let baseline = &checkpoints[0];
+    let routed = &checkpoints[1];
+    let first_settled = &checkpoints[2];
+    let settled = &checkpoints[3];
+    if routed["zeta"].protocol.epoch != 4
+        || routed["alpha"].protocol.epoch != 4
+        || routed["yankee"].protocol.epoch != 4
+        || routed["observer"].protocol.epoch != 3
+    {
+        return Err(format!(
+            "process route did not reach the controlled intermediate split: {routed:#?}"
+        ));
+    }
+
+    let expected_payloads = BTreeSet::from([
+        "probe-from-alpha".to_owned(),
+        "probe-from-observer".to_owned(),
+        "probe-from-yankee".to_owned(),
+        "probe-from-zeta".to_owned(),
+        "zeta-branch-witness".to_owned(),
+    ]);
+    let mut public_commitments = BTreeSet::new();
+    for client in &spec.clients {
+        let observation = settled[client.as_str()];
+        let prior = first_settled[client.as_str()];
+        if prior.protocol != observation.protocol
+            || prior.application != observation.application
+            || prior.progress.projection_checkpoint_sha256
+                != observation.progress.projection_checkpoint_sha256
+            || prior.progress.relay_inbound_events_seen
+                != observation.progress.relay_inbound_events_seen
+            || prior.progress.relay_inbound_events_delivered
+                != observation.progress.relay_inbound_events_delivered
+            || prior.progress.relay_publish_attempts != observation.progress.relay_publish_attempts
+            || prior.progress.relay_publish_failures != observation.progress.relay_publish_failures
+            || prior.progress.relay_directory_inflight_fetches != 0
+            || observation.progress.relay_directory_inflight_fetches != 0
+            || prior.progress.relay_directory_completed_fetches
+                != observation.progress.relay_directory_completed_fetches
+            || prior.progress.retry_timer_armed
+            || observation.progress.retry_timer_armed
+            || observation.progress.stable_checkpoint_observations
+                < prior.progress.stable_checkpoint_observations
+            || observation.progress.stable_checkpoint_observations < 2
+        {
+            return Err(format!(
+                "{client} did not preserve a stable final process checkpoint: {first_settled:#?} {settled:#?}"
+            ));
+        }
+        if observation.protocol.epoch != 5
+            || observation.protocol.member_count != 4
+            || observation.protocol.member_identities != ["alpha", "observer", "yankee", "zeta"]
+            || observation.protocol.admin_identities != ["alpha", "yankee", "zeta"]
+            || observation.protocol.group_name != "zeta-branch-depth-two"
+            || !observation.protocol.group_description.is_empty()
+        {
+            return Err(format!(
+                "{client} did not reach the selected public protocol state: {settled:#?}"
+            ));
+        }
+        public_commitments.insert(observation.protocol.state_commitment_sha256.as_str());
+        let payloads = observation
+            .application
+            .visible_plaintexts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if payloads != expected_payloads
+            || observation.application.visible_plaintexts.len() != payloads.len()
+            || observation.application.pending_confirmation
+        {
+            return Err(format!(
+                "{client} did not reach the complete duplicate-free application projection: {settled:#?}"
+            ));
+        }
+        let invalidated = observation.application.invalidated_message_ids.len();
+        let left_losing_branch = observation.protocol.group_name != "alpha-root"
+            && observation.protocol.epoch > baseline[client.as_str()].protocol.epoch;
+        if invalidated > 1
+            || (invalidated != 0 && !left_losing_branch)
+            || (client == "alpha" && invalidated != usize::from(left_losing_branch))
+            || ((client == "yankee" || client == "zeta") && invalidated != 0)
+        {
+            return Err(format!(
+                "{client} violated the losing-branch withdrawal rule: {settled:#?}"
+            ));
+        }
+        let visible_ids = observation
+            .application
+            .visible_message_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if observation
+            .application
+            .invalidated_message_ids
+            .iter()
+            .any(|id| visible_ids.contains(id))
+        {
+            return Err(format!(
+                "{client} projected an invalidated row as visible: {settled:#?}"
+            ));
+        }
+    }
+    if public_commitments.len() != 1 {
+        return Err(format!(
+            "process participants disagree on their public state commitment: {settled:#?}"
+        ));
+    }
+    let zeta_launches = report
+        .lifecycle
+        .iter()
+        .filter(|event| event.participant == "zeta" && event.event == "launched")
+        .count();
+    if zeta_launches < 2 {
+        return Err(format!(
+            "zeta did not reopen through the process lifecycle: {:#?}",
+            report.lifecycle
+        ));
+    }
+    Ok(())
+}
+
+async fn run_four_party_cross_route_process_trial() -> Result<(), String> {
+    let spec = cross_route_app_runtime_scenario(false);
+    let artifacts = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let mut process = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let roots = process.participant_roots();
+    if roots.len() != spec.clients.len()
+        || roots.values().collect::<BTreeSet<_>>().len() != spec.clients.len()
+    {
+        process.shutdown().await;
+        return Err(format!("process roots were not isolated: {roots:#?}"));
+    }
+    let report = process.run().await.map_err(|error| error.to_string());
+    process.shutdown().await;
+    validate_four_party_cross_route_process_report(&spec, &report?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_party_cross_route_recovery_processes_match_unified_route() {
+    if let Err(error) = run_four_party_cross_route_process_trial().await {
+        panic!("four-process cross-route recovery failed: {error}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual twenty-trial process route-equivalence soak"]
+async fn four_party_cross_route_recovery_process_equivalence_soak() {
+    let mut failures = Vec::new();
+    for trial in 1..=PROCESS_ROUTE_EQUIVALENCE_SOAK_TRIALS {
+        if let Err(error) = run_four_party_cross_route_process_trial().await {
+            failures.push((trial, error));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the unified route produced non-equivalent process outcomes: {failures:#?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
     let spec = cross_adapter_restart_scenario();
@@ -1346,7 +1562,7 @@ async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn process_kill_pause_resume_and_restart_agree_with_uninterrupted_execution() {
+async fn process_kill_disconnect_reconnect_and_restart_agree_with_uninterrupted_execution() {
     let uninterrupted_spec = process_scenario("uninterrupted-app-process", false);
     let uninterrupted_artifacts = tempfile::tempdir().unwrap();
     let mut uninterrupted = ProcessOrchestrator::launch(
@@ -1397,13 +1613,13 @@ async fn process_kill_pause_resume_and_restart_agree_with_uninterrupted_executio
         recovered_report
             .lifecycle
             .iter()
-            .any(|event| event.event == "paused")
+            .any(|event| event.event == "disconnected")
     );
     assert!(
         recovered_report
             .lifecycle
             .iter()
-            .any(|event| event.event == "resumed")
+            .any(|event| event.event == "reconnected")
     );
     assert!(
         recovered_report
@@ -1529,6 +1745,35 @@ async fn external_relay_map_must_exactly_match_topology() {
         Err(error) => error,
     };
     assert_eq!(error.code, "missing_external_relay");
+}
+
+#[tokio::test]
+async fn external_relays_do_not_claim_runner_owned_visibility_control() {
+    let spec = cross_route_app_runtime_scenario(false);
+    let artifacts = tempfile::tempdir().unwrap();
+    let error = match ProcessOrchestrator::launch_with(
+        ProcessNodeLaunchV1::executable(env!("CARGO_BIN_EXE_cgka-conformance-node")),
+        Some(BTreeMap::from([(
+            "relay:shared".into(),
+            "ws://127.0.0.1:1".into(),
+        )])),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    {
+        Ok(mut orchestrator) => {
+            orchestrator.shutdown().await;
+            panic!("an uncontrolled external relay passed retained-control preflight")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "process_capability_preflight");
+    assert!(
+        error.message.contains("retained_relay_control"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
