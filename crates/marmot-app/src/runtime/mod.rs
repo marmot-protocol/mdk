@@ -1150,14 +1150,12 @@ impl MarmotAppRuntime {
         let mut events = self.events.subscribe();
         let catch_up = timeout(max_wait, self.catch_up_accounts()).await;
         let remaining = max_wait.saturating_sub(started.elapsed());
-        let mut notifications = Vec::new();
-
         match catch_up {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 return BackgroundNotificationCollection {
                     status: NotificationCollectionStatus::Failed,
-                    notifications,
+                    notifications: Vec::new(),
                     error: Some(err.to_string()),
                 };
             }
@@ -1171,18 +1169,15 @@ impl MarmotAppRuntime {
                     project_wake_notification_events(self.accounts.app.clone(), drained)
                         .await
                         .unwrap_or_default();
+                let timed_out = notifications.is_empty();
                 return BackgroundNotificationCollection {
-                    status: if notifications.is_empty() {
+                    status: if timed_out {
                         NotificationCollectionStatus::Failed
                     } else {
                         NotificationCollectionStatus::NewData
                     },
                     notifications,
-                    error: if notifications.is_empty() {
-                        Some("notification wake collection timed out".into())
-                    } else {
-                        None
-                    },
+                    error: timed_out.then(|| "notification wake collection timed out".into()),
                 };
             }
         }
