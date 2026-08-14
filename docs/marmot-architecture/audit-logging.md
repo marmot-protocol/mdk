@@ -190,11 +190,13 @@ and retain the raw line for forward-compatible reprocessing.
 
 ## Event catalogue
 
-This catalogue is not yet complete. `AuditEventKind` currently has 42 variants, and these eleven have no section
+This catalogue is not yet complete. `AuditEventKind` currently has 46 variants, and these fifteen have no section
 here yet — treat `crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
-`audit_data_mode_changed`, `convergence_pass_discarded`, `group_hydration_quarantined`,
-`group_hydration_recovered`, `message_content_decoded`, `pending_commit_recovered_on_open`,
-`recipient_expectation`, `source_context`, `subscription_rebuild`, `sync_drain`, and `transport_received`.
+`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_completed`,
+`epoch_stall_backfill_deferred`, `epoch_stall_backfill_failed`, `epoch_stall_backfill_started`,
+`group_hydration_quarantined`, `group_hydration_recovered`, `message_content_decoded`,
+`pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
+`sync_drain`, and `transport_received`.
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v2.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v2.schema.json); the
