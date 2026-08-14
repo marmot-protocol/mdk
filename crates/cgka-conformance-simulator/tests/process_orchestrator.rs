@@ -949,6 +949,7 @@ async fn four_party_cross_route_recovery_app_runtime_equivalence_soak() {
 }
 
 const PROCESS_ROUTE_EQUIVALENCE_SOAK_TRIALS: usize = 20;
+type CrossRouteProcessTrial = Result<(ScenarioSpec, ProcessScenarioReportV1), String>;
 
 fn validate_four_party_cross_route_process_report(
     spec: &ScenarioSpec,
@@ -957,7 +958,7 @@ fn validate_four_party_cross_route_process_report(
     cgka_conformance_simulator::validate_cross_route_public_process_report(spec, report)
 }
 
-async fn run_four_party_cross_route_process_trial() -> Result<(), String> {
+async fn execute_cross_route_process_trial() -> CrossRouteProcessTrial {
     let spec = cross_route_app_runtime_scenario(false);
     let artifacts = tempfile::tempdir().map_err(|error| error.to_string())?;
     let mut process = ProcessOrchestrator::launch(
@@ -976,14 +977,29 @@ async fn run_four_party_cross_route_process_trial() -> Result<(), String> {
     }
     let report = process.run().await.map_err(|error| error.to_string());
     process.shutdown().await;
-    validate_four_party_cross_route_process_report(&spec, &report?)
+    Ok((spec, report?))
+}
+
+async fn run_four_party_cross_route_process_trial() -> Result<(), String> {
+    let (spec, report) = execute_cross_route_process_trial().await?;
+    validate_four_party_cross_route_process_report(&spec, &report)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_party_cross_route_recovery_processes_match_unified_route() {
-    if let Err(error) = run_four_party_cross_route_process_trial().await {
-        panic!("four-process cross-route recovery failed: {error}");
-    }
+    let (spec, report) = execute_cross_route_process_trial()
+        .await
+        .unwrap_or_else(|error| panic!("four-process cross-route recovery failed: {error}"));
+    validate_four_party_cross_route_process_report(&spec, &report)
+        .unwrap_or_else(|error| panic!("four-process cross-route recovery failed: {error}"));
+
+    let mut malformed = report.clone();
+    malformed.observations[1].participant = malformed.observations[0].participant.clone();
+    let error = validate_four_party_cross_route_process_report(&spec, &malformed).unwrap_err();
+    assert!(
+        error.contains("exactly one observation per participant"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

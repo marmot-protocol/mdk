@@ -133,6 +133,9 @@ impl NostrDatabase for FileRecordingRelayDatabase {
 
     fn query(&self, filter: Filter) -> BoxedFuture<'_, Result<Events, DatabaseError>> {
         Box::pin(async move {
+            // Apply the requested limit only after hidden events are removed;
+            // otherwise one hidden newest event would incorrectly reduce the
+            // visible result below the relay client's requested page size.
             let mut database_filter = filter.clone();
             database_filter.limit = None;
             let events = self.inner.query(database_filter).await?;
@@ -320,11 +323,17 @@ impl ProcessRelayControl for FileProcessRelayControl {
             })?;
         let hidden_path = self.control_root.join(HIDDEN_EVENTS).join(event_token);
         if visible {
-            std::fs::remove_file(&hidden_path)
-                .map_err(|error| control_error("relay_event_not_removed", error))?;
+            std::fs::remove_file(&hidden_path).map_err(|error| {
+                relay_visibility_error(error, io::ErrorKind::NotFound, "relay_event_not_removed")
+            })?;
         } else {
-            fs_private::create_new_private(&hidden_path)
-                .map_err(|error| control_error("relay_event_already_removed", error))?;
+            fs_private::create_new_private(&hidden_path).map_err(|error| {
+                relay_visibility_error(
+                    error,
+                    io::ErrorKind::AlreadyExists,
+                    "relay_event_already_removed",
+                )
+            })?;
         }
         Ok(())
     }
@@ -347,6 +356,18 @@ fn control_error(code: &str, error: impl std::fmt::Display) -> ProcessRelayContr
     ProcessRelayControlError {
         code: code.into(),
         message: error.to_string(),
+    }
+}
+
+fn relay_visibility_error(
+    error: io::Error,
+    semantic_kind: io::ErrorKind,
+    semantic_code: &str,
+) -> ProcessRelayControlError {
+    if error.kind() == semantic_kind {
+        control_error(semantic_code, error)
+    } else {
+        control_error("relay_event_visibility_io", error)
     }
 }
 
@@ -438,5 +459,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "relay_action_publication_identity_mismatch");
+    }
+
+    #[test]
+    fn visibility_errors_distinguish_semantic_state_from_io_failures() {
+        let semantic = relay_visibility_error(
+            io::Error::new(io::ErrorKind::AlreadyExists, "hidden"),
+            io::ErrorKind::AlreadyExists,
+            "relay_event_already_removed",
+        );
+        assert_eq!(semantic.code, "relay_event_already_removed");
+
+        let infrastructure = relay_visibility_error(
+            io::Error::new(io::ErrorKind::PermissionDenied, "read only"),
+            io::ErrorKind::AlreadyExists,
+            "relay_event_already_removed",
+        );
+        assert_eq!(infrastructure.code, "relay_event_visibility_io");
     }
 }

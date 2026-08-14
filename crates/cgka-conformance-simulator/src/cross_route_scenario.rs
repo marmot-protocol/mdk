@@ -387,7 +387,7 @@ pub fn validate_cross_route_public_process_report(
             "process execution reported the wrong Scenario IR digest: {report:#?}"
         ));
     }
-    if report.observations.len() != spec.clients.len() * 4 {
+    if spec.clients.is_empty() || report.observations.len() != spec.clients.len() * 4 {
         return Err(format!(
             "expected four complete process checkpoints: {report:#?}"
         ));
@@ -402,6 +402,18 @@ pub fn validate_cross_route_public_process_report(
                 .collect::<BTreeMap<_, _>>()
         })
         .collect::<Vec<_>>();
+    let expected_participants = spec
+        .clients
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if checkpoints.iter().any(|checkpoint| {
+        checkpoint.keys().copied().collect::<BTreeSet<_>>() != expected_participants
+    }) {
+        return Err(format!(
+            "process checkpoints did not report exactly one observation per participant: {report:#?}"
+        ));
+    }
     let baseline = &checkpoints[0];
     let routed = &checkpoints[1];
     let first_settled = &checkpoints[2];
