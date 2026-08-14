@@ -92,6 +92,9 @@ mod migration_0045_timeline_canonical_order;
 mod migration_0046_message_group_state_epoch_index;
 #[path = "migrations/0047_normalized_message_records.rs"]
 mod migration_0047_normalized_message_records;
+#[cfg(test)]
+#[path = "migrations/test_support.rs"]
+mod test_support;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -1019,7 +1022,7 @@ mod tests {
                 / promotion_duration.as_nanos().max(1),
         )
         .unwrap_or(u64::MAX);
-        println!(
+        super::test_support::emit_benchmark_line(format!(
             "MDK_BENCH storage_format_upgrade rows={message_count} \
              representative_record_bytes={representative_record_bytes} \
              before_bytes={before_bytes} migration_ms={} \
@@ -1037,7 +1040,7 @@ mod tests {
             promotion_duration.as_millis(),
             reopen_duration.as_millis(),
             vacuum_duration.as_millis(),
-        );
+        ));
     }
 
     #[test]

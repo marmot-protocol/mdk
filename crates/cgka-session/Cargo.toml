@@ -21,6 +21,7 @@ tracing.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 nostr.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

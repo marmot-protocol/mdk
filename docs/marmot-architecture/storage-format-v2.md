@@ -72,10 +72,12 @@ changes only the scalar `state` and, when leaving `PeelDeferred`, clears
 `deferred_peel`. It does not read, decode, copy, or rewrite `payload`.
 
 The retained legacy `record` column is a compatibility read path, not an
-ongoing second authority. `promote_legacy_message_rows` promotes at most 256
-rows in one atomic, idempotent batch and reports only aggregate progress so a
-host can schedule it away from account-open latency. Removing format-1 reads
-requires a later migration and release decision.
+ongoing second authority. The storage primitive accepts a caller-selected
+limit of at most 256 rows in one atomic, idempotent batch and reports only
+aggregate progress. The production host deliberately selects 32 rows and
+schedules one transaction per 15-second steady-state maintenance tick after
+account readiness. Removing format-1 reads requires a later migration and
+release decision.
 Reclaiming freed SQLCipher pages is an explicit maintenance operation; opening
 an account never runs `VACUUM` implicitly.
 
