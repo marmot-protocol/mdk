@@ -38,6 +38,9 @@ not "fix" it into the per-account database.
 - Follow `docs/marmot-architecture/storage-format-v2.md`: numbered schema migrations gate database compatibility;
   independently decoded blobs carry artifact-local versions; new `cgka_messages` writes use normalized format 2;
   legacy format-1 rows remain readable and promote atomically on mutation.
+- Keep history-wide format promotion out of account open. The app runtime owns
+  bounded post-readiness scheduling; storage owns only the atomic,
+  idempotent batch and aggregate progress result.
 - Never make `record` and normalized message columns competing authorities. In format 2, scalar columns, `payload`,
   and `deferred_peel` are authoritative and `record` is `NULL`.
 - Migration file names use padded numeric prefixes, for example `0001_initial_schema.rs`.
@@ -47,4 +50,6 @@ not "fix" it into the per-account database.
 ```sh
 cargo test -p storage-sqlite
 cargo clippy -p storage-sqlite --all-targets -- -D warnings
+# Ignored file-backed v1 -> v2 operational benchmark:
+just bench-storage-upgrade
 ```
