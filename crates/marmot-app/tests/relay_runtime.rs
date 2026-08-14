@@ -4113,6 +4113,13 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     wait_for_event(&mut events, |event| {
         matches!(
             event,
+            MarmotAppEvent::GroupStateUpdated {
+                account_id_hex,
+                group_id: updated,
+                ..
+            } if account_id_hex == &bob_id && updated == &group_id
+        ) || matches!(
+            event,
             MarmotAppEvent::ProjectionUpdated(update)
                 if update.account_id_hex == bob_id
                     && update.update.group_id_hex == group_id_hex
