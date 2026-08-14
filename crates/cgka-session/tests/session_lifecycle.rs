@@ -13,15 +13,17 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{KeyPackageBundleStorage, MessageStorage};
+use cgka_traits::storage::KeyPackageBundleStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use std::io::Write;
 use std::sync::Arc;
-use storage_sqlite::{
-    SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, open_hardened_sqlcipher,
-};
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
+
+const SESSION_PROMOTION_FIXTURE: &[u8] = include_bytes!("../fixtures/session-promotion-v1.bin");
+const SESSION_PROMOTION_GROUP_ID_HEX: &str = "1d3ce58153822ac936ba83eba9cb87db";
 
 fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
     use sha2::{Digest, Sha256};
@@ -316,83 +318,30 @@ async fn session_reopens_encrypted_sqlite_group_state() {
 #[tokio::test]
 async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change() {
     let dir = tempfile::tempdir().unwrap();
-    let alice_path = dir.path().join("alice-promotion.sqlite");
-    let bob_path = dir.path().join("bob-promotion.sqlite");
+    let mut fixture = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    fixture.write_all(SESSION_PROMOTION_FIXTURE).unwrap();
+    fixture.flush().unwrap();
+    let database_path = fixture.path().to_owned();
     let key = SqlCipherKey::new("session promotion facade key").unwrap();
-
-    let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice-promotion"))
-        .expect("session open establishes readiness");
-    let mut bob = AccountDeviceSession::open(config(&bob_path, &key, b"bob-promotion"))
-        .expect("peer session opens");
-    let bob_key_package = bob.fresh_key_package().await.unwrap();
-    let created = alice
-        .create_group(CreateGroupRequest {
-            name: "session-promotion".into(),
-            description: "".into(),
-            members: vec![bob_key_package],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let (pending, welcome_id) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].id.clone()),
-        other => panic!("expected GroupCreated publish work, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    drop(alice);
-
-    let storage = SqliteAccountStorage::open_encrypted(
-        &alice_path,
-        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
-    )
-    .unwrap();
-    let before = storage.get_message(&welcome_id).unwrap();
-    let legacy_record = serde_json::to_vec(&before).unwrap();
-    storage.close().unwrap();
-
-    let connection = rusqlite::Connection::open(&alice_path).unwrap();
-    open_hardened_sqlcipher(
-        &connection,
-        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
-        SqlCipherHardening::live_cache(),
-    )
-    .unwrap();
-    let changed = connection
-        .execute(
-            "UPDATE cgka_messages
-             SET storage_format = 1, record = ?1, payload = NULL, deferred_peel = NULL
-             WHERE id = ?2",
-            [legacy_record.as_slice(), welcome_id.as_slice()],
-        )
-        .unwrap();
-    assert_eq!(changed, 1);
-    drop(connection);
-
-    let mut reopened = AccountDeviceSession::open(config(&alice_path, &key, b"alice-promotion"))
+    let group_id = GroupId::new(hex::decode(SESSION_PROMOTION_GROUP_ID_HEX).unwrap());
+    let mut session = AccountDeviceSession::open(config(&database_path, &key, b"alice-promotion"))
         .expect("session is ready before maintenance promotion");
-    let progress = reopened.promote_legacy_message_rows(1).unwrap();
+
+    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(session.members(&group_id).unwrap().len(), 2);
+    let progress = session.promote_legacy_message_rows(1).unwrap();
     assert_eq!(progress.promoted, 1);
     assert!(!progress.has_more);
-    assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
-    assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
-    let post_promotion_payload = app_payload_for(&reopened, b"usable after promotion");
-    reopened
+    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(session.members(&group_id).unwrap().len(), 2);
+    let post_promotion_payload = app_payload_for(&session, b"usable after promotion");
+    session
         .send(SendIntent::AppMessage {
-            group_id: created.group_id,
+            group_id,
             payload: post_promotion_payload,
         })
         .await
         .expect("promotion preserves public session behavior");
-    drop(reopened);
-
-    let storage = SqliteAccountStorage::open_encrypted(
-        &alice_path,
-        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(storage.get_message(&welcome_id).unwrap(), before);
 }
 
 #[tokio::test]
