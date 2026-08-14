@@ -110,12 +110,16 @@ impl EpochManager {
     ///   verified repair path (mdk#971);
     /// - an unresolved local publication (`PendingPublish` / `Merging`) exits
     ///   only through [`Self::confirm_publish`] or [`Self::rollback_publish`],
-    ///   which carry the per-pending bookkeeping — the pending slot and its
-    ///   `committed_from` ownership — that a blind overwrite would strand;
+    ///   the two transitions that also retire the group's `self.pending` entry.
+    ///   A blind overwrite drops the staged commit handle and strands that
+    ///   entry: its rollback epoch is gone, and both exits then fail
+    ///   `InvalidTransition` off the `Stable` we just wrote;
     /// - `Disbanded` has no outgoing transition.
     ///
-    /// Callers are already gated to the two overwritable states, so a fired
-    /// refusal means a caller lost its gate; see the invariant in
+    /// Callers already reach this only from the two overwritable states, or
+    /// from no state at all — every guard here reads through `is_some_and`, so
+    /// create/join and hydration pass by construction. A fired refusal means a
+    /// caller lost its gate; see the invariant in
     /// `crates/cgka-engine/AGENTS.md`.
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
         if self.is_unrecoverable(&group_id) || self.is_disbanded(&group_id) {
