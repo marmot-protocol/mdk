@@ -1115,7 +1115,32 @@ impl MarmotAppRuntime {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     event = events.recv() => match event {
                         Ok(event) => event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let app_for_lookup = app.clone();
+                            let account_label_for_lookup = account_label.clone();
+                            let groups = match blocking_app_task(move || {
+                                if include_archived {
+                                    app_for_lookup.groups(&account_label_for_lookup)
+                                } else {
+                                    app_for_lookup.visible_groups(&account_label_for_lookup)
+                                }
+                            })
+                            .await
+                            {
+                                Ok(groups) => groups,
+                                Err(_) => continue,
+                            };
+                            if !reconcile_chats_snapshot(
+                                &updates_tx,
+                                &mut group_fingerprints,
+                                groups,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            continue;
+                        }
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                 };
@@ -1469,7 +1494,29 @@ impl MarmotAppRuntime {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     event = events.recv() => match event {
                         Ok(event) => event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let app_for_lookup = app.clone();
+                            let account_label_for_lookup = account_label.clone();
+                            let group_id_hex_for_lookup = group_id_hex.clone();
+                            let group = match blocking_app_task(move || {
+                                app_for_lookup
+                                    .group(&account_label_for_lookup, &group_id_hex_for_lookup)
+                            })
+                            .await
+                            {
+                                Ok(Some(group)) => group,
+                                Ok(None) | Err(_) => continue,
+                            };
+                            let fingerprint = app_group_record_fingerprint(&group);
+                            if fingerprint == last_fingerprint {
+                                continue;
+                            }
+                            last_fingerprint = fingerprint;
+                            if updates_tx.send(group).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                 };
@@ -1687,6 +1734,29 @@ pub(crate) fn received_message_update_from_record(
 
 fn app_group_record_fingerprint(group: &AppGroupRecord) -> String {
     serde_json::to_string(group).unwrap_or_else(|_| group.group_id_hex.clone())
+}
+
+async fn reconcile_chats_snapshot(
+    updates_tx: &mpsc::Sender<AppGroupRecord>,
+    group_fingerprints: &mut HashMap<String, String>,
+    groups: Vec<AppGroupRecord>,
+) -> bool {
+    let visible_group_ids = groups
+        .iter()
+        .map(|group| group.group_id_hex.clone())
+        .collect::<HashSet<_>>();
+    group_fingerprints.retain(|group_id_hex, _| visible_group_ids.contains(group_id_hex));
+    for group in groups {
+        let fingerprint = app_group_record_fingerprint(&group);
+        if group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint) {
+            continue;
+        }
+        group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
+        if updates_tx.send(group).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn chat_list_row_fingerprint(row: &ChatListRow) -> String {
