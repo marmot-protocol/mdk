@@ -465,6 +465,25 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   commit nothing will ever apply.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
+- **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a
+  specific transition and `set_stable` refuses it: `Unrecoverable` → `repair_to_stable` after a verified repair path,
+  `PendingPublish`/`Merging` → `confirm_publish` or `rollback_publish`, the only transitions that also retire the
+  group's `pending` entry (a blind overwrite drops the staged commit handle and strands that entry with its rollback
+  epoch, leaving both exits to fail `InvalidTransition` off the freshly written `Stable`), `Disbanded` → nothing.
+  Callers reach it only from the two overwritable states or from no state at all (inbound apply behind `can_ingest`,
+  the outbound drain behind its `Stable`-only re-check, hydration on fresh state, create/join on a group that cannot be
+  holding a publication), so a fired refusal means a new caller lost that gate — fix the caller, don't relax the
+  refusal.
+- **A held publication and an unresolved convergence input are mutually exclusive.** This is why the convergence pass
+  needs no held-publication gate of its own, and it is the non-obvious half of the invariant above — read it before
+  concluding that `converge_stored_openmls_messages*` is missing one because it takes any `EpochState`. Outbound:
+  `should_queue_outbound_intent` settles convergence *before* staging anything, so an unresolved input diverts the
+  intent to the retention queue and the group never leaves `Stable` — `begin_pending` is never reached. Inbound: once a
+  publication is held, `can_ingest` is false, so an arriving commit is persisted as `Retryable` transport bytes for
+  deterministic replay, never buffered as a convergence input. A pass run at that moment therefore has no branch to
+  select and cannot reach `set_stable` with one. Both halves are pinned by
+  `tests/publish_lifecycle.rs::a_publication_is_never_staged_while_a_convergence_input_is_unresolved` and
+  `::an_inbound_commit_under_a_held_publication_is_retained_not_converged`.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
   do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
   `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so
