@@ -1,4 +1,5 @@
-//! Criterion benchmarks for the group creation and welcome-join flows.
+//! Criterion benchmarks for group creation, Welcome joins, and canonical
+//! state advances.
 //!
 //! These benches drive the real OpenMLS-backed engine over in-memory SQLite
 //! storage with the same pass-through peeler style the Tier-2 tests use, so
@@ -19,7 +20,8 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendResult};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -29,7 +31,7 @@ use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use sha2::{Digest, Sha256};
@@ -248,6 +250,74 @@ fn create_request(members: Vec<KeyPackage>) -> CreateGroupRequest {
     }
 }
 
+/// Emit stable logical-size anchors alongside Criterion's timing output. The
+/// Welcome value counts the byte-bearing normalized row columns; SQLite page
+/// overhead is captured separately by the startup-scaling database footprint.
+fn report_storage_format_sizes(_: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_client_with_storage(b"bench-alice-format-sizes", storage.clone());
+    let (group_id, result) = rt
+        .block_on(alice.create_group(create_request(invitee_key_packages(32))))
+        .expect("create_group succeeds");
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("expected FoundingGroupCreated");
+    };
+    let welcome = welcomes.first().expect("32-member group has Welcomes");
+    let sizes = storage
+        .storage_format_bench_sizes(&group_id, &welcome.id)
+        .expect("read storage-format size anchors");
+    let welcome_record_bytes = sizes.message_value_bytes;
+    let founding_snapshot_bytes = sizes.largest_snapshot_bytes;
+    println!(
+        "MDK_BENCH storage_format_sizes members=32 welcome_record_bytes={welcome_record_bytes} \
+         founding_snapshot_bytes={founding_snapshot_bytes}"
+    );
+}
+
+fn confirm_group_evolution(
+    rt: &tokio::runtime::Runtime,
+    engine: &mut Engine<SqliteAccountStorage>,
+    result: SendResult,
+) -> TransportMessage {
+    let SendResult::GroupEvolution { msg, pending, .. } = result else {
+        panic!("expected GroupEvolution");
+    };
+    rt.block_on(engine.confirm_published(pending))
+        .expect("confirm_published succeeds");
+    msg
+}
+
+fn update_group_data(
+    rt: &tokio::runtime::Runtime,
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    sequence: usize,
+) -> TransportMessage {
+    let result = rt
+        .block_on(engine.send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some(format!("bench-{sequence}")),
+            description: None,
+        }))
+        .expect("UpdateGroupData succeeds");
+    confirm_group_evolution(rt, engine, result)
+}
+
+fn app_payload_for(engine: &Engine<SqliteAccountStorage>) -> Vec<u8> {
+    MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "storage-format benchmark",
+    )
+    .encode()
+    .expect("benchmark app event encodes")
+}
+
 // ── create_group ────────────────────────────────────────────────────────────
 
 fn bench_create_group(c: &mut Criterion) {
@@ -355,9 +425,7 @@ fn bench_join_welcome(c: &mut Criterion) {
 }
 
 /// Joining a larger group: every join ends with a buffered-message replay
-/// scan over the group's stored messages. The just-persisted Welcome record
-/// alone is ~180KB of JSON at this size; a re-join additionally carries the
-/// group's whole prior history.
+/// scan over the group's stored messages.
 fn bench_join_welcome_large_group(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -411,11 +479,253 @@ fn bench_join_welcome_large_group(c: &mut Criterion) {
     group.finish();
 }
 
+fn prepare_app_send(
+    rt: &tokio::runtime::Runtime,
+) -> (Engine<SqliteAccountStorage>, GroupId, Vec<u8>) {
+    let mut alice = build_client(b"bench-alice-app-send");
+    let (group_id, create) = rt
+        .block_on(alice.create_group(create_request(vec![])))
+        .expect("create_group succeeds");
+    assert!(matches!(create, SendResult::FoundingGroupCreated { .. }));
+    let payload = app_payload_for(&alice);
+    (alice, group_id, payload)
+}
+
+/// Pure application-message encryption and normalized-row persistence.
+fn bench_app_message_send(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("send_app_message");
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_millis(300));
+    group.sample_size(10);
+    group.bench_function("current profile", |b| {
+        b.iter_batched(
+            || prepare_app_send(&rt),
+            |(mut alice, group_id, payload)| {
+                let result = rt
+                    .block_on(alice.send(SendIntent::AppMessage { group_id, payload }))
+                    .expect("app send succeeds");
+                assert!(matches!(result, SendResult::ApplicationMessage { .. }));
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+fn prepare_app_ingest(
+    rt: &tokio::runtime::Runtime,
+) -> (Engine<SqliteAccountStorage>, TransportMessage) {
+    let mut alice = build_client(b"bench-alice-app-ingest");
+    let mut bob = build_client(b"bench-bob-app-ingest");
+    let bob_kp = rt
+        .block_on(bob.fresh_key_package())
+        .expect("mint bob key package");
+    let (group_id, create) = rt
+        .block_on(alice.create_group(create_request(vec![bob_kp])))
+        .expect("create_group succeeds");
+    let SendResult::FoundingGroupCreated { mut welcomes } = create else {
+        panic!("expected FoundingGroupCreated");
+    };
+    rt.block_on(bob.join_welcome(welcomes.remove(0)))
+        .expect("bob joins");
+    let result = rt
+        .block_on(alice.send(SendIntent::AppMessage {
+            group_id,
+            payload: app_payload_for(&alice),
+        }))
+        .expect("app send succeeds");
+    let SendResult::ApplicationMessage { msg, .. } = result else {
+        panic!("expected ApplicationMessage");
+    };
+    (bob, msg)
+}
+
+/// Peeling, MLS decryption, validation, and normalized-row persistence for an
+/// inbound application message.
+fn bench_app_message_ingest(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("ingest_app_message");
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_millis(300));
+    group.sample_size(10);
+    group.bench_function("current profile", |b| {
+        b.iter_batched(
+            || prepare_app_ingest(&rt),
+            |(mut bob, message)| rt.block_on(bob.ingest(message)).expect("ingest succeeds"),
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+fn prepare_rejoin_with_history(
+    rt: &tokio::runtime::Runtime,
+    retained_commits: usize,
+) -> (Engine<SqliteAccountStorage>, TransportMessage) {
+    let mut alice = build_client(b"bench-alice-rejoin");
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(b"bench-bob-rejoin", bob_storage.clone());
+    let bob_id = bob.self_id().clone();
+    let bob_kp = rt
+        .block_on(bob.fresh_key_package())
+        .expect("mint initial bob key package");
+    let (group_id, create) = rt
+        .block_on(alice.create_group(create_request(vec![bob_kp])))
+        .expect("create_group succeeds");
+    let SendResult::FoundingGroupCreated { mut welcomes } = create else {
+        panic!("expected FoundingGroupCreated");
+    };
+    rt.block_on(bob.join_welcome(welcomes.remove(0)))
+        .expect("initial join succeeds");
+
+    // Build real canonical history on both peers. These commits become the
+    // rows and retained checkpoints that the rejoin path must reconcile.
+    for sequence in 0..retained_commits {
+        let commit = update_group_data(rt, &mut alice, &group_id, sequence);
+        rt.block_on(bob.ingest(commit))
+            .expect("bob ingests retained commit");
+        bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .expect("retained commit converges");
+    }
+    assert!(
+        bob_storage
+            .list_messages(&group_id, EpochId(0))
+            .expect("list retained rejoin history")
+            .len()
+            >= retained_commits,
+        "fixture must retain the requested canonical history"
+    );
+
+    let removal = rt
+        .block_on(alice.send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob_id],
+        }))
+        .expect("remove succeeds");
+    let removal_commit = confirm_group_evolution(rt, &mut alice, removal);
+    rt.block_on(bob.ingest(removal_commit))
+        .expect("bob ingests removal");
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("removal converges");
+
+    let rejoin_kp = rt
+        .block_on(bob.fresh_key_package())
+        .expect("mint rejoin key package");
+    let rejoin = rt
+        .block_on(alice.send(SendIntent::Invite {
+            group_id,
+            key_packages: vec![rejoin_kp],
+        }))
+        .expect("re-invite succeeds");
+    let SendResult::GroupEvolution {
+        mut welcomes,
+        pending,
+        ..
+    } = rejoin
+    else {
+        panic!("expected GroupEvolution");
+    };
+    rt.block_on(alice.confirm_published(pending))
+        .expect("confirm re-invite succeeds");
+    (bob, welcomes.remove(0))
+}
+
+/// Same-group rejoin after removal, scaled by the canonical commit history
+/// retained by the joining device. Fixture construction is excluded from the
+/// timed interval; only the second `join_welcome` call is measured.
+fn bench_rejoin_welcome_with_history(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("rejoin_welcome_with_history");
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_millis(300));
+    group.sample_size(10);
+    for retained_commits in [0_usize, 8, 32] {
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{retained_commits} retained commits")),
+            |b| {
+                b.iter_batched(
+                    || prepare_rejoin_with_history(&rt, retained_commits),
+                    |(mut bob, welcome)| {
+                        rt.block_on(bob.join_welcome(welcome))
+                            .expect("rejoin succeeds")
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+fn prepare_canonical_advance(
+    rt: &tokio::runtime::Runtime,
+    retained_commits: usize,
+) -> (Engine<SqliteAccountStorage>, GroupId, usize) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_client_with_storage(b"bench-alice-canonical-advance", storage.clone());
+    let (group_id, create) = rt
+        .block_on(alice.create_group(create_request(vec![])))
+        .expect("create_group succeeds");
+    assert!(matches!(create, SendResult::FoundingGroupCreated { .. }));
+    for sequence in 0..retained_commits {
+        update_group_data(rt, &mut alice, &group_id, sequence);
+    }
+    assert!(
+        storage
+            .list_messages(&group_id, EpochId(0))
+            .expect("list retained canonical history")
+            .len()
+            >= retained_commits,
+        "fixture must retain the requested canonical history"
+    );
+    (alice, group_id, retained_commits)
+}
+
+/// One canonical commit preparation + confirmation at fixed retained-history
+/// depths. The setup commits are real state advances but are excluded from the
+/// timed interval.
+fn bench_canonical_advance_with_history(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("canonical_advance_with_history");
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_millis(300));
+    group.sample_size(10);
+    for retained_commits in [0_usize, 8, 32] {
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{retained_commits} retained commits")),
+            |b| {
+                b.iter_batched(
+                    || prepare_canonical_advance(&rt, retained_commits),
+                    |(mut alice, group_id, sequence)| {
+                        update_group_data(&rt, &mut alice, &group_id, sequence)
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    report_storage_format_sizes,
     bench_create_group,
     bench_retained_anchor_snapshot,
     bench_join_welcome,
-    bench_join_welcome_large_group
+    bench_join_welcome_large_group,
+    bench_app_message_send,
+    bench_app_message_ingest,
+    bench_rejoin_welcome_with_history,
+    bench_canonical_advance_with_history
 );
 criterion_main!(benches);

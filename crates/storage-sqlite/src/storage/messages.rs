@@ -34,7 +34,55 @@ pub struct MessageFormatPromotionProgress {
     pub has_more: bool,
 }
 
+/// Logical blob/value sizes used by the storage-format benchmark rail.
+///
+/// This excludes SQLite page overhead; the startup-scaling harness reports
+/// the complete database-file footprint separately.
+#[cfg(feature = "storage-format-benchmarks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageFormatBenchSizes {
+    pub message_value_bytes: u64,
+    pub largest_snapshot_bytes: u64,
+}
+
 impl SqliteAccountStorage {
+    /// Read aggregate value sizes without returning any stored content.
+    #[cfg(feature = "storage-format-benchmarks")]
+    pub fn storage_format_bench_sizes(
+        &self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+    ) -> StorageResult<StorageFormatBenchSizes> {
+        let conn = self.lock()?;
+        let message_value_bytes = conn
+            .query_row(
+                "SELECT length(id) + length(group_id) + coalesce(length(payload), 0) +
+                        coalesce(length(record), 0) + coalesce(length(deferred_peel), 0)
+                 FROM cgka_messages WHERE id = ?1",
+                params![message_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?
+            .ok_or(StorageError::NotFound)?;
+        let largest_snapshot_bytes = conn
+            .query_row(
+                "SELECT max(length(snapshot)) FROM cgka_group_snapshots WHERE group_id = ?1",
+                params![group_id.as_slice()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .storage()?
+            .ok_or_else(|| StorageError::SnapshotMissing("benchmark-size-anchor".into()))?;
+        Ok(StorageFormatBenchSizes {
+            message_value_bytes: u64::try_from(message_value_bytes).map_err(|error| {
+                StorageError::Backend(format!("invalid message benchmark size: {error}"))
+            })?,
+            largest_snapshot_bytes: u64::try_from(largest_snapshot_bytes).map_err(|error| {
+                StorageError::Backend(format!("invalid snapshot benchmark size: {error}"))
+            })?,
+        })
+    }
+
     /// Promote at most `limit` legacy message rows to normalized format 2.
     ///
     /// The bounded batch is atomic and idempotent. A malformed row rolls the
@@ -728,6 +776,38 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::PeelDeferred
         );
+    }
+
+    #[cfg(feature = "storage-format-benchmarks")]
+    #[test]
+    fn storage_format_bench_sizes_accepts_legacy_message_rows() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 0);
+        let message = sample_message(mid(1), group.id.clone(), 0);
+        let record = serialize(&message).unwrap();
+        store.put_group(&group).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 0, 0, ?3)",
+                rusqlite::params![message.id.as_slice(), group.id.as_slice(), record],
+            )
+            .unwrap();
+        store
+            .create_group_snapshot(&group.id, "legacy-size")
+            .unwrap();
+
+        let sizes = store
+            .storage_format_bench_sizes(&group.id, &message.id)
+            .expect("legacy row size is defined");
+        assert_eq!(
+            sizes.message_value_bytes,
+            u64::try_from(message.id.as_slice().len() + group.id.as_slice().len() + record.len())
+                .unwrap()
+        );
+        assert!(sizes.largest_snapshot_bytes > 0);
     }
 
     #[test]

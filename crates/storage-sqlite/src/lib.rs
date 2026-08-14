@@ -48,6 +48,8 @@ pub use shared::{
     StoredRelayTelemetrySettings,
 };
 pub use storage::messages::MessageFormatPromotionProgress;
+#[cfg(feature = "storage-format-benchmarks")]
+pub use storage::messages::StorageFormatBenchSizes;
 pub use timeline::{
     MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult, StoredAppEvent, TimelineMessageChange,
     TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget, TimelinePage,

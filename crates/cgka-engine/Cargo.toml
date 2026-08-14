@@ -44,7 +44,7 @@ sha2.workspace = true
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 
 [dev-dependencies]
-storage-sqlite.workspace = true
+storage-sqlite = { workspace = true, features = ["storage-format-benchmarks"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 test-log.workspace = true
 insta.workspace = true
