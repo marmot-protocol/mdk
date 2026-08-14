@@ -265,8 +265,9 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
 ///
 /// This is the scenario-level companion to the engine's
 /// `stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` family
-/// (mdk#1110, fixed in mdk#1182). The field incident was a durable pass whose
-/// `base_epoch` disagreed with the live tip, which durably halted the group.
+/// (mdk#1182, over the durable passes mdk#1110 added). The field incident was a
+/// durable pass whose `base_epoch` disagreed with the live tip, which durably
+/// halted the group.
 /// Those engine tests install the disagreement on the durable record directly,
 /// because the engine keeps a single tip authority and an active pass gates every
 /// path that could move it. This scenario pins that precondition from the public
@@ -285,7 +286,7 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
 ///
 /// The subject adapter's `structural_wake_rebases_across_restart_without_granting_fresh_time`
 /// already covers the deadline-rebase half of this on a lone client with an empty
-/// group. This scenario is the version that matters for mdk#1110: the deadline has
+/// group. This scenario is the version that matters for the incident: the deadline has
 /// to survive a *backlog* landing on the reopened engine, which is the pressure
 /// that could plausibly re-derive it.
 ///
