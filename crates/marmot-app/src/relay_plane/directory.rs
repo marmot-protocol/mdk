@@ -347,13 +347,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        let relay_urls = request
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let relay_urls = parsed_directory_relay_urls(&request.endpoints)?;
         let mut connect_candidates = Vec::new();
         for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
             if self.client.add_relay(relay_url.clone()).await.is_ok() {
@@ -429,6 +423,21 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     }
 }
 
+fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
+    let mut relay_urls = endpoints
+        .iter()
+        .map(|endpoint| {
+            RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // RelayUrl equality canonicalizes trailing slashes even though its display
+    // form preserves them. Collapse equivalent candidates before concurrent
+    // connection attempts so one failed twin cannot remove a successful one.
+    relay_urls.sort();
+    relay_urls.dedup();
+    Ok(relay_urls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +482,16 @@ mod tests {
 
         assert_eq!(error, "invalid relay URL");
         assert!(!error.contains(secret_url));
+    }
+
+    #[test]
+    fn parsed_directory_relay_urls_deduplicate_trailing_slash_variants() {
+        let relay_urls = parsed_directory_relay_urls(&[
+            TransportEndpoint("wss://relay.example".to_owned()),
+            TransportEndpoint("wss://relay.example/".to_owned()),
+        ])
+        .unwrap();
+
+        assert_eq!(relay_urls.len(), 1);
     }
 }

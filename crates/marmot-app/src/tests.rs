@@ -2996,6 +2996,7 @@ async fn relay_list_zero_ack_does_not_advance_the_local_projection() {
 async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
+    // Batch order is NIP-65, inbox, contacts, profile: fail the inbox record.
     relay.script([true, false, true, true]);
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay);
@@ -3038,6 +3039,42 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
             .unwrap()
             .is_none(),
         "successful retry must commit and remove the setup journal"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    home.set_account_setup_phase(
+        &account.label,
+        marmot_account::AccountSetupPhase::BootstrapPublicationConfirmed,
+    )
+    .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    app.mark_key_package_cutover_scan_complete(&account.label)
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+
+    let retried = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .expect("a confirmed setup with a lost projection must republish safely");
+
+    assert_eq!(retried.account.account_id_hex, account.account_id_hex);
+    assert!(retried.relay_lists.complete);
+    assert_eq!(
+        relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "projection recovery should issue one idempotent bootstrap batch"
     );
     runtime.shutdown().await;
 }

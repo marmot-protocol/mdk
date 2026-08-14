@@ -1034,6 +1034,69 @@ async fn failed_key_package_setup_retries_same_nsec_after_restart() {
 }
 
 #[tokio::test]
+async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let secret = Keys::generate().secret_key().to_bech32().unwrap();
+    let account_id = AccountHome::account_id_for_secret(&secret).unwrap();
+    let setup = |secret: &str| AccountSetupRequest {
+        import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        discovery_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .create_or_import_account(setup(&secret))
+        .await
+        .expect("initial import should publish its KeyPackage");
+    runtime
+        .sign_out(
+            &created.account.label,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    rejecting.store(true, Ordering::Relaxed);
+    runtime
+        .create_or_import_account(setup(&secret))
+        .await
+        .expect_err("reactivation must surface the rejected KeyPackage publication");
+    assert!(
+        AccountHome::open(dir.path())
+            .account(&account_id)
+            .unwrap()
+            .signed_out,
+        "failed reactivation must restore the durable signed-out marker"
+    );
+
+    rejecting.store(false, Ordering::Relaxed);
+    let retried = runtime
+        .create_or_import_account(setup(&secret))
+        .await
+        .expect("the same nsec must resume instead of returning AccountExists");
+    assert_eq!(retried.account.account_id_hex, account_id);
+    assert!(!retried.account.signed_out);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));

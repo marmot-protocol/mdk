@@ -4258,10 +4258,12 @@ impl AccountManager {
                 }
                 match self.publish_initial_key_package_for_account(&account).await {
                     Ok(bytes) => {
-                        self.app.account_home().set_account_setup_phase(
-                            &account.label,
-                            AccountSetupPhase::KeyPackagePublicationConfirmed,
-                        )?;
+                        if setup_phase.is_some() {
+                            self.app.account_home().set_account_setup_phase(
+                                &account.label,
+                                AccountSetupPhase::KeyPackagePublicationConfirmed,
+                            )?;
+                        }
                         Some(bytes)
                     }
                     Err(err) => {
@@ -4269,6 +4271,13 @@ impl AccountManager {
                         // is sufficient to retry safely after any ordinary error
                         // or task cancellation. Never delete possibly exposed
                         // exact bytes/private material here.
+                        // A reactivation has no setup journal, so restore its
+                        // durable signed-out state and stop the just-started
+                        // worker. The same nsec can then resume this exact
+                        // lifecycle attempt instead of failing AccountExists.
+                        if reactivating_existing {
+                            self.deactivate_account(&account.label).await?;
+                        }
                         return Err(err);
                     }
                 }
@@ -4562,6 +4571,9 @@ impl AccountManager {
             request.default_relays.clone(),
             request.bootstrap_relays.clone(),
         );
+        // Validate before advancing the durable publication phase. The
+        // publisher validates again at its own action boundary because it is
+        // also called directly outside this setup orchestrator.
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
         }
@@ -4580,9 +4592,6 @@ impl AccountManager {
                 | AccountSetupPhase::KeyPackagePublicationConfirmed
         ) {
             let status = self.app.account_relay_list_status(&account.label)?;
-            if !status.complete {
-                return Err(AppError::MissingRelayLists(status.missing));
-            }
             if let Some(cached) = self
                 .app
                 .directory_entry_for_account_id(&account.account_id_hex)?
@@ -4590,7 +4599,13 @@ impl AccountManager {
             {
                 profile = cached;
             }
-            return Ok((status, Some(profile)));
+            if status.complete {
+                return Ok((status, Some(profile)));
+            }
+            // The durable publication phase is authoritative, but the local
+            // directory projection can still be lost independently. These are
+            // replaceable records, so rebuild the projection by republishing
+            // the same bootstrap instead of trapping every retry here.
         }
         if phase == AccountSetupPhase::LocalStateCreated {
             self.app.account_home().set_account_setup_phase(
@@ -4603,10 +4618,7 @@ impl AccountManager {
             .app
             .publish_generated_account_bootstrap(&account.label, bootstrap, &profile)
             .await?;
-        self.app.account_home().set_account_setup_phase(
-            &account.label,
-            AccountSetupPhase::BootstrapPublicationConfirmed,
-        )?;
+        self.mark_bootstrap_publication_confirmed(&account.label)?;
         Ok((status, Some(profile)))
     }
 
@@ -4670,11 +4682,13 @@ impl AccountManager {
                                 target: "marmot_app::runtime",
                                 method = "setup_relay_lists_for_account",
                                 error_kind = error.privacy_safe_kind(),
-                                "using cached relay-list status after advisory import fetch failed"
+                                "import relay-list discovery failed; refusing to publish defaults"
                             );
-                            self.app.account_relay_list_status(&account.label)?
+                            return self.complete_cached_relay_list_status(&account.label);
                         }
-                        None => self.app.account_relay_list_status(&account.label)?,
+                        None => {
+                            return self.complete_cached_relay_list_status(&account.label);
+                        }
                     }
                 };
                 if current_status.complete {
@@ -4696,6 +4710,9 @@ impl AccountManager {
                     Ok(status)
                 }
             } else {
+                // Keep validation ahead of the durable publication-intent
+                // marker; the private publisher repeats these guards at its
+                // own boundary before it can be reused independently.
                 if request.default_relays.is_empty() && request.bootstrap_relays.is_empty() {
                     return self.app.account_relay_list_status(&account.label);
                 }
@@ -4751,6 +4768,18 @@ impl AccountManager {
         Ok(())
     }
 
+    fn complete_cached_relay_list_status(
+        &self,
+        label: &str,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let status = self.app.account_relay_list_status(label)?;
+        if status.complete {
+            Ok(status)
+        } else {
+            Err(AppError::MissingRelayLists(status.missing))
+        }
+    }
+
     async fn publish_relay_lists_for_new_account(
         &self,
         label: &str,
@@ -4786,11 +4815,9 @@ impl AccountManager {
                 .mark_key_package_cutover_replacement_pending(&account.label);
             return Err(AppError::AccountSetupRecoveryRequired);
         }
-        // Let the managed worker own the only session opened for this setup.
-        // Its open runs through `blocking_app_task`; publishing through the
-        // worker avoids the former one-shot session open followed immediately
-        // by a second worker session open.
-        self.reconcile().await?;
+        // Publishing through the managed worker avoids the former one-shot
+        // session open followed by a second worker session open. The command's
+        // `worker_commands` lookup reconciles before dispatch.
         self.publish_key_package(&account.label).await
     }
 
@@ -4910,6 +4937,9 @@ impl AccountManager {
                             .app
                             .mark_key_package_cutover_scan_complete(&account.label)
                         {
+                            let _ = self
+                                .app
+                                .remove_account_key_package_artifacts(&account.label);
                             let _ = account_home.remove_account(&account.label);
                             return Err(error);
                         }

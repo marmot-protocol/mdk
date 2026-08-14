@@ -1635,13 +1635,10 @@ impl MarmotApp {
         // the union of both endpoint sets once.
         let content_endpoints =
             self.outbox_endpoints(&account.account_id_hex, bootstrap.default_relays.clone());
-        let requested = publish_endpoints_from_bootstrap(&bootstrap);
-        let mut endpoints = self.outbox_endpoints(&account.account_id_hex, requested.clone());
-        for endpoint in requested {
-            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
-                endpoints.push(endpoint);
-            }
-        }
+        let endpoints = self.publish_route_including_requested(
+            &account.account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
 
         let mut requests = Vec::with_capacity(4);
         for list_kind in [
@@ -1683,11 +1680,25 @@ impl MarmotApp {
 
         let relay_client =
             self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
-        for outcome in relay_client.publish_events(&requests).await {
+        let record_kinds = [
+            "NIP-65 relay list",
+            "inbox relay list",
+            "contact list",
+            "profile metadata",
+        ];
+        let outcomes = relay_client.publish_events(&requests).await;
+        if outcomes.len() != record_kinds.len() {
+            return Err(AppError::Publish(format!(
+                "account bootstrap returned {} outcomes for {} records",
+                outcomes.len(),
+                record_kinds.len()
+            )));
+        }
+        for (record_kind, outcome) in record_kinds.into_iter().zip(outcomes) {
             if outcome?.accepted.is_empty() {
-                return Err(AppError::Publish(
-                    "relay acknowledged zero account bootstrap events".to_owned(),
-                ));
+                return Err(AppError::Publish(format!(
+                    "relay acknowledged zero events for bootstrap record {record_kind}"
+                )));
             }
         }
 
@@ -1953,13 +1964,10 @@ impl MarmotApp {
         // ever lands on the relays you were already on. Unioning means an
         // explicit republish reaches both your old relays (so they update) and
         // the newly-declared ones (so they learn about you for the first time).
-        let requested = publish_endpoints_from_bootstrap(&bootstrap);
-        let mut endpoints = self.outbox_endpoints(&account_id_hex, requested.clone());
-        for endpoint in requested {
-            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
-                endpoints.push(endpoint);
-            }
-        }
+        let endpoints = self.publish_route_including_requested(
+            &account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
         let relay_client =
             self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
         let mut requests = Vec::with_capacity(list_kinds.len());
@@ -2121,6 +2129,22 @@ impl MarmotApp {
             "local account outbox routing",
         );
         if safe.is_empty() { fallback } else { safe }
+    }
+
+    /// Preserve the account's existing outbox route while ensuring every
+    /// explicitly requested publication endpoint is reached at least once.
+    fn publish_route_including_requested(
+        &self,
+        account_id_hex: &str,
+        requested: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let mut endpoints = self.outbox_endpoints(account_id_hex, requested.clone());
+        for endpoint in requested {
+            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
+                endpoints.push(endpoint);
+            }
+        }
+        endpoints
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
