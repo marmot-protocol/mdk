@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-07-04
+updated: 2026-08-14
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -51,6 +51,12 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | `AgentStreamWatchManager.watches` | 256 (`AGENT_STREAM_WATCH_RETAIN_LIMIT`), including `running` watches | Enforced on both start and finish. Finished watches evict oldest-first; when running watches alone exceed the cap (a finish that never arrives), the oldest running watches evict too (mdk#343). |
 | `recent_updates` replay ring | 256 (`AGENT_STREAM_UPDATE_REPLAY_LIMIT`) | Oldest popped on publish. |
+
+### `marmot-app` (`src/sqlcipher.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `SQLCIPHER_V2_VERDICTS` probe-verdict cache | 256 entries (`SQLCIPHER_V2_VERDICT_CACHE_CAPACITY`) | Entries are keyed by canonical database path + salt and record only an observed "opens under the v2 key" verdict (mdk#1439). Removed when the database file set is deleted via `remove_sqlite_file_set`; replaced in place when the salt rotates; oldest-first eviction at the cap. Eviction or loss of an entry only ever causes one extra recovery probe, never a wrong-key assumption. The companion `SQLCIPHER_MIGRATION_PROBE_RUNS`/`SKIPS` counters are monotonic process-lifetime aggregates by design (telemetry gauges, not tracked state). |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 

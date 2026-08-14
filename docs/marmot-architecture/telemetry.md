@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-08-07
+updated: 2026-08-14
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -21,7 +21,7 @@ runtime. It complements the policy docs:
 | --- | --- | --- | --- |
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
-| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read operations, and media upload/download. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
+| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Engine reorg telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg counters/histograms. Exposed by `Engine::engine_metrics()`. The relay-plane/export structs have an optional seam for it, but the periodic runtime exporter currently passes `None`. | No via the runtime exporter today. Engine metrics can be exported only if a caller explicitly folds a snapshot into the rollup/batch. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
@@ -435,6 +435,8 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_host_foreground_local_ready_attempts` | none | Counter | `AppPerformanceSnapshot.host_foreground_local_ready.attempts` |
 | `app_host_foreground_local_ready_successes` | none | Counter | `AppPerformanceSnapshot.host_foreground_local_ready.successes` |
 | `app_host_foreground_local_ready_failures` | none | Counter | `AppPerformanceSnapshot.host_foreground_local_ready.failures` |
+| `app_sqlcipher_migration_probe_runs` | none | Counter | `AppPerformanceSnapshot.sqlcipher_migration_probe_runs`; each run is one full keyed SQLCipher open paying the passphrase KDF (mdk#1439) |
+| `app_sqlcipher_migration_probe_skips` | none | Counter | `AppPerformanceSnapshot.sqlcipher_migration_probe_skips`; each skip is one passphrase KDF derivation avoided via the cached v2-open verdict (mdk#1439) |
 
 Current implementation note: publish telemetry is device-wide attempts/successes/failures. It is not currently
 per-relay or per-Nostr-kind, even though the relay observability design doc names those as desired future ranking

@@ -109,6 +109,17 @@ pub struct AppPerformanceSnapshot {
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
     pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
+    /// Interrupted-migration recovery probes executed since process start. Each
+    /// probe is a full keyed SQLCipher open paying the passphrase KDF; the
+    /// healthy steady state skips it via the cached v2-open verdict (mdk#1439).
+    /// Process-wide aggregate: no account, path, or key information.
+    #[serde(default)]
+    pub sqlcipher_migration_probe_runs: u64,
+    /// Existing-database opens that skipped the recovery probe via a cached
+    /// v2-open verdict since process start. Each skip avoided one full
+    /// passphrase KDF derivation (mdk#1439).
+    #[serde(default)]
+    pub sqlcipher_migration_probe_skips: u64,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_queue_wait: AppPerformanceOperationSnapshot,
@@ -453,6 +464,8 @@ impl AppPerformanceTelemetry {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sqlcipher_migration_probe_runs, sqlcipher_migration_probe_skips) =
+            crate::sqlcipher::sqlcipher_migration_probe_counters();
         AppPerformanceSnapshot {
             app_start: inner.app_start.snapshot(),
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
@@ -467,6 +480,8 @@ impl AppPerformanceTelemetry {
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
             account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
+            sqlcipher_migration_probe_runs,
+            sqlcipher_migration_probe_skips,
             outbound_message_send: inner.outbound_message_send.snapshot(),
             group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
             group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
@@ -726,5 +741,21 @@ mod tests {
         assert_eq!(snapshot.account_setup_advisory_step.attempts, 1);
         assert_eq!(snapshot.account_setup_advisory_step.successes, 0);
         assert_eq!(snapshot.account_setup_advisory_step.failures, 1);
+    }
+
+    #[test]
+    fn snapshot_carries_the_process_wide_sqlcipher_probe_counters() {
+        // The counters are process-global atomics shared with every test in
+        // this process, so bracket the snapshot between two direct reads
+        // instead of asserting exact values.
+        let telemetry = AppPerformanceTelemetry::default();
+        let before = crate::sqlcipher::sqlcipher_migration_probe_counters();
+        let snapshot = telemetry.snapshot();
+        let after = crate::sqlcipher::sqlcipher_migration_probe_counters();
+
+        assert!(before.0 <= snapshot.sqlcipher_migration_probe_runs);
+        assert!(snapshot.sqlcipher_migration_probe_runs <= after.0);
+        assert!(before.1 <= snapshot.sqlcipher_migration_probe_skips);
+        assert!(snapshot.sqlcipher_migration_probe_skips <= after.1);
     }
 }
