@@ -22,6 +22,7 @@ use super::{
     wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::AppPerformanceOperation;
+use crate::client::EncryptedMediaUploadFinish;
 use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
@@ -727,6 +728,7 @@ async fn run_app_runtime_account_worker(
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result.
+    let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     for deferred_command in deferred {
         match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
@@ -740,6 +742,7 @@ async fn run_app_runtime_account_worker(
                     &account_id_hex,
                     &account_label,
                     &shared,
+                    &media_http_tx,
                 )
                 .await;
             }
@@ -912,6 +915,7 @@ async fn run_app_runtime_account_worker(
                                         &account_id_hex,
                                         &account_label,
                                         &shared,
+                                        &media_http_tx,
                                     )
                                     .await;
                                 }
@@ -927,6 +931,18 @@ async fn run_app_runtime_account_worker(
                                 );
                             }
                         }
+                    }
+                    None => return,
+                }
+            }
+            done = media_http_rx.recv() => {
+                match done {
+                    Some(done) => {
+                        complete_media_http(&mut client, done, &shared).await;
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
                     }
                     None => return,
                 }
@@ -1719,6 +1735,77 @@ async fn handle_startup_hydration_command(
     }
 }
 
+enum MediaHttpDone {
+    Upload {
+        finish: EncryptedMediaUploadFinish,
+        result: Result<MediaUploadResult, AppError>,
+        respond: oneshot::Sender<Result<MediaUploadResult, AppError>>,
+        started_at: Instant,
+    },
+    Download {
+        result: Result<MediaDownloadResult, AppError>,
+        respond: oneshot::Sender<Result<MediaDownloadResult, AppError>>,
+        started_at: Instant,
+    },
+    GroupImage {
+        result: Result<Vec<u8>, AppError>,
+        respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
+    },
+}
+
+fn spawn_media_http<T>(
+    media_http: &mpsc::UnboundedSender<MediaHttpDone>,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+    into_done: impl FnOnce(T) -> MediaHttpDone + Send + 'static,
+) {
+    let tx = media_http.clone();
+    tokio::spawn(async move {
+        let output = work.await;
+        let _ = tx.send(into_done(output));
+    });
+}
+
+async fn complete_media_http(
+    client: &mut AppClient,
+    done: MediaHttpDone,
+    shared: &RuntimeSharedServices,
+) {
+    match done {
+        MediaHttpDone::Upload {
+            finish,
+            result,
+            respond,
+            started_at,
+        } => {
+            let result = match result {
+                Ok(result) => client.finish_encrypted_media_upload(finish, result).await,
+                Err(err) => Err(err),
+            };
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::MediaUpload,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        MediaHttpDone::Download {
+            result,
+            respond,
+            started_at,
+        } => {
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::MediaDownload,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        MediaHttpDone::GroupImage { result, respond } => {
+            let _ = respond.send(result);
+        }
+    }
+}
+
 /// Process a single account-worker command against the live session.
 ///
 /// Extracted so the worker can drive commands from two places: the steady-state
@@ -1735,6 +1822,7 @@ async fn handle_account_worker_command(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
+    media_http: &mpsc::UnboundedSender<MediaHttpDone>,
 ) {
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
@@ -2346,8 +2434,14 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::DownloadGroupImage { group_id, respond } => {
-            let result = client.download_group_blossom_image(&group_id).await;
-            let _ = respond.send(result);
+            match client.prepare_group_image_download(&group_id).await {
+                Ok(http) => spawn_media_http(media_http, http.run(), move |result| {
+                    MediaHttpDone::GroupImage { result, respond }
+                }),
+                Err(err) => {
+                    let _ = respond.send(Err(err));
+                }
+            }
         }
         AccountWorkerCommand::SendMessage {
             group_id,
@@ -2431,28 +2525,55 @@ async fn handle_account_worker_command(
             request,
             respond,
         } => {
-            let upload_started_at = Instant::now();
-            let result = client.upload_media(&group_id, request).await;
-            shared.app_performance_telemetry().record(
-                AppPerformanceOperation::MediaUpload,
-                upload_started_at.elapsed(),
-                result.is_ok(),
-            );
-            let _ = respond.send(result);
+            let started_at = Instant::now();
+            match client
+                .prepare_encrypted_media_upload(&group_id, request)
+                .await
+            {
+                Ok((http, finish)) => spawn_media_http(media_http, http.run(), move |result| {
+                    MediaHttpDone::Upload {
+                        finish,
+                        result,
+                        respond,
+                        started_at,
+                    }
+                }),
+                Err(err) => {
+                    shared.app_performance_telemetry().record(
+                        AppPerformanceOperation::MediaUpload,
+                        started_at.elapsed(),
+                        false,
+                    );
+                    let _ = respond.send(Err(err));
+                }
+            }
         }
         AccountWorkerCommand::DownloadMedia {
             group_id,
             reference,
             respond,
         } => {
-            let download_started_at = Instant::now();
-            let result = client.download_media(&group_id, reference).await;
-            shared.app_performance_telemetry().record(
-                AppPerformanceOperation::MediaDownload,
-                download_started_at.elapsed(),
-                result.is_ok(),
-            );
-            let _ = respond.send(result);
+            let started_at = Instant::now();
+            match client
+                .prepare_encrypted_media_download(&group_id, reference)
+                .await
+            {
+                Ok(http) => spawn_media_http(media_http, http.run(), move |result| {
+                    MediaHttpDone::Download {
+                        result,
+                        respond,
+                        started_at,
+                    }
+                }),
+                Err(err) => {
+                    shared.app_performance_telemetry().record(
+                        AppPerformanceOperation::MediaDownload,
+                        started_at.elapsed(),
+                        false,
+                    );
+                    let _ = respond.send(Err(err));
+                }
+            }
         }
         AccountWorkerCommand::SecureDeleteExpiredPlaintext { group_id, respond } => {
             let result = client.secure_delete_expired_plaintext_for_group(&group_id);
@@ -3784,6 +3905,7 @@ mod tests {
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
         let (respond, response) = oneshot::channel();
+        let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
         handle_account_worker_command(
             &mut client,
             AccountWorkerCommand::RepairFullHistory { respond },
@@ -3791,6 +3913,7 @@ mod tests {
             "account-id",
             "alice",
             &shared,
+            &media_http_tx,
         )
         .await;
 
