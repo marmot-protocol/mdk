@@ -95,8 +95,8 @@ const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// epoch it was already sitting at and folds afterwards; at 0 ms every commit
 /// folds inside its own ingest, so the runtime reports an epoch per delivery and
 /// no device can be carried *through* an epoch at all. The whole reporting gap
-/// [`a_clean_recovery_the_runtime_never_reports_still_escalates`] exists to pin
-/// lives in the first regime, which is also the one real devices run in, so this
+/// that [`a_clean_recovery_the_runtime_never_reports_still_escalates`] exists to
+/// pin lives in the first regime, which is also the one real devices run in, so this
 /// file states the window it means instead of taking whichever one the feature
 /// resolution hands it.
 const SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;

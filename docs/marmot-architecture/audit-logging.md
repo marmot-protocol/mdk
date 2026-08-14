@@ -832,8 +832,9 @@ Metadata notes:
 
 ### `epoch_stall_backfill_armed`
 
-Emitted when the app runtime's epoch-stall detector reads a group as stuck below its group's live epoch and arms one
-account-wide full-history transport replay to recover the commit it missed. Two triggers reach it: the group accumulated
+Emitted when the app runtime's epoch-stall detector reads a group as stuck — traffic it cannot decrypt keeps arriving
+while the device's own epoch does not move — and arms one account-wide full-history transport replay to recover the
+commit it missed. Two triggers reach it: the group accumulated
 `threshold` distinct undecryptable messages while its own epoch did not move, or an inbound object was refused outright
 (direct proof that the fetched history was not fully retained).
 
@@ -856,7 +857,8 @@ Metadata notes:
 ### `epoch_stall_backfill_escalated`
 
 Emitted when `arms` backfills have been armed for one group in a single unrecovered run — a run being arms with nothing
-in between to show the device caught up — reporting that full-history replay is not repairing this group. Recorded once
+in between to show the device caught up — reporting that nothing this device can see shows full-history replay
+repairing this group. Recorded once
 per run, at the arm that reached `arm_threshold`, alongside that arm's `epoch_stall_backfill_armed` row.
 
 | Field | Meaning |
