@@ -43,7 +43,7 @@ use crate::{
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
-    push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
+    blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
 
 impl MarmotApp {
@@ -104,7 +104,12 @@ impl MarmotApp {
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
         if !observed_nip65 || !observed_inbox {
-            let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let cached = blocking_app_task(move || {
+                app.account_relay_list_status_for_account_id(&account_id)
+            })
+            .await?;
             if !observed_nip65 {
                 status.nip65 = cached.nip65;
             }
@@ -120,7 +125,15 @@ impl MarmotApp {
                 .map(|endpoint| endpoint.0.clone())
                 .collect();
         }
-        self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = status.clone();
+            blocking_app_task(move || {
+                app.remember_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
+        }
         Ok(status)
     }
 
@@ -174,7 +187,12 @@ impl MarmotApp {
         }
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
-        let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+        let cached = {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
+        };
         if !observed_nip65 {
             status.nip65 = cached.nip65;
         }
@@ -189,7 +207,15 @@ impl MarmotApp {
                 .collect();
         }
         status.refresh();
-        self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = status.clone();
+            blocking_app_task(move || {
+                app.remember_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
+        }
         Ok(Some(status))
     }
 
@@ -251,7 +277,10 @@ impl MarmotApp {
             self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
                 .await?
         } else {
-            self.account_relay_list_status_for_account_id(account_id_hex)?
+            let app = self.clone();
+            let account_id = account_id_hex.to_owned();
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
         };
         if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
             let source_relays = self.directory_source_relays(&[]);
@@ -261,7 +290,15 @@ impl MarmotApp {
                     .await?;
             }
         }
-        self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.to_owned();
+            let remembered = relay_lists.clone();
+            blocking_app_task(move || {
+                app.remember_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
+        }
         let mut source_relays = self.retain_safe_discovered_endpoints(
             relay_lists
                 .nip65
@@ -283,7 +320,11 @@ impl MarmotApp {
         let records = self
             .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
             .await?;
-        let cached_entry = self.directory_entry_for_account_id(account_id_hex)?;
+        let cached_entry = {
+            let app = self.clone();
+            let account_id = account_id_hex.to_owned();
+            blocking_app_task(move || app.directory_entry_for_account_id(&account_id)).await?
+        };
         let mut fetched = fresh_or_cached_key_package(
             account_id_hex,
             latest_fresh_key_package_from_records(
@@ -294,7 +335,11 @@ impl MarmotApp {
             cached_entry,
         )?;
         fetched.relay_lists = relay_lists;
-        self.remember_directory_key_package(&fetched)?;
+        {
+            let app = self.clone();
+            let remembered = fetched.clone();
+            blocking_app_task(move || app.remember_directory_key_package(&remembered)).await?;
+        }
         Ok(fetched)
     }
 
@@ -330,11 +375,23 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<UserDirectoryRefresh, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
-        self.remember_directory_user(&account_id_hex)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            blocking_app_task(move || app.remember_directory_user(&account_id)).await?;
+        }
         let follow_list = self
             .fetch_follow_list_for_account_id(&account_id_hex, &bootstrap_relays)
             .await?;
-        self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = follow_list.clone();
+            blocking_app_task(move || {
+                app.remember_directory_follow_list(&account_id, &remembered)
+            })
+            .await?;
+        }
 
         let profile_count = self
             .refresh_directory_profiles(&follow_list.follows, &bootstrap_relays)
@@ -528,10 +585,12 @@ impl MarmotApp {
         // No event on this relay set means "unknown", not "the account
         // follows nobody". Preserve any cached edges whether the candidates
         // were absent or rejected as future-dated.
-        Ok(cached_or_unknown_follow_list(
-            self.directory_entry_for_account_id(account_id_hex)?,
-            source_relays,
-        ))
+        let cached_entry = {
+            let app = self.clone();
+            let account_id = account_id_hex.to_owned();
+            blocking_app_task(move || app.directory_entry_for_account_id(&account_id)).await?
+        };
+        Ok(cached_or_unknown_follow_list(cached_entry, source_relays))
     }
 
     pub async fn fetch_current_follow_list_for_account_id(
@@ -570,11 +629,20 @@ impl MarmotApp {
             .await?;
         let profiles =
             latest_fresh_profiles_from_records(records, self.directory_freshness()).value;
-        for account_id in account_ids {
-            self.remember_directory_user(account_id)?;
-        }
-        for (account_id, profile) in &profiles {
-            self.remember_directory_profile_if_newer(account_id, profile)?;
+        {
+            let app = self.clone();
+            let account_ids = account_ids.to_vec();
+            let remembered = profiles.clone();
+            blocking_app_task(move || {
+                for account_id in &account_ids {
+                    app.remember_directory_user(account_id)?;
+                }
+                for (account_id, profile) in &remembered {
+                    app.remember_directory_profile_if_newer(account_id, profile)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
         Ok(profiles.len())
     }
