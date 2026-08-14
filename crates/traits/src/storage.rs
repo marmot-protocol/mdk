@@ -675,6 +675,40 @@ pub trait ConvergencePassStorage {
     fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()>;
 }
 
+// ── DeferredPeelGenerationStorage ────────────────────────────────────────
+
+/// Durable barrier for one contested deferred-peel evidence generation.
+///
+/// A contested sweep may recover several messages before it has examined the
+/// complete deferred set. Applying convergence to that prefix can freeze a
+/// verdict that later evidence would have changed. The engine therefore
+/// persists this marker before buffering the first recovered contested row and
+/// clears it only after every row has received a definitive result under the
+/// final peel-context fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredPeelGeneration {
+    /// MLS group whose deferred rows belong to this contested generation.
+    pub group_id: GroupId,
+    /// Complete peel-context fingerprint that defines this generation.
+    pub context_fingerprint: [u8; 32],
+}
+
+/// Persistence for the contested deferred-peel generation barrier.
+pub trait DeferredPeelGenerationStorage {
+    /// Return the active generation barrier for `group_id`, if any.
+    fn deferred_peel_generation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeferredPeelGeneration>>;
+    /// Insert or replace a group's active generation barrier.
+    fn put_deferred_peel_generation(
+        &self,
+        generation: &DeferredPeelGeneration,
+    ) -> StorageResult<()>;
+    /// Remove a group's completed generation barrier.
+    fn delete_deferred_peel_generation(&self, group_id: &GroupId) -> StorageResult<()>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -695,6 +729,7 @@ pub trait StorageProvider:
     + CapabilityStorage
     + ConvergencePolicyStorage
     + ConvergencePassStorage
+    + DeferredPeelGenerationStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
     + KeyPackageBundleStorage

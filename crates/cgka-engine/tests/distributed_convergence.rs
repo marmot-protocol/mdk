@@ -3168,6 +3168,87 @@ async fn pass_opens_while_app_message_intents_are_queued() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
 }
 
+/// A completed pass may expose a dormant fairness slot while authenticated
+/// input is already durable but has not gone through admission yet. Queue
+/// regeneration must converge that input first instead of preparing wire from
+/// the stale completed-pass epoch.
+#[tokio::test]
+async fn queued_app_regeneration_converges_authenticated_input_before_fairness_slot() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "queue-converges-first").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, commit_one, 1_000)
+        .unwrap();
+    let settled = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        carol_storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .expect("completed first pass")
+            .fairness_slot_available
+    );
+
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-app-converges-first",
+        SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, "queued after authenticated input"),
+        },
+        1_000_001,
+    );
+    let commit_two_id = content_id(&commit_two);
+    let commit_two = TransportMessage {
+        id: commit_two_id.clone(),
+        ..commit_two
+    };
+    carol_storage
+        .put_message(&MessageRecord {
+            id: commit_two_id,
+            group_id: group_id.clone(),
+            epoch: EpochId(2),
+            state: MessageState::Created,
+            payload: StoredMessagePayload::openmls_wire(commit_two)
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+
+    let early = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    assert!(
+        early.is_empty(),
+        "authenticated input must open its pass before the fairness slot can drain the queue"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 3_000_000)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    let [SendResult::ApplicationMessage { msg, .. }] = drained.as_slice() else {
+        panic!("expected one regenerated application message, got {drained:?}");
+    };
+    assert_eq!(
+        project_mls_message(&msg.payload).unwrap().source_epoch,
+        Some(3),
+        "queued wire must be prepared from the post-convergence epoch"
+    );
+}
+
 /// The spec's one-attempt rule (convergence.md, marmot#375): a queued
 /// admin-authorized group-state intent holds the completed-pass boundary and
 /// gets exactly one preparation attempt before the next inbound-only pass.

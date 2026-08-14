@@ -694,6 +694,9 @@ pub trait CgkaEngine: Send + Sync {
     /// under the post-repair epoch.
     ///
     /// Unresolved convergence input queues every intent kind the same way.
+    /// Foreground deferred-peel enforcement uses Tokio timers, so callers must
+    /// invoke this method inside a Tokio runtime with its time driver enabled
+    /// (for example, a runtime built with `enable_time` or `enable_all`).
     ///
     /// [`SendIntent::Disband`] is not epoch-state gated at all: it only
     /// persists the irreversible request, so `PendingPublish`, `Merging`, and

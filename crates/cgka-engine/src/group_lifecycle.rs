@@ -1133,6 +1133,7 @@ impl<S: StorageProvider> Engine<S> {
                     // MLS copy. Frozen-pass membership belongs to the discarded
                     // copy and must not re-halt the repaired group.
                     storage.delete_convergence_pass(&group_id)?;
+                    storage.delete_deferred_peel_generation(&group_id)?;
                     // The pass is only half of that residue. Unresolved commits
                     // retained below the replacement epoch were retained
                     // against the discarded copy too, and an anchor-less one

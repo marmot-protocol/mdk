@@ -119,6 +119,18 @@ pub fn conformance_constant_snapshot() -> ConformanceConstantSnapshot {
         "E9.max_queued_outbound_intents_per_group".into(),
         crate::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP as u64,
     );
+    values.insert(
+        "E10.max_candidate_branch_peel_contexts".into(),
+        crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS as u64,
+    );
+    values.insert(
+        "E11.foreground_deferred_peel_budget_ms".into(),
+        crate::message_processor::FOREGROUND_DEFERRED_PEEL_BUDGET_MS,
+    );
+    values.insert(
+        "E12.max_foreground_deferred_rows".into(),
+        crate::message_processor::MAX_FOREGROUND_DEFERRED_ROWS as u64,
+    );
     ConformanceConstantSnapshot {
         schema_version: "1".into(),
         values,
@@ -820,7 +832,7 @@ mod tests {
     fn constant_snapshot_pins_every_engine_owned_reliability_constant() {
         let snapshot = conformance_constant_snapshot();
         assert_eq!(snapshot.schema_version, "1");
-        assert_eq!(snapshot.values.len(), 20);
+        assert_eq!(snapshot.values.len(), 23);
         for key in [
             "P1.max_rewind_commits",
             "P2.app_message_past_epoch_limit",
@@ -842,6 +854,9 @@ mod tests {
             "E7.self_remove_auto_commit_jitter_max_ms",
             "E8.max_deferred_peel_residence_ms",
             "E9.max_queued_outbound_intents_per_group",
+            "E10.max_candidate_branch_peel_contexts",
+            "E11.foreground_deferred_peel_budget_ms",
+            "E12.max_foreground_deferred_rows",
         ] {
             assert!(snapshot.values.contains_key(key), "missing {key}");
         }

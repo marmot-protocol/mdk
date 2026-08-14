@@ -23,7 +23,7 @@ runtime. It complements the policy docs:
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
 | Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
-| Engine reorg telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg counters/histograms. Exposed by `Engine::engine_metrics()`. The relay-plane/export structs have an optional seam for it, but the periodic runtime exporter currently passes `None`. | No via the runtime exporter today. Engine metrics can be exported only if a caller explicitly folds a snapshot into the rollup/batch. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
+| Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
 
 ## Source map
@@ -39,7 +39,7 @@ runtime. It complements the policy docs:
 | Runtime lifecycle wiring | [`crates/marmot-app/src/runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | CLI/local inspection | [`crates/cli/src/lib.rs`](../../crates/cli/src/lib.rs), [`crates/cli/README.md`](../../crates/cli/README.md) |
 | UniFFI settings bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions.rs`](../../crates/marmot-uniffi/src/conversions.rs) |
-| Engine post-settle reorg metrics | [`crates/cgka-engine/src/engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs) |
+| Engine convergence and outbound metrics | [`crates/cgka-engine/src/engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs) |
 
 ## What is collected locally
 
@@ -149,11 +149,12 @@ are no samples, and `None` if the percentile falls in overflow.
 | `directory_subscriptions_created` | Directory subscriptions created. | No. |
 | `directory_subscriptions_removed` | Directory subscriptions removed. | No. |
 
-### Engine post-settle reorg metrics
+### Engine convergence and outbound metrics
 
-`EngineMetrics` lives inside `cgka-engine` and is read through `Engine::engine_metrics()`. It is not part of
-`RelayTelemetrySnapshot`. The relay-plane export rollup has an optional `EngineReorgMetrics` field, but the current
-periodic exporter passes `None` for that engine snapshot, so engine metrics are not sent by the runtime exporter today.
+`EngineMetrics` lives inside `cgka-engine` and is read through `Engine::engine_metrics()`. Its full
+`EngineMetricsSnapshot` is device-local only and is not part of `RelayTelemetrySnapshot` or accepted by the exporter.
+The relay-plane export rollup accepts only an optional `EngineReorgMetrics` projection, and the current periodic
+exporter passes `None`, so no engine metrics are sent by the runtime exporter today.
 
 | Field | Meaning |
 | --- | --- |
@@ -162,6 +163,19 @@ periodic exporter passes `None` for that engine snapshot, so engine metrics are 
 | `reorg_rewind_depth` | Histogram in commits: `previous_applied_tip - new_fork_epoch`. |
 | `reorg_lateness_ms` | Histogram in milliseconds: local time from superseded settle to reorg. |
 | `observed_reorg_rate()` | Derived `post_settle_reorgs / settles`, `None` with no settles. |
+| `pass_apply_latency_ms` | Histogram from convergence-pass open to apply/completion. |
+| `generation_gap_ms` | Histogram from one completed generation to the next generation opening. |
+| `freeze_overdue_ms` | Histogram of scheduler lag past a convergence-pass cutoff. |
+| `admin_reservation_*` | Aggregate observations and outcomes for the one-attempt queued admin reservation. |
+| `outbound_required_convergence_ms` | Monotonic duration of required authenticated convergence during outbound preflight. |
+| `outbound_deferred_peel_ms` | Monotonic duration of the foreground deferred-peel phase. |
+| `outbound_queue_accept_ms` | Monotonic duration required to durably accept an outbound intent. |
+| `outbound_wire_prepare_ms` | Monotonic duration of actual MLS/wire preparation; queued attempts add no sample. |
+| `foreground_deferred_rows_attempted` | Histogram of deferred rows attempted per foreground opportunity. |
+| `foreground_deferred_backlog` | Histogram of deferred backlog observed by foreground opportunities. |
+| `foreground_deferred_completed`, `foreground_deferred_budget_exhausted`, `foreground_deferred_normalization_pending`, `foreground_deferred_unchanged`, `foreground_deferred_errors` | Aggregate foreground outcomes. |
+| `foreground_deferred_budget_overrun_ms` | Histogram of elapsed foreground time beyond its configured monotonic budget; zero is recorded when work completes within budget. |
+| `queued_outbound_wait_ms` | Histogram from durable intent acceptance to later regeneration attempt. |
 
 `reorg_lateness_ms` uses the same millisecond bucket bounds as relay timing. `reorg_rewind_depth` uses commit-count
 buckets:
@@ -171,7 +185,8 @@ buckets:
 ```
 
 Engine metrics keep an in-memory per-group last-applied branch record for classification, but snapshots contain only
-aggregate counts and histograms.
+aggregate counts and histograms. Deferred-peel and outbound metrics likewise contain no group, message, account,
+member, relay, fingerprint, branch, or payload identifiers and never feed convergence or scheduling decisions.
 
 ### App performance telemetry
 

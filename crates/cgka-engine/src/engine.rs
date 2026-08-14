@@ -314,9 +314,9 @@ pub struct Engine<S: StorageProvider> {
     /// this rebuilds only when the set actually changed. `None` until first use.
     pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
 
-    /// Per-group deferred-peel performance state: context-fingerprint sweep
-    /// gate, bounded-sweep cursor, and cached row count. Correctness-critical
-    /// per-row attempt/residence bookkeeping lives durably on MessageRecord.
+    /// Per-group deferred-peel performance state: aggregate sweep count and
+    /// cached row-count/cap bookkeeping. Correctness-critical completion and
+    /// residence bookkeeping lives durably on each MessageRecord.
     pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
 
     /// Retry budget before a `PeelDeferred` row is resource-refused and
@@ -326,6 +326,11 @@ pub struct Engine<S: StorageProvider> {
     /// Durable local residence budget for a `PeelDeferred` row. Field (not a
     /// const) so deterministic tests can advance a short deadline.
     pub(crate) deferred_peel_residence_ms: u64,
+    /// Foreground-only deferred-history allowance (mdk#1176). Kept as fields
+    /// so deterministic tests can use a short deadline without changing the
+    /// production contract.
+    pub(crate) foreground_deferred_peel_budget_ms: u64,
+    pub(crate) foreground_deferred_peel_rows: usize,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -585,6 +590,9 @@ impl<S: StorageProvider> EngineBuilder<S> {
             deferred_peel: HashMap::new(),
             deferred_peel_retry_budget: crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS,
             deferred_peel_residence_ms: crate::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS,
+            foreground_deferred_peel_budget_ms:
+                crate::message_processor::FOREGROUND_DEFERRED_PEEL_BUDGET_MS,
+            foreground_deferred_peel_rows: crate::message_processor::MAX_FOREGROUND_DEFERRED_ROWS,
         })
     }
 }
@@ -2528,6 +2536,12 @@ impl<S: StorageProvider> Engine<S> {
     /// sleeping.
     pub fn set_deferred_peel_residence_ms(&mut self, residence_ms: u64) {
         self.deferred_peel_residence_ms = residence_ms.max(1);
+    }
+
+    #[doc(hidden)]
+    pub fn set_foreground_deferred_peel_budget(&mut self, budget_ms: u64, rows: usize) {
+        self.foreground_deferred_peel_budget_ms = budget_ms.max(1);
+        self.foreground_deferred_peel_rows = rows.max(1);
     }
 
     /// Replace the installed forensic recorder on a live engine. Dropping the

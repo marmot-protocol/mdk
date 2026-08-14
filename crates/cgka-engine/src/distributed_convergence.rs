@@ -1059,6 +1059,24 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(unrecoverable_result(epoch));
         }
 
+        // A contested deferred-peel generation buffers recovered evidence
+        // durably but must not adjudicate a prefix. The sweep clears this
+        // barrier only after every retained raw row has a definitive result
+        // under the final context fingerprint (mdk#1176).
+        if self
+            .storage
+            .deferred_peel_generation(group_id)
+            .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
+            .is_some()
+        {
+            let epoch = self
+                .epoch_manager
+                .epoch(group_id)
+                .map(|epoch| epoch.0)
+                .unwrap_or_default();
+            return Ok(waiting_result(epoch));
+        }
+
         let previous_group = self
             .storage
             .get_group(group_id)

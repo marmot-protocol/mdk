@@ -92,6 +92,8 @@ mod migration_0045_timeline_canonical_order;
 mod migration_0046_message_group_state_epoch_index;
 #[path = "migrations/0047_normalized_message_records.rs"]
 mod migration_0047_normalized_message_records;
+#[path = "migrations/0048_deferred_peel_generations.rs"]
+mod migration_0048_deferred_peel_generations;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -341,6 +343,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 47,
         name: "0047_normalized_message_records",
         apply: migration_0047_normalized_message_records::apply,
+    },
+    Migration {
+        version: 48,
+        name: "0048_deferred_peel_generations",
+        apply: migration_0048_deferred_peel_generations::apply,
     },
 ];
 
@@ -869,7 +876,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 47,
+                found: 48,
                 latest_supported: 46,
             }
         ));
@@ -925,7 +932,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 47,
+                found: 48,
                 latest_supported: 46,
             }
         ));
@@ -1221,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_format_v2_binary_refuses_migration_47_database() {
+    fn pre_format_v2_binary_refuses_current_database() {
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
         run(&mut connection, MIGRATIONS).unwrap();
 
@@ -1229,7 +1236,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 47,
+                found: 48,
                 latest_supported: 46,
             }
         ));

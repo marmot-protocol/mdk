@@ -1,7 +1,7 @@
 //! Durable persistence, dedup classification, and stored-message state
 //! transitions for the ingest/send paths of [`Engine`].
 
-use super::{MAX_DEFERRED_ROWS_PER_SWEEP, content_dedup_id};
+use super::content_dedup_id;
 use crate::engine::Engine;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::error::EngineError;
@@ -485,6 +485,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         records: &mut [MessageRecord],
         now: crate::convergence_clock::ConvergenceTime,
+        limit: usize,
     ) -> Result<bool, EngineError> {
         let mut persisted = 0usize;
         let mut normalization_pending = false;
@@ -497,7 +498,7 @@ impl<S: StorageProvider> Engine<S> {
             );
             record.deferred_peel = Some(lifecycle);
             if changed {
-                if persisted < MAX_DEFERRED_ROWS_PER_SWEEP {
+                if persisted < limit {
                     self.storage.put_message(record)?;
                     persisted += 1;
                 } else {
