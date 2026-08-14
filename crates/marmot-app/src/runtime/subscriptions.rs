@@ -1002,7 +1002,8 @@ impl MarmotAppRuntime {
                 method = "subscribe_timeline_messages"
             )
             .entered();
-            app_for_snapshot.timeline_messages_with_query(&account_label_for_snapshot, snapshot_query)
+            app_for_snapshot
+                .timeline_messages_with_query(&account_label_for_snapshot, snapshot_query)
         })
         .await?;
         // The subscription owns the window, so the re-query base carries only the

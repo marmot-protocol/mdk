@@ -129,10 +129,8 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.clone();
             let remembered = status.clone();
-            blocking_app_task(move || {
-                app.remember_directory_relay_lists(&account_id, &remembered)
-            })
-            .await?;
+            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
+                .await?;
         }
         Ok(status)
     }
@@ -211,10 +209,8 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.clone();
             let remembered = status.clone();
-            blocking_app_task(move || {
-                app.remember_directory_relay_lists(&account_id, &remembered)
-            })
-            .await?;
+            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
+                .await?;
         }
         Ok(Some(status))
     }
@@ -294,10 +290,8 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.to_owned();
             let remembered = relay_lists.clone();
-            blocking_app_task(move || {
-                app.remember_directory_relay_lists(&account_id, &remembered)
-            })
-            .await?;
+            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
+                .await?;
         }
         let mut source_relays = self.retain_safe_discovered_endpoints(
             relay_lists
@@ -387,10 +381,8 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.clone();
             let remembered = follow_list.clone();
-            blocking_app_task(move || {
-                app.remember_directory_follow_list(&account_id, &remembered)
-            })
-            .await?;
+            blocking_app_task(move || app.remember_directory_follow_list(&account_id, &remembered))
+                .await?;
         }
 
         let profile_count = self

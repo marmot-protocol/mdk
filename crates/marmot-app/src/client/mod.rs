@@ -20,9 +20,9 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
-use nostr::NostrSigner;
 use futures::StreamExt;
 use marmot_forensics::AuditEventContext;
+use nostr::NostrSigner;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
@@ -2823,7 +2823,10 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<u8>, AppError> {
-        self.prepare_group_image_download(group_id).await?.run().await
+        self.prepare_group_image_download(group_id)
+            .await?
+            .run()
+            .await
     }
 
     pub(crate) async fn prepare_group_image_download(

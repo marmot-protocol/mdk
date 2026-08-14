@@ -489,10 +489,7 @@ pub(crate) async fn handle_group_state_subscription(
         let _ = write_stream_end(stream).await;
         return Ok(());
     };
-    let mut subscription = match runtime
-        .subscribe_group_state(&account_ref, &group_id)
-        .await
-    {
+    let mut subscription = match runtime.subscribe_group_state(&account_ref, &group_id).await {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ =
