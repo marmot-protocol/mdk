@@ -5038,10 +5038,10 @@ pub(crate) async fn long_account_worker_response<T>(
     account_worker_response_with_wait(response, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT).await
 }
 
-pub(crate) async fn account_worker_catch_up_response(
+pub(crate) async fn long_account_worker_catch_up_response(
     response: oneshot::Receiver<Result<(), String>>,
 ) -> Result<(), AppError> {
-    match timeout(APP_RUNTIME_WORKER_RESPONSE_WAIT, response).await {
+    match timeout(APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT, response).await {
         Ok(Ok(result)) => result.map_err(AppError::AccountCatchUp),
         Ok(Err(_)) => Err(AppError::TransportClosed),
         Err(_) => Err(AppError::AccountWorkerResponseTimedOut),

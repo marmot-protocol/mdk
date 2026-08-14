@@ -784,6 +784,10 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
+    scheduled_runtime_group_subscription_refresh.observe_pending(
+        client.has_pending_runtime_group_subscription_refresh(),
+        &command_tx,
+    );
     // Automatic gossip is best-effort network work. Run it only after startup
     // callers have received their deferred responses so a degraded relay cannot
     // extend account-open latency.
@@ -958,6 +962,10 @@ async fn run_app_runtime_account_worker(
                             schedule_pending_convergence_groups(
                                 &mut scheduled_convergence,
                                 &mut client,
+                            );
+                            scheduled_runtime_group_subscription_refresh.observe_pending(
+                                client.has_pending_runtime_group_subscription_refresh(),
+                                &command_tx,
                             );
                             if may_change_push_registration_work {
                                 scheduled_push_retry.observe_pending(
@@ -1253,6 +1261,10 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                 }
+                scheduled_runtime_group_subscription_refresh.observe_pending(
+                    client.has_pending_runtime_group_subscription_refresh(),
+                    &command_tx,
+                );
                 let _ = run_pending_epoch_backfill_reporting_arm(
                     &mut client,
                     &events,
@@ -1847,7 +1859,13 @@ async fn handle_startup_hydration_command(
                     &group_id,
                 );
             }
+            let retry_after_response = result.is_ok();
             let _ = respond.send(result);
+            if retry_after_response {
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+            }
         }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {

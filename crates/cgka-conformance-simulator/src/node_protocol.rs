@@ -22,7 +22,9 @@ use tokio::io::{
 };
 use tokio::sync::broadcast;
 
-use crate::app_runtime::{opaque_public_identity, public_protocol_projection};
+use crate::app_runtime::{
+    accept_group_invite_retrying_busy, opaque_public_identity, public_protocol_projection,
+};
 use crate::{
     AppRuntimeApplicationProjectionV1, AppRuntimeProtocolProjectionV1, SubjectFailureCategory,
 };
@@ -706,9 +708,7 @@ async fn accept_active_invite(state: &mut NodeRuntimeState) -> Result<(), NodeEr
         .map_err(app_node_error)?
         .is_some_and(|group| group.pending_confirmation)
     {
-        state
-            .runtime
-            .accept_group_invite(&state.account_id, &group_id)
+        accept_group_invite_retrying_busy(&state.runtime, &state.account_id, &group_id)
             .await
             .map_err(app_node_error)?;
     }

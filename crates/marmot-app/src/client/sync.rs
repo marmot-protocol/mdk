@@ -334,6 +334,9 @@ impl AppClient {
         self.prepare_transport_with_telemetry(telemetry)
             .await
             .map_err(SyncFailure::from)?;
+        // A complete startup/catch-up rebuild satisfies any older deferred
+        // refresh intent before this pass starts ingesting new deliveries.
+        self.pending_runtime_group_subscription_refresh = false;
         // Both the inbox/group activation and the group-subscription refresh
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.
@@ -909,9 +912,17 @@ impl AppClient {
         summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
 
         if routes_dirty || routes_changed {
-            self.sync_runtime_groups()
-                .await
-                .map_err(SyncCheckpointError::AfterPersistence)?;
+            match self.sync_runtime_groups().await {
+                Ok(()) => self.pending_runtime_group_subscription_refresh = false,
+                Err(error) => {
+                    // The projection and route checkpoint above are durable.
+                    // Retain an explicit retry edge so the worker repairs the
+                    // ordinary subscriptions without replaying this prefix or
+                    // waiting for another catch-up trigger.
+                    self.pending_runtime_group_subscription_refresh = true;
+                    return Err(SyncCheckpointError::AfterPersistence(error));
+                }
+            }
         }
         Ok(())
     }
@@ -1508,6 +1519,7 @@ impl AppClient {
         self.sync_runtime_groups()
             .await
             .map_err(SyncFailure::from)?;
+        self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut deliveries = 0;
         let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
@@ -2321,6 +2333,57 @@ mod membership_change_tests {
         let admin = GroupStateChange::AdminAdded { member };
         assert!(member_departure(&added).is_none());
         assert!(member_departure(&admin).is_none());
+    }
+}
+
+#[cfg(test)]
+mod runtime_group_subscription_refresh_tests {
+    use std::sync::Arc;
+
+    use super::{SyncCheckpointError, SyncSummary};
+    use crate::tests::ScriptedPushRelayClient;
+    use crate::{AppPerformanceTelemetry, MarmotApp};
+    use marmot_account::AccountHome;
+
+    #[tokio::test]
+    async fn catch_up_checkpoint_arms_refresh_after_durable_subscription_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        client
+            .create_group_with_initial_profile_and_telemetry(
+                "catch-up retry intent",
+                "",
+                &[],
+                None,
+                &telemetry,
+            )
+            .await
+            .unwrap();
+
+        relay.fail_next_subscribe();
+        let mut summary = SyncSummary::default();
+        let error = client
+            .checkpoint_sync_prefix(&mut summary, true, 0)
+            .await
+            .expect_err("the injected post-checkpoint subscription rebuild must fail");
+        assert!(matches!(error, SyncCheckpointError::AfterPersistence(_)));
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        assert!(
+            !client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap()
+        );
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
     }
 }
 

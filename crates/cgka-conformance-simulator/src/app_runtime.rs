@@ -555,11 +555,13 @@ impl AppRuntimeHarness {
                 .map_err(app_error)?
                 .is_some_and(|group| group.pending_confirmation)
             {
-                participant
-                    .runtime()?
-                    .accept_group_invite(&participant.account_id, group_id)
-                    .await
-                    .map_err(app_error)?;
+                accept_group_invite_retrying_busy(
+                    participant.runtime()?,
+                    &participant.account_id,
+                    group_id,
+                )
+                .await
+                .map_err(app_error)?;
             }
         }
         Ok(())
@@ -1347,6 +1349,32 @@ fn drain_runtime_events(participant: &mut Participant) {
     };
     while events.try_recv().is_ok() {
         participant.runtime_events_observed = participant.runtime_events_observed.saturating_add(1);
+    }
+}
+
+pub(crate) async fn accept_group_invite_retrying_busy(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    group_id: &GroupId,
+) -> Result<(), AppError> {
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match runtime.accept_group_invite(account_ref, group_id).await {
+                Ok(_) => return Ok(()),
+                Err(AppError::AccountWorkerBusy) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        // Every attempt returned definitely-not-started busy, so preserving
+        // that typed result remains safe and lets the scenario classify it as
+        // retryable rather than inventing ambiguous completion.
+        Err(_) => Err(AppError::AccountWorkerBusy),
     }
 }
 

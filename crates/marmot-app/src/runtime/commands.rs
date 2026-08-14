@@ -12,8 +12,8 @@ use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::oneshot;
 
 use super::{
-    AccountManager, AccountWorkerCommand, account_worker_catch_up_response,
-    account_worker_response, group_contributes_co_members, local_account_worker_response,
+    AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
+    local_account_worker_response, long_account_worker_catch_up_response,
     long_account_worker_response, publish_app_runtime_group_state_updated,
 };
 use crate::app_telemetry::AppPerformanceOperation;
@@ -147,7 +147,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::RepairFullHistory { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_catch_up_response(response).await
+        long_account_worker_catch_up_response(response).await
     }
 
     /// Create the group and return its canonical id. Invitation delivery is
