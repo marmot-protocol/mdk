@@ -230,10 +230,12 @@ clone_hermes_repo() {
         if git_with_github_auth clone "$hermes_url" "$dest"; then
             return 0
         fi
-        echo "warning: hermes clone failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s" >&2
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            echo "warning: hermes clone failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
         attempt=$((attempt + 1))
-        sleep "$delay"
-        delay=$((delay * 2))
     done
     echo "error: failed to clone Hermes after ${max_attempts} attempts" >&2
     return 1
@@ -245,8 +247,8 @@ install_hermes() {
     fi
 
     if [ -n "$hermes_ref" ]; then
-        git_with_github_auth -C "$hermes_repo" fetch origin "$hermes_ref" || true
-        git -C "$hermes_repo" checkout "$hermes_ref"
+        git_with_github_auth -C "$hermes_repo" fetch origin "$hermes_ref"
+        git -C "$hermes_repo" checkout --detach FETCH_HEAD
     fi
 
     if ensure_uv; then

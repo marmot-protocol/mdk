@@ -2723,7 +2723,7 @@ impl AppClient {
             // normal current-epoch cache pass can retry this durable write.
             tracing::warn!(
                 target: "marmot_app::media",
-                method = "upload_media",
+                method = "finish_encrypted_media_upload",
                 error_code = "encrypted_media_secret_cache_skipped",
                 "failed to cache encrypted media source epoch secret after publish",
             );

@@ -248,7 +248,15 @@ impl MarmotApp {
         let Some(profile) = profiles.get(&account_id_hex).cloned() else {
             return Ok(None);
         };
-        self.remember_directory_profile_if_newer(&account_id_hex, &profile)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = profile.clone();
+            blocking_app_task(move || {
+                app.remember_directory_profile_if_newer(&account_id, &remembered)
+            })
+            .await?;
+        }
         Ok(Some(profile))
     }
 
@@ -343,14 +351,28 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<UserDirectoryRecord, AppError> {
         let status = if bootstrap_relays.is_empty() {
-            self.account_relay_list_status_for_account_id(account_id_hex)?
+            let app = self.clone();
+            let account_id = account_id_hex.to_owned();
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
         } else {
             self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
                 .await?
         };
-        self.remember_directory_relay_lists(account_id_hex, &status)?;
-        self.directory_entry_for_account_id(account_id_hex)?
-            .ok_or_else(|| AppError::MissingDirectoryEntry(account_id_hex.to_owned()))
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.to_owned();
+            let remembered = status.clone();
+            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
+                .await?;
+        }
+        let app = self.clone();
+        let account_id = account_id_hex.to_owned();
+        blocking_app_task(move || {
+            app.directory_entry_for_account_id(&account_id)?
+                .ok_or_else(|| AppError::MissingDirectoryEntry(account_id))
+        })
+        .await
     }
 
     pub fn directory_entry_for_account_id(
@@ -451,22 +473,28 @@ impl MarmotApp {
         // Publishing a local kind-3 list must make its own cached edge set
         // immediately available to the bindings, without admitting every
         // followed account as a watched directory entry.
-        if let Err(error) = self.remember_directory_follow_edges_for_search(
-            &account.account_id_hex,
-            &FetchedFollowList {
+        {
+            let app = self.clone();
+            let account_id = account.account_id_hex.clone();
+            let follow_list = FetchedFollowList {
                 follows: cached_follows,
                 source_relays: endpoints
                     .iter()
                     .map(|endpoint| endpoint.0.clone())
                     .collect(),
-            },
-        ) {
-            tracing::warn!(
-                target: "marmot_app::directory",
-                method = "publish_account_follow_list",
-                error_kind = error.privacy_safe_kind(),
-                "follow list published but local cache update failed"
-            );
+            };
+            if let Err(error) = blocking_app_task(move || {
+                app.remember_directory_follow_edges_for_search(&account_id, &follow_list)
+            })
+            .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::directory",
+                    method = "publish_account_follow_list",
+                    error_kind = error.privacy_safe_kind(),
+                    "follow list published but local cache update failed"
+                );
+            }
         }
         Ok(())
     }
@@ -604,7 +632,13 @@ impl MarmotApp {
         else {
             return Ok(None);
         };
-        self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+        {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = follow_list.clone();
+            blocking_app_task(move || app.remember_directory_follow_list(&account_id, &remembered))
+                .await?;
+        }
         Ok(Some(follow_list.follows))
     }
 

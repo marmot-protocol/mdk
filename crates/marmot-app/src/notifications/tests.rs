@@ -1720,3 +1720,11 @@ fn signed_record_survives_wire_round_trip_and_verifies() {
         other => panic!("expected upsert, got {other:?}"),
     }
 }
+
+#[test]
+fn recovery_skips_rows_before_the_subscription_watermark() {
+    assert!(!notification_recovery_is_fresh(10, Some(11)));
+    assert!(notification_recovery_is_fresh(11, Some(11)));
+    assert!(notification_recovery_is_fresh(12, Some(11)));
+    assert!(notification_recovery_is_fresh(1, None));
+}

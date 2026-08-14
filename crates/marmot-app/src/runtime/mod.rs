@@ -1147,16 +1147,35 @@ impl MarmotAppRuntime {
     ) -> BackgroundNotificationCollection {
         let max_wait = Duration::from_millis(u64::from(max_wait_ms.max(1)));
         let started = Instant::now();
+        let recovery_watermark = notifications::unix_now_seconds();
         let mut events = self.events.subscribe();
         let catch_up = timeout(max_wait, self.catch_up_accounts()).await;
         let remaining = max_wait.saturating_sub(started.elapsed());
         match catch_up {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
+                // Catch-up failed, but events already published into this
+                // receiver must still be projected so a partial ingest is not
+                // discarded as an empty failure.
+                let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
+                let notifications = project_wake_notification_events(
+                    self.accounts.app.clone(),
+                    drained,
+                    Some(recovery_watermark),
+                )
+                .await
+                .unwrap_or_default();
+                if notifications.is_empty() {
+                    return BackgroundNotificationCollection {
+                        status: NotificationCollectionStatus::Failed,
+                        notifications: Vec::new(),
+                        error: Some(err.to_string()),
+                    };
+                }
                 return BackgroundNotificationCollection {
-                    status: NotificationCollectionStatus::Failed,
-                    notifications: Vec::new(),
-                    error: Some(err.to_string()),
+                    status: NotificationCollectionStatus::NewData,
+                    notifications,
+                    error: None,
                 };
             }
             Err(_) => {
@@ -1165,10 +1184,13 @@ impl MarmotAppRuntime {
                 // exhausts its budget on cold sockets after messages have
                 // already landed.
                 let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
-                let notifications =
-                    project_wake_notification_events(self.accounts.app.clone(), drained)
-                        .await
-                        .unwrap_or_default();
+                let notifications = project_wake_notification_events(
+                    self.accounts.app.clone(),
+                    drained,
+                    Some(recovery_watermark),
+                )
+                .await
+                .unwrap_or_default();
                 let timed_out = notifications.is_empty();
                 return BackgroundNotificationCollection {
                     status: if timed_out {
@@ -1183,9 +1205,13 @@ impl MarmotAppRuntime {
         }
 
         let drained = drain_wake_notification_events(&mut events, remaining).await;
-        let notifications = project_wake_notification_events(self.accounts.app.clone(), drained)
-            .await
-            .unwrap_or_default();
+        let notifications = project_wake_notification_events(
+            self.accounts.app.clone(),
+            drained,
+            Some(recovery_watermark),
+        )
+        .await
+        .unwrap_or_default();
         BackgroundNotificationCollection {
             status: if notifications.is_empty() {
                 NotificationCollectionStatus::NoData
@@ -5007,11 +5033,17 @@ where
         .map_err(|err| AppError::BlockingTask(err.to_string()))?
 }
 
+struct WakeNotificationDrain {
+    events: Vec<MarmotAppEvent>,
+    lagged: bool,
+}
+
 async fn drain_wake_notification_events(
     events: &mut broadcast::Receiver<MarmotAppEvent>,
     remaining: Duration,
-) -> Vec<MarmotAppEvent> {
+) -> WakeNotificationDrain {
     let mut drained = Vec::new();
+    let mut lagged = false;
     let drain_until = Instant::now() + remaining;
     loop {
         match events.try_recv() {
@@ -5027,20 +5059,30 @@ async fn drain_wake_notification_events(
                 .await
                 {
                     Ok(Ok(event)) => drained.push(event),
-                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                        lagged = true;
+                        continue;
+                    }
                     Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
                 }
             }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                lagged = true;
+                continue;
+            }
             Err(broadcast::error::TryRecvError::Closed) => break,
         }
     }
-    drained
+    WakeNotificationDrain {
+        events: drained,
+        lagged,
+    }
 }
 
 async fn project_wake_notification_events(
     app: MarmotApp,
-    events: Vec<MarmotAppEvent>,
+    drain: WakeNotificationDrain,
+    min_observed_at: Option<u64>,
 ) -> Result<Vec<NotificationUpdate>, AppError> {
     blocking_app_task(move || {
         // #639: one resolver shared across the drained batch so repeated
@@ -5048,8 +5090,14 @@ async fn project_wake_notification_events(
         // re-opening SQLCipher / directory caches per event.
         let mut resolver = notifications::NotificationResolver::default();
         let mut notifications = Vec::new();
-        for event in &events {
+        for event in &drain.events {
             collect_notification_update_from_event(&app, &mut resolver, event, &mut notifications);
+        }
+        if drain.lagged {
+            notifications.extend(notifications::recover_notification_updates(
+                &app,
+                min_observed_at,
+            )?);
         }
         Ok(notifications::dedupe_notification_updates(notifications))
     })

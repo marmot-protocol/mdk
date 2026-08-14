@@ -1469,9 +1469,13 @@ pub(crate) fn notification_update_from_event(
 /// Re-derive candidate notifications from recent stored messages after the
 /// live broadcast ring overflows. Callers still dedupe against already-emitted
 /// `notification_key`s so recovery cannot replay a notification the subscriber
-/// already saw.
+/// already saw. `min_observed_at` is a per-subscription watermark in the same
+/// second-resolution units as `recorded_at` / `received_at`; rows strictly
+/// before it are pre-subscription history and must not become fresh OS alerts.
+/// Same-second rows stay eligible so in-session events are not dropped.
 pub(crate) fn recover_notification_updates(
     app: &MarmotApp,
+    min_observed_at: Option<u64>,
 ) -> Result<Vec<NotificationUpdate>, AppError> {
     let mut resolver = NotificationResolver::default();
     let mut updates = Vec::new();
@@ -1484,9 +1488,19 @@ pub(crate) fn recover_notification_updates(
             },
         )?;
         for record in records {
+            if !notification_recovery_is_fresh(
+                record.received_at.max(record.recorded_at),
+                min_observed_at,
+            ) {
+                continue;
+            }
             let Ok(group_id) = hex::decode(&record.group_id_hex) else {
                 continue;
             };
+            let sender_display_name = app
+                .display_name_for_account_id(&record.sender)
+                .ok()
+                .flatten();
             let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
                 account_id_hex: account.account_id_hex.clone(),
                 account_label: account.label.clone(),
@@ -1494,7 +1508,7 @@ pub(crate) fn recover_notification_updates(
                     message_id_hex: record.message_id_hex,
                     source_message_id_hex: String::new(),
                     sender: record.sender,
-                    sender_display_name: None,
+                    sender_display_name,
                     group_id: cgka_traits::GroupId::new(group_id),
                     source_epoch: record.source_epoch.unwrap_or(0),
                     retention: record.retention,
@@ -1508,11 +1522,25 @@ pub(crate) fn recover_notification_updates(
             match notification_update_from_event_cached(app, &mut resolver, &event) {
                 Ok(Some(update)) => updates.push(update),
                 Ok(None) | Err(AppError::NotificationsDisabled) => {}
-                Err(_) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "recover_notification_updates",
+                        error_code = "notification_projection_skipped",
+                        "recovered notification projection skipped",
+                    );
+                }
             }
         }
     }
     Ok(dedupe_notification_updates(updates))
+}
+
+pub(crate) fn notification_recovery_is_fresh(
+    observed_at: u64,
+    min_observed_at: Option<u64>,
+) -> bool {
+    min_observed_at.is_none_or(|min| observed_at >= min)
 }
 
 /// Build a notification for one event, reusing `resolver`'s memoized
@@ -1990,6 +2018,13 @@ pub(crate) fn unix_now_ms() -> i64 {
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+pub(crate) fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
@@ -11,7 +12,7 @@ use cgka_traits::{GroupId, SecretBytes};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, Sleep, interval, sleep, timeout};
 use zeroize::Zeroizing;
@@ -729,6 +730,11 @@ async fn run_app_runtime_account_worker(
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
+    let media_http = MediaHttpContext {
+        tx: media_http_tx,
+        permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+        lifecycle: lifecycle.clone(),
+    };
     for deferred_command in deferred {
         match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
@@ -742,7 +748,7 @@ async fn run_app_runtime_account_worker(
                     &account_id_hex,
                     &account_label,
                     &shared,
-                    &media_http_tx,
+                    &media_http,
                 )
                 .await;
             }
@@ -915,7 +921,7 @@ async fn run_app_runtime_account_worker(
                                         &account_id_hex,
                                         &account_label,
                                         &shared,
-                                        &media_http_tx,
+                                        &media_http,
                                     )
                                     .await;
                                 }
@@ -1735,6 +1741,14 @@ async fn handle_startup_hydration_command(
     }
 }
 
+const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
+
+struct MediaHttpContext {
+    tx: mpsc::UnboundedSender<MediaHttpDone>,
+    permits: Arc<Semaphore>,
+    lifecycle: RuntimeLifecycle,
+}
+
 enum MediaHttpDone {
     Upload {
         finish: EncryptedMediaUploadFinish,
@@ -1754,13 +1768,24 @@ enum MediaHttpDone {
 }
 
 fn spawn_media_http<T>(
-    media_http: &mpsc::UnboundedSender<MediaHttpDone>,
+    media_http: &MediaHttpContext,
     work: impl std::future::Future<Output = T> + Send + 'static,
     into_done: impl FnOnce(T) -> MediaHttpDone + Send + 'static,
 ) {
-    let tx = media_http.clone();
+    let tx = media_http.tx.clone();
+    let permits = media_http.permits.clone();
+    let lifecycle = media_http.lifecycle.clone();
     tokio::spawn(async move {
+        let Ok(_permit) = permits.acquire_owned().await else {
+            return;
+        };
+        if lifecycle.is_stopping() {
+            return;
+        }
         let output = work.await;
+        if lifecycle.is_stopping() {
+            return;
+        }
         let _ = tx.send(into_done(output));
     });
 }
@@ -1822,7 +1847,7 @@ async fn handle_account_worker_command(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    media_http: &mpsc::UnboundedSender<MediaHttpDone>,
+    media_http: &MediaHttpContext,
 ) {
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
@@ -3906,6 +3931,11 @@ mod tests {
         let shared = RuntimeSharedServices::default();
         let (respond, response) = oneshot::channel();
         let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+        let media_http = MediaHttpContext {
+            tx: media_http_tx,
+            permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+            lifecycle: shared.lifecycle(),
+        };
         handle_account_worker_command(
             &mut client,
             AccountWorkerCommand::RepairFullHistory { respond },
@@ -3913,7 +3943,7 @@ mod tests {
             "account-id",
             "alice",
             &shared,
-            &media_http_tx,
+            &media_http,
         )
         .await;
 

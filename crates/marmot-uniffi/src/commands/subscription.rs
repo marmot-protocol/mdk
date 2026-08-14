@@ -37,11 +37,10 @@ impl Marmot {
 
     /// Per-account chats list. Emits whenever a group's projection changes.
     ///
-    /// `async` is required even though the body is synchronous: marmot-app's
-    /// `subscribe_chats` spawns a background filter task via `tokio::spawn`,
-    /// which panics ("no reactor running") if invoked outside a tokio
-    /// runtime. UniFFI only enters the tokio runtime for `async` exports, so
-    /// the subscribe methods that spawn must be async.
+    /// `async` because marmot-app's `subscribe_chats` is itself async (the
+    /// initial snapshot is loaded off-thread) and also spawns a background
+    /// filter task. UniFFI only enters the tokio runtime for `async` exports,
+    /// so this constructor must be awaited.
     pub async fn subscribe_chats(
         &self,
         account_ref: String,

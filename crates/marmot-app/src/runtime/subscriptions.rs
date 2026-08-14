@@ -1119,22 +1119,40 @@ impl MarmotAppRuntime {
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             let app_for_lookup = app.clone();
                             let account_label_for_lookup = account_label.clone();
-                            let groups = match blocking_app_task(move || {
-                                if include_archived {
-                                    app_for_lookup.groups(&account_label_for_lookup)
+                            let prior_group_ids = group_fingerprints.keys().cloned().collect::<Vec<_>>();
+                            let recovered = match blocking_app_task(move || {
+                                let groups = if include_archived {
+                                    app_for_lookup.groups(&account_label_for_lookup)?
                                 } else {
-                                    app_for_lookup.visible_groups(&account_label_for_lookup)
+                                    app_for_lookup.visible_groups(&account_label_for_lookup)?
+                                };
+                                let visible_group_ids = groups
+                                    .iter()
+                                    .map(|group| group.group_id_hex.clone())
+                                    .collect::<HashSet<_>>();
+                                let mut removed_records = Vec::new();
+                                for group_id_hex in prior_group_ids {
+                                    if visible_group_ids.contains(&group_id_hex) {
+                                        continue;
+                                    }
+                                    if let Some(record) =
+                                        app_for_lookup.group(&account_label_for_lookup, &group_id_hex)?
+                                    {
+                                        removed_records.push(record);
+                                    }
                                 }
+                                Ok((groups, removed_records))
                             })
                             .await
                             {
-                                Ok(groups) => groups,
+                                Ok(recovered) => recovered,
                                 Err(_) => continue,
                             };
                             if !reconcile_chats_snapshot(
                                 &updates_tx,
                                 &mut group_fingerprints,
-                                groups,
+                                recovered.0,
+                                recovered.1,
                             )
                             .await
                             {
@@ -1487,6 +1505,7 @@ impl MarmotAppRuntime {
                 .ok_or_else(|| AppError::UnknownGroup(group_id_hex_for_snapshot))
         })
         .await?;
+        let mut last_group = snapshot.clone();
         let mut last_fingerprint = app_group_record_fingerprint(&snapshot);
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
@@ -1506,13 +1525,26 @@ impl MarmotAppRuntime {
                             .await
                             {
                                 Ok(Some(group)) => group,
-                                Ok(None) | Err(_) => continue,
+                                Ok(None) => {
+                                    if !emit_missing_group_state(
+                                        &updates_tx,
+                                        &mut last_group,
+                                        &mut last_fingerprint,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                Err(_) => continue,
                             };
                             let fingerprint = app_group_record_fingerprint(&group);
                             if fingerprint == last_fingerprint {
                                 continue;
                             }
                             last_fingerprint = fingerprint;
+                            last_group = group.clone();
                             if updates_tx.send(group).await.is_err() {
                                 return;
                             }
@@ -1541,13 +1573,26 @@ impl MarmotAppRuntime {
                 .await
                 {
                     Ok(Some(group)) => group,
-                    Ok(None) | Err(_) => continue,
+                    Ok(None) => {
+                        if !emit_missing_group_state(
+                            &updates_tx,
+                            &mut last_group,
+                            &mut last_fingerprint,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 let fingerprint = app_group_record_fingerprint(&group);
                 if fingerprint == last_fingerprint {
                     continue;
                 }
                 last_fingerprint = fingerprint;
+                last_group = group.clone();
                 if updates_tx.send(group).await.is_err() {
                     return;
                 }
@@ -1567,7 +1612,9 @@ impl MarmotAppRuntime {
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
-            let mut seen_notification_keys = HashSet::new();
+            let mut seen_notification_keys =
+                MessageSubscriptionSeenIds::with_limit(MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT);
+            let recovery_watermark = notifications::unix_now_seconds();
             loop {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
@@ -1582,7 +1629,9 @@ impl MarmotAppRuntime {
                         .await
                         {
                             Ok(Some(update)) => {
-                                if !seen_notification_keys.insert(update.notification_key.clone()) {
+                                if !seen_notification_keys
+                                    .should_emit(update.notification_key.clone())
+                                {
                                     continue;
                                 }
                                 if updates_tx.send(update).await.is_err() {
@@ -1603,7 +1652,10 @@ impl MarmotAppRuntime {
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let app_for_lookup = app.clone();
                         let recovered = match blocking_app_task(move || {
-                            notifications::recover_notification_updates(&app_for_lookup)
+                            notifications::recover_notification_updates(
+                                &app_for_lookup,
+                                Some(recovery_watermark),
+                            )
                         })
                         .await
                         {
@@ -1611,7 +1663,8 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         for update in recovered {
-                            if !seen_notification_keys.insert(update.notification_key.clone()) {
+                            if !seen_notification_keys.should_emit(update.notification_key.clone())
+                            {
                                 continue;
                             }
                             if updates_tx.send(update).await.is_err() {
@@ -1764,16 +1817,36 @@ fn app_group_record_fingerprint(group: &AppGroupRecord) -> String {
     serde_json::to_string(group).unwrap_or_else(|_| group.group_id_hex.clone())
 }
 
+async fn emit_missing_group_state(
+    updates_tx: &mpsc::Sender<AppGroupRecord>,
+    last_group: &mut AppGroupRecord,
+    last_fingerprint: &mut String,
+) -> bool {
+    if last_group.archived {
+        return true;
+    }
+    last_group.archived = true;
+    *last_fingerprint = app_group_record_fingerprint(last_group);
+    updates_tx.send(last_group.clone()).await.is_ok()
+}
+
 async fn reconcile_chats_snapshot(
     updates_tx: &mpsc::Sender<AppGroupRecord>,
     group_fingerprints: &mut HashMap<String, String>,
     groups: Vec<AppGroupRecord>,
+    removed_records: Vec<AppGroupRecord>,
 ) -> bool {
     let visible_group_ids = groups
         .iter()
         .map(|group| group.group_id_hex.clone())
         .collect::<HashSet<_>>();
     group_fingerprints.retain(|group_id_hex, _| visible_group_ids.contains(group_id_hex));
+    for record in removed_records {
+        group_fingerprints.remove(&record.group_id_hex);
+        if updates_tx.send(record).await.is_err() {
+            return false;
+        }
+    }
     for group in groups {
         let fingerprint = app_group_record_fingerprint(&group);
         if group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint) {
