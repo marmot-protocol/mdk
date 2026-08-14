@@ -432,6 +432,42 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Sentinel: an engine unit test proves that device-local committer-leaf status, roster order, and duplicate roster rows
   do not change terminal equality.
 
+### `open_convergence_pass_survives_restart_and_walks_the_backlog_to_the_tip`
+
+- Setup: Alice and Carol settle at epoch 1, the scenario moves onto virtual time, and one inbound commit edge opens
+  Carol's convergence pass at base epoch 1.
+- Pressure: Carol crashes and reopens (encrypted file storage, real close/reopen) 300ms short of the pass cutoff, then
+  three more commits from Alice land on the reopened engine while the recovered pass still holds the boundary.
+- Expected: mid-history Carol is still at epoch 1 with Alice four epochs ahead — an active pass pins the tip across the
+  crash and the backlog. The settle tick at exactly the original 1000ms deadline clears the recovered pass, and Carol
+  then walks 1→2→3→4→5, one generation per quiescence window, ending exactly equivalent to Alice with no pending work.
+- Reason: scenario-level companion to the stale-pass-base field incident fixed in mdk#1182, over the durable
+  convergence passes mdk#1110 added. The engine tests for that fix install a `base_epoch`/tip disagreement on the
+  durable record directly, because the engine keeps a single tip authority and an active pass gates every path that
+  could move the tip. This scenario pins that precondition from the
+  public boundary: the disagreement the incident needed never arises, and the device still converges. The timing is the
+  evidence that the *same* durable pass survived the crash — a pass reopened afterwards would carry a later deadline and
+  leave Carol behind.
+- Not portable yet, because the multi-process subject cannot carry the contract: `process_subject_descriptor`
+  deliberately does not advertise `SubjectCapability::VirtualTime`, so `AdvanceTime` fails preflight as
+  `unsupported_subject_capability` and the orchestrator's `tokio::time::sleep` arm never runs — and `node_protocol`
+  exposes no clock surface, so there is no subject clock for the step to move. Each node's pass deadlines would run on
+  real elapsed time, which is fine for a step that only needs settling slack and wrong for one whose contract is
+  landing on a boundary. Promoting this to `vectors/` needs a node-side virtual clock and a capability the process
+  subject can honestly advertise.
+- The manual `AdvanceTime`/`Tick` walk is a choice, not an oracle workaround. `await_quiescence` advances virtual time
+  to a fixed point and settles the recovered pass whenever it comes due, which erases the exact-deadline evidence —
+  with it appended, shortening the settle tick to 900ms still passes. Ticking manually costs nothing under
+  `--strict-oracle`: `VirtualTimeAdvance` recommends `OracleBehavior::QuiescenceState` *or*
+  `OracleBehavior::NoPendingWorkObserved`, and this scenario asserts `NoPendingWork`.
+- Mutation evidence: deleting the durable pass on reopen, or ignoring the quiescence cutoff, both turn this scenario
+  red. Shortening the post-restart settle tick from 300ms to 200ms — landing at 900ms instead of the recovered pass's
+  original 1000ms deadline — leaves Carol with an unresolved convergence input and one epoch behind, which is the direct
+  evidence that the deadline survived the reopen rather than being re-derived. Leaving an applied pass active at its old
+  base epoch (producing the incident shape live) keeps it green, because the mdk#1182 discard reopens at the tip;
+  replacing that discard with the pre-mdk#1182 durable halt turns it red with Carol's canonical `convergence_status`
+  stuck at `unrecoverable`.
+
 ### `bidirectional_decryptability_probe_passes_for_settled_members`
 
 - Setup: Alice creates a settled three-member group with Bob and Carol.
