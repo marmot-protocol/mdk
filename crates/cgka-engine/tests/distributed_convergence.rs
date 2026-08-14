@@ -858,6 +858,145 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     );
 }
 
+/// A late application from common history can enter convergence while a newer
+/// epoch is contested. Every candidate path starts at the fork epoch, so the
+/// application predates the first commit in every path. It must still be
+/// authenticated against the retained base state and delivered after branch
+/// selection rather than being invalidated without a decryption attempt.
+#[tokio::test]
+async fn contested_fork_delivers_late_pre_fork_application() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut common_invitee, _common_invitee_storage) = build_client(b"common-invitee");
+    let (mut alice_invitee, _alice_invitee_storage) = build_client(b"alice-invitee");
+    let (mut bob_invitee, _bob_invitee_storage) = build_client(b"bob-invitee");
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "late-pre-fork-application".into(),
+            description: "".into(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Hold this epoch-1 application until after the shared group has advanced
+    // and epoch 2 has forked.
+    let late_app = send_app(
+        &mut alice,
+        &group_id,
+        b"late shared-history application".to_vec(),
+    )
+    .await;
+
+    let common_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![common_invitee.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (common_commit, common_pending) = evolution(common_invite);
+    alice.confirm_published(common_pending).await.unwrap();
+    let common_commit = route(common_commit, &group_id);
+    assert!(matches!(
+        bob.ingest(common_commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("Bob applies the shared commit");
+    assert!(matches!(
+        carol.ingest(common_commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("Carol applies the shared commit");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    carol.drain_events();
+
+    let alice_fork = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![alice_invitee.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let bob_fork = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_invitee.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_fork);
+    let (bob_commit, _bob_pending) = evolution(bob_fork);
+    for message in [
+        route(alice_commit, &group_id),
+        route(bob_commit, &group_id),
+        late_app.clone(),
+    ] {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, message, 1_000)
+            .unwrap();
+    }
+
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("contested fork converges with late shared-history evidence");
+    let late_app_id = content_hex(&late_app);
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(result.accepted_app_messages, vec![late_app_id.clone()]);
+    assert!(
+        result
+            .invalidated_app_messages
+            .iter()
+            .all(|invalidated| invalidated.message_id != late_app_id)
+    );
+    assert_message_state(&carol_storage, &late_app, MessageState::Processed);
+
+    let events = carol.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                GroupEvent::MessageReceived { payload, .. }
+                    if app_content(payload) == b"late shared-history application"
+            ))
+            .count(),
+        1,
+        "late shared-history application must be delivered exactly once: {events:?}"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        GroupEvent::AppMessageInvalidated { message_id, .. }
+            if *message_id == content_id(&late_app)
+    )));
+}
+
 /// Regression for the Android-visible "This message is no longer valid"
 /// banner on a device's own sent message. OpenMLS cannot decrypt an own
 /// private-message ciphertext during candidate replay, so convergence must use
@@ -2251,6 +2390,297 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
         }),
         "expected multi-commit canonical app payload event, got {events:?}"
     );
+}
+
+/// Application observations and the accepted-message result are canonical
+/// even when peers admit the same source-epoch applications in opposite
+/// transport order. Exercise the retained base, each commit edge, and the
+/// selected tip so every application replay bucket uses the same ordering.
+#[tokio::test]
+async fn application_replay_is_invariant_to_opposite_arrival_order() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut forward, _forward_storage) = build_client(b"forward");
+    let (mut reverse, _reverse_storage) = build_client(b"reverse");
+
+    let forward_kp = forward.fresh_key_package().await.unwrap();
+    let reverse_kp = reverse.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "canonical-application-arrival-order".into(),
+            description: "".into(),
+            members: vec![forward_kp, reverse_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    forward
+        .join_welcome(welcome_for(&welcomes, b"forward"))
+        .await
+        .unwrap();
+    reverse
+        .join_welcome(welcome_for(&welcomes, b"reverse"))
+        .await
+        .unwrap();
+    forward.drain_events();
+    reverse.drain_events();
+
+    let base_apps = [
+        send_app(&mut alice, &group_id, b"base-a".to_vec()).await,
+        send_app(&mut alice, &group_id, b"base-b".to_vec()).await,
+    ];
+    let (mut david, _david_storage) = build_client(b"arrival-order-david");
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit_david, pending) = evolution(invite_david);
+    alice.confirm_published(pending).await.unwrap();
+    let edge_apps = [
+        send_app(&mut alice, &group_id, b"edge-a".to_vec()).await,
+        send_app(&mut alice, &group_id, b"edge-b".to_vec()).await,
+    ];
+    let (mut eve, _eve_storage) = build_client(b"arrival-order-eve");
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit_eve, pending) = evolution(invite_eve);
+    alice.confirm_published(pending).await.unwrap();
+    let tip_apps = [
+        send_app(&mut alice, &group_id, b"tip-a".to_vec()).await,
+        send_app(&mut alice, &group_id, b"tip-b".to_vec()).await,
+    ];
+    let commit_david = route(commit_david, &group_id);
+    let commit_eve = route(commit_eve, &group_id);
+
+    for apps in [&base_apps, &edge_apps, &tip_apps] {
+        for app in apps {
+            forward
+                .buffer_openmls_convergence_message_at(&group_id, app.clone(), 1_000)
+                .unwrap();
+        }
+    }
+    for commit in [&commit_david, &commit_eve] {
+        forward
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
+            .unwrap();
+        reverse
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
+            .unwrap();
+    }
+    for apps in [&tip_apps, &edge_apps, &base_apps] {
+        for app in apps.iter().rev() {
+            reverse
+                .buffer_openmls_convergence_message_at(&group_id, app.clone(), 1_000)
+                .unwrap();
+        }
+    }
+
+    let forward_result = forward
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    let reverse_result = reverse
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+
+    let expected_app_messages = [&base_apps, &edge_apps, &tip_apps]
+        .into_iter()
+        .flatten()
+        .map(content_hex)
+        .collect::<Vec<_>>();
+    let mut expected_app_messages = expected_app_messages;
+    expected_app_messages.sort();
+    assert_eq!(forward_result.accepted_app_messages, expected_app_messages);
+    assert_eq!(reverse_result.accepted_app_messages, expected_app_messages);
+    let received_payloads = |events: Vec<GroupEvent>| {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { payload, .. } => Some(app_content(&payload).to_vec()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let canonical_payloads = |apps: &[TransportMessage; 2], payloads: [&[u8]; 2]| {
+        let mut keyed_payloads = apps
+            .iter()
+            .zip(payloads)
+            .map(|(app, payload)| (content_hex(app), payload.to_vec()))
+            .collect::<Vec<_>>();
+        keyed_payloads.sort_by(|left, right| left.0.cmp(&right.0));
+        keyed_payloads
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>()
+    };
+    let expected_payloads = canonical_payloads(&base_apps, [b"base-a", b"base-b"])
+        .into_iter()
+        .chain(canonical_payloads(&edge_apps, [b"edge-a", b"edge-b"]))
+        .chain(canonical_payloads(&tip_apps, [b"tip-a", b"tip-b"]))
+        .collect::<Vec<_>>();
+    assert_eq!(received_payloads(forward.drain_events()), expected_payloads);
+    assert_eq!(received_payloads(reverse.drain_events()), expected_payloads);
+}
+
+/// A frozen convergence pass already owns a bounded retained-anchor snapshot.
+/// Application inputs admitted while they are inside the app window must use
+/// that source-epoch state before later commits in the same pass advance far
+/// enough to prune it. Dividing the same retained input across passes must not
+/// decide whether the application is delivered (mdk#1171).
+#[tokio::test]
+async fn retained_application_delivery_is_invariant_to_convergence_pass_partition() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut one_pass, one_pass_storage) = build_client(b"one-pass");
+    let (mut split_pass, split_pass_storage) = build_client(b"split-pass");
+
+    let one_pass_kp = one_pass.fresh_key_package().await.unwrap();
+    let split_pass_kp = split_pass.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "retained-app-pass-partition".into(),
+            description: "".into(),
+            members: vec![one_pass_kp, split_pass_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    one_pass
+        .join_welcome(welcome_for(&welcomes, b"one-pass"))
+        .await
+        .unwrap();
+    split_pass
+        .join_welcome(welcome_for(&welcomes, b"split-pass"))
+        .await
+        .unwrap();
+    one_pass.drain_events();
+    split_pass.drain_events();
+
+    let app = send_app(
+        &mut alice,
+        &group_id,
+        b"retained across active convergence".to_vec(),
+    )
+    .await;
+    let retention_limit =
+        usize::try_from(CanonicalizationPolicy::default().app_message_past_epoch_limit)
+            .expect("pinned application-retention limit fits usize");
+    let commit_count = retention_limit + 1;
+    let expected_tip = EpochId(1 + commit_count as u64);
+    let mut commits = Vec::new();
+    for index in 0..commit_count {
+        let identity = format!("partition-invitee-{index}");
+        let (mut invitee, _invitee_storage) = build_client(identity.as_bytes());
+        let invite = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![invitee.fresh_key_package().await.unwrap()],
+            })
+            .await
+            .unwrap();
+        let (commit, pending) = evolution(invite);
+        alice.confirm_published(pending).await.unwrap();
+        commits.push(route(commit, &group_id));
+    }
+
+    for message in commits.iter().chain([&app]) {
+        one_pass
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
+            .unwrap();
+    }
+    // Inbound contested-pass handoff can retain a past-epoch wire message in
+    // a row stamped with the receiver's newer current epoch. Final apply must
+    // order by the authenticated wire source epoch, not this row metadata.
+    let mut one_pass_app_record = one_pass_storage.get_message(&content_id(&app)).unwrap();
+    one_pass_app_record.epoch = expected_tip;
+    one_pass_storage.put_message(&one_pass_app_record).unwrap();
+    let one_pass_result = one_pass
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+
+    for message in commits[..retention_limit].iter().chain([&app]) {
+        split_pass
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
+            .unwrap();
+    }
+    let split_first_result = split_pass
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    split_pass
+        .buffer_openmls_convergence_message_at(
+            &group_id,
+            commits[retention_limit].clone(),
+            2_000_000,
+        )
+        .unwrap();
+    split_pass
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .unwrap();
+
+    assert_eq!(one_pass.epoch(&group_id).unwrap(), expected_tip);
+    assert_eq!(split_pass.epoch(&group_id).unwrap(), expected_tip);
+    assert_eq!(one_pass_result.accepted_commits.len(), commit_count);
+    assert_eq!(
+        one_pass_result.accepted_app_messages,
+        vec![content_hex(&app)]
+    );
+    assert_eq!(
+        split_first_result.accepted_app_messages,
+        vec![content_hex(&app)]
+    );
+    assert_eq!(
+        one_pass_storage
+            .get_message(&content_id(&app))
+            .unwrap()
+            .state,
+        MessageState::Processed
+    );
+    assert_eq!(
+        split_pass_storage
+            .get_message(&content_id(&app))
+            .unwrap()
+            .state,
+        MessageState::Processed
+    );
+
+    for events in [one_pass.drain_events(), split_pass.drain_events()] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GroupEvent::MessageReceived { payload, .. }
+                        if app_content(payload) == b"retained across active convergence"
+                ))
+                .count(),
+            1,
+            "the admitted application must be delivered exactly once: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&app)
+        )));
+    }
 }
 
 /// Reuse-path sibling of `engine_materializes_multi_commit_path_from_stored_commits`: the same

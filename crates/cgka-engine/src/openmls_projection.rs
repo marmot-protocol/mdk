@@ -2783,7 +2783,7 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
 ) -> Result<Vec<TransportMessage>, OpenMlsProjectionError> {
     let mut replay_messages = Vec::new();
     let mut seen = BTreeSet::new();
-    for hex_message_id in result
+    for (input_order, hex_message_id) in result
         .accepted_proposals
         .iter()
         .chain(
@@ -2793,6 +2793,7 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
                 .filter(|commit_id| !applied_prefix.contains(*commit_id)),
         )
         .chain(&result.accepted_app_messages)
+        .enumerate()
     {
         if !seen.insert(hex_message_id.clone()) {
             continue;
@@ -2801,25 +2802,46 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         let record = storage
             .get_message(&message_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // An accepted proposal below the apply-start epoch was consumed by a
-        // commit in the skipped already-applied prefix: its effect is inside
-        // the live state, and MLS proposals are epoch-scoped, so replaying it
-        // against the post-prefix state would be rejected (WrongEpoch) and
-        // fail the whole apply. Skip the replay; its `Processed` disposition
-        // still persists so it leaves the convergence input set.
-        if result.accepted_proposals.contains(hex_message_id) && record.epoch.0 < apply_start_epoch
-        {
-            continue;
-        }
         let Some(message) = openmls_wire_message_from_record(&record)? else {
             return Err(OpenMlsProjectionError::Decode(format!(
                 "accepted message {} is not a stored OpenMLS wire payload",
                 hex_message_id
             )));
         };
-        replay_messages.push(message);
+        let projection = project_mls_message(&message.payload)?;
+        let source_epoch =
+            projection
+                .source_epoch
+                .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
+                    projection.kind,
+                ))?;
+        // An accepted proposal below the apply-start epoch was consumed by a
+        // commit in the skipped already-applied prefix: its effect is inside
+        // the live state, and MLS proposals are epoch-scoped, so replaying it
+        // against the post-prefix state would be rejected (WrongEpoch) and
+        // fail the whole apply. Use the authenticated wire epoch rather than
+        // mutable row metadata. Skip the replay; its `Processed` disposition
+        // still persists so it leaves the convergence input set.
+        if result.accepted_proposals.contains(hex_message_id) && source_epoch < apply_start_epoch {
+            continue;
+        }
+        let kind_order = match projection.kind {
+            // Proposals and applications from epoch E must be processed while
+            // the group is still at E. The commit advancing E -> E+1 comes
+            // last so OpenMLS cannot prune source-epoch application material
+            // before the accepted application is authenticated (mdk#1171).
+            OpenMlsContentKind::Proposal => 0,
+            OpenMlsContentKind::Application => 1,
+            OpenMlsContentKind::Commit => 2,
+            OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => 3,
+        };
+        replay_messages.push((source_epoch, kind_order, input_order, message));
     }
-    Ok(replay_messages)
+    replay_messages.sort_by_key(|message| (message.0, message.1, message.2));
+    Ok(replay_messages
+        .into_iter()
+        .map(|(_, _, _, message)| message)
+        .collect())
 }
 
 fn update_group_record_from_replay<S: StorageProvider>(
@@ -2997,7 +3019,7 @@ fn candidate_paths_with_pending_replay_messages(
     pending_messages: &[TransportMessage],
 ) -> Result<Vec<OpenMlsCandidatePath>, OpenMlsProjectionError> {
     let mut proposals_by_epoch: BTreeMap<u64, Vec<TransportMessage>> = BTreeMap::new();
-    let mut applications = Vec::new();
+    let mut applications_by_epoch: BTreeMap<u64, Vec<TransportMessage>> = BTreeMap::new();
     for message in pending_messages {
         let projection = project_mls_message(&message.payload)?;
         match projection.kind {
@@ -3010,7 +3032,15 @@ fn candidate_paths_with_pending_replay_messages(
                     .or_default()
                     .push(message.clone());
             }
-            OpenMlsContentKind::Application => applications.push(message.clone()),
+            OpenMlsContentKind::Application => {
+                let source_epoch = projection.source_epoch.ok_or(
+                    OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                )?;
+                applications_by_epoch
+                    .entry(source_epoch)
+                    .or_default()
+                    .push(message.clone());
+            }
             OpenMlsContentKind::Commit
             | OpenMlsContentKind::Welcome
             | OpenMlsContentKind::Other => {}
@@ -3018,6 +3048,9 @@ fn candidate_paths_with_pending_replay_messages(
     }
     for proposals in proposals_by_epoch.values_mut() {
         proposals.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    }
+    for applications in applications_by_epoch.values_mut() {
+        applications.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
     }
 
     candidate_paths
@@ -3027,8 +3060,39 @@ fn candidate_paths_with_pending_replay_messages(
                 let mut seen = BTreeSet::new();
                 let mut messages = Vec::new();
                 let mut final_epoch = None;
-                for message in &path.messages {
-                    let projection = project_mls_message(&message.payload)?;
+                let projected_messages = path
+                    .messages
+                    .iter()
+                    .map(|message| Ok((message, project_mls_message(&message.payload)?)))
+                    .collect::<Result<Vec<_>, OpenMlsProjectionError>>()?;
+                let first_commit_epoch = projected_messages
+                    .iter()
+                    .find(|(_, projection)| projection.kind == OpenMlsContentKind::Commit)
+                    .map(|(_, projection)| {
+                        projection.source_epoch.ok_or(
+                            OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                        )
+                    })
+                    .transpose()?;
+                // A late application from common pre-fork history can be
+                // older than every commit in the candidate path. Probe it
+                // against the retained base state, before the first commit;
+                // that state owns the widest past-epoch decryption window.
+                // The observation is shared by every candidate and therefore
+                // cannot bias selection toward either fork.
+                if let Some(first_commit_epoch) = first_commit_epoch {
+                    for applications in applications_by_epoch
+                        .range(..first_commit_epoch)
+                        .map(|(_, applications)| applications)
+                    {
+                        for application in applications {
+                            if seen.insert(hex::encode(application.id.as_slice())) {
+                                messages.push(application.clone());
+                            }
+                        }
+                    }
+                }
+                for (message, projection) in projected_messages {
                     if projection.kind == OpenMlsContentKind::Commit {
                         let source_epoch = projection.source_epoch.ok_or(
                             OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
@@ -3037,6 +3101,18 @@ fn candidate_paths_with_pending_replay_messages(
                             for proposal in proposals {
                                 if seen.insert(hex::encode(proposal.id.as_slice())) {
                                     messages.push(proposal.clone());
+                                }
+                            }
+                        }
+                        // Authenticate applications while the candidate still
+                        // owns their source-epoch state. Their branch-specific
+                        // observations are retained for witness scoring and the
+                        // eventual post-selection disposition; delivery itself
+                        // still happens only during canonical apply.
+                        if let Some(applications) = applications_by_epoch.get(&source_epoch) {
+                            for application in applications {
+                                if seen.insert(hex::encode(application.id.as_slice())) {
+                                    messages.push(application.clone());
                                 }
                             }
                         }
@@ -3059,9 +3135,13 @@ fn candidate_paths_with_pending_replay_messages(
                         }
                     }
                 }
-                for message in &applications {
-                    if seen.insert(hex::encode(message.id.as_slice())) {
-                        messages.push(message.clone());
+                if let Some(final_epoch) = final_epoch
+                    && let Some(applications) = applications_by_epoch.get(&final_epoch)
+                {
+                    for application in applications {
+                        if seen.insert(hex::encode(application.id.as_slice())) {
+                            messages.push(application.clone());
+                        }
                     }
                 }
                 Ok(OpenMlsCandidatePath {
