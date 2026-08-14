@@ -1,13 +1,16 @@
 //! Retained in-memory Nostr relay for isolated distributed campaigns.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
+use convergence_campaign_runner::file_control_relay_builder;
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 
 struct RelayOptions {
     bind: SocketAddr,
     advertise_ip: IpAddr,
+    control_root: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -35,11 +38,11 @@ fn init_diagnostics() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_relay_options(std::env::args().skip(1))?;
-    let relay = LocalRelay::new(
-        RelayBuilder::default()
-            .addr(options.bind.ip())
-            .port(options.bind.port()),
-    );
+    let builder = match options.control_root {
+        Some(control_root) => file_control_relay_builder(&control_root)?,
+        None => RelayBuilder::default(),
+    };
+    let relay = LocalRelay::new(builder.addr(options.bind.ip()).port(options.bind.port()));
     relay.run().await?;
     tracing::info!(
         target: "convergence_campaign_runner",
@@ -57,6 +60,7 @@ fn parse_relay_options(
     let args = args.collect::<Vec<_>>();
     let mut bind = "0.0.0.0:8080".parse::<SocketAddr>()?;
     let mut advertise_ip = None;
+    let mut control_root = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -68,9 +72,13 @@ fn parse_relay_options(
                 advertise_ip = Some(args[index + 1].parse()?);
                 index += 2;
             }
+            "--control-root" if index + 1 < args.len() => {
+                control_root = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
             _ => {
                 return Err(
-                    "usage: cgka-conformance-relay [--bind IP:PORT] [--advertise-ip IP]".into(),
+                    "usage: cgka-conformance-relay [--bind IP:PORT] [--advertise-ip IP] [--control-root PATH]".into(),
                 );
             }
         }
@@ -85,7 +93,11 @@ fn parse_relay_options(
     if advertise_ip.is_unspecified() {
         return Err("advertised relay address must be dialable".into());
     }
-    Ok(RelayOptions { bind, advertise_ip })
+    Ok(RelayOptions {
+        bind,
+        advertise_ip,
+        control_root,
+    })
 }
 
 #[cfg(test)]
@@ -97,6 +109,7 @@ mod tests {
         let options = parse_relay_options(std::iter::empty()).unwrap();
         assert!(options.bind.ip().is_unspecified());
         assert_eq!(options.advertise_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(options.control_root.is_none());
     }
 
     #[test]
@@ -109,5 +122,19 @@ mod tests {
         .unwrap();
         assert_eq!(options.bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(options.advertise_ip, "192.0.2.4".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn file_control_root_is_explicitly_configurable() {
+        let options = parse_relay_options(
+            ["--control-root", "/campaign-relay-control"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            options.control_root,
+            Some(PathBuf::from("/campaign-relay-control"))
+        );
     }
 }

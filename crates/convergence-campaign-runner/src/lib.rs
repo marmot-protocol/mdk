@@ -10,6 +10,7 @@ pub mod failure_corpus;
 pub mod lane;
 pub mod manifest;
 pub mod plan;
+mod relay_file_control;
 pub mod runner;
 
 pub use evidence::*;
@@ -17,6 +18,7 @@ pub use failure_corpus::*;
 pub use lane::*;
 pub use manifest::*;
 pub use plan::*;
+pub use relay_file_control::*;
 pub use runner::*;
 
 /// Runner-owned DNS alias attached only to the campaign relay container.

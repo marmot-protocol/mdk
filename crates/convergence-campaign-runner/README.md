@@ -57,6 +57,13 @@ time-to-diagnosis, and `promote-capsule` creates a fixed vector candidate from
 validated synthetic-shareable evidence and records its capsule/vector digests
 in the corpus. Promotion cannot be asserted through the diagnosis command.
 
+The scheduled real-container lane runs both the network-shaping smoke and the shared four-party cross-route
+checkpoint. Set `CGKA_DISTRIBUTED_ARTIFACTS_DIR` to an absolute path to retain the latter's exact scenario, normalized
+manifest, process report, distributed receipt, and any failure-corpus entry; without it, the
+ignored local test uses an automatically deleted temporary directory. The relay's reversible visibility control uses
+an owner-only ephemeral directory and opaque run-local event tokens; it retains no Nostr event ids in campaign
+evidence.
+
 The operator contract, backend boundary, artifact posture, and real-container
 verification commands live in
 [`docs/marmot-architecture/distributed-convergence-campaigns.md`](../../docs/marmot-architecture/distributed-convergence-campaigns.md).

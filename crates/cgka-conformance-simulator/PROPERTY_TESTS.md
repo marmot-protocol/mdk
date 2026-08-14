@@ -190,8 +190,22 @@ helpers. Shared harness generators live in `src/proptest_support.rs`.
   Zeta reopen. An ignored twenty-trial soak repeats the full process route outside normal CI.
 - Boundary: runner-owned local relays declare `retained_relay_control`; externally supplied relay URLs fail capability
   preflight rather than pretending the runner can hide or restore their events. The process protocol still does not
-  expose exact MLS commitments, durable input dispositions, or active decryptability probes. Container and VM
-  execution of this Scenario IR remains open.
+  expose exact MLS commitments, durable input dispositions, or active decryptability probes. VM execution remains
+  open.
+
+### `four_party_cross_route_recovery_containers_match_unified_route`
+
+- Runs: the exact shared four-party Scenario IR through the distributed container backend, with one non-root OCI
+  container and one encrypted durable root per participant plus the runner-owned retained relay on an isolated
+  network. Zeta's scenario-owned restart removes and recreates its participant container over the same durable root.
+- Checks: the manifest source digest and canonical IR digest, exact expanded schedule, controlled intermediate split,
+  stable final public protocol/application projection, losing-branch withdrawal rule, one public commitment, real
+  durable reopen, successful infrastructure commands, and complete cleanup.
+- Evidence: the nightly and weekly/manual lanes retain the exact scenario, normalized manifest, process report,
+  distributed receipt, and any failure-corpus entry under `target/cgka-distributed-container-evidence`. Encrypted
+  participant roots and the opaque-token relay control plane are ephemeral and are not uploaded.
+- Boundary: this reuses the process protocol's strict public oracle. It does not claim exact MLS-state commitment,
+  durable input dispositions, or active decryptability from a black-box container adapter.
 
 ## Shared Generators
 
