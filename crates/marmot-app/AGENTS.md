@@ -37,7 +37,7 @@ App runtime bridge for the first real Marmot app surfaces.
   validation/resolution/removal, and HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
 - Keep SQLCipher key derivation, per-database salt persistence, legacy-key migration/recovery, and the in-process
   v2-open probe-verdict cache (mdk#1439) in `src/sqlcipher.rs`. The verdict cache is advisory only: a durable
-  migration marker or a missing verdict always re-runs the recovery probe, so the #219 crash windows keep their
+  migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their
   self-heal. Key presentation and the passphrase KDF work factor follow the decision record in
   `docs/marmot-architecture/storage-format-v2.md`.
 - Keep the user-directory domain in the `src/directory/` module instead of regrowing `src/lib.rs`. It splits along these

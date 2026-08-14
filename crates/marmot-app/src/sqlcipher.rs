@@ -12,7 +12,7 @@
 //! a successful "this database opens under the v2 key" verdict is cached
 //! in-process per database file and salt (mdk#1439). The cache is advisory
 //! only: a durable migration marker or a missing verdict always re-runs the
-//! recovery probe, so the crash windows keep the #219 self-heal. Key
+//! recovery probe, so the crash windows keep the mdk#568 self-heal. Key
 //! presentation (passphrase vs raw key) and the KDF work factor are unchanged;
 //! that decision is recorded in
 //! `docs/marmot-architecture/storage-format-v2.md`.
@@ -67,7 +67,7 @@ static SQLCIPHER_MIGRATION_PROBE_SKIPS: AtomicU64 = AtomicU64::new(0);
 ///   fresh-database path, where no database file has been observed yet.
 /// - A durable migration marker always forces the probe, verdict or not: the
 ///   marker means a migration may have been interrupted, and those crash
-///   windows must keep the #219 self-heal.
+///   windows must keep the mdk#568 self-heal.
 /// - A cache miss, an invalidated entry, or any doubt means probe. Eviction
 ///   and removal-invalidation only ever cause an *extra* probe.
 static SQLCIPHER_V2_VERDICTS: LazyLock<Mutex<SqlcipherV2VerdictCache>> =
@@ -301,7 +301,7 @@ impl MarmotApp {
             //   * a marker is present — an interrupted migration started by the
             //     crash-safe path below, or
             //   * NO marker is present, but the database is still legacy-keyed —
-            //     the pre-fix #219 bricked state, where the salt was written
+            //     the pre-fix mdk#568 bricked state, where the salt was written
             //     before the rekey and the process crashed in between. No marker
             //     was written back then, so a marker check alone never recovers
             //     these already-bricked accounts.
@@ -313,7 +313,7 @@ impl MarmotApp {
             //
             // The probe must run whenever the migration marker exists or this
             // process has not yet established that this database opens under
-            // the v2 key for this salt — those are the crash windows the #219
+            // the v2 key for this salt — those are the crash windows the mdk#568
             // self-heal exists for. Once a verdict has been established, the
             // healthy steady-state path skips the probe so a repeated open of
             // the same database pays the SQLCipher KDF once, not twice
@@ -884,7 +884,7 @@ mod tests {
 
     #[test]
     fn sqlcipher_recovers_pre_fix_bricked_db_with_salt_present_no_marker() {
-        // The pre-fix #219 bricked state: the vulnerable code wrote the salt to
+        // The pre-fix mdk#568 bricked state: the vulnerable code wrote the salt to
         // disk and then crashed before `PRAGMA rekey` committed, so the database
         // is still legacy-keyed. Crucially that code never wrote a migration
         // marker, so the salt-present branch sees `.salt` with NO `.salt-migrating`
@@ -1072,7 +1072,7 @@ mod tests {
         // mdk#1439 acceptance: a durable migration marker always forces the
         // recovery probe, even when a verdict for this database+salt is already
         // cached — the marker means a migration may have been interrupted, and
-        // those crash windows keep the #219 self-heal.
+        // those crash windows keep the mdk#568 self-heal.
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
