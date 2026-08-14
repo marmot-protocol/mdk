@@ -537,6 +537,19 @@ These are real simulator scenarios that are still tied to Rust harness details.
   peeled or a local resource policy releases it.
 - Reason: the trace format does not yet record stale classifications as portable expectations.
 
+### `seven_member_future_epoch_backlog_queues_send_and_regenerates_after_restart`
+
+- Setup: Alice creates a seven-member group. One observer misses Alice's self-update commit but receives 47
+  future-epoch application wrappers, then originates an application of its own.
+- Pressure: the observer's outbound preflight reaches the four-row foreground deferred-peel limit, restarts with both
+  the backlog and queued intent durable, and later receives the withheld epoch-advance commit.
+- Expected: accepting the observer's outbound intent emits no wire, reports the bounded foreground outcome, and leaves
+  exactly one queued intent. Restart preserves that state. Delivering the missing commit peels the complete backlog,
+  advances the observer, and regenerates its queued application for publication; its durable intent remains until the
+  harness reports publication acceptance.
+- Reason: this is production-shaped Nostr-wrapper and multi-client coverage; the 250ms blocked-peeler timing boundary
+  remains a deterministic engine integration test rather than a portable protocol assertion.
+
 ## Generated Scenario Families
 
 Generated cases are deterministic for a fixed family, seed, and case index. They are run directly as generated coverage.

@@ -562,6 +562,7 @@ impl<S: StorageProvider> Engine<S> {
                     let _ = storage.take_welcome(&welcome.message_id)?;
                 }
                 storage.delete_convergence_pass(group_id)?;
+                storage.delete_deferred_peel_generation(group_id)?;
                 for snapshot in storage.list_group_snapshots(group_id)? {
                     storage.release_group_snapshot(group_id, &snapshot)?;
                 }

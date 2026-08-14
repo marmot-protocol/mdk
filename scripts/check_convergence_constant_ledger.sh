@@ -9,7 +9,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 inventory_path="docs/marmot-architecture/convergence-constant-inventory.txt"
 plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
-expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 A1 A2 A3 A4 A5 A6 A7 A8 A9)
+expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 A1 A2 A3 A4 A5 A6 A7 A8 A9)
 inventory_pairs=("__inventory_sentinel__")
 inventory_ids=()
 fail=0
@@ -115,7 +115,7 @@ discover_constants \
     "DEFAULT_(MAX_PAST_EPOCHS|OUT_OF_ORDER_TOLERANCE|MAXIMUM_FORWARD_DISTANCE)"
 discover_constants \
     "crates/cgka-engine/src/message_processor/mod.rs" \
-    "(MAX_CANDIDATE_BRANCH_[A-Z0-9_]+|MAX_CONVERGENCE_[A-Z0-9_]+|MAX_DEFERRED_[A-Z0-9_]+|MAX_PEEL_DEFERRED_[A-Z0-9_]+|MAX_QUEUED_[A-Z0-9_]+|SELF_REMOVE_AUTO_COMMIT_[A-Z0-9_]+)"
+    "(FOREGROUND_DEFERRED_[A-Z0-9_]+|MAX_CANDIDATE_BRANCH_[A-Z0-9_]+|MAX_CONVERGENCE_[A-Z0-9_]+|MAX_DEFERRED_[A-Z0-9_]+|MAX_FOREGROUND_[A-Z0-9_]+|MAX_PEEL_DEFERRED_[A-Z0-9_]+|MAX_QUEUED_[A-Z0-9_]+|SELF_REMOVE_AUTO_COMMIT_[A-Z0-9_]+)"
 discover_constants \
     "crates/cgka-engine/src/openmls_projection.rs" \
     "CANDIDATE_REPLAY_BUDGET_[A-Z0-9_]+"

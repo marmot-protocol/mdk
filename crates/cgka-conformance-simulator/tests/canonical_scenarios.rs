@@ -3361,6 +3361,108 @@ async fn welcome_before_commit_rejects_commit_echo_cleanly_via_harness() {
     );
 }
 
+/// End-to-end #1176 coverage through the production-shaped Nostr wrapper. A
+/// seven-member observer misses one epoch advance, retains 47 future-epoch
+/// applications, and must durably queue its own send without emitting wire.
+/// Restart preserves both work sets; the missing commit then unlocks the
+/// complete backlog and regenerates the queued send.
+#[tokio::test]
+async fn seven_member_future_epoch_backlog_queues_send_and_regenerates_after_restart() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut observer = ClientBuilder::new(pad32(b"observer"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut additional = Vec::new();
+    for index in 0..5 {
+        additional.push(
+            ClientBuilder::new(pad32(format!("member-{index}").as_bytes()))
+                .registry(selfremove_registry())
+                .attach(&bus),
+        );
+    }
+
+    let mut key_packages = vec![observer.fresh_key_package().await];
+    for client in &mut additional {
+        key_packages.push(client.fresh_key_package().await);
+    }
+    let (_group_id, pending) = alice
+        .create_group("foreground-deferred-budget", key_packages, vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    observer.tick().await;
+    assert_eq!(observer.members().len(), 7);
+
+    let epoch_advance = alice.self_update().await;
+    alice.confirm(epoch_advance).await;
+    for index in 0..47 {
+        alice
+            .send_app(format!("future-epoch-application-{index}").into_bytes())
+            .await;
+    }
+    assert_eq!(bus.queued_len(), 48, "one commit plus 47 applications");
+    assert!(bus.delay_queued(0, "missing-epoch-advance"));
+    bus.deliver_all();
+
+    let outcomes = observer.tick_ingest_only().await;
+    assert_eq!(outcomes.len(), 47);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Ok(IngestOutcome::TransportDeferred { .. })))
+    );
+    assert_eq!(bus.queued_len(), 0);
+
+    observer
+        .send_app(b"observer-accepted-pending".to_vec())
+        .await;
+    assert_eq!(bus.queued_len(), 0, "queued acceptance must emit no wire");
+    let pending = observer.pending_work_observation();
+    assert_eq!(pending.engine.stored_transport_deferred_messages, 47);
+    assert_eq!(pending.engine.queued_outbound_intents, 1);
+    let metrics = observer.engine_metrics();
+    assert_eq!(metrics.foreground_deferred_budget_exhausted, 1);
+    assert_eq!(metrics.foreground_deferred_rows_attempted.sample_count(), 1);
+    assert_eq!(
+        metrics
+            .foreground_deferred_rows_attempted
+            .approx_percentile(1.0),
+        Some(4)
+    );
+    assert_eq!(metrics.outbound_wire_prepare_ms.sample_count(), 0);
+    assert_eq!(metrics.outbound_queue_accept_ms.sample_count(), 1);
+
+    observer.restart();
+    let after_restart = observer.pending_work_observation();
+    assert_eq!(after_restart.engine.stored_transport_deferred_messages, 47);
+    assert_eq!(after_restart.engine.queued_outbound_intents, 1);
+    assert_eq!(
+        observer
+            .engine_metrics()
+            .foreground_deferred_budget_exhausted,
+        1,
+        "foreground metrics survive the harness restart rollup"
+    );
+
+    assert!(bus.release_delayed("missing-epoch-advance"));
+    bus.deliver_all();
+    observer.tick().await;
+    assert_eq!(observer.epoch(), EpochId(2));
+    let drained = observer.pending_work_observation();
+    assert_eq!(drained.engine.stored_transport_deferred_messages, 0);
+    assert_eq!(
+        drained.engine.queued_outbound_intents, 1,
+        "durable intent remains until publication acknowledgement"
+    );
+    assert!(
+        bus.queued_len() >= 1,
+        "the regenerated observer application is now publishable"
+    );
+}
+
 /// End-to-end proof of the convergence assert surface: an observer's engine
 /// makes a real `convergence_decision`, the harness recorder captures it, and it
 /// is asserted through `TraceExpectation::ConvergenceDecision`. Two admins invite

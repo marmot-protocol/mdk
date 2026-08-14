@@ -52,6 +52,9 @@ const LATENESS_BUCKET_BOUNDS_MS: [u64; 24] = [
 /// the higher edges leave headroom for groups that negotiate a deeper horizon.
 const REWIND_DEPTH_BUCKET_BOUNDS: [u64; 10] = [1, 2, 3, 4, 5, 6, 8, 10, 16, 32];
 
+/// Upper bounds for deferred-row and queue-depth observations.
+const WORK_COUNT_BUCKET_BOUNDS: [u64; 10] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256];
+
 /// Fixed-bucket histogram over `u64` samples (milliseconds for lateness,
 /// commits for rewind depth).
 ///
@@ -215,6 +218,22 @@ pub struct EngineMetrics {
     admin_reservation_prepared: u64,
     /// One-attempt reservations consumed by a failed preparation.
     admin_reservation_failed: u64,
+    /// Outbound preflight phase durations. These phases are recorded
+    /// independently so a slow historical peel is not attributed to required
+    /// authenticated convergence or wire preparation.
+    outbound_required_convergence_ms: BucketHistogram,
+    outbound_deferred_peel_ms: BucketHistogram,
+    outbound_queue_accept_ms: BucketHistogram,
+    outbound_wire_prepare_ms: BucketHistogram,
+    /// Deferred-peel foreground work and outcome aggregates.
+    foreground_deferred_rows_attempted: BucketHistogram,
+    foreground_deferred_backlog: BucketHistogram,
+    foreground_deferred_completed: u64,
+    foreground_deferred_budget_exhausted: u64,
+    foreground_deferred_unchanged: u64,
+    foreground_deferred_errors: u64,
+    foreground_deferred_budget_overrun_ms: BucketHistogram,
+    queued_outbound_wait_ms: BucketHistogram,
     /// Per-group completion time of the last applied pass, in-memory only
     /// (never snapshotted); feeds `generation_gap_ms`.
     last_pass_completed_at_ms: HashMap<GroupId, u64>,
@@ -234,6 +253,18 @@ impl Default for EngineMetrics {
             admin_reservation_hold_observations: 0,
             admin_reservation_prepared: 0,
             admin_reservation_failed: 0,
+            outbound_required_convergence_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            outbound_deferred_peel_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            outbound_queue_accept_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            outbound_wire_prepare_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            foreground_deferred_rows_attempted: BucketHistogram::new(&WORK_COUNT_BUCKET_BOUNDS),
+            foreground_deferred_backlog: BucketHistogram::new(&WORK_COUNT_BUCKET_BOUNDS),
+            foreground_deferred_completed: 0,
+            foreground_deferred_budget_exhausted: 0,
+            foreground_deferred_unchanged: 0,
+            foreground_deferred_errors: 0,
+            foreground_deferred_budget_overrun_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            queued_outbound_wait_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             last_pass_completed_at_ms: HashMap::new(),
         }
     }
@@ -336,6 +367,48 @@ impl EngineMetrics {
         }
     }
 
+    pub(crate) fn note_outbound_required_convergence_ms(&mut self, duration_ms: u64) {
+        self.outbound_required_convergence_ms.record(duration_ms);
+    }
+
+    pub(crate) fn note_outbound_deferred_peel(
+        &mut self,
+        duration_ms: u64,
+        rows_attempted: usize,
+        backlog: usize,
+        outcome: DeferredPeelMetricOutcome,
+        budget_ms: Option<u64>,
+    ) {
+        self.outbound_deferred_peel_ms.record(duration_ms);
+        self.foreground_deferred_rows_attempted
+            .record(rows_attempted as u64);
+        self.foreground_deferred_backlog.record(backlog as u64);
+        match outcome {
+            DeferredPeelMetricOutcome::Completed => self.foreground_deferred_completed += 1,
+            DeferredPeelMetricOutcome::BudgetExhausted => {
+                self.foreground_deferred_budget_exhausted += 1
+            }
+            DeferredPeelMetricOutcome::Unchanged => self.foreground_deferred_unchanged += 1,
+            DeferredPeelMetricOutcome::Error => self.foreground_deferred_errors += 1,
+        }
+        if let Some(budget_ms) = budget_ms {
+            self.foreground_deferred_budget_overrun_ms
+                .record(duration_ms.saturating_sub(budget_ms));
+        }
+    }
+
+    pub(crate) fn note_outbound_queue_accept_ms(&mut self, duration_ms: u64) {
+        self.outbound_queue_accept_ms.record(duration_ms);
+    }
+
+    pub(crate) fn note_outbound_wire_prepare_ms(&mut self, duration_ms: u64) {
+        self.outbound_wire_prepare_ms.record(duration_ms);
+    }
+
+    pub(crate) fn note_queued_outbound_wait_ms(&mut self, duration_ms: u64) {
+        self.queued_outbound_wait_ms.record(duration_ms);
+    }
+
     /// Drop the per-group in-memory records for a group that reached a
     /// terminal state (disband/removal). Both maps grow one entry per live
     /// group and are never snapshotted; without this hook a long-lived
@@ -358,8 +431,30 @@ impl EngineMetrics {
             admin_reservation_hold_observations: self.admin_reservation_hold_observations,
             admin_reservation_prepared: self.admin_reservation_prepared,
             admin_reservation_failed: self.admin_reservation_failed,
+            outbound_required_convergence_ms: self.outbound_required_convergence_ms.snapshot(),
+            outbound_deferred_peel_ms: self.outbound_deferred_peel_ms.snapshot(),
+            outbound_queue_accept_ms: self.outbound_queue_accept_ms.snapshot(),
+            outbound_wire_prepare_ms: self.outbound_wire_prepare_ms.snapshot(),
+            foreground_deferred_rows_attempted: self.foreground_deferred_rows_attempted.snapshot(),
+            foreground_deferred_backlog: self.foreground_deferred_backlog.snapshot(),
+            foreground_deferred_completed: self.foreground_deferred_completed,
+            foreground_deferred_budget_exhausted: self.foreground_deferred_budget_exhausted,
+            foreground_deferred_unchanged: self.foreground_deferred_unchanged,
+            foreground_deferred_errors: self.foreground_deferred_errors,
+            foreground_deferred_budget_overrun_ms: self
+                .foreground_deferred_budget_overrun_ms
+                .snapshot(),
+            queued_outbound_wait_ms: self.queued_outbound_wait_ms.snapshot(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredPeelMetricOutcome {
+    Completed,
+    BudgetExhausted,
+    Unchanged,
+    Error,
 }
 
 /// Aggregate engine telemetry snapshot.
@@ -390,6 +485,18 @@ pub struct EngineMetricsSnapshot {
     pub admin_reservation_prepared: u64,
     /// One-attempt admin reservations consumed by a failed preparation.
     pub admin_reservation_failed: u64,
+    pub outbound_required_convergence_ms: HistogramSnapshot,
+    pub outbound_deferred_peel_ms: HistogramSnapshot,
+    pub outbound_queue_accept_ms: HistogramSnapshot,
+    pub outbound_wire_prepare_ms: HistogramSnapshot,
+    pub foreground_deferred_rows_attempted: HistogramSnapshot,
+    pub foreground_deferred_backlog: HistogramSnapshot,
+    pub foreground_deferred_completed: u64,
+    pub foreground_deferred_budget_exhausted: u64,
+    pub foreground_deferred_unchanged: u64,
+    pub foreground_deferred_errors: u64,
+    pub foreground_deferred_budget_overrun_ms: HistogramSnapshot,
+    pub queued_outbound_wait_ms: HistogramSnapshot,
 }
 
 impl EngineMetricsSnapshot {
@@ -591,5 +698,38 @@ mod tests {
         assert_eq!(snap.post_settle_reorgs, 1);
         assert_eq!(snap.reorg_lateness_ms.overflow_count, 1);
         assert_eq!(snap.reorg_lateness_ms.approx_percentile(1.0), None);
+    }
+
+    #[test]
+    fn outbound_preflight_metrics_keep_phases_and_outcomes_separate() {
+        let mut metrics = EngineMetrics::default();
+        metrics.note_outbound_required_convergence_ms(12);
+        metrics.note_outbound_deferred_peel(
+            275,
+            4,
+            64,
+            DeferredPeelMetricOutcome::BudgetExhausted,
+            Some(250),
+        );
+        metrics.note_outbound_queue_accept_ms(3);
+        metrics.note_queued_outbound_wait_ms(1_200);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.outbound_required_convergence_ms.sample_count(), 1);
+        assert_eq!(snap.outbound_deferred_peel_ms.sample_count(), 1);
+        assert_eq!(snap.outbound_queue_accept_ms.sample_count(), 1);
+        assert_eq!(snap.outbound_wire_prepare_ms.sample_count(), 0);
+        assert_eq!(snap.foreground_deferred_rows_attempted.sample_count(), 1);
+        assert_eq!(snap.foreground_deferred_backlog.sample_count(), 1);
+        assert_eq!(snap.foreground_deferred_completed, 0);
+        assert_eq!(snap.foreground_deferred_budget_exhausted, 1);
+        assert_eq!(snap.foreground_deferred_unchanged, 0);
+        assert_eq!(snap.foreground_deferred_errors, 0);
+        assert_eq!(
+            snap.foreground_deferred_budget_overrun_ms
+                .approx_percentile(1.0),
+            Some(30)
+        );
+        assert_eq!(snap.queued_outbound_wait_ms.sample_count(), 1);
     }
 }

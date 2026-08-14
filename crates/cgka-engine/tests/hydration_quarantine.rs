@@ -690,6 +690,26 @@ impl ConvergencePassStorage for FlakyGroupRecordStorage {
     }
 }
 
+impl cgka_traits::storage::DeferredPeelGenerationStorage for FlakyGroupRecordStorage {
+    fn deferred_peel_generation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::storage::DeferredPeelGeneration>> {
+        self.inner.deferred_peel_generation(group_id)
+    }
+
+    fn put_deferred_peel_generation(
+        &self,
+        generation: &cgka_traits::storage::DeferredPeelGeneration,
+    ) -> StorageResult<()> {
+        self.inner.put_deferred_peel_generation(generation)
+    }
+
+    fn delete_deferred_peel_generation(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_deferred_peel_generation(group_id)
+    }
+}
+
 impl StorageProvider for FlakyGroupRecordStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 

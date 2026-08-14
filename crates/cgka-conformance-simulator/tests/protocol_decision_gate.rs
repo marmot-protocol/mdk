@@ -37,6 +37,12 @@ fn adopted_v1_policy_identity_and_values_are_pinned() {
     for (id, value) in expected {
         assert_eq!(snapshot.values[id], value, "{id}");
     }
+    assert_eq!(snapshot.values["E10.max_candidate_branch_peel_contexts"], 8);
+    assert_eq!(
+        snapshot.values["E11.foreground_deferred_peel_budget_ms"],
+        250
+    );
+    assert_eq!(snapshot.values["E12.max_foreground_deferred_rows"], 4);
 }
 
 #[test]
@@ -67,7 +73,7 @@ fn semantic_or_coupled_change_requires_a_new_required_component() {
             "{id}"
         );
     }
-    for id in ["E1", "E8", "A1", "A8"] {
+    for id in ["E1", "E8", "E11", "E12", "A1", "A8"] {
         assert!(
             !future_policy_change_requires_new_required_app_component(&[id]),
             "{id}"

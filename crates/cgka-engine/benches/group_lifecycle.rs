@@ -14,6 +14,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::{
@@ -25,9 +26,10 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::MessageStorage;
+use cgka_traits::storage::{DeferredPeelGeneration, DeferredPeelGenerationStorage, MessageStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -160,6 +162,79 @@ impl TransportPeeler for BenchPeeler {
     }
 }
 
+/// Peeler used by the #1176 outbound-preflight benchmark matrix. Synthetic
+/// `deferred:` payloads stay opaque; ordinary MLS payloads keep the same
+/// pass-through behavior as the established lifecycle rail.
+#[derive(Clone)]
+struct DeferredBenchPeeler {
+    attempts: Arc<AtomicU64>,
+    block: Arc<AtomicBool>,
+    block_on_attempt: Arc<AtomicU64>,
+}
+
+impl DeferredBenchPeeler {
+    fn new() -> Self {
+        Self {
+            attempts: Arc::new(AtomicU64::new(0)),
+            block: Arc::new(AtomicBool::new(false)),
+            block_on_attempt: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    fn reset(&self) {
+        self.attempts.store(0, Ordering::SeqCst);
+    }
+
+    fn block_from_attempt(&self, attempt: u64) {
+        self.reset();
+        self.block_on_attempt.store(attempt, Ordering::SeqCst);
+        self.block.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for DeferredBenchPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload.starts_with(b"deferred:") {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.block.load(Ordering::SeqCst)
+                && attempt >= self.block_on_attempt.load(Ordering::SeqCst)
+            {
+                // Foreground code bounds this wait by its remaining monotonic
+                // budget. The long sleep makes the budget, not this fixture,
+                // determine the observed latency.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            return Err(PeelerError::DecryptFailed);
+        }
+        BenchPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        BenchPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        BenchPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        BenchPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 // ── Engine construction ─────────────────────────────────────────────────────
 
 fn build_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
@@ -177,6 +252,23 @@ fn build_client_with_storage(
         .peeler(Box::new(BenchPeeler))
         .build()
         .expect("build bench engine")
+}
+
+fn build_deferred_bench_client(
+    identity: &[u8],
+    storage: SqliteAccountStorage,
+    peeler: DeferredBenchPeeler,
+    recorder: Option<marmot_forensics::JsonlRecorder>,
+) -> Engine<SqliteAccountStorage> {
+    let mut builder = EngineBuilder::new(storage)
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(peeler));
+    if let Some(recorder) = recorder {
+        builder = builder.recorder(Box::new(recorder));
+    }
+    builder.build().expect("build deferred benchmark engine")
 }
 
 // ── retained-anchor snapshot capture ───────────────────────────────────────
@@ -515,6 +607,269 @@ fn bench_app_message_send(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DeferredPreflightCase {
+    Clean,
+    UnchangedBacklog,
+    ChangedContext,
+    Contested,
+    Restart,
+    EpochChurn,
+}
+
+impl DeferredPreflightCase {
+    const ALL: [Self; 6] = [
+        Self::Clean,
+        Self::UnchangedBacklog,
+        Self::ChangedContext,
+        Self::Contested,
+        Self::Restart,
+        Self::EpochChurn,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::UnchangedBacklog => "unchanged-backlog",
+            Self::ChangedContext => "changed-context-blocked",
+            Self::Contested => "contested",
+            Self::Restart => "restart-resume",
+            Self::EpochChurn => "epoch-churn",
+        }
+    }
+
+    fn expects_queue(self) -> bool {
+        !matches!(self, Self::Clean | Self::UnchangedBacklog)
+    }
+}
+
+struct DeferredPreflightFixture {
+    engine: Engine<SqliteAccountStorage>,
+    group_id: GroupId,
+    peeler: DeferredBenchPeeler,
+    case: DeferredPreflightCase,
+    // Keep the recorder's parent alive until after the engine flushes it.
+    _audit_dir: Option<tempfile::TempDir>,
+}
+
+fn seed_deferred_backlog(
+    rt: &tokio::runtime::Runtime,
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    count: usize,
+) {
+    let transport_group_id = engine
+        .group_context(group_id)
+        .expect("group context")
+        .transport_group_id()
+        .expect("transport group id");
+    for index in 0..count {
+        let message = TransportMessage {
+            id: MessageId::new(format!("deferred-matrix-{index}").into_bytes()),
+            payload: format!("deferred:{index}").into_bytes(),
+            timestamp: Timestamp(index as u64),
+            causal_deps: vec![],
+            source: TransportSource("bench".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: transport_group_id.clone(),
+            },
+        };
+        assert!(matches!(
+            rt.block_on(engine.ingest(message))
+                .expect("retain deferred benchmark row"),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+}
+
+fn mark_backlog_unchanged(
+    rt: &tokio::runtime::Runtime,
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+) {
+    rt.block_on(engine.retry_deferred_peels(group_id))
+        .expect("complete one background fingerprint sweep");
+}
+
+fn reset_deferred_fingerprints(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    completed_prefix: usize,
+) -> [u8; 32] {
+    let mut deferred = storage
+        .list_messages(group_id, EpochId(0))
+        .expect("list deferred benchmark rows")
+        .into_iter()
+        .filter(|record| record.state == MessageState::PeelDeferred)
+        .collect::<Vec<_>>();
+    let fingerprint = deferred
+        .first()
+        .and_then(|record| record.deferred_peel.as_ref())
+        .and_then(|lifecycle| lifecycle.last_context_fingerprint)
+        .expect("background sweep persisted a fingerprint");
+    for (index, record) in deferred.iter_mut().enumerate() {
+        if index >= completed_prefix {
+            record
+                .deferred_peel
+                .as_mut()
+                .expect("deferred lifecycle")
+                .last_context_fingerprint = None;
+            storage
+                .put_message(record)
+                .expect("reset deferred fingerprint");
+        }
+    }
+    fingerprint
+}
+
+fn install_benchmark_recorder(
+    engine: &mut Engine<SqliteAccountStorage>,
+    enabled: bool,
+) -> Option<tempfile::TempDir> {
+    if !enabled {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("create benchmark recorder directory");
+    let recorder = marmot_forensics::JsonlRecorder::open(
+        dir.path().join("deferred-preflight.jsonl"),
+        "deferred-preflight-benchmark".into(),
+    )
+    .expect("open benchmark recorder");
+    engine.set_recorder(Box::new(recorder));
+    Some(dir)
+}
+
+fn prepare_deferred_preflight_fixture(
+    rt: &tokio::runtime::Runtime,
+    members: usize,
+    recorder_enabled: bool,
+    case: DeferredPreflightCase,
+) -> DeferredPreflightFixture {
+    const BACKLOG: usize = 64;
+
+    let identity = format!(
+        "bench-deferred-{}-{}-{}",
+        members,
+        recorder_enabled as u8,
+        case.label()
+    );
+    let storage = SqliteAccountStorage::in_memory().expect("matrix storage");
+    let peeler = DeferredBenchPeeler::new();
+    let mut engine =
+        build_deferred_bench_client(identity.as_bytes(), storage.clone(), peeler.clone(), None);
+    let key_packages = invitee_key_packages(members.saturating_sub(1));
+    let (group_id, result) = rt
+        .block_on(engine.create_group(create_request(key_packages)))
+        .expect("create matrix group");
+    assert!(matches!(result, SendResult::FoundingGroupCreated { .. }));
+
+    if matches!(case, DeferredPreflightCase::EpochChurn) {
+        for sequence in 0..3 {
+            update_group_data(rt, &mut engine, &group_id, sequence);
+        }
+    }
+
+    if !matches!(case, DeferredPreflightCase::Clean) {
+        seed_deferred_backlog(rt, &mut engine, &group_id, BACKLOG);
+    }
+
+    match case {
+        DeferredPreflightCase::Clean | DeferredPreflightCase::ChangedContext => {}
+        DeferredPreflightCase::UnchangedBacklog => {
+            mark_backlog_unchanged(rt, &mut engine, &group_id);
+        }
+        DeferredPreflightCase::Contested => {
+            mark_backlog_unchanged(rt, &mut engine, &group_id);
+            let fingerprint = reset_deferred_fingerprints(&storage, &group_id, 0);
+            storage
+                .put_deferred_peel_generation(&DeferredPeelGeneration {
+                    group_id: group_id.clone(),
+                    context_fingerprint: fingerprint,
+                })
+                .expect("persist contested benchmark barrier");
+        }
+        DeferredPreflightCase::Restart => {
+            mark_backlog_unchanged(rt, &mut engine, &group_id);
+            reset_deferred_fingerprints(&storage, &group_id, 4);
+            drop(engine);
+            engine =
+                build_deferred_bench_client(identity.as_bytes(), storage, peeler.clone(), None);
+            engine
+                .hydrate_all_stored_groups()
+                .expect("hydrate restarted benchmark engine");
+        }
+        DeferredPreflightCase::EpochChurn => {}
+    }
+
+    peeler.reset();
+    if matches!(case, DeferredPreflightCase::ChangedContext) {
+        peeler.block_from_attempt(4);
+    }
+    let audit_dir = install_benchmark_recorder(&mut engine, recorder_enabled);
+    DeferredPreflightFixture {
+        engine,
+        group_id,
+        peeler,
+        case,
+        _audit_dir: audit_dir,
+    }
+}
+
+/// #1176 foreground deferred-maintenance evidence rail. These timings are
+/// compared on the same machine; they are not a shared-runner CI threshold.
+fn bench_deferred_outbound_preflight_matrix(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("bench runtime");
+    let mut group = c.benchmark_group("deferred_outbound_preflight");
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_millis(500));
+    group.sample_size(10);
+
+    for recorder_enabled in [false, true] {
+        for members in [1_usize, 5, 9] {
+            for case in DeferredPreflightCase::ALL {
+                let label = format!(
+                    "recorder={}/members={members}/{}",
+                    if recorder_enabled { "on" } else { "off" },
+                    case.label()
+                );
+                group.bench_function(label, |b| {
+                    b.iter_batched(
+                        || prepare_deferred_preflight_fixture(&rt, members, recorder_enabled, case),
+                        |mut fixture| {
+                            let payload = app_payload_for(&fixture.engine);
+                            let result = rt
+                                .block_on(fixture.engine.send(SendIntent::AppMessage {
+                                    group_id: fixture.group_id.clone(),
+                                    payload,
+                                }))
+                                .expect("matrix send");
+                            if fixture.case.expects_queue() {
+                                assert!(matches!(result, SendResult::Queued { .. }));
+                                assert!(fixture.peeler.attempts.load(Ordering::SeqCst) <= 4);
+                                assert_eq!(
+                                    fixture
+                                        .engine
+                                        .engine_metrics()
+                                        .outbound_wire_prepare_ms
+                                        .sample_count(),
+                                    0
+                                );
+                            } else {
+                                assert!(matches!(result, SendResult::ApplicationMessage { .. }));
+                            }
+                        },
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 fn prepare_app_ingest(
     rt: &tokio::runtime::Runtime,
 ) -> (Engine<SqliteAccountStorage>, TransportMessage) {
@@ -724,6 +1079,7 @@ criterion_group!(
     bench_join_welcome,
     bench_join_welcome_large_group,
     bench_app_message_send,
+    bench_deferred_outbound_preflight_matrix,
     bench_app_message_ingest,
     bench_rejoin_welcome_with_history,
     bench_canonical_advance_with_history

@@ -15,15 +15,20 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{MessageStorage, StorageError};
+use cgka_traits::storage::{
+    DeferredPeelGeneration, DeferredPeelGenerationStorage, MessageStorage, OutboundIntentStorage,
+    StorageError,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
+use tokio::sync::Notify;
 
 mod support;
 use support::proof_signer;
@@ -163,6 +168,118 @@ impl TransportPeeler for CountingEpochGatePeeler {
     }
 }
 
+/// Epoch-gated peeler whose foreground retry attempt can be held on a
+/// `Notify`. Initial ingest remains fast; tests arm the gate only after the
+/// deferred backlog is durable.
+#[derive(Clone)]
+struct NotifyEpochGatePeeler {
+    gated: Arc<AtomicBool>,
+    gated_attempts: Arc<AtomicU64>,
+    block_on_attempt: Arc<AtomicU64>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl NotifyEpochGatePeeler {
+    fn new() -> Self {
+        Self {
+            gated: Arc::new(AtomicBool::new(false)),
+            gated_attempts: Arc::new(AtomicU64::new(0)),
+            block_on_attempt: Arc::new(AtomicU64::new(u64::MAX)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    fn block_on_attempt(&self, attempt: u64) {
+        self.gated_attempts.store(0, Ordering::SeqCst);
+        self.block_on_attempt.store(attempt, Ordering::SeqCst);
+        self.gated.store(true, Ordering::SeqCst);
+    }
+
+    fn gated_attempts(&self) -> u64 {
+        self.gated_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for NotifyEpochGatePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if self.gated.load(Ordering::SeqCst) {
+            let attempt = self.gated_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt >= self.block_on_attempt.load(Ordering::SeqCst) {
+                self.entered.notify_waiters();
+                self.release.notified().await;
+            }
+        }
+        if let Ok(projection) = project_mls_message(&msg.payload)
+            && let Some(source_epoch) = projection.source_epoch
+            && ctx.epoch().0 < source_epoch
+        {
+            return Err(PeelerError::DecryptFailed);
+        }
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::MlsMessage {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        })
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+        })
+    }
+}
+
 fn build_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
@@ -216,6 +333,31 @@ fn build_counting_client_with_storage_and_clock(
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(peeler.clone()))
         .convergence_clock(Arc::new(clock))
+        .build()
+        .unwrap();
+    engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    (engine, storage, peeler)
+}
+
+fn build_notify_client(
+    name: &[u8],
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    NotifyEpochGatePeeler,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let peeler = NotifyEpochGatePeeler::new();
+    let mut engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .peeler(Box::new(peeler.clone()))
         .build()
         .unwrap();
     engine
@@ -303,17 +445,13 @@ async fn carol_behind_two_epochs() -> (
     carol_behind_two_epochs_with(build_counting_client(b"carol")).await
 }
 
-async fn carol_behind_two_epochs_with(
-    carol: (
-        Engine<SqliteAccountStorage>,
-        SqliteAccountStorage,
-        CountingEpochGatePeeler,
-    ),
+async fn carol_behind_two_epochs_with<P>(
+    carol: (Engine<SqliteAccountStorage>, SqliteAccountStorage, P),
 ) -> (
     Engine<SqliteAccountStorage>,
     Engine<SqliteAccountStorage>,
     SqliteAccountStorage,
-    CountingEpochGatePeeler,
+    P,
     GroupId,
     TransportMessage,
     TransportMessage,
@@ -381,6 +519,114 @@ async fn carol_behind_two_epochs_with(
     )
 }
 
+#[tokio::test]
+async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
+    assert_eq!(
+        cgka_engine::message_processor::FOREGROUND_DEFERRED_PEEL_BUDGET_MS,
+        250
+    );
+    assert_eq!(
+        cgka_engine::message_processor::MAX_FOREGROUND_DEFERRED_ROWS,
+        4
+    );
+
+    for backlog in [47_usize, 64] {
+        let client = build_notify_client(b"carol");
+        let (mut alice, mut carol, storage, peeler, group_id, _commit2, _commit3) =
+            carol_behind_two_epochs_with(client).await;
+
+        let template = send_app(&mut alice, &group_id, "foreground deferred backlog").await;
+        for index in 0..backlog {
+            let wrapped = TransportMessage {
+                id: MessageId::new(format!("foreground-{backlog}-{index}").into_bytes()),
+                ..template.clone()
+            };
+            assert!(matches!(
+                carol.ingest(wrapped).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ));
+        }
+        assert_eq!(
+            storage
+                .list_messages(&group_id, EpochId(0))
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.state == MessageState::PeelDeferred)
+                .count(),
+            backlog
+        );
+
+        carol.set_foreground_deferred_peel_budget(25, 4);
+        peeler.block_on_attempt(4);
+
+        let result = carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "queued application"),
+            })
+            .await
+            .unwrap();
+        let app_intent_id = match result {
+            SendResult::Queued { intent_id, .. } => intent_id,
+            other => panic!("expected queued application, got {other:?}"),
+        };
+        assert_eq!(peeler.gated_attempts(), 4);
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+        // Isolate each intent class from the separate queued-before-history
+        // priority rule: once a queue exists, a later direct send is allowed
+        // to overtake it and skips historical maintenance.
+        storage
+            .delete_queued_outbound_intent(&app_intent_id)
+            .unwrap();
+
+        // The same shared preflight queues proposal- and commit-producing
+        // requests without constructing either wire artifact.
+        peeler.block_on_attempt(1);
+        let leave = carol
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+        let leave_intent_id = match leave {
+            SendResult::Queued { intent_id, .. } => intent_id,
+            other => panic!("expected queued proposal, got {other:?}"),
+        };
+        storage
+            .delete_queued_outbound_intent(&leave_intent_id)
+            .unwrap();
+        peeler.block_on_attempt(1);
+        assert!(matches!(
+            carol
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let metrics = carol.engine_metrics();
+        assert_eq!(metrics.foreground_deferred_budget_exhausted, 3);
+        assert_eq!(metrics.outbound_wire_prepare_ms.sample_count(), 0);
+        assert_eq!(metrics.outbound_queue_accept_ms.sample_count(), 3);
+    }
+}
+
 /// The core #339 fix: a deferred row is not re-peeled while the
 /// (epoch, snapshot-set) peel context is unchanged — after one unproductive
 /// full cycle over the backlog, whole sweeps are skipped.
@@ -427,7 +673,219 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
         MessageState::PeelDeferred,
         "row stays retained while the context is unchanged"
     );
+
+    // A newly retained wrapper has not been examined with candidate branch
+    // contexts merely because older rows completed this fingerprint. It must
+    // invalidate the historical-only fast path and receive one sweep attempt.
+    let new_wrapper = TransportMessage {
+        id: MessageId::new(b"new-wrapper-same-context".to_vec()),
+        ..commit3.clone()
+    };
+    assert!(matches!(
+        carol.ingest(new_wrapper.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let after_live_attempt = carol_peeler.attempts_for(&new_wrapper.id);
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_003)
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_peeler.attempts_for(&new_wrapper.id),
+        after_live_attempt + 1,
+        "new row must be examined under the current full peel context"
+    );
+
+    let historical_attempts =
+        carol_peeler.attempts_for(&commit3.id) + carol_peeler.attempts_for(&new_wrapper.id);
+    assert!(matches!(
+        carol
+            .queue_app_message(
+                group_id.clone(),
+                app_payload_for(&carol, "queued before historical maintenance"),
+            )
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+    let queued_before_fresh_send = carol_storage
+        .list_queued_outbound_intents(&group_id)
+        .unwrap()
+        .len();
+    let untested_history = TransportMessage {
+        id: MessageId::new(b"history-arrived-behind-queue".to_vec()),
+        ..commit3.clone()
+    };
+    assert!(matches!(
+        carol.ingest(untested_history.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let untested_attempts = carol_peeler.attempts_for(&untested_history.id);
+
+    // The documented non-FIFO contract still allows a later direct send to
+    // overtake, but neither it nor the queued drain may run untested
+    // historical-only peeling ahead of already accepted user work.
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "later direct send"),
+            })
+            .await
+            .unwrap(),
+        SendResult::ApplicationMessage { .. }
+    ));
+    assert_eq!(
+        carol_peeler.attempts_for(&untested_history.id),
+        untested_attempts,
+        "direct send must skip historical peeling while a queue exists"
+    );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        queued_before_fresh_send
+    );
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_004)
+        .await
+        .unwrap();
+    assert!(matches!(
+        drained.as_slice(),
+        [SendResult::ApplicationMessage { .. }]
+    ));
+    assert_eq!(
+        carol_peeler.attempts_for(&commit3.id) + carol_peeler.attempts_for(&new_wrapper.id),
+        historical_attempts,
+        "queued intent must drain before unchanged historical-only maintenance"
+    );
+    assert_eq!(
+        carol_peeler.attempts_for(&untested_history.id),
+        untested_attempts,
+        "queued drain must skip even newly untested historical-only rows"
+    );
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+}
+
+#[tokio::test]
+async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset() {
+    let client = build_notify_client(b"carol");
+    let (mut alice, mut carol, storage, peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs_with(client).await;
+    let template = send_app(&mut alice, &group_id, "restart resume backlog").await;
+    let mut ids = Vec::new();
+    for index in 0..64 {
+        let id = MessageId::new(format!("restart-resume-{index}").into_bytes());
+        ids.push(id.clone());
+        assert!(matches!(
+            carol
+                .ingest(TransportMessage {
+                    id,
+                    ..template.clone()
+                })
+                .await
+                .unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    carol.set_foreground_deferred_peel_budget(25, 4);
+    peeler.block_on_attempt(4);
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "restart queued"),
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+    assert_eq!(peeler.gated_attempts(), 4);
+    drop(carol);
+
+    let clock = ManualConvergenceClock::new(2_000, 20_000);
+    let (mut restarted, _, restarted_peeler) =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock);
+    restarted.hydrate_all_stored_groups().unwrap();
+    restarted.retry_deferred_peels(&group_id).await.unwrap();
+
+    for id in &ids[..3] {
+        assert_eq!(
+            restarted_peeler.attempts_for(id),
+            0,
+            "definitively completed rows must not repeat after restart"
+        );
+    }
+    assert_eq!(
+        restarted_peeler.attempts_for(&ids[3]),
+        1,
+        "the timed-out row must be the first resumed attempt"
+    );
+    assert_eq!(
+        restarted_peeler.attempts_for(ids.last().unwrap()),
+        1,
+        "later rows must not be stranded behind an in-memory cursor"
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "accepted-pending intent survives the same restart"
+    );
+}
+
+#[tokio::test]
+async fn contested_generation_barrier_survives_restart_and_blocks_prefix_convergence() {
+    let (_alice, mut carol, storage, _peeler, group_id, commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    storage
+        .put_deferred_peel_generation(&DeferredPeelGeneration {
+            group_id: group_id.clone(),
+            context_fingerprint: [9; 32],
+        })
+        .unwrap();
+
+    assert!(matches!(
+        carol.ingest(commit2).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    drop(carol);
+
+    let clock = ManualConvergenceClock::new(3_000, 30_000);
+    let (mut restarted, _, _) =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock);
+    restarted.hydrate_all_stored_groups().unwrap();
+    let blocked = restarted
+        .converge_stored_openmls_messages(&group_id)
+        .unwrap();
+    assert_eq!(
+        blocked.convergence_status,
+        cgka_engine::canonicalization::ConvergenceStatus::Syncing
+    );
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(1));
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_some(),
+        "restart must retain the prefix-adjudication barrier"
+    );
+
+    // With no raw rows remaining, deferred maintenance closes the generation
+    // and drains the complete durable content set.
+    restarted.retry_deferred_peels(&group_id).await.unwrap();
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
 }
 
 /// The gate must not block legitimate retries: once the epoch advances, the

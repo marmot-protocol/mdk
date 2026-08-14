@@ -106,6 +106,50 @@ pub(crate) fn merge_engine_metrics(
     target.admin_reservation_failed = target
         .admin_reservation_failed
         .saturating_add(source.admin_reservation_failed);
+    merge_histogram(
+        &mut target.outbound_required_convergence_ms,
+        &source.outbound_required_convergence_ms,
+    );
+    merge_histogram(
+        &mut target.outbound_deferred_peel_ms,
+        &source.outbound_deferred_peel_ms,
+    );
+    merge_histogram(
+        &mut target.outbound_queue_accept_ms,
+        &source.outbound_queue_accept_ms,
+    );
+    merge_histogram(
+        &mut target.outbound_wire_prepare_ms,
+        &source.outbound_wire_prepare_ms,
+    );
+    merge_histogram(
+        &mut target.foreground_deferred_rows_attempted,
+        &source.foreground_deferred_rows_attempted,
+    );
+    merge_histogram(
+        &mut target.foreground_deferred_backlog,
+        &source.foreground_deferred_backlog,
+    );
+    target.foreground_deferred_completed = target
+        .foreground_deferred_completed
+        .saturating_add(source.foreground_deferred_completed);
+    target.foreground_deferred_budget_exhausted = target
+        .foreground_deferred_budget_exhausted
+        .saturating_add(source.foreground_deferred_budget_exhausted);
+    target.foreground_deferred_unchanged = target
+        .foreground_deferred_unchanged
+        .saturating_add(source.foreground_deferred_unchanged);
+    target.foreground_deferred_errors = target
+        .foreground_deferred_errors
+        .saturating_add(source.foreground_deferred_errors);
+    merge_histogram(
+        &mut target.foreground_deferred_budget_overrun_ms,
+        &source.foreground_deferred_budget_overrun_ms,
+    );
+    merge_histogram(
+        &mut target.queued_outbound_wait_ms,
+        &source.queued_outbound_wait_ms,
+    );
 }
 
 fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
