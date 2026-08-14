@@ -118,9 +118,13 @@ impl EpochManager {
     ///
     /// Callers already reach this only from the two overwritable states, or
     /// from no state at all — every guard here reads through `is_some_and`, so
-    /// create/join and hydration pass by construction. A fired refusal means a
-    /// caller lost its gate; see the invariant in
-    /// `crates/cgka-engine/AGENTS.md`.
+    /// create/join and hydration pass by construction. The convergence caller
+    /// is gated a step earlier than it looks: a held publication and an
+    /// unresolved convergence input cannot coexist, because the outbound
+    /// preflight settles convergence before it stages anything and `can_ingest`
+    /// keeps new input out afterwards, so a pass entered under a held
+    /// publication has no branch to select. A fired refusal means a caller lost
+    /// its gate; see the invariant in `crates/cgka-engine/AGENTS.md`.
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
         if self.is_unrecoverable(&group_id) || self.is_disbanded(&group_id) {
             tracing::warn!(

@@ -2020,3 +2020,134 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
         "expected a direct send once the group is stable again, got {sent:?}"
     );
 }
+
+/// A held publication and an unresolved convergence input are mutually
+/// exclusive, and that is what keeps a convergence pass from ever landing on
+/// top of a staged commit.
+///
+/// This is the outbound half: the send preflight settles convergence *before*
+/// it stages anything, so an unresolved input diverts the intent to the
+/// retention queue and the group never leaves `Stable`. `begin_pending` is
+/// never reached, so there is no window in which a pass could select a branch
+/// under a publication this client is still holding.
+#[tokio::test]
+async fn a_publication_is_never_staged_while_a_convergence_input_is_unresolved() {
+    let mut alice = build_engine_with_storage(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    let stable_epoch = alice.epoch(&group_id).unwrap();
+
+    // Bob commits and Alice buffers it while she is still `Stable`, so it
+    // becomes a live convergence input rather than retained transport bytes.
+    let SendResult::GroupEvolution {
+        msg,
+        pending: bob_pending,
+        ..
+    } = bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a staged self-update")
+    };
+    bob.confirm_published(bob_pending).await.unwrap();
+    assert!(matches!(
+        alice.ingest(msg).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    let sent = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, SendResult::Queued { .. }),
+        "an unresolved convergence input must divert a group-state intent to the \
+         retention queue instead of staging a commit, got {sent:?}"
+    );
+    assert!(
+        alice
+            .epoch_state(&group_id)
+            .expect("alice tracks the group")
+            .is_stable(),
+        "the group must stay Stable: a staged commit here is the window in which \
+         a convergence pass could overwrite a held publication"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), stable_epoch);
+}
+
+/// The inbound half of the same exclusion: once a publication is held,
+/// `can_ingest` is false, so an arriving commit is retained as transport bytes
+/// for deterministic replay rather than buffered as a convergence input. A
+/// pass run against that group therefore has no branch to select — it is an
+/// empty no-op, and the publication still resolves through its own transition.
+#[tokio::test]
+async fn an_inbound_commit_under_a_held_publication_is_retained_not_converged() {
+    let mut alice = build_engine_with_storage(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a staged self-update")
+    };
+    let staged_epoch = alice.epoch(&group_id).unwrap();
+    assert!(
+        alice
+            .epoch_state(&group_id)
+            .expect("alice tracks the group")
+            .is_resolving_local_publish()
+    );
+
+    let SendResult::GroupEvolution {
+        msg,
+        pending: bob_pending,
+        ..
+    } = bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a staged self-update")
+    };
+    bob.confirm_published(bob_pending).await.unwrap();
+    assert!(matches!(
+        alice.ingest(msg).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    // The ungated public entry point, run at the worst possible moment.
+    let result = alice
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("a pass over a held publication runs against no eligible input");
+    assert!(
+        result.selected_tip.is_none(),
+        "a pass must have no branch to select while a publication is held"
+    );
+    assert!(result.accepted_commits.is_empty());
+    assert_eq!(
+        alice.epoch(&group_id).unwrap(),
+        staged_epoch,
+        "the pass must leave the held publication's epoch untouched"
+    );
+
+    let confirmed = alice
+        .confirm_published(pending)
+        .await
+        .expect("the publication still resolves through its own transition");
+    assert!(matches!(
+        confirmed,
+        cgka_traits::engine::GroupEvent::EpochChanged { to, .. } if to == staged_epoch
+    ));
+}
