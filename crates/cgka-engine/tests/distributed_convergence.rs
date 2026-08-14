@@ -2392,6 +2392,129 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     );
 }
 
+/// Application observations and the accepted-message result are canonical
+/// even when peers admit the same source-epoch applications in opposite
+/// transport order. Exercise the retained base, each commit edge, and the
+/// selected tip so every application replay bucket uses the same ordering.
+#[tokio::test]
+async fn application_replay_is_invariant_to_opposite_arrival_order() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut forward, _forward_storage) = build_client(b"forward");
+    let (mut reverse, _reverse_storage) = build_client(b"reverse");
+
+    let forward_kp = forward.fresh_key_package().await.unwrap();
+    let reverse_kp = reverse.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "canonical-application-arrival-order".into(),
+            description: "".into(),
+            members: vec![forward_kp, reverse_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    forward
+        .join_welcome(welcome_for(&welcomes, b"forward"))
+        .await
+        .unwrap();
+    reverse
+        .join_welcome(welcome_for(&welcomes, b"reverse"))
+        .await
+        .unwrap();
+    forward.drain_events();
+    reverse.drain_events();
+
+    let base_apps = [
+        send_app(&mut alice, &group_id, b"base-a".to_vec()).await,
+        send_app(&mut alice, &group_id, b"base-b".to_vec()).await,
+    ];
+    let (mut david, _david_storage) = build_client(b"arrival-order-david");
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit_david, pending) = evolution(invite_david);
+    alice.confirm_published(pending).await.unwrap();
+    let edge_apps = [
+        send_app(&mut alice, &group_id, b"edge-a".to_vec()).await,
+        send_app(&mut alice, &group_id, b"edge-b".to_vec()).await,
+    ];
+    let (mut eve, _eve_storage) = build_client(b"arrival-order-eve");
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit_eve, pending) = evolution(invite_eve);
+    alice.confirm_published(pending).await.unwrap();
+    let tip_apps = [
+        send_app(&mut alice, &group_id, b"tip-a".to_vec()).await,
+        send_app(&mut alice, &group_id, b"tip-b".to_vec()).await,
+    ];
+    let commit_david = route(commit_david, &group_id);
+    let commit_eve = route(commit_eve, &group_id);
+
+    for apps in [&base_apps, &edge_apps, &tip_apps] {
+        for app in apps {
+            forward
+                .buffer_openmls_convergence_message_at(&group_id, app.clone(), 1_000)
+                .unwrap();
+        }
+    }
+    for commit in [&commit_david, &commit_eve] {
+        forward
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
+            .unwrap();
+        reverse
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
+            .unwrap();
+    }
+    for apps in [&tip_apps, &edge_apps, &base_apps] {
+        for app in apps.iter().rev() {
+            reverse
+                .buffer_openmls_convergence_message_at(&group_id, app.clone(), 1_000)
+                .unwrap();
+        }
+    }
+
+    let forward_result = forward
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    let reverse_result = reverse
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+
+    assert_eq!(
+        forward_result.accepted_app_messages,
+        reverse_result.accepted_app_messages
+    );
+    let received_payloads = |events: Vec<GroupEvent>| {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { payload, .. } => Some(app_content(&payload).to_vec()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        received_payloads(forward.drain_events()),
+        received_payloads(reverse.drain_events())
+    );
+}
+
 /// A frozen convergence pass already owns a bounded retained-anchor snapshot.
 /// Application inputs admitted while they are inside the app window must use
 /// that source-epoch state before later commits in the same pass advance far
