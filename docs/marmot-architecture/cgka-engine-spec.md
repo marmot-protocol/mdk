@@ -149,11 +149,13 @@ targets a later candidate epoch.
 
 Before preparing any new outbound application message, proposal, or commit, the engine MUST give every deferred row
 not yet definitively tested under the current peel-context fingerprint a bounded foreground opportunity. Production
-uses the earlier of 250ms local monotonic time or four attempted rows. If work remains when either bound is reached,
-the engine MUST durably retain the original outbound intent and return `AcceptedPending`; it MUST NOT prepare wire
-bytes. Rows already definitively tested under that fingerprint are historical-only maintenance and MUST NOT keep a new
-outbound intent waiting. The durable per-row fingerprint, rather than a process-local numeric cursor, determines which
-row is next after restart.
+uses the earlier of 250 ms of local monotonic deferred-phase time or four row attempts. Required authenticated
+convergence is completed first and does not consume that deferred-phase time budget. If work remains when either bound
+is reached, the engine MUST durably retain the original outbound intent and return `AcceptedPending`; it MUST NOT
+prepare wire bytes. Current-fingerprint deferred work remains safety-critical ahead of every queued outbound intent.
+Rows already definitively tested under that fingerprint are historical-only maintenance and MUST NOT keep a new or
+queued outbound intent waiting. The durable per-row fingerprint, rather than a process-local numeric cursor,
+determines which row is next after restart.
 
 When candidate-branch peel contexts are involved, the engine MUST persist a contested-generation marker before trying
 the first row and MUST retain that marker until every row in the generation has a durable definitive outcome. While

@@ -258,17 +258,14 @@ fn build_deferred_bench_client(
     identity: &[u8],
     storage: SqliteAccountStorage,
     peeler: DeferredBenchPeeler,
-    recorder: Option<marmot_forensics::JsonlRecorder>,
 ) -> Engine<SqliteAccountStorage> {
-    let mut builder = EngineBuilder::new(storage)
+    EngineBuilder::new(storage)
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(peeler));
-    if let Some(recorder) = recorder {
-        builder = builder.recorder(Box::new(recorder));
-    }
-    builder.build().expect("build deferred benchmark engine")
+        .peeler(Box::new(peeler))
+        .build()
+        .expect("build deferred benchmark engine")
 }
 
 // ── retained-anchor snapshot capture ───────────────────────────────────────
@@ -647,7 +644,6 @@ struct DeferredPreflightFixture {
     engine: Engine<SqliteAccountStorage>,
     group_id: GroupId,
     peeler: DeferredBenchPeeler,
-    case: DeferredPreflightCase,
     // Keep the recorder's parent alive until after the engine flushes it.
     _audit_dir: Option<tempfile::TempDir>,
 }
@@ -756,7 +752,7 @@ fn prepare_deferred_preflight_fixture(
     let storage = SqliteAccountStorage::in_memory().expect("matrix storage");
     let peeler = DeferredBenchPeeler::new();
     let mut engine =
-        build_deferred_bench_client(identity.as_bytes(), storage.clone(), peeler.clone(), None);
+        build_deferred_bench_client(identity.as_bytes(), storage.clone(), peeler.clone());
     let key_packages = invitee_key_packages(members.saturating_sub(1));
     let (group_id, result) = rt
         .block_on(engine.create_group(create_request(key_packages)))
@@ -792,8 +788,7 @@ fn prepare_deferred_preflight_fixture(
             mark_backlog_unchanged(rt, &mut engine, &group_id);
             reset_deferred_fingerprints(&storage, &group_id, 4);
             drop(engine);
-            engine =
-                build_deferred_bench_client(identity.as_bytes(), storage, peeler.clone(), None);
+            engine = build_deferred_bench_client(identity.as_bytes(), storage, peeler.clone());
             engine
                 .hydrate_all_stored_groups()
                 .expect("hydrate restarted benchmark engine");
@@ -810,8 +805,35 @@ fn prepare_deferred_preflight_fixture(
         engine,
         group_id,
         peeler,
-        case,
         _audit_dir: audit_dir,
+    }
+}
+
+fn assert_deferred_preflight_contract(
+    rt: &tokio::runtime::Runtime,
+    fixture: &mut DeferredPreflightFixture,
+    case: DeferredPreflightCase,
+) {
+    let payload = app_payload_for(&fixture.engine);
+    let result = rt
+        .block_on(fixture.engine.send(SendIntent::AppMessage {
+            group_id: fixture.group_id.clone(),
+            payload,
+        }))
+        .expect("matrix probe send");
+    if case.expects_queue() {
+        assert!(matches!(result, SendResult::Queued { .. }));
+        assert!(fixture.peeler.attempts.load(Ordering::SeqCst) <= 4);
+        assert_eq!(
+            fixture
+                .engine
+                .engine_metrics()
+                .outbound_wire_prepare_ms
+                .sample_count(),
+            0
+        );
+    } else {
+        assert!(matches!(result, SendResult::ApplicationMessage { .. }));
     }
 }
 
@@ -835,31 +857,27 @@ fn bench_deferred_outbound_preflight_matrix(c: &mut Criterion) {
                     if recorder_enabled { "on" } else { "off" },
                     case.label()
                 );
+                let mut probe =
+                    prepare_deferred_preflight_fixture(&rt, members, recorder_enabled, case);
+                assert_deferred_preflight_contract(&rt, &mut probe, case);
                 group.bench_function(label, |b| {
                     b.iter_batched(
-                        || prepare_deferred_preflight_fixture(&rt, members, recorder_enabled, case),
-                        |mut fixture| {
+                        || {
+                            let fixture = prepare_deferred_preflight_fixture(
+                                &rt,
+                                members,
+                                recorder_enabled,
+                                case,
+                            );
                             let payload = app_payload_for(&fixture.engine);
-                            let result = rt
-                                .block_on(fixture.engine.send(SendIntent::AppMessage {
-                                    group_id: fixture.group_id.clone(),
-                                    payload,
-                                }))
-                                .expect("matrix send");
-                            if fixture.case.expects_queue() {
-                                assert!(matches!(result, SendResult::Queued { .. }));
-                                assert!(fixture.peeler.attempts.load(Ordering::SeqCst) <= 4);
-                                assert_eq!(
-                                    fixture
-                                        .engine
-                                        .engine_metrics()
-                                        .outbound_wire_prepare_ms
-                                        .sample_count(),
-                                    0
-                                );
-                            } else {
-                                assert!(matches!(result, SendResult::ApplicationMessage { .. }));
-                            }
+                            (fixture, payload)
+                        },
+                        |(mut fixture, payload)| {
+                            rt.block_on(fixture.engine.send(SendIntent::AppMessage {
+                                group_id: fixture.group_id,
+                                payload,
+                            }))
+                            .expect("matrix send")
                         },
                         BatchSize::PerIteration,
                     );

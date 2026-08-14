@@ -33,16 +33,13 @@ fn adopted_v1_policy_identity_and_values_are_pinned() {
         ("P8.max_witness_override_depth", 1),
         ("P9.sender_ratchet_out_of_order_tolerance", 100),
         ("P10.sender_ratchet_maximum_forward_distance", 1_000),
+        ("E10.max_candidate_branch_peel_contexts", 8),
+        ("E11.foreground_deferred_peel_budget_ms", 250),
+        ("E12.max_foreground_deferred_rows", 4),
     ];
     for (id, value) in expected {
         assert_eq!(snapshot.values[id], value, "{id}");
     }
-    assert_eq!(snapshot.values["E10.max_candidate_branch_peel_contexts"], 8);
-    assert_eq!(
-        snapshot.values["E11.foreground_deferred_peel_budget_ms"],
-        250
-    );
-    assert_eq!(snapshot.values["E12.max_foreground_deferred_rows"], 4);
 }
 
 #[test]

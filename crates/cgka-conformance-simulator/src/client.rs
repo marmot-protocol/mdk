@@ -136,6 +136,9 @@ pub(crate) fn merge_engine_metrics(
     target.foreground_deferred_budget_exhausted = target
         .foreground_deferred_budget_exhausted
         .saturating_add(source.foreground_deferred_budget_exhausted);
+    target.foreground_deferred_normalization_pending = target
+        .foreground_deferred_normalization_pending
+        .saturating_add(source.foreground_deferred_normalization_pending);
     target.foreground_deferred_unchanged = target
         .foreground_deferred_unchanged
         .saturating_add(source.foreground_deferred_unchanged);
@@ -166,6 +169,53 @@ fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
     }
     target.buckets.sort_by_key(|bucket| bucket.upper_bound);
     target.overflow_count = target.overflow_count.saturating_add(source.overflow_count);
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use cgka_engine::engine_metrics::HistogramBucket;
+
+    fn histogram(upper_bound: u64, count: u64, overflow_count: u64) -> HistogramSnapshot {
+        HistogramSnapshot {
+            buckets: vec![HistogramBucket { upper_bound, count }],
+            overflow_count,
+        }
+    }
+
+    #[test]
+    fn merge_engine_metrics_covers_every_snapshot_field() {
+        let source = EngineMetricsSnapshot {
+            settles: 1,
+            post_settle_reorgs: 2,
+            reorg_rewind_depth: histogram(3, 4, 5),
+            reorg_lateness_ms: histogram(6, 7, 8),
+            pass_apply_latency_ms: histogram(9, 10, 11),
+            generation_gap_ms: histogram(12, 13, 14),
+            freeze_overdue_ms: histogram(15, 16, 17),
+            admin_reservation_hold_observations: 18,
+            admin_reservation_prepared: 19,
+            admin_reservation_failed: 20,
+            outbound_required_convergence_ms: histogram(21, 22, 23),
+            outbound_deferred_peel_ms: histogram(24, 25, 26),
+            outbound_queue_accept_ms: histogram(27, 28, 29),
+            outbound_wire_prepare_ms: histogram(30, 31, 32),
+            foreground_deferred_rows_attempted: histogram(33, 34, 35),
+            foreground_deferred_backlog: histogram(36, 37, 38),
+            foreground_deferred_completed: 39,
+            foreground_deferred_budget_exhausted: 40,
+            foreground_deferred_normalization_pending: 41,
+            foreground_deferred_unchanged: 42,
+            foreground_deferred_errors: 43,
+            foreground_deferred_budget_overrun_ms: histogram(44, 45, 46),
+            queued_outbound_wait_ms: histogram(47, 48, 49),
+        };
+        let mut target = EngineMetricsSnapshot::default();
+
+        merge_engine_metrics(&mut target, &source);
+
+        assert_eq!(target, source);
+    }
 }
 
 pub struct ClientBuilder {

@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
-use tokio::sync::Notify;
 
 mod support;
 use support::proof_signer;
@@ -62,6 +61,68 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 fn content_id(msg: &TransportMessage) -> MessageId {
     MessageId::new(Sha256::digest(&msg.payload).to_vec())
+}
+
+fn epoch_gated_group_message(
+    msg: &TransportMessage,
+    ctx: &GroupContextSnapshot,
+) -> Result<PeeledMessage, PeelerError> {
+    if let Ok(projection) = project_mls_message(&msg.payload)
+        && let Some(source_epoch) = projection.source_epoch
+        && ctx.epoch().0 < source_epoch
+    {
+        return Err(PeelerError::DecryptFailed);
+    }
+    Ok(PeeledMessage {
+        id: msg.id.clone(),
+        group_id: None,
+        sender: None,
+        content: PeeledContent::MlsMessage {
+            bytes: msg.payload.clone(),
+        },
+        origin: msg.clone(),
+    })
+}
+
+fn passthrough_welcome(msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+    Ok(PeeledMessage {
+        id: msg.id.clone(),
+        group_id: None,
+        sender: None,
+        content: PeeledContent::Welcome {
+            bytes: msg.payload.clone(),
+        },
+        origin: msg.clone(),
+    })
+}
+
+fn wrapped_group_message(payload: &EncryptedPayload) -> Result<TransportMessage, PeelerError> {
+    Ok(TransportMessage {
+        id: hash_id(&payload.ciphertext),
+        payload: payload.ciphertext.clone(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![],
+        },
+    })
+}
+
+fn wrapped_welcome(
+    payload: &EncryptedPayload,
+    recipient: &MemberId,
+) -> Result<TransportMessage, PeelerError> {
+    Ok(TransportMessage {
+        id: hash_id(&payload.ciphertext),
+        payload: payload.ciphertext.clone(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: recipient.clone(),
+        },
+    })
 }
 
 /// Pass-through peeler that fails `DecryptFailed` for messages wrapped at an
@@ -104,33 +165,11 @@ impl TransportPeeler for CountingEpochGatePeeler {
             .unwrap()
             .entry(msg.id.clone())
             .or_insert(0) += 1;
-        if let Ok(projection) = project_mls_message(&msg.payload)
-            && let Some(source_epoch) = projection.source_epoch
-            && ctx.epoch().0 < source_epoch
-        {
-            return Err(PeelerError::DecryptFailed);
-        }
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
-            },
-            origin: msg.clone(),
-        })
+        epoch_gated_group_message(msg, ctx)
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                bytes: msg.payload.clone(),
-            },
-            origin: msg.clone(),
-        })
+        passthrough_welcome(msg)
     }
 
     async fn wrap_group_message(
@@ -138,16 +177,7 @@ impl TransportPeeler for CountingEpochGatePeeler {
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
-            },
-        })
+        wrapped_group_message(payload)
     }
 
     async fn wrap_welcome(
@@ -155,29 +185,18 @@ impl TransportPeeler for CountingEpochGatePeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
+        wrapped_welcome(payload, recipient)
     }
 }
 
-/// Epoch-gated peeler whose foreground retry attempt can be held on a
-/// `Notify`. Initial ingest remains fast; tests arm the gate only after the
-/// deferred backlog is durable.
+/// Epoch-gated peeler whose foreground retry attempt can be held indefinitely.
+/// Initial ingest remains fast; tests arm the gate only after the deferred
+/// backlog is durable.
 #[derive(Clone)]
 struct NotifyEpochGatePeeler {
     gated: Arc<AtomicBool>,
     gated_attempts: Arc<AtomicU64>,
     block_on_attempt: Arc<AtomicU64>,
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
 }
 
 impl NotifyEpochGatePeeler {
@@ -186,8 +205,6 @@ impl NotifyEpochGatePeeler {
             gated: Arc::new(AtomicBool::new(false)),
             gated_attempts: Arc::new(AtomicU64::new(0)),
             block_on_attempt: Arc::new(AtomicU64::new(u64::MAX)),
-            entered: Arc::new(Notify::new()),
-            release: Arc::new(Notify::new()),
         }
     }
 
@@ -212,37 +229,14 @@ impl TransportPeeler for NotifyEpochGatePeeler {
         if self.gated.load(Ordering::SeqCst) {
             let attempt = self.gated_attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt >= self.block_on_attempt.load(Ordering::SeqCst) {
-                self.entered.notify_waiters();
-                self.release.notified().await;
+                std::future::pending::<()>().await;
             }
         }
-        if let Ok(projection) = project_mls_message(&msg.payload)
-            && let Some(source_epoch) = projection.source_epoch
-            && ctx.epoch().0 < source_epoch
-        {
-            return Err(PeelerError::DecryptFailed);
-        }
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
-            },
-            origin: msg.clone(),
-        })
+        epoch_gated_group_message(msg, ctx)
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                bytes: msg.payload.clone(),
-            },
-            origin: msg.clone(),
-        })
+        passthrough_welcome(msg)
     }
 
     async fn wrap_group_message(
@@ -250,16 +244,7 @@ impl TransportPeeler for NotifyEpochGatePeeler {
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
-            },
-        })
+        wrapped_group_message(payload)
     }
 
     async fn wrap_welcome(
@@ -267,16 +252,7 @@ impl TransportPeeler for NotifyEpochGatePeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
+        wrapped_welcome(payload, recipient)
     }
 }
 
@@ -299,8 +275,18 @@ fn build_counting_client(
     SqliteAccountStorage,
     CountingEpochGatePeeler,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
     let peeler = CountingEpochGatePeeler::new();
+    build_gated_client(name, peeler)
+}
+
+fn build_gated_client<P>(
+    name: &[u8],
+    peeler: P,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage, P)
+where
+    P: TransportPeeler + Clone + 'static,
+{
+    let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(name))
@@ -351,22 +337,8 @@ fn build_notify_client(
     SqliteAccountStorage,
     NotifyEpochGatePeeler,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
     let peeler = NotifyEpochGatePeeler::new();
-    let mut engine = EngineBuilder::new(storage.clone())
-        .legacy_compatibility_profile()
-        .identity(pad32(name))
-        .account_identity_proof_signer(proof_signer(name))
-        .peeler(Box::new(peeler.clone()))
-        .build()
-        .unwrap();
-    engine
-        .set_convergence_policy(CanonicalizationPolicy {
-            settlement_quiescence_ms: 0,
-            ..CanonicalizationPolicy::default()
-        })
-        .expect("convergence policy accepted");
-    (engine, storage, peeler)
+    build_gated_client(name, peeler)
 }
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
@@ -557,7 +529,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
         );
 
         carol.set_foreground_deferred_peel_budget(25, 4);
-        peeler.block_on_attempt(4);
+        peeler.block_on_attempt(1);
 
         let result = carol
             .send(SendIntent::AppMessage {
@@ -570,7 +542,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
             SendResult::Queued { intent_id, .. } => intent_id,
             other => panic!("expected queued application, got {other:?}"),
         };
-        assert_eq!(peeler.gated_attempts(), 4);
+        assert_eq!(peeler.gated_attempts(), 1);
         assert_eq!(
             storage
                 .list_queued_outbound_intents(&group_id)
@@ -579,9 +551,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
             1
         );
         assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-        // Isolate each intent class from the separate queued-before-history
-        // priority rule: once a queue exists, a later direct send is allowed
-        // to overtake it and skips historical maintenance.
+        // Isolate each intent class while retaining the same deferred backlog.
         storage
             .delete_queued_outbound_intent(&app_intent_id)
             .unwrap();
@@ -631,7 +601,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
 /// (epoch, snapshot-set) peel context is unchanged — after one unproductive
 /// full cycle over the backlog, whole sweeps are skipped.
 #[tokio::test]
-async fn deferred_peel_not_retried_while_context_unchanged() {
+async fn deferred_peel_new_row_invalidates_unchanged_fast_path() {
     let (_alice, mut carol, carol_storage, carol_peeler, group_id, _commit2, commit3) =
         carol_behind_two_epochs().await;
 
@@ -695,9 +665,64 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
         after_live_attempt + 1,
         "new row must be examined under the current full peel context"
     );
+}
 
-    let historical_attempts =
-        carol_peeler.attempts_for(&commit3.id) + carol_peeler.attempts_for(&new_wrapper.id);
+#[tokio::test]
+async fn deferred_lifecycle_normalization_is_pending_not_budget_exhaustion() {
+    let (_alice, mut carol, storage, _peeler, group_id, _commit2, commit3) =
+        carol_behind_two_epochs().await;
+    for index in 0..5 {
+        let wrapper = TransportMessage {
+            id: MessageId::new(format!("legacy-lifecycle-{index}").into_bytes()),
+            ..commit3.clone()
+        };
+        assert!(matches!(
+            carol.ingest(wrapper.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        let mut legacy = storage.get_message(&wrapper.id).unwrap();
+        legacy.deferred_peel = None;
+        storage.put_message(&legacy).unwrap();
+    }
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "send after lifecycle normalization"),
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+    let metrics = carol.engine_metrics();
+    assert_eq!(metrics.foreground_deferred_normalization_pending, 1);
+    assert_eq!(
+        metrics.foreground_deferred_budget_exhausted, 1,
+        "the later four-attempt slice, not normalization, exhausts the budget"
+    );
+    assert_eq!(
+        metrics
+            .foreground_deferred_rows_attempted
+            .approx_percentile(1.0),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn queued_intent_drains_before_historical_only_maintenance() {
+    let (_alice, mut carol, storage, peeler, group_id, _commit2, commit3) =
+        carol_behind_two_epochs().await;
+
+    assert!(matches!(
+        carol.ingest(commit3.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let historical_attempts = peeler.attempts_for(&commit3.id);
+
     assert!(matches!(
         carol
             .queue_app_message(
@@ -708,23 +733,16 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
             .unwrap(),
         SendResult::Queued { .. }
     ));
-    let queued_before_fresh_send = carol_storage
-        .list_queued_outbound_intents(&group_id)
-        .unwrap()
-        .len();
-    let untested_history = TransportMessage {
-        id: MessageId::new(b"history-arrived-behind-queue".to_vec()),
-        ..commit3.clone()
-    };
-    assert!(matches!(
-        carol.ingest(untested_history.clone()).await.unwrap(),
-        IngestOutcome::TransportDeferred { .. }
-    ));
-    let untested_attempts = carol_peeler.attempts_for(&untested_history.id);
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
+    );
 
-    // The documented non-FIFO contract still allows a later direct send to
-    // overtake, but neither it nor the queued drain may run untested
-    // historical-only peeling ahead of already accepted user work.
+    // The existing row is historical-only under an unchanged fingerprint, so
+    // it neither blocks a newer direct send nor repeats ahead of queued work.
     assert!(matches!(
         carol
             .send(SendIntent::AppMessage {
@@ -735,21 +753,34 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
             .unwrap(),
         SendResult::ApplicationMessage { .. }
     ));
-    assert_eq!(
-        carol_peeler.attempts_for(&untested_history.id),
-        untested_attempts,
-        "direct send must skip historical peeling while a queue exists"
-    );
-    assert_eq!(
-        carol_storage
-            .list_queued_outbound_intents(&group_id)
-            .unwrap()
-            .len(),
-        queued_before_fresh_send
-    );
+    assert_eq!(peeler.attempts_for(&commit3.id), historical_attempts);
 
+    // A newly retained row is current-generation work, even with a queue. It
+    // receives a definitive foreground attempt before any wire is prepared.
+    let fresh = TransportMessage {
+        id: MessageId::new(b"fresh-row-ahead-of-queue".to_vec()),
+        ..commit3
+    };
+    assert!(matches!(
+        carol.ingest(fresh.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let fresh_attempts = peeler.attempts_for(&fresh.id);
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "send after fresh row"),
+            })
+            .await
+            .unwrap(),
+        SendResult::ApplicationMessage { .. }
+    ));
+    assert_eq!(peeler.attempts_for(&fresh.id), fresh_attempts + 1);
+
+    let completed_attempts = peeler.attempts_for(&fresh.id);
     let drained = carol
-        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_004)
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
         .await
         .unwrap();
     assert!(matches!(
@@ -757,16 +788,11 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
         [SendResult::ApplicationMessage { .. }]
     ));
     assert_eq!(
-        carol_peeler.attempts_for(&commit3.id) + carol_peeler.attempts_for(&new_wrapper.id),
-        historical_attempts,
-        "queued intent must drain before unchanged historical-only maintenance"
+        peeler.attempts_for(&fresh.id),
+        completed_attempts,
+        "the queued drain skips rows now historical under the same fingerprint"
     );
-    assert_eq!(
-        carol_peeler.attempts_for(&untested_history.id),
-        untested_attempts,
-        "queued drain must skip even newly untested historical-only rows"
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(peeler.attempts_for(&commit3.id), historical_attempts);
 }
 
 #[tokio::test]
@@ -802,7 +828,29 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
             .unwrap(),
         SendResult::Queued { .. }
     ));
-    assert_eq!(peeler.gated_attempts(), 4);
+    assert!((1..=4).contains(&peeler.gated_attempts()));
+    let deferred_after_send = storage
+        .list_messages(&group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.state == MessageState::PeelDeferred)
+        .collect::<Vec<_>>();
+    let completed_ids = deferred_after_send
+        .iter()
+        .take_while(|record| {
+            record
+                .deferred_peel
+                .as_ref()
+                .and_then(|lifecycle| lifecycle.last_context_fingerprint)
+                .is_some()
+        })
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let first_uncompleted_id = deferred_after_send
+        .get(completed_ids.len())
+        .expect("foreground slice leaves an uncompleted row")
+        .id
+        .clone();
     drop(carol);
 
     let clock = ManualConvergenceClock::new(2_000, 20_000);
@@ -811,7 +859,7 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
     restarted.hydrate_all_stored_groups().unwrap();
     restarted.retry_deferred_peels(&group_id).await.unwrap();
 
-    for id in &ids[..3] {
+    for id in &completed_ids {
         assert_eq!(
             restarted_peeler.attempts_for(id),
             0,
@@ -819,7 +867,7 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
         );
     }
     assert_eq!(
-        restarted_peeler.attempts_for(&ids[3]),
+        restarted_peeler.attempts_for(&first_uncompleted_id),
         1,
         "the timed-out row must be the first resumed attempt"
     );

@@ -230,6 +230,7 @@ pub struct EngineMetrics {
     foreground_deferred_backlog: BucketHistogram,
     foreground_deferred_completed: u64,
     foreground_deferred_budget_exhausted: u64,
+    foreground_deferred_normalization_pending: u64,
     foreground_deferred_unchanged: u64,
     foreground_deferred_errors: u64,
     foreground_deferred_budget_overrun_ms: BucketHistogram,
@@ -261,6 +262,7 @@ impl Default for EngineMetrics {
             foreground_deferred_backlog: BucketHistogram::new(&WORK_COUNT_BUCKET_BOUNDS),
             foreground_deferred_completed: 0,
             foreground_deferred_budget_exhausted: 0,
+            foreground_deferred_normalization_pending: 0,
             foreground_deferred_unchanged: 0,
             foreground_deferred_errors: 0,
             foreground_deferred_budget_overrun_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
@@ -388,6 +390,9 @@ impl EngineMetrics {
             DeferredPeelMetricOutcome::BudgetExhausted => {
                 self.foreground_deferred_budget_exhausted += 1
             }
+            DeferredPeelMetricOutcome::NormalizationPending => {
+                self.foreground_deferred_normalization_pending += 1
+            }
             DeferredPeelMetricOutcome::Unchanged => self.foreground_deferred_unchanged += 1,
             DeferredPeelMetricOutcome::Error => self.foreground_deferred_errors += 1,
         }
@@ -439,6 +444,8 @@ impl EngineMetrics {
             foreground_deferred_backlog: self.foreground_deferred_backlog.snapshot(),
             foreground_deferred_completed: self.foreground_deferred_completed,
             foreground_deferred_budget_exhausted: self.foreground_deferred_budget_exhausted,
+            foreground_deferred_normalization_pending: self
+                .foreground_deferred_normalization_pending,
             foreground_deferred_unchanged: self.foreground_deferred_unchanged,
             foreground_deferred_errors: self.foreground_deferred_errors,
             foreground_deferred_budget_overrun_ms: self
@@ -453,6 +460,7 @@ impl EngineMetrics {
 pub(crate) enum DeferredPeelMetricOutcome {
     Completed,
     BudgetExhausted,
+    NormalizationPending,
     Unchanged,
     Error,
 }
@@ -485,17 +493,32 @@ pub struct EngineMetricsSnapshot {
     pub admin_reservation_prepared: u64,
     /// One-attempt admin reservations consumed by a failed preparation.
     pub admin_reservation_failed: u64,
+    /// Required authenticated convergence time during outbound preflight.
     pub outbound_required_convergence_ms: HistogramSnapshot,
+    /// Foreground deferred-peel phase duration.
     pub outbound_deferred_peel_ms: HistogramSnapshot,
+    /// Time required to durably accept a queued outbound intent.
     pub outbound_queue_accept_ms: HistogramSnapshot,
+    /// MLS and transport wire-preparation duration for non-queued sends.
     pub outbound_wire_prepare_ms: HistogramSnapshot,
+    /// Deferred row attempts started per foreground phase.
     pub foreground_deferred_rows_attempted: HistogramSnapshot,
+    /// Deferred backlog observed per foreground phase.
     pub foreground_deferred_backlog: HistogramSnapshot,
+    /// Foreground phases that completed their current-fingerprint work.
     pub foreground_deferred_completed: u64,
+    /// Foreground phases stopped by their time or row-attempt bound.
     pub foreground_deferred_budget_exhausted: u64,
+    /// Foreground phases that durably normalized legacy lifecycle rows and
+    /// scheduled another bounded slice.
+    pub foreground_deferred_normalization_pending: u64,
+    /// Foreground phases skipped because every row had the current fingerprint.
     pub foreground_deferred_unchanged: u64,
+    /// Foreground phases that returned an engine or storage error.
     pub foreground_deferred_errors: u64,
+    /// Elapsed foreground deferred time beyond the configured budget.
     pub foreground_deferred_budget_overrun_ms: HistogramSnapshot,
+    /// Time from durable queue acceptance to a regeneration attempt.
     pub queued_outbound_wait_ms: HistogramSnapshot,
 }
 
@@ -723,6 +746,7 @@ mod tests {
         assert_eq!(snap.foreground_deferred_backlog.sample_count(), 1);
         assert_eq!(snap.foreground_deferred_completed, 0);
         assert_eq!(snap.foreground_deferred_budget_exhausted, 1);
+        assert_eq!(snap.foreground_deferred_normalization_pending, 0);
         assert_eq!(snap.foreground_deferred_unchanged, 0);
         assert_eq!(snap.foreground_deferred_errors, 0);
         assert_eq!(
@@ -731,5 +755,21 @@ mod tests {
             Some(30)
         );
         assert_eq!(snap.queued_outbound_wait_ms.sample_count(), 1);
+    }
+
+    #[test]
+    fn deferred_lifecycle_normalization_has_its_own_outcome() {
+        let mut metrics = EngineMetrics::default();
+        metrics.note_outbound_deferred_peel(
+            2,
+            0,
+            3,
+            DeferredPeelMetricOutcome::NormalizationPending,
+            Some(250),
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.foreground_deferred_normalization_pending, 1);
+        assert_eq!(snap.foreground_deferred_budget_exhausted, 0);
     }
 }

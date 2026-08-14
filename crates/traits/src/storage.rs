@@ -687,19 +687,25 @@ pub trait ConvergencePassStorage {
 /// final peel-context fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredPeelGeneration {
+    /// MLS group whose deferred rows belong to this contested generation.
     pub group_id: GroupId,
+    /// Complete peel-context fingerprint that defines this generation.
     pub context_fingerprint: [u8; 32],
 }
 
+/// Persistence for the contested deferred-peel generation barrier.
 pub trait DeferredPeelGenerationStorage {
+    /// Return the active generation barrier for `group_id`, if any.
     fn deferred_peel_generation(
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Option<DeferredPeelGeneration>>;
+    /// Insert or replace a group's active generation barrier.
     fn put_deferred_peel_generation(
         &self,
         generation: &DeferredPeelGeneration,
     ) -> StorageResult<()>;
+    /// Remove a group's completed generation barrier.
     fn delete_deferred_peel_generation(&self, group_id: &GroupId) -> StorageResult<()>;
 }
 

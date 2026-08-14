@@ -3420,9 +3420,9 @@ async fn seven_member_future_epoch_backlog_queues_send_and_regenerates_after_res
         .send_app(b"observer-accepted-pending".to_vec())
         .await;
     assert_eq!(bus.queued_len(), 0, "queued acceptance must emit no wire");
-    let pending = observer.pending_work_observation();
-    assert_eq!(pending.engine.stored_transport_deferred_messages, 47);
-    assert_eq!(pending.engine.queued_outbound_intents, 1);
+    let pending_work = observer.pending_work_observation();
+    assert_eq!(pending_work.engine.stored_transport_deferred_messages, 47);
+    assert_eq!(pending_work.engine.queued_outbound_intents, 1);
     let metrics = observer.engine_metrics();
     assert_eq!(metrics.foreground_deferred_budget_exhausted, 1);
     assert_eq!(metrics.foreground_deferred_rows_attempted.sample_count(), 1);
