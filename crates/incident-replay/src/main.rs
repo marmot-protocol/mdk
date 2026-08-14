@@ -9,11 +9,12 @@
 //! Reading, format detection, and printing live here; everything about *which*
 //! route an export takes is [`incident_replay::route`].
 //!
-//! Output is one primary line — `healthy:`, `quarantine:`, or `accepted:` — plus
-//! an `advisory (<label>):` line for every co-occurring finding that line does
-//! not itself report. An accepted incident is written owner-only as the portable
-//! vector next to its `incident-scenario-artifact.v1` evidence envelope; the
-//! source export, transport ciphertext, and MLS checkpoints are never copied.
+//! Output is one primary line — `healthy:`, `quarantine:`, or
+//! `accepted (<fidelity>, <sensitivity>)` — plus an `advisory (<label>):` line
+//! for every co-occurring finding that line does not itself report. An
+//! accepted incident is written owner-only as the portable vector next to its
+//! `incident-scenario-artifact.v1` evidence envelope; the source export,
+//! transport ciphertext, and MLS checkpoints are never copied.
 //!
 //! Exits 0 for any successful classification (healthy, quarantine, and accepted
 //! are all valid outcomes). Exits 2 on usage, I/O, parse, or write failure, and
