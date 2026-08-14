@@ -1,8 +1,12 @@
 //! `group` and `groups` command namespace handlers and group output helpers.
 
+use std::time::Duration;
+
 use cgka_traits::{GroupId, PeriodicMaintenancePolicy};
 use marmot_account::AccountHome;
-use marmot_app::{AppError, AppGroupMemberRecord, AppGroupMlsState, MarmotApp, MarmotAppRuntime};
+use marmot_app::{
+    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, MarmotApp, MarmotAppRuntime,
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -10,6 +14,33 @@ use crate::{
     ensure_local_signing, group_json, group_list_plain, group_show_output, normalize_group_id_hex,
     npub_for_account_id, parse_public_key, resolve_account,
 };
+
+async fn accept_group_invite_retrying_busy(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    group_id: &GroupId,
+) -> Result<AppGroupRecord, AppError> {
+    // A one-shot `wn groups accept` starts its own runtime and can race that
+    // runtime's initial catch-up. Keep the same runtime alive for a bounded
+    // 30-second retry window; restarting the CLI would only recreate the race.
+    const BUSY_RETRY_ATTEMPTS: usize = 600;
+    const BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    for attempt in 0..BUSY_RETRY_ATTEMPTS {
+        match runtime.accept_group_invite(account_ref, group_id).await {
+            Err(AppError::AccountWorkerBusy) => {
+                if attempt + 1 < BUSY_RETRY_ATTEMPTS {
+                    tokio::time::sleep(BUSY_RETRY_DELAY).await;
+                }
+            }
+            // Every other result is terminal for this CLI invocation. In
+            // particular, never retry an ambiguous worker response timeout.
+            result => return result,
+        }
+    }
+
+    Err(AppError::AccountWorkerBusy)
+}
 
 pub(crate) async fn group_command(
     account_home: &AccountHome,
@@ -451,9 +482,8 @@ pub(crate) async fn groups_command_with_runtime(
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
-            let group = runtime
-                .accept_group_invite(&account.label, &group_id)
-                .await?;
+            let group =
+                accept_group_invite_retrying_busy(runtime, &account.label, &group_id).await?;
             let group_id_hex = hex::encode(group_id.as_slice());
             Ok(CommandOutput {
                 plain: format!("accepted invite {group_id_hex}"),
