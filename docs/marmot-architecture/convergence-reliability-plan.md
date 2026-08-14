@@ -847,7 +847,7 @@ remain mandatory implicit v1 and any change requires the future required compone
 to re-encode the only valid v1 choice. E/A constants remain local only under operational non-interference: exhaustion
 is visible and fail-closed, retained work can retry, and equal closed input reaches the same settled result.
 
-The protocol decision gate pins all ten P values, checks the 29-id ledger/classification bijection, enforces the
+The protocol decision gate pins every P value, checks the full ledger/classification bijection, enforces the
 future-component decision, and varies batch width, wake delay, and a temporary resource refusal over one closed
 witness-sensitive input set. Intermediate pass histories differ while the settled winner remains equal; the resource
 failure never produces a partial settled result. Production coverage remains the same-horizon pass-partition
