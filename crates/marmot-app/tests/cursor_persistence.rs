@@ -40,9 +40,11 @@ use marmot_app::{
 use nostr_relay_builder::MockRelay;
 use tokio::time::sleep;
 
-/// How long a cold boot's initial catch-up is allowed to take. Generous
-/// relative to the crate's own `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`.
-const CATCH_UP_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a cold boot's initial catch-up is allowed to take. The integration
+/// test runs inside a workspace-wide nextest partition, where concurrent
+/// crypto, SQLite, and relay tests can delay the current-thread runtime well
+/// beyond the relay adapter's own waits without indicating a stuck catch-up.
+const CATCH_UP_DEADLINE: Duration = Duration::from_secs(30);
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
