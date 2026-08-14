@@ -877,6 +877,167 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
 }
 
 #[test]
+fn account_projection_delta_writes_only_observations_and_changed_groups() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let seen_events = (0..64)
+        .map(|index| format!("event-{index:05}"))
+        .collect::<Vec<_>>();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events,
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            64,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE write_audit (write_kind TEXT NOT NULL);
+             CREATE TRIGGER audit_seen_insert AFTER INSERT ON seen_events BEGIN
+                INSERT INTO write_audit VALUES ('seen_insert');
+             END;
+             CREATE TRIGGER audit_seen_update AFTER UPDATE ON seen_events BEGIN
+                INSERT INTO write_audit VALUES ('seen_update');
+             END;
+             CREATE TRIGGER audit_seen_delete AFTER DELETE ON seen_events BEGIN
+                INSERT INTO write_audit VALUES ('seen_delete');
+             END;
+             CREATE TRIGGER audit_group_insert AFTER INSERT ON account_groups BEGIN
+                INSERT INTO write_audit VALUES ('group_insert');
+             END;
+             CREATE TRIGGER audit_group_update AFTER UPDATE ON account_groups BEGIN
+                INSERT INTO write_audit VALUES ('group_update');
+             END;
+             CREATE TRIGGER audit_group_delete AFTER DELETE ON account_groups BEGIN
+                INSERT INTO write_audit VALUES ('group_delete');
+             END;
+             CREATE TRIGGER audit_component_insert
+             AFTER INSERT ON account_group_app_components BEGIN
+                INSERT INTO write_audit VALUES ('component_insert');
+             END;
+             CREATE TRIGGER audit_component_update
+             AFTER UPDATE ON account_group_app_components BEGIN
+                INSERT INTO write_audit VALUES ('component_update');
+             END;
+             CREATE TRIGGER audit_component_delete
+             AFTER DELETE ON account_group_app_components BEGIN
+                INSERT INTO write_audit VALUES ('component_delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let mut changed_group = group("bb", "beta updated");
+    changed_group.components[1].component_data_hex = "0506".to_owned();
+    store
+        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec!["event-new-a".to_owned(), "event-new-b".to_owned()],
+                last_transport_timestamp: None,
+                groups: vec![changed_group],
+            },
+            64,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+    let write_count = |kind: &str| -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM write_audit WHERE write_kind = ?1",
+                params![kind],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(write_count("seen_insert"), 2);
+    assert_eq!(write_count("seen_update"), 0);
+    assert_eq!(write_count("seen_delete"), 2);
+    assert_eq!(write_count("group_insert"), 0);
+    assert_eq!(write_count("group_update"), 1);
+    assert_eq!(write_count("group_delete"), 0);
+    assert_eq!(write_count("component_insert"), 0);
+    assert_eq!(write_count("component_update"), 1);
+    assert_eq!(write_count("component_delete"), 0);
+
+    let restored = store.load_account_projection_state("alice", 64).unwrap();
+    assert_eq!(restored.seen_events.len(), 64);
+    assert_eq!(
+        &restored.seen_events[62..],
+        &["event-new-a".to_owned(), "event-new-b".to_owned()]
+    );
+    assert_eq!(
+        restored.groups.len(),
+        2,
+        "delta must not prune absent groups"
+    );
+    assert_eq!(restored.groups[0].profile_name, "alpha");
+    assert_eq!(restored.groups[1].profile_name, "beta updated");
+
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM write_audit", [])
+        .unwrap();
+    store
+        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec!["event-00063".to_owned()],
+                last_transport_timestamp: None,
+                groups: Vec::new(),
+            },
+            64,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(write_count("seen_insert"), 0);
+    assert_eq!(write_count("seen_update"), 1);
+    assert_eq!(write_count("seen_delete"), 0);
+
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM write_audit", [])
+        .unwrap();
+    let mut archived_group = group("aa", "alpha");
+    archived_group.archived = true;
+    store
+        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![archived_group],
+            },
+            64,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(write_count("seen_insert"), 0);
+    assert_eq!(write_count("seen_update"), 0);
+    assert_eq!(write_count("seen_delete"), 0);
+    assert_eq!(write_count("group_update"), 1);
+    assert_eq!(write_count("component_insert"), 0);
+    assert_eq!(write_count("component_update"), 0);
+    assert_eq!(write_count("component_delete"), 0);
+}
+
+#[test]
 fn app_messages_list_raw_events_and_prune_updates_timeline() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
@@ -2338,7 +2499,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         )
         .unwrap();
 
-    let result = store.save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    let result = store.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &StoredAccountState {
             label: "alice".to_owned(),
             seen_events: Vec::new(),

@@ -217,6 +217,7 @@ impl AppClient {
                 Ok(false) => {}
             }
         }
+        let previous = self.state_group_record(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
             return;
@@ -238,9 +239,13 @@ impl AppClient {
             &projection,
             GroupConfirmationProjection::Preserve,
         );
+        if previous != self.state_group_record(group_id) {
+            self.mark_group_projection_dirty(group_id);
+        }
     }
 
     pub(crate) fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        let previous = self.state_group_record(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         let projection = EventGroupProjection {
@@ -260,6 +265,9 @@ impl AppClient {
             &projection,
             GroupConfirmationProjection::Accepted,
         );
+        if previous != self.state_group_record(group_id) {
+            self.mark_group_projection_dirty(group_id);
+        }
         let group_id_hex = hex::encode(group_id.as_slice());
         let subscriptions = self
             .state
@@ -399,7 +407,12 @@ impl AppClient {
         else {
             return Ok(false);
         };
+        let previous_routes = group.prior_nostr_routes.clone();
         group.adopt_prior_nostr_routes(routes);
+        let changed = group.prior_nostr_routes != previous_routes;
+        if changed {
+            self.mark_group_projection_dirty_hex(group_id_hex);
+        }
         Ok(true)
     }
 
@@ -465,7 +478,10 @@ impl AppClient {
                 && let Ok(group) = self.runtime.group_record(&group_id)
             {
                 projected_group.member_count = u64::try_from(group.members.len()).ok();
-                changed |= projected_group.member_count.is_some();
+                if projected_group.member_count.is_some() {
+                    self.mark_group_projection_dirty_hex(group_id_hex);
+                    changed = true;
+                }
             }
         }
         Ok(changed)
@@ -476,7 +492,7 @@ impl AppClient {
     /// pipeline; eager clients call it before returning from open.
     pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
         if self.reconcile_live_engine_groups()? {
-            self.app.save_state(&self.state)?;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         self.reconcile_disband_drafts();
         self.backfill_self_membership_once()

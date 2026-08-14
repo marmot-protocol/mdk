@@ -113,6 +113,15 @@ pub struct AppClient {
     /// persisted. Before this index existed, every inbound delivery and every
     /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.
     pub(crate) seen_events_index: HashSet<String>,
+    /// Number of ids at the tail of `state.seen_events` observed since the last
+    /// successful account-projection checkpoint. The count saturates at the
+    /// bounded ring length, so even a catch-up batch larger than the window
+    /// persists only the final retained ids. It is cleared only after commit.
+    pub(crate) pending_seen_event_count: usize,
+    /// Exact group projections changed since the last successful checkpoint.
+    /// Live saves replace only these groups; full snapshot replacement is
+    /// reserved for import/rebuild paths outside the account worker.
+    pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
@@ -870,7 +879,7 @@ impl AppClient {
         // into a false failure that invites the caller to create a duplicate.
         let local_projection_started_at = Instant::now();
         let local_projection_saved = match self.add_group(&group_id) {
-            Ok(()) => match self.app.save_state(&self.state) {
+            Ok(()) => match self.save_state_with_pending_local_group_deletion_frontier_clears() {
                 Ok(()) => true,
                 Err(error) => {
                     tracing::warn!(
@@ -1344,7 +1353,7 @@ impl AppClient {
             self.remember_published_reports(&effects);
             self.refresh_group(group_id);
             self.prune_plaintext_retention_for_group(group_id)?;
-            self.app.save_state(&self.state)?;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
             self.queue_own_group_system_projection_updates(&effects);
             Ok::<_, AppError>(())
         })();
@@ -1407,7 +1416,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
@@ -1452,7 +1461,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         // Enabling lifecycle-v1 changes eligibility, not group history. It
         // intentionally emits no kind-1210 system row.
         Ok(send_summary_from_effects(&effects))
@@ -1500,7 +1509,7 @@ impl AppClient {
                 "durable disband request outpaced composer draft cleanup"
             );
         }
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.runtime
             .disband_request(group_id)?
             .map(Into::into)
@@ -1667,7 +1676,7 @@ impl AppClient {
         };
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         // A local leave / decline is a voluntary departure, recorded as `Left`
         // so the chat list can distinguish it from an involuntary removal. The
@@ -1870,7 +1879,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
@@ -1906,7 +1915,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
@@ -1976,7 +1985,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
@@ -2020,7 +2029,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
@@ -2687,7 +2696,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(summary)
     }
@@ -2897,7 +2906,7 @@ impl AppClient {
         self.pending_projection_updates.extend(finalize_updates);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
-        self.app.save_state(&self.state)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
@@ -2968,7 +2977,8 @@ impl AppClient {
             &projection,
             GroupConfirmationProjection::Preserve,
         );
-        self.app.save_state(&self.state)?;
+        self.mark_group_projection_dirty(group_id);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(SendSummary {
             published: effects.reports.len(),
@@ -3034,11 +3044,12 @@ impl AppClient {
         let previous = group.archived;
         group.archived = archived;
         let group = group.clone();
+        self.mark_group_projection_dirty_hex(group_id_hex.clone());
         // Roll the in-memory flag back if persistence fails so the worker's
         // authoritative snapshot stays consistent with what is on disk; a later
         // unrelated `save_state` must not silently re-apply a toggle the caller
         // was told had failed.
-        if let Err(err) = self.app.save_state(&self.state) {
+        if let Err(err) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
             if let Some(group) = self
                 .state
                 .groups
@@ -3068,7 +3079,8 @@ impl AppClient {
         group.pending_confirmation = pending_confirmation;
         group.archived = archived;
         let group = group.clone();
-        self.app.save_state(&self.state)?;
+        self.mark_group_projection_dirty_hex(group_id_hex);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         Ok(group)
     }
 
@@ -3310,8 +3322,11 @@ impl AppClient {
                 .has_pending_convergence_inputs(&group_id)
                 .unwrap_or(true)
                 && let Ok(group_record) = self.runtime.group_record(&group_id)
+                && group.prune_prior_nostr_routes(group_record.epoch.0)
             {
-                refresh.state_pruned |= group.prune_prior_nostr_routes(group_record.epoch.0);
+                self.pending_group_projection_updates
+                    .insert(group.group_id_hex.clone());
+                refresh.state_pruned = true;
             }
             let Ok(subscriptions) = group.transport_subscriptions(&group_id) else {
                 tracing::warn!(
@@ -3344,8 +3359,26 @@ impl AppClient {
         }
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
-            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
+            self.remember_seen_event(event_id);
         }
+    }
+
+    pub(crate) fn remember_seen_event(&mut self, event_id: String) {
+        if remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id) {
+            self.pending_seen_event_count = self
+                .pending_seen_event_count
+                .saturating_add(1)
+                .min(self.state.seen_events.len());
+        }
+    }
+
+    pub(crate) fn mark_group_projection_dirty(&mut self, group_id: &GroupId) {
+        self.pending_group_projection_updates
+            .insert(hex::encode(group_id.as_slice()));
+    }
+
+    pub(crate) fn mark_group_projection_dirty_hex(&mut self, group_id_hex: String) {
+        self.pending_group_projection_updates.insert(group_id_hex);
     }
 
     /// Durably record welcomes a confirmed create/invite could not deliver, so

@@ -777,12 +777,19 @@ pub struct AppProjectionUpdate {
 /// duplicate detection. The ordered `seen_events` Vec is kept only for pruning;
 /// when pruning drops the oldest ids it removes them from `seen` incrementally
 /// so the two stay in sync without rebuilding the set.
-fn remember_seen_event(seen: &mut HashSet<String>, state: &mut AccountState, event_id: String) {
+fn remember_seen_event(
+    seen: &mut HashSet<String>,
+    state: &mut AccountState,
+    event_id: String,
+) -> bool {
     if seen.insert(event_id.clone()) {
         state.seen_events.push(event_id);
         for pruned in prune_seen_events(&mut state.seen_events) {
             seen.remove(&pruned);
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -1465,6 +1472,8 @@ impl MarmotApp {
             transport_signer: open.signer,
             state: open.state,
             seen_events_index,
+            pending_seen_event_count: 0,
+            pending_group_projection_updates: std::collections::HashSet::new(),
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -2842,7 +2851,16 @@ impl MarmotApp {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         group.archived = archived;
         let group = group.clone();
-        self.save_state(&state)?;
+        self.save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            &AccountState {
+                label: state.label,
+                seen_events: Vec::new(),
+                last_transport_timestamp: state.last_transport_timestamp,
+                groups: vec![group.clone()],
+            },
+            &[],
+            &[],
+        )?;
         Ok(group)
     }
 
@@ -4017,31 +4035,30 @@ impl MarmotApp {
     /// it — bounded exposure, ~180s beyond the 120s
     /// `APP_RUNTIME_RELAY_REBUILD_LOOKBACK`. A deliberate cursor reset must be
     /// a dedicated named API; a raw save cannot lower the merged value.
+    #[cfg(test)]
     fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
-        self.save_state_clearing_local_group_deletion_frontiers(state, &[])
+        self.account_storage(&state.label)?
+            .save_account_projection_state(
+                &stored_state_from_account_state(state),
+                MAX_SEEN_EVENT_IDS,
+                TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+            )?;
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(state.label.clone());
+        Ok(())
     }
 
-    fn save_state_clearing_local_group_deletion_frontiers(
+    fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &self,
-        state: &AccountState,
-        frontiers_to_clear: &[(String, u64)],
-    ) -> Result<(), AppError> {
-        self.save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
-            state,
-            frontiers_to_clear,
-            &[],
-        )
-    }
-
-    fn save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
-        &self,
-        state: &AccountState,
+        delta: &AccountState,
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
     ) -> Result<(), AppError> {
-        self.account_storage(&state.label)?
-            .save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
-                &stored_state_from_account_state(state),
+        self.account_storage(&delta.label)?
+            .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                &stored_state_from_account_state(delta),
                 MAX_SEEN_EVENT_IDS,
                 TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
                 frontiers_to_clear,
@@ -4050,7 +4067,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(state.label.clone());
+            .insert(delta.label.clone());
         Ok(())
     }
 
