@@ -80,11 +80,11 @@ pub enum MarmotEventFfi {
         message_id_hex: String,
         recipient_hex: String,
     },
-    /// This device armed `arms` epoch-gap history backfills for the group
-    /// without catching up: it is still stalled at `stalled_epoch` while the
-    /// group has moved on. Surface it as "this group cannot catch up; re-syncing
-    /// is recommended"; the sanctioned repair is rotating this device's key
-    /// package and re-activating transport, which is the host app's call.
+    /// This device armed `arms` epoch-gap history backfills for the group with
+    /// no sign in between that it caught up: it is still at `stalled_epoch`.
+    /// Surface it as "this group cannot catch up; re-syncing is recommended";
+    /// the sanctioned repair is rotating this device's key package and
+    /// re-activating transport, which is the host app's call.
     EpochStallEscalated {
         account_id_hex: String,
         account_label: String,
