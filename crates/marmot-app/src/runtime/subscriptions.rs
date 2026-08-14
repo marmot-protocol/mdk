@@ -1566,6 +1566,7 @@ impl MarmotAppRuntime {
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
+            let mut seen_notification_keys = HashSet::new();
             loop {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
@@ -1573,8 +1574,16 @@ impl MarmotAppRuntime {
                 };
                 match event {
                     Ok(event) => {
-                        match notifications::notification_update_from_event(&app, &event) {
+                        let app_for_lookup = app.clone();
+                        match blocking_app_task(move || {
+                            notifications::notification_update_from_event(&app_for_lookup, &event)
+                        })
+                        .await
+                        {
                             Ok(Some(update)) => {
+                                if !seen_notification_keys.insert(update.notification_key.clone()) {
+                                    continue;
+                                }
                                 if updates_tx.send(update).await.is_err() {
                                     return;
                                 }
@@ -1590,7 +1599,25 @@ impl MarmotAppRuntime {
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let app_for_lookup = app.clone();
+                        let recovered = match blocking_app_task(move || {
+                            notifications::recover_notification_updates(&app_for_lookup)
+                        })
+                        .await
+                        {
+                            Ok(updates) => updates,
+                            Err(_) => continue,
+                        };
+                        for update in recovered {
+                            if !seen_notification_keys.insert(update.notification_key.clone()) {
+                                continue;
+                            }
+                            if updates_tx.send(update).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }

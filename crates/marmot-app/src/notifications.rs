@@ -32,8 +32,8 @@ use cgka_traits::group::ProtocolProfile;
 
 use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
 use crate::{
-    AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
-    tag_value,
+    AppError, AppGroupRecord, AppMessageQuery, MarmotApp, MarmotAppEvent, ReceivedMessage,
+    RuntimeMessageReceived, tag_value,
 };
 use storage_sqlite::TimelineMessageTarget;
 
@@ -62,6 +62,10 @@ const LEGACY_PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
 const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
 const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
+/// Bounded recent-history window used to rebuild missed notifications after
+/// broadcast lag. Large enough to cover a slow consumer, small enough that
+/// recovery stays a snapshot rather than a full-history hydrate.
+const NOTIFICATION_LAG_RECOVERY_LIMIT: usize = 64;
 
 #[cfg(test)]
 std::thread_local! {
@@ -1460,6 +1464,55 @@ pub(crate) fn notification_update_from_event(
 ) -> Result<Option<NotificationUpdate>, AppError> {
     let mut resolver = NotificationResolver::default();
     notification_update_from_event_cached(app, &mut resolver, event)
+}
+
+/// Re-derive candidate notifications from recent stored messages after the
+/// live broadcast ring overflows. Callers still dedupe against already-emitted
+/// `notification_key`s so recovery cannot replay a notification the subscriber
+/// already saw.
+pub(crate) fn recover_notification_updates(
+    app: &MarmotApp,
+) -> Result<Vec<NotificationUpdate>, AppError> {
+    let mut resolver = NotificationResolver::default();
+    let mut updates = Vec::new();
+    for account in app.account_home().accounts()? {
+        let records = app.messages_with_query(
+            &account.label,
+            AppMessageQuery {
+                group_id_hex: None,
+                limit: Some(NOTIFICATION_LAG_RECOVERY_LIMIT),
+            },
+        )?;
+        for record in records {
+            let Ok(group_id) = hex::decode(&record.group_id_hex) else {
+                continue;
+            };
+            let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+                account_id_hex: account.account_id_hex.clone(),
+                account_label: account.label.clone(),
+                message: ReceivedMessage {
+                    message_id_hex: record.message_id_hex,
+                    source_message_id_hex: String::new(),
+                    sender: record.sender,
+                    sender_display_name: None,
+                    group_id: cgka_traits::GroupId::new(group_id),
+                    source_epoch: record.source_epoch.unwrap_or(0),
+                    retention: record.retention,
+                    plaintext: record.plaintext,
+                    kind: record.kind,
+                    tags: record.tags,
+                    recorded_at: record.recorded_at,
+                    received_at: record.received_at,
+                },
+            });
+            match notification_update_from_event_cached(app, &mut resolver, &event) {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) | Err(AppError::NotificationsDisabled) => {}
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(dedupe_notification_updates(updates))
 }
 
 /// Build a notification for one event, reusing `resolver`'s memoized
