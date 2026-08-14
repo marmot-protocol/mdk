@@ -51,8 +51,9 @@ fn a_fail_closed_convergence_falls_through_to_a_clean_fork() {
 
 #[test]
 fn a_superseded_route_is_recorded_in_the_accepted_artifact() {
-    // The test above pins the stdout surface of the superseded finding; this pins
-    // the persisted one. `unavailable_fields` is where the artifact already states
+    // The test above pins the in-memory advisory (`routing.advisories`); this
+    // pins the persisted one — the stdout rendering of both lives in
+    // `tests/cli.rs`. `unavailable_fields` is where the artifact already states
     // what it could not cover, so that is where the finding belongs — see
     // `fall_through_to_fork` for why the artifact needs its own copy at all.
     let routing = routed("convergence-failclosed-with-clean-fork.json");
