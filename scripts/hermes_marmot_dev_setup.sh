@@ -210,13 +210,42 @@ ensure_uv() {
     command -v uv >/dev/null 2>&1
 }
 
+# Authenticate GitHub HTTPS via extraheader so a failed clone cannot echo a
+# token-bearing URL. Unauthenticated clones of public repos 429 in CI.
+git_with_github_auth() {
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        git -c "http.extraheader=AUTHORIZATION: bearer ${GITHUB_TOKEN}" "$@"
+    else
+        git "$@"
+    fi
+}
+
+clone_hermes_repo() {
+    local dest="$1"
+    local attempt=1
+    local max_attempts=5
+    local delay=8
+    while [ "$attempt" -le "$max_attempts" ]; do
+        rm -rf "$dest"
+        if git_with_github_auth clone "$hermes_url" "$dest"; then
+            return 0
+        fi
+        echo "warning: hermes clone failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s" >&2
+        attempt=$((attempt + 1))
+        sleep "$delay"
+        delay=$((delay * 2))
+    done
+    echo "error: failed to clone Hermes after ${max_attempts} attempts" >&2
+    return 1
+}
+
 install_hermes() {
     if [ ! -d "$hermes_repo/.git" ]; then
-        git clone "$hermes_url" "$hermes_repo"
+        clone_hermes_repo "$hermes_repo"
     fi
 
     if [ -n "$hermes_ref" ]; then
-        git -C "$hermes_repo" fetch origin "$hermes_ref" || true
+        git_with_github_auth -C "$hermes_repo" fetch origin "$hermes_ref" || true
         git -C "$hermes_repo" checkout "$hermes_ref"
     fi
 
