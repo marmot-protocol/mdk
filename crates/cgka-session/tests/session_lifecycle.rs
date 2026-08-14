@@ -18,8 +18,12 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use std::io::Write;
 use std::sync::Arc;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
+
+const SESSION_PROMOTION_FIXTURE: &[u8] = include_bytes!("../fixtures/session-promotion-v1.bin");
+const SESSION_PROMOTION_GROUP_ID_HEX: &str = "1d3ce58153822ac936ba83eba9cb87db";
 
 fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
     use sha2::{Digest, Sha256};
@@ -309,6 +313,35 @@ async fn session_reopens_encrypted_sqlite_group_state() {
     assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
     assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
     assert_eq!(reopened.own_leaf_index(&created.group_id).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    fixture.write_all(SESSION_PROMOTION_FIXTURE).unwrap();
+    fixture.flush().unwrap();
+    let database_path = fixture.path().to_owned();
+    let key = SqlCipherKey::new("session promotion facade key").unwrap();
+    let group_id = GroupId::new(hex::decode(SESSION_PROMOTION_GROUP_ID_HEX).unwrap());
+    let mut session = AccountDeviceSession::open(config(&database_path, &key, b"alice-promotion"))
+        .expect("session is ready before maintenance promotion");
+
+    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(session.members(&group_id).unwrap().len(), 2);
+    let progress = session.promote_legacy_message_rows(1).unwrap();
+    assert_eq!(progress.promoted, 1);
+    assert!(!progress.has_more);
+    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(session.members(&group_id).unwrap().len(), 2);
+    let post_promotion_payload = app_payload_for(&session, b"usable after promotion");
+    session
+        .send(SendIntent::AppMessage {
+            group_id,
+            payload: post_promotion_payload,
+        })
+        .await
+        .expect("promotion preserves public session behavior");
 }
 
 #[tokio::test]

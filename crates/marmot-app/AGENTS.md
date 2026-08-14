@@ -76,6 +76,10 @@ App runtime bridge for the first real Marmot app surfaces.
   release file locks. Closing is terminal — do not add a path that transparently reopens a database afterwards, and
   put shutdown checks at engine-step boundaries (never inside a step, where a snapshot guard may be live). See
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
+- Keep legacy message-format promotion after account readiness and bounded to
+  one small transaction per steady-state maintenance tick. Log aggregate
+  progress only, retry transient contention, and halt durable decode failures
+  without disabling legacy reads.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.

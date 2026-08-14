@@ -63,6 +63,15 @@ pub enum StorageError {
     /// one instead.
     #[error("backend closed: {0}")]
     Closed(String),
+    /// The database was opened by a binary whose schema migration list ends
+    /// before a migration already recorded on disk. Callers must not retry or
+    /// attempt to read application tables with this binary; re-upgrade the
+    /// application or restore a database created before the unsupported
+    /// migration.
+    #[error(
+        "database schema version {found} is newer than the latest supported version {latest_supported}"
+    )]
+    UnsupportedSchemaVersion { found: i64, latest_supported: i64 },
     #[error("backend failure: {0}")]
     Backend(String),
     #[error("serialization failure: {0}")]

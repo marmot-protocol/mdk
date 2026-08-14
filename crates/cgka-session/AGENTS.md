@@ -12,6 +12,9 @@ account key derivation, relay sync, or UI projection.
 - Keep SQLCipher keys app-provided. Do not add key derivation or recovery here.
 - Keep transport-specific code out. Inject a `TransportPeeler`.
 - Surface engine effects as app events plus publishable transport work.
+- Keep storage-only legacy-format promotion explicit and host-scheduled after
+  readiness; do not add it to the session-open critical path or widen the
+  generic engine storage API for it.
 - Prefer behavior tests over internal state assertions.
 
 ## Verification

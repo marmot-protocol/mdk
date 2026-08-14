@@ -1,0 +1,64 @@
+// Compile this example against exact MDK tag v0.9.12, commit
+// 3fc4eb83974eb64ecb298856b0db70cc3055af57. It is retained as provenance,
+// not compiled by the current workspace.
+
+use cgka_traits::capabilities::GroupCapabilities;
+use cgka_traits::group::{Group, ProtocolProfile};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::storage::{GroupStorage, MessageStorage};
+use cgka_traits::transport::{
+    Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
+
+const FIXTURE_KEY: &str = "mdk storage v1 fixture key";
+
+fn main() {
+    let path = std::env::args_os().nth(1).expect("fixture output path");
+    let key = SqlCipherKey::new(FIXTURE_KEY).expect("fixture key");
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).expect("open fixture");
+
+    let group_id = GroupId::new(vec![0x11; 16]);
+    storage
+        .put_group(&Group {
+            id: group_id.clone(),
+            name: "storage-v1-fixture".into(),
+            description: "written by MDK v0.9.12".into(),
+            epoch: EpochId(7),
+            members: Vec::new(),
+            required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
+            removed: false,
+            unrecoverable: false,
+            disbanded: None,
+            join_epoch: EpochId(0),
+        })
+        .expect("put group");
+
+    let message_id = MessageId::new(vec![0x22; 32]);
+    let transport = TransportMessage {
+        id: message_id.clone(),
+        payload: vec![0x5a; 16_727],
+        timestamp: Timestamp(1_723_456_789),
+        causal_deps: Vec::new(),
+        source: TransportSource("fixture".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: MemberId::new(vec![0x33; 32]),
+        },
+    };
+    let payload = StoredMessagePayload::outbound_welcome(transport)
+        .encode()
+        .expect("encode legacy payload");
+    storage
+        .put_message(&MessageRecord {
+            id: message_id,
+            group_id,
+            epoch: EpochId(7),
+            state: MessageState::Sent,
+            payload,
+            deferred_peel: None,
+        })
+        .expect("put message");
+    storage.close().expect("close fixture");
+}

@@ -92,6 +92,9 @@ mod migration_0045_timeline_canonical_order;
 mod migration_0046_message_group_state_epoch_index;
 #[path = "migrations/0047_normalized_message_records.rs"]
 mod migration_0047_normalized_message_records;
+#[cfg(test)]
+#[path = "migrations/test_support.rs"]
+mod test_support;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -420,9 +423,10 @@ fn reject_unknown_future_migrations(
         .optional()
         .storage()?;
     if let Some(version) = unknown {
-        return Err(StorageError::Backend(format!(
-            "database was migrated by a newer storage-sqlite version: {version}"
-        )));
+        return Err(StorageError::UnsupportedSchemaVersion {
+            found: version,
+            latest_supported: latest_known,
+        });
     }
     Ok(())
 }
@@ -544,18 +548,23 @@ mod tests {
         SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, epoch_to_i64, message_state_to_i64,
         open_hardened_sqlcipher, serialize,
     };
-    use cgka_traits::message::MessageRecord;
+    use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
     use cgka_traits::storage::{GroupStorage, MessageStorage};
-    use std::io::Read;
+    use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+    use std::io::{Read, Write};
     use std::path::Path;
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const CRASH_CHILD_ENV: &str = "MDK_STORAGE_TEST_CRASH_CHILD";
     const CRASH_DATABASE_ENV: &str = "MDK_STORAGE_TEST_CRASH_DATABASE";
     const CRASH_READY_FILE_ENV: &str = "MDK_STORAGE_TEST_CRASH_READY_FILE";
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
+    const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
+    const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
@@ -625,6 +634,119 @@ mod tests {
             .collect();
         drop(connection);
         messages
+    }
+
+    fn benchmark_message_id(index: usize) -> cgka_traits::MessageId {
+        cgka_traits::MessageId::new(index.to_be_bytes().to_vec())
+    }
+
+    fn benchmark_legacy_message(index: usize, group_id: &cgka_traits::GroupId) -> MessageRecord {
+        let message_id = benchmark_message_id(index);
+        let transport = TransportMessage {
+            id: message_id.clone(),
+            payload: vec![u8::try_from(index % 251).unwrap(); 16_727],
+            timestamp: Timestamp(u64::try_from(index).unwrap()),
+            causal_deps: Vec::new(),
+            source: TransportSource("storage-format-ops".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: cgka_traits::MemberId::new(vec![0x44; 32]),
+            },
+        };
+        // Call serde_json directly to pin the v1 envelope. The current
+        // `StoredMessagePayload::encode` intentionally emits binary v2.
+        let payload =
+            serde_json::to_vec(&StoredMessagePayload::outbound_welcome(transport)).unwrap();
+        MessageRecord {
+            id: message_id,
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(u64::try_from(index).unwrap()),
+            state: MessageState::Sent,
+            payload,
+            deferred_peel: None,
+        }
+    }
+
+    fn seed_file_backed_v1_benchmark_database(path: &Path, message_count: usize) -> usize {
+        let mut connection = keyed_connection(path);
+        run(&mut connection, &MIGRATIONS[..46]).unwrap();
+        let group = sample_group(gid(1), 0, 0);
+        connection
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, ?2, ?3)",
+                params![
+                    group.id.as_slice(),
+                    epoch_to_i64(group.epoch).unwrap(),
+                    serialize(&group).unwrap()
+                ],
+            )
+            .unwrap();
+        let tx = connection.transaction().unwrap();
+        let mut representative_record_bytes = 0;
+        for index in 1..=message_count {
+            let message = benchmark_legacy_message(index, &group.id);
+            let record = serialize(&message).unwrap();
+            representative_record_bytes = record.len();
+            tx.execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    message.id.as_slice(),
+                    message.group_id.as_slice(),
+                    epoch_to_i64(message.epoch).unwrap(),
+                    message_state_to_i64(message.state),
+                    record,
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        representative_record_bytes
+    }
+
+    fn database_footprint(path: &Path) -> u64 {
+        [
+            path.to_path_buf(),
+            path.with_extension("sqlite3-wal"),
+            path.with_extension("sqlite3-shm"),
+        ]
+        .into_iter()
+        .filter_map(|artifact| std::fs::metadata(artifact).ok())
+        .map(|metadata| metadata.len())
+        .sum()
+    }
+
+    fn measure_database_operation<T>(
+        path: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Duration, u64) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler_stop = Arc::clone(&stop);
+        let sampler_path = path.to_path_buf();
+        let sampler = thread::spawn(move || {
+            let mut peak = database_footprint(&sampler_path);
+            while !sampler_stop.load(Ordering::Relaxed) {
+                peak = peak.max(database_footprint(&sampler_path));
+                thread::sleep(Duration::from_millis(1));
+            }
+            peak.max(database_footprint(&sampler_path))
+        });
+        let started = Instant::now();
+        let result = operation();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        let peak = sampler.join().unwrap();
+        (result, elapsed, peak)
+    }
+
+    fn checkpoint_database(path: &Path) {
+        let connection = keyed_connection(path);
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
 
     fn kill_child_at(
@@ -744,11 +866,13 @@ mod tests {
             .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
             .unwrap();
         let error = run(&mut older_connection, &MIGRATIONS[..46]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("database was migrated by a newer storage-sqlite version: 47")
-        );
+        assert!(matches!(
+            error,
+            StorageError::UnsupportedSchemaVersion {
+                found: 47,
+                latest_supported: 46,
+            }
+        ));
         let after: i64 = older_connection
             .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
             .unwrap();
@@ -756,6 +880,167 @@ mod tests {
             after, before,
             "downgrade refusal must not touch account rows"
         );
+    }
+
+    #[test]
+    fn exact_v0_9_12_database_upgrades_and_promotes_without_semantic_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("v0.9.12-upgrade.sqlite3");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        fs_private::set_private_file_mode(&mut options);
+        let mut fixture_copy = options.open(&database).unwrap();
+        fixture_copy.write_all(V0_9_12_FIXTURE).unwrap();
+        fixture_copy.sync_all().unwrap();
+        drop(fixture_copy);
+        let key = SqlCipherKey::new(V0_9_12_FIXTURE_KEY).unwrap();
+
+        let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let group = store
+            .get_group(&cgka_traits::GroupId::new(vec![0x11; 16]))
+            .unwrap();
+        assert_eq!(group.name, "storage-v1-fixture");
+        assert_eq!(group.epoch, cgka_traits::EpochId(7));
+
+        let message_id = cgka_traits::MessageId::new(vec![0x22; 32]);
+        let before = store.get_message(&message_id).unwrap();
+        assert_eq!(before.state, cgka_traits::message::MessageState::Sent);
+        let decoded = StoredMessagePayload::decode(&before.payload).unwrap();
+        let welcome = decoded.as_outbound_welcome().unwrap();
+        assert_eq!(welcome.payload.len(), 16_727);
+        assert_eq!(welcome.source.0, "fixture");
+
+        let progress = store.promote_legacy_message_rows(1).unwrap();
+        assert_eq!(progress.promoted, 1);
+        assert!(!progress.has_more);
+        assert_eq!(store.get_message(&message_id).unwrap(), before);
+        store.close().unwrap();
+
+        let mut older_connection = {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+            connection
+        };
+        let error = run(&mut older_connection, &MIGRATIONS[..46]).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::UnsupportedSchemaVersion {
+                found: 47,
+                latest_supported: 46,
+            }
+        ));
+    }
+
+    #[test]
+    #[ignore = "large file-backed storage-format benchmark; run via `just bench-storage-upgrade`"]
+    fn storage_format_upgrade_benchmark() {
+        let message_count = std::env::var("MDK_STORAGE_OPS_ROWS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("MDK_STORAGE_OPS_ROWS usize"))
+            .unwrap_or(512);
+        assert!((1..=100_000).contains(&message_count));
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("storage-format-upgrade.sqlite3");
+        let representative_record_bytes =
+            seed_file_backed_v1_benchmark_database(&database, message_count);
+        let before_bytes = database_footprint(&database);
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+
+        let (store, migration_duration, migration_peak_bytes) =
+            measure_database_operation(&database, || {
+                SqliteAccountStorage::open_encrypted(&database, &key).unwrap()
+            });
+        let legacy_after_migration = usize::try_from(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM cgka_messages WHERE storage_format = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_after_migration, message_count);
+        let after_migration_bytes = database_footprint(&database);
+
+        let (
+            (promotion_batches, promoted, promotion_max_batch_ms),
+            promotion_duration,
+            promotion_peak_bytes,
+        ) = measure_database_operation(&database, || {
+            let mut batches = 0usize;
+            let mut promoted = 0usize;
+            let mut max_batch = Duration::ZERO;
+            loop {
+                let batch_started = Instant::now();
+                let progress = store.promote_legacy_message_rows(32).unwrap();
+                max_batch = max_batch.max(batch_started.elapsed());
+                batches += 1;
+                promoted += progress.promoted;
+                if !progress.has_more {
+                    break;
+                }
+            }
+            (batches, promoted, max_batch.as_millis())
+        });
+        assert_eq!(promoted, message_count);
+        assert_eq!(
+            store.get_message(&benchmark_message_id(1)).unwrap().payload,
+            benchmark_legacy_message(1, &gid(1)).payload
+        );
+        assert_eq!(
+            store
+                .get_message(&benchmark_message_id(message_count))
+                .unwrap()
+                .payload,
+            benchmark_legacy_message(message_count, &gid(1)).payload
+        );
+        store.close().unwrap();
+        checkpoint_database(&database);
+        let after_promotion_bytes = database_footprint(&database);
+
+        let (reopened, reopen_duration, _) = measure_database_operation(&database, || {
+            SqliteAccountStorage::open_encrypted(&database, &key).unwrap()
+        });
+        reopened.close().unwrap();
+        checkpoint_database(&database);
+
+        let (_, vacuum_duration, vacuum_peak_bytes) = measure_database_operation(&database, || {
+            let connection = keyed_connection(&database);
+            connection.execute_batch("VACUUM").unwrap();
+        });
+        checkpoint_database(&database);
+        let after_vacuum_bytes = database_footprint(&database);
+
+        let promotion_rows_per_second = u64::try_from(
+            u128::try_from(message_count)
+                .unwrap()
+                .saturating_mul(1_000_000_000)
+                / promotion_duration.as_nanos().max(1),
+        )
+        .unwrap_or(u64::MAX);
+        super::test_support::emit_benchmark_line(format!(
+            "MDK_BENCH storage_format_upgrade rows={message_count} \
+             representative_record_bytes={representative_record_bytes} \
+             before_bytes={before_bytes} migration_ms={} \
+             migration_peak_bytes={migration_peak_bytes} migration_extra_bytes={} \
+             after_migration_bytes={after_migration_bytes} \
+             promotion_batches={promotion_batches} promotion_ms={} \
+             promotion_max_batch_ms={promotion_max_batch_ms} \
+             promotion_rows_per_second={promotion_rows_per_second} \
+             promotion_peak_bytes={promotion_peak_bytes} \
+             after_promotion_bytes={after_promotion_bytes} reopen_ms={} \
+             vacuum_ms={} vacuum_peak_bytes={vacuum_peak_bytes} \
+             after_vacuum_bytes={after_vacuum_bytes}",
+            migration_duration.as_millis(),
+            migration_peak_bytes.saturating_sub(before_bytes),
+            promotion_duration.as_millis(),
+            reopen_duration.as_millis(),
+            vacuum_duration.as_millis(),
+        ));
     }
 
     #[test]
@@ -941,12 +1226,13 @@ mod tests {
         run(&mut connection, MIGRATIONS).unwrap();
 
         let error = run(&mut connection, &MIGRATIONS[..46]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("database was migrated by a newer storage-sqlite version: 47"),
-            "unexpected downgrade error: {error}"
-        );
+        assert!(matches!(
+            error,
+            StorageError::UnsupportedSchemaVersion {
+                found: 47,
+                latest_supported: 46,
+            }
+        ));
         assert_eq!(
             applied_migrations_from_connection(&connection),
             expected_migrations(),

@@ -35,7 +35,9 @@ use cgka_traits::{
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportContext, AuditTransportWire, ForensicRecorder,
 };
-use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
+use storage_sqlite::{
+    MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
+};
 
 const TRACE_TARGET: &str = "cgka_session::session";
 
@@ -190,6 +192,7 @@ impl SessionConfig {
 
 pub struct AccountDeviceSession {
     engine: Engine<SqliteAccountStorage>,
+    storage: SqliteAccountStorage,
     open_timings: SessionOpenTimings,
 }
 
@@ -328,6 +331,11 @@ impl AccountDeviceSession {
             &config.database_key,
             config.storage_options,
         )?;
+        // Keep a clone of the same closeable connection for storage-only
+        // maintenance that must not widen the generic engine API. The engine
+        // and this handle share one underlying connection and terminal close
+        // state.
+        let maintenance_storage = storage.clone();
         let storage_open = opened_at.elapsed();
         let build_started = std::time::Instant::now();
         let builder = EngineBuilder::new(storage)
@@ -407,6 +415,7 @@ impl AccountDeviceSession {
         );
         Ok(Self {
             engine,
+            storage: maintenance_storage,
             open_timings,
         })
     }
@@ -415,6 +424,20 @@ impl AccountDeviceSession {
     /// counts only, safe for fixed-bucket telemetry.
     pub fn open_timings(&self) -> &SessionOpenTimings {
         &self.open_timings
+    }
+
+    /// Promote one bounded batch of legacy message rows after session
+    /// readiness.
+    ///
+    /// This is deliberately an explicit host-scheduled step rather than part
+    /// of [`Self::open`]: migration 47 preserves legacy rows so a large
+    /// account's payload decoding does not extend the account-open critical
+    /// path. The result contains aggregate counts only.
+    pub fn promote_legacy_message_rows(
+        &self,
+        limit: usize,
+    ) -> SessionResult<MessageFormatPromotionProgress> {
+        Ok(self.storage.promote_legacy_message_rows(limit)?)
     }
 
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {

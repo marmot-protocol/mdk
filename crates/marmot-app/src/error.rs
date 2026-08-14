@@ -299,6 +299,7 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::TimelineCursorExpired => "storage_timeline_cursor_expired",
         StorageError::Busy(_) => "storage_busy",
         StorageError::Closed(_) => "storage_closed",
+        StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
         StorageError::Backend(_) => "storage_backend",
         StorageError::Serialization(_) => "storage_serialization",
     }

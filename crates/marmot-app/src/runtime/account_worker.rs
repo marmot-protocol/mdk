@@ -766,6 +766,7 @@ async fn run_app_runtime_account_worker(
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
 
     'worker: loop {
         tokio::select! {
@@ -1120,6 +1121,10 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
+                run_legacy_message_promotion_batch(
+                    &client,
+                    &mut legacy_message_promotion,
+                );
                 if client.key_package_maintenance_requires_catch_up() {
                     match timeout(
                         Duration::from_secs(15),
@@ -1400,6 +1405,32 @@ async fn handle_account_worker_catch_up(
 /// its own group's hydration.
 const STARTUP_HYDRATION_BATCH_SIZE: usize = 4;
 
+/// Legacy rows promoted per steady-state maintenance tick. Keep this much
+/// smaller than the storage API's hard maximum so a message-heavy account
+/// remains responsive and shutdown never waits on a history-sized batch.
+const LEGACY_MESSAGE_PROMOTION_BATCH_SIZE: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyMessagePromotionStatus {
+    Pending,
+    Complete,
+    Halted,
+}
+
+struct LegacyMessagePromotionSchedule {
+    status: LegacyMessagePromotionStatus,
+    promoted_total: usize,
+}
+
+impl LegacyMessagePromotionSchedule {
+    fn new() -> Self {
+        Self {
+            status: LegacyMessagePromotionStatus::Pending,
+            promoted_total: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) const STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST: usize = STARTUP_HYDRATION_BATCH_SIZE;
 
@@ -1414,6 +1445,82 @@ const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
 enum StartupHydrationOutcome {
     Completed,
     Shutdown,
+}
+
+/// Run one storage-only promotion transaction after account readiness.
+///
+/// Transient lock failures retry on the next 15-second maintenance tick.
+/// Durable decode failures halt this optional sweep until the next process
+/// start so a malformed legacy row cannot create a hot retry loop. Reads keep
+/// their legacy fallback either way, so this never gates account use.
+fn run_legacy_message_promotion_batch(
+    client: &AppClient,
+    schedule: &mut LegacyMessagePromotionSchedule,
+) {
+    run_legacy_message_promotion_batch_with(schedule, |limit| {
+        client.runtime.session().promote_legacy_message_rows(limit)
+    });
+}
+
+fn run_legacy_message_promotion_batch_with(
+    schedule: &mut LegacyMessagePromotionSchedule,
+    promote: impl FnOnce(
+        usize,
+    )
+        -> cgka_session::SessionResult<storage_sqlite::MessageFormatPromotionProgress>,
+) {
+    if schedule.status != LegacyMessagePromotionStatus::Pending {
+        return;
+    }
+    let started = Instant::now();
+    match promote(LEGACY_MESSAGE_PROMOTION_BATCH_SIZE) {
+        Ok(progress) => {
+            schedule.promoted_total = schedule.promoted_total.saturating_add(progress.promoted);
+            if progress.has_more {
+                tracing::info!(
+                    target: "marmot_app::storage_maintenance",
+                    method = "promote_legacy_message_rows",
+                    promoted = progress.promoted,
+                    promoted_total = schedule.promoted_total,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "promoted one bounded legacy-message batch"
+                );
+            } else {
+                schedule.status = LegacyMessagePromotionStatus::Complete;
+                if schedule.promoted_total == 0 {
+                    tracing::debug!(
+                        target: "marmot_app::storage_maintenance",
+                        method = "promote_legacy_message_rows",
+                        "legacy-message promotion is already complete"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "marmot_app::storage_maintenance",
+                        method = "promote_legacy_message_rows",
+                        promoted = progress.promoted,
+                        promoted_total = schedule.promoted_total,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "completed legacy-message promotion"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            let transient = error.is_transient();
+            let error_kind = AppError::from(error).privacy_safe_kind();
+            if !transient {
+                schedule.status = LegacyMessagePromotionStatus::Halted;
+            }
+            tracing::warn!(
+                target: "marmot_app::storage_maintenance",
+                method = "promote_legacy_message_rows",
+                error_kind,
+                retry_scheduled = transient,
+                promoted_total = schedule.promoted_total,
+                "legacy-message promotion batch failed"
+            );
+        }
+    }
 }
 
 /// Fully hydrate every group the deferred session open only seeded, in
@@ -3226,6 +3333,64 @@ mod tests {
 
     fn test_group_id(byte: u8) -> GroupId {
         GroupId::new(vec![byte])
+    }
+
+    #[test]
+    fn legacy_message_promotion_completes_and_stops_scheduling() {
+        let mut schedule = LegacyMessagePromotionSchedule::new();
+        let mut calls = 0;
+
+        run_legacy_message_promotion_batch_with(&mut schedule, |limit| {
+            calls += 1;
+            assert_eq!(limit, LEGACY_MESSAGE_PROMOTION_BATCH_SIZE);
+            Ok(storage_sqlite::MessageFormatPromotionProgress {
+                promoted: 7,
+                has_more: false,
+            })
+        });
+        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+            calls += 1;
+            unreachable!("completed promotion must not call storage again")
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(schedule.promoted_total, 7);
+        assert_eq!(schedule.status, LegacyMessagePromotionStatus::Complete);
+    }
+
+    #[test]
+    fn legacy_message_promotion_retries_transient_failures() {
+        let mut schedule = LegacyMessagePromotionSchedule::new();
+
+        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+            Err(cgka_session::SessionError::Storage(
+                cgka_traits::storage::StorageError::Busy("test contention".into()),
+            ))
+        });
+
+        assert_eq!(schedule.status, LegacyMessagePromotionStatus::Pending);
+        assert_eq!(schedule.promoted_total, 0);
+    }
+
+    #[test]
+    fn legacy_message_promotion_halts_after_durable_failure() {
+        let mut schedule = LegacyMessagePromotionSchedule::new();
+        let mut calls = 0;
+
+        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+            calls += 1;
+            Err(cgka_session::SessionError::Storage(
+                cgka_traits::storage::StorageError::Serialization("malformed legacy row".into()),
+            ))
+        });
+        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+            calls += 1;
+            unreachable!("durable failure must halt this process's sweep")
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(schedule.status, LegacyMessagePromotionStatus::Halted);
+        assert_eq!(schedule.promoted_total, 0);
     }
 
     #[test]

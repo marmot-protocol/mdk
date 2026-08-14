@@ -162,7 +162,10 @@ storage artifact:
    `docs/marmot-architecture/storage-format-v2.md` in the release notes.
 2. Verify an older fixture opens and upgrades once, a current fixture reopens
    without rewriting, and the prior binary refuses the new migration before
-   reading or writing account tables.
+   reading or writing account tables. The current migration runner's downgrade
+   guard must remain a typed `StorageError::UnsupportedSchemaVersion`; a pinned
+   previously shipped binary may retain its older error wrapper, but it must
+   still refuse before application-table access.
 3. Run crash/failure-injection tests at every multi-row transformation or
    artifact replacement boundary. Schema migrations are transactional;
    background promotion work must additionally be row-idempotent and bounded.
@@ -172,11 +175,27 @@ storage artifact:
 5. Recommend a pre-upgrade backup/export for the migration-47 cohort. Although
    it preserves legacy row bytes and defers per-row format promotion, its
    transactional table rebuild physically copies the complete message history.
-   Validate upgrade duration, WAL growth, and temporary free-space requirements
-   on a representative large account before release.
+   Before promoting the release cohort, capture the stable `MDK_BENCH` output
+   from a representative large-account run:
+
+   ```sh
+   MDK_STORAGE_OPS_ROWS=2048 just bench-storage-upgrade
+   ```
+
+   The 2026-08-14 baseline peaked at 4.01 times the starting database footprint
+   and needed 3.01 times that footprint as additional temporary space. Release
+   notes should require at least 3.25 times the account database size free
+   before upgrade, report the newly measured duration, peak footprint, and
+   maximum 32-row batch latency, and explain that the estimate must be refreshed
+   if the format or journal policy changes.
 6. Do not run `VACUUM` during automatic account open. If page reclamation is
    useful, expose it as explicit keyed-connection maintenance and report its
    expected duration and temporary free-space requirement.
+7. Ship the change as one synchronized cohort via `just release-all <version>`
+   so MDK, wn-agent, and MarmotKit agree on the database boundary. Call out
+   migration 47, unsupported downgrade, the backup remedy, and gradual
+   post-readiness promotion in every applicable release note. Workspace and
+   package version changes remain a separate manual release operation.
 
 Storage migrations do not require a workspace version bump during feature
 development. The eventual release version remains a manual release operation.
