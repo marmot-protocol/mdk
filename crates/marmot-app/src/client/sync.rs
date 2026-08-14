@@ -1135,9 +1135,8 @@ impl AppClient {
         if let BackfillDecision::ArmAndEscalate { arms } = decision {
             // The replay is armed above regardless: escalating reports that
             // replay alone is not repairing this group, it does not replace the
-            // attempt. The stronger repair (key-package rotation plus a full
-            // re-activation) publishes new key material, so it stays the app's
-            // decision — MDK reports the condition and names the repair.
+            // attempt (see EPOCH_STALL_ESCALATION_ARM_THRESHOLD for why
+            // reporting is all this decision does).
             tracing::warn!(
                 target: "marmot_app::epoch_stall",
                 method = "apply_backfill_decision",
@@ -1175,6 +1174,9 @@ impl AppClient {
     /// also makes `sync_inner`'s own call belt-and-braces rather than
     /// load-bearing: the nested drain has already emptied the stash.)
     ///
+    /// A run is still forgotten when a caller discards the client outright; the
+    /// [`super::epoch_stall`] module header covers that case and what
+    /// re-escalating then costs.
     fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations
@@ -1540,7 +1542,6 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_pending_convergence_groups(&effects);
-        let mut summary = SyncSummary::default();
         self.arm_recovery_from_effects(&effects);
         self.remember_published_reports(&effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
@@ -1560,6 +1561,7 @@ impl AppClient {
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();

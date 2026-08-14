@@ -190,12 +190,13 @@ and retain the raw line for forward-compatible reprocessing.
 
 ## Event catalogue
 
-This catalogue is not yet complete. `AuditEventKind` currently has 42 variants, and these thirteen have no section
+This catalogue is not yet complete. `AuditEventKind` currently has 46 variants, and these fifteen have no section
 here yet — treat `crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
-`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_armed`,
-`epoch_stall_backfill_escalated`, `group_hydration_quarantined`, `group_hydration_recovered`,
-`message_content_decoded`, `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`,
-`subscription_rebuild`, `sync_drain`, and `transport_received`.
+`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_completed`,
+`epoch_stall_backfill_deferred`, `epoch_stall_backfill_failed`, `epoch_stall_backfill_started`,
+`group_hydration_quarantined`, `group_hydration_recovered`, `message_content_decoded`,
+`pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
+`sync_drain`, and `transport_received`.
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v2.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v2.schema.json); the
@@ -828,6 +829,57 @@ Metadata notes:
 - Error details live in the sensitive audit log, not normal telemetry.
 - `error_kind` values are `malformed`, `decrypt_failed`, `stale_epoch`, `missing_context`, `wrap_failed`, and
   `backend`.
+
+### `epoch_stall_backfill_armed`
+
+Emitted when the app runtime's epoch-stall detector reads a group as stuck — traffic it cannot decrypt keeps arriving
+while the device's own epoch does not move — and arms one account-wide full-history transport replay to recover the
+commit it missed. Two triggers reach it: the group accumulated
+`threshold` distinct undecryptable messages while its own epoch did not move, or an inbound object was refused outright
+(direct proof that the fetched history was not fully retained).
+
+| Field | Meaning |
+| --- | --- |
+| `stalled_epoch` | The device's own group epoch when the replay was armed. |
+| `threshold` | Distinct-undecryptable count in force in this build, so the row is self-describing when the constant is retuned. |
+| `trigger` | Which of the two triggers armed this replay: `undecryptable_threshold` or `resource_refusal`. Absent on rows written before the field existed. |
+
+Metadata notes:
+
+- This event has `group_ref`.
+- At most one row per (group, epoch): a second burst at the same stalled epoch is debounced, and one replay covers every
+  group stuck at once, so N stuck groups cost one replay rather than N.
+- Read `stalled_epoch` against the group's live epoch — visible on `group_context` and the `epoch_*` rows — to size the
+  gap that triggered recovery. The detector cannot read that live epoch itself; it never decrypts the traffic it counts.
+- Undecryptable traffic is attacker-mintable, so an armed row is evidence of a *decision*, not of a genuine gap. The
+  bounded cost of a wrong one is a single debounced replay.
+
+### `epoch_stall_backfill_escalated`
+
+Emitted when `arms` backfills have been armed for one group in a single unrecovered run — a run being arms with nothing
+in between to show the device caught up — reporting that nothing this device can see shows full-history replay
+repairing this group. Recorded once
+per run, at the arm that reached `arm_threshold`, alongside that arm's `epoch_stall_backfill_armed` row.
+
+| Field | Meaning |
+| --- | --- |
+| `stalled_epoch` | The device's own group epoch when the escalating arm fired. |
+| `arms` | Backfills armed in this unrecovered run, including the escalating one. |
+| `arm_threshold` | Run length that escalates in this build, carried for the same reason as `threshold` above. |
+
+Metadata notes:
+
+- This event has `group_ref`.
+- Escalation only *reports*. It does not change recovery behavior: the replay is armed either way, and the stronger
+  repair — rotating this device's key package and re-activating transport over full history — publishes new key
+  material, so it stays the host app's decision.
+- The run counter behind `arms` is in-memory, which cuts both ways. Two rows for one group need not be two independent
+  failures: a restart clears the counter, so the second can be the same unresolved condition re-earning a whole run.
+  And one row is not a bound on the damage: re-escalating needs the device's own epoch to keep moving, so a group whose
+  local epoch stops moving escalates at most once however long it sits there.
+- A device that keeps up with the group but cannot read one peer's traffic — a forked peer, or minted envelopes — can
+  complete a run too. The row stays true as stated (this device could not read this group's traffic); whether a re-sync
+  is the right answer is a separate judgement.
 
 ### `auto_commit_decision`
 

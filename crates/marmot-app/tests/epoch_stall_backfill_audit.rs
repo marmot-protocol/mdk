@@ -19,8 +19,9 @@
 //! the sync summary (published to app subscribers as
 //! `MarmotAppEvent::EpochStallEscalated`) plus one durable
 //! `epoch_stall_backfill_escalated` row. The escalation tests below pin that
-//! decision, its once-per-run latch, and its reset when bob passes cleanly
-//! through an epoch.
+//! decision, its once-per-run latch, its reset when bob passes cleanly through
+//! an epoch, and the runtime reporting gap that costs him that reset when a
+//! convergence fold is what carried him through.
 //!
 //! The arm is driven through `AppClient::next_event` exactly as
 //! `next_event_backfill.rs` does — the deterministic seam that avoids the full
@@ -30,7 +31,7 @@
 //! `cursor_persistence.rs`, following the established test convention of
 //! duplicating these helpers rather than sharing them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use marmot_account::AccountHome;
@@ -68,9 +69,37 @@ const ESCALATION_ARM_THRESHOLD: usize = 3;
 /// Deadline for one of alice's commits to reach bob and advance his epoch.
 const EPOCH_ADVANCE_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Wait that outlasts the engine's convergence quiescence window, so bob's
-/// convergence pass can open and fold alice's retained commit.
-const CONVERGENCE_QUIESCENCE_WAIT: Duration = Duration::from_millis(1_200);
+/// Poll interval while waiting for bob's epoch to advance.
+///
+/// The engine's settlement quiescence window ([`SETTLEMENT_QUIESCENCE_MS`])
+/// is a genuine floor on how soon bob's open convergence pass can freeze and
+/// fold alice's commit, so this wait cannot be removed — but it can be *waited
+/// out* rather than slept through. The window's deadline is only pushed back when
+/// the pass admits an input that could change its deterministic resolution
+/// (`cgka_engine::distributed_convergence::admit_convergence_input`), and neither
+/// re-draining nor re-driving convergence admits one once alice's single commit
+/// is in, so polling this fast converges on the floor instead of on a multiple of
+/// it.
+const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The convergence settlement quiescence window this harness runs both of its
+/// clients on, mirroring the protocol-pinned
+/// `cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS`.
+///
+/// Pinned explicitly rather than inherited, because the value a test-policy
+/// build inherits is not the production one: `MarmotApp::with_relay_and_config`
+/// defaults `dev_settlement_quiescence_ms` to `0` — instant settlement — under
+/// the `test-policy-overrides` feature, which the workspace CI run enables
+/// through `wn-cli`. That difference is not cosmetic here. At 1 s a convergence
+/// pass stays open across a drain, so a device reads a burst of commits at the
+/// epoch it was already sitting at and folds afterwards; at 0 ms every commit
+/// folds inside its own ingest, so the runtime reports an epoch per delivery and
+/// no device can be carried *through* an epoch at all. The whole reporting gap
+/// that [`a_clean_recovery_the_runtime_never_reports_still_escalates`] exists to
+/// pin lives in the first regime, which is also the one real devices run in, so this
+/// file states the window it means instead of taking whichever one the feature
+/// resolution hands it.
+const SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -90,7 +119,9 @@ fn open_store_with_config(
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),
-        config.with_allow_loopback_relay_endpoints(true),
+        config
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(SETTLEMENT_QUIESCENCE_MS),
     )
 }
 
@@ -182,6 +213,20 @@ fn total_sync_drain_deliveries(rows: &[serde_json::Value]) -> u64 {
         .iter()
         .filter_map(|row| row["kind"]["deliveries"].as_u64())
         .sum()
+}
+
+/// The transport message ids the engine reported an ingest outcome for.
+///
+/// This is the per-delivery evidence `sync_drain`'s aggregate count cannot
+/// give: a test that has published a specific message can wait for *that*
+/// delivery to have reached the engine rather than for some delivery to have.
+/// `msg_id` is a public transport id and survives the default obfuscated audit
+/// mode, so the ids match the ones the publishing client reported.
+fn ingested_message_ids(rows: &[serde_json::Value]) -> Vec<String> {
+    rows_of_kind(rows, "ingest_outcome")
+        .iter()
+        .filter_map(|row| row["kind"]["msg_id"].as_str().map(ToOwned::to_owned))
+        .collect()
 }
 
 /// A live group with bob (the stalled account under test) and alice, each in
@@ -311,9 +356,14 @@ impl StalledGroup {
     /// commit, without ever reaching the group's live epoch on his own.
     ///
     /// Applying an inbound commit is a two-step in this crate: the delivery is
-    /// retained by `sync`, and the convergence pass that folds it opens only
-    /// after its quiescence window closes. The account worker drives that second
+    /// retained by `sync`, and the convergence pass that folds it cannot freeze
+    /// until its quiescence window closes. The account worker drives that second
     /// step; a direct client must call `retry_group_convergence` itself.
+    ///
+    /// Awaits bob's observable epoch rather than a fixed wait, the shape
+    /// `wait_for_inbound_delivered` in `since_floor.rs` uses: each pass re-drains,
+    /// re-drives convergence, and reads the epoch, so the loop returns as soon as
+    /// the fold lands instead of one whole `EPOCH_ADVANCE_POLL_INTERVAL` late.
     async fn advance_bobs_epoch(&mut self, name: &str) {
         let before = self.bobs_epoch();
         self.alice
@@ -323,7 +373,6 @@ impl StalledGroup {
         let deadline = Instant::now() + EPOCH_ADVANCE_DEADLINE;
         loop {
             self.bob.sync().await.unwrap();
-            sleep(CONVERGENCE_QUIESCENCE_WAIT).await;
             self.bob
                 .retry_group_convergence(&self.group_id)
                 .await
@@ -335,6 +384,94 @@ impl StalledGroup {
                 Instant::now() < deadline,
                 "bob did not apply alice's commit within the deadline",
             );
+            sleep(EPOCH_ADVANCE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Carry bob *through* an epoch instead of stopping at it: alice commits
+    /// twice, bob retains *both* commits before he folds either, and the folds
+    /// then take him past the middle epoch without a single delivery ever being
+    /// read while he is there. That is the whole shape of the reporting gap: the
+    /// only epoch the runtime reports to the detector is the one it read a
+    /// delivery at, and the folds that moved bob two epochs on report nothing.
+    ///
+    /// Ingesting and folding are two phases here, not one loop, and the split is
+    /// what makes the carry deterministic rather than a race. The epoch a
+    /// delivery is *read* at is the only epoch the runtime ever reports, so both
+    /// commits have to be read before either is folded. Neither half of that is
+    /// left to timing: [`SETTLEMENT_QUIESCENCE_MS`] keeps the convergence pass
+    /// open across the drain that reads them (bob retains the first commit as
+    /// convergence input and cannot even peel the second from below its epoch),
+    /// and the fold is driven explicitly, by `retry_group_convergence`, only
+    /// once the ingest phase has both. Interleaving the two — drain, fold, drain
+    /// — would instead let a slow relay hand bob the second commit after the
+    /// first had already been folded: that delivery is then read at the middle
+    /// epoch, the runtime does report it, the arm run legitimately ends, and the
+    /// test's premise is deleted rather than failed. The ingest phase therefore
+    /// waits on the engine's own ingest outcomes for exactly alice's two commit
+    /// ids — the group's undecryptable probe traffic shares its `group_ref`, so
+    /// a count would not do — and the epoch assertion between the phases pins
+    /// that nothing folded early.
+    async fn carry_bob_through_an_epoch(&mut self, name: &str) {
+        let before = self.bobs_epoch();
+        let mut audit_rows = AuditRowTracker::default();
+        let _baseline = audit_rows.new_rows(&self.app_bob, "bob");
+        let mut commits = Vec::new();
+        for step in ["a", "b"] {
+            commits.extend(
+                self.alice
+                    .update_group_profile(&self.group_id, Some(&format!("{name}-{step}")), None)
+                    .await
+                    .unwrap()
+                    .message_ids,
+            );
+        }
+        assert_eq!(
+            commits.len(),
+            2,
+            "the carry needs exactly two published commits: {commits:?}",
+        );
+
+        // Phase one: ingest both commits, fold neither.
+        let deadline = Instant::now() + EPOCH_ADVANCE_DEADLINE;
+        let mut ingested = HashSet::new();
+        loop {
+            self.bob.sync().await.unwrap();
+            ingested.extend(ingested_message_ids(
+                &audit_rows.new_rows(&self.app_bob, "bob"),
+            ));
+            if commits.iter().all(|commit| ingested.contains(commit)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bob did not ingest both of alice's commits within the deadline",
+            );
+            sleep(EPOCH_ADVANCE_POLL_INTERVAL).await;
+        }
+        assert_eq!(
+            self.bobs_epoch(),
+            before,
+            "reading deliveries must not fold: both commits have to be read at the armed epoch",
+        );
+
+        // Phase two: fold, without reading anything else. Bob transits the
+        // middle epoch with no delivery to read it at, which is exactly the
+        // runtime behavior under test.
+        let deadline = Instant::now() + EPOCH_ADVANCE_DEADLINE;
+        loop {
+            self.bob
+                .retry_group_convergence(&self.group_id)
+                .await
+                .unwrap();
+            if self.bobs_epoch() >= before + 2 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bob did not fold both of alice's commits within the deadline",
+            );
+            sleep(EPOCH_ADVANCE_POLL_INTERVAL).await;
         }
     }
 
@@ -610,6 +747,73 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
         row["group_ref"].as_str(),
         Some(hex::encode(live.group_id.as_slice()).as_str()),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
+    );
+}
+
+/// A device that recovered cleanly is escalated anyway, because the runtime
+/// never tells the detector about the epochs a convergence fold carried it
+/// through.
+///
+/// Bob arms, then one real fold takes him past an epoch he never stalled at.
+/// Under the detector's own rule that clean pass ends his unrecovered run — but
+/// no `observe_*` call on the fold path reports it, so the run stays open and his
+/// next two stalls are counted as its second and third arms. He is reported as a
+/// group full-history replay cannot repair on the strength of an epoch he sailed
+/// through.
+///
+/// This is today's behavior, not the intended behavior, and it is the "before"
+/// side of closing the reporting gap: once the convergence fold reports its
+/// epochs, the middle epoch ends the run, the last stall is only its second arm,
+/// and this test flips to asserting no escalation at all. The detector unit test
+/// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`
+/// cannot pin this — it omits the observation by hand, so it keeps passing
+/// whether or not the runtime makes the call.
+#[tokio::test]
+async fn a_clean_recovery_the_runtime_never_reports_still_escalates() {
+    let dir_bob = tempfile::tempdir().unwrap();
+    let dir_alice = tempfile::tempdir().unwrap();
+    let mut live = stalled_bob_in_a_live_group(&dir_bob, &dir_alice).await;
+
+    // Arm one: bob stalls at the epoch he starts on.
+    assert!(
+        live.stall_bob_for_one_run(0).await.is_empty(),
+        "the first arm of a run must not escalate",
+    );
+
+    // He then recovers cleanly through an epoch — the one thing that should end
+    // the run — carried by a fold nobody reports.
+    let armed_epoch = live.bobs_epoch();
+    live.carry_bob_through_an_epoch("recovered").await;
+    assert!(
+        live.bobs_epoch() >= armed_epoch + 2,
+        "the carry must take bob past an epoch, not stop at the next one",
+    );
+
+    // The two stalls that follow are unrelated to the armed run, but the detector
+    // has heard nothing since the arm, so it counts them as its second and third.
+    assert!(
+        live.stall_bob_for_one_run(1).await.is_empty(),
+        "a stall after a clean recovery must not escalate on its own",
+    );
+    let stalled_epoch = live.bobs_epoch();
+    live.advance_bobs_epoch("advanced").await;
+    let escalations = live.stall_bob_for_one_run(2).await;
+
+    assert_eq!(
+        escalations.len(),
+        1,
+        "today's runtime escalates a recovered device: {escalations:?}",
+    );
+    assert_eq!(
+        escalations[0].arms, ESCALATION_ARM_THRESHOLD as u32,
+        "the escalation counts the clean recovery as an arm of the same run: {:?}",
+        escalations[0],
+    );
+    assert_eq!(
+        escalations[0].stalled_epoch,
+        stalled_epoch + 1,
+        "the escalating arm fired at the epoch the last commit left bob on: {:?}",
+        escalations[0],
     );
 }
 
