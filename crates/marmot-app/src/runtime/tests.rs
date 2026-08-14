@@ -25,6 +25,28 @@ fn default_directory_discovery_relays_use_live_indexers() {
 }
 
 #[test]
+fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let (account, private_key_import) = runtime
+        .accounts
+        .create_nostr_account_from_setup(&AccountSetupRequest::default())
+        .unwrap();
+
+    assert!(private_key_import.is_none());
+    assert!(app.key_package_cutover_scan_complete(&account.label));
+    assert!(
+        !app.account_home()
+            .account_dir(&account.label)
+            .join("session.sqlite")
+            .exists(),
+        "the scan marker must be durable before any session can open"
+    );
+}
+
+#[test]
 fn message_subscription_seen_ids_are_bounded_to_recent_ids() {
     let mut seen =
         MessageSubscriptionSeenIds::from_ids((0..5).map(|index| format!("message-{index}")), 3);

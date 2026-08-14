@@ -831,7 +831,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
             import_nsec: Some(zeroize::Zeroizing::new(secret)),
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
-            discovery_relays: vec![endpoint(&stall_url)],
+            discovery_relays: vec![endpoint(&url), endpoint(&stall_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         }),
@@ -840,6 +840,27 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     .expect("import must not hang on a stalled discovery endpoint")
     .expect("import should succeed without the advisory preflight");
     assert!(imported.account.local_signing);
+    assert_eq!(
+        runtime
+            .shared_services()
+            .relay_plane()
+            .relay_health()
+            .await
+            .directory_failed_fetches,
+        0,
+        "a stalled peer must not fail a directory fetch that has one connected relay"
+    );
+    assert_eq!(
+        runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .account_session_open
+            .attempts,
+        1,
+        "nsec setup must use the worker-owned session instead of a one-shot open"
+    );
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -1358,8 +1379,29 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
     );
     let relay_health = runtime.shared_services().relay_plane().relay_health().await;
     assert!(
-        relay_health.directory_completed_fetches > 0,
-        "identity setup should use the runtime shared relay plane for directory discovery"
+        relay_health.directory_completed_fetches <= 1,
+        "generated setup must not add synchronous relay-list/follow-list refetches; observed {} directory fetches",
+        relay_health.directory_completed_fetches,
+    );
+    assert_eq!(
+        runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .account_session_open
+            .attempts,
+        1,
+        "setup must open the worker-owned session exactly once"
+    );
+    assert!(
+        dir.path()
+            .join("key-packages")
+            .join(format!(
+                "{}.capability-refresh-v1-relay-scan-complete",
+                created.account.label
+            ))
+            .exists(),
+        "a generated account must persist the guaranteed-empty cutover scan marker before opening"
     );
 
     let fetched = app
@@ -1384,6 +1426,33 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         "a new identity should publish a kind-3 event with no p tags"
     );
 
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn account_creation_succeeds_with_one_unreachable_bootstrap_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, live_url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable_url = format!("ws://{}", unused.local_addr().unwrap());
+    drop(unused);
+
+    let created = timeout(
+        Duration::from_secs(20),
+        runtime.create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&live_url), endpoint(&unreachable_url)],
+            bootstrap_relays: vec![endpoint(&live_url), endpoint(&unreachable_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("one unreachable relay must not multiply setup deadlines")
+    .expect("one acknowledged relay is sufficient for account setup");
+
+    assert!(created.relay_lists.complete);
+    assert!(created.key_package_bytes.is_some());
     runtime.shutdown().await;
 }
 

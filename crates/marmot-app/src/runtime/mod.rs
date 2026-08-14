@@ -4150,89 +4150,63 @@ impl AccountManager {
             self.create_nostr_account_from_setup(&request)?
         };
         let reactivating_existing = account.signed_out;
-        let setup_already_reached_publication = self
-            .app
-            .account_home()
-            .account_setup_state(&account.label)?
-            .is_some_and(|state| state.phase != AccountSetupPhase::LocalStateCreated);
-        let rollback_on_setup_failure =
-            !reactivating_existing && !setup_already_reached_publication;
-
-        if imports_private_key || reactivating_existing || !account.local_signing {
-            // Resolve a pre-existing identity's profile from public indexers, not
-            // the app's own messaging relays, where its outbox metadata does not
-            // live. Runs before the relay-list setup below so discovery never
-            // clobbers, or is clobbered by, the publish-missing-relay-lists step.
-            // Advisory: bounded so a stalled indexer cannot hang import or
-            // reactivation, exactly like the external-signer login path.
-            let _ = bounded_advisory_step(
-                &self.shared.app_performance_telemetry(),
-                ACCOUNT_SETUP_ADVISORY_WAIT,
-                "import_directory_preflight",
-                self.preflight_existing_account_directory(
-                    &account.account_id_hex,
-                    directory_discovery_relays_for_setup(&request),
-                ),
-            )
-            .await;
-        }
-
-        let relay_lists = match self
-            .setup_relay_lists_for_account(
-                &account,
-                &request,
-                imports_private_key,
-                creates_new_private_key,
-            )
-            .await
-        {
-            Ok(relay_lists) => relay_lists,
-            Err(err) => {
-                if rollback_on_setup_failure {
-                    return self.rollback_import_after_setup_failure(
-                        &account,
-                        private_key_import.as_ref(),
-                        err,
-                    );
-                }
-                return Err(err);
-            }
-        };
-
-        if creates_new_private_key && account.local_signing {
-            self.shared.lifecycle().ensure_running()?;
-            if let Err(err) = self
-                .app
-                .publish_account_follow_list(
-                    &account.label,
-                    &[],
-                    AccountRelayListBootstrap::new(
-                        request.default_relays.clone(),
-                        request.bootstrap_relays.clone(),
+        let recent_relay_lists =
+            if imports_private_key || reactivating_existing || !account.local_signing {
+                // Resolve a pre-existing identity's profile from public indexers, not
+                // the app's own messaging relays, where its outbox metadata does not
+                // live. Runs before the relay-list setup below so discovery never
+                // clobbers, or is clobbered by, the publish-missing-relay-lists step.
+                // Advisory: bounded so a stalled indexer cannot hang import or
+                // reactivation, exactly like the external-signer login path.
+                bounded_advisory_step(
+                    &self.shared.app_performance_telemetry(),
+                    ACCOUNT_SETUP_ADVISORY_WAIT,
+                    "import_directory_preflight",
+                    self.preflight_existing_account_directory(
+                        &account.account_id_hex,
+                        directory_discovery_relays_for_setup(&request),
                     ),
                 )
                 .await
-            {
-                if rollback_on_setup_failure {
-                    return self.rollback_import_after_setup_failure(
-                        &account,
-                        private_key_import.as_ref(),
-                        err,
-                    );
-                }
-                return Err(err);
-            }
-        }
+                .flatten()
+            } else {
+                None
+            };
 
-        let profile = if creates_new_private_key && account.local_signing {
-            self.shared.lifecycle().ensure_running()?;
+        let (relay_lists, profile) = if creates_new_private_key && account.local_signing {
             match self
-                .publish_default_profile_for_account(&account, &request)
+                .setup_generated_account_bootstrap(&account, &request)
                 .await
             {
-                Ok(profile) => Some(profile),
+                Ok(result) => result,
                 Err(err) => {
-                    if rollback_on_setup_failure {
+                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                        return self.rollback_import_after_setup_failure(
+                            &account,
+                            private_key_import.as_ref(),
+                            err,
+                        );
+                    }
+                    // Once the helper records publication intent, a relay may
+                    // hold one replaceable bootstrap record. Retain the
+                    // journaled identity and retry instead of deleting it.
+                    return Err(err);
+                }
+            }
+        } else {
+            let relay_lists = match self
+                .setup_relay_lists_for_account(
+                    &account,
+                    &request,
+                    imports_private_key,
+                    creates_new_private_key,
+                    recent_relay_lists,
+                )
+                .await
+            {
+                Ok(relay_lists) => relay_lists,
+                Err(err) => {
+                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
                         return self.rollback_import_after_setup_failure(
                             &account,
                             private_key_import.as_ref(),
@@ -4241,9 +4215,8 @@ impl AccountManager {
                     }
                     return Err(err);
                 }
-            }
-        } else {
-            None
+            };
+            (relay_lists, None)
         };
 
         let key_package_bytes = if request.publish_initial_key_package && account.local_signing {
@@ -4268,7 +4241,7 @@ impl AccountManager {
                         AccountSetupPhase::KeyPackagePublicationStarted,
                     )
                 {
-                    if rollback_on_setup_failure {
+                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
                         return self.rollback_import_after_setup_failure(
                             &account,
                             private_key_import.as_ref(),
@@ -4276,6 +4249,12 @@ impl AccountManager {
                         );
                     }
                     return Err(err.into());
+                }
+                if account.signed_out {
+                    account = self
+                        .app
+                        .account_home()
+                        .set_account_signed_out(&account.label, false)?;
                 }
                 match self.publish_initial_key_package_for_account(&account).await {
                     Ok(bytes) => {
@@ -4299,18 +4278,21 @@ impl AccountManager {
         };
 
         self.shared.lifecycle().ensure_running()?;
-        // Advisory refresh, bounded like the matching step in
-        // login_external_signer.
-        let _ = bounded_advisory_step(
-            &self.shared.app_performance_telemetry(),
-            ACCOUNT_SETUP_ADVISORY_WAIT,
-            "import_directory_refresh",
-            self.app.refresh_user_directory_for_account_id(
-                &account.account_id_hex,
-                directory_bootstrap_relays.clone(),
-            ),
-        )
-        .await;
+        if !creates_new_private_key {
+            // Generated setup already persisted the just-acknowledged empty
+            // follow list and profile locally. Only imported/existing accounts
+            // need a directory refresh here.
+            let _ = bounded_advisory_step(
+                &self.shared.app_performance_telemetry(),
+                ACCOUNT_SETUP_ADVISORY_WAIT,
+                "import_directory_refresh",
+                self.app.refresh_user_directory_for_account_id(
+                    &account.account_id_hex,
+                    directory_bootstrap_relays.clone(),
+                ),
+            )
+            .await;
+        }
         if account.signed_out {
             account = self
                 .app
@@ -4404,12 +4386,6 @@ impl AccountManager {
                 AccountSetupPhase::LocalStateCreated,
             )?;
         }
-        let setup_already_reached_publication = self
-            .app
-            .account_home()
-            .account_setup_state(&account.label)?
-            .is_some_and(|state| state.phase != AccountSetupPhase::LocalStateCreated);
-
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
         // An external-signer account is pre-existing by definition, so resolve
         // its profile from public indexers (its outbox metadata does not live on
@@ -4417,7 +4393,7 @@ impl AccountManager {
         // discovery keeps its anti-clobber ordering.
         // Discovery is advisory (its error path already proceeds without it),
         // so a stalled indexer must not hold the whole login hostage.
-        let _ = bounded_advisory_step(
+        let recent_relay_lists = bounded_advisory_step(
             &self.shared.app_performance_telemetry(),
             ACCOUNT_SETUP_ADVISORY_WAIT,
             "login_directory_preflight",
@@ -4426,15 +4402,16 @@ impl AccountManager {
                 directory_discovery_relays_for_setup(&request),
             ),
         )
-        .await;
+        .await
+        .flatten();
 
         let relay_lists = match self
-            .setup_relay_lists_for_account(&account, &request, true, false)
+            .setup_relay_lists_for_account(&account, &request, true, false, recent_relay_lists)
             .await
         {
             Ok(relay_lists) => relay_lists,
             Err(err) => {
-                if setup_already_reached_publication {
+                if !self.setup_failure_can_roll_back(&account, account.signed_out)? {
                     return Err(err);
                 }
                 return self.rollback_external_signer_setup(
@@ -4447,6 +4424,12 @@ impl AccountManager {
         };
 
         let key_package_bytes = if request.publish_initial_key_package {
+            if account.signed_out {
+                account = self
+                    .app
+                    .account_home()
+                    .set_account_signed_out(&account.label, false)?;
+            }
             self.app.account_home().set_account_setup_phase(
                 &account.label,
                 AccountSetupPhase::KeyPackagePublicationStarted,
@@ -4563,31 +4546,83 @@ impl AccountManager {
         Some(status)
     }
 
-    async fn publish_default_profile_for_account(
+    async fn setup_generated_account_bootstrap(
         &self,
         account: &AccountSummary,
         request: &AccountSetupRequest,
-    ) -> Result<UserProfileMetadata, AppError> {
+    ) -> Result<(AccountRelayListStatus, Option<UserProfileMetadata>), AppError> {
         let pseudonym = default_profile_pseudonym(&account.account_id_hex);
-        let profile = UserProfileMetadata {
+        let mut profile = UserProfileMetadata {
             name: Some(pseudonym.clone()),
             display_name: Some(pseudonym),
             created_at: unix_now_seconds(),
             ..UserProfileMetadata::default()
         };
+        let bootstrap = AccountRelayListBootstrap::new(
+            request.default_relays.clone(),
+            request.bootstrap_relays.clone(),
+        );
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
         self.app
-            .publish_user_profile(
+            .validate_account_relay_list_declarations(&bootstrap, None)?;
+        let phase = self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .map(|state| state.phase)
+            .ok_or(AppError::AccountSetupRetryRequired)?;
+        if matches!(
+            phase,
+            AccountSetupPhase::BootstrapPublicationConfirmed
+                | AccountSetupPhase::KeyPackagePublicationStarted
+                | AccountSetupPhase::KeyPackagePublicationConfirmed
+        ) {
+            let status = self.app.account_relay_list_status(&account.label)?;
+            if !status.complete {
+                return Err(AppError::MissingRelayLists(status.missing));
+            }
+            if let Some(cached) = self
+                .app
+                .directory_entry_for_account_id(&account.account_id_hex)?
+                .and_then(|entry| entry.profile)
+            {
+                profile = cached;
+            }
+            return Ok((status, Some(profile)));
+        }
+        if phase == AccountSetupPhase::LocalStateCreated {
+            self.app.account_home().set_account_setup_phase(
                 &account.label,
-                profile.clone(),
-                AccountRelayListBootstrap::new(
-                    request.default_relays.clone(),
-                    request.bootstrap_relays.clone(),
-                ),
-            )
+                AccountSetupPhase::BootstrapPublicationStarted,
+            )?;
+        }
+        self.shared.lifecycle().ensure_running()?;
+        let status = self
+            .app
+            .publish_generated_account_bootstrap(&account.label, bootstrap, &profile)
             .await?;
-        self.app
-            .remember_directory_profile(&account.account_id_hex, &profile)?;
-        Ok(profile)
+        self.app.account_home().set_account_setup_phase(
+            &account.label,
+            AccountSetupPhase::BootstrapPublicationConfirmed,
+        )?;
+        Ok((status, Some(profile)))
+    }
+
+    fn setup_failure_can_roll_back(
+        &self,
+        account: &AccountSummary,
+        reactivating_existing: bool,
+    ) -> Result<bool, AppError> {
+        if reactivating_existing {
+            return Ok(false);
+        }
+        Ok(self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some_and(|state| state.phase == AccountSetupPhase::LocalStateCreated))
     }
 
     async fn setup_relay_lists_for_account(
@@ -4596,6 +4631,7 @@ impl AccountManager {
         request: &AccountSetupRequest,
         imports_private_key: bool,
         creates_new_private_key: bool,
+        recent_relay_lists: Option<AccountRelayListStatus>,
     ) -> Result<AccountRelayListStatus, AppError> {
         if account.can_sign() {
             if creates_new_private_key && request.default_relays.is_empty() {
@@ -4614,30 +4650,64 @@ impl AccountManager {
                     request.default_relays.clone(),
                     request.bootstrap_relays.clone(),
                 );
-                let current_status = self
-                    .app
-                    .fetch_account_relay_list_status_for_account_id(
-                        &account.account_id_hex,
-                        bootstrap.bootstrap_relays.clone(),
+                let current_status = if let Some(status) = recent_relay_lists {
+                    status
+                } else {
+                    match bounded_advisory_step(
+                        &self.shared.app_performance_telemetry(),
+                        ACCOUNT_SETUP_ADVISORY_WAIT,
+                        "import_relay_list_status",
+                        self.app.fetch_account_relay_list_status_for_account_id(
+                            &account.account_id_hex,
+                            bootstrap.bootstrap_relays.clone(),
+                        ),
                     )
-                    .await?;
+                    .await
+                    {
+                        Some(Ok(status)) => status,
+                        Some(Err(error)) => {
+                            tracing::debug!(
+                                target: "marmot_app::runtime",
+                                method = "setup_relay_lists_for_account",
+                                error_kind = error.privacy_safe_kind(),
+                                "using cached relay-list status after advisory import fetch failed"
+                            );
+                            self.app.account_relay_list_status(&account.label)?
+                        }
+                        None => self.app.account_relay_list_status(&account.label)?,
+                    }
+                };
                 if current_status.complete {
                     Ok(current_status)
                 } else if !request.publish_missing_relay_lists || request.default_relays.is_empty()
                 {
                     Err(AppError::MissingRelayLists(current_status.missing.clone()))
                 } else {
-                    self.app
+                    self.mark_bootstrap_publication_started(&account.label)?;
+                    let status = self
+                        .app
                         .publish_missing_account_relay_lists_from_status(
                             &account.label,
                             bootstrap,
                             current_status,
                         )
-                        .await
+                        .await?;
+                    self.mark_bootstrap_publication_confirmed(&account.label)?;
+                    Ok(status)
                 }
             } else {
-                self.publish_relay_lists_for_new_account(&account.label, request)
-                    .await
+                if request.default_relays.is_empty() && request.bootstrap_relays.is_empty() {
+                    return self.app.account_relay_list_status(&account.label);
+                }
+                if request.default_relays.is_empty() {
+                    return Err(AppError::MissingDefaultRelays);
+                }
+                self.mark_bootstrap_publication_started(&account.label)?;
+                let status = self
+                    .publish_relay_lists_for_new_account(&account.label, request)
+                    .await?;
+                self.mark_bootstrap_publication_confirmed(&account.label)?;
+                Ok(status)
             }
         } else {
             let bootstrap_relays = directory_bootstrap_relays_for_setup(request);
@@ -4651,6 +4721,34 @@ impl AccountManager {
                 )
                 .await
         }
+    }
+
+    fn mark_bootstrap_publication_started(&self, label: &str) -> Result<(), AppError> {
+        if self
+            .app
+            .account_home()
+            .account_setup_state(label)?
+            .is_some_and(|state| state.phase == AccountSetupPhase::LocalStateCreated)
+        {
+            self.app
+                .account_home()
+                .set_account_setup_phase(label, AccountSetupPhase::BootstrapPublicationStarted)?;
+        }
+        Ok(())
+    }
+
+    fn mark_bootstrap_publication_confirmed(&self, label: &str) -> Result<(), AppError> {
+        if self
+            .app
+            .account_home()
+            .account_setup_state(label)?
+            .is_some_and(|state| state.phase == AccountSetupPhase::BootstrapPublicationStarted)
+        {
+            self.app
+                .account_home()
+                .set_account_setup_phase(label, AccountSetupPhase::BootstrapPublicationConfirmed)?;
+        }
+        Ok(())
     }
 
     async fn publish_relay_lists_for_new_account(
@@ -4688,10 +4786,12 @@ impl AccountManager {
                 .mark_key_package_cutover_replacement_pending(&account.label);
             return Err(AppError::AccountSetupRecoveryRequired);
         }
-        self.app.status(&account.label)?;
-        let mut client = self.app.client(&account.label).await?;
-        let key_package = client.publish_key_package().await?;
-        Ok(key_package.bytes().len())
+        // Let the managed worker own the only session opened for this setup.
+        // Its open runs through `blocking_app_task`; publishing through the
+        // worker avoids the former one-shot session open followed immediately
+        // by a second worker session open.
+        self.reconcile().await?;
+        self.publish_key_package(&account.label).await
     }
 
     fn confirmed_setup_key_package_bytes(&self, label: &str) -> Result<Option<usize>, AppError> {
@@ -4799,7 +4899,22 @@ impl AccountManager {
             None => {
                 let account = match account_home.resumable_generated_account_setup()? {
                     Some(account) => account,
-                    None => account_home.create_nostr_account_for_setup()?,
+                    None => {
+                        let account = account_home.create_nostr_account_for_setup()?;
+                        // This identity did not exist before this process and
+                        // therefore cannot have a legacy kind-30443 event to
+                        // retire. Persist that proof before its first session
+                        // open so startup never pays a guaranteed-empty relay
+                        // scan (mdk#1436).
+                        if let Err(error) = self
+                            .app
+                            .mark_key_package_cutover_scan_complete(&account.label)
+                        {
+                            let _ = account_home.remove_account(&account.label);
+                            return Err(error);
+                        }
+                        account
+                    }
                 };
                 Ok((account, None))
             }

@@ -7,6 +7,7 @@ use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::{Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -353,18 +354,46 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for relay_url in &relay_urls {
-            self.client
-                .add_relay(relay_url.clone())
-                .await
-                .map_err(|_| "add relay failed".to_owned())?;
-            timeout(
-                DIRECTORY_RELAY_CONNECT_WAIT,
-                self.client.connect_relay(relay_url.clone()),
-            )
-            .await
-            .map_err(|_| "connect relay timed out".to_owned())?
-            .map_err(|_| "connect relay failed".to_owned())?;
+        let mut connect_candidates = Vec::new();
+        for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
+            if self.client.add_relay(relay_url.clone()).await.is_ok() {
+                connect_candidates.push((index, relay_url));
+            }
+        }
+        let mut connects = JoinSet::new();
+        for (index, relay_url) in connect_candidates {
+            let client = self.client.clone();
+            connects.spawn(async move {
+                let connected = matches!(
+                    timeout(
+                        DIRECTORY_RELAY_CONNECT_WAIT,
+                        client.connect_relay(relay_url.clone()),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                );
+                (index, relay_url, connected)
+            });
+        }
+        let mut connected = vec![false; relay_urls.len()];
+        let mut failed_urls = Vec::new();
+        while let Some(result) = connects.join_next().await {
+            match result {
+                Ok((index, _relay_url, true)) => connected[index] = true,
+                Ok((_index, relay_url, false)) => failed_urls.push(relay_url),
+                Err(_) => {}
+            }
+        }
+        for relay_url in failed_urls {
+            let _ = self.client.remove_relay(relay_url).await;
+        }
+        let relay_urls = relay_urls
+            .into_iter()
+            .zip(connected)
+            .filter_map(|(relay_url, connected)| connected.then_some(relay_url))
+            .collect::<Vec<_>>();
+        if relay_urls.is_empty() {
+            return Err("connect relays failed".to_owned());
         }
 
         let mut records = Vec::new();

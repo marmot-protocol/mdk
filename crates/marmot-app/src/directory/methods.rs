@@ -361,12 +361,12 @@ impl MarmotApp {
         );
         let content = serde_json::to_string(&profile_content_json(&profile))?;
         let event = NostrTransportEvent::new_unsigned(
-            account.account_id_hex,
+            account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
             content,
         );
-        self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
+        self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer())
             .publish_event(&endpoints, &event, 1)
             .await?;
         Ok(())
@@ -396,7 +396,7 @@ impl MarmotApp {
             tags,
             String::new(),
         );
-        self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
+        self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer())
             .publish_event(&endpoints, &event, 1)
             .await?;
         // Publishing a local kind-3 list must make its own cached edge set
@@ -781,7 +781,7 @@ impl MarmotApp {
         Ok(None)
     }
 
-    fn remember_directory_relay_lists(
+    pub(crate) fn remember_directory_relay_lists(
         &self,
         account_id_hex: &str,
         relay_lists: &AccountRelayListStatus,
@@ -876,7 +876,7 @@ impl MarmotApp {
     /// known directory entry (e.g. a local account whose contact list we sync),
     /// its own cached follow edges are refreshed too, but its follows are still
     /// not promoted.
-    fn remember_directory_follow_edges_for_search(
+    pub(crate) fn remember_directory_follow_edges_for_search(
         &self,
         account_id_hex: &str,
         follow_list: &FetchedFollowList,

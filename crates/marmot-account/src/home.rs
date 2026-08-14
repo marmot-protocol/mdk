@@ -126,6 +126,15 @@ pub enum AccountSetupKind {
 pub enum AccountSetupPhase {
     #[default]
     LocalStateCreated,
+    /// Set before publishing the account's replaceable bootstrap records
+    /// (relay lists and, for generated identities, the empty follow list and
+    /// default profile). A retry may safely republish those records, but setup
+    /// rollback must stop here because a relay may already have accepted one
+    /// member of the batch.
+    BootstrapPublicationStarted,
+    /// Every required bootstrap record reached at least one relay and its
+    /// local directory projection is durable.
+    BootstrapPublicationConfirmed,
     /// Set before entering KeyPackage preparation/publication. If the task is
     /// cancelled after this point, the SQLCipher lifecycle is authoritative:
     /// exact signed bytes are persisted there before the first network send.

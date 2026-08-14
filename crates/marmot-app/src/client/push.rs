@@ -474,7 +474,7 @@ impl AppClient {
                 let event =
                     notifications::build_notification_gift_wrap(&server_pubkey_hex, chunk).await?;
                 self.app
-                    .relay_client_for_endpoints(nostr_signer.clone(), &endpoints)
+                    .relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone())
                     .publish_event(&endpoints, &event, 1)
                     .await
                     .map_err(AppError::Transport)?;
