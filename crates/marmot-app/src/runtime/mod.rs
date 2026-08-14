@@ -1162,10 +1162,27 @@ impl MarmotAppRuntime {
                 };
             }
             Err(_) => {
+                // Catch-up timed out, but events already published into this
+                // receiver must still be projected. A background wake often
+                // exhausts its budget on cold sockets after messages have
+                // already landed.
+                let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
+                let notifications =
+                    project_wake_notification_events(self.accounts.app.clone(), drained)
+                        .await
+                        .unwrap_or_default();
                 return BackgroundNotificationCollection {
-                    status: NotificationCollectionStatus::Failed,
+                    status: if notifications.is_empty() {
+                        NotificationCollectionStatus::Failed
+                    } else {
+                        NotificationCollectionStatus::NewData
+                    },
                     notifications,
-                    error: Some("notification wake collection timed out".into()),
+                    error: if notifications.is_empty() {
+                        Some("notification wake collection timed out".into())
+                    } else {
+                        None
+                    },
                 };
             }
         }
