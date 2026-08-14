@@ -1998,6 +1998,20 @@ async fn handle_account_worker_command(
             let result = client
                 .update_message_retention(&group_id, disappearing_message_secs)
                 .await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
@@ -2009,6 +2023,12 @@ async fn handle_account_worker_command(
                 .replace_encrypted_media_blob_endpoints(&group_id, endpoints)
                 .await;
             if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
                 publish_app_runtime_group_state_updated(
                     events,
                     account_id_hex,
@@ -2486,6 +2506,20 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => {
             let result = client.retry_group_convergence(&group_id).await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
