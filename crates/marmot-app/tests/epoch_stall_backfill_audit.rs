@@ -19,8 +19,9 @@
 //! the sync summary (published to app subscribers as
 //! `MarmotAppEvent::EpochStallEscalated`) plus one durable
 //! `epoch_stall_backfill_escalated` row. The escalation tests below pin that
-//! decision, its once-per-run latch, and its reset when bob passes cleanly
-//! through an epoch.
+//! decision, its once-per-run latch, its reset when bob passes cleanly through
+//! an epoch, and the runtime reporting gap that costs him that reset when a
+//! convergence fold is what carried him through.
 //!
 //! The arm is driven through `AppClient::next_event` exactly as
 //! `next_event_backfill.rs` does — the deterministic seam that avoids the full
@@ -352,6 +353,39 @@ impl StalledGroup {
         }
     }
 
+    /// Carry bob *through* an epoch instead of stopping at it: alice commits
+    /// twice before bob drains, so both commits are retained in one drain — read
+    /// at the epoch bob was already sitting at — and the convergence pass folds
+    /// him past the middle epoch without a delivery ever reaching him while he is
+    /// there. That is the whole shape of the reporting gap: the only epoch the
+    /// runtime reports to the detector is the one it read the deliveries at, and
+    /// the fold that moved bob two epochs on reports nothing.
+    async fn carry_bob_through_an_epoch(&mut self, name: &str) {
+        let before = self.bobs_epoch();
+        for step in ["a", "b"] {
+            self.alice
+                .update_group_profile(&self.group_id, Some(&format!("{name}-{step}")), None)
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + EPOCH_ADVANCE_DEADLINE;
+        loop {
+            self.bob.sync().await.unwrap();
+            self.bob
+                .retry_group_convergence(&self.group_id)
+                .await
+                .unwrap();
+            if self.bobs_epoch() >= before + 2 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bob did not apply both of alice's commits within the deadline",
+            );
+            sleep(EPOCH_ADVANCE_POLL_INTERVAL).await;
+        }
+    }
+
     /// Bob's current group epoch.
     fn bobs_epoch(&self) -> u64 {
         self.bob.group_mls_state(&self.group_id).unwrap().epoch
@@ -624,6 +658,73 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
         row["group_ref"].as_str(),
         Some(hex::encode(live.group_id.as_slice()).as_str()),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
+    );
+}
+
+/// A device that recovered cleanly is escalated anyway, because the runtime
+/// never tells the detector about the epochs a convergence fold carried it
+/// through.
+///
+/// Bob arms, then one real fold takes him past an epoch he never stalled at.
+/// Under the detector's own rule that clean pass ends his unrecovered run — but
+/// no `observe_*` call on the fold path reports it, so the run stays open and his
+/// next two stalls are counted as its second and third arms. He is reported as a
+/// group full-history replay cannot repair on the strength of an epoch he sailed
+/// through.
+///
+/// This is today's behavior, not the intended behavior, and it is the "before"
+/// side of closing the reporting gap: once the convergence fold reports its
+/// epochs, the middle epoch ends the run, the last stall is only its second arm,
+/// and this test flips to asserting no escalation at all. The detector unit test
+/// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`
+/// cannot pin this — it omits the observation by hand, so it keeps passing
+/// whether or not the runtime makes the call.
+#[tokio::test]
+async fn a_clean_recovery_the_runtime_never_reports_still_escalates() {
+    let dir_bob = tempfile::tempdir().unwrap();
+    let dir_alice = tempfile::tempdir().unwrap();
+    let mut live = stalled_bob_in_a_live_group(&dir_bob, &dir_alice).await;
+
+    // Arm one: bob stalls at the epoch he starts on.
+    assert!(
+        live.stall_bob_for_one_run(0).await.is_empty(),
+        "the first arm of a run must not escalate",
+    );
+
+    // He then recovers cleanly through an epoch — the one thing that should end
+    // the run — carried by a fold nobody reports.
+    let armed_epoch = live.bobs_epoch();
+    live.carry_bob_through_an_epoch("recovered").await;
+    assert!(
+        live.bobs_epoch() >= armed_epoch + 2,
+        "the carry must take bob past an epoch, not stop at the next one",
+    );
+
+    // The two stalls that follow are unrelated to the armed run, but the detector
+    // has heard nothing since the arm, so it counts them as its second and third.
+    assert!(
+        live.stall_bob_for_one_run(1).await.is_empty(),
+        "a stall after a clean recovery must not escalate on its own",
+    );
+    let stalled_epoch = live.bobs_epoch();
+    live.advance_bobs_epoch("advanced").await;
+    let escalations = live.stall_bob_for_one_run(2).await;
+
+    assert_eq!(
+        escalations.len(),
+        1,
+        "today's runtime escalates a recovered device: {escalations:?}",
+    );
+    assert_eq!(
+        escalations[0].arms, ESCALATION_ARM_THRESHOLD as u32,
+        "the escalation counts the clean recovery as an arm of the same run: {:?}",
+        escalations[0],
+    );
+    assert_eq!(
+        escalations[0].stalled_epoch,
+        stalled_epoch + 1,
+        "the escalating arm fired at the epoch the last commit left bob on: {:?}",
+        escalations[0],
     );
 }
 

@@ -168,14 +168,18 @@ impl GroupStall {
     ///
     /// "Passed through" means *reported to this method*, which is narrower than
     /// "the device advanced". `self.epoch` only moves when a caller reports an
-    /// epoch, and the convergence fold — the mechanism by which a trailing device
-    /// usually catches up — reaches no `observe_*` call at all. So a device armed
-    /// at 10 and then folded cleanly through 11, 12 and 13 arrives at its next
-    /// stall with `self.epoch` still 10, the epoch it armed at, and the run
-    /// continues: a healthy recovery is counted as arm two. That makes the
-    /// unreported advance a false-positive amplifier, not merely a delayed reset,
-    /// and closing the reporting gap is the tracked follow-up. Pinned by
-    /// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`.
+    /// epoch, and neither convergence-fold seam — `AppClient::retry_group_convergence`
+    /// nor `AppClient::advance_convergence_after_runtime_sync`, the mechanism by
+    /// which a trailing device usually catches up — reaches an `observe_*` call at
+    /// all. So a device armed at 10 and then folded cleanly through 11, 12 and 13
+    /// arrives at its next stall with `self.epoch` still 10, the epoch it armed
+    /// at, and the run continues: a healthy recovery is counted as arm two. That
+    /// makes the unreported advance a false-positive amplifier, not merely a
+    /// delayed reset, and closing the reporting gap on both seams is the tracked
+    /// follow-up. The rule is pinned by
+    /// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`;
+    /// the escalation it costs a recovered device is pinned at the runtime by
+    /// `a_clean_recovery_the_runtime_never_reports_still_escalates`.
     ///
     /// How far the epoch jumped does not enter into it: the rule compares only
     /// the armed epoch against the epoch being left, so a reported advance of
@@ -486,10 +490,14 @@ mod tests {
     /// epoch the detector is never told about cannot be that observation. This is
     /// today's behavior, not the intended behavior — a device that recovers
     /// cleanly through several epochs still has its next unrelated stall counted
-    /// as arm two, so a healthy device can be escalated. Closing the observation
-    /// gap is the tracked follow-up; until then this test is what makes the blind
-    /// spot visible instead of surprising, and it is the "before" side of that
-    /// change.
+    /// as arm two, so a healthy device can be escalated.
+    ///
+    /// What it pins is the rule, not the field bug: the observation is omitted
+    /// here by hand, so this test keeps passing whether or not the runtime ever
+    /// learns to report a fold. The "before" side of closing the gap is
+    /// `a_clean_recovery_the_runtime_never_reports_still_escalates` in
+    /// `tests/epoch_stall_backfill_audit.rs`, which drives a real fold and flips
+    /// to asserting no escalation once the report lands.
     #[test]
     fn an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run() {
         let mut detector = EpochStallDetector::new(1, 3);
