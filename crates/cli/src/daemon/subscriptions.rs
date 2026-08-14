@@ -254,17 +254,20 @@ pub(crate) async fn handle_timeline_messages_subscription(
         let _ = write_stream_end(stream).await;
         return Ok(());
     };
-    let mut runtime_subscription = match runtime.subscribe_timeline_messages(
-        &account_ref,
-        marmot_app::TimelineMessageQuery {
-            group_id_hex: group_id.clone(),
-            search: None,
-            pagination: marmot_app::TimelinePagination {
-                limit,
-                ..marmot_app::TimelinePagination::default()
+    let mut runtime_subscription = match runtime
+        .subscribe_timeline_messages(
+            &account_ref,
+            marmot_app::TimelineMessageQuery {
+                group_id_hex: group_id.clone(),
+                search: None,
+                pagination: marmot_app::TimelinePagination {
+                    limit,
+                    ..marmot_app::TimelinePagination::default()
+                },
             },
-        },
-    ) {
+        )
+        .await
+    {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ =
@@ -378,7 +381,10 @@ pub(crate) async fn handle_chats_subscription(
         let _ = write_stream_end(stream).await;
         return Ok(());
     };
-    let mut subscription = match runtime.subscribe_chats(&account_ref, include_archived) {
+    let mut subscription = match runtime
+        .subscribe_chats(&account_ref, include_archived)
+        .await
+    {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ =
@@ -483,7 +489,10 @@ pub(crate) async fn handle_group_state_subscription(
         let _ = write_stream_end(stream).await;
         return Ok(());
     };
-    let mut subscription = match runtime.subscribe_group_state(&account_ref, &group_id) {
+    let mut subscription = match runtime
+        .subscribe_group_state(&account_ref, &group_id)
+        .await
+    {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ =

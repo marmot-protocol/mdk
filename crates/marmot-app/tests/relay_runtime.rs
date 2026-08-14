@@ -4495,6 +4495,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 
     let mut bob_chats = runtime
         .subscribe_chats(&bob.account.account_id_hex, false)
+        .await
         .unwrap();
     assert!(bob_chats.snapshot.is_empty());
 
@@ -4513,6 +4514,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 
     let mut group_state = runtime
         .subscribe_group_state(&bob.account.account_id_hex, &group_id_hex)
+        .await
         .unwrap();
     assert_eq!(group_state.snapshot.group_id_hex, group_id_hex);
 
@@ -4600,6 +4602,7 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
 
     let mut group_state = runtime
         .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
         .unwrap();
 
     let renamed = "renamed during retained send".to_owned();
@@ -4709,6 +4712,7 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
 
     let mut group_state = runtime
         .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
         .unwrap();
 
     let renamed = "renamed during rejected send".to_owned();
@@ -4787,6 +4791,7 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
     };
     let mut timeline = runtime
         .subscribe_timeline_messages(&alice_id, query.clone())
+        .await
         .unwrap();
     assert!(timeline.take_snapshot().messages.is_empty());
 
@@ -4812,6 +4817,7 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
 
     let reopened = runtime
         .subscribe_timeline_messages(&alice_id, query)
+        .await
         .unwrap();
     let reopened_snapshot = reopened.take_snapshot();
     assert_eq!(reopened_snapshot.messages.len(), 1);
@@ -4893,6 +4899,7 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
     };
     let timeline = runtime
         .subscribe_timeline_messages(&alice_id, query)
+        .await
         .unwrap();
     let snapshot = timeline.take_snapshot();
     assert_eq!(snapshot.messages.len(), 2);

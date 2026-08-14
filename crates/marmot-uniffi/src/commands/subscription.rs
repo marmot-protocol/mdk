@@ -49,7 +49,8 @@ impl Marmot {
     ) -> Result<Arc<ChatsSubscription>, MarmotKitError> {
         let inner = self
             .runtime
-            .subscribe_chats(&account_ref, include_archived)?;
+            .subscribe_chats(&account_ref, include_archived)
+            .await?;
         Ok(ChatsSubscription::new(inner))
     }
 
@@ -62,7 +63,8 @@ impl Marmot {
     ) -> Result<Arc<ChatListSubscription>, MarmotKitError> {
         let inner = self
             .runtime
-            .subscribe_chat_list(&account_ref, include_archived)?;
+            .subscribe_chat_list(&account_ref, include_archived)
+            .await?;
         Ok(ChatListSubscription::new(inner))
     }
 
@@ -102,7 +104,8 @@ impl Marmot {
         };
         let inner = self
             .runtime
-            .subscribe_timeline_messages(&account_ref, query)?;
+            .subscribe_timeline_messages(&account_ref, query)
+            .await?;
         Ok(TimelineMessagesSubscription::new(inner))
     }
 
@@ -115,7 +118,8 @@ impl Marmot {
     ) -> Result<Arc<GroupStateSubscription>, MarmotKitError> {
         let inner = self
             .runtime
-            .subscribe_group_state(&account_ref, &group_id_hex)?;
+            .subscribe_group_state(&account_ref, &group_id_hex)
+            .await?;
         Ok(GroupStateSubscription::new(inner))
     }
 }

@@ -979,7 +979,7 @@ impl MarmotAppRuntime {
         })
     }
 
-    pub fn subscribe_timeline_messages(
+    pub async fn subscribe_timeline_messages(
         &self,
         account_ref: &str,
         query: TimelineMessageQuery,
@@ -992,15 +992,19 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let snapshot = {
+        let snapshot_query = query.clone();
+        let app_for_snapshot = app.clone();
+        let account_label_for_snapshot = account_label.clone();
+        let snapshot = blocking_app_task(move || {
             let _span = tracing::debug_span!(
                 target: "marmot_app::runtime",
                 "timeline_subscription_snapshot",
                 method = "subscribe_timeline_messages"
             )
             .entered();
-            app.timeline_messages_with_query(&account_label, query.clone())?
-        };
+            app_for_snapshot.timeline_messages_with_query(&account_label_for_snapshot, snapshot_query)
+        })
+        .await?;
         // The subscription owns the window, so the re-query base carries only the
         // durable filter (group + search); pagination is supplied per call.
         let base_query = TimelineMessageQuery {
@@ -1073,7 +1077,7 @@ impl MarmotAppRuntime {
         })
     }
 
-    pub fn subscribe_chats(
+    pub async fn subscribe_chats(
         &self,
         account_ref: &str,
         include_archived: bool,
@@ -1085,11 +1089,16 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let snapshot = if include_archived {
-            app.groups(&account_label)?
-        } else {
-            app.visible_groups(&account_label)?
-        };
+        let app_for_snapshot = app.clone();
+        let account_label_for_snapshot = account_label.clone();
+        let snapshot = blocking_app_task(move || {
+            if include_archived {
+                app_for_snapshot.groups(&account_label_for_snapshot)
+            } else {
+                app_for_snapshot.visible_groups(&account_label_for_snapshot)
+            }
+        })
+        .await?;
         let mut group_fingerprints = snapshot
             .iter()
             .map(|group| {
@@ -1159,7 +1168,7 @@ impl MarmotAppRuntime {
         })
     }
 
-    pub fn subscribe_chat_list(
+    pub async fn subscribe_chat_list(
         &self,
         account_ref: &str,
         include_archived: bool,
@@ -1171,15 +1180,18 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let snapshot = {
+        let app_for_snapshot = app.clone();
+        let account_label_for_snapshot = account_label.clone();
+        let snapshot = blocking_app_task(move || {
             let _span = tracing::debug_span!(
                 target: "marmot_app::runtime",
                 "chat_list_subscription_snapshot",
                 method = "subscribe_chat_list"
             )
             .entered();
-            app.chat_list(&account_label, include_archived)?
-        };
+            app_for_snapshot.chat_list(&account_label_for_snapshot, include_archived)
+        })
+        .await?;
         let mut row_fingerprints = snapshot
             .iter()
             .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row)))
@@ -1426,7 +1438,7 @@ impl MarmotAppRuntime {
         })
     }
 
-    pub fn subscribe_group_state(
+    pub async fn subscribe_group_state(
         &self,
         account_ref: &str,
         group_id_hex: &str,
@@ -1440,9 +1452,15 @@ impl MarmotAppRuntime {
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let snapshot = app
-            .group(&account_label, &group_id_hex)?
-            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        let app_for_snapshot = app.clone();
+        let account_label_for_snapshot = account_label.clone();
+        let group_id_hex_for_snapshot = group_id_hex.clone();
+        let snapshot = blocking_app_task(move || {
+            app_for_snapshot
+                .group(&account_label_for_snapshot, &group_id_hex_for_snapshot)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex_for_snapshot))
+        })
+        .await?;
         let mut last_fingerprint = app_group_record_fingerprint(&snapshot);
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
