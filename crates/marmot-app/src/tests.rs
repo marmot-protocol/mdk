@@ -1220,6 +1220,54 @@ where
 }
 
 #[test]
+fn live_group_archive_checkpoints_seen_and_target_group_deltas() {
+    run_composed_app_runtime_test("account-projection-delta", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let alpha = client.create_group("alpha", &[]).await.unwrap();
+        let beta = client.create_group("beta", &[]).await.unwrap();
+
+        client.state.seen_events = (0..256).map(|index| format!("event-{index:05}")).collect();
+        client.seen_events_index = client.state.seen_events.iter().cloned().collect();
+        client.pending_seen_event_count = 0;
+        app.save_state(&client.state).unwrap();
+
+        client.remember_seen_event("event-new".to_owned());
+        client.set_group_archived(&alpha, true).unwrap();
+
+        assert_eq!(client.pending_seen_event_count, 0);
+        assert!(client.pending_group_projection_updates.is_empty());
+        let restored = app.load_state("alice").unwrap();
+        assert_eq!(restored.seen_events.len(), 257);
+        assert_eq!(
+            restored.seen_events.last().map(String::as_str),
+            Some("event-new")
+        );
+        assert!(
+            restored
+                .groups
+                .iter()
+                .find(|group| group.group_id_hex == hex::encode(alpha.as_slice()))
+                .unwrap()
+                .archived
+        );
+        assert!(
+            !restored
+                .groups
+                .iter()
+                .find(|group| group.group_id_hex == hex::encode(beta.as_slice()))
+                .unwrap()
+                .archived
+        );
+    });
+}
+
+#[test]
 fn account_session_guard_is_exclusive_until_client_drop() {
     run_composed_app_runtime_test("account-session-guard", || async {
         let dir = tempfile::tempdir().unwrap();

@@ -16,9 +16,9 @@ use crate::groups::{
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AppError, AppGroupAdminPolicyComponent, AppMessageProjection, AppPerformanceTelemetry,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
-    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event, unix_now_seconds,
+    AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
+    AppPerformanceTelemetry, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure,
+    SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillDeferredReason,
@@ -449,6 +449,11 @@ impl AppClient {
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
+            if previous_group != updated_group
+                && let Some(group_id) = event_group_id(event)
+            {
+                self.mark_group_projection_dirty(group_id);
+            }
             self.audit_observed_group_event(
                 event,
                 previous_group.as_ref(),
@@ -663,7 +668,7 @@ impl AppClient {
         // the catch-up drain below. Marking at receive time would let a failed
         // ingest poison the index, so a reused client would silently skip the
         // redelivered event.
-        remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
+        self.remember_seen_event(event_id);
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
@@ -773,7 +778,7 @@ impl AppClient {
                         .await);
                 }
             };
-            remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id);
+            self.remember_seen_event(event_id);
             *deliveries = (*deliveries).saturating_add(1);
             summary.merge(delivery_summary);
             routes_dirty |= delivery_routes_dirty;
@@ -1749,12 +1754,34 @@ impl AppClient {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let seen_start = self
+            .state
+            .seen_events
+            .len()
+            .saturating_sub(self.pending_seen_event_count);
+        let delta = AccountState {
+            label: self.state.label.clone(),
+            seen_events: self.state.seen_events[seen_start..].to_vec(),
+            last_transport_timestamp: self.state.last_transport_timestamp,
+            groups: self
+                .state
+                .groups
+                .iter()
+                .filter(|group| {
+                    self.pending_group_projection_updates
+                        .contains(&group.group_id_hex)
+                })
+                .cloned()
+                .collect(),
+        };
         self.app
-            .save_state_clearing_local_group_deletion_frontiers_and_acking_application_events(
-                &self.state,
+            .save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                &delta,
                 &frontiers_to_clear,
                 &application_event_ids_to_ack,
             )?;
+        self.pending_seen_event_count = 0;
+        self.pending_group_projection_updates.clear();
         self.pending_local_group_deletion_frontier_clears.clear();
         self.pending_application_event_acks.clear();
         Ok(())
@@ -1878,6 +1905,11 @@ impl AppClient {
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
+            if previous_group != updated_group
+                && let Some(group_id) = event_group_id(event)
+            {
+                self.mark_group_projection_dirty(group_id);
+            }
             self.audit_observed_group_event(
                 event,
                 previous_group.as_ref(),

@@ -606,6 +606,53 @@ impl SqliteAccountStorage {
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
     ) -> StorageResult<()> {
+        self.save_account_projection(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            frontiers_to_clear,
+            application_event_ids_to_ack,
+            true,
+        )
+    }
+
+    /// Apply an exact account-projection delta.
+    ///
+    /// Unlike [`Self::save_account_projection_state`], this does not interpret
+    /// `groups` as the complete retained group snapshot and therefore never
+    /// deletes groups absent from `state.groups`. Each supplied group is a full
+    /// replacement for that one group's projection/component set, while
+    /// `seen_events` contains only event ids observed since the last successful
+    /// checkpoint. Cursor merge, local-deletion frontier clears, group updates,
+    /// seen-event observations, and application-event acknowledgements remain
+    /// atomic in the same transaction.
+    pub fn save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+    ) -> StorageResult<()> {
+        self.save_account_projection(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            frontiers_to_clear,
+            application_event_ids_to_ack,
+            false,
+        )
+    }
+
+    fn save_account_projection(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+        replace_group_snapshot: bool,
+    ) -> StorageResult<()> {
         let now = unix_now_seconds();
         let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
         self.connection.with_transaction(|| {
@@ -652,28 +699,43 @@ impl SqliteAccountStorage {
             .storage()?;
 
             let retained_start = state.seen_events.len().saturating_sub(max_seen_events);
+            let mut inserted_seen_event = false;
             for event_id in &state.seen_events[retained_start..] {
-                conn.execute(
-                    "INSERT INTO seen_events (event_id, seen_at)
-                     VALUES (?1, ?2)
-                     ON CONFLICT(event_id) DO UPDATE SET
-                        seen_at = excluded.seen_at",
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
+                     VALUES (?1, ?2)",
                     params![event_id, now_i64],
                 )
                 .storage()?;
+                if inserted == 0 {
+                    conn.execute(
+                        "UPDATE seen_events SET seen_at = ?2 WHERE event_id = ?1",
+                        params![event_id, now_i64],
+                    )
+                    .storage()?;
+                } else {
+                    inserted_seen_event = true;
+                }
             }
-            conn.execute(
-                "DELETE FROM seen_events
-                 WHERE event_id NOT IN (
-                    SELECT event_id FROM seen_events
-                    ORDER BY seen_at DESC, rowid DESC
-                    LIMIT ?1
-                 )",
-                params![usize_to_i64(max_seen_events)?],
-            )
-            .storage()?;
+            // A delta containing only refreshes cannot grow the table, so it
+            // needs no prune. Full snapshot writes retain the historical
+            // max-bound enforcement even when the supplied snapshot is empty.
+            if replace_group_snapshot || inserted_seen_event {
+                conn.execute(
+                    "DELETE FROM seen_events
+                     WHERE event_id NOT IN (
+                        SELECT event_id FROM seen_events
+                        ORDER BY seen_at DESC, rowid DESC
+                        LIMIT ?1
+                     )",
+                    params![usize_to_i64(max_seen_events)?],
+                )
+                .storage()?;
+            }
 
-            let locally_deleted_group_ids = {
+            let locally_deleted_group_ids = if state.groups.is_empty() {
+                std::collections::HashSet::new()
+            } else {
                 let mut statement = conn
                     .prepare("SELECT group_id_hex FROM local_group_deletion_frontiers")
                     .storage()?;
@@ -696,19 +758,21 @@ impl SqliteAccountStorage {
             // projection/chat-list reads while its draft exists. Once the draft
             // is deleted, the next save selects the group as a candidate and
             // cleans it up normally.
-            delete_stale_text_keys(
-                &conn,
-                "SELECT group_id_hex
-                 FROM account_groups
-                 WHERE NOT EXISTS (
-                    SELECT 1 FROM message_drafts
-                    WHERE message_drafts.group_id_hex = account_groups.group_id_hex
-                 )",
-                &[],
-                "DELETE FROM account_groups WHERE group_id_hex IN",
-                &[],
-                &retained_group_ids,
-            )?;
+            if replace_group_snapshot {
+                delete_stale_text_keys(
+                    &conn,
+                    "SELECT group_id_hex
+                     FROM account_groups
+                     WHERE NOT EXISTS (
+                        SELECT 1 FROM message_drafts
+                        WHERE message_drafts.group_id_hex = account_groups.group_id_hex
+                     )",
+                    &[],
+                    "DELETE FROM account_groups WHERE group_id_hex IN",
+                    &[],
+                    &retained_group_ids,
+                )?;
+            }
 
             for group in state
                 .groups
