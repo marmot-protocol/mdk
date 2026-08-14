@@ -1113,9 +1113,10 @@ pub enum AuditEventKind {
     },
     /// A group armed `arms` epoch-gap backfills in one run with nothing in
     /// between to show the device had caught up: full-history replay keeps
-    /// recovering some backlog while the device stays behind the group. Emitted
-    /// once per unrecovered run, at the arm that reached `arm_threshold`,
-    /// alongside that arm's `epoch_stall_backfill_armed` row.
+    /// recovering some backlog, and nothing this device can see says it is
+    /// reaching the group. Emitted once per unrecovered run, at the arm that
+    /// reached `arm_threshold`, alongside that arm's
+    /// `epoch_stall_backfill_armed` row.
     ///
     /// This is the durable record of the escalation the runtime reports to the
     /// app, which decides whether to run the stronger repair (key-package
@@ -1128,8 +1129,8 @@ pub enum AuditEventKind {
     /// independent failure: a restart clears the counter, so it can be the same
     /// unresolved condition re-earning a whole run of arms. And the absence of a
     /// second row is not recovery: re-escalating needs the device's own epoch to
-    /// keep moving, so a group wedged at a single epoch escalates at most once
-    /// however long it stays wedged.
+    /// keep moving, so a group whose local epoch stops moving escalates at most
+    /// once however long it sits there.
     ///
     /// Group-scoped: the group id is on the enclosing [`AuditEvent::group_ref`],
     /// exactly as `epoch_stall_backfill_armed` carries it. `stalled_epoch` is the

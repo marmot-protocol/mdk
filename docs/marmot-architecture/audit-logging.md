@@ -873,8 +873,8 @@ Metadata notes:
   material, so it stays the host app's decision.
 - The run counter behind `arms` is in-memory, which cuts both ways. Two rows for one group need not be two independent
   failures: a restart clears the counter, so the second can be the same unresolved condition re-earning a whole run.
-  And one row is not a bound on the damage: re-escalating needs the device's own epoch to keep moving, so a group wedged
-  at a single epoch escalates at most once however long it stays wedged.
+  And one row is not a bound on the damage: re-escalating needs the device's own epoch to keep moving, so a group whose
+  local epoch stops moving escalates at most once however long it sits there.
 - A device that keeps up with the group but cannot read one peer's traffic — a forked peer, or minted envelopes — can
   complete a run too. The row stays true as stated (this device could not read this group's traffic); whether a re-sync
   is the right answer is a separate judgement.
