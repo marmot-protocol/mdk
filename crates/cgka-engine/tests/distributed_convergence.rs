@@ -2496,10 +2496,15 @@ async fn application_replay_is_invariant_to_opposite_arrival_order() {
         .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
 
-    assert_eq!(
-        forward_result.accepted_app_messages,
-        reverse_result.accepted_app_messages
-    );
+    let expected_app_messages = [&base_apps, &edge_apps, &tip_apps]
+        .into_iter()
+        .flatten()
+        .map(content_hex)
+        .collect::<Vec<_>>();
+    let mut expected_app_messages = expected_app_messages;
+    expected_app_messages.sort();
+    assert_eq!(forward_result.accepted_app_messages, expected_app_messages);
+    assert_eq!(reverse_result.accepted_app_messages, expected_app_messages);
     let received_payloads = |events: Vec<GroupEvent>| {
         events
             .into_iter()
@@ -2509,10 +2514,25 @@ async fn application_replay_is_invariant_to_opposite_arrival_order() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        received_payloads(forward.drain_events()),
-        received_payloads(reverse.drain_events())
-    );
+    let canonical_payloads = |apps: &[TransportMessage; 2], payloads: [&[u8]; 2]| {
+        let mut keyed_payloads = apps
+            .iter()
+            .zip(payloads)
+            .map(|(app, payload)| (content_hex(app), payload.to_vec()))
+            .collect::<Vec<_>>();
+        keyed_payloads.sort_by(|left, right| left.0.cmp(&right.0));
+        keyed_payloads
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>()
+    };
+    let expected_payloads = canonical_payloads(&base_apps, [b"base-a", b"base-b"])
+        .into_iter()
+        .chain(canonical_payloads(&edge_apps, [b"edge-a", b"edge-b"]))
+        .chain(canonical_payloads(&tip_apps, [b"tip-a", b"tip-b"]))
+        .collect::<Vec<_>>();
+    assert_eq!(received_payloads(forward.drain_events()), expected_payloads);
+    assert_eq!(received_payloads(reverse.drain_events()), expected_payloads);
 }
 
 /// A frozen convergence pass already owns a bounded retained-anchor snapshot.
