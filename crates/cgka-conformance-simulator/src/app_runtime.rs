@@ -1357,25 +1357,34 @@ pub(crate) async fn accept_group_invite_retrying_busy(
     account_ref: &str,
     group_id: &GroupId,
 ) -> Result<(), AppError> {
-    match tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match runtime.accept_group_invite(account_ref, group_id).await {
-                Ok(_) => return Ok(()),
-                Err(AppError::AccountWorkerBusy) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+    const BUSY_RETRY_ATTEMPTS: usize = 500;
+    const BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+    const ACCEPT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for attempt in 0..BUSY_RETRY_ATTEMPTS {
+        match tokio::time::timeout(
+            ACCEPT_ATTEMPT_TIMEOUT,
+            runtime.accept_group_invite(account_ref, group_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(AppError::AccountWorkerBusy)) => {
+                if attempt + 1 < BUSY_RETRY_ATTEMPTS {
+                    tokio::time::sleep(BUSY_RETRY_DELAY).await;
                 }
-                Err(error) => return Err(error),
             }
+            Ok(Err(error)) => return Err(error),
+            // This accept may have reached the worker, so its completion is
+            // unknown. Never collapse that ambiguity into definitely-not-
+            // started AccountWorkerBusy.
+            Err(_) => return Err(AppError::AccountWorkerResponseTimedOut),
         }
-    })
-    .await
-    {
-        Ok(result) => result,
-        // Every attempt returned definitely-not-started busy, so preserving
-        // that typed result remains safe and lets the scenario classify it as
-        // retryable rather than inventing ambiguous completion.
-        Err(_) => Err(AppError::AccountWorkerBusy),
     }
+
+    // The fixed attempt budget was exhausted entirely by confirmed
+    // definitely-not-started responses.
+    Err(AppError::AccountWorkerBusy)
 }
 
 fn record_failure(participant: &mut Participant, error: &AppError) {
