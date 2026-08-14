@@ -41,30 +41,41 @@ const VERIFIED_REPAIR_REASON: &str = "join_welcome_repair";
 
 /// Stand-in reason for a halt whose row carried none. Every emitting surface
 /// populates a reason today; this keeps the lenient model from dropping a halt
-/// on the floor should one ever not.
+/// on the floor should one ever not. It names no cause, so it is reported only
+/// when nothing better is available — see [`HALT_NON_CAUSE_REASONS`].
 const UNSPECIFIED_HALT_REASON: &str = "unspecified";
 
-/// Halt reasons that re-assert an existing halt instead of naming its cause.
+/// Halt reasons that do not name the cause of the halt. Two kinds reach here.
 ///
-/// `already_unrecoverable` is emitted on every convergence attempt against an
-/// already-halted group (`cgka-engine/src/distributed_convergence.rs`) and
+/// **Re-assertions.** `already_unrecoverable` is emitted on every convergence
+/// attempt against an already-halted group
+/// (`cgka-engine/src/distributed_convergence.rs`) and
 /// `hydrate_unrecoverable_group` on every session open over one
 /// (`cgka-engine/src/engine.rs`). Both are the halt restating itself — the
 /// property rule 5's newest-wins clearing relies on — so they arm the gate like
-/// any other halt reason. Neither says why the engine stopped. See
-/// [`is_halt_re_assertion`] for what that means for reporting.
-const HALT_RE_ASSERTION_REASONS: [&str; 2] =
-    ["already_unrecoverable", "hydrate_unrecoverable_group"];
+/// any other halt reason. Neither says why the engine stopped.
+///
+/// **The stand-in.** [`UNSPECIFIED_HALT_REASON`] names a cause even less: it is
+/// what the model substitutes for a halt row that carried no reason at all. It is
+/// a member by construction rather than by literal so the two cannot drift apart.
+///
+/// See [`is_halt_cause`] for what the distinction means for reporting.
+const HALT_NON_CAUSE_REASONS: [&str; 3] = [
+    "already_unrecoverable",
+    "hydrate_unrecoverable_group",
+    UNSPECIFIED_HALT_REASON,
+];
 
-/// Whether `reason` only re-asserts a halt rather than naming its cause.
+/// Whether `reason` names why the engine stopped, rather than only restating that
+/// it did (see [`HALT_NON_CAUSE_REASONS`]).
 ///
 /// Purely a reporting distinction: rule 5 arms on any halt reason, and a window
-/// carrying nothing but re-assertions is still a live halt. It exists because
+/// carrying nothing but non-causes is still a live halt. It exists because
 /// `reasons` is the first thing an operator reads, and once a cause is known a
-/// re-assertion adds nothing — that the halt is durable and still being retried
-/// is what rule 5 *means*, not a separate finding.
-pub(crate) fn is_halt_re_assertion(reason: &str) -> bool {
-    HALT_RE_ASSERTION_REASONS.contains(&reason)
+/// non-cause adds nothing — that the halt is durable and still being retried is
+/// what rule 5 *means*, not a separate finding.
+pub(crate) fn is_halt_cause(reason: &str) -> bool {
+    !HALT_NON_CAUSE_REASONS.contains(&reason)
 }
 
 /// A parsed export, reduced to the classifier's inputs.

@@ -9,11 +9,12 @@
 //! Reading, format detection, and printing live here; everything about *which*
 //! route an export takes is [`incident_replay::route`].
 //!
-//! Output is one primary line — `healthy:`, `quarantine:`, or `accepted:` — plus
-//! an `advisory (<label>):` line for every co-occurring finding that line does
-//! not itself report. An accepted incident is written owner-only as the portable
-//! vector next to its `incident-scenario-artifact.v1` evidence envelope; the
-//! source export, transport ciphertext, and MLS checkpoints are never copied.
+//! Output is one primary line — `healthy:`, `quarantine:`, or
+//! `accepted (<fidelity>, <sensitivity>)` — plus an `advisory (<label>):` line
+//! for every co-occurring finding that line does not itself report. An
+//! accepted incident is written owner-only as the portable vector next to its
+//! `incident-scenario-artifact.v1` evidence envelope; the source export,
+//! transport ciphertext, and MLS checkpoints are never copied.
 //!
 //! Exits 0 for any successful classification (healthy, quarantine, and accepted
 //! are all valid outcomes). Exits 2 on usage, I/O, parse, or write failure, and
@@ -76,11 +77,20 @@ fn main() -> ExitCode {
     // attested history supersedes an archetype, and what happens when a route
     // fails closed — lives in the library; this is presentation only.
     let routing = route(&export, source_format);
+    // Every primary line is rendered here, so this match is the single source of
+    // truth for what an operator reads. Two of the four need facts only this
+    // binary has — the accepted line depends on what was written where, and an
+    // infrastructure failure is a stderr line, not a verdict — so `Outcome`
+    // deliberately renders none of them itself.
     let code = match &routing.outcome {
-        // Producing no vector is a valid outcome, so a quarantine is not an
+        // Producing no vector is a valid outcome, so neither of these is an
         // error exit.
-        Outcome::Healthy | Outcome::Quarantine { .. } => {
-            println!("{}", routing.outcome);
+        Outcome::Healthy => {
+            println!("healthy: 0 vectors");
+            ExitCode::SUCCESS
+        }
+        Outcome::Quarantine { reason } => {
+            println!("quarantine: {reason}");
             ExitCode::SUCCESS
         }
         Outcome::Accepted(artifact) => persist_or_report(artifact, out_dir.as_deref()),
