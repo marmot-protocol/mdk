@@ -3409,6 +3409,12 @@ impl MarmotAppRuntime {
         self.accounts.create_or_import_account(request).await
     }
 
+    /// Wait until in-flight create/invite Welcome fanout has finished on every
+    /// managed worker, while the relay plane is still live.
+    pub async fn drain_in_flight_work(&self) {
+        self.accounts.drain_in_flight_work().await
+    }
+
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
@@ -5067,6 +5073,33 @@ impl AccountManager {
             Err(rollback) => Err(AppError::RelayDirectory(format!(
                 "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
             ))),
+        }
+    }
+
+    /// Wait until in-flight create/invite Welcome fanout has finished on every
+    /// managed worker. One-shot CLI calls this before [`Self::shutdown`] so the
+    /// relay plane is still available for that publish.
+    pub async fn drain_in_flight_work(&self) {
+        let senders = {
+            let workers = self.workers.lock().await;
+            workers
+                .values()
+                .map(|worker| worker.commands.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut responses = Vec::with_capacity(senders.len());
+        for commands in senders {
+            let (respond, response) = oneshot::channel();
+            if commands
+                .send(AccountWorkerCommand::Drain { respond })
+                .await
+                .is_ok()
+            {
+                responses.push(response);
+            }
+        }
+        for response in responses {
+            let _ = timeout(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, response).await;
         }
     }
 

@@ -142,6 +142,12 @@ pub(crate) enum AccountWorkerCommand {
     NetworkStartupSettled {
         respond: oneshot::Sender<()>,
     },
+    /// Wait until in-flight create/invite Welcome fanout (and any mutations
+    /// queued ahead of this command) have finished, then reply. One-shot CLI
+    /// uses this before shutting the relay plane.
+    Drain {
+        respond: oneshot::Sender<()>,
+    },
     RetryHydrateQuarantinedGroup {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -769,7 +775,9 @@ async fn run_app_runtime_account_worker(
     };
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
-    // with the initial catch-up's result.
+    // with the initial catch-up's result. Replay uses the live command queue so
+    // post-canonical snapshot reads (Members / GroupRoster / …) can land while
+    // a deferred create/invite still owns Welcome fanout.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
@@ -777,7 +785,7 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         worker_lifetime: media_http_worker_lifetime,
     };
-    let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
+    let mut pending = VecDeque::new();
     for deferred_command in deferred {
         match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
@@ -788,8 +796,8 @@ async fn run_app_runtime_account_worker(
                     &mut client,
                     *command,
                     AccountWorkerCommandContext {
-                        commands: &mut unused_commands,
-                        pending: &mut unused_pending,
+                        commands: &mut commands,
+                        pending: &mut pending,
                         app: &app,
                         events: &events,
                         account_id_hex: &account_id_hex,
@@ -801,6 +809,47 @@ async fn run_app_runtime_account_worker(
                 .await;
             }
         }
+    }
+    // Live commands that arrived during startup-deferred fanout stay behind the
+    // remaining startup FIFO. Drain them only after every deferred command has
+    // run, then enter the steady-state select.
+    while let Some(command) = pending.pop_front() {
+        match command {
+            AccountWorkerCommand::CatchUp { respond } => {
+                handle_account_worker_catch_up(
+                    &mut client,
+                    respond,
+                    &mut commands,
+                    &mut pending,
+                    AccountWorkerCatchUpContext {
+                        app: &app,
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
+                )
+                .await;
+            }
+            command => {
+                handle_account_worker_command(
+                    &mut client,
+                    command,
+                    AccountWorkerCommandContext {
+                        commands: &mut commands,
+                        pending: &mut pending,
+                        app: &app,
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                        media_http: &media_http,
+                    },
+                )
+                .await;
+            }
+        }
+        schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
     }
     scheduled_runtime_group_subscription_refresh.observe_pending(
         client.has_pending_runtime_group_subscription_refresh(),
@@ -944,7 +993,7 @@ async fn run_app_runtime_account_worker(
             command = commands.recv() => {
                 match command {
                     Some(command) => {
-                        let mut pending = VecDeque::from([command]);
+                        pending.push_back(command);
                         while let Some(command) = pending.pop_front() {
                             let may_change_push_registration_work =
                                 command.may_change_push_registration_work();
@@ -2023,6 +2072,10 @@ async fn complete_media_http(
     drop(permit);
 }
 
+/// Closed command channel for handlers that never serve concurrent commands
+/// (unit tests that call `handle_account_worker_command` directly). Startup
+/// deferred replay uses the live worker queue instead.
+#[cfg(test)]
 fn unused_account_worker_command_io() -> (
     mpsc::Receiver<AccountWorkerCommand>,
     VecDeque<AccountWorkerCommand>,
@@ -2179,6 +2232,9 @@ async fn handle_account_worker_command(
     } = context;
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
+            let _ = respond.send(());
+        }
+        AccountWorkerCommand::Drain { respond } => {
             let _ = respond.send(());
         }
         AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {

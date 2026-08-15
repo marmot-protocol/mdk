@@ -1468,8 +1468,49 @@ impl AppClient {
         } else {
             self.record_welcome_delivery_intents(group_id, &welcomes)
         };
-        let welcome_intents =
-            recover_post_canonical_result("record_welcome_delivery_intents", welcome_intent_result);
+        let welcome_intents = match welcome_intent_result {
+            Ok(welcome_intents) => welcome_intents,
+            Err(error) => {
+                let _: Vec<String> =
+                    recover_post_canonical_result("record_welcome_delivery_intents", Err(error));
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    true,
+                );
+                // The MLS invite is already canonical locally. Invite Welcomes
+                // are raw transport rows, so exposing the commit without a
+                // durable destination index leaves no restart repair handle.
+                let local_refresh_started_at = Instant::now();
+                let local_refresh = (|| {
+                    if cfg!(feature = "test-policy-overrides")
+                        && self.app.config.dev_fail_invite_local_refresh
+                    {
+                        return Err(AppError::Publish(
+                            "injected invite local refresh failure".into(),
+                        ));
+                    }
+                    self.refresh_group(group_id);
+                    self.prune_plaintext_retention_for_group(group_id)?;
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+                    Ok::<_, AppError>(())
+                })();
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteLocalRefresh,
+                    local_refresh_started_at.elapsed(),
+                    local_refresh.is_ok(),
+                );
+                recover_post_canonical_result("invite_members_local_refresh", local_refresh);
+                return Ok(SendSummary {
+                    published: 0,
+                    message_ids: Vec::new(),
+                    accept_disposition: cgka_traits::SendAcceptDisposition::AcceptedPending,
+                    maintenance_disposition: Default::default(),
+                });
+            }
+        };
         self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
             group_id: group_id.clone(),
             audit_context: audit_context.clone(),

@@ -1361,6 +1361,7 @@ pub(crate) async fn accept_group_invite_retrying_busy(
     const BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
     const ACCEPT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    let mut last_retryable = AppError::AccountWorkerBusy;
     for attempt in 0..BUSY_RETRY_ATTEMPTS {
         match tokio::time::timeout(
             ACCEPT_ATTEMPT_TIMEOUT,
@@ -1369,7 +1370,8 @@ pub(crate) async fn accept_group_invite_retrying_busy(
         .await
         {
             Ok(Ok(_)) => return Ok(()),
-            Ok(Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_))) => {
+            Ok(Err(error @ (AppError::AccountWorkerBusy | AppError::UnknownGroup(_)))) => {
+                last_retryable = error;
                 if attempt + 1 < BUSY_RETRY_ATTEMPTS {
                     tokio::time::sleep(BUSY_RETRY_DELAY).await;
                 }
@@ -1384,7 +1386,7 @@ pub(crate) async fn accept_group_invite_retrying_busy(
 
     // The fixed attempt budget was exhausted entirely by confirmed
     // definitely-not-started responses.
-    Err(AppError::AccountWorkerBusy)
+    Err(last_retryable)
 }
 
 fn record_failure(participant: &mut Participant, error: &AppError) {

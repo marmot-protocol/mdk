@@ -27,9 +27,11 @@ async fn accept_group_invite_retrying_busy(
     const BUSY_RETRY_ATTEMPTS: usize = 600;
     const BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+    let mut last_retryable = AppError::AccountWorkerBusy;
     for attempt in 0..BUSY_RETRY_ATTEMPTS {
         match runtime.accept_group_invite(account_ref, group_id).await {
-            Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
+            Err(error @ (AppError::AccountWorkerBusy | AppError::UnknownGroup(_))) => {
+                last_retryable = error;
                 if attempt + 1 < BUSY_RETRY_ATTEMPTS {
                     tokio::time::sleep(BUSY_RETRY_DELAY).await;
                 }
@@ -40,7 +42,7 @@ async fn accept_group_invite_retrying_busy(
         }
     }
 
-    Err(AppError::AccountWorkerBusy)
+    Err(last_retryable)
 }
 
 pub(crate) async fn group_command(
@@ -52,9 +54,10 @@ pub(crate) async fn group_command(
     let runtime = app.runtime();
     let result =
         group_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
-    // Drain in-flight Welcome fanout before the process drops this runtime.
+    // Drain in-flight Welcome fanout while the relay plane is still live.
     // Create/invite now reply at the canonical MLS boundary; without this
     // wait, one-shot CLI would cancel delivery on exit.
+    runtime.drain_in_flight_work().await;
     runtime.shutdown().await;
     result
 }
@@ -265,6 +268,7 @@ pub(crate) async fn groups_command(
     let runtime = app.runtime();
     let result =
         groups_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
+    runtime.drain_in_flight_work().await;
     runtime.shutdown().await;
     result
 }

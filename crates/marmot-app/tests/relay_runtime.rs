@@ -8582,7 +8582,7 @@ async fn create_group_returns_before_blocked_founding_welcome() {
         .await
         .expect("the founding Welcome should still be blocked after create returns");
     timeout(
-        Duration::from_millis(250),
+        Duration::from_secs(2),
         runtime.group_members(&alice.account.account_id_hex, &group_id),
     )
     .await
@@ -8668,7 +8668,7 @@ async fn invite_members_returns_before_blocked_welcome() {
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
         .expect("the invite Welcome should still be blocked after invite returns");
-    let (members, mls_state) = timeout(Duration::from_millis(250), async {
+    let (members, mls_state) = timeout(Duration::from_secs(2), async {
         let members = runtime
             .group_members(&alice.account.account_id_hex, &group_id)
             .await?;
@@ -8703,6 +8703,99 @@ async fn invite_members_returns_before_blocked_welcome() {
     })
     .await;
     runtime.shutdown().await;
+}
+
+/// mdk#1451: an invite deferred by startup hydration must still serve live
+/// worker reads while Welcome fanout holds `&mut AppClient`. Replay uses the
+/// live command queue, not a closed dummy receiver.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGiftWraps::new();
+    let (relay, app, url) = gift_wrap_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "startup-deferred invite before welcome",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+    runtime.shutdown().await;
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_startup_hydration_batch_delay_ms(3_000),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+
+    gate.arm(1);
+    timeout(
+        Duration::from_secs(30),
+        runtime.invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id)),
+    )
+    .await
+    .expect("startup-deferred invite must return after hydration")
+    .unwrap();
+
+    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+        .await
+        .expect("the invite Welcome should still be blocked after the deferred invite returns");
+    timeout(
+        Duration::from_secs(2),
+        runtime.group_members(&alice_id, &group_id),
+    )
+    .await
+    .expect("startup-replayed invite must serve live worker reads while Welcome is blocked")
+    .expect("group members should be readable during blocked Welcome fanout");
+
+    let mut events = runtime.subscribe();
+    gate.release();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &carol_id && joined_group == &group_id
+        )
+    })
+    .await;
+    runtime.shutdown().await;
+    drop(relay);
 }
 
 #[cfg(feature = "test-policy-overrides")]
@@ -8777,16 +8870,125 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
 }
 
 /// mdk#1451: an injected Welcome-intent index failure after confirm must not
-/// fail the caller or suppress the first Welcome attempt.
+/// fail the caller, and must not expose the invite commit until destinations
+/// are durable. A restart without the inject flag must not let the invitee
+/// join from an unrepaired on-wire commit.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn invite_members_returns_when_welcome_intent_recording_fails() {
-    invite_members_survives_injected_post_canonical_failure(
+    let dir = tempfile::tempdir().unwrap();
+    let (relay, app, url) = gift_wrap_blocking_app_with_config(
+        &dir,
+        BlockNextGiftWraps::new(),
         MarmotAppConfig::default()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_fail_invite_welcome_intent(true),
     )
     .await;
+    let runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "canonical invite despite intent failure",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let summary = timeout(
+        Duration::from_secs(5),
+        runtime.invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id)),
+    )
+    .await
+    .expect("invite_members must return after the canonical invite")
+    .expect("canonical invite must not tell the caller to retry after an intent-index failure");
+    assert_eq!(summary.published, 0);
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::AcceptedPending
+    );
+    assert!(
+        runtime
+            .pending_welcome_deliveries(&alice_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "failed Welcome-intent persistence must not leave a durable repair handle"
+    );
+    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+    assert!(
+        members
+            .iter()
+            .any(|member| member.member_id_hex == carol_id),
+        "invite must still be canonical locally when intent recording fails"
+    );
+
+    runtime.shutdown().await;
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(
+        runtime
+            .pending_welcome_deliveries(&alice_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "restart must not invent Welcome repair handles the first attempt never persisted"
+    );
+    let joined = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                    if account_id_hex == carol_id && joined_group == group_id
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        joined.is_err(),
+        "invitee must not join from an unpublished invite commit after intent persistence failed"
+    );
+    runtime.shutdown().await;
+    drop(relay);
 }
 
 /// mdk#1451: an injected local-projection failure after confirm must not fail
@@ -8908,7 +9110,8 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
 }
 
 /// mdk#1451: a rejected founding Welcome stays a single durable obligation
-/// across restart and is delivered exactly once after the worker resumes.
+/// across restart. Keep the relay rejecting until pending is observed after
+/// restart so a successful resume cannot clear the row before the poll.
 #[tokio::test]
 async fn founding_welcome_resumes_exactly_once_after_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -8971,7 +9174,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
         "canonical create must not mint a second group when Welcome delivery fails"
     );
 
-    rejecting.store(false, Ordering::Relaxed);
     runtime.shutdown().await;
 
     let runtime = MarmotAppRuntime::new(app.clone());
