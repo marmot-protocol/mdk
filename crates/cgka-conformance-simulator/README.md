@@ -525,7 +525,7 @@ epoch/roster/profile/admin-policy oracle and an order-insensitive exact payload 
 forms reuse the same scenario builder in explicit manual tests. Run the file-backed app-runtime campaign with:
 
 ```sh
-just cross-route-restart-campaign 7 12 target/cross-route-restart-seed-7
+just cross-route-restart-campaign 0 12 target/cross-route-restart-seed-0
 ```
 
 The command writes each generated input before execution and retains its report, fixture candidate, process metrics,
@@ -533,7 +533,7 @@ and failure capsule using the ordinary isolated campaign path. The exact retaine
 family so a panic-shaped private-state failure cannot prevent later catalog cases from running:
 
 ```sh
-just cross-route-exact-restart-campaign 7 12 target/cross-route-exact-restart-seed-7
+just cross-route-exact-restart-campaign 0 12 target/cross-route-exact-restart-seed-0
 ```
 
 Run the isolated-process adapter catalog explicitly with:

@@ -445,6 +445,10 @@ pub fn generate_cross_route_exact_restart_permutation_case(
                 name: "zeta-branch-depth-two".into(),
                 description: String::new(),
             },
+            // Public app-runtime projections include sender-visible accepted events and
+            // therefore expect all probes plus the witness. Exact retained-engine
+            // projections contain only payloads received/decrypted by this client, so
+            // they omit the client's own probe and Yankee's losing-branch witness.
             TraceExpectation::ApplicationPayloadMultiset {
                 client: client.clone(),
                 payloads: clients
