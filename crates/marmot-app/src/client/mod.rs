@@ -1442,7 +1442,7 @@ impl AppClient {
             )
             .await
             .map_err(AppError::from);
-        let (session_effects, welcomes) = match commit {
+        let prepared = match commit {
             Ok(prepared) => prepared,
             Err(error) => {
                 record_app_performance(
@@ -1454,11 +1454,10 @@ impl AppClient {
                 return Err(error);
             }
         };
-        // The MLS invite is already canonical. Record exact Welcome destinations
-        // and stash fanout before the commit is exposed on the wire, then treat
-        // local projection as repairable follow-up so a later index failure
-        // cannot tell the caller to retry an applied invite or skip the first
-        // Welcome attempt.
+        // The invite is staged locally but not canonical yet. Record every
+        // Welcome destination atomically before exposing the commit; if that
+        // persistence fails, roll back the staged MLS change and return the
+        // original error so a retry cannot create phantom local membership.
         let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
             && self.app.config.dev_fail_invite_welcome_intent
         {
@@ -1466,51 +1465,38 @@ impl AppClient {
                 "injected invite welcome intent failure".into(),
             ))
         } else {
-            self.record_welcome_delivery_intents(group_id, &welcomes)
+            self.record_welcome_delivery_intents(group_id, prepared.welcomes())
         };
         let welcome_intents = match welcome_intent_result {
             Ok(welcome_intents) => welcome_intents,
             Err(error) => {
-                let _: Vec<String> =
-                    recover_post_canonical_result("record_welcome_delivery_intents", Err(error));
+                let rollback = self
+                    .runtime
+                    .rollback_prepared_session_commit(prepared)
+                    .await
+                    .map_err(AppError::from);
                 record_app_performance(
                     telemetry,
                     AppPerformanceOperation::GroupInviteEnginePublish,
                     engine_publish_started_at.elapsed(),
-                    true,
+                    false,
                 );
-                // The MLS invite is already canonical locally. Invite Welcomes
-                // are raw transport rows, so exposing the commit without a
-                // durable destination index leaves no restart repair handle.
-                let local_refresh_started_at = Instant::now();
-                let local_refresh = (|| {
-                    if cfg!(feature = "test-policy-overrides")
-                        && self.app.config.dev_fail_invite_local_refresh
-                    {
-                        return Err(AppError::Publish(
-                            "injected invite local refresh failure".into(),
-                        ));
-                    }
-                    self.refresh_group(group_id);
-                    self.prune_plaintext_retention_for_group(group_id)?;
-                    self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-                    Ok::<_, AppError>(())
-                })();
-                record_app_performance(
-                    telemetry,
-                    AppPerformanceOperation::GroupInviteLocalRefresh,
-                    local_refresh_started_at.elapsed(),
-                    local_refresh.is_ok(),
-                );
-                recover_post_canonical_result("invite_members_local_refresh", local_refresh);
-                return Ok(SendSummary {
-                    published: 0,
-                    message_ids: Vec::new(),
-                    accept_disposition: cgka_traits::SendAcceptDisposition::AcceptedPending,
-                    maintenance_disposition: Default::default(),
-                });
+                rollback?;
+                self.refresh_group(group_id);
+                if let Err(refresh_error) =
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()
+                {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "invite_members_intent_failure_rollback",
+                        error_kind = refresh_error.privacy_safe_kind(),
+                        "rolled back staged invite but could not persist the refreshed app projection"
+                    );
+                }
+                return Err(error);
             }
         };
+        let (session_effects, welcomes) = prepared.into_effects_and_welcomes();
         self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
             group_id: group_id.clone(),
             audit_context: audit_context.clone(),
@@ -3690,7 +3676,7 @@ impl AppClient {
         let group_id_hex = hex::encode(group_id.as_slice());
         let recorded_at = unix_now_seconds();
         let storage = self.app.account_storage(&self.state.label)?;
-        let mut message_ids = Vec::new();
+        let mut records = Vec::with_capacity(welcomes.len());
         for welcome in welcomes {
             let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
                 return Err(AppError::Publish(
@@ -3698,15 +3684,18 @@ impl AppClient {
                 ));
             };
             let message_id_hex = hex::encode(welcome.id.as_slice());
-            storage.record_pending_welcome_delivery(
-                &message_id_hex,
-                &group_id_hex,
-                &hex::encode(recipient.as_slice()),
+            records.push(storage_sqlite::PendingWelcomeDeliveryRecord {
+                message_id_hex,
+                group_id_hex: group_id_hex.clone(),
+                recipient_hex: hex::encode(recipient.as_slice()),
                 recorded_at,
-            )?;
-            message_ids.push(message_id_hex);
+            });
         }
-        Ok(message_ids)
+        storage.record_pending_welcome_deliveries(&records)?;
+        Ok(records
+            .into_iter()
+            .map(|record| record.message_id_hex)
+            .collect())
     }
 
     /// Clear only intent rows whose exact Welcome met its acknowledgement

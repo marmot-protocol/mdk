@@ -8693,7 +8693,18 @@ async fn invite_members_returns_before_blocked_welcome() {
         .expect("inviter projection is queryable when invite returns");
     assert_eq!(members.profile.name, "canonical invite before welcome");
 
+    let drain_runtime = runtime.clone();
+    let mut drain = tokio::spawn(async move { drain_runtime.drain_in_flight_work().await });
+    assert!(
+        timeout(Duration::from_secs(6), &mut drain).await.is_err(),
+        "delivery barrier must not abandon fanout at the old five-second shutdown budget"
+    );
     gate.release();
+    timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("delivery barrier should finish after the relay unblocks")
+        .expect("delivery barrier task should not panic")
+        .expect("delivery barrier should report successful completion");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -8705,9 +8716,9 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
-/// mdk#1451: an invite deferred by startup hydration must still serve live
-/// worker reads while Welcome fanout holds `&mut AppClient`. Replay uses the
-/// live command queue, not a closed dummy receiver.
+/// mdk#1451: startup replay uses one live FIFO. A read may be served during
+/// deferred Welcome fanout only when no earlier mutation remains; otherwise it
+/// waits and observes that mutation's result.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanout() {
@@ -8765,27 +8776,71 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
     runtime.reconcile_accounts().await.unwrap();
 
     gate.arm(1);
-    timeout(
-        Duration::from_secs(30),
-        runtime.invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id)),
-    )
-    .await
-    .expect("startup-deferred invite must return after hydration")
-    .unwrap();
+    let invite_runtime = runtime.clone();
+    let invite_alice_id = alice_id.clone();
+    let invite_group_id = group_id.clone();
+    let invite_carol_id = carol_id.clone();
+    let invite = tokio::spawn(async move {
+        invite_runtime
+            .invite_members(
+                &invite_alice_id,
+                &invite_group_id,
+                std::slice::from_ref(&invite_carol_id),
+            )
+            .await
+    });
+    sleep(Duration::from_millis(50)).await;
+    let remove_runtime = runtime.clone();
+    let remove_alice_id = alice_id.clone();
+    let remove_group_id = group_id.clone();
+    let remove_bob_id = bob_id.clone();
+    let remove = tokio::spawn(async move {
+        remove_runtime
+            .remove_members(
+                &remove_alice_id,
+                &remove_group_id,
+                std::slice::from_ref(&remove_bob_id),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(30), invite)
+        .await
+        .expect("startup-deferred invite must return after hydration")
+        .expect("startup-deferred invite task should not panic")
+        .unwrap();
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
         .expect("the invite Welcome should still be blocked after the deferred invite returns");
-    timeout(
-        Duration::from_secs(2),
-        runtime.group_members(&alice_id, &group_id),
-    )
-    .await
-    .expect("startup-replayed invite must serve live worker reads while Welcome is blocked")
-    .expect("group members should be readable during blocked Welcome fanout");
+    let read_runtime = runtime.clone();
+    let read_alice_id = alice_id.clone();
+    let read_group_id = group_id.clone();
+    let mut read = tokio::spawn(async move {
+        read_runtime
+            .group_members(&read_alice_id, &read_group_id)
+            .await
+    });
+    assert!(
+        timeout(Duration::from_secs(2), &mut read).await.is_err(),
+        "live read must not bypass the earlier startup-deferred remove"
+    );
 
     let mut events = runtime.subscribe();
     gate.release();
+    timeout(Duration::from_secs(10), remove)
+        .await
+        .expect("deferred remove should run after Welcome fanout")
+        .expect("deferred remove task should not panic")
+        .expect("deferred remove should succeed");
+    let members = timeout(Duration::from_secs(5), read)
+        .await
+        .expect("read should run after the earlier deferred remove")
+        .expect("read task should not panic")
+        .expect("group members should remain readable");
+    assert!(
+        members.iter().all(|member| member.member_id_hex != bob_id),
+        "read must observe the earlier startup-deferred remove"
+    );
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -8869,10 +8924,9 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
     runtime.shutdown().await;
 }
 
-/// mdk#1451: an injected Welcome-intent index failure after confirm must not
-/// fail the caller, and must not expose the invite commit until destinations
-/// are durable. A restart without the inject flag must not let the invitee
-/// join from an unrepaired on-wire commit.
+/// mdk#1451: an injected Welcome-intent index failure must atomically roll back
+/// a multi-member staged invite before relay exposure. No repair-row prefix or
+/// phantom membership may survive restart.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn invite_members_returns_when_welcome_intent_recording_fails() {
@@ -8901,9 +8955,19 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
         .await
         .unwrap();
     let carol = runtime.create_identity(setup).await.unwrap();
+    let dave = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
+    let dave_id = dave.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
     let group_id = runtime
@@ -8924,18 +8988,14 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
     })
     .await;
 
-    let summary = timeout(
+    let error = timeout(
         Duration::from_secs(5),
-        runtime.invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id)),
+        runtime.invite_members(&alice_id, &group_id, &[carol_id.clone(), dave_id.clone()]),
     )
     .await
-    .expect("invite_members must return after the canonical invite")
-    .expect("canonical invite must not tell the caller to retry after an intent-index failure");
-    assert_eq!(summary.published, 0);
-    assert_eq!(
-        summary.accept_disposition,
-        cgka_traits::SendAcceptDisposition::AcceptedPending
-    );
+    .expect("intent persistence failure must roll back promptly")
+    .expect_err("an unexposed, rolled-back invite must return its persistence error");
+    assert!(matches!(error, AppError::Publish(_)));
     assert!(
         runtime
             .pending_welcome_deliveries(&alice_id)
@@ -8948,8 +9008,8 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
     assert!(
         members
             .iter()
-            .any(|member| member.member_id_hex == carol_id),
-        "invite must still be canonical locally when intent recording fails"
+            .all(|member| { member.member_id_hex != carol_id && member.member_id_hex != dave_id }),
+        "rolled-back invitees must disappear from the live roster"
     );
 
     runtime.shutdown().await;
@@ -8960,7 +9020,6 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
         MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app);
-    let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
     assert!(
         runtime
@@ -8970,22 +9029,12 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
             .is_empty(),
         "restart must not invent Welcome repair handles the first attempt never persisted"
     );
-    let joined = timeout(Duration::from_secs(2), async {
-        loop {
-            let event = events.recv().await.unwrap();
-            if matches!(
-                event,
-                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
-                    if account_id_hex == carol_id && joined_group == group_id
-            ) {
-                return;
-            }
-        }
-    })
-    .await;
+    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
     assert!(
-        joined.is_err(),
-        "invitee must not join from an unpublished invite commit after intent persistence failed"
+        members
+            .iter()
+            .all(|member| { member.member_id_hex != carol_id && member.member_id_hex != dave_id }),
+        "rolled-back multi-member invite must remain absent after restart"
     );
     runtime.shutdown().await;
     drop(relay);

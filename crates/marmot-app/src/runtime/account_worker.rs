@@ -97,6 +97,12 @@ pub(crate) enum AccountWorkerCommand {
     CatchUp {
         respond: oneshot::Sender<Result<(), String>>,
     },
+    /// Startup-coalesced catch-up response held in the same FIFO as deferred
+    /// mutations so later live reads cannot bypass those mutations.
+    StartupCatchUpResult {
+        result: Result<(), String>,
+        respond: oneshot::Sender<Result<(), String>>,
+    },
     RepairFullHistory {
         respond: oneshot::Sender<Result<(), String>>,
     },
@@ -785,34 +791,21 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         worker_lifetime: media_http_worker_lifetime,
     };
-    let mut pending = VecDeque::new();
-    for deferred_command in deferred {
-        match deferred_command {
+    let mut pending = deferred
+        .into_iter()
+        .map(|deferred_command| match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
-                let _ = respond.send(catch_up_result.clone());
+                AccountWorkerCommand::StartupCatchUpResult {
+                    result: catch_up_result.clone(),
+                    respond,
+                }
             }
-            DeferredStartupCommand::Command(command) => {
-                handle_account_worker_command(
-                    &mut client,
-                    *command,
-                    AccountWorkerCommandContext {
-                        commands: &mut commands,
-                        pending: &mut pending,
-                        app: &app,
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                        media_http: &media_http,
-                    },
-                )
-                .await;
-            }
-        }
-    }
-    // Live commands that arrived during startup-deferred fanout stay behind the
-    // remaining startup FIFO. Drain them only after every deferred command has
-    // run, then enter the steady-state select.
+            DeferredStartupCommand::Command(command) => *command,
+        })
+        .collect::<VecDeque<_>>();
+    // Every remaining startup command is visible to snapshot serving in this
+    // one FIFO. Live commands received during fanout append behind it, so a
+    // later read cannot bypass an earlier deferred mutation.
     while let Some(command) = pending.pop_front() {
         match command {
             AccountWorkerCommand::CatchUp { respond } => {
@@ -2233,6 +2226,9 @@ async fn handle_account_worker_command(
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
             let _ = respond.send(());
+        }
+        AccountWorkerCommand::StartupCatchUpResult { result, respond } => {
+            let _ = respond.send(result);
         }
         AccountWorkerCommand::Drain { respond } => {
             let _ = respond.send(());

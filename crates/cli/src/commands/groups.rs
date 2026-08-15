@@ -57,8 +57,9 @@ pub(crate) async fn group_command(
     // Drain in-flight Welcome fanout while the relay plane is still live.
     // Create/invite now reply at the canonical MLS boundary; without this
     // wait, one-shot CLI would cancel delivery on exit.
-    runtime.drain_in_flight_work().await;
+    let drain_result = runtime.drain_in_flight_work().await;
     runtime.shutdown().await;
+    drain_result?;
     result
 }
 
@@ -268,8 +269,9 @@ pub(crate) async fn groups_command(
     let runtime = app.runtime();
     let result =
         groups_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
-    runtime.drain_in_flight_work().await;
+    let drain_result = runtime.drain_in_flight_work().await;
     runtime.shutdown().await;
+    drain_result?;
     result
 }
 

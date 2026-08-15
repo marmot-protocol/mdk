@@ -3411,7 +3411,7 @@ impl MarmotAppRuntime {
 
     /// Wait until in-flight create/invite Welcome fanout has finished on every
     /// managed worker, while the relay plane is still live.
-    pub async fn drain_in_flight_work(&self) {
+    pub async fn drain_in_flight_work(&self) -> Result<(), AppError> {
         self.accounts.drain_in_flight_work().await
     }
 
@@ -5079,7 +5079,7 @@ impl AccountManager {
     /// Wait until in-flight create/invite Welcome fanout has finished on every
     /// managed worker. One-shot CLI calls this before [`Self::shutdown`] so the
     /// relay plane is still available for that publish.
-    pub async fn drain_in_flight_work(&self) {
+    pub async fn drain_in_flight_work(&self) -> Result<(), AppError> {
         let senders = {
             let workers = self.workers.lock().await;
             workers
@@ -5090,17 +5090,16 @@ impl AccountManager {
         let mut responses = Vec::with_capacity(senders.len());
         for commands in senders {
             let (respond, response) = oneshot::channel();
-            if commands
+            commands
                 .send(AccountWorkerCommand::Drain { respond })
                 .await
-                .is_ok()
-            {
-                responses.push(response);
-            }
+                .map_err(|_| AppError::TransportClosed)?;
+            responses.push(response);
         }
         for response in responses {
-            let _ = timeout(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, response).await;
+            response.await.map_err(|_| AppError::TransportClosed)?;
         }
+        Ok(())
     }
 
     pub async fn shutdown(&self) {

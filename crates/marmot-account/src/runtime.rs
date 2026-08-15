@@ -121,6 +121,31 @@ struct PreparedLegacyPublishAttempt {
     request: TransportPublishRequest,
 }
 
+/// A locally staged commit whose transport publication has not started.
+///
+/// Keeping the pending handle beside the extracted Welcomes lets callers
+/// either publish the commit after durable Welcome-intent persistence or roll
+/// the staged MLS change back while external exposure is still impossible.
+pub struct PreparedSessionCommit {
+    effects: SessionEffects,
+    welcomes: Vec<TransportMessage>,
+    pending: PendingStateRef,
+}
+
+impl PreparedSessionCommit {
+    pub fn welcomes(&self) -> &[TransportMessage] {
+        &self.welcomes
+    }
+
+    pub fn into_effects_and_welcomes(self) -> (SessionEffects, Vec<TransportMessage>) {
+        (self.effects, self.welcomes)
+    }
+
+    fn into_parts(self) -> (SessionEffects, Vec<TransportMessage>, PendingStateRef) {
+        (self.effects, self.welcomes, self.pending)
+    }
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -1629,8 +1654,8 @@ where
         Ok(output)
     }
 
-    /// Confirm an outbound intent locally and extract Welcome payloads without
-    /// publishing the remaining session effects.
+    /// Stage an outbound commit locally and extract Welcome payloads without
+    /// publishing or confirming the remaining session effects.
     ///
     /// The caller must record exact Welcome delivery obligations before
     /// [`Self::publish_prepared_session_effects_with_audit_context`] exposes the
@@ -1639,13 +1664,51 @@ where
         &mut self,
         intent: SendIntent,
         context: AuditEventContext,
-    ) -> AccountResult<(SessionEffects, Vec<TransportMessage>)> {
+    ) -> AccountResult<PreparedSessionCommit> {
         let mut session_effects = self
             .session
             .send_with_audit_context(intent, context)
             .await?;
+        let pending = session_effects
+            .publish
+            .iter()
+            .find_map(|work| match work {
+                PublishWork::GroupEvolution { pending, .. }
+                | PublishWork::GroupCreated { pending, .. } => Some(*pending),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                cgka_traits::EngineError::Backend(
+                    "prepared commit did not contain a pending MLS evolution".into(),
+                )
+            })?;
         let welcomes = take_deferred_welcomes(&mut session_effects);
-        Ok((session_effects, welcomes))
+        Ok(PreparedSessionCommit {
+            effects: session_effects,
+            welcomes,
+            pending,
+        })
+    }
+
+    /// Roll back a prepared commit before any transport side effect.
+    pub async fn rollback_prepared_session_commit(
+        &mut self,
+        prepared: PreparedSessionCommit,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
+        prepared_effects.publish.clear();
+
+        let mut output = AccountDeviceEffects::default();
+        let mut queue = VecDeque::new();
+        output.absorb_session_effects(prepared_effects, &mut queue);
+
+        let rollback_effects = self.session.publish_failed(pending).await?;
+        output
+            .pending
+            .push(PendingResolution::RolledBack { pending });
+        output.absorb_session_effects(rollback_effects, &mut queue);
+        debug_assert!(queue.is_empty());
+        Ok(output)
     }
 
     /// Confirm an outbound intent's commit without waiting for Welcome fanout.
@@ -1662,9 +1725,10 @@ where
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
-        let (session_effects, welcomes) = self
+        let prepared = self
             .confirm_commit_without_publish_with_audit_context(intent, context.clone())
             .await?;
+        let (session_effects, welcomes, _pending) = prepared.into_parts();
         let mut output = self
             .publish_session_effects_with_audit_context(session_effects, Some(context))
             .await?;
