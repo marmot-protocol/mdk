@@ -21,7 +21,7 @@ runtime. It complements the policy docs:
 | --- | --- | --- | --- |
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
-| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
+| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read/accept operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. Exposed locally via `MarmotAppRuntime::app_performance_snapshot()` and the MarmotKit `appPerformanceSnapshot()` binding. | No by itself. Local getters return the aggregate snapshot to the host process only. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
@@ -190,8 +190,11 @@ member, relay, fingerprint, branch, or payload identifiers and never feed conver
 
 ### App performance telemetry
 
-`AppPerformanceTelemetry` lives in `RuntimeSharedServices` and exposes an `AppPerformanceSnapshot`. Each operation has
-the same shape:
+`AppPerformanceTelemetry` lives in `RuntimeSharedServices` and exposes an `AppPerformanceSnapshot`. Hosts read the
+snapshot in-process through `MarmotAppRuntime::app_performance_snapshot()`; the MarmotKit
+`appPerformanceSnapshot()` binding carries the same aggregate fields across UniFFI for debug surfaces and support
+dumps. Neither path adds collection — both return the counters and histograms the runtime already keeps. Each
+operation has the same shape:
 
 | Field | Meaning | Sensitivity |
 | --- | --- | --- |
@@ -228,6 +231,7 @@ Collected operations:
 | `group_promote_admin` | `AccountManager::promote_admin()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Covers the separate admin-policy mutation path used when invite-as-admin follows member invite. |
 | `group_details_read` | UniFFI `group_details_for()`, including account/group lookup, member read, display-name hydration, and DTO assembly. | Matches the FFI `groupDetails` surface consumed by apps. |
 | `group_mls_state_read` | `AccountManager::group_mls_state()`, from worker command dispatch through the read response. | Captures projection reads used by the conversation developer/debug state surface. |
+| `group_accept_invite` | `AccountManager::accept_group_invite()`, from worker command dispatch through the worker response. | Caller-visible accept latency; a worker-busy rejection counts as a failed attempt, matching the `group_create_total_caller_latency` convention. The join itself is published by the invite catch-up flow, not by this envelope. |
 | `media_upload` | Worker `UploadMedia` command until `client.upload_media()` returns. | Measures local encryption/upload pipeline and endpoint response time as seen by this device. |
 | `media_download` | Worker `DownloadMedia` command until `client.download_media()` returns. | Measures local fetch/decrypt pipeline and endpoint response time as seen by this device. |
 | `host_splash_ready` | Host-defined launch origin until the primary UI is allowed to leave its splash/loading screen. | Recorded by the host through `record_host_performance`; use success only when the usable local UI is actually presented. |
@@ -434,6 +438,10 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_outbound_message_send_attempts` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.attempts` |
 | `app_outbound_message_send_successes` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.successes` |
 | `app_outbound_message_send_failures` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.failures` |
+| `app_group_accept_invite_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_accept_invite.duration_ms` |
+| `app_group_accept_invite_attempts` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.attempts` |
+| `app_group_accept_invite_successes` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.successes` |
+| `app_group_accept_invite_failures` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.failures` |
 | `app_media_upload_duration_ms` | none | Histogram | `AppPerformanceSnapshot.media_upload.duration_ms` |
 | `app_media_upload_attempts` | none | Counter | `AppPerformanceSnapshot.media_upload.attempts` |
 | `app_media_upload_successes` | none | Counter | `AppPerformanceSnapshot.media_upload.successes` |
