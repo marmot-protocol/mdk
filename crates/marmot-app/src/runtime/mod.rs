@@ -1769,6 +1769,17 @@ impl MarmotAppRuntime {
             .record_host_performance(operation, duration, outcome);
     }
 
+    /// Read the process-wide app-performance snapshot for debug/diagnostics
+    /// surfaces and on-demand support dumps.
+    ///
+    /// Read-only and privacy-safe by construction: cumulative counters and
+    /// fixed-bucket millisecond histograms per reviewed operation. No account,
+    /// group, message, relay, URL, pubkey, payload, or key material — the same
+    /// posture as the opt-in OTLP export.
+    pub fn app_performance_snapshot(&self) -> crate::AppPerformanceSnapshot {
+        self.shared.app_performance_telemetry().snapshot()
+    }
+
     pub fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettings,

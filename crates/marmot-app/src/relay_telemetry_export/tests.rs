@@ -236,6 +236,12 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failures: 0,
             duration_ms: hist(1),
         },
+        group_accept_invite: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 1,
+            failures: 1,
+            duration_ms: hist(3),
+        },
         host_splash_ready: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
@@ -335,6 +341,30 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     }
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    // The accept-invite phase is population-level like every other
+    // app-performance point: all four metrics exist and carry no relay label.
+    for metric_name in [
+        metric_names::APP_GROUP_ACCEPT_INVITE_DURATION,
+        metric_names::APP_GROUP_ACCEPT_INVITE_ATTEMPTS,
+        metric_names::APP_GROUP_ACCEPT_INVITE_SUCCESSES,
+        metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES,
+    ] {
+        assert!(
+            batch
+                .points
+                .iter()
+                .any(|point| point.name == metric_name && point.relay.is_none()),
+            "missing unlabeled accept-invite telemetry export {metric_name}",
+        );
+    }
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_ACCEPT_INVITE_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES
             && point.value == ExportMetricValue::Counter(1)
     }));
 

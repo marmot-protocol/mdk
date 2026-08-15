@@ -53,6 +53,7 @@ pub(crate) enum AppPerformanceOperation {
     GroupDetailsRead,
     GroupMlsStateRead,
     GroupRosterRead,
+    GroupAcceptInvite,
     MediaUpload,
     MediaDownload,
     HostSplashReady,
@@ -163,6 +164,8 @@ pub struct AppPerformanceSnapshot {
     pub group_mls_state_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_roster_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_accept_invite: AppPerformanceOperationSnapshot,
     pub media_upload: AppPerformanceOperationSnapshot,
     pub media_download: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -213,6 +216,7 @@ struct AppPerformanceTelemetryInner {
     group_details_read: AppPerformanceOperationTelemetry,
     group_mls_state_read: AppPerformanceOperationTelemetry,
     group_roster_read: AppPerformanceOperationTelemetry,
+    group_accept_invite: AppPerformanceOperationTelemetry,
     media_upload: AppPerformanceOperationTelemetry,
     media_download: AppPerformanceOperationTelemetry,
     host_splash_ready: AppPerformanceOperationTelemetry,
@@ -425,6 +429,9 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::GroupRosterRead => {
                 inner.group_roster_read.record(duration, success);
             }
+            AppPerformanceOperation::GroupAcceptInvite => {
+                inner.group_accept_invite.record(duration, success);
+            }
             AppPerformanceOperation::MediaUpload => inner.media_upload.record(duration, success),
             AppPerformanceOperation::MediaDownload => {
                 inner.media_download.record(duration, success);
@@ -508,6 +515,7 @@ impl AppPerformanceTelemetry {
             group_details_read: inner.group_details_read.snapshot(),
             group_mls_state_read: inner.group_mls_state_read.snapshot(),
             group_roster_read: inner.group_roster_read.snapshot(),
+            group_accept_invite: inner.group_accept_invite.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
             host_splash_ready: inner.host_splash_ready.snapshot(),
@@ -682,6 +690,28 @@ mod tests {
             assert_eq!(stage.successes, 1);
             assert_eq!(stage.duration_ms.sample_count(), 1);
         }
+    }
+
+    #[test]
+    fn records_group_accept_invite_operation() {
+        let telemetry = AppPerformanceTelemetry::default();
+        telemetry.record(
+            AppPerformanceOperation::GroupAcceptInvite,
+            Duration::from_millis(30),
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::GroupAcceptInvite,
+            Duration::from_millis(70),
+            false,
+        );
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_accept_invite.attempts, 2);
+        assert_eq!(snapshot.group_accept_invite.successes, 1);
+        assert_eq!(snapshot.group_accept_invite.failures, 1);
+        assert_eq!(snapshot.group_accept_invite.duration_ms.sample_count(), 2);
+        assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
     }
 
     #[test]

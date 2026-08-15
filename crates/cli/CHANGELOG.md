@@ -11,6 +11,19 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- MarmotKit exposes `appPerformanceSnapshot()`, a read-only fetch of the
+  process-wide app-performance snapshot — per-phase attempt/success/failure
+  counters and fixed-bucket millisecond duration histograms — so host debug
+  surfaces and on-demand support dumps can read per-device timings that were
+  previously available only inside the runtime, with optional OTLP export.
+  Accepting
+  a group invite now records its own caller-visible `group_accept_invite`
+  phase alongside the existing invite, create, and roster phases, and the
+  OTLP export gains the matching unlabeled `app_group_accept_invite_*`
+  points. The privacy posture is unchanged: aggregate values only, with no
+  account, group, relay, or payload labels.
+  ([#1453](https://github.com/marmot-protocol/mdk/pull/1453))
+
 - Sending a message now reports whether it reached the relay or is waiting in
   the group's durable queue. MarmotKit's send summary carries an explicit
   `accept_disposition` of `published` or `accepted_pending`, so a host no longer
