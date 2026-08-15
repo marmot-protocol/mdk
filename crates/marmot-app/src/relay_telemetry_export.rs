@@ -388,6 +388,14 @@ pub mod metric_names {
     pub const APP_GROUP_DETAILS_READ_SUCCESSES: &str = "app_group_details_read_successes";
     /// Failed group details reads.
     pub const APP_GROUP_DETAILS_READ_FAILURES: &str = "app_group_details_read_failures";
+    /// Single chat-list row read duration histogram.
+    pub const APP_CHAT_LIST_ROW_READ_DURATION: &str = "app_chat_list_row_read_duration_ms";
+    /// Single chat-list row read attempts.
+    pub const APP_CHAT_LIST_ROW_READ_ATTEMPTS: &str = "app_chat_list_row_read_attempts";
+    /// Successful single chat-list row reads.
+    pub const APP_CHAT_LIST_ROW_READ_SUCCESSES: &str = "app_chat_list_row_read_successes";
+    /// Failed single chat-list row reads.
+    pub const APP_CHAT_LIST_ROW_READ_FAILURES: &str = "app_chat_list_row_read_failures";
     /// Group MLS state read duration histogram.
     pub const APP_GROUP_MLS_STATE_READ_DURATION: &str = "app_group_mls_state_read_duration_ms";
     /// Group MLS state read attempts.
@@ -966,6 +974,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS,
         metric_names::APP_GROUP_DETAILS_READ_SUCCESSES,
         metric_names::APP_GROUP_DETAILS_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.chat_list_row_read,
+        metric_names::APP_CHAT_LIST_ROW_READ_DURATION,
+        metric_names::APP_CHAT_LIST_ROW_READ_ATTEMPTS,
+        metric_names::APP_CHAT_LIST_ROW_READ_SUCCESSES,
+        metric_names::APP_CHAT_LIST_ROW_READ_FAILURES,
     );
     append_app_operation_points(
         points,

@@ -1,5 +1,7 @@
 //! Durable chat-list and chat read-state commands.
 
+use std::time::Instant;
+
 use crate::conversions::{
     ChatListRowFfi, ChatNotificationSettingsFfi, ChatPinStateFfi, group_id_from_hex,
 };
@@ -23,6 +25,31 @@ impl Marmot {
         )
         .entered();
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Read one hydrated chat-list row for a known group.
+    ///
+    /// Delegates to the runtime's keyed `chat_list_row` read. A well-formed
+    /// group id with no local projection — including a group that belongs to
+    /// another account, a group that is not yet projected, or a quarantined
+    /// group without a chat-list row — returns `None`. Unknown accounts,
+    /// malformed group ids, and storage failures keep the same typed errors as
+    /// the other chat-list commands.
+    pub fn chat_list_row(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Option<ChatListRowFfi>, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        let started_at = Instant::now();
+        let result = self
+            .runtime
+            .chat_list_row(&account_ref, &group_id_hex)
+            .map(|row| row.map(Into::into))
+            .map_err(MarmotKitError::from);
+        self.runtime
+            .record_chat_list_row_read(started_at.elapsed(), result.is_ok());
+        result
     }
 
     /// Establish the unread baseline the first time a user opens a group.
@@ -366,5 +393,157 @@ mod tests {
         ));
 
         kit.runtime.shutdown().await;
+    }
+
+    #[test]
+    fn chat_list_row_matches_full_list_and_stays_independent_of_chat_count() {
+        let test_thread = std::thread::Builder::new()
+            .name("ffi-chat-list-row-round-trip".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let test_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                test_runtime.block_on(chat_list_row_round_trip_body());
+            })
+            .unwrap();
+        test_thread.join().unwrap();
+    }
+
+    async fn chat_list_row_round_trip_body() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url.clone());
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+        let account_ref = account.account.account_id_hex;
+
+        let isolated_endpoint = TransportEndpoint(relay_url);
+        let isolated_account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![isolated_endpoint.clone()],
+                bootstrap_relays: vec![isolated_endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create isolated identity");
+        let isolated_account_ref = isolated_account.account.account_id_hex;
+        let isolated_group = kit
+            .create_group(
+                isolated_account_ref.clone(),
+                "Isolated row".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("create isolated group");
+
+        let mut group_ids = Vec::new();
+        for title in ["Alpha", "Beta", "Gamma", "Delta"] {
+            group_ids.push(
+                kit.create_group(account_ref.clone(), title.to_owned(), Vec::new(), None)
+                    .await
+                    .expect("create group"),
+            );
+        }
+        let target = group_ids[2].clone();
+
+        kit.set_group_archived(account_ref.clone(), group_ids[0].clone(), true)
+            .await
+            .expect("archive first chat");
+
+        let missing = kit
+            .chat_list_row(account_ref.clone(), "00aa".into())
+            .expect("well-formed unknown group is a missing row, not an error");
+        assert!(missing.is_none());
+
+        let isolated_from_other_account = kit
+            .chat_list_row(account_ref.clone(), isolated_group.clone())
+            .expect("foreign group is account-isolated");
+        assert!(isolated_from_other_account.is_none());
+
+        let archived = kit
+            .chat_list_row(account_ref.clone(), group_ids[0].clone())
+            .expect("archived row remains readable")
+            .expect("archived projection exists");
+        assert_eq!(archived.group_id_hex, group_ids[0]);
+        assert!(archived.archived);
+        let visible_list = kit
+            .chat_list(account_ref.clone(), false)
+            .expect("visible chat list");
+        assert!(
+            visible_list
+                .iter()
+                .all(|row| row.group_id_hex != group_ids[0])
+        );
+
+        let before = kit.app_performance_snapshot();
+        let row = kit
+            .chat_list_row(account_ref.clone(), target.clone())
+            .expect("read target row")
+            .expect("target projection exists");
+        let after = kit.app_performance_snapshot();
+        assert_eq!(
+            after.chat_list_row_read.attempts,
+            before.chat_list_row_read.attempts + 1
+        );
+        assert_eq!(
+            after.chat_list_row_read.successes,
+            before.chat_list_row_read.successes + 1
+        );
+        assert_eq!(
+            after.chat_list_row_read.attempts - before.chat_list_row_read.attempts,
+            1,
+            "single-row read must record one sample regardless of chat count"
+        );
+
+        let full_list = kit
+            .chat_list(account_ref.clone(), true)
+            .expect("full chat list");
+        let expected = full_list
+            .iter()
+            .find(|candidate| candidate.group_id_hex == target)
+            .expect("target exists in full list");
+        assert_eq!(row.group_id_hex, expected.group_id_hex);
+        assert_eq!(row.title, expected.title);
+        assert_eq!(row.archived, expected.archived);
+        assert_eq!(row.unread_count, expected.unread_count);
+        assert_eq!(row.has_unread, expected.has_unread);
+        assert_eq!(row.pinned, expected.pinned);
+        assert_eq!(
+            format!("{:?}", row.self_membership),
+            format!("{:?}", expected.self_membership)
+        );
+        assert_eq!(
+            format!("{:?}", row.conversation_kind),
+            format!("{:?}", expected.conversation_kind)
+        );
+        assert_eq!(row.lifecycle_state, expected.lifecycle_state);
+        assert_eq!(row.activity_sort_at, expected.activity_sort_at);
+
+        kit.shutdown_and_close()
+            .await
+            .expect("close store after row reads");
+        let closed = kit
+            .chat_list_row(account_ref, target)
+            .expect_err("closed storage must fail deterministically");
+        assert!(matches!(closed, MarmotKitError::StorageClosed { .. }));
     }
 }
