@@ -214,7 +214,13 @@ ensure_uv() {
 # token-bearing URL. Unauthenticated clones of public repos 429 in CI.
 git_with_github_auth() {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        git -c "http.extraheader=AUTHORIZATION: bearer ${GITHUB_TOKEN}" "$@"
+        local github_basic_auth
+        github_basic_auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\r\n')"
+        GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${github_basic_auth}" \
+            GIT_TERMINAL_PROMPT=0 \
+            git "$@"
     else
         git "$@"
     fi

@@ -32,8 +32,8 @@ use cgka_traits::group::ProtocolProfile;
 
 use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
 use crate::{
-    AppError, AppGroupRecord, AppMessageQuery, MarmotApp, MarmotAppEvent, ReceivedMessage,
-    RuntimeMessageReceived, tag_value,
+    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
+    ReceivedMessage, RuntimeMessageReceived, tag_value,
 };
 use storage_sqlite::TimelineMessageTarget;
 
@@ -1488,10 +1488,7 @@ pub(crate) fn recover_notification_updates(
             },
         )?;
         for record in records {
-            if !notification_recovery_is_fresh(
-                record.received_at.max(record.recorded_at),
-                min_observed_at,
-            ) {
+            if !notification_recovery_is_fresh(&record, min_observed_at) {
                 continue;
             }
             let Ok(group_id) = hex::decode(&record.group_id_hex) else {
@@ -1537,10 +1534,13 @@ pub(crate) fn recover_notification_updates(
 }
 
 pub(crate) fn notification_recovery_is_fresh(
-    observed_at: u64,
+    record: &AppMessageRecord,
     min_observed_at: Option<u64>,
 ) -> bool {
-    min_observed_at.is_none_or(|min| observed_at >= min)
+    // `recorded_at` is sender-authenticated and intentionally not clamped.
+    // Only this device's local observation time can define whether a row was
+    // received before or after the subscription boundary.
+    min_observed_at.is_none_or(|min| record.received_at >= min)
 }
 
 /// Build a notification for one event, reusing `resolver`'s memoized

@@ -9,6 +9,54 @@ dev_root="$tmp_parent/nested/hermes-marmot-test"
 account_id="$(printf '11%.0s' {1..32})"
 group_id="$(printf '22%.0s' {1..32})"
 
+# Exercise GitHub smart-HTTP authentication without network access. The fake
+# git verifies the scoped config environment on both clone and fetch; fake uv
+# lets the setup finish without constructing a real Hermes environment.
+auth_fake_bin="$tmp_parent/auth-fake-bin"
+auth_capture="$tmp_parent/github-auth-capture"
+mkdir -p "$auth_fake_bin"
+cat >"$auth_fake_bin/git" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+capture_auth() {
+    printf '%s\n%s\n' "${GIT_CONFIG_KEY_0:-}" "${GIT_CONFIG_VALUE_0:-}" >>"$AUTH_CAPTURE"
+}
+
+case " $* " in
+    *" clone "*)
+        capture_auth
+        dest="${@: -1}"
+        mkdir -p "$dest/.git"
+        ;;
+    *" fetch "*)
+        capture_auth
+        ;;
+esac
+SCRIPT
+cat >"$auth_fake_bin/uv" <<'SCRIPT'
+#!/usr/bin/env bash
+exit 0
+SCRIPT
+chmod +x "$auth_fake_bin/git" "$auth_fake_bin/uv"
+
+auth_dev_root="$tmp_parent/github-auth"
+env \
+    PATH="$auth_fake_bin:$PATH" \
+    GITHUB_TOKEN="test-actions-token" \
+    AUTH_CAPTURE="$auth_capture" \
+    "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
+        --root "$auth_dev_root" \
+        --hermes-ref "test-ref" \
+        --no-enable-plugin
+expected_basic="$(printf 'x-access-token:%s' 'test-actions-token' | base64 | tr -d '\r\n')"
+[ "$(grep -Fxc 'http.https://github.com/.extraheader' "$auth_capture")" -eq 2 ]
+[ "$(grep -Fxc "AUTHORIZATION: basic $expected_basic" "$auth_capture")" -eq 2 ]
+if grep -F 'test-actions-token' "$auth_capture" >/dev/null; then
+    echo "raw GitHub token leaked into git configuration" >&2
+    exit 1
+fi
+
 "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
     --root "$dev_root" \
     --skip-hermes-install \

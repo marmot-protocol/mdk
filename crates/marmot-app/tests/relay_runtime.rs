@@ -2225,7 +2225,21 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         .accept_group_invite(&bob_id, &second_group_id)
         .await
         .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
     let second_group_id_hex = hex::encode(second_group_id.as_slice());
+    let mut bob_chats = runtime.subscribe_chats(&bob_id, false).await.unwrap();
+    assert!(
+        bob_chats
+            .snapshot
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+    );
+    assert!(
+        bob_chats
+            .snapshot
+            .iter()
+            .any(|group| group.group_id_hex == second_group_id_hex)
+    );
 
     runtime
         .send_message(&alice_id, &group_id, b"local rows must be wiped".to_vec())
@@ -2242,7 +2256,6 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
     })
     .await;
 
-    let group_id_hex = hex::encode(group_id.as_slice());
     runtime
         .initialize_chat_read_state(&bob_id, &group_id_hex)
         .unwrap();
@@ -2279,12 +2292,22 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             .await
             .unwrap()
     );
+    let deleted_chat = wait_for_chat_update(&mut bob_chats, |group| {
+        group.group_id_hex == group_id_hex && group.archived
+    })
+    .await;
+    assert!(deleted_chat.archived);
     assert!(
         runtime
             .delete_group_local(&bob_id, &second_group_id)
             .await
             .unwrap()
     );
+    let second_deleted_chat = wait_for_chat_update(&mut bob_chats, |group| {
+        group.group_id_hex == second_group_id_hex && group.archived
+    })
+    .await;
+    assert!(second_deleted_chat.archived);
 
     assert!(app.group(&bob_label, &group_id_hex).unwrap().is_none());
     assert!(

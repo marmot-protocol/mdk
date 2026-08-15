@@ -12,7 +12,7 @@ use cgka_traits::{GroupId, SecretBytes};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, Sleep, interval, sleep, timeout};
 use zeroize::Zeroizing;
@@ -730,10 +730,11 @@ async fn run_app_runtime_account_worker(
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
+    let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-        lifecycle: lifecycle.clone(),
+        worker_lifetime: media_http_worker_lifetime,
     };
     for deferred_command in deferred {
         match deferred_command {
@@ -1746,10 +1747,20 @@ const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 struct MediaHttpContext {
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
-    lifecycle: RuntimeLifecycle,
+    /// Never sends a value. Dropping the worker-owned sender closes every
+    /// receiver and cancels active HTTP futures on every worker exit path.
+    worker_lifetime: watch::Sender<()>,
 }
 
-enum MediaHttpDone {
+struct MediaHttpDone {
+    /// Capacity remains reserved while a whole-blob result waits for and runs
+    /// account-worker completion, so the unbounded channel is effectively
+    /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
+    permit: OwnedSemaphorePermit,
+    completion: MediaHttpCompletion,
+}
+
+enum MediaHttpCompletion {
     Upload {
         finish: EncryptedMediaUploadFinish,
         result: Result<MediaUploadResult, AppError>,
@@ -1769,25 +1780,31 @@ enum MediaHttpDone {
 
 fn spawn_media_http<T>(
     media_http: &MediaHttpContext,
+    permit: OwnedSemaphorePermit,
     work: impl std::future::Future<Output = T> + Send + 'static,
-    into_done: impl FnOnce(T) -> MediaHttpDone + Send + 'static,
+    into_done: impl FnOnce(T) -> MediaHttpCompletion + Send + 'static,
 ) {
     let tx = media_http.tx.clone();
-    let permits = media_http.permits.clone();
-    let lifecycle = media_http.lifecycle.clone();
+    let mut worker_lifetime = media_http.worker_lifetime.subscribe();
     tokio::spawn(async move {
-        let Ok(_permit) = permits.acquire_owned().await else {
-            return;
+        let output = tokio::select! {
+            biased;
+            _ = worker_lifetime.changed() => return,
+            output = work => output,
         };
-        if lifecycle.is_stopping() {
-            return;
-        }
-        let output = work.await;
-        if lifecycle.is_stopping() {
-            return;
-        }
-        let _ = tx.send(into_done(output));
+        let _ = tx.send(MediaHttpDone {
+            permit,
+            completion: into_done(output),
+        });
     });
+}
+
+fn reserve_media_http(media_http: &MediaHttpContext) -> Result<OwnedSemaphorePermit, AppError> {
+    media_http
+        .permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::BlockingTask("media HTTP capacity exhausted".to_owned()))
 }
 
 async fn complete_media_http(
@@ -1795,8 +1812,9 @@ async fn complete_media_http(
     done: MediaHttpDone,
     shared: &RuntimeSharedServices,
 ) {
-    match done {
-        MediaHttpDone::Upload {
+    let MediaHttpDone { permit, completion } = done;
+    match completion {
+        MediaHttpCompletion::Upload {
             finish,
             result,
             respond,
@@ -1813,7 +1831,7 @@ async fn complete_media_http(
             );
             let _ = respond.send(result);
         }
-        MediaHttpDone::Download {
+        MediaHttpCompletion::Download {
             result,
             respond,
             started_at,
@@ -1825,10 +1843,11 @@ async fn complete_media_http(
             );
             let _ = respond.send(result);
         }
-        MediaHttpDone::GroupImage { result, respond } => {
+        MediaHttpCompletion::GroupImage { result, respond } => {
             let _ = respond.send(result);
         }
     }
+    drop(permit);
 }
 
 /// Process a single account-worker command against the live session.
@@ -2459,9 +2478,16 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::DownloadGroupImage { group_id, respond } => {
+            let permit = match reserve_media_http(media_http) {
+                Ok(permit) => permit,
+                Err(err) => {
+                    let _ = respond.send(Err(err));
+                    return;
+                }
+            };
             match client.prepare_group_image_download(&group_id).await {
-                Ok(http) => spawn_media_http(media_http, http.run(), move |result| {
-                    MediaHttpDone::GroupImage { result, respond }
+                Ok(http) => spawn_media_http(media_http, permit, http.run(), move |result| {
+                    MediaHttpCompletion::GroupImage { result, respond }
                 }),
                 Err(err) => {
                     let _ = respond.send(Err(err));
@@ -2551,18 +2577,32 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let started_at = Instant::now();
+            let permit = match reserve_media_http(media_http) {
+                Ok(permit) => permit,
+                Err(err) => {
+                    shared.app_performance_telemetry().record(
+                        AppPerformanceOperation::MediaUpload,
+                        started_at.elapsed(),
+                        false,
+                    );
+                    let _ = respond.send(Err(err));
+                    return;
+                }
+            };
             match client
                 .prepare_encrypted_media_upload(&group_id, request)
                 .await
             {
-                Ok((http, finish)) => spawn_media_http(media_http, http.run(), move |result| {
-                    MediaHttpDone::Upload {
-                        finish,
-                        result,
-                        respond,
-                        started_at,
-                    }
-                }),
+                Ok((http, finish)) => {
+                    spawn_media_http(media_http, permit, http.run(), move |result| {
+                        MediaHttpCompletion::Upload {
+                            finish,
+                            result,
+                            respond,
+                            started_at,
+                        }
+                    })
+                }
                 Err(err) => {
                     shared.app_performance_telemetry().record(
                         AppPerformanceOperation::MediaUpload,
@@ -2579,12 +2619,24 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let started_at = Instant::now();
+            let permit = match reserve_media_http(media_http) {
+                Ok(permit) => permit,
+                Err(err) => {
+                    shared.app_performance_telemetry().record(
+                        AppPerformanceOperation::MediaDownload,
+                        started_at.elapsed(),
+                        false,
+                    );
+                    let _ = respond.send(Err(err));
+                    return;
+                }
+            };
             match client
                 .prepare_encrypted_media_download(&group_id, reference)
                 .await
             {
-                Ok(http) => spawn_media_http(media_http, http.run(), move |result| {
-                    MediaHttpDone::Download {
+                Ok(http) => spawn_media_http(media_http, permit, http.run(), move |result| {
+                    MediaHttpCompletion::Download {
                         result,
                         respond,
                         started_at,
@@ -3531,6 +3583,87 @@ mod tests {
         GroupId::new(vec![byte])
     }
 
+    fn media_http_context(
+        limit: usize,
+    ) -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (worker_lifetime, _) = watch::channel(());
+        (
+            MediaHttpContext {
+                tx,
+                permits: Arc::new(Semaphore::new(limit)),
+                worker_lifetime,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn media_http_capacity_stays_reserved_until_completion_is_consumed() {
+        let (media_http, mut completions) = media_http_context(1);
+        let permit = reserve_media_http(&media_http).expect("first transfer reserves capacity");
+        let (respond, _response) = oneshot::channel();
+        spawn_media_http(
+            &media_http,
+            permit,
+            async { Ok(Vec::new()) },
+            move |result| MediaHttpCompletion::GroupImage { result, respond },
+        );
+
+        let completion = timeout(Duration::from_secs(1), completions.recv())
+            .await
+            .expect("HTTP work completes")
+            .expect("worker completion channel remains open");
+        assert!(
+            matches!(
+                reserve_media_http(&media_http),
+                Err(AppError::BlockingTask(_))
+            ),
+            "a queued whole-blob result must continue to consume capacity"
+        );
+
+        drop(completion);
+        assert!(reserve_media_http(&media_http).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_media_http_context_cancels_active_work_and_releases_capacity() {
+        struct CancellationWitness(Option<oneshot::Sender<()>>);
+
+        impl Drop for CancellationWitness {
+            fn drop(&mut self) {
+                if let Some(cancelled) = self.0.take() {
+                    let _ = cancelled.send(());
+                }
+            }
+        }
+
+        let (media_http, _completions) = media_http_context(1);
+        let permits = media_http.permits.clone();
+        let permit = reserve_media_http(&media_http).expect("transfer reserves capacity");
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let (respond, _response) = oneshot::channel();
+        spawn_media_http(
+            &media_http,
+            permit,
+            async move {
+                let _witness = CancellationWitness(Some(cancelled_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<Result<Vec<u8>, AppError>>().await
+            },
+            move |result| MediaHttpCompletion::GroupImage { result, respond },
+        );
+        started_rx.await.expect("HTTP future starts");
+
+        drop(media_http);
+        timeout(Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("worker exit cancels HTTP future")
+            .expect("cancellation witness is delivered");
+        assert_eq!(permits.available_permits(), 1);
+    }
+
     #[test]
     fn legacy_message_promotion_completes_and_stops_scheduling() {
         let mut schedule = LegacyMessagePromotionSchedule::new();
@@ -3931,10 +4064,11 @@ mod tests {
         let shared = RuntimeSharedServices::default();
         let (respond, response) = oneshot::channel();
         let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+        let (media_http_worker_lifetime, _) = watch::channel(());
         let media_http = MediaHttpContext {
             tx: media_http_tx,
             permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-            lifecycle: shared.lifecycle(),
+            worker_lifetime: media_http_worker_lifetime,
         };
         handle_account_worker_command(
             &mut client,

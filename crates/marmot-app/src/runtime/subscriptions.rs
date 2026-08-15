@@ -1109,6 +1109,10 @@ impl MarmotAppRuntime {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let mut group_records = snapshot
+            .iter()
+            .map(|group| (group.group_id_hex.clone(), group.clone()))
+            .collect::<HashMap<_, _>>();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -1119,7 +1123,7 @@ impl MarmotAppRuntime {
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             let app_for_lookup = app.clone();
                             let account_label_for_lookup = account_label.clone();
-                            let prior_group_ids = group_fingerprints.keys().cloned().collect::<Vec<_>>();
+                            let prior_groups = group_records.values().cloned().collect::<Vec<_>>();
                             let recovered = match blocking_app_task(move || {
                                 let groups = if include_archived {
                                     app_for_lookup.groups(&account_label_for_lookup)?
@@ -1131,15 +1135,15 @@ impl MarmotAppRuntime {
                                     .map(|group| group.group_id_hex.clone())
                                     .collect::<HashSet<_>>();
                                 let mut removed_records = Vec::new();
-                                for group_id_hex in prior_group_ids {
-                                    if visible_group_ids.contains(&group_id_hex) {
+                                for prior_group in prior_groups {
+                                    if visible_group_ids.contains(&prior_group.group_id_hex) {
                                         continue;
                                     }
-                                    if let Some(record) =
-                                        app_for_lookup.group(&account_label_for_lookup, &group_id_hex)?
-                                    {
-                                        removed_records.push(record);
-                                    }
+                                    let current = app_for_lookup.group(
+                                        &account_label_for_lookup,
+                                        &prior_group.group_id_hex,
+                                    )?;
+                                    removed_records.push(removed_chat_record(prior_group, current));
                                 }
                                 Ok((groups, removed_records))
                             })
@@ -1151,6 +1155,7 @@ impl MarmotAppRuntime {
                             if !reconcile_chats_snapshot(
                                 &updates_tx,
                                 &mut group_fingerprints,
+                                &mut group_records,
                                 recovered.0,
                                 recovered.1,
                             )
@@ -1183,13 +1188,23 @@ impl MarmotAppRuntime {
                 .await
                 {
                     Ok(Some(group)) => group,
-                    Ok(None) | Err(_) => {
+                    Ok(None) => {
                         group_fingerprints.remove(&group_id_hex);
+                        if let Some(prior_group) = group_records.remove(&group_id_hex) {
+                            let tombstone = removed_chat_record(prior_group, None);
+                            if updates_tx.send(tombstone).await.is_err() {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(_) => {
                         continue;
                     }
                 };
                 if !include_archived && group.archived {
                     group_fingerprints.remove(&group_id_hex);
+                    group_records.remove(&group_id_hex);
                     if updates_tx.send(group).await.is_err() {
                         return;
                     }
@@ -1200,6 +1215,7 @@ impl MarmotAppRuntime {
                     continue;
                 }
                 group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
+                group_records.insert(group.group_id_hex.clone(), group.clone());
                 if updates_tx.send(group).await.is_err() {
                     return;
                 }
@@ -1817,6 +1833,16 @@ fn app_group_record_fingerprint(group: &AppGroupRecord) -> String {
     serde_json::to_string(group).unwrap_or_else(|_| group.group_id_hex.clone())
 }
 
+fn removed_chat_record(
+    mut prior_group: AppGroupRecord,
+    current: Option<AppGroupRecord>,
+) -> AppGroupRecord {
+    current.unwrap_or_else(|| {
+        prior_group.archived = true;
+        prior_group
+    })
+}
+
 async fn emit_missing_group_state(
     updates_tx: &mpsc::Sender<AppGroupRecord>,
     last_group: &mut AppGroupRecord,
@@ -1833,6 +1859,7 @@ async fn emit_missing_group_state(
 async fn reconcile_chats_snapshot(
     updates_tx: &mpsc::Sender<AppGroupRecord>,
     group_fingerprints: &mut HashMap<String, String>,
+    group_records: &mut HashMap<String, AppGroupRecord>,
     groups: Vec<AppGroupRecord>,
     removed_records: Vec<AppGroupRecord>,
 ) -> bool {
@@ -1841,15 +1868,19 @@ async fn reconcile_chats_snapshot(
         .map(|group| group.group_id_hex.clone())
         .collect::<HashSet<_>>();
     group_fingerprints.retain(|group_id_hex, _| visible_group_ids.contains(group_id_hex));
+    group_records.retain(|group_id_hex, _| visible_group_ids.contains(group_id_hex));
     for record in removed_records {
         group_fingerprints.remove(&record.group_id_hex);
+        group_records.remove(&record.group_id_hex);
         if updates_tx.send(record).await.is_err() {
             return false;
         }
     }
     for group in groups {
         let fingerprint = app_group_record_fingerprint(&group);
-        if group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint) {
+        let unchanged = group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint);
+        group_records.insert(group.group_id_hex.clone(), group.clone());
+        if unchanged {
             continue;
         }
         group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
