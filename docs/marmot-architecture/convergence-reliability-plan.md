@@ -1045,8 +1045,16 @@ the app/process adapters cannot expose and the container/VM routes remain open b
     runner-owned reversible relay control, a real disconnect/reopen boundary, and one post-displacement restart. The
     shared scenario and oracle are also the input to a scheduled four-container checkpoint with retained manifests,
     reports, receipts, and failure-corpus entries. Encrypted participant roots and the relay control plane remain
-    ephemeral. Keep this item open for VM execution, per-durable-transition restart
-    permutations, and exact evidence on adapters that can expose it.
+    ephemeral. `cross-route-restart-permutations/v1` now supplies a bounded twelve-case current-build catalog: it adds
+    one reopen after each reviewed accepted-publication/ingest boundary and after retained-history repair for each
+    participant, resolves named publication boundaries to stable action ids after schedule mutation, and is selectable
+    through the isolated app-runtime campaign path with strict per-case artifacts. A separate exact retained-engine
+    family reuses the same isolated runner so panic-shaped failures cannot abort later catalog cases. Its first seed-0
+    run passed 9/12: the three early Zeta publication-boundary restarts produced a structured `PendingPublish` refusal,
+    a `PendingPublish` panic, and an epoch-3/pending-work/decryptability stall; every later branch/repair boundary
+    passed. Isolated-process execution reuses the catalog as an explicit manual test. Keep this item open until reviewed
+    execution evidence exists for the complete catalog and the permutations are carried through container/VM routes;
+    exact evidence remains required on every adapter that can expose it.
 - [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
   disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
   comparison remains part of the open route-equivalence work above.
@@ -1062,9 +1070,21 @@ the app/process adapters cannot expose and the container/VM routes remain open b
 The remaining 6.1 work is assurance closure, not another speculative engine rewrite. #1285 is the implementation now
 on `master`; after #1293 and #1403, the retained-engine reference settles and the corrected-input app-runtime route is
 held to the same public terminal protocol/profile/probe result. The isolated-process adapter now carries that same
-input contract and public oracle. The container checkpoint now consumes that shared contract; carry it next into VM
-execution and the remaining durable-transition permutations. Do not project app/process/container public evidence
+input contract and public oracle. The container checkpoint now consumes that shared contract; carry the restart
+catalog next into container/VM execution and diagnose the exact early-publication counterexamples. Do not project app/process/container public evidence
 into exact cryptographic, durable-disposition, or active-decryptability claims that those adapters cannot expose.
+
+Current exact seed-0 restart findings (generator version `1`):
+
+| Case | Boundary | Result | Stable evidence |
+| --- | --- | --- | --- |
+| `0` | `after-create-accepted-zeta` | Later admin update refused from `PendingPublish` | failure fingerprint `6e80edf7de013c3c92863676d708d0cdb28096a6304aa48707d458953dd4a0c4`; input SHA-256 `f3be4dbd4f72a48764905b822763839b11d711cadca2a6a2c6bb8d3ccdd7b35b` |
+| `1` | `after-promote-alpha-accepted-zeta` | Next update panicked from `PendingPublish` | exit `101`; input SHA-256 `fa1689d6185637441107a4a90296768cc9e44ec64585ad6e31d512e9a98292d7`; no report/capsule |
+| `2` | `after-promote-yankee-accepted-zeta` | Zeta stayed at epoch 3 with pending work, quiescence timeout, and failed inbound decryptability | failure fingerprint `cbebdfc84fd84598d1a0d34751fe1a7d4bdb51f863a4eedebae3fd87a776c3dd`; input SHA-256 `fd62a2b493b867f20ddd12c316482c81062477971e90a517164871488ff74afe` |
+
+Cases `3` through `11` passed the exact state, profile, payload-multiset, pending-work, and twelve-direction active
+decryptability oracle. These digests identify the local discovery run; promote minimized regressions before fixing
+production behavior rather than treating a machine-local output directory as durable evidence.
 
 [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) merged the fail-closed missing-anchor behavior and
 Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) has now
@@ -1286,7 +1306,13 @@ residual gap.
    separate ignored twenty-trial soak. The scheduled four-container checkpoint runs the same builder, IR digest, and
    strict public report oracle and retains its exact scenario, normalized manifest, process report, command receipt,
    and failure-corpus entry. VM execution, exact cryptographic and active-decryptability evidence on capable
-   adapters, complete application disposition, and durable-transition permutations remain open. The decision-route
+   adapters, and complete application disposition remain open. The new bounded
+   `cross-route-restart-permutations/v1` catalog makes twelve current-build durable/public transition points
+   selectable through the isolated app-runtime campaign. Its `cross-route-exact-restart-permutations/v1` companion
+   isolates private-state cases; its first seed-0 catalog passed 9/12 and localized failures to the three early Zeta
+   publication boundaries (`PendingPublish` refusal, `PendingPublish` panic, and epoch-3/pending/decryptability stall).
+   isolated-process permutations remain an explicit manual gate. Reviewed all-case execution, diagnosis/remediation
+   of the exact counterexample, and container/VM lowering remain open. The decision-route
    inventory is machine checked against the unified route.
 
    The reviewed twenty-trial process soak belongs to the #1424 merge snapshot. Later storage/runtime changes, including
@@ -1485,6 +1511,7 @@ incorrect result.
 | 2026-08-14 | 6.1 scheduled container cross-route checkpoint | Extracted the four-party public scenario and strict process-report oracle into one shared assurance fixture, selected that exact IR and digest through the distributed manifest, and added a real four-container checkpoint with one non-root participant container and encrypted root per member. A source-built local Docker run completed the exact checkpoint in 61.20 seconds with clean teardown. Nightly and weekly/manual workflows retain the exact scenario, normalized manifest, process report, distributed receipt, and failure corpus on success or failure; encrypted participant roots and the opaque-token relay control plane remain ephemeral. Exact engine-private evidence and VM/per-transition permutations remain open. | `container_manifest_selects_the_shared_four_party_cross_route_ir`; `four_party_cross_route_recovery_containers_match_unified_route`; `target/cgka-distributed-container-evidence` |
 | 2026-08-15 | 6.3 scheduled lane budget enforcement | Added workflow-owned command observation with Unix child resource accounting, structured Nextest case/retry counts, final working/artifact byte measurement, private raw evidence, and fail-closed nightly/weekly/release policy evaluation. Documented the lower-bound boundaries rather than treating the resulting budget pass as capability or release assurance; the first reviewed release-hardening evidence bundle remains open. | `observe-step`; `collect-observation`; `check-budget`; `lane_policy`; scheduled workflow wiring |
 | 2026-08-15 | 6.3 release evidence production path | Replaced the release lane's unprovisioned manifest-path input with an exact ancestor revision, two source-built content-addressed images, one runner-materialized canonical cross-route manifest, and deterministic evidence assembly. The assembler binds the reviewed claim to the canonical IR, normalized mixed-build execution, strict public oracle, successful receipt, raw lane observation, recomputed budget, and private digest-pinned artifact copies. No release assurance item closes until an actual workflow artifact is downloaded and reviewed. | `materialize-release-campaign`; `assemble-release-evidence`; `cross-route-mixed-build.v1.json`; release workflow contract tests |
+| 2026-08-15 | 6.1 durable-transition restart catalog | Added a bounded twelve-case current-build catalog over the shared four-party cross-route topology. The builder resolves named publication boundaries to adapter-supported action ids only after inserting each restart, keeping relay faults invariant as the schedule shifts. Public cases run through the full app runtime with strict state/admin and order-insensitive exact-payload expectations; a separate exact retained-engine family uses isolated workers so one panic cannot abort later cases. The first seed-0 exact catalog passed 9/12 and localized all failures to Zeta's three early accepted-publication boundaries: structured `PendingPublish`, panic from `PendingPublish`, and epoch-3/pending-work/decryptability stall. Structured failures wrote shareable capsules; the panic preserved exact input and exit 101 but no report/capsule. Every later branch/repair restart passed. Isolated-process cases share the catalog and bind every restart to a durable lifecycle event. This is discovery evidence, not a fix or reviewed all-case assurance; diagnosis/remediation, container/VM execution, and complete app-input dispositions remain open. | `cross-route-restart-permutations/v1`; `cross-route-exact-restart-permutations/v1`; public case-0 pass; exact seed-0 9/12 result; failure capsules/digests; process catalog test |
 
 ## Capability Naming Cleanup
 

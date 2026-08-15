@@ -619,6 +619,8 @@ mod tests {
             "convergence-chaos/v1",
             "admin-churn/v1",
             "adversarial-reliability/v1",
+            "cross-route-exact-restart-permutations/v1",
+            "cross-route-restart-permutations/v1",
             "chat-journey/v1",
         ] {
             let case = generate_family_case(family, 42, 3).expect("family case generates");
@@ -635,6 +637,16 @@ mod tests {
                 "admin-churn/v1" => cgka_conformance_simulator::generate_admin_churn_family(42, 4),
                 "adversarial-reliability/v1" => {
                     cgka_conformance_simulator::generate_adversarial_reliability_family(42, 4)
+                }
+                "cross-route-exact-restart-permutations/v1" => {
+                    cgka_conformance_simulator::generate_cross_route_exact_restart_permutation_family(
+                        42, 4,
+                    )
+                }
+                "cross-route-restart-permutations/v1" => {
+                    cgka_conformance_simulator::generate_cross_route_restart_permutation_family(
+                        42, 4,
+                    )
                 }
                 "chat-journey/v1" => {
                     cgka_conformance_simulator::generate_stateful_chat_journey_family(42, 4)

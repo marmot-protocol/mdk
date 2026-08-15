@@ -147,6 +147,12 @@ pub fn generate_family_case(
         "bounded-convergence-pressure/v1" => {
             generate_bounded_convergence_pressure_case(seed, case_index)
         }
+        "cross-route-restart-permutations/v1" => {
+            generate_cross_route_restart_permutation_case(seed, case_index)
+        }
+        "cross-route-exact-restart-permutations/v1" => {
+            generate_cross_route_exact_restart_permutation_case(seed, case_index)
+        }
         "chat-journey/v1" => {
             crate::stateful_generator::generate_stateful_chat_journey_case(seed, case_index)
         }
@@ -308,6 +314,161 @@ pub fn generate_bounded_convergence_pressure_case(
         seed,
         case_index,
         subject: GeneratedSubjectKind::Engine,
+        scenario,
+        expected_outcomes,
+    }
+}
+
+/// Generate the current-build four-party cross-route restart catalog.
+///
+/// Twelve consecutive cases cover every reviewed durable/public transition
+/// boundary once. The seed rotates their order without changing the bounded
+/// catalog, which makes parallel shards deterministic while preserving full
+/// coverage. The production-shaped app-runtime adapter owns this generated
+/// family; a separately registered exact retained-engine family and the
+/// isolated-process manual gate reuse the same scenario builder.
+pub fn generate_cross_route_restart_permutation_family(
+    seed: u64,
+    cases: usize,
+) -> Vec<GeneratedScenarioCase> {
+    (0..cases)
+        .map(|case_index| generate_cross_route_restart_permutation_case(seed, case_index as u64))
+        .collect()
+}
+
+/// Generate one indexed cross-route restart case without regenerating prior
+/// catalog entries.
+pub fn generate_cross_route_restart_permutation_case(
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut scenario = crate::cross_route_restart_permutation_public_scenario(seed, case_index);
+    let clients = scenario.clients.clone();
+    scenario.steps.push(ScenarioStep::InGroup {
+        group: "main".into(),
+        action: Box::new(ScenarioStep::ObserveAdminPolicy {
+            clients: clients.clone(),
+        }),
+    });
+    let expected_payloads = clients
+        .iter()
+        .map(|sender| format!("probe-from-{sender}"))
+        .chain(std::iter::once("zeta-branch-witness".into()))
+        .collect::<Vec<_>>();
+
+    let mut expected_outcomes = vec![TraceExpectation::ClientsConverged {
+        clients: clients.clone(),
+        epoch: Some(5),
+        member_count: Some(4),
+    }];
+    for client in &clients {
+        expected_outcomes.extend([
+            TraceExpectation::ClientState {
+                client: client.clone(),
+                epoch: 5,
+                member_count: 4,
+                received_payloads: None,
+                added_members: None,
+                removed_members: None,
+            },
+            TraceExpectation::GroupProfile {
+                client: client.clone(),
+                name: "zeta-branch-depth-two".into(),
+                description: String::new(),
+            },
+            TraceExpectation::ApplicationPayloadMultiset {
+                client: client.clone(),
+                payloads: expected_payloads.clone(),
+            },
+            TraceExpectation::AdminPolicy {
+                client: client.clone(),
+                admins: vec!["alpha".into(), "yankee".into(), "zeta".into()],
+            },
+        ]);
+    }
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name: "cross-route-restart-permutations/v1".into(),
+        generator_version: "1".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::AppRuntime,
+        scenario,
+        expected_outcomes,
+    }
+}
+
+/// Generate the exact retained-engine companion to the public app-runtime
+/// restart catalog. Keeping it as a distinct family makes panic-shaped engine
+/// failures process-isolated, so later catalog cases still execute and retain
+/// their exact input/resource evidence.
+pub fn generate_cross_route_exact_restart_permutation_family(
+    seed: u64,
+    cases: usize,
+) -> Vec<GeneratedScenarioCase> {
+    (0..cases)
+        .map(|case_index| {
+            generate_cross_route_exact_restart_permutation_case(seed, case_index as u64)
+        })
+        .collect()
+}
+
+/// Generate one indexed exact retained-engine restart case.
+pub fn generate_cross_route_exact_restart_permutation_case(
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let scenario = crate::cross_route_restart_permutation_exact_scenario(seed, case_index);
+    let clients = scenario.clients.clone();
+    let mut expected_outcomes = vec![
+        TraceExpectation::ClientsConverged {
+            clients: clients.clone(),
+            epoch: Some(5),
+            member_count: Some(4),
+        },
+        TraceExpectation::ClientsExactlyEquivalent {
+            clients: clients.clone(),
+        },
+        TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: clients.clone(),
+        },
+        TraceExpectation::NoPendingWork {
+            clients: clients.clone(),
+        },
+    ];
+    for client in &clients {
+        expected_outcomes.extend([
+            TraceExpectation::ClientState {
+                client: client.clone(),
+                epoch: 5,
+                member_count: 4,
+                received_payloads: None,
+                added_members: None,
+                removed_members: None,
+            },
+            TraceExpectation::GroupProfile {
+                client: client.clone(),
+                name: "zeta-branch-depth-two".into(),
+                description: String::new(),
+            },
+            TraceExpectation::ApplicationPayloadMultiset {
+                client: client.clone(),
+                payloads: clients
+                    .iter()
+                    .filter(|sender| *sender != client)
+                    .map(|sender| format!("probe-from-{sender}"))
+                    .chain((client != "yankee").then_some("zeta-branch-witness".into()))
+                    .collect(),
+            },
+        ]);
+    }
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name: "cross-route-exact-restart-permutations/v1".into(),
+        generator_version: "1".into(),
+        seed,
+        case_index,
+        subject: GeneratedSubjectKind::RetainedRelay,
         scenario,
         expected_outcomes,
     }
@@ -3915,6 +4076,74 @@ fn add_reliability_oracle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_route_restart_family_covers_the_complete_catalog() {
+        let cases = generate_cross_route_restart_permutation_family(
+            7,
+            crate::CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len(),
+        );
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.scenario.name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            crate::CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len()
+        );
+        for case in cases {
+            assert_eq!(case.subject, GeneratedSubjectKind::AppRuntime);
+            assert!(
+                case.expected_outcomes.iter().any(|expectation| matches!(
+                    expectation,
+                    TraceExpectation::ClientsConverged {
+                        epoch: Some(5),
+                        member_count: Some(4),
+                        ..
+                    }
+                )),
+                "{} lacks the terminal public convergence oracle",
+                case.scenario.name
+            );
+            assert!(
+                case.expected_outcomes.iter().any(|expectation| matches!(
+                    expectation,
+                    TraceExpectation::ApplicationPayloadMultiset { payloads, .. }
+                        if payloads.len() == case.scenario.clients.len() + 1
+                )),
+                "{} lacks the complete probe/witness multiset oracle",
+                case.scenario.name
+            );
+        }
+
+        let exact_cases = generate_cross_route_exact_restart_permutation_family(
+            7,
+            crate::CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len(),
+        );
+        assert_eq!(
+            exact_cases
+                .iter()
+                .map(|case| case.scenario.name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            crate::CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len()
+        );
+        assert!(exact_cases.iter().all(|case| {
+            case.subject == GeneratedSubjectKind::RetainedRelay
+                && case.expected_outcomes.iter().any(|expectation| {
+                    matches!(
+                        expectation,
+                        TraceExpectation::ClientsExactlyEquivalent { .. }
+                    )
+                })
+                && case.expected_outcomes.iter().any(|expectation| {
+                    matches!(
+                        expectation,
+                        TraceExpectation::ClientsBidirectionallyDecryptable { .. }
+                    )
+                })
+        }));
+    }
 
     #[test]
     #[should_panic(expected = "must exercise at least one labelled outbound acknowledgement")]

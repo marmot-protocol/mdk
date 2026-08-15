@@ -77,8 +77,11 @@ pub use cgka_engine::conformance_snapshot::{
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
 pub use client::{ClientBuilder, HarnessClient, HarnessStorageMode};
 pub use cross_route_scenario::{
+    CROSS_ROUTE_RESTART_PERMUTATIONS_V1, CrossRouteRestartPermutationV1,
     cross_route_app_runtime_recovery_exact_scenario,
-    cross_route_app_runtime_recovery_public_scenario, validate_cross_route_public_process_report,
+    cross_route_app_runtime_recovery_public_scenario,
+    cross_route_restart_permutation_exact_scenario,
+    cross_route_restart_permutation_public_scenario, validate_cross_route_public_process_report,
 };
 pub use decryptability::{
     BidirectionalDecryptabilityObservation, DecryptabilityProbeSendStatus,
@@ -105,6 +108,9 @@ pub use family::{
     generate_bounded_convergence_pressure_case, generate_bounded_convergence_pressure_family,
     generate_convergence_chaos_case, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_case, generate_convergence_e2e_delivery_family,
+    generate_cross_route_exact_restart_permutation_case,
+    generate_cross_route_exact_restart_permutation_family,
+    generate_cross_route_restart_permutation_case, generate_cross_route_restart_permutation_family,
     generate_family_case, generate_send_leave_case, generate_send_leave_family,
     run_generated_case_report, run_generated_case_report_with_capture,
     run_generated_case_report_with_capture_on_subject, run_generated_case_report_with_storage_mode,
