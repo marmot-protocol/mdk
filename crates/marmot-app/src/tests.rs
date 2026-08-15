@@ -2904,6 +2904,182 @@ async fn push_registration_removal_retry_body() {
 }
 
 #[tokio::test]
+async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ack() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let profile = UserProfileMetadata {
+        name: Some("Swift Otter".into()),
+        display_name: Some("Swift Otter".into()),
+        created_at: 42,
+        ..UserProfileMetadata::default()
+    };
+
+    let status = app
+        .publish_generated_account_bootstrap(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("wss://relay.example".into())],
+                vec![TransportEndpoint("wss://relay.example".into())],
+            ),
+            &profile,
+        )
+        .await
+        .expect("acknowledged bootstrap must not depend on a relay refetch");
+
+    assert!(status.complete);
+    assert_eq!(
+        relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "relay lists, follow list, and profile must share one connection-amortizing batch"
+    );
+    let mut kinds = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec![
+            KIND_NOSTR_METADATA,
+            KIND_NOSTR_CONTACT_LIST,
+            KIND_NIP65_RELAY_LIST,
+            KIND_MARMOT_INBOX_RELAY_LIST,
+        ]
+    );
+    assert_eq!(
+        app.account_relay_list_status(&account.label).unwrap(),
+        status,
+        "the acknowledged declaration must be the durable local projection"
+    );
+}
+
+#[tokio::test]
+async fn relay_list_zero_ack_does_not_advance_the_local_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("relay-list-zero-ack")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay.zero_ack_next_publish();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay);
+
+    let error = app
+        .publish_account_relay_lists(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("wss://relay.example".into())],
+                vec![TransportEndpoint("wss://relay.example".into())],
+            ),
+        )
+        .await
+        .expect_err("zero acknowledgements must not confirm relay-list setup");
+
+    assert!(matches!(error, AppError::Publish(_)));
+    assert!(
+        !app.account_relay_list_status(&account.label)
+            .unwrap()
+            .complete,
+        "local setup state must not advance before every required event reaches a relay"
+    );
+}
+
+#[tokio::test]
+async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // Batch order is NIP-65, inbox, contacts, profile: fail the inbox record.
+    relay.script([true, false, true, true]);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = || AccountSetupRequest {
+        default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        ..AccountSetupRequest::default()
+    };
+
+    runtime
+        .create_identity(request())
+        .await
+        .expect_err("one failed member of the bootstrap batch must fail setup");
+    let account = app
+        .account_home()
+        .accounts()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        app.account_home()
+            .account_setup_state(&account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        marmot_account::AccountSetupPhase::BootstrapPublicationStarted,
+        "a possibly exposed bootstrap batch must stop destructive rollback"
+    );
+
+    let retried = runtime
+        .create_identity(request())
+        .await
+        .expect("replaceable bootstrap records must be retryable");
+    assert_eq!(retried.account.account_id_hex, account.account_id_hex);
+    assert!(
+        app.account_home()
+            .account_setup_state(&account.label)
+            .unwrap()
+            .is_none(),
+        "successful retry must commit and remove the setup journal"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    home.set_account_setup_phase(
+        &account.label,
+        marmot_account::AccountSetupPhase::BootstrapPublicationConfirmed,
+    )
+    .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    app.mark_key_package_cutover_scan_complete(&account.label)
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+
+    let retried = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .expect("a confirmed setup with a lost projection must republish safely");
+
+    assert_eq!(retried.account.account_id_hex, account.account_id_hex);
+    assert!(retried.relay_lists.complete);
+    assert_eq!(
+        relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "projection recovery should issue one idempotent bootstrap batch"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_restart() {
     let directory = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");

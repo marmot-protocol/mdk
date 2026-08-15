@@ -45,7 +45,7 @@ relay auth, or transport-specific relay discovery.
 - Keep `AccountDeviceSession` as the owner of engine state.
 - Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `wn` and `marmot-app`.
 - Confirm pending work only after the adapter reports enough acknowledgements.
-- Roll back pending work when publication fails or does not meet the required acknowledgement count.
+- Roll back pending work when publication fails before any external exposure is possible. Once publication intent is durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication instead.
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.
 
 ## Verification

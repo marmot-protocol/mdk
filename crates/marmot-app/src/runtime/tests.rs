@@ -6,6 +6,7 @@ use cgka_traits::transport_adapter::{
 
 use super::subscriptions::chat_list_mute_expiries;
 use super::*;
+use crate::tests::ScriptedPushRelayClient;
 
 #[test]
 fn default_directory_discovery_relays_use_live_indexers() {
@@ -22,6 +23,71 @@ fn default_directory_discovery_relays_use_live_indexers() {
                 .contains(&relay.0.as_str())),
         "retired relays must never return to discovery defaults"
     );
+}
+
+#[test]
+fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let (account, private_key_import) = runtime
+        .accounts
+        .create_nostr_account_from_setup(&AccountSetupRequest::default())
+        .unwrap();
+
+    assert!(private_key_import.is_none());
+    assert!(app.key_package_cutover_scan_complete(&account.label));
+    assert!(
+        !app.account_home()
+            .account_dir(&account.label)
+            .join(crate::SESSION_DB_FILE)
+            .exists(),
+        "the scan marker must be durable before any session can open"
+    );
+}
+
+#[tokio::test]
+async fn failed_import_relay_discovery_does_not_publish_default_lists() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let keys = nostr::Keys::generate();
+    let imported = home
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    let account = imported.account().clone();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = MarmotAppRuntime::new(app);
+
+    let error = runtime
+        .accounts
+        .setup_relay_lists_for_account(
+            &account,
+            &AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                // A non-WebSocket bootstrap endpoint makes the bounded
+                // fallback discovery fail before any dial.
+                bootstrap_relays: vec![TransportEndpoint("https://directory.invalid".into())],
+                publish_missing_relay_lists: true,
+                ..AccountSetupRequest::default()
+            },
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect_err("failed discovery must not become a write of request defaults");
+
+    assert!(matches!(
+        error,
+        AppError::MissingRelayLists(missing)
+            if missing
+                == vec![
+                    crate::MissingRelayListKind::Nip65,
+                    crate::MissingRelayListKind::Inbox,
+                ]
+    ));
 }
 
 #[test]

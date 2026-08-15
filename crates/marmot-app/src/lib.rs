@@ -495,6 +495,10 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    /// One signer-bound publisher per account. Setup publishes and the managed
+    /// account worker share this client so the worker can reuse the same relay
+    /// pool instead of constructing another TCP/TLS/WebSocket stack.
+    account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1260,6 +1264,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1327,6 +1332,7 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1611,6 +1617,138 @@ impl MarmotApp {
         .await
     }
 
+    /// Publish every generated-identity bootstrap record through one scoped
+    /// relay batch. The SDK connects the endpoint union once for the two relay
+    /// lists, empty follow list, and default profile, then returns one ordered
+    /// acknowledgement result per replaceable event.
+    pub(crate) async fn publish_generated_account_bootstrap(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        profile: &UserProfileMetadata,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        self.validate_account_relay_list_declarations(&bootstrap, None)?;
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        // Relay-list records are discoverability maps and therefore go to the
+        // bootstrap route. Profiles and contact lists are outbox content: keep
+        // them on the declared write relays even though the mixed batch retains
+        // the union of both endpoint sets once.
+        let content_endpoints =
+            self.outbox_endpoints(&account.account_id_hex, bootstrap.default_relays.clone());
+        let endpoints = self.publish_route_including_requested(
+            &account.account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
+
+        let mut requests = Vec::with_capacity(4);
+        for list_kind in [
+            NostrAccountRelayListKind::Nip65,
+            NostrAccountRelayListKind::Inbox,
+        ] {
+            requests.push(NostrEventPublishRequest {
+                endpoints: endpoints.clone(),
+                event: NostrAccountRelayListPublication {
+                    account_id: account_id.clone(),
+                    list_kind,
+                    relays: bootstrap.default_relays.clone(),
+                    publish_endpoints: endpoints.clone(),
+                }
+                .to_event()?,
+                required_acks: 1,
+            });
+        }
+        requests.push(NostrEventPublishRequest {
+            endpoints: content_endpoints.clone(),
+            event: NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_NOSTR_CONTACT_LIST,
+                Vec::new(),
+                String::new(),
+            ),
+            required_acks: 1,
+        });
+        requests.push(NostrEventPublishRequest {
+            endpoints: content_endpoints.clone(),
+            event: NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_NOSTR_METADATA,
+                Vec::new(),
+                serde_json::to_string(&directory::records::profile_content_json(profile))?,
+            ),
+            required_acks: 1,
+        });
+
+        let relay_client =
+            self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
+        let record_kinds = [
+            "NIP-65 relay list",
+            "inbox relay list",
+            "contact list",
+            "profile metadata",
+        ];
+        let outcomes = relay_client.publish_events(&requests).await;
+        if outcomes.len() != record_kinds.len() {
+            return Err(AppError::Publish(format!(
+                "account bootstrap returned {} outcomes for {} records",
+                outcomes.len(),
+                record_kinds.len()
+            )));
+        }
+        for (record_kind, outcome) in record_kinds.into_iter().zip(outcomes) {
+            if outcome?.accepted.is_empty() {
+                return Err(AppError::Publish(format!(
+                    "relay acknowledged zero events for bootstrap record {record_kind}"
+                )));
+            }
+        }
+
+        let relays = bootstrap
+            .default_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        let mut status = AccountRelayListStatus {
+            complete: false,
+            missing: Vec::new(),
+            default_relays: Vec::new(),
+            bootstrap_relays: endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            nip65: AccountRelayListState {
+                kind: KIND_NIP65_RELAY_LIST,
+                relays: relays.clone(),
+                read_relays: relays.clone(),
+                write_relays: relays.clone(),
+            },
+            inbox: AccountRelayListState {
+                kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                relays,
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
+            },
+        };
+        status.refresh();
+        self.remember_directory_relay_lists(&account.account_id_hex, &status)?;
+        self.remember_directory_follow_edges_for_search(
+            &account.account_id_hex,
+            &directory::FetchedFollowList {
+                follows: Vec::new(),
+                source_relays: content_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
+            },
+        )?;
+        self.remember_directory_profile(&account.account_id_hex, profile)?;
+        Ok(status)
+    }
+
     pub async fn publish_missing_account_relay_lists(
         &self,
         label: &str,
@@ -1831,14 +1969,13 @@ impl MarmotApp {
         // ever lands on the relays you were already on. Unioning means an
         // explicit republish reaches both your old relays (so they update) and
         // the newly-declared ones (so they learn about you for the first time).
-        let requested = publish_endpoints_from_bootstrap(&bootstrap);
-        let mut endpoints = self.outbox_endpoints(&account_id_hex, requested.clone());
-        for endpoint in requested {
-            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
-                endpoints.push(endpoint);
-            }
-        }
-        let relay_client = self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints);
+        let endpoints = self.publish_route_including_requested(
+            &account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
+        let relay_client =
+            self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
+        let mut requests = Vec::with_capacity(list_kinds.len());
         for list_kind in list_kinds {
             let event = if *list_kind == NostrAccountRelayListKind::Nip65
                 && let Some(relays) = nip65_relay_set
@@ -1858,10 +1995,80 @@ impl MarmotApp {
                 }
                 .to_event()?
             };
-            relay_client.publish_event(&endpoints, &event, 1).await?;
+            requests.push(NostrEventPublishRequest {
+                endpoints: endpoints.clone(),
+                event,
+                required_acks: 1,
+            });
         }
-        self.fetch_account_relay_list_status_for_account_id(&account_id_hex, endpoints)
-            .await
+        for outcome in relay_client.publish_events(&requests).await {
+            if outcome?.accepted.is_empty() {
+                return Err(AppError::Publish(
+                    "relay acknowledged zero account relay-list events".to_owned(),
+                ));
+            }
+        }
+
+        // The signed replaceable events above are the authoritative effect of
+        // this operation. Persist their declared state directly after every
+        // event has an acknowledgement; synchronously querying the same relays
+        // again adds no confirmation strength and used to turn a post-success
+        // read outage into account-setup rollback (mdk#1436).
+        let mut status = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+        for list_kind in list_kinds {
+            match list_kind {
+                NostrAccountRelayListKind::Nip65 => {
+                    let (read_relays, write_relays) = nip65_relay_set
+                        .map(|relays| {
+                            (
+                                relays
+                                    .read_relays
+                                    .iter()
+                                    .map(|endpoint| endpoint.0.clone())
+                                    .collect::<Vec<_>>(),
+                                relays
+                                    .write_relays
+                                    .iter()
+                                    .map(|endpoint| endpoint.0.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            let relays = bootstrap
+                                .default_relays
+                                .iter()
+                                .map(|endpoint| endpoint.0.clone())
+                                .collect::<Vec<_>>();
+                            (relays.clone(), relays)
+                        });
+                    status.nip65 = AccountRelayListState {
+                        kind: KIND_NIP65_RELAY_LIST,
+                        relays: write_relays.clone(),
+                        read_relays,
+                        write_relays,
+                    };
+                }
+                NostrAccountRelayListKind::Inbox => {
+                    status.inbox = AccountRelayListState {
+                        kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                        relays: bootstrap
+                            .default_relays
+                            .iter()
+                            .map(|endpoint| endpoint.0.clone())
+                            .collect(),
+                        read_relays: Vec::new(),
+                        write_relays: Vec::new(),
+                    };
+                }
+            }
+        }
+        push_unique_strings(
+            &mut status.bootstrap_relays,
+            endpoints.iter().map(|endpoint| endpoint.0.clone()),
+        );
+        status.refresh();
+        self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        Ok(status)
     }
 
     /// Validate caller-owned relay-list declarations without applying the dial
@@ -1927,6 +2134,22 @@ impl MarmotApp {
             "local account outbox routing",
         );
         if safe.is_empty() { fallback } else { safe }
+    }
+
+    /// Preserve the account's existing outbox route while ensuring every
+    /// explicitly requested publication endpoint is reached at least once.
+    fn publish_route_including_requested(
+        &self,
+        account_id_hex: &str,
+        requested: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let mut endpoints = self.outbox_endpoints(account_id_hex, requested.clone());
+        for endpoint in requested {
+            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
+                endpoints.push(endpoint);
+            }
+        }
+        endpoints
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -2961,7 +3184,7 @@ impl MarmotApp {
             AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
 
         let publish_client =
-            self.relay_client_for_endpoints(nostr_signer.clone(), &self.relay_endpoints());
+            self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
         let adapter = relay_plane.account_adapter(account_id.clone(), publish_client);
 
         let key_packages = AppKeyPackagePublisher {
@@ -3267,7 +3490,9 @@ impl MarmotApp {
             }
         }
         if delete_failure_count == 0 {
-            self.mark_key_package_cutover_scan_complete(label);
+            // The marker helper emits its own privacy-safe warning. It is not
+            // a relay deletion failure, so do not fold it into this counter.
+            let _ = self.mark_key_package_cutover_scan_complete(label);
         }
         if non_current_event_count > 0 {
             tracing::info!(
@@ -3360,7 +3585,7 @@ impl MarmotApp {
         self.key_package_cutover_scan_complete_path(label).exists()
     }
 
-    fn mark_key_package_cutover_scan_complete(&self, label: &str) {
+    fn mark_key_package_cutover_scan_complete(&self, label: &str) -> Result<(), AppError> {
         let path = self.key_package_cutover_scan_complete_path(label);
         let result = path
             .parent()
@@ -3371,15 +3596,17 @@ impl MarmotApp {
                 )
             })
             .and_then(fs_private::create_dir_all_private)
-            .and_then(|()| fs_private::write_private(&path, b"complete\n"));
-        if let Err(error) = result {
+            .and_then(|()| fs_private::write_private(&path, b"complete\n"))
+            .map_err(AppError::from);
+        if let Err(error) = &result {
             tracing::warn!(
                 target: "marmot_app::key_packages",
                 method = "mark_key_package_cutover_scan_complete",
-                error_kind = AppError::from(error).privacy_safe_kind(),
+                error_kind = error.privacy_safe_kind(),
                 "could not persist completed key package relay scan"
             );
         }
+        result
     }
 
     pub fn local_key_package_records(
@@ -3584,7 +3811,6 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         let mut requests = Vec::new();
         let mut request_indices = Vec::new();
-        let mut all_endpoints = Vec::new();
 
         for (index, target) in targets.into_iter().enumerate() {
             let event_id_hex = match parse_key_package_event_id_hex(&target.event_id_hex) {
@@ -3623,7 +3849,6 @@ impl MarmotApp {
                     continue;
                 }
             };
-            all_endpoints.extend(endpoints.iter().cloned());
             requests.push(NostrEventPublishRequest {
                 endpoints,
                 event: NostrTransportEvent::new_unsigned(
@@ -3642,7 +3867,7 @@ impl MarmotApp {
 
         if !requests.is_empty() {
             let relay_client =
-                self.relay_client_for_endpoints(signer.as_nostr_signer(), &all_endpoints);
+                self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
             let outcomes = relay_client.publish_events(&requests).await;
             for (index, outcome) in request_indices.into_iter().zip(outcomes) {
                 results[index].result = match outcome {
@@ -4857,6 +5082,12 @@ impl MarmotApp {
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
+        if let Ok(account) = self.account_home().account(label) {
+            self.account_publish_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&account.account_id_hex);
+        }
         self.account_storages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4909,18 +5140,29 @@ impl MarmotApp {
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 
-    fn relay_client_for_endpoints(
+    fn relay_client_for_account_id(
         &self,
+        account_id_hex: &str,
         signer: Arc<dyn nostr::NostrSigner>,
-        endpoints: &[TransportEndpoint],
     ) -> Arc<dyn NostrRelayClient> {
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
             return client.clone();
         }
-        let _ = endpoints;
-        let client = NostrSdkClient::builder().signer(signer).build();
-        Arc::new(NostrSdkRelayClient::new(client))
+        let mut clients = self
+            .account_publish_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The signer is intentionally ignored on a cache hit. Callers that
+        // replace an account signer must evict this entry first, as
+        // register_external_signer and drop_account_caches do today.
+        clients
+            .entry(account_id_hex.to_owned())
+            .or_insert_with(|| {
+                let client = NostrSdkClient::builder().signer(signer).build();
+                Arc::new(NostrSdkRelayClient::new(client))
+            })
+            .clone()
     }
 
     #[cfg(test)]
@@ -4958,9 +5200,13 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
-                account.account_id_hex,
+                account.account_id_hex.clone(),
                 RegisteredExternalSigner::new(public_key, signer),
             );
+        self.account_publish_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&account.account_id_hex);
         Ok(())
     }
 
@@ -5360,9 +5606,10 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 "persisted KeyPackage event identity does not match lifecycle record",
             ));
         }
-        let relay_client = self
-            .app
-            .relay_client_for_endpoints(self.signer.as_nostr_signer(), &publication.endpoints);
+        let relay_client = self.app.relay_client_for_account_id(
+            &hex::encode(publication.account_id.as_slice()),
+            self.signer.as_nostr_signer(),
+        );
         let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_prepared_key_package(&nostr_publication, &event)
             .await

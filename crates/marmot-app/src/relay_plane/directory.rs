@@ -7,12 +7,20 @@ use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::{Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryRelayConnectOutcome {
+    Connected,
+    TimedOut,
+    Failed,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DirectoryEventQuery {
@@ -346,25 +354,67 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        let relay_urls = request
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for relay_url in &relay_urls {
-            self.client
-                .add_relay(relay_url.clone())
+        let relay_urls = parsed_directory_relay_urls(&request.endpoints)?;
+        let mut connect_candidates = Vec::new();
+        let mut added = vec![false; relay_urls.len()];
+        let mut add_failure_count = 0usize;
+        for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
+            if self.client.add_relay(relay_url.clone()).await.is_ok() {
+                added[index] = true;
+                connect_candidates.push((index, relay_url));
+            } else {
+                add_failure_count += 1;
+            }
+        }
+        let mut connects = JoinSet::new();
+        for (index, relay_url) in connect_candidates {
+            let client = self.client.clone();
+            connects.spawn(async move {
+                let outcome = match timeout(
+                    DIRECTORY_RELAY_CONNECT_WAIT,
+                    client.connect_relay(relay_url),
+                )
                 .await
-                .map_err(|_| "add relay failed".to_owned())?;
-            timeout(
-                DIRECTORY_RELAY_CONNECT_WAIT,
-                self.client.connect_relay(relay_url.clone()),
-            )
-            .await
-            .map_err(|_| "connect relay timed out".to_owned())?
-            .map_err(|_| "connect relay failed".to_owned())?;
+                {
+                    Ok(Ok(())) => DirectoryRelayConnectOutcome::Connected,
+                    Ok(Err(_)) => DirectoryRelayConnectOutcome::Failed,
+                    Err(_) => DirectoryRelayConnectOutcome::TimedOut,
+                };
+                (index, outcome)
+            });
+        }
+        let mut connected = vec![false; relay_urls.len()];
+        let mut connect_timeout_count = 0usize;
+        let mut connect_failure_count = 0usize;
+        let mut task_failure_count = 0usize;
+        while let Some(result) = connects.join_next().await {
+            match result {
+                Ok((index, DirectoryRelayConnectOutcome::Connected)) => connected[index] = true,
+                Ok((_index, DirectoryRelayConnectOutcome::TimedOut)) => {
+                    connect_timeout_count += 1;
+                }
+                Ok((_index, DirectoryRelayConnectOutcome::Failed)) => {
+                    connect_failure_count += 1;
+                }
+                Err(_) => task_failure_count += 1,
+            }
+        }
+        // A task that panics or is cancelled never flips its index to
+        // connected, so this also removes relays from failed JoinSet tasks.
+        for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
+            if added[index] && !connected[index] {
+                let _ = self.client.remove_relay(relay_url).await;
+            }
+        }
+        let relay_urls = relay_urls
+            .into_iter()
+            .zip(connected)
+            .filter_map(|(relay_url, connected)| connected.then_some(relay_url))
+            .collect::<Vec<_>>();
+        if relay_urls.is_empty() {
+            return Err(format!(
+                "connect relays failed: add_failures={add_failure_count}, connect_timeouts={connect_timeout_count}, connect_failures={connect_failure_count}, task_failures={task_failure_count}"
+            ));
         }
 
         let mut records = Vec::new();
@@ -398,6 +448,21 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         }
         Ok(records)
     }
+}
+
+fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
+    let mut relay_urls = endpoints
+        .iter()
+        .map(|endpoint| {
+            RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // RelayUrl equality canonicalizes trailing slashes even though its display
+    // form preserves them. Collapse equivalent candidates before concurrent
+    // connection attempts so one failed twin cannot remove a successful one.
+    relay_urls.sort();
+    relay_urls.dedup();
+    Ok(relay_urls)
 }
 
 #[cfg(test)]
@@ -444,5 +509,16 @@ mod tests {
 
         assert_eq!(error, "invalid relay URL");
         assert!(!error.contains(secret_url));
+    }
+
+    #[test]
+    fn parsed_directory_relay_urls_deduplicate_trailing_slash_variants() {
+        let relay_urls = parsed_directory_relay_urls(&[
+            TransportEndpoint("wss://relay.example".to_owned()),
+            TransportEndpoint("wss://relay.example/".to_owned()),
+        ])
+        .unwrap();
+
+        assert_eq!(relay_urls.len(), 1);
     }
 }
