@@ -67,7 +67,7 @@ the property-test registry. This file is the agent-facing model.
     version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report`
     adds generated metadata to report artifacts. Reliability families append a final global drain, exact canonical
     observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
-    observation passed.
+    observation passed. Positive `PayloadCount` asserts are strict-oracle `AppMessage` coverage.
 
 - **Module:** `src/stateful_generator.rs`
   - **Role:** Legality-aware product journey generation into canonical Scenario IR v3. Tracks membership, admins,
@@ -77,7 +77,9 @@ the property-test registry. This file is the agent-facing model.
 
 - **Module:** `src/oracle.rs`
   - **Role:** Scenario oracle and coverage evidence. Computes scenario stimuli, expected behavior classes, observed
-    behavior classes, weak-oracle warnings, and coverage matrix rows.
+    behavior classes, weak-oracle warnings, and coverage matrix rows. Executable `PayloadCount` asserts with a
+    positive count cover `AppMessage` without inventing a cross-sender payload order. Declared asserts are
+    expected coverage; only passing assertion observations count as observed evidence.
 
 - **Module:** `cgka_engine::openmls_projection`
   - **Role:** Bytes-first OpenMLS projection and candidate materialization helpers, re-exported by this crate for tests.
