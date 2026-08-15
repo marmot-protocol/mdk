@@ -14,8 +14,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - MarmotKit exposes `appPerformanceSnapshot()`, a read-only fetch of the
   process-wide app-performance snapshot — per-phase attempt/success/failure
   counters and fixed-bucket millisecond duration histograms — so host debug
-  surfaces and on-demand support dumps can read per-device timings that
-  previously only left via the opt-in population-level OTLP export. Accepting
+  surfaces and on-demand support dumps can read per-device timings that were
+  previously available only inside the runtime, with optional OTLP export.
+  Accepting
   a group invite now records its own caller-visible `group_accept_invite`
   phase alongside the existing invite, create, and roster phases, and the
   OTLP export gains the matching unlabeled `app_group_accept_invite_*`
