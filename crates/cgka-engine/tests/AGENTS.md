@@ -74,7 +74,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
-- **File:** `auto_commit_atomicity.rs`
+- **File:** `record_write_atomicity.rs`
   - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
     seam that projects the record plus direct-ingest capability-cache coverage. No torn record or capability cache,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch

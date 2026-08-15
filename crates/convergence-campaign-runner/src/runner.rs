@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use cgka_conformance_simulator::process_orchestrator::{
-    ProcessBarrierHook, ProcessOrchestrator, ProcessOrchestratorError, ProcessScenarioReportV1,
-    process_participant_token,
+    ProcessBarrierHook, ProcessOrchestrator, ProcessOrchestratorError, ProcessRelayControl,
+    ProcessScenarioReportV1, process_participant_token,
 };
 use cgka_conformance_simulator::{
     ResolvedScenarioInputV1, ScenarioInputFormatV1, ScenarioSpec, compile_scenario,
@@ -22,7 +23,8 @@ use crate::plan::{
     build_execution_plan,
 };
 use crate::{
-    RunnerError, container_node_launch, record_distributed_failure, verify_manifest_inputs,
+    FileProcessRelayControl, RunnerError, container_node_launch, record_distributed_failure,
+    verify_manifest_inputs,
 };
 
 pub const DISTRIBUTED_RUN_RECEIPT_VERSION: &str = "1";
@@ -291,6 +293,22 @@ async fn run_container(
 ) -> Result<DistributedRunReceiptV1, RunnerError> {
     let resource_lease = ContainerResourceLease::acquire()?;
     let resource_token = resource_lease.token.as_str();
+    let (relay_control_root, relay_control) = match &manifest.backend {
+        DistributedBackendV1::Container(container) if container.enable_retained_relay_control => {
+            let root = resource_lease._guard.path().join("relay-control");
+            fs_private::create_dir_all_private(&root)
+                .map_err(|error| RunnerError::environment("relay_control_directory", error))?;
+            let root = std::fs::canonicalize(&root).map_err(|error| {
+                RunnerError::environment("relay_control_directory_canonicalize", error)
+            })?;
+            let control: Arc<dyn ProcessRelayControl> = Arc::new(
+                FileProcessRelayControl::new(&root)
+                    .map_err(|error| RunnerError::environment("relay_control_open", error))?,
+            );
+            (Some(root), Some(control))
+        }
+        _ => (None, None),
+    };
     let mut receipts = Vec::new();
     let mut cleanup_failures = Vec::new();
     for command in &plan.setup {
@@ -298,6 +316,7 @@ async fn run_container(
             command,
             CommandContext {
                 resource_token: Some(resource_token),
+                relay_control_root: relay_control_root.as_deref(),
                 ..Default::default()
             },
         )
@@ -331,7 +350,15 @@ async fn run_container(
         }
     }
 
-    let result = run_container_scenario(manifest, plan, input, resource_token, &mut receipts).await;
+    let result = run_container_scenario(
+        manifest,
+        plan,
+        input,
+        resource_token,
+        relay_control,
+        &mut receipts,
+    )
+    .await;
     let run_token = match &result {
         Ok(result) => Some(result.run_token.as_str()),
         Err(failure) => failure.run_token.as_deref(),
@@ -400,6 +427,7 @@ async fn run_container_scenario(
     plan: &DistributedExecutionPlanV1,
     input: &ResolvedScenarioInputV1,
     resource_token: &str,
+    relay_control: Option<Arc<dyn ProcessRelayControl>>,
     receipts: &mut Vec<CommandReceiptV1>,
 ) -> Result<ContainerScenarioResult, ContainerScenarioFailure> {
     let node_launch = container_node_launch(manifest, resource_token).map_err(|error| {
@@ -429,7 +457,8 @@ async fn run_container_scenario(
             .collect()
     };
     let relay_urls = relay_labels
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|label| (label, format!("ws://{NODE_RELAY_PROXY_LISTEN}")))
         .collect::<BTreeMap<_, _>>();
     let resolved = ResolvedScenarioInputV1 {
@@ -438,14 +467,35 @@ async fn run_container_scenario(
         provenance: input.provenance.clone(),
         generated_case: input.generated_case.clone(),
     };
-    let mut orchestrator = ProcessOrchestrator::launch_resolved_with(
-        node_launch,
-        Some(relay_urls),
-        &resolved,
-        &manifest.output_dir,
-    )
-    .await
-    .map_err(|error| ContainerScenarioFailure {
+    let controls = relay_control.map(|control| {
+        relay_labels
+            .iter()
+            .cloned()
+            .map(|label| (label, Arc::clone(&control)))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let launch = match controls {
+        Some(controls) => {
+            ProcessOrchestrator::launch_resolved_with_relay_controls(
+                node_launch,
+                relay_urls,
+                controls,
+                &resolved,
+                &manifest.output_dir,
+            )
+            .await
+        }
+        None => {
+            ProcessOrchestrator::launch_resolved_with(
+                node_launch,
+                Some(relay_urls),
+                &resolved,
+                &manifest.output_dir,
+            )
+            .await
+        }
+    };
+    let mut orchestrator = launch.map_err(|error| ContainerScenarioFailure {
         error: RunnerError::environment("container_node_launch", error),
         run_token: None,
     })?;
@@ -577,6 +627,7 @@ impl ContainerFaultHook<'_> {
                 resource_token: Some(&self.resource_token),
                 run_token: Some(&self.run_token),
                 host_run_root: Some(&self.host_run_root),
+                ..Default::default()
             },
         )
         .await
@@ -728,6 +779,7 @@ async fn cleanup(
                 resource_token: Some(resource_token),
                 run_token,
                 host_run_root: None,
+                ..Default::default()
             },
         )
         .await
@@ -748,6 +800,7 @@ struct CommandContext<'a> {
     resource_token: Option<&'a str>,
     run_token: Option<&'a str>,
     host_run_root: Option<&'a Path>,
+    relay_control_root: Option<&'a Path>,
 }
 
 #[derive(Debug)]
@@ -806,6 +859,26 @@ fn render_command_args(
                 receipt: None,
             })?;
             rendered = rendered.replace("{host_run_root}", root);
+        }
+        if rendered.contains("{relay_control_root}") {
+            let root = context.relay_control_root.ok_or_else(|| CommandFailure {
+                error: RunnerError::validation(
+                    "missing_relay_control_root",
+                    format!(
+                        "{} requires an unavailable relay control root",
+                        command.purpose
+                    ),
+                ),
+                receipt: None,
+            })?;
+            let root = root.to_str().ok_or_else(|| CommandFailure {
+                error: RunnerError::validation(
+                    "non_utf8_relay_control_root",
+                    "relay control root must be valid UTF-8",
+                ),
+                receipt: None,
+            })?;
+            rendered = rendered.replace("{relay_control_root}", root);
         }
         args.push(rendered);
     }
@@ -1218,6 +1291,7 @@ mod tests {
                 namespace: "receipt-test".into(),
                 allow_mutable_image_references: true,
                 allow_cleartext_isolated_relay: true,
+                enable_retained_relay_control: false,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -1265,6 +1339,7 @@ mod tests {
                 namespace: "crash-lowering".into(),
                 allow_mutable_image_references: true,
                 allow_cleartext_isolated_relay: true,
+                enable_retained_relay_control: false,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -1368,6 +1443,7 @@ mod tests {
                 namespace: "relay-validation".into(),
                 allow_mutable_image_references: true,
                 allow_cleartext_isolated_relay: true,
+                enable_retained_relay_control: false,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -1411,6 +1487,7 @@ mod tests {
                 namespace: "duplicate-barrier".into(),
                 allow_mutable_image_references: true,
                 allow_cleartext_isolated_relay: true,
+                enable_retained_relay_control: false,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -1445,6 +1522,7 @@ mod tests {
                 namespace: "unmatched-heal".into(),
                 allow_mutable_image_references: true,
                 allow_cleartext_isolated_relay: true,
+                enable_retained_relay_control: false,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -1487,6 +1565,7 @@ mod tests {
                 namespace: "duplicate-partition".into(),
                 allow_mutable_image_references: true,
                 allow_cleartext_isolated_relay: true,
+                enable_retained_relay_control: false,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],

@@ -15,7 +15,8 @@ use cgka_conformance_simulator::{
     generate_bounded_convergence_pressure_family, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
     observe_client_exact, run_generated_case_report, run_generated_case_report_with_storage_mode,
-    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
+    run_scenario_report, run_scenario_report_with_outcomes,
+    run_scenario_report_with_outcomes_and_storage_mode, run_scenario_spec,
     run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
 };
 use cgka_engine::ManualConvergenceClock;
@@ -256,6 +257,186 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
 
     alice.restart();
     assert_eq!(alice.canonical_state_snapshot(), before_restart);
+}
+
+/// A convergence pass that is open when the device crashes must survive the
+/// reopen, keep pinning the tip while a backlog piles up behind it, and then
+/// walk the device all the way to the group tip.
+///
+/// This is the scenario-level companion to the engine's
+/// `stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` family
+/// (mdk#1182, over the durable passes mdk#1110 added). The field incident was a
+/// durable pass whose `base_epoch` disagreed with the live tip, which durably
+/// halted the group.
+/// Those engine tests install the disagreement on the durable record directly,
+/// because the engine keeps a single tip authority and an active pass gates every
+/// path that could move it. This scenario pins that precondition from the public
+/// boundary instead: carol holds an open pass at epoch 1 across a crash/reopen and
+/// a three-commit backlog burst without her tip ever drifting off the base, so the
+/// disagreement the incident needed never arises, and she still reaches exact
+/// equivalence with alice.
+///
+/// The timing is load-bearing evidence that the *same* durable pass survived the
+/// crash rather than a fresh one reopening afterwards. The pass opens at virtual
+/// time 0 with a 1000ms quiescence deadline; the restart happens at 700ms, the
+/// backlog arrives while the reopened engine holds the pass, and the settle tick
+/// at exactly 1000ms clears the original deadline. A pass reopened after the
+/// restart would carry a later deadline and leave carol behind at epoch 1, which
+/// the pinned epoch walk rejects.
+///
+/// The subject adapter's `structural_wake_rebases_across_restart_without_granting_fresh_time`
+/// already covers the deadline-rebase half of this on a lone client with an empty
+/// group. This scenario is the version that matters for the incident: the deadline has
+/// to survive a *backlog* landing on the reopened engine, which is the pressure
+/// that could plausibly re-derive it.
+///
+/// Deliberately does not use `ScenarioStep::AwaitQuiescence`. That step drives
+/// virtual time to a fixed point, which settles the recovered pass whenever it
+/// happens to come due and so erases the exact-deadline evidence — with it
+/// appended, shortening the settle tick to 900ms still passes. The manual
+/// `AdvanceTime`/`Tick` walk is what makes the timing falsifiable.
+#[tokio::test]
+async fn open_convergence_pass_survives_restart_and_walks_the_backlog_to_the_tip() {
+    let update = |name: &str, pending: &str| ScenarioStep::UpdateGroupData {
+        client: "alice".into(),
+        name: name.into(),
+        pending: pending.into(),
+    };
+    let confirm = |pending: &str| ScenarioStep::accept_publication("alice", pending);
+    let tick_carol = || ScenarioStep::Tick {
+        clients: vec!["carol".into()],
+    };
+    let both = || vec!["alice".to_owned(), "carol".to_owned()];
+
+    let spec = ScenarioSpec {
+        name: "open-pass-restart-catchup/v1".into(),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: both(),
+        steps: vec![
+            // 0-4: alice and carol settle at epoch 1.
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "open-pass-restart-catchup".into(),
+                invitees: vec!["carol".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            confirm("create"),
+            ScenarioStep::DeliverAll,
+            tick_carol(),
+            ScenarioStep::ClearEvents { clients: both() },
+            // 5: take the scenario onto virtual time so a pass can stay open
+            // between ticks instead of settling through the far-future shortcut.
+            ScenarioStep::AdvanceTime { delta_ms: 0 },
+            // 6-9: one inbound commit edge opens carol's pass at base epoch 1.
+            update("backlog-2", "u2"),
+            confirm("u2"),
+            ScenarioStep::DeliverAll,
+            tick_carol(),
+            // 10-12: crash and reopen 300ms short of the pass cutoff.
+            ScenarioStep::AdvanceTime { delta_ms: 700 },
+            tick_carol(),
+            ScenarioStep::RestartClient {
+                client: "carol".into(),
+            },
+            // 13-20: three more commits land on the reopened engine while the
+            // recovered pass still holds the boundary.
+            update("backlog-3", "u3"),
+            confirm("u3"),
+            update("backlog-4", "u4"),
+            confirm("u4"),
+            update("backlog-5", "u5"),
+            confirm("u5"),
+            ScenarioStep::DeliverAll,
+            tick_carol(),
+            // 21: alice is four epochs ahead; carol is still pinned to her base.
+            ScenarioStep::Observe { clients: both() },
+            // 22-29: the recovered pass settles on its original deadline, then
+            // one generation per quiescence window walks carol to the tip.
+            ScenarioStep::AdvanceTime { delta_ms: 300 },
+            tick_carol(),
+            ScenarioStep::AdvanceTime { delta_ms: 1_000 },
+            tick_carol(),
+            ScenarioStep::AdvanceTime { delta_ms: 1_000 },
+            tick_carol(),
+            ScenarioStep::AdvanceTime { delta_ms: 1_000 },
+            tick_carol(),
+            // 30-32: drain both runtimes and compare exact canonical state.
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick { clients: both() },
+            ScenarioStep::ObserveExact { clients: both() },
+        ],
+    };
+
+    let epoch_walk = |from: u64| EpochChangeObservation { from, to: from + 1 };
+    let report = run_scenario_report_with_outcomes_and_storage_mode(
+        &spec,
+        None,
+        vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: "alice".into(),
+                pending: "create".into(),
+                resolution: "confirmed".into(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 7,
+                client: "alice".into(),
+                pending: "u2".into(),
+                resolution: "confirmed".into(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 18,
+                client: "alice".into(),
+                pending: "u5".into(),
+                resolution: "confirmed".into(),
+            },
+            // Step 21, mid-history: the backlog burst never moved carol's tip
+            // off the open pass's base epoch, across the crash and reopen.
+            TraceExpectation::ClientState {
+                client: "carol".into(),
+                epoch: 1,
+                member_count: 2,
+                received_payloads: None,
+                added_members: None,
+                removed_members: None,
+            },
+            TraceExpectation::ClientState {
+                client: "alice".into(),
+                epoch: 5,
+                member_count: 2,
+                received_payloads: None,
+                added_members: None,
+                removed_members: None,
+            },
+            // Step 32: carol catches up one generation per pass, with no skipped
+            // epoch and no halt.
+            TraceExpectation::ClientEpochChanges {
+                client: "carol".into(),
+                changes: vec![epoch_walk(1), epoch_walk(2), epoch_walk(3), epoch_walk(4)],
+            },
+            TraceExpectation::ClientsExactlyEquivalent { clients: both() },
+            TraceExpectation::NoPendingWork { clients: both() },
+        ],
+        // A real close-and-reopen of the encrypted database, not just a rebuilt
+        // engine over a live handle.
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .await
+    .expect("run open-pass restart catch-up scenario");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "unexpected failures: {:#?}",
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "unexpected invariant failures: {:#?}",
+        report.invariant_failures
+    );
 }
 
 #[tokio::test]

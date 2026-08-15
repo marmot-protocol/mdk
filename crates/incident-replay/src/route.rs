@@ -56,10 +56,9 @@ pub const CONVERGENCE_NAME: &str = "convergence-incident/v1";
 /// A higher-precedence route quarantined, but a lower one reproduced an incident
 /// from the same export.
 const SUPERSEDED_ROUTE: &str = "superseded route";
-/// The [`IncidentScenarioArtifactV1::unavailable_fields`] entry for the same
-/// finding: the accepted archetype stands for the lower-precedence incident, and
-/// the contested convergence the export also carried is evidence it does not
-/// cover.
+/// The [`IncidentScenarioArtifactV1::unavailable_fields`] entry for that same
+/// finding, carried by the accepted artifact as well as the advisory — see
+/// [`fall_through_to_fork`] for why both.
 const CONTESTED_CONVERGENCE_REPLAY: &str = "contested_convergence_replay";
 /// A higher-precedence route quarantined and the fall-through could not rescue
 /// it either.
@@ -70,6 +69,16 @@ const HALT: &str = "halt";
 const LIVENESS: &str = "liveness";
 
 /// What the pipeline produced for an export: exactly one primary outcome.
+///
+/// Deliberately not [`fmt::Display`], unlike [`Advisory`]: half of these
+/// variants cannot be rendered from the outcome alone. [`Outcome::Accepted`]
+/// reads as whatever the CLI did with the artifact — which files it wrote, or
+/// how to persist it when no out-dir was given — and
+/// [`Outcome::InfrastructureFailure`] is a stderr line with a non-zero exit
+/// rather than a verdict on stdout. Rendering all four in the CLI's one match
+/// keeps a single source of truth for what an operator reads; a `Display` here
+/// could only cover the two variants that need no I/O, and its other arms were
+/// unreachable text describing output the CLI never produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// No incident and no liveness problem. Zero vectors.
@@ -106,19 +115,8 @@ pub struct Routing {
     pub advisories: Vec<Advisory>,
 }
 
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Outcome::Healthy => f.write_str("healthy: 0 vectors"),
-            Outcome::Accepted(artifact) => {
-                write!(f, "accepted: {}", artifact.vector.scenario_name)
-            }
-            Outcome::Quarantine { reason } => write!(f, "quarantine: {reason}"),
-            Outcome::InfrastructureFailure { reason } => write!(f, "error: {reason}"),
-        }
-    }
-}
-
+/// An advisory is nothing but its message, so unlike [`Outcome`] it renders
+/// losslessly here and needs no CLI knowledge to do it.
 impl fmt::Display for Advisory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "advisory ({}): {}", self.label, self.detail)
@@ -254,6 +252,14 @@ fn archetype(
 /// yields nothing, the convergence quarantine stays the primary — it is the
 /// higher-precedence incident, and demoting it would misreport which one the
 /// export is really about.
+///
+/// When it *does* upgrade, the superseded finding is said once and reported
+/// twice: as the stdout advisory and as the accepted artifact's own statement of
+/// what it does not cover. The artifact is what gets written to disk and read
+/// later as evidence, so a finding that lived only in `advisories` would die with
+/// the terminal, leaving an envelope that shows a clean accepted archetype with
+/// no trace of the higher-precedence incident that shared the export — failing
+/// the standard [`archetype_artifact`] already enforces on itself.
 fn fall_through_to_fork(
     export: &AgentStateExport,
     source_format: IncidentSourceFormatV1,
@@ -271,12 +277,6 @@ fn fall_through_to_fork(
     }
     match fork_route(export, source_format) {
         Ok(mut artifact) => {
-            // Said once, then reported twice: as the stdout advisory and as the
-            // accepted artifact's own statement of what it does not cover. The
-            // artifact is what gets written to disk and read later as evidence, so
-            // a finding that lives only in `advisories` dies with the terminal —
-            // and the envelope would show a clean accepted archetype with no trace
-            // of the higher-precedence incident that shared the export.
             let detail = format!("contested convergence could not be replayed: {superseded}");
             artifact
                 .unavailable_fields
@@ -287,9 +287,6 @@ fn fall_through_to_fork(
             });
             Outcome::Accepted(artifact)
         }
-        // No artifact exists on this path — both routes failed closed, so there is
-        // no accepted envelope for the finding to enter and the advisory is its
-        // only surface. Construction, not omission (AGENTS.md, `src/route.rs`).
         Err(fallback) => {
             advisories.push(Advisory {
                 label: FALLBACK_ROUTE,

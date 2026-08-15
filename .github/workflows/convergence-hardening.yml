@@ -68,6 +68,7 @@ jobs:
         run: |
           just convergence-weekly-lane
           CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
+          CGKA_DISTRIBUTED_ARTIFACTS_DIR="${{ github.workspace }}/target/cgka-distributed-container-evidence" \
             cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
               --run-ignored ignored-only --no-tests fail
 
@@ -93,5 +94,6 @@ jobs:
           path: |
             target/cgka-weekly-reliability
             target/cgka-adversarial-reliability-ci
+            target/cgka-distributed-container-evidence
           if-no-files-found: warn
           retention-days: ${{ inputs.lane == 'release_hardening' && 180 || 60 }}

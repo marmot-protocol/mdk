@@ -51,14 +51,11 @@ fn a_fail_closed_convergence_falls_through_to_a_clean_fork() {
 
 #[test]
 fn a_superseded_route_is_recorded_in_the_accepted_artifact() {
-    // The advisory line is stdout; the artifact is what gets written to disk and
-    // passed around as evidence. Without this, someone opening the persisted
-    // envelope sees a clean accepted fork archetype with no trace that the same
-    // export carried a higher-precedence contested convergence at the same epoch
-    // that could not be replayed — which is exactly the standard `archetype`
-    // enforces on itself ("an artifact that cannot point at its own source rows is
-    // not publishable evidence"). `unavailable_fields` is where the artifact
-    // already states what it could not cover, so the finding belongs there.
+    // The test above pins the in-memory advisory (`routing.advisories`); this
+    // pins the persisted one — the stdout rendering of both lives in
+    // `tests/cli.rs`. `unavailable_fields` is where the artifact already states
+    // what it could not cover, so that is where the finding belongs — see
+    // `fall_through_to_fork` for why the artifact needs its own copy at all.
     let routing = routed("convergence-failclosed-with-clean-fork.json");
 
     let Outcome::Accepted(artifact) = &routing.outcome else {

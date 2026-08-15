@@ -80,11 +80,11 @@ pub enum MarmotEventFfi {
         message_id_hex: String,
         recipient_hex: String,
     },
-    /// This device armed `arms` epoch-gap history backfills for the group
-    /// without catching up: it is still stalled at `stalled_epoch` while the
-    /// group has moved on. Surface it as "this group cannot catch up; re-syncing
-    /// is recommended"; the sanctioned repair is rotating this device's key
-    /// package and re-activating transport, which is the host app's call.
+    /// This device armed `arms` epoch-gap history backfills for the group with
+    /// no sign in between that it caught up: it is still at `stalled_epoch`.
+    /// Surface it as "this group cannot catch up; re-syncing is recommended";
+    /// the sanctioned repair is rotating this device's key package and
+    /// re-activating transport, which is the host app's call.
     EpochStallEscalated {
         account_id_hex: String,
         account_label: String,
@@ -397,6 +397,39 @@ mod tests {
             } => {
                 assert_eq!(message_id_hex, "22".repeat(32));
                 assert_eq!(resource, "transport_deferred_residence_budget");
+            }
+            other => panic!("unexpected FFI event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn epoch_stall_escalation_reaches_the_ffi_with_its_group_and_counts() {
+        // This conversion is the whole of an FFI host's view of a group that
+        // full-history replay cannot repair: the host cannot see the sync summary
+        // or the forensic row, so a field lost here is a repair prompt the user
+        // never gets. The group id is the one field that changes shape crossing
+        // the boundary, and it is what the host needs to name the group.
+        let event = MarmotAppEvent::EpochStallEscalated {
+            account_id_hex: "ac".repeat(32),
+            account_label: "bob".to_owned(),
+            group_id: GroupId::new(vec![0x33; 16]),
+            stalled_epoch: 12,
+            arms: 3,
+        };
+
+        match MarmotEventFfi::from(event) {
+            MarmotEventFfi::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                stalled_epoch,
+                arms,
+            } => {
+                assert_eq!(account_id_hex, "ac".repeat(32));
+                assert_eq!(account_label, "bob");
+                assert_eq!(group_id_hex, "33".repeat(16));
+                assert_eq!(stalled_epoch, 12);
+                assert_eq!(arms, 3);
             }
             other => panic!("unexpected FFI event: {other:?}"),
         }

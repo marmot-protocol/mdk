@@ -261,6 +261,16 @@ const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
+/// Local worker operations include SQLite's bounded busy retry but no relay or
+/// blob transfer. A missing response beyond this point indicates a wedged
+/// worker, not ordinary storage contention.
+const APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(10);
+/// Default deadline for worker commands that may sign, publish, or perform a
+/// bounded relay exchange.
+const APP_RUNTIME_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(2 * 60);
+/// Media commands have their own 15-minute transfer cap; leave one minute for
+/// queueing, projection, and response delivery around that bounded operation.
+const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 * 60);
 /// Cap for advisory account-setup steps (directory discovery/refresh): their
 /// results are best-effort, so a slow indexer must not stall login.
 pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
@@ -719,8 +729,13 @@ impl From<AppError> for SyncFailure {
 }
 
 /// A group that full-history replay is not repairing: it armed `arms` epoch-gap
-/// backfills without once passing cleanly through an epoch, so it is still
-/// stalled below the group's live epoch at `stalled_epoch`.
+/// backfills in one run with no sign in between that the device caught up, and
+/// it is still sitting at `stalled_epoch`.
+///
+/// "No sign it caught up" is the honest strength of the claim. The runtime never
+/// decrypts the traffic that would reveal a group's live epoch, so it infers the
+/// stall from what it can see, and an advance it does not observe reads the same
+/// as no advance at all. Surface this as a strong hint, not a verdict.
 ///
 /// Reported once per unrecovered run so the application can say "this group
 /// cannot catch up; re-syncing is recommended" and offer the stronger repair —
@@ -1481,6 +1496,7 @@ impl MarmotApp {
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
+            pending_runtime_group_subscription_refresh: false,
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),

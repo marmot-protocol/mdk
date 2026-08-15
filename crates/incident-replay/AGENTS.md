@@ -112,16 +112,14 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     only *after* a failure — and one rule keeps it honest: a lower route may
     override a higher route's quarantine only by producing an accepted vector. A
     second quarantine never displaces the higher-precedence one; it becomes an
-    `advisory (fallback route):` instead. When the fall-through *does* produce an
-    accepted vector, the superseded finding is also written into that artifact's
-    `unavailable_fields` as `contested_convergence_replay`, with the same sentence
-    the advisory carries: the advisory is stdout, the artifact is what gets
-    persisted and read later as evidence, and an envelope showing a clean accepted
-    archetype with no trace of the higher-precedence incident that shared the
-    export fails the standard `archetype` already enforces on itself. The
-    `fallback route` finding has no such home by construction — both routes failed
-    closed, so there is no accepted artifact — and the advisory line is its only
-    surface. Vector names live here too: they are pipeline facts, not CLI ones.
+    `advisory (fallback route):` instead. When the fall-through *does* produce
+    an accepted vector, the superseded finding is also written into that
+    artifact's `unavailable_fields` as `contested_convergence_replay`, with the
+    same sentence the advisory carries (`fall_through_to_fork` carries the
+    argument for why the persisted envelope needs it too). The `fallback route`
+    finding has no such home by construction — both routes failed closed, so
+    there is no accepted artifact — and the advisory line is its only surface.
+    Vector names live here too: they are pipeline facts, not CLI ones.
 - **Module:** `src/main.rs`
   - **Role:** CLI — read one export file, detect its format, print the `Routing`.
     Reading and formatting only; route policy is `src/route.rs`. Exits 0 for any
@@ -155,18 +153,20 @@ Precedence, highest first:
 5. **Quarantine `unrecoverable_halt`** — an engine recorded halting
    unrecoverably, so its group stays blocked until a verified repair clears the
    marker. Two audit surfaces arm it, and the reason string from whichever fired
-   is reported per engine — **causes first-class, re-assertions only when there is
-   no cause**. `already_unrecoverable` (emitted on every convergence attempt
-   against an already-halted group) and `hydrate_unrecoverable_group` (every
-   session open over one) *arm* the gate like any other reason, because a window
-   of nothing but re-assertions is still a live halt, but they never say why the
-   engine stopped: beside a real cause they are noise in the line an operator
-   reads first, and `BTreeSet` order puts `already_unrecoverable` ahead of the
-   diagnosis. Once the cause is known they add nothing — that a halt is durable
-   and still being retried is what rule 5 *means*. When re-assertions are all the
-   export has (the real 26a9f546 shape: the halt predates the window) they are
-   reported, because the engine still has to be named and "the halt stands, cause
-   not in this window" is the honest reading. The two surfaces are
+   is reported per engine — **causes first-class, non-causes only when there is
+   no cause**. Three strings name no cause. `already_unrecoverable` (emitted on
+   every convergence attempt against an already-halted group) and
+   `hydrate_unrecoverable_group` (every session open over one) *arm* the gate
+   like any other reason, because a window of nothing but re-assertions is still
+   a live halt, but they never say why the engine stopped: beside a real cause
+   they are noise in the line an operator reads first, and `BTreeSet` order puts
+   `already_unrecoverable` ahead of the diagnosis. Once the cause is known they
+   add nothing — that a halt is durable and still being retried is what rule 5
+   *means*. `unspecified` — the stand-in for a halt row that carried no reason at
+   all — names even less and ranks with them. When non-causes are all the export
+   has (the real 26a9f546 shape: the halt predates the window) they are reported,
+   because the engine still has to be named and "the halt stands, cause not in
+   this window" is the honest reading. The two surfaces are
    `convergence_run_state` with `phase: unrecoverable`
    (mdk#1110 — reason `frozen_pass_integrity_failure` from `error_kind:
    frozen_member_integrity`, and the reason-less `error_kind:
@@ -194,24 +194,22 @@ Precedence, highest first:
    below). Clearing is decided per **`(engine_id, group_ref)`** — `Unrecoverable`
    is per-group state, so a repair in one group must not clear another group's
    halt — by **repair strictly after the newest halt**, with surviving halts
-   folded back
-   per engine so an engine halted in two groups is still one halted engine with
-   the union of its reasons. Newest-wins needs no global event ordering because a
-   live halt is continuously re-asserted (every session open re-emits
-   `hydrate_unrecoverable_group`; every convergence attempt emits
-   `already_unrecoverable`), so a halt that outlived its repair leaves rows after
-   it. Both rows come from one engine — one clock, one recorder file — so rule 6's
-   cross-device grace does not apply here. Two boundaries of that comparison are
-   contract, not incident: a repair sharing the halt's millisecond does **not**
-   clear it (a tie orders nothing, and the two orders mean opposite things), and
-   **one untimed halt row makes the whole halt side unorderable** — not just that
-   row. The untimed row may be the newest halt evidence there is, so the newest
-   *timed* halt is only a lower bound on the halt's position and a repair after
-   that bound proves nothing; taking it as the halt's position is the fail-open
-   direction, clearing a live halt on partially instrumented input. It therefore outranks rule 6, which it usually
-   explains: on the real 26a9f546 export the halted engine is exactly the one
-   rule 6 labelled `went dark`, and reporting the inference over the diagnosis
-   would send the operator to re-pull for a confirmation they already have.
+   folded back per engine so an engine halted in two groups is still one halted
+   engine with the union of its reasons. Newest-wins needs no global event
+   ordering because a live halt is continuously re-asserted (every session open
+   re-emits `hydrate_unrecoverable_group`; every convergence attempt emits
+   `already_unrecoverable`), so a halt that outlived its repair leaves rows
+   after it. Both rows come from one engine — one clock, one recorder file — so
+   rule 6's cross-device grace does not apply here. Two boundaries of that
+   comparison are contract, not incident: a repair sharing the halt's
+   millisecond does **not** clear it (a tie orders nothing, and the two orders
+   mean opposite things), and **one untimed halt row makes the whole halt side
+   unorderable** — not just that row (`HaltLifecycle::halt_position_ms` carries
+   the argument for why the newest *timed* halt is only a lower bound). Rule 5
+   outranks rule 6, which it usually explains: on the real 26a9f546 export the
+   halted engine is exactly the one rule 6 labelled `went dark`, and reporting
+   the inference over the diagnosis would send the operator to re-pull for a
+   confirmation they already have.
    A halt is a client failure, not a branch contest, so there is still nothing
    to replay. `halt_advisory` exposes the same computation verdict-independently,
    as `liveness_advisory` does for rule 6.

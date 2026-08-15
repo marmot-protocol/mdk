@@ -142,6 +142,31 @@ fn container_plan(
     let network = format!("{}-{{resource_token}}-network", container.namespace);
     let relay = format!("{}-{{resource_token}}-relay", container.namespace);
     let label = format!("io.marmot.convergence={}", manifest.campaign_id);
+    let mut relay_args = vec![
+        "run".into(),
+        "--detach".into(),
+        "--rm".into(),
+        "--name".into(),
+        relay.clone(),
+        "--network".into(),
+        network.clone(),
+        "--network-alias".into(),
+        ISOLATED_RELAY_NETWORK_ALIAS.into(),
+        "--label".into(),
+        label.clone(),
+    ];
+    let mut relay_command = container.relay_command.clone();
+    if container.enable_retained_relay_control {
+        relay_args.extend([
+            "--user".into(),
+            participant_container_user()?,
+            "--mount".into(),
+            "type=bind,src={relay_control_root},dst=/campaign-relay-control".into(),
+        ]);
+        relay_command.extend(["--control-root".into(), "/campaign-relay-control".into()]);
+    }
+    relay_args.push(container.relay_image.clone());
+    relay_args.extend(relay_command);
     let setup = vec![
         PlannedCommandV1::exact(
             "create_isolated_network",
@@ -154,28 +179,7 @@ fn container_plan(
                 network.clone(),
             ],
         ),
-        PlannedCommandV1::exact(
-            "start_retained_relay",
-            runtime,
-            [
-                vec![
-                    "run".into(),
-                    "--detach".into(),
-                    "--rm".into(),
-                    "--name".into(),
-                    relay.clone(),
-                    "--network".into(),
-                    network.clone(),
-                    "--network-alias".into(),
-                    ISOLATED_RELAY_NETWORK_ALIAS.into(),
-                    "--label".into(),
-                    label,
-                    container.relay_image.clone(),
-                ],
-                container.relay_command.clone(),
-            ]
-            .concat(),
-        ),
+        PlannedCommandV1::exact("start_retained_relay", runtime, relay_args),
     ];
 
     let mut faults = BTreeMap::<String, Vec<PlannedFaultV1>>::new();

@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-07
+updated: 2026-08-14
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -125,8 +125,27 @@ CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
   cargo test -p convergence-campaign-runner --test container_runtime -- --ignored
 ```
 
+The named four-party checkpoint can retain its exact distributed evidence outside the test's temporary directory:
+
+```sh
+CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
+CGKA_DISTRIBUTED_ARTIFACTS_DIR="$PWD/target/cgka-distributed-container-evidence" \
+  cargo test -p convergence-campaign-runner --test container_runtime \
+    four_party_cross_route_recovery_containers_match_unified_route -- --ignored --exact
+```
+
 The default CI lane validates command construction and the process boundary without requiring Docker. Scheduled lanes
-may opt into the real-container tests when the runner environment advertises that capability.
+run selected real-container tests when the runner environment advertises that capability. The four-party checkpoint
+uses the same `cross-route-app-runtime-recovery/v1` builder, canonical IR digest, and strict public process-report
+oracle as the isolated-process checkpoint, then uploads its owner-only evidence directory even after failure. It is
+public protocol/application projection evidence; exact MLS state, durable convergence-input dispositions, and active
+decryptability remain owned by the engine-capable control.
+
+The retained-relay visibility seam is not a network administration API. The runner bind-mounts an owner-only,
+run-scoped control directory into the repository-owned relay. Relay admission records contain only publication class
+and an opaque token derived with an ephemeral secret; raw Nostr event ids, payloads, ciphertext, and key material are
+not persisted. The directory lives under the runner's temporary resource lease and is removed with that lease rather
+than uploaded as campaign evidence.
 
 ## Execution lanes and budgets
 

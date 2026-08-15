@@ -25,6 +25,7 @@ mod audit_capture;
 pub mod bus;
 mod campaign_metrics;
 pub mod client;
+mod cross_route_scenario;
 mod decryptability;
 mod failure_capsule;
 pub mod family;
@@ -75,6 +76,10 @@ pub use cgka_engine::conformance_snapshot::{
 };
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
 pub use client::{ClientBuilder, HarnessClient, HarnessStorageMode};
+pub use cross_route_scenario::{
+    cross_route_app_runtime_recovery_exact_scenario,
+    cross_route_app_runtime_recovery_public_scenario, validate_cross_route_public_process_report,
+};
 pub use decryptability::{
     BidirectionalDecryptabilityObservation, DecryptabilityProbeSendStatus,
     DirectionalDecryptabilityProbe,

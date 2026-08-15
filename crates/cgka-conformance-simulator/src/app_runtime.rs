@@ -555,11 +555,13 @@ impl AppRuntimeHarness {
                 .map_err(app_error)?
                 .is_some_and(|group| group.pending_confirmation)
             {
-                participant
-                    .runtime()?
-                    .accept_group_invite(&participant.account_id, group_id)
-                    .await
-                    .map_err(app_error)?;
+                accept_group_invite_retrying_busy(
+                    participant.runtime()?,
+                    &participant.account_id,
+                    group_id,
+                )
+                .await
+                .map_err(app_error)?;
             }
         }
         Ok(())
@@ -1350,9 +1352,46 @@ fn drain_runtime_events(participant: &mut Participant) {
     }
 }
 
+pub(crate) async fn accept_group_invite_retrying_busy(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    group_id: &GroupId,
+) -> Result<(), AppError> {
+    const BUSY_RETRY_ATTEMPTS: usize = 500;
+    const BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+    const ACCEPT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for attempt in 0..BUSY_RETRY_ATTEMPTS {
+        match tokio::time::timeout(
+            ACCEPT_ATTEMPT_TIMEOUT,
+            runtime.accept_group_invite(account_ref, group_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(AppError::AccountWorkerBusy)) => {
+                if attempt + 1 < BUSY_RETRY_ATTEMPTS {
+                    tokio::time::sleep(BUSY_RETRY_DELAY).await;
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+            // This accept may have reached the worker, so its completion is
+            // unknown. Never collapse that ambiguity into definitely-not-
+            // started AccountWorkerBusy.
+            Err(_) => return Err(AppError::AccountWorkerResponseTimedOut),
+        }
+    }
+
+    // The fixed attempt budget was exhausted entirely by confirmed
+    // definitely-not-started responses.
+    Err(AppError::AccountWorkerBusy)
+}
+
 fn record_failure(participant: &mut Participant, error: &AppError) {
     let kind = match error {
         AppError::AccountSessionBusy => "account_session_busy",
+        AppError::AccountWorkerBusy => "account_worker_busy",
+        AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
         AppError::TransportClosed => "transport_closed",
@@ -1367,7 +1406,10 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
     participant.last_error_kind = Some(kind);
     if matches!(
         error,
-        AppError::AccountSessionBusy | AppError::RuntimeBusy | AppError::TransportClosed
+        AppError::AccountSessionBusy
+            | AppError::AccountWorkerBusy
+            | AppError::RuntimeBusy
+            | AppError::TransportClosed
     ) {
         participant.retryable_failures = participant.retryable_failures.saturating_add(1);
     } else {
@@ -1379,6 +1421,8 @@ fn app_error(error: AppError) -> SubjectError {
     let category = match error {
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
+        | AppError::AccountWorkerBusy
+        | AppError::AccountWorkerResponseTimedOut
         | AppError::RuntimeStopping
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)

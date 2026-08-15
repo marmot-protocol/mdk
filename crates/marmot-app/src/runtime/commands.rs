@@ -13,7 +13,8 @@ use tokio::sync::oneshot;
 
 use super::{
     AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
-    publish_app_runtime_group_state_updated,
+    local_account_worker_response, long_account_worker_catch_up_response,
+    long_account_worker_response, publish_app_runtime_group_state_updated,
 };
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
@@ -146,10 +147,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::RepairFullHistory { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        response
-            .await
-            .map_err(|_| AppError::TransportClosed)?
-            .map_err(AppError::AccountCatchUp)
+        long_account_worker_catch_up_response(response).await
     }
 
     /// Create the group and return its canonical id. Invitation delivery is
@@ -189,7 +187,7 @@ impl AccountManager {
                 })
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
-            account_worker_response(response).await
+            long_account_worker_response(response).await
         }
         .await;
         self.shared.app_performance_telemetry().record(
@@ -239,7 +237,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        local_account_worker_response(response).await
     }
 
     /// Read identifier-only rosters for a bounded page of groups in one
@@ -387,7 +385,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        local_account_worker_response(response).await
     }
 
     /// Stored groups that failed session-open hydration and were skipped
@@ -403,7 +401,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::QuarantinedGroups { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        local_account_worker_response(response).await
     }
 
     /// Re-attempt hydration of a single quarantined group (mdk#426).
@@ -643,7 +641,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        local_account_worker_response(response).await
     }
 
     pub async fn decline_group_invite(
@@ -704,7 +702,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        local_account_worker_response(response).await
     }
 
     pub async fn update_group_image(
@@ -725,7 +723,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let summary = long_account_worker_response(response).await?;
         self.catch_up_after_committed_mutation("update_group_image")
             .await;
         Ok(summary)
@@ -745,7 +743,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        long_account_worker_response(response).await
     }
 
     pub async fn update_message_retention(
@@ -1186,7 +1184,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let result = account_worker_response(response).await?;
+        let result = long_account_worker_response(response).await?;
         if result.sent.is_some() {
             self.schedule_audit_log_tracker_update("upload_media_send");
         }
@@ -1228,7 +1226,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        long_account_worker_response(response).await
     }
 
     pub(crate) async fn secure_delete_expired_plaintext(

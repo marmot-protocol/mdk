@@ -196,6 +196,25 @@ async fn held_hydration_body() {
         "persisted chat list must hold every group while hydration is held"
     );
 
+    // Invite acceptance only mutates the durable app projection; it does not
+    // need unrelated MLS groups to finish hydrating. This fixture's founder
+    // row is already confirmed, so the operation is idempotent, but its prompt
+    // response proves the command is executed during the hold rather than
+    // retained behind the 30-second pipeline delay.
+    let accept_started = Instant::now();
+    let accepted = tokio::time::timeout(
+        Duration::from_millis(BATCH_HOLD_MS / 2),
+        runtime.accept_group_invite(BENCH_ACCOUNT, &group_ids[0]),
+    )
+    .await
+    .expect("projection-only invite acceptance must run during startup hydration")
+    .unwrap();
+    assert!(!accepted.pending_confirmation);
+    assert!(
+        accept_started.elapsed() < Duration::from_millis(BATCH_HOLD_MS / 2),
+        "invite acceptance must not join the startup hydration deferral"
+    );
+
     // The identifier-only roster page is the bounded companion read for that
     // chat projection (mdk#1314). One worker command promotes only the named
     // groups from durable state and returns every roster without waiting for

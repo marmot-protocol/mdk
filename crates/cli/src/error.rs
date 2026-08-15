@@ -635,6 +635,17 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "account_catch_up",
             "message": err.to_string(),
         }),
+        AppError::AccountWorkerBusy => json!({
+            "code": "account_worker_busy",
+            "message": err.to_string(),
+            "safe_to_retry": true,
+        }),
+        AppError::AccountWorkerResponseTimedOut => json!({
+            "code": "account_worker_response_timed_out",
+            "message": err.to_string(),
+            "completion_unknown": true,
+            "repair": { "action": "refresh authoritative state before retrying" },
+        }),
         AppError::AccountSetupRecoveryRequired => json!({
             "code": "account_setup_recovery_required",
             "message": err.to_string(),
@@ -767,5 +778,16 @@ mod tests {
         for (error, code) in cases {
             assert_eq!(wn_error_json(&WnError::App(error))["code"], code);
         }
+    }
+
+    #[test]
+    fn account_worker_errors_preserve_retry_safety_in_json() {
+        let busy = wn_error_json(&WnError::App(AppError::AccountWorkerBusy));
+        assert_eq!(busy["code"], "account_worker_busy");
+        assert_eq!(busy["safe_to_retry"], true);
+
+        let timed_out = wn_error_json(&WnError::App(AppError::AccountWorkerResponseTimedOut));
+        assert_eq!(timed_out["code"], "account_worker_response_timed_out");
+        assert_eq!(timed_out["completion_unknown"], true);
     }
 }

@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::{
     GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind, ScenarioInputFormatV1,
-    ScenarioSpec, ScenarioStep,
+    ScenarioSpec, ScenarioStep, canonical_scenario_ir_sha256,
+    cross_route_app_runtime_recovery_public_scenario,
 };
 use convergence_campaign_runner::{
     ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1, DistributedFaultV1,
@@ -44,6 +45,7 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
             namespace: "marmot-campaign-test".into(),
             allow_mutable_image_references: true,
             allow_cleartext_isolated_relay: true,
+            enable_retained_relay_control: false,
             default_participant_image: "marmot-conformance:current".into(),
             relay_image: "marmot-conformance:current".into(),
             relay_command: vec!["cgka-conformance-relay".into()],
@@ -372,6 +374,55 @@ fn distributed_manifest_selects_a_generated_input_and_pins_its_canonical_ir() {
     );
 }
 
+#[test]
+fn container_manifest_selects_the_shared_four_party_cross_route_ir() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults.clear();
+    let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+        unreachable!();
+    };
+    container.enable_retained_relay_control = true;
+    let scenario = cross_route_app_runtime_recovery_public_scenario();
+    let bytes = serde_json::to_vec_pretty(&scenario).unwrap();
+    fs_private::write_private(&manifest.scenario.path, &bytes).unwrap();
+    manifest.scenario.sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    let canonical_ir_sha256 = canonical_scenario_ir_sha256(&scenario).unwrap();
+    manifest.scenario.canonical_ir_sha256 = Some(canonical_ir_sha256.clone());
+    manifest.participants = scenario
+        .clients
+        .iter()
+        .map(|id| DistributedParticipantV1 {
+            id: id.clone(),
+            build_id: "current".into(),
+            container_image: None,
+        })
+        .collect();
+
+    let selected = validate_scenario_bytes(&manifest, &bytes).unwrap();
+    assert_eq!(selected.scenario, scenario);
+    assert_eq!(selected.provenance.canonical_ir_sha256, canonical_ir_sha256);
+    let plan = build_execution_plan(&manifest).unwrap();
+    assert_eq!(plan.backend, "container");
+    let relay = plan
+        .setup
+        .iter()
+        .find(|command| command.purpose == "start_retained_relay")
+        .unwrap();
+    assert!(relay.args.iter().any(|arg| arg == "--user"));
+    assert!(
+        relay
+            .args
+            .iter()
+            .any(|arg| { arg == "type=bind,src={relay_control_root},dst=/campaign-relay-control" })
+    );
+    assert!(
+        relay
+            .args
+            .windows(2)
+            .any(|args| { args == ["--control-root", "/campaign-relay-control"] })
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn vm_run_materializes_the_selected_generated_input_as_canonical_ir() {
@@ -487,6 +538,20 @@ fn cleartext_isolated_relay_requires_manifest_level_operator_approval() {
     assert_eq!(
         manifest.validate().unwrap_err().code,
         "cleartext_isolated_relay_not_approved"
+    );
+}
+
+#[test]
+fn retained_relay_control_requires_the_repo_owned_relay_command() {
+    let (_root, mut manifest) = container_manifest();
+    let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+        unreachable!();
+    };
+    container.enable_retained_relay_control = true;
+    container.relay_command = vec!["third-party-relay".into()];
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "retained_relay_control_command"
     );
 }
 

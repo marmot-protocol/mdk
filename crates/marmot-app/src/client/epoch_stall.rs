@@ -17,6 +17,15 @@
 //! [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`], so the runtime can report a group
 //! that full-history replay cannot repair instead of retrying it silently.
 //!
+//! What the detector counts is bounded by what it is told. Its only view of a
+//! group's local epoch is the epoch handed to its own `observe_*` calls, so an
+//! advance nobody reports leaves it believing the group never moved. Two known
+//! blind spots follow, both tracked for a follow-up rather than defended here: a
+//! run can outlive the condition that opened it, because an unreported advance
+//! cannot end one (see [`GroupStall::observe_epoch`]); and a group whose
+//! reported epoch never moves at all arms once and never escalates, because
+//! every arm after the first needs that epoch to change.
+//!
 //! All detector state is process-local, like the stall counts it extends.
 //! `sync_with_partial_progress` moves a one-shot escalation into either its
 //! success summary or its failure prefix before the managed runtime can rebuild
@@ -25,6 +34,15 @@
 //! seam. A caller that discards such a client also discards the detector run;
 //! the opt-in `epoch_stall_backfill_escalated` audit row is then the only durable
 //! trace.
+//!
+//! A discarded run is re-earned from zero rather than re-raised: escalating
+//! again costs a whole fresh run of [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`]
+//! arms, and only the first can land at the epoch the device already sits at,
+//! because an arm at an epoch already fired at is skipped. A group still
+//! reporting epoch advances therefore escalates again once the run refills —
+//! delayed, not lost — while the frozen group above never does. That frozen case
+//! is not a restart artifact: a group frozen from its first arm never escalates
+//! in a fresh process either.
 //!
 //! The policy is deliberately I/O-free so it can be unit-tested in isolation;
 //! the recovery action it triggers — a full-history transport replay — lives in
@@ -53,9 +71,10 @@ use rand::RngCore;
 /// treated as general.
 pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 
-/// Backfills a group may arm in one unrecovered run — arms with no epoch the
-/// device passed through cleanly in between — before the runtime reports the
-/// full-history replay as insufficient and escalates to the app.
+/// Backfills a group may arm in one unrecovered run before the runtime reports
+/// the full-history replay as insufficient and escalates to the app.
+/// [`GroupStall::observe_epoch`] defines what starts and ends a run, and is the
+/// place to read before reasoning about what this count means.
 ///
 /// Empirical, like `EPOCH_STALL_BACKFILL_THRESHOLD`, and chosen from the
 /// 2026-07-29 field cohort: one device armed at stalled epochs 10, 11, and 12
@@ -88,8 +107,8 @@ pub(crate) enum BackfillDecision {
     /// Arm one account-wide full-history backfill.
     Arm,
     /// Arm, and report that repeated arming is not recovering this group:
-    /// `arms` backfills have been armed without the device passing cleanly
-    /// through a single epoch.
+    /// `arms` backfills have been armed in one unrecovered run (see
+    /// [`GroupStall::observe_epoch`]).
     ArmAndEscalate { arms: u32 },
 }
 
@@ -146,6 +165,25 @@ impl GroupStall {
     /// a device that cannot decrypt a group's traffic can never learn the
     /// group's live epoch. Ending the run also clears the escalation latch, so a
     /// group that stalls again much later is reported again.
+    ///
+    /// "Passed through" means *reported to this method*, which is narrower than
+    /// "the device advanced". `self.epoch` only moves when a caller reports an
+    /// epoch, and neither convergence-fold seam — `AppClient::retry_group_convergence`
+    /// nor `AppClient::advance_convergence_after_runtime_sync`, the mechanism by
+    /// which a trailing device usually catches up — reaches an `observe_*` call at
+    /// all. So a device armed at 10 and then folded cleanly through 11, 12 and 13
+    /// arrives at its next stall with `self.epoch` still 10, the epoch it armed
+    /// at, and the run continues: a healthy recovery is counted as arm two. That
+    /// makes the unreported advance a false-positive amplifier, not merely a
+    /// delayed reset, and closing the reporting gap on both seams is the tracked
+    /// follow-up. The rule is pinned by
+    /// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`;
+    /// the escalation it costs a recovered device is pinned at the runtime by
+    /// `a_clean_recovery_the_runtime_never_reports_still_escalates`.
+    ///
+    /// How far the epoch jumped does not enter into it: the rule compares only
+    /// the armed epoch against the epoch being left, so a reported advance of
+    /// five epochs decides exactly as one of a single epoch does.
     ///
     /// Deliberately *not* "the device decrypted something": a replay that
     /// recovers old backlog the device can read has not caught it up, and
@@ -444,6 +482,45 @@ mod tests {
             detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(14)),
             BackfillDecision::Arm,
             "the arm count must have restarted, so this is the run's second arm"
+        );
+    }
+
+    /// Pins the known blind spot named in [`GroupStall::observe_epoch`]: a run
+    /// ends on an *observation* at an epoch the device did not arm at, and an
+    /// epoch the detector is never told about cannot be that observation. This is
+    /// today's behavior, not the intended behavior — a device that recovers
+    /// cleanly through several epochs still has its next unrelated stall counted
+    /// as arm two, so a healthy device can be escalated.
+    ///
+    /// What it pins is the rule, not the field bug: the observation is omitted
+    /// here by hand, so this test keeps passing whether or not the runtime ever
+    /// learns to report a fold. The "before" side of closing the gap is
+    /// `a_clean_recovery_the_runtime_never_reports_still_escalates` in
+    /// `tests/epoch_stall_backfill_audit.rs`, which drives a real fold and flips
+    /// to asserting no escalation once the report lands.
+    #[test]
+    fn an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // One arm at 10, then the device is carried to 13 by advances the
+        // detector is never told about — the convergence fold reaches no
+        // `observe_*` call, so nothing between the arm and the next stall records
+        // 11, 12 or 13.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+
+        // The next stall is therefore the first observation since the arm, and it
+        // finds the detector still sitting at the epoch it armed at. The run
+        // continues even though the device passed through three epochs in between,
+        // and reaches its escalation threshold.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(13)),
+            BackfillDecision::Arm,
+            "an unobserved advance leaves the run open, so this is arm two"
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(14)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
         );
     }
 

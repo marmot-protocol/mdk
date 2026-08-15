@@ -199,6 +199,15 @@ pub enum MarmotKitError {
     GroupUnrecoverableRepairRequired { group_id_hex: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
+    /// The account worker is completing an exclusive catch-up and definitely
+    /// did not start this operation. Safe to retry after the worker becomes
+    /// available.
+    #[error("marmot account worker is busy catching up; operation was not started")]
+    AccountWorkerBusy,
+    /// The worker response exceeded its operation-class deadline. The command
+    /// may have completed, so refresh authoritative state before retrying.
+    #[error("marmot account worker response timed out; operation completion is unknown")]
+    AccountWorkerResponseTimedOut,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -277,6 +286,8 @@ impl From<AppError> for MarmotKitError {
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeBusy => Self::RuntimeBusy,
             AppError::AccountSessionBusy => Self::AccountSessionBusy,
+            AppError::AccountWorkerBusy => Self::AccountWorkerBusy,
+            AppError::AccountWorkerResponseTimedOut => Self::AccountWorkerResponseTimedOut,
             AppError::AccountSetupRecoveryRequired => Self::AccountSetupRecoveryRequired,
             AppError::AccountSetupRetryRequired => Self::AccountSetupRetryRequired,
             AppError::AccountSetupResetNotApplicable => Self::AccountSetupResetNotApplicable,
@@ -705,6 +716,18 @@ mod tests {
         assert!(matches!(
             MarmotKitError::from(AppError::AccountSetupKeyPackageRecoveryAvailable),
             MarmotKitError::AccountSetupKeyPackageRecoveryAvailable
+        ));
+    }
+
+    #[test]
+    fn account_worker_availability_crosses_ffi_without_losing_retry_semantics() {
+        assert!(matches!(
+            MarmotKitError::from(AppError::AccountWorkerBusy),
+            MarmotKitError::AccountWorkerBusy
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::AccountWorkerResponseTimedOut),
+            MarmotKitError::AccountWorkerResponseTimedOut
         ));
     }
 

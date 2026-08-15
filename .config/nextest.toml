@@ -28,10 +28,19 @@ leak-timeout = "500ms"
 # Reduced concurrency for the subprocess-heavy CLI end-to-end tests. Tunable: 1
 # fully serializes them, higher trades isolation for wall-clock.
 cli-e2e = { max-threads = 2 }
+# Each process-orchestrator test starts multiple application nodes and local
+# relays. Running those tests against each other can starve relay publication
+# admission long enough to trip the action-correlation timeout even though the
+# same scenario is stable in isolation.
+process-orchestrator = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(wn-cli) & binary(cli)'
 test-group = 'cli-e2e'
+
+[[profile.default.overrides]]
+filter = 'package(cgka-conformance-simulator) & binary(process_orchestrator)'
+test-group = 'process-orchestrator'
 
 # CI profile (`cargo nextest run --profile ci`).
 #

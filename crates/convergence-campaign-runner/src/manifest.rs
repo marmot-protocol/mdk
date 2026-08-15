@@ -64,6 +64,11 @@ pub struct ContainerBackendV1 {
     /// isolated OCI network. This exception is never inferred or defaulted on.
     #[serde(default)]
     pub allow_cleartext_isolated_relay: bool,
+    /// Mount a runner-owned file control plane into the campaign relay so
+    /// action-addressed retained events can be hidden and restored without
+    /// weakening the canonical scenario.
+    #[serde(default)]
+    pub enable_retained_relay_control: bool,
     pub default_participant_image: String,
     pub relay_image: String,
     #[serde(default = "default_relay_command")]
@@ -291,6 +296,15 @@ impl DistributedCampaignManifestV1 {
                     return Err(RunnerError::validation(
                         "container_image_or_command",
                         "container images and argv commands must be non-empty",
+                    ));
+                }
+                if container.enable_retained_relay_control
+                    && container.relay_command.first().map(String::as_str)
+                        != Some("cgka-conformance-relay")
+                {
+                    return Err(RunnerError::validation(
+                        "retained_relay_control_command",
+                        "file-backed retained relay control requires the repo-owned cgka-conformance-relay command",
                     ));
                 }
                 if !container.allow_mutable_image_references

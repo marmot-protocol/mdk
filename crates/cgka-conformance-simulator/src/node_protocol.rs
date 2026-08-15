@@ -22,7 +22,9 @@ use tokio::io::{
 };
 use tokio::sync::broadcast;
 
-use crate::app_runtime::{opaque_public_identity, public_protocol_projection};
+use crate::app_runtime::{
+    accept_group_invite_retrying_busy, opaque_public_identity, public_protocol_projection,
+};
 use crate::{
     AppRuntimeApplicationProjectionV1, AppRuntimeProtocolProjectionV1, SubjectFailureCategory,
 };
@@ -706,9 +708,7 @@ async fn accept_active_invite(state: &mut NodeRuntimeState) -> Result<(), NodeEr
         .map_err(app_node_error)?
         .is_some_and(|group| group.pending_confirmation)
     {
-        state
-            .runtime
-            .accept_group_invite(&state.account_id, &group_id)
+        accept_group_invite_retrying_busy(&state.runtime, &state.account_id, &group_id)
             .await
             .map_err(app_node_error)?;
     }
@@ -1052,8 +1052,12 @@ trait IntoAppNodeError {
 impl IntoAppNodeError for AppError {
     fn into_node_error(self) -> NodeErrorV1 {
         let retryable = is_retryable_app_error(&self);
+        let resource_failure =
+            retryable || matches!(&self, AppError::AccountWorkerResponseTimedOut);
         let code = match self {
             AppError::AccountSessionBusy => "account_session_busy",
+            AppError::AccountWorkerBusy => "account_worker_busy",
+            AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
             AppError::RuntimeBusy => "runtime_busy",
             AppError::RuntimeStopping => "runtime_stopping",
             AppError::TransportClosed => "transport_closed",
@@ -1064,7 +1068,7 @@ impl IntoAppNodeError for AppError {
         };
         NodeErrorV1 {
             code: code.into(),
-            category: if retryable {
+            category: if resource_failure {
                 SubjectFailureCategory::Resource
             } else {
                 SubjectFailureCategory::Environment
@@ -1090,6 +1094,7 @@ fn is_retryable_app_error(error: &AppError) -> bool {
     matches!(
         error,
         AppError::AccountSessionBusy
+            | AppError::AccountWorkerBusy
             | AppError::RuntimeBusy
             | AppError::RuntimeStopping
             | AppError::TransportClosed
