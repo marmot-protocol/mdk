@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-14
+updated: 2026-08-15
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -168,8 +168,33 @@ Accordingly, `incident_corpus` is false until a lane has a real, reviewed incide
 Every lane defines maximum wall time, CPU time, peak RSS, disk use, artifact bytes, artifact retention, flake retries,
 and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-usage JSON document and exits nonzero if
 any limit is exceeded. It also rejects zero executed cases, observations below the lane minimum, and flaky-case counts
-larger than executed-case counts. The scheduled workflows do not yet emit this aggregate observation or invoke
-`check-budget`; these limits are machine-checkable reviewed policy, not yet a green-workflow attestation.
+larger than executed-case counts. The nightly, weekly/manual, and release-hardening workflows wrap each lane command
+with `observe-step`, aggregate the private step records with `collect-observation`, then invoke `check-budget` even
+after an earlier failure. A failed wrapped command writes its step record before returning nonzero, so failure evidence
+is retained rather than replaced by a generic red workflow.
+
+On the scheduled Linux runner, each step records elapsed wall time, `wait4` user/system CPU, peak RSS, exit or signal,
+and a filesystem-block-write lower bound. Executed cases come from Nextest's experimental structured suite summaries;
+retry counts come from its retry-status records. The aggregate sums sequential step wall/CPU time and case/retry
+counts, takes the maximum per-step RSS, and measures final regular-file bytes below the declared working and retained
+artifact roots without following symlinks. These are deliberately bounded observations: setup/tool installation,
+GitHub upload time, peak transient Docker disk use, non-Nextest case notions, and the collector's own metadata bytes are
+not included; process usage also excludes work performed outside the command's child tree, such as the Docker daemon.
+Non-Unix observations lack required CPU/RSS fields and therefore cannot satisfy scheduled collection.
+The retained raw observation and budget decision live under `target/cgka-nightly-lane-evidence` or
+`target/cgka-hardening-lane-evidence` beside the per-step records.
+
+The scheduled workflows pin Nextest `0.9.104` because case and retry accounting depends on its structured suite and
+retry-status formats. Missing artifact roots contribute zero bytes so an early lane failure can still retain its
+aggregate; the disk root remains mandatory. A release manifest's `output_dir` must not equal or nest under the retained
+weekly, adversarial, or distributed-container roots, because overlapping roots would double-count bytes and are
+rejected.
+
+GitHub-hosted jobs have a six-hour execution ceiling. The weekly/manual wall budget is five hours and release
+hardening is five and a half hours, leaving the same job time to collect, evaluate, and upload failure evidence. A
+hardening workload that needs a longer reviewed budget must move to a runner whose execution ceiling can preserve
+equivalent evidence headroom; raising `timeout-minutes` above the hosted-runner limit does not do so.
+
 `minimum_executed_cases` is therefore only a liveness floor: it prevents empty evidence, but does not prove that every
 declared capability ran. Capability-specific evidence remains required before a lane can support an assurance claim.
 

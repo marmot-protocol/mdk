@@ -14,7 +14,7 @@ on:
           - weekly_manual
           - release_hardening
       distributed_manifest:
-        description: Repository-relative mixed-build manifest required by release hardening
+        description: Release manifest; output_dir must not nest under retained lane roots
         required: false
         type: string
 
@@ -29,12 +29,15 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  CGKA_LANE_EVIDENCE_DIR: ${{ github.workspace }}/target/cgka-hardening-lane-evidence
 
 jobs:
   hardening:
     name: Weekly or release convergence hardening
     runs-on: ubuntu-latest
-    timeout-minutes: 480
+    # GitHub-hosted jobs are capped at six hours. Lane wall budgets stay below
+    # this ceiling so collection, enforcement, and upload retain headroom.
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
@@ -51,6 +54,8 @@ jobs:
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cargo-nextest@0.9.104
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
@@ -60,16 +65,42 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      - name: Prepare private evidence roots
+        run: |
+          install -d -m 700 \
+            "$CGKA_LANE_EVIDENCE_DIR/steps" \
+            target/cgka-weekly-reliability \
+            target/cgka-adversarial-reliability-ci \
+            target/cgka-distributed-container-evidence
+
       - name: Build current distributed campaign image
-        run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name distributed-image-build \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/distributed-image-build.json" \
+            -- docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
       - name: Run weekly/manual lane
         if: github.event_name == 'schedule' || inputs.lane == 'weekly_manual'
         run: |
-          just convergence-weekly-lane
-          CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
-          CGKA_DISTRIBUTED_ARTIFACTS_DIR="${{ github.workspace }}/target/cgka-distributed-container-evidence" \
-            cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name weekly-core \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/weekly-core.json" \
+            -- just convergence-weekly-lane
+
+      - name: Run weekly/manual real-container campaigns
+        if: github.event_name == 'schedule' || inputs.lane == 'weekly_manual'
+        env:
+          CGKA_CONVERGENCE_IMAGE: marmot-conformance:local
+          CGKA_DISTRIBUTED_ARTIFACTS_DIR: ${{ github.workspace }}/target/cgka-distributed-container-evidence
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name weekly-container-campaigns \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/weekly-container-campaigns.json" \
+            -- cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
               --run-ignored ignored-only --no-tests fail
 
       - name: Require a release manifest
@@ -84,7 +115,53 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
         env:
           DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
-        run: just convergence-release-hardening-lane "$DISTRIBUTED_MANIFEST"
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name release-hardening-core \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/release-hardening-core.json" \
+            -- just convergence-release-hardening-lane "$DISTRIBUTED_MANIFEST"
+
+      - name: Collect weekly/manual lane observation
+        if: always() && (github.event_name == 'schedule' || inputs.lane == 'weekly_manual')
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            collect-observation \
+            --step-dir "$CGKA_LANE_EVIDENCE_DIR/steps" \
+            --artifact-root target/cgka-weekly-reliability \
+            --artifact-root target/cgka-adversarial-reliability-ci \
+            --artifact-root target/cgka-distributed-container-evidence \
+            --disk-root target \
+            --output "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json"
+
+      - name: Enforce weekly/manual lane budget
+        if: always() && (github.event_name == 'schedule' || inputs.lane == 'weekly_manual')
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            check-budget weekly_manual "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
+            --output "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json"
+
+      - name: Collect release-hardening lane observation
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        env:
+          DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            collect-observation \
+            --step-dir "$CGKA_LANE_EVIDENCE_DIR/steps" \
+            --artifact-root target/cgka-weekly-reliability \
+            --artifact-root target/cgka-adversarial-reliability-ci \
+            --artifact-root target/cgka-distributed-container-evidence \
+            --campaign-manifest "$DISTRIBUTED_MANIFEST" \
+            --disk-root target \
+            --output "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json"
+
+      - name: Enforce release-hardening lane budget
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            check-budget release_hardening "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
+            --output "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json"
 
       - name: Upload convergence evidence inputs
         if: always()
@@ -95,5 +172,6 @@ jobs:
             target/cgka-weekly-reliability
             target/cgka-adversarial-reliability-ci
             target/cgka-distributed-container-evidence
+            target/cgka-hardening-lane-evidence
           if-no-files-found: warn
           retention-days: ${{ inputs.lane == 'release_hardening' && 180 || 60 }}

@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-14
+updated: 2026-08-15
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -1108,7 +1108,7 @@ and VM-execution layer; MDK owns canonical scenario meaning and assertions:
 - [x] Define and wire a weekly/manual lane for process/container soak plus resource and constant sweeps.
 - [x] Define and wire a release-hardening lane that requires an explicit mixed-build manifest.
 - [x] Define wall-clock, CPU, memory, disk, artifact-retention, and flake budgets for every lane.
-- [ ] Collect aggregate workflow-owned observations and invoke the reviewed budget evaluator in every scheduled lane.
+- [x] Collect aggregate workflow-owned observations and invoke the reviewed budget evaluator in every scheduled lane.
 - [ ] Execute a reviewed incident-derived corpus before setting any lane's `incident_corpus` capability to true.
 - [ ] Produce and review a byte-verified release evidence bundle from an actual release-hardening run.
 
@@ -1121,13 +1121,16 @@ lane. The conservative minimum case counts are liveness floors preventing empty 
 declared capability ran.
 
 The typed evaluator rejects zero-case observations, inconsistent flaky-case counts, work below the lane minimum, and
-wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. It is not yet fed by a workflow-owned
-observation collector, so workflow enforcement and the resource/flake exit gate remain open. Evidence
-bundles require a nonempty artifact set; `check-evidence` recomputes the budget result from its observation and the
-reviewed lane policy, resolves each relative artifact path beside the bundle, and verifies its SHA-256 bytes. A policy
-test also pins each workflow artifact-retention setting to the corresponding lane manifest. The remaining
+wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. Scheduled Linux workflows now record each
+wrapped lane command's elapsed time, `wait4` process use, Nextest suite/retry counts, and exit status; the collector
+combines those records with final working-tree and retained-artifact sizes, and the workflow uploads both the raw
+observation and evaluator result. Final regular-file sizes are not peak transient Docker use, and the Nextest-derived
+case floor is not a capability-completeness claim. Evidence bundles require a nonempty artifact set;
+`check-evidence` recomputes the budget result from its observation and the reviewed lane policy, resolves each relative
+artifact path beside the bundle, and verifies its SHA-256 bytes. A policy test also pins each workflow
+artifact-retention setting to the corresponding lane manifest. The remaining
 route/model/adapter/mutation/boundary/assumption fields are still producer-supplied scoped evidence rather than an
-automatic correctness attestation.
+automatic correctness attestation, so an actual reviewed release-hardening bundle remains open.
 
 ### 6.4 Failure corpus lifecycle
 
@@ -1294,7 +1297,11 @@ residual gap.
    on the squash-merge commit; the retained CI run and commit are the durable evidence, not machine-local timings,
    paths, logs, or digests. This is a small targeted matrix, not a requirement to repeat the entire historical campaign.
    [MDK #1383](https://github.com/marmot-protocol/mdk/pull/1383) merged the gate at `fc3cae3e`.
-7. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
+7. [ ] Produce and review a byte-verified release evidence bundle from an actual release-hardening run.
+   - [x] Feed workflow-owned command/resource/case observations into every scheduled lane budget and retain the raw
+     observation plus evaluator result.
+   - [ ] Review an actual release-hardening run's scoped claims and digest-pinned artifacts, then publish its complete
+     evidence bundle; the workflow budget files alone are not that assurance artifact.
 8. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
 
@@ -1468,6 +1475,7 @@ incorrect result.
 | 2026-08-14 | Source-epoch application replay invariance | Reordered candidate and selected-branch replay so proposals and applications are authenticated at their source epoch before the commit advancing that epoch prunes required OpenMLS material. This closes the observed pass-partition-dependent delivery defect without broadening the adopted application-witness eligibility horizon. | [MDK #1423](https://github.com/marmot-protocol/mdk/pull/1423); one-pass versus split-pass six-advance regression; canonical-branch delivery and branch-witness tests |
 | 2026-08-14 | 6.1 isolated-process cross-route assurance | Extracted runner-owned reversible retained-relay control for reuse by app and process adapters, then executed the exact app-runtime four-party IR and digest through four child runtimes with separate encrypted roots. Replaced SIGSTOP offline simulation with public checkpoint plus graceful runtime/transport disconnect and durable reopen, preventing open subscriptions from buffering withheld events across the declared offline boundary. The strict process oracle pins the controlled split, canonical schedule, public terminal protocol/profile, complete duplicate-free application set, losing-branch withdrawal rule, no pending confirmation, and real Zeta reopen. Exact MLS state, durable input dispositions, and active decryptability remain unavailable through the public node protocol; container/VM and every-transition permutations remain open. No production engine or app behavior changed. | [MDK #1424](https://github.com/marmot-protocol/mdk/pull/1424); `four_party_cross_route_recovery_processes_match_unified_route`; `four_party_cross_route_recovery_process_equivalence_soak`; process-adapter capability preflight and focused simulator tests |
 | 2026-08-14 | 6.1 scheduled container cross-route checkpoint | Extracted the four-party public scenario and strict process-report oracle into one shared assurance fixture, selected that exact IR and digest through the distributed manifest, and added a real four-container checkpoint with one non-root participant container and encrypted root per member. A source-built local Docker run completed the exact checkpoint in 61.20 seconds with clean teardown. Nightly and weekly/manual workflows retain the exact scenario, normalized manifest, process report, distributed receipt, and failure corpus on success or failure; encrypted participant roots and the opaque-token relay control plane remain ephemeral. Exact engine-private evidence and VM/per-transition permutations remain open. | `container_manifest_selects_the_shared_four_party_cross_route_ir`; `four_party_cross_route_recovery_containers_match_unified_route`; `target/cgka-distributed-container-evidence` |
+| 2026-08-15 | 6.3 scheduled lane budget enforcement | Added workflow-owned command observation with Unix child resource accounting, structured Nextest case/retry counts, final working/artifact byte measurement, private raw evidence, and fail-closed nightly/weekly/release policy evaluation. Documented the lower-bound boundaries rather than treating the resulting budget pass as capability or release assurance; the first reviewed release-hardening evidence bundle remains open. | `observe-step`; `collect-observation`; `check-budget`; `lane_policy`; scheduled workflow wiring |
 
 ## Capability Naming Cleanup
 

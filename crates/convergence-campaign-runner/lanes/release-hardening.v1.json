@@ -17,7 +17,7 @@
     "incident_corpus": false
   },
   "budgets": {
-    "max_wall_clock_seconds": 28800,
+    "max_wall_clock_seconds": 19800,
     "max_cpu_seconds": 57600,
     "max_peak_rss_bytes": 12884901888,
     "max_disk_bytes": 53687091200,

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use convergence_campaign_runner::{
-    CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1, ConvergenceEvidenceBundleV1,
-    EvidenceArtifactV1, TestedBoundaryV1,
+    CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneStepObservationV1, CampaignLaneV1,
+    ConvergenceEvidenceBundleV1, EvidenceArtifactV1, TestedBoundaryV1,
 };
 use sha2::{Digest, Sha256};
 
@@ -71,6 +71,60 @@ fn workflow_artifact_retention_matches_lane_policy() {
         "name: convergence-hardening-${{ github.run_id }}",
         &format!("${{{{ inputs.lane == 'release_hardening' && {release} || {weekly} }}}}"),
     );
+}
+
+#[test]
+fn scheduled_workflows_collect_and_enforce_lane_observations() {
+    let nightly = include_str!("../../../.github/workflows/simulator-nightly.yml");
+    let hardening = include_str!("../../../.github/workflows/convergence-hardening.yml");
+
+    for (workflow, lane, evidence_dir) in [
+        (nightly, "nightly", "target/cgka-nightly-lane-evidence"),
+        (
+            hardening,
+            "weekly_manual",
+            "target/cgka-hardening-lane-evidence",
+        ),
+        (
+            hardening,
+            "release_hardening",
+            "target/cgka-hardening-lane-evidence",
+        ),
+    ] {
+        assert!(workflow.contains("observe-step"));
+        assert!(workflow.contains("collect-observation"));
+        assert!(workflow.contains(&format!("check-budget {lane}")));
+        assert!(workflow.contains("observed-usage.v1.json"));
+        assert!(workflow.contains("budget-evaluation.v1.json"));
+        assert!(workflow.contains(evidence_dir));
+        assert!(workflow.contains("tool: cargo-nextest@0.9.104"));
+    }
+    assert!(nightly.contains("timeout-minutes: 150"));
+    assert!(hardening.contains("timeout-minutes: 360"));
+    for lane in [
+        CampaignLaneV1::WeeklyManual,
+        CampaignLaneV1::ReleaseHardening,
+    ] {
+        let wall_budget_minutes = CampaignLaneConfigV1::builtin(lane)
+            .budgets
+            .max_wall_clock_seconds
+            / 60;
+        assert!(
+            wall_budget_minutes < 360,
+            "{lane} wall budget must leave evidence-collection headroom below the hosted-runner limit"
+        );
+    }
+    let release_collection = hardening
+        .split_once("- name: Collect release-hardening lane observation")
+        .expect("release collection step")
+        .1
+        .split_once("- name: Enforce release-hardening lane budget")
+        .expect("release enforcement step")
+        .0;
+    assert!(
+        release_collection.contains("--artifact-root target/cgka-distributed-container-evidence")
+    );
+    assert!(release_collection.contains("--campaign-manifest"));
 }
 
 fn assert_artifact_retention(workflow: &str, artifact_name: &str, expected: &str) {
@@ -146,6 +200,143 @@ fn budget_evaluation_reports_every_exceeded_dimension() {
     });
     assert!(!evaluation.passed);
     assert_eq!(evaluation.violations.len(), 7);
+}
+
+#[test]
+fn observer_and_collector_cli_write_private_machine_checkable_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let steps = root.path().join("steps");
+    let observed_step = steps.join("observer-smoke.json");
+    let observer = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-distributed-campaign"))
+        .args(["observe-step", "--name", "observer-smoke", "--output"])
+        .arg(&observed_step)
+        .args([
+            "--",
+            env!("CARGO_BIN_EXE_cgka-distributed-campaign"),
+            "lane",
+            "nightly",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        observer.status.success(),
+        "observer failed: {}",
+        String::from_utf8_lossy(&observer.stderr)
+    );
+    let observed: CampaignLaneStepObservationV1 =
+        serde_json::from_slice(&std::fs::read(&observed_step).unwrap()).unwrap();
+    assert!(observed.succeeded());
+    assert!(observed.user_cpu_us.is_some());
+    assert!(observed.system_cpu_us.is_some());
+    assert!(observed.peak_rss_bytes.is_some());
+
+    let artifact = root.path().join("artifacts");
+    let disk = root.path().join("disk");
+    std::fs::create_dir(&artifact).unwrap();
+    std::fs::create_dir(&disk).unwrap();
+    std::fs::write(artifact.join("report.json"), b"report").unwrap();
+    std::fs::write(disk.join("work.bin"), b"working-data").unwrap();
+
+    let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::Nightly);
+    let mut completed = observed;
+    completed.name = "completed-cases".into();
+    completed.executed_cases = config.contents.minimum_executed_cases;
+    completed
+        .write_private(&steps.join("completed.json"))
+        .unwrap();
+    std::fs::remove_file(observed_step).unwrap();
+
+    let usage = root.path().join("observed-usage.v1.json");
+    let collected = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-distributed-campaign"))
+        .args(["collect-observation", "--step-dir"])
+        .arg(&steps)
+        .arg("--artifact-root")
+        .arg(&artifact)
+        .arg("--disk-root")
+        .arg(&disk)
+        .arg("--output")
+        .arg(&usage)
+        .output()
+        .unwrap();
+    assert!(
+        collected.status.success(),
+        "collector failed: {}",
+        String::from_utf8_lossy(&collected.stderr)
+    );
+    let observation: CampaignLaneObservationV1 =
+        serde_json::from_slice(&std::fs::read(&usage).unwrap()).unwrap();
+    assert_eq!(
+        observation.executed_cases,
+        config.contents.minimum_executed_cases
+    );
+    assert_eq!(observation.artifact_bytes, 6);
+    assert_eq!(observation.disk_bytes, 12);
+
+    let evaluation = root.path().join("budget-evaluation.v1.json");
+    let checked = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-distributed-campaign"))
+        .args(["check-budget", "nightly"])
+        .arg(&usage)
+        .arg("--output")
+        .arg(&evaluation)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "budget check failed: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    #[cfg(unix)]
+    for path in [steps.join("completed.json"), usage, evaluation] {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn observer_persists_failure_status_before_returning_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let observation = root.path().join("failed-step.json");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-distributed-campaign"))
+        .args(["observe-step", "--name", "expected-failure", "--output"])
+        .arg(&observation)
+        .args([
+            "--",
+            env!("CARGO_BIN_EXE_cgka-distributed-campaign"),
+            "check-evidence",
+            "missing-evidence.json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let observed: CampaignLaneStepObservationV1 =
+        serde_json::from_slice(&std::fs::read(observation).unwrap()).unwrap();
+    assert!(!observed.succeeded());
+    assert!(observed.exit_code.is_some() || observed.signal.is_some());
+
+    let artifacts = root.path().join("artifacts");
+    let disk = root.path().join("disk");
+    std::fs::create_dir(&artifacts).unwrap();
+    std::fs::create_dir(&disk).unwrap();
+    let aggregate = root.path().join("failed-observed-usage.v1.json");
+    let collected = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-distributed-campaign"))
+        .args(["collect-observation", "--step-dir"])
+        .arg(root.path())
+        .arg("--artifact-root")
+        .arg(&artifacts)
+        .arg("--disk-root")
+        .arg(&disk)
+        .arg("--output")
+        .arg(&aggregate)
+        .output()
+        .unwrap();
+    assert!(!collected.status.success());
+    let aggregate: CampaignLaneObservationV1 =
+        serde_json::from_slice(&std::fs::read(aggregate).unwrap()).unwrap();
+    assert_eq!(aggregate.executed_cases, 0);
 }
 
 #[test]
