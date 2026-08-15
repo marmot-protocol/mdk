@@ -3241,6 +3241,7 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
         .send(SendIntent::Invite {
             group_id: created.group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3383,6 +3384,7 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
         .send(SendIntent::Invite {
             group_id: created.group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

@@ -1431,8 +1431,19 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         members: &[String],
     ) -> Result<SendSummary, AppError> {
+        self.invite_members_with_initial_admins(account_ref, group_id, members, &[])
+            .await
+    }
+
+    pub async fn invite_members_with_initial_admins(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        members: &[String],
+        initial_admins: &[String],
+    ) -> Result<SendSummary, AppError> {
         self.accounts
-            .invite_members(account_ref, group_id, members)
+            .invite_members_with_initial_admins(account_ref, group_id, members, initial_admins)
             .await
     }
 

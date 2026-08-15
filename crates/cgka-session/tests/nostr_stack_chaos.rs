@@ -783,6 +783,7 @@ async fn invite_carol(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_key_package],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

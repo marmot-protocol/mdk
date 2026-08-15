@@ -159,6 +159,7 @@ pub(crate) enum AccountWorkerCommand {
     InviteMembers {
         group_id: GroupId,
         members: Vec<String>,
+        initial_admins: Vec<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     RemoveMembers {
@@ -2406,13 +2407,18 @@ async fn handle_account_worker_command(
         AccountWorkerCommand::InviteMembers {
             group_id,
             members,
+            initial_admins,
             respond,
         } => {
             let telemetry = shared.app_performance_telemetry();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+                let admin_refs = initial_admins
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 client
-                    .invite_members_with_telemetry(&group_id, &member_refs, &telemetry)
+                    .invite_members_with_telemetry(&group_id, &member_refs, &admin_refs, &telemetry)
                     .await
             }
             .await;

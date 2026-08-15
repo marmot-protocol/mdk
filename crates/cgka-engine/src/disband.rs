@@ -377,13 +377,16 @@ impl<S: StorageProvider> Engine<S> {
 
         let guard = PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
-        let commit = self.stage_commit_with_app_data_updates(
-            &mut mls_group,
-            &provider,
-            removals,
-            proposals,
-            "disband",
-        )?;
+        let commit = self
+            .stage_commit_with_app_data_updates(
+                &mut mls_group,
+                &provider,
+                removals,
+                Vec::new(),
+                proposals,
+                "disband",
+            )?
+            .0;
         let staged = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("disband produced no pending commit".into()))?;

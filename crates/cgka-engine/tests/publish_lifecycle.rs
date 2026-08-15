@@ -451,6 +451,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -480,6 +481,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp2],
+            initial_admins: vec![],
         })
         .await
         .expect("post-rollback invite must succeed");
@@ -523,6 +525,7 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .expect_err("first invite should fail at transport wrapping");
@@ -538,6 +541,7 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp2],
+            initial_admins: vec![],
         })
         .await
         .expect("retry after wrap failure must not hit orphaned OpenMLS PendingCommit");
@@ -729,6 +733,7 @@ async fn create_publish_failed_drops_invitee_and_keeps_solo_alice() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![bob_kp2],
+            initial_admins: vec![],
         })
         .await
         .expect("post-rollback invite must succeed");
@@ -778,6 +783,7 @@ async fn double_confirm_and_confirm_after_fail_both_error_unknown_pending() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1549,6 +1555,7 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

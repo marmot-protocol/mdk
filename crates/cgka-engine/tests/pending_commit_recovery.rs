@@ -219,6 +219,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![carol_kp],
+                initial_admins: vec![],
             })
             .await
             .unwrap();
@@ -280,6 +281,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("post-recovery invite must succeed");

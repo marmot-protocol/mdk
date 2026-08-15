@@ -82,7 +82,11 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::Invite {
                 group_id,
                 key_packages,
-            } => self.do_send_invite(group_id, key_packages).await,
+                initial_admins,
+            } => {
+                self.do_send_invite(group_id, key_packages, initial_admins)
+                    .await
+            }
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
             }
@@ -110,6 +114,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         key_packages: Vec<cgka_traits::engine::KeyPackage>,
+        initial_admins: Vec<MemberId>,
     ) -> Result<SendResult, EngineError> {
         // Load group + require Stable.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -178,6 +183,36 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
 
+        let mut current_admins = Vec::new();
+        let mut resulting_admins = Vec::new();
+        let mut granted_admin_ids = Vec::new();
+        if !initial_admins.is_empty() {
+            let invitee_ids = parsed_kps
+                .iter()
+                .map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()))
+                .collect::<Result<Vec<_>, _>>()?;
+            current_admins = crate::app_components::admins_of_group(&mls_group)?;
+            resulting_admins = current_admins.clone();
+            let mut seen_grants = HashSet::new();
+            for admin in &initial_admins {
+                crate::identity::validate_credential_identity(admin.as_slice())?;
+                let pk = crate::app_components::admin_pubkey_from_member_id(admin)?;
+                if !invitee_ids.iter().any(|id| id == admin) {
+                    return Err(EngineError::Other(
+                        "initial admin must be among the invited members".into(),
+                    ));
+                }
+                if !seen_grants.insert(pk) {
+                    continue;
+                }
+                if resulting_admins.iter().any(|existing| existing == &pk) {
+                    continue;
+                }
+                resulting_admins.push(pk);
+                granted_admin_ids.push(admin.clone());
+            }
+        }
+
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
@@ -190,9 +225,32 @@ impl<S: StorageProvider> Engine<S> {
         // which is the right key for receivers to derive when peeling
         // (they're at the same pre-commit epoch when they decrypt the
         // wrap; only after they apply the inner commit do they advance).
-        let (commit_out, welcome_out, _gi) = mls_group
-            .add_members(&provider, &self.identity.signer, &parsed_kps)
-            .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+        // Empty `initial_admins` keeps the add-only OpenMLS path so Welcome
+        // fanout after confirm is unchanged. Non-empty grants couple the
+        // admin-policy update into the same Add commit (#1298).
+        let (commit_out, welcome_out) = if granted_admin_ids.is_empty() {
+            let (commit_out, welcome_out, _gi) = mls_group
+                .add_members(&provider, &self.identity.signer, &parsed_kps)
+                .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+            (commit_out, welcome_out)
+        } else {
+            let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                crate::app_components::encode_admin_policy(&resulting_admins)?,
+            )));
+            let (commit_out, welcome_out) = self.stage_commit_with_app_data_updates(
+                &mut mls_group,
+                &provider,
+                Vec::new(),
+                parsed_kps.clone(),
+                vec![admin_update],
+                "invite",
+            )?;
+            let welcome_out = welcome_out.ok_or_else(|| {
+                EngineError::Backend("invite-with-admin produced no Welcome".into())
+            })?;
+            (commit_out, welcome_out)
+        };
         let own_leaf_index = mls_group.own_leaf_index();
         let staged_commit = mls_group
             .pending_commit()
@@ -208,6 +266,18 @@ impl<S: StorageProvider> Engine<S> {
             self.identity.self_id(),
             self.ciphersuite,
         )?;
+        if !granted_admin_ids.is_empty() {
+            crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+                &mls_group,
+                &group_id,
+                staged_commit,
+            )?;
+            crate::app_components::validate_app_component_integrity_for_staged_commit(
+                &mls_group,
+                &group_id,
+                staged_commit,
+            )?;
+        }
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -310,16 +380,27 @@ impl<S: StorageProvider> Engine<S> {
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
         // Buffer the additions so confirm_published emits an attributed
         // GroupStateChanged (and the app a kind-1210 row) once the commit merges.
-        let added_changes = parsed_kps
+        let actor = Some(self.identity.self_id().clone());
+        let mut pending_changes = parsed_kps
             .iter()
             .filter_map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()).ok())
             .map(|member| crate::engine::PendingGroupStateChange {
-                actor: Some(self.identity.self_id().clone()),
+                actor: actor.clone(),
                 change: GroupStateChange::MemberAdded { member },
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if !granted_admin_ids.is_empty() {
+            pending_changes.extend(
+                crate::group_state_changes::admin_changes(&current_admins, &resulting_admins)
+                    .into_iter()
+                    .map(|change| crate::engine::PendingGroupStateChange {
+                        actor: actor.clone(),
+                        change,
+                    }),
+            );
+        }
         self.pending_state_changes
-            .insert(pending_ref, added_changes);
+            .insert(pending_ref, pending_changes);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
@@ -462,9 +543,11 @@ impl<S: StorageProvider> Engine<S> {
                 &mut mls_group,
                 &provider,
                 leaf_indices,
+                Vec::new(),
                 vec![admin_update],
                 "remove_members",
             )?
+            .0
         };
 
         let staged_commit = mls_group

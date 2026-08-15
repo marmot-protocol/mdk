@@ -978,6 +978,7 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1325,6 +1326,7 @@ async fn malformed_via_snapshot_fallback_is_rejected_and_does_not_wedge_ingest()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1709,6 +1711,7 @@ async fn welcome_before_commit_yields_already_at_epoch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2005,6 +2008,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()

@@ -1111,6 +1111,7 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1118,6 +1119,7 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1286,6 +1288,7 @@ async fn inbound_self_capability_mirror_failure_rolls_back_and_reschedules() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1293,6 +1296,7 @@ async fn inbound_self_capability_mirror_failure_rolls_back_and_reschedules() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

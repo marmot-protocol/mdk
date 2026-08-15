@@ -8670,6 +8670,111 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
+/// mdk#1298: inviting a member as admin is one group evolution. The invitee is
+/// an admin after the invite returns, without a follow-on promote_admin commit.
+#[tokio::test]
+async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "invite with admin",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let epoch_before = runtime
+        .group_roster(&alice_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
+
+    runtime
+        .invite_members_with_initial_admins(
+            &alice_id,
+            &group_id,
+            std::slice::from_ref(&carol_id),
+            std::slice::from_ref(&carol_id),
+        )
+        .await
+        .unwrap();
+
+    let roster = runtime.group_roster(&alice_id, &group_id).await.unwrap();
+    assert_eq!(
+        roster.epoch,
+        epoch_before.saturating_add(1),
+        "invite-with-admin must be a single epoch transition, not invite then promote"
+    );
+    let carol_member = roster
+        .members
+        .iter()
+        .find(|member| member.member_id_hex == carol_id)
+        .expect("invited member is in the local roster when invite returns");
+    assert!(
+        carol_member.is_admin,
+        "carol must be an admin after the invite commit, without promote_admin"
+    );
+    let bob_member = roster
+        .members
+        .iter()
+        .find(|member| member.member_id_hex == bob_id)
+        .expect("existing member remains in the roster");
+    assert!(!bob_member.is_admin, "bob was not granted admin");
+
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &carol_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let carol_roster = runtime.group_roster(&carol_id, &group_id).await.unwrap();
+    assert_eq!(carol_roster.epoch, roster.epoch);
+    assert!(
+        carol_roster
+            .members
+            .iter()
+            .any(|member| member.member_id_hex == carol_id && member.is_admin),
+        "invitee must observe their own admin grant from the Welcome commit"
+    );
+
+    runtime.shutdown().await;
+}
+
 /// mdk#1451: a rejected founding Welcome stays a single durable obligation
 /// across restart and is delivered exactly once after the worker resumes.
 #[tokio::test]

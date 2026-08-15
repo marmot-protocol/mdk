@@ -18,7 +18,7 @@ use cgka_traits::types::{EpochId, GroupId};
 use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
-use openmls::prelude::{LeafNodeIndex, MlsMessageOut};
+use openmls::prelude::{KeyPackage as MlsKeyPackage, LeafNodeIndex, MlsMessageOut};
 use openmls_traits::OpenMlsProvider;
 use std::collections::BTreeSet;
 use tls_codec::Serialize as _;
@@ -213,13 +213,16 @@ impl<S: StorageProvider> Engine<S> {
                 )))
             })
             .collect::<Vec<_>>();
-        let commit_out = self.stage_commit_with_app_data_updates(
-            &mut mls_group,
-            &provider,
-            Vec::new(),
-            proposals,
-            "app_data_update",
-        )?;
+        let commit_out = self
+            .stage_commit_with_app_data_updates(
+                &mut mls_group,
+                &provider,
+                Vec::new(),
+                Vec::new(),
+                proposals,
+                "app_data_update",
+            )?
+            .0;
         let staged_commit = mls_group.pending_commit().ok_or_else(|| {
             EngineError::Backend("app data update produced no pending commit".into())
         })?;
@@ -349,22 +352,25 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Stage (don't merge) a commit that carries `AppDataUpdate` proposals,
-    /// optionally alongside member removals, through the OpenMLS commit
+    /// optionally alongside member removals or adds, through the OpenMLS commit
     /// builder. Every `Update` and `Remove` proposal is mirrored into the
     /// resulting `app_data_dictionary` via the builder's dictionary updater,
     /// matching what recipients compute in
     /// [`crate::openmls_projection::process_commit_with_app_data_updates`].
-    /// Shared by the `UpdateAppComponents` path and the coupled admin-policy
-    /// removal path in `do_send_remove_members`. `context` prefixes error
-    /// messages so failures stay attributable to the calling intent.
+    /// Shared by the `UpdateAppComponents` path, the coupled admin-policy
+    /// removal path in `do_send_remove_members`, and invite-with-admin Adds.
+    /// `context` prefixes error messages so failures stay attributable to the
+    /// calling intent. Returns the commit and, when Adds were staged, the
+    /// Welcome.
     pub(crate) fn stage_commit_with_app_data_updates(
         &self,
         mls_group: &mut MlsGroup,
         provider: &EngineOpenMlsProvider<'_, S>,
         removals: Vec<LeafNodeIndex>,
+        adds: Vec<MlsKeyPackage>,
         proposals: Vec<Proposal>,
         context: &str,
-    ) -> Result<MlsMessageOut, EngineError> {
+    ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
         // Validate the proposal set as one operation. In particular, removal
         // legality is based on the resulting requirement list so one Commit
         // may atomically unrequire and remove an optional component.
@@ -378,6 +384,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut builder = mls_group
             .commit_builder()
             .propose_removals(removals)
+            .propose_adds(adds)
             .add_proposals(proposals)
             .load_psks(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
@@ -410,7 +417,7 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("{context} build: {e:?}")))?
             .stage_commit(provider)
             .map_err(|e| EngineError::Backend(format!("{context} stage: {e:?}")))?;
-        let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
-        Ok(commit_out)
+        let (commit_out, welcome_opt, _gi) = commit_bundle.into_messages();
+        Ok((commit_out, welcome_opt))
     }
 }

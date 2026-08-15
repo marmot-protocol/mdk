@@ -431,11 +431,15 @@ impl Marmot {
             .await?)
     }
 
+    /// Invite `member_refs` into an existing group. Pass the same refs in
+    /// `initial_admin_refs` to grant admin in the invite commit instead of a
+    /// follow-on promote. An empty `initial_admin_refs` keeps add-only invite.
     pub async fn invite_members(
         &self,
         account_ref: String,
         group_id_hex: String,
         member_refs: Vec<String>,
+        initial_admin_refs: Vec<String>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -444,7 +448,12 @@ impl Marmot {
         ensure_group_admin(&state, &group_id_hex)?;
         let summary = self
             .runtime
-            .invite_members(&account_ref, &group_id, &member_refs)
+            .invite_members_with_initial_admins(
+                &account_ref,
+                &group_id,
+                &member_refs,
+                &initial_admin_refs,
+            )
             .await?;
         Ok(summary.into())
     }
@@ -735,11 +744,14 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Same as [`Self::invite_members`], returning the post-mutation group
+    /// snapshot. `initial_admin_refs` grants admin in the invite commit.
     pub async fn invite_members_detailed(
         &self,
         account_ref: String,
         group_id_hex: String,
         member_refs: Vec<String>,
+        initial_admin_refs: Vec<String>,
     ) -> Result<GroupMutationResultFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -748,7 +760,12 @@ impl Marmot {
         ensure_group_admin(&state, &group_id_hex)?;
         let summary = self
             .runtime
-            .invite_members(&account_ref, &group_id, &member_refs)
+            .invite_members_with_initial_admins(
+                &account_ref,
+                &group_id,
+                &member_refs,
+                &initial_admin_refs,
+            )
             .await?;
         group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
             .await

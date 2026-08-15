@@ -1436,6 +1436,7 @@ impl HarnessClient {
             .send(SendIntent::Invite {
                 group_id: gid.clone(),
                 key_packages: kps,
+                initial_admins: vec![],
             })
             .await?;
         match res {

@@ -598,6 +598,7 @@ async fn invite_adds_third_member_and_advances_epoch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -651,6 +652,159 @@ async fn invite_adds_third_member_and_advances_epoch() {
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
     assert_eq!(bob.members(&group_id).unwrap().len(), 3);
     assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+}
+
+/// mdk#1298: inviting a member as admin is one GroupEvolution, one epoch
+/// bump, and the invitee is an admin after confirm — not invite then promote.
+#[tokio::test]
+async fn invite_with_initial_admin_grants_admin_in_the_invite_commit() {
+    let mut alice = build_client(b"invite-admin-alice");
+    let mut bob = build_client(b"invite-admin-bob");
+    let mut carol = build_client(b"invite-admin-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "invite-with-admin".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, create_pending) = match create_result {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    let epoch_before_invite = alice.epoch(&group_id).unwrap();
+    let alice_admin: [u8; 32] = alice
+        .self_id()
+        .as_slice()
+        .try_into()
+        .expect("alice identity is 32 bytes");
+    assert_eq!(alice.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite_result = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (commit, carol_welcome, inv_pending) = match invite_result {
+        SendResult::GroupEvolution {
+            msg,
+            mut welcomes,
+            pending,
+        } => (msg, welcomes.remove(0), pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    assert_eq!(
+        alice.epoch(&group_id).unwrap().0,
+        epoch_before_invite.0.saturating_add(1),
+        "invite-with-admin must be a single epoch transition"
+    );
+
+    alice.confirm_published(inv_pending).await.unwrap();
+    let carol_admin: [u8; 32] = carol
+        .self_id()
+        .as_slice()
+        .try_into()
+        .expect("carol identity is 32 bytes");
+    let mut expected_admins = vec![alice_admin, carol_admin];
+    expected_admins.sort();
+    let mut alice_admins = alice.admin_pubkeys(&group_id).unwrap();
+    alice_admins.sort();
+    assert_eq!(
+        alice_admins, expected_admins,
+        "carol must be an admin after the invite commit confirms"
+    );
+    let events = alice.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                cgka_traits::engine::GroupEvent::GroupStateChanged {
+                    change: cgka_traits::engine::GroupStateChange::AdminAdded { member },
+                    ..
+                } if member == &carol.self_id()
+            )
+        }),
+        "confirm should emit AdminAdded for the invited admin; events: {events:?}"
+    );
+
+    carol.join_welcome(carol_welcome).await.unwrap();
+    let mut carol_admins = carol.admin_pubkeys(&group_id).unwrap();
+    carol_admins.sort();
+    assert_eq!(carol_admins, expected_admins);
+
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
+    );
+    let mut bob_admins = bob.admin_pubkeys(&group_id).unwrap();
+    bob_admins.sort();
+    assert_eq!(bob_admins, expected_admins);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+    assert_eq!(bob.members(&group_id).unwrap().len(), 3);
+    assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn invite_rejects_initial_admin_who_is_not_an_invitee() {
+    let mut alice = build_client(b"invite-admin-reject-alice");
+    let mut bob = build_client(b"invite-admin-reject-bob");
+    let mut carol = build_client(b"invite-admin-reject-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "invite-admin-reject".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create_result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let err = alice
+        .send(SendIntent::Invite {
+            group_id,
+            key_packages: vec![carol_kp],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .expect_err("existing member who is not an invitee cannot be an invite initial admin");
+    assert!(
+        matches!(err, EngineError::Other(ref message) if message.contains("invited members")),
+        "expected invited-members coupling error, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -716,6 +870,7 @@ async fn strict_cutover_rejects_inbound_adds_to_legacy_groups_during_convergence
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -880,6 +1035,8 @@ async fn invite_rejects_invitee_missing_required_capability() {
         .send(SendIntent::Invite {
             group_id,
             key_packages: vec![stripped_kp],
+
+            initial_admins: vec![],
         })
         .await
         .err()
@@ -1687,6 +1844,7 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![bob_kp_2],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1886,6 +2044,7 @@ async fn non_admin_cannot_invite_members() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .err()
@@ -2937,6 +3096,7 @@ async fn leave_requires_stable_epoch_state() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

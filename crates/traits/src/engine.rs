@@ -125,6 +125,13 @@ pub enum SendIntent {
     Invite {
         group_id: GroupId,
         key_packages: Vec<KeyPackage>,
+        /// Admins granted in the same invite commit as the Adds.
+        ///
+        /// Each id must be among the invited members. Empty keeps the
+        /// add-only commit. The current admin set is preserved and these
+        /// invitees are appended.
+        #[serde(default)]
+        initial_admins: Vec<MemberId>,
     },
     /// Remove existing members from the group.
     RemoveMembers {

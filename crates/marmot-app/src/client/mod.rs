@@ -1342,7 +1342,7 @@ impl AppClient {
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
         let summary = self
-            .invite_members_with_optional_telemetry(group_id, member_refs, None)
+            .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
             .await?;
         self.drive_unpublished_welcome_delivery(None).await;
         Ok(summary)
@@ -1352,16 +1352,23 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         member_refs: &[&str],
+        initial_admin_refs: &[&str],
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_optional_telemetry(group_id, member_refs, Some(telemetry))
-            .await
+        self.invite_members_with_optional_telemetry(
+            group_id,
+            member_refs,
+            initial_admin_refs,
+            Some(telemetry),
+        )
+        .await
     }
 
     async fn invite_members_with_optional_telemetry(
         &mut self,
         group_id: &GroupId,
         member_refs: &[&str],
+        initial_admin_refs: &[&str],
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
@@ -1384,6 +1391,11 @@ impl AppClient {
         );
         let key_packages = key_packages?;
 
+        let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
+        for admin in initial_admin_refs {
+            initial_admins.push(self.app.member_id(admin)?);
+        }
+
         let routing_refresh_started_at = Instant::now();
         let routing_refresh = self.refresh_routing();
         record_app_performance(
@@ -1394,10 +1406,16 @@ impl AppClient {
         );
         routing_refresh?;
 
+        let mut affected_fields = vec!["members"];
+        let mut affected_components = Vec::new();
+        if !initial_admin_refs.is_empty() {
+            affected_fields.push("admins");
+            affected_components.push(GROUP_ADMIN_POLICY_COMPONENT_ID);
+        }
         let audit_context = Self::local_human_action_context(
             "invite_members",
-            vec!["members"],
-            Vec::new(),
+            affected_fields,
+            affected_components,
             Some(member_refs.len() as u64),
         );
 
@@ -1418,6 +1436,7 @@ impl AppClient {
                 SendIntent::Invite {
                     group_id: group_id.clone(),
                     key_packages,
+                    initial_admins,
                 },
                 audit_context.clone(),
             )

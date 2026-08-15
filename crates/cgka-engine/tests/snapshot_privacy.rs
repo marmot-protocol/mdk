@@ -170,6 +170,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

@@ -150,6 +150,7 @@ async fn ordinary_delivery_still_converges_when_the_transport_seals_per_epoch() 
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -239,6 +240,7 @@ async fn incumbent_adopts_a_deeper_rival_branch_whose_traffic_only_it_can_read()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -250,6 +252,7 @@ async fn incumbent_adopts_a_deeper_rival_branch_whose_traffic_only_it_can_read()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -274,6 +277,7 @@ async fn incumbent_adopts_a_deeper_rival_branch_whose_traffic_only_it_can_read()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()

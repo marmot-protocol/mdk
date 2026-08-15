@@ -324,6 +324,7 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
         .send(SendIntent::Invite {
             group_id: created.group_id.clone(),
             key_packages: vec![carol_key_package],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

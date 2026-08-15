@@ -1118,6 +1118,7 @@ async fn bob_sees_alice_caps_cached_after_invite_commit() {
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1422,6 +1423,8 @@ async fn invite_rejects_member_missing_required_role_capability() {
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id,
             key_packages: vec![bob_kp],
+
+            initial_admins: vec![],
         })
         .await
         .expect_err("bob lacks the required receive role capability at invite");

@@ -333,6 +333,7 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -340,6 +341,7 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -537,6 +539,7 @@ async fn strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![invitee_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1061,6 +1064,7 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![dave_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1159,6 +1163,7 @@ async fn stale_commit_without_own_commit_is_classified_as_already_at_epoch_not_f
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1251,6 +1256,7 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![duplicate_bob_kp],
+            initial_admins: vec![],
         })
         .await;
     assert!(
@@ -1266,6 +1272,7 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1309,6 +1316,7 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![erin_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("group must remain usable after failed staging + sibling commit");
@@ -1374,6 +1382,7 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1391,6 +1400,7 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1431,6 +1441,7 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![erin_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("group must remain usable after rolled-back publish + sibling commit");
@@ -1519,6 +1530,7 @@ async fn incumbent_committer_defers_to_deeper_convergence_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1526,6 +1538,7 @@ async fn incumbent_committer_defers_to_deeper_convergence_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1606,6 +1619,7 @@ async fn incumbent_committer_defers_to_deeper_convergence_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1761,6 +1775,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1775,6 +1790,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1851,6 +1867,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -1993,6 +2010,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -2007,6 +2025,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -2059,6 +2078,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![heidi_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -2108,6 +2128,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -2123,6 +2144,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![grace_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -2424,6 +2446,7 @@ async fn router_flip_fixture_arranged_with_creator(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![own_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -2435,6 +2458,7 @@ async fn router_flip_fixture_arranged_with_creator(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![sibling_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -3005,6 +3029,7 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
         .send(SendIntent::Invite {
             group_id: f.group_id.clone(),
             key_packages: vec![fresh_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -3264,6 +3289,7 @@ async fn committers_losing_rival_is_reconsidered_onto_the_fleets_deeper_branch()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -3279,6 +3305,7 @@ async fn committers_losing_rival_is_reconsidered_onto_the_fleets_deeper_branch()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()

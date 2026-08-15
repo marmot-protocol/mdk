@@ -771,6 +771,7 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1128,6 +1129,7 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1149,6 +1151,7 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

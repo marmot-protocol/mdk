@@ -461,6 +461,7 @@ async fn carol_behind_two_epochs_with<P>(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -473,6 +474,7 @@ async fn carol_behind_two_epochs_with<P>(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1270,6 +1272,7 @@ async fn pre_membership_application_message_is_terminal_not_deferred() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1372,6 +1375,7 @@ async fn rejoin_does_not_generalize_latest_welcome_into_pre_membership() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![rejoin_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
