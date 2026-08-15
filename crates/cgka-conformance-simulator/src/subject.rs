@@ -682,6 +682,7 @@ pub struct EngineHarnessSubject {
     active_scenario_group: Option<String>,
     scenario_groups: BTreeMap<String, GroupId>,
     pending_refs: HashMap<String, EngineSubjectPendingRef>,
+    client_incarnations: BTreeMap<String, u64>,
     convergence_clock: ManualConvergenceClock,
     outbound_cursors: HashMap<String, u64>,
     outbound_records: BTreeMap<u64, EngineSubjectOutboundRecord>,
@@ -702,12 +703,14 @@ fn sqlite_database_files(path: &std::path::Path) -> [std::path::PathBuf; 3] {
 #[derive(Clone)]
 struct EngineSubjectPendingRef {
     client: String,
+    client_incarnation: u64,
     pending: PendingStateRef,
 }
 
 #[derive(Clone)]
 struct EngineSubjectOutboundRecord {
     artifact: SubjectOutboundArtifact,
+    client_incarnation: u64,
     pending: Option<PendingStateRef>,
     queued_intent: Option<(GroupId, MessageId)>,
     resolution: Option<SubjectOutboundOutcome>,
@@ -870,6 +873,7 @@ impl EngineHarnessSubject {
             active_scenario_group: None,
             scenario_groups: BTreeMap::new(),
             pending_refs: HashMap::new(),
+            client_incarnations: clients.iter().map(|client| (client.clone(), 0)).collect(),
             convergence_clock,
             outbound_cursors: HashMap::new(),
             outbound_records: BTreeMap::new(),
@@ -1117,12 +1121,14 @@ impl EngineHarnessSubject {
         client: &str,
         pending_ref: PendingStateRef,
     ) -> Result<(), SubjectError> {
+        let client_incarnation = self.client_incarnation(client)?;
         if self
             .pending_refs
             .insert(
                 label.to_string(),
                 EngineSubjectPendingRef {
                     client: client.to_owned(),
+                    client_incarnation,
                     pending: pending_ref,
                 },
             )
@@ -1136,13 +1142,29 @@ impl EngineHarnessSubject {
         Ok(())
     }
 
-    fn publication_for_pending(&self, client: &str, pending: PendingStateRef) -> Option<String> {
+    fn client_incarnation(&self, client: &str) -> Result<u64, SubjectError> {
+        self.client_incarnations
+            .get(client)
+            .copied()
+            .ok_or_else(|| SubjectError::new("unknown_client", format!("unknown client {client}")))
+    }
+
+    fn publication_for_pending(
+        &self,
+        client: &str,
+        client_incarnation: u64,
+        pending: PendingStateRef,
+    ) -> Option<String> {
         self.pending_refs.iter().find_map(|(label, candidate)| {
-            (candidate.client == client && candidate.pending == pending).then(|| label.clone())
+            (candidate.client == client
+                && candidate.client_incarnation == client_incarnation
+                && candidate.pending == pending)
+                .then(|| label.clone())
         })
     }
 
     fn sync_client_outbound(&mut self, label: &str) -> Result<(), SubjectError> {
+        let client_incarnation = self.client_incarnation(label)?;
         let client = self.client(label)?;
         let bus_id = client.bus_id;
         let after_sequence = self.outbound_cursors.get(label).copied();
@@ -1155,8 +1177,9 @@ impl EngineHarnessSubject {
             let pending = self
                 .client(label)?
                 .pending_publication_for_message(&emission.msg.id);
-            let publication =
-                pending.and_then(|pending| self.publication_for_pending(label, pending));
+            let publication = pending.and_then(|pending| {
+                self.publication_for_pending(label, client_incarnation, pending)
+            });
             let queued_intent = self
                 .client(label)?
                 .regenerated_queued_intent_for_message(&emission.msg.id);
@@ -1182,6 +1205,7 @@ impl EngineHarnessSubject {
                         state_confirmation_required,
                         regenerated_queued_intent: queued_intent.is_some(),
                     },
+                    client_incarnation,
                     pending,
                     queued_intent,
                     resolution: None,
@@ -1195,11 +1219,13 @@ impl EngineHarnessSubject {
     fn mark_pending_outbound(
         &mut self,
         client: &str,
+        client_incarnation: u64,
         pending: PendingStateRef,
         outcome: SubjectOutboundOutcome,
     ) {
         for record in self.outbound_records.values_mut() {
             if record.artifact.client == client
+                && record.client_incarnation == client_incarnation
                 && record.pending == Some(pending)
                 && record.resolution.is_none()
             {
@@ -1208,18 +1234,30 @@ impl EngineHarnessSubject {
         }
     }
 
-    fn pending_confirmation_accepted(&self, client: &str, pending: PendingStateRef) -> bool {
+    fn pending_confirmation_accepted(
+        &self,
+        client: &str,
+        client_incarnation: u64,
+        pending: PendingStateRef,
+    ) -> bool {
         self.outbound_records.values().any(|candidate| {
             candidate.artifact.client == client
+                && candidate.client_incarnation == client_incarnation
                 && candidate.pending == Some(pending)
                 && candidate.artifact.state_confirmation_required
                 && candidate.resolution == Some(SubjectOutboundOutcome::Accepted)
         })
     }
 
-    fn pending_non_confirmation_accepted(&self, client: &str, pending: PendingStateRef) -> bool {
+    fn pending_non_confirmation_accepted(
+        &self,
+        client: &str,
+        client_incarnation: u64,
+        pending: PendingStateRef,
+    ) -> bool {
         self.outbound_records.values().any(|candidate| {
             candidate.artifact.client == client
+                && candidate.client_incarnation == client_incarnation
                 && candidate.pending == Some(pending)
                 && !candidate.artifact.state_confirmation_required
                 && candidate.resolution == Some(SubjectOutboundOutcome::Accepted)
@@ -1491,13 +1529,17 @@ impl ConvergenceSubject for EngineHarnessSubject {
             };
         }
 
-        let pending_already_confirmed = record
-            .pending
-            .is_some_and(|pending| self.pending_confirmation_accepted(client, pending));
+        let current_client_incarnation = self.client_incarnation(client)?;
+        let pending_belongs_to_current_incarnation =
+            record.client_incarnation == current_client_incarnation;
+        let pending_already_confirmed = record.pending.is_some_and(|pending| {
+            self.pending_confirmation_accepted(client, record.client_incarnation, pending)
+        });
 
         match outcome {
             SubjectOutboundOutcome::Accepted => {
                 if record.artifact.state_confirmation_required
+                    && pending_belongs_to_current_incarnation
                     && !pending_already_confirmed
                     && let Some(pending) = record.pending
                 {
@@ -1505,8 +1547,11 @@ impl ConvergenceSubject for EngineHarnessSubject {
                         .try_confirm(pending)
                         .await
                         .map_err(subject_engine_error)?;
-                    self.pending_refs
-                        .retain(|_, value| value.client != client || value.pending != pending);
+                    self.pending_refs.retain(|_, value| {
+                        value.client != client
+                            || value.client_incarnation != record.client_incarnation
+                            || value.pending != pending
+                    });
                 }
                 if let Some((_, intent_id)) = &record.queued_intent {
                     self.client_mut(client)?
@@ -1525,8 +1570,17 @@ impl ConvergenceSubject for EngineHarnessSubject {
                     .pending
                     .filter(|_| record.artifact.state_confirmation_required)
                     .is_some_and(|pending| {
-                        !self.pending_confirmation_accepted(client, pending)
-                            && self.pending_non_confirmation_accepted(client, pending)
+                        pending_belongs_to_current_incarnation
+                            && !self.pending_confirmation_accepted(
+                                client,
+                                record.client_incarnation,
+                                pending,
+                            )
+                            && self.pending_non_confirmation_accepted(
+                                client,
+                                record.client_incarnation,
+                                pending,
+                            )
                     })
                 {
                     return Err(SubjectError::new(
@@ -1540,18 +1594,25 @@ impl ConvergenceSubject for EngineHarnessSubject {
                     .pending
                     .filter(|_| record.artifact.state_confirmation_required)
                     .is_some_and(|pending| {
+                        if !pending_belongs_to_current_incarnation {
+                            return false;
+                        }
                         let another_confirmation_is_unresolved =
                             self.outbound_records
                                 .iter()
                                 .any(|(candidate_sequence, candidate)| {
                                     *candidate_sequence != outbound_sequence
                                         && candidate.artifact.client == client
+                                        && candidate.client_incarnation == record.client_incarnation
                                         && candidate.pending == Some(pending)
                                         && candidate.artifact.state_confirmation_required
                                         && candidate.resolution.is_none()
                                 });
-                        let confirmation_was_accepted =
-                            self.pending_confirmation_accepted(client, pending);
+                        let confirmation_was_accepted = self.pending_confirmation_accepted(
+                            client,
+                            record.client_incarnation,
+                            pending,
+                        );
                         !another_confirmation_is_unresolved && !confirmation_was_accepted
                     });
 
@@ -1567,9 +1628,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
                         .try_fail_publication(pending)
                         .await
                         .map_err(subject_publication_error)?;
-                    self.pending_refs
-                        .retain(|_, value| value.client != client || value.pending != pending);
-                    self.mark_pending_outbound(client, pending, outcome);
+                    self.pending_refs.retain(|_, value| {
+                        value.client != client
+                            || value.client_incarnation != record.client_incarnation
+                            || value.pending != pending
+                    });
+                    self.mark_pending_outbound(client, record.client_incarnation, pending, outcome);
                 } else {
                     self.bus
                         .retract_undelivered_publication(
@@ -1907,7 +1971,21 @@ impl ConvergenceSubject for EngineHarnessSubject {
     }
 
     fn restart(&mut self, client: &str) -> Result<(), SubjectError> {
+        // Capture every artifact emitted by the old engine before replacing
+        // it. `PendingStateRef` is process-local and may be reused by the new
+        // engine, so records must retain the incarnation that issued it.
+        self.sync_client_outbound(client)?;
         self.client_mut(client)?.restart();
+        let incarnation = self
+            .client_incarnation(client)?
+            .checked_add(1)
+            .ok_or_else(|| {
+                SubjectError::new("restart_overflow", "client restart counter exhausted")
+            })?;
+        self.client_incarnations
+            .insert(client.to_owned(), incarnation);
+        self.pending_refs
+            .retain(|_, pending| pending.client != client);
         Ok(())
     }
 
@@ -2607,6 +2685,61 @@ mod tests {
             "bob-second-name"
         );
         assert!(subject.pending_refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepted_publication_before_restart_cannot_confirm_reused_pending_ref() {
+        let labels = vec!["alice".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::TempFileBackedSqlite,
+        )
+        .expect("file-backed engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &[]).await;
+
+        async fn update_and_accept(subject: &mut EngineHarnessSubject, action_id: &str) {
+            subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id,
+                    client: "alice",
+                    name: Some(action_id),
+                    description: None,
+                    pending: action_id,
+                })
+                .await
+                .expect("group-data update produces pending publication");
+            let outbound = subject
+                .poll_outbound("alice")
+                .expect("group-data publication is pollable");
+            assert_eq!(outbound.len(), 1);
+            assert!(outbound[0].state_confirmation_required);
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &outbound[0].outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .expect("accepted publication confirms staged state");
+        }
+
+        update_and_accept(&mut subject, "before-restart").await;
+        subject
+            .restart("alice")
+            .expect("file-backed client restarts");
+
+        // The fresh engine starts issuing process-local pending references
+        // from the beginning. The second post-restart update therefore reuses
+        // the reference held by the accepted pre-restart publication.
+        update_and_accept(&mut subject, "after-restart-first").await;
+        update_and_accept(&mut subject, "after-restart-reused-ref").await;
+
+        assert_eq!(
+            subject.client("alice").expect("alice exists").group_name(),
+            "after-restart-reused-ref",
+            "an accepted artifact must confirm its own engine incarnation"
+        );
     }
 
     #[tokio::test]
