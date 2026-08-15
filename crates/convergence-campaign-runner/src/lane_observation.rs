@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CampaignLaneObservationV1, RunnerError, load_manifest};
 
+/// Schema version for one privately retained scheduled-lane step observation.
 pub const CAMPAIGN_LANE_STEP_OBSERVATION_VERSION: &str = "1";
 
+/// Resource, test-count, and termination evidence for one wrapped lane command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CampaignLaneStepObservationV1 {
     pub schema_version: String,
@@ -33,6 +35,7 @@ pub struct CampaignLaneStepObservationV1 {
 }
 
 impl CampaignLaneStepObservationV1 {
+    /// Validate the versioned step observation and its internal accounting.
     pub fn validate(&self) -> Result<(), RunnerError> {
         if self.schema_version != CAMPAIGN_LANE_STEP_OBSERVATION_VERSION {
             return Err(RunnerError::validation(
@@ -67,10 +70,12 @@ impl CampaignLaneStepObservationV1 {
         Ok(())
     }
 
+    /// Return whether the wrapped command exited successfully without a signal.
     pub fn succeeded(&self) -> bool {
         self.exit_code == Some(0) && self.signal.is_none()
     }
 
+    /// Validate and write this observation with owner-only permissions.
     pub fn write_private(&self, path: &Path) -> Result<(), RunnerError> {
         self.validate()?;
         create_private_parent(path)?;
@@ -81,6 +86,7 @@ impl CampaignLaneStepObservationV1 {
     }
 }
 
+/// Aggregate budget input plus names of wrapped commands that did not succeed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectedLaneObservationV1 {
     pub observation: CampaignLaneObservationV1,
@@ -133,10 +139,10 @@ impl NextestStats {
 
     fn record_retry_line(&mut self, line: &str) {
         let plain = strip_ansi(line);
-        let Some(marker) = plain.find("TRY ") else {
+        let Some(retry) = plain.trim_start().strip_prefix("TRY ") else {
             return;
         };
-        let mut fields = plain[marker + 4..].split_whitespace();
+        let mut fields = retry.split_whitespace();
         let Some(attempt) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
             return;
         };
@@ -178,6 +184,7 @@ impl NextestStats {
     }
 }
 
+/// Run one trusted argv command and capture its private lane-step evidence.
 pub fn observe_lane_step(
     name: String,
     command: &[OsString],
@@ -247,6 +254,10 @@ pub fn observe_lane_step(
     Ok(observation)
 }
 
+/// Aggregate wrapped steps and final filesystem sizes into a lane observation.
+///
+/// Missing artifact roots contribute zero bytes so early command failures can
+/// still retain an aggregate. Working-disk roots remain required.
 pub fn collect_lane_observation(
     step_dir: &Path,
     artifact_roots: &[PathBuf],
@@ -301,8 +312,8 @@ pub fn collect_lane_observation(
             wall_clock_seconds: micros_to_seconds_ceil(wall_clock_us),
             cpu_seconds: micros_to_seconds_ceil(cpu_us),
             peak_rss_bytes,
-            disk_bytes: measure_roots(disk_roots)?,
-            artifact_bytes: measure_roots(&artifact_roots)?,
+            disk_bytes: measure_roots(disk_roots, false)?,
+            artifact_bytes: measure_roots(&artifact_roots, true)?,
             executed_cases,
             flaky_cases,
             flake_retries,
@@ -311,6 +322,7 @@ pub fn collect_lane_observation(
     })
 }
 
+/// Write an aggregate budget observation with owner-only permissions.
 pub fn write_lane_observation_private(
     observation: &CampaignLaneObservationV1,
     path: &Path,
@@ -367,21 +379,29 @@ fn read_step_observations(
     Ok(steps)
 }
 
-fn measure_roots(roots: &[PathBuf]) -> Result<u64, RunnerError> {
+fn measure_roots(roots: &[PathBuf], allow_missing: bool) -> Result<u64, RunnerError> {
     let mut canonical = Vec::with_capacity(roots.len());
     for root in roots {
-        let metadata = fs::symlink_metadata(root)
-            .map_err(|error| RunnerError::environment("lane_observation_root", error))?;
+        let metadata = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(RunnerError::environment("lane_observation_root", error));
+            }
+        };
         if metadata.file_type().is_symlink() {
             return Err(RunnerError::validation(
                 "lane_observation_root_symlink",
                 "lane observation roots must not be symlinks",
             ));
         }
-        canonical.push(
-            fs::canonicalize(root)
-                .map_err(|error| RunnerError::environment("lane_observation_root", error))?,
-        );
+        match fs::canonicalize(root) {
+            Ok(root) => canonical.push(root),
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(RunnerError::environment("lane_observation_root", error));
+            }
+        }
     }
     canonical.sort();
     canonical.dedup();
@@ -618,6 +638,7 @@ mod tests {
         stats.record_line("TRY 2 PASS [ 0.1s] crate::tests flaky_case");
         stats.record_line("TRY 1 FAIL [ 0.1s] other::tests flaky_case");
         stats.record_line("TRY 3 PASS [ 0.1s] other::tests flaky_case");
+        stats.record_line("RETRY 9 PASS [ 0.1s] ordinary command output");
         assert_eq!(stats.executed_cases, 8);
         assert_eq!(stats.flaky_cases(), 2);
         assert_eq!(stats.flake_retries(), 3);
@@ -666,5 +687,16 @@ mod tests {
         assert_eq!(collected.observation.executed_cases, 7);
         assert_eq!(collected.observation.artifact_bytes, 4);
         assert!(collected.failed_steps.is_empty());
+    }
+
+    #[test]
+    fn missing_artifact_root_contributes_zero_but_missing_disk_root_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert_eq!(
+            measure_roots(std::slice::from_ref(&missing), true).unwrap(),
+            0
+        );
+        assert!(measure_roots(&[missing], false).is_err());
     }
 }

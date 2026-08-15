@@ -58,6 +58,9 @@ artifact and working-directory sizes into `observed-usage.v1.json`, and
 nightly workflow retains these files under
 `target/cgka-nightly-lane-evidence`; weekly/manual and release-hardening runs
 use `target/cgka-hardening-lane-evidence`.
+Release manifests must keep `output_dir` disjoint from the retained weekly,
+adversarial, and distributed-container artifact roots; nested roots are rejected
+to prevent double-counting.
 
 Failed distributed executions append a privacy-safe entry to the private
 `failure-corpus.v1.json` in the campaign output directory. `index-capsule` and

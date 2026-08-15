@@ -14,7 +14,7 @@ on:
           - weekly_manual
           - release_hardening
       distributed_manifest:
-        description: Repository-relative mixed-build manifest required by release hardening
+        description: Release manifest; output_dir must not nest under retained lane roots
         required: false
         type: string
 
@@ -35,7 +35,9 @@ jobs:
   hardening:
     name: Weekly or release convergence hardening
     runs-on: ubuntu-latest
-    timeout-minutes: 480
+    # GitHub-hosted jobs are capped at six hours. Lane wall budgets stay below
+    # this ceiling so collection, enforcement, and upload retain headroom.
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
@@ -52,6 +54,8 @@ jobs:
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cargo-nextest@0.9.104
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
@@ -147,6 +151,7 @@ jobs:
             --step-dir "$CGKA_LANE_EVIDENCE_DIR/steps" \
             --artifact-root target/cgka-weekly-reliability \
             --artifact-root target/cgka-adversarial-reliability-ci \
+            --artifact-root target/cgka-distributed-container-evidence \
             --campaign-manifest "$DISTRIBUTED_MANIFEST" \
             --disk-root target \
             --output "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json"

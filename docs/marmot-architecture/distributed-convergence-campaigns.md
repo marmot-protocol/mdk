@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-14
+updated: 2026-08-15
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -183,6 +183,17 @@ not included; process usage also excludes work performed outside the command's c
 Non-Unix observations lack required CPU/RSS fields and therefore cannot satisfy scheduled collection.
 The retained raw observation and budget decision live under `target/cgka-nightly-lane-evidence` or
 `target/cgka-hardening-lane-evidence` beside the per-step records.
+
+The scheduled workflows pin Nextest `0.9.104` because case and retry accounting depends on its structured suite and
+retry-status formats. Missing artifact roots contribute zero bytes so an early lane failure can still retain its
+aggregate; the disk root remains mandatory. A release manifest's `output_dir` must not equal or nest under the retained
+weekly, adversarial, or distributed-container roots, because overlapping roots would double-count bytes and are
+rejected.
+
+GitHub-hosted jobs have a six-hour execution ceiling. The weekly/manual wall budget is five hours and release
+hardening is five and a half hours, leaving the same job time to collect, evaluate, and upload failure evidence. A
+hardening workload that needs a longer reviewed budget must move to a runner whose execution ceiling can preserve
+equivalent evidence headroom; raising `timeout-minutes` above the hosted-runner limit does not do so.
 
 `minimum_executed_cases` is therefore only a liveness floor: it prevents empty evidence, but does not prove that every
 declared capability ran. Capability-specific evidence remains required before a lane can support an assurance claim.

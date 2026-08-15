@@ -97,7 +97,34 @@ fn scheduled_workflows_collect_and_enforce_lane_observations() {
         assert!(workflow.contains("observed-usage.v1.json"));
         assert!(workflow.contains("budget-evaluation.v1.json"));
         assert!(workflow.contains(evidence_dir));
+        assert!(workflow.contains("tool: cargo-nextest@0.9.104"));
     }
+    assert!(nightly.contains("timeout-minutes: 150"));
+    assert!(hardening.contains("timeout-minutes: 360"));
+    for lane in [
+        CampaignLaneV1::WeeklyManual,
+        CampaignLaneV1::ReleaseHardening,
+    ] {
+        let wall_budget_minutes = CampaignLaneConfigV1::builtin(lane)
+            .budgets
+            .max_wall_clock_seconds
+            / 60;
+        assert!(
+            wall_budget_minutes < 360,
+            "{lane} wall budget must leave evidence-collection headroom below the hosted-runner limit"
+        );
+    }
+    let release_collection = hardening
+        .split_once("- name: Collect release-hardening lane observation")
+        .expect("release collection step")
+        .1
+        .split_once("- name: Enforce release-hardening lane budget")
+        .expect("release enforcement step")
+        .0;
+    assert!(
+        release_collection.contains("--artifact-root target/cgka-distributed-container-evidence")
+    );
+    assert!(release_collection.contains("--campaign-manifest"));
 }
 
 fn assert_artifact_retention(workflow: &str, artifact_name: &str, expected: &str) {
