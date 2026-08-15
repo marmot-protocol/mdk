@@ -1050,9 +1050,13 @@ the app/process adapters cannot expose and the container/VM routes remain open b
     participant, resolves named publication boundaries to stable action ids after schedule mutation, and is selectable
     through the isolated app-runtime campaign path with strict per-case artifacts. A separate exact retained-engine
     family reuses the same isolated runner so panic-shaped failures cannot abort later catalog cases. The reviewed
-    seed-0 public catalog passed 12/12; the exact run passed 9/12: the three early Zeta publication-boundary restarts produced a structured `PendingPublish` refusal,
-    a `PendingPublish` panic, and an epoch-3/pending-work/decryptability stall; every later branch/repair boundary
-    passed. The exact semantic sequence and insertion index for every boundary are pinned by test, including the first
+    seed-0 public catalog passed 12/12. The initial exact run passed 9/12: the three early Zeta
+    publication-boundary restarts produced a structured `PendingPublish` refusal, a `PendingPublish` panic, and an
+    epoch-3/pending-work/decryptability stall. Minimization traced all three to the harness carrying process-local
+    `PendingStateRef` values across engine incarnations: a new publication could reuse an older accepted handle and
+    the adapter would skip the real confirmation. Incarnation-scoped bookkeeping removes that false match, and the
+    exact seed-0 catalog then passed 12/12 without a production engine change. The exact semantic sequence and
+    insertion index for every boundary are pinned by test, including the first
     full-history repair rather than the second settling round. Isolated-process execution reuses the catalog as an
     explicit manual test. Keep this item open until the permutations are carried through process/container/VM routes;
     exact evidence remains required on every adapter that can expose it.
@@ -1072,7 +1076,8 @@ The remaining 6.1 work is assurance closure, not another speculative engine rewr
 on `master`; after #1293 and #1403, the retained-engine reference settles and the corrected-input app-runtime route is
 held to the same public terminal protocol/profile/probe result. The isolated-process adapter now carries that same
 input contract and public oracle. The container checkpoint now consumes that shared contract; carry the restart
-catalog next into container/VM execution and diagnose the exact early-publication counterexamples. Do not project app/process/container public evidence
+catalog next into container/VM execution. The exact early-publication counterexamples were simulator false positives,
+not evidence for a production convergence rewrite. Do not project app/process/container public evidence
 into exact cryptographic, durable-disposition, or active-decryptability claims that those adapters cannot expose.
 
 Current exact seed-0 restart findings (generator version `1`):
@@ -1084,8 +1089,13 @@ Current exact seed-0 restart findings (generator version `1`):
 | `2` | `after-promote-yankee-accepted-zeta` | Zeta stayed at epoch 3 with pending work, quiescence timeout, and failed inbound decryptability | failure fingerprint `85a6e40f2db9ebf57caa689f423316bd293ebd6b6b1f2d42f88eaf47f7a66ca2`; input SHA-256 `25440d31481a4aa38b67d54dd3fecb21b334d0fb652edc100f3bde059098ed9c` |
 
 Cases `3` through `11` passed the exact state, profile, payload-multiset, pending-work, and twelve-direction active
-decryptability oracle. These digests identify the local discovery run; promote minimized regressions before fixing
-production behavior rather than treating a machine-local output directory as durable evidence.
+decryptability oracle in the discovery run. Minimization then proved that cases `0` through `2` shared a simulator
+identity defect: `PendingStateRef` is process-local, but accepted outbound records survived restart and were compared
+with raw handles from the new engine incarnation. The harness now scopes pending labels, outbound sibling decisions,
+confirmation, and rollback to the issuing incarnation. The focused reused-handle regression passes, followed by all
+12 exact seed-0 restart cases. No production convergence behavior changed. The failure digests above remain the
+historical discovery evidence; the post-fix local output directory is supporting evidence until the merge commit and
+its CI run provide the durable record.
 
 [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) merged the fail-closed missing-anchor behavior and
 Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) has now
@@ -1310,10 +1320,12 @@ residual gap.
    adapters, and complete application disposition remain open. The new bounded
    `cross-route-restart-permutations/v1` catalog makes twelve current-build durable/public transition points
    selectable through the isolated app-runtime campaign. Its `cross-route-exact-restart-permutations/v1` companion
-   isolates private-state cases. The complete public seed-0 catalog passed 12/12; the exact catalog passed 9/12 and localized failures to the three early Zeta
-   publication boundaries (`PendingPublish` refusal, `PendingPublish` panic, and epoch-3/pending/decryptability stall).
-   isolated-process permutations remain an explicit manual gate. Diagnosis/remediation
-   of the exact counterexample, and container/VM lowering remain open. The decision-route
+   isolates private-state cases. The complete public seed-0 catalog passed 12/12. The initial exact catalog passed
+   9/12 and localized failures to the three early Zeta publication boundaries (`PendingPublish` refusal,
+   `PendingPublish` panic, and epoch-3/pending/decryptability stall); minimized regression proved those were caused by
+   cross-incarnation reuse of process-local pending handles in the engine harness, and the corrected exact catalog
+   passed 12/12 without production behavior changes. Isolated-process permutations remain an explicit manual gate;
+   container/VM lowering remains open. The decision-route
    inventory is machine checked against the unified route.
 
    The reviewed twenty-trial process soak belongs to the #1424 merge snapshot. Later storage/runtime changes, including
@@ -1513,6 +1525,7 @@ incorrect result.
 | 2026-08-15 | 6.3 scheduled lane budget enforcement | Added workflow-owned command observation with Unix child resource accounting, structured Nextest case/retry counts, final working/artifact byte measurement, private raw evidence, and fail-closed nightly/weekly/release policy evaluation. Documented the lower-bound boundaries rather than treating the resulting budget pass as capability or release assurance; the first reviewed release-hardening evidence bundle remains open. | `observe-step`; `collect-observation`; `check-budget`; `lane_policy`; scheduled workflow wiring |
 | 2026-08-15 | 6.3 release evidence production path | Replaced the release lane's unprovisioned manifest-path input with an exact ancestor revision, two source-built content-addressed images, one runner-materialized canonical cross-route manifest, and deterministic evidence assembly. The assembler binds the reviewed claim to the canonical IR, normalized mixed-build execution, strict public oracle, successful receipt, raw lane observation, recomputed budget, and private digest-pinned artifact copies. No release assurance item closes until an actual workflow artifact is downloaded and reviewed. | `materialize-release-campaign`; `assemble-release-evidence`; `cross-route-mixed-build.v1.json`; release workflow contract tests |
 | 2026-08-15 | 6.1 durable-transition restart catalog | Added a bounded twelve-case current-build catalog over the shared four-party cross-route topology. The builder resolves named publication boundaries to adapter-supported action ids only after inserting each restart, keeping relay faults invariant as the schedule shifts; semantic sequence and insertion-index tests pin every boundary. Public cases run through the full app runtime with strict state/admin and order-insensitive exact-payload expectations; a separate exact retained-engine family uses isolated workers so one panic cannot abort later cases. The reviewed seed-0 public catalog passed 12/12. The exact catalog passed 9/12 and localized all failures to Zeta's three early accepted-publication boundaries: structured `PendingPublish`, panic from `PendingPublish`, and epoch-3/pending-work/decryptability stall. Structured failures wrote shareable capsules; the panic preserved exact input and exit 101 but no report/capsule. Every later branch/repair restart passed, including all four restarts after the corrected first repair round. Isolated-process cases share the catalog and bind every restart to a durable lifecycle event. This is discovery evidence, not a fix; diagnosis/remediation, process/container/VM execution, and complete app-input dispositions remain open. | `cross-route-restart-permutations/v1`; `cross-route-exact-restart-permutations/v1`; public seed-0 12/12; exact seed-0 9/12; failure capsules/digests; process catalog test |
+| 2026-08-15 | 6.1 exact-restart harness remediation | Minimized all three early Zeta failures to one simulator identity bug: `PendingStateRef` is process-local, while the harness retained accepted outbound records across restart and compared only the raw handle. A fresh engine could reuse that handle, causing the adapter to report transport acceptance but skip `confirm_published` for the new staged evolution. Pending labels and outbound sibling/confirmation/rollback decisions are now scoped by client incarnation, and old-incarnation transport outcomes cannot mutate new engine state. The focused reused-handle regression failed with the original `PendingPublish` panic before the fix and passes afterward; the exact seed-0 catalog moved from 9/12 to 12/12. No production engine, storage, app, or protocol behavior changed. | `accepted_publication_before_restart_cannot_confirm_reused_pending_ref`; `just cross-route-exact-restart-campaign 0 12`; simulator adapter only |
 
 ## Capability Naming Cleanup
 
