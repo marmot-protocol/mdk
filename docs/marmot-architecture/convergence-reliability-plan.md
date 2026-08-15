@@ -1128,9 +1128,14 @@ observation and evaluator result. Final regular-file sizes are not peak transien
 case floor is not a capability-completeness claim. Evidence bundles require a nonempty artifact set;
 `check-evidence` recomputes the budget result from its observation and the reviewed lane policy, resolves each relative
 artifact path beside the bundle, and verifies its SHA-256 bytes. A policy test also pins each workflow
-artifact-retention setting to the corresponding lane manifest. The remaining
-route/model/adapter/mutation/boundary/assumption fields are still producer-supplied scoped evidence rather than an
-automatic correctness attestation, so an actual reviewed release-hardening bundle remains open.
+artifact-retention setting to the corresponding lane manifest. A separately reviewed release claim now pins the
+campaign id, canonical scenario digest, route/model/adapter/mutation inventory, tested boundaries, assumptions, and
+untested surfaces. Release assembly validates that claim against the exact mixed-build manifest, normalized run,
+successful receipt, strict public process oracle, raw observation, recomputed budget, and required observed steps,
+then copies and digests the privacy-safe retained inputs into one owner-only bundle. A separate verification record
+binds the validated payload-bearing canonical scenario and raw process report by digest without copying their contents
+into the shareable bundle. The scoped claim remains human-authored rather than an automatic correctness attestation,
+and an actual downloaded and reviewed release-hardening bundle remains open.
 
 ### 6.4 Failure corpus lifecycle
 
@@ -1300,6 +1305,9 @@ residual gap.
 7. [ ] Produce and review a byte-verified release evidence bundle from an actual release-hardening run.
    - [x] Feed workflow-owned command/resource/case observations into every scheduled lane budget and retain the raw
      observation plus evaluator result.
+   - [x] Materialize the reviewed four-party campaign from one exact source revision and one distinct exact ancestor,
+     build both content-addressed images, and assemble a claim-pinned bundle only after the mixed-build manifest,
+     strict public oracle, successful receipt, observed steps, and recomputed release budget agree.
    - [ ] Review an actual release-hardening run's scoped claims and digest-pinned artifacts, then publish its complete
      evidence bundle; the workflow budget files alone are not that assurance artifact.
 8. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
@@ -1476,6 +1484,7 @@ incorrect result.
 | 2026-08-14 | 6.1 isolated-process cross-route assurance | Extracted runner-owned reversible retained-relay control for reuse by app and process adapters, then executed the exact app-runtime four-party IR and digest through four child runtimes with separate encrypted roots. Replaced SIGSTOP offline simulation with public checkpoint plus graceful runtime/transport disconnect and durable reopen, preventing open subscriptions from buffering withheld events across the declared offline boundary. The strict process oracle pins the controlled split, canonical schedule, public terminal protocol/profile, complete duplicate-free application set, losing-branch withdrawal rule, no pending confirmation, and real Zeta reopen. Exact MLS state, durable input dispositions, and active decryptability remain unavailable through the public node protocol; container/VM and every-transition permutations remain open. No production engine or app behavior changed. | [MDK #1424](https://github.com/marmot-protocol/mdk/pull/1424); `four_party_cross_route_recovery_processes_match_unified_route`; `four_party_cross_route_recovery_process_equivalence_soak`; process-adapter capability preflight and focused simulator tests |
 | 2026-08-14 | 6.1 scheduled container cross-route checkpoint | Extracted the four-party public scenario and strict process-report oracle into one shared assurance fixture, selected that exact IR and digest through the distributed manifest, and added a real four-container checkpoint with one non-root participant container and encrypted root per member. A source-built local Docker run completed the exact checkpoint in 61.20 seconds with clean teardown. Nightly and weekly/manual workflows retain the exact scenario, normalized manifest, process report, distributed receipt, and failure corpus on success or failure; encrypted participant roots and the opaque-token relay control plane remain ephemeral. Exact engine-private evidence and VM/per-transition permutations remain open. | `container_manifest_selects_the_shared_four_party_cross_route_ir`; `four_party_cross_route_recovery_containers_match_unified_route`; `target/cgka-distributed-container-evidence` |
 | 2026-08-15 | 6.3 scheduled lane budget enforcement | Added workflow-owned command observation with Unix child resource accounting, structured Nextest case/retry counts, final working/artifact byte measurement, private raw evidence, and fail-closed nightly/weekly/release policy evaluation. Documented the lower-bound boundaries rather than treating the resulting budget pass as capability or release assurance; the first reviewed release-hardening evidence bundle remains open. | `observe-step`; `collect-observation`; `check-budget`; `lane_policy`; scheduled workflow wiring |
+| 2026-08-15 | 6.3 release evidence production path | Replaced the release lane's unprovisioned manifest-path input with an exact ancestor revision, two source-built content-addressed images, one runner-materialized canonical cross-route manifest, and deterministic evidence assembly. The assembler binds the reviewed claim to the canonical IR, normalized mixed-build execution, strict public oracle, successful receipt, raw lane observation, recomputed budget, and private digest-pinned artifact copies. No release assurance item closes until an actual workflow artifact is downloaded and reviewed. | `materialize-release-campaign`; `assemble-release-evidence`; `cross-route-mixed-build.v1.json`; release workflow contract tests |
 
 ## Capability Naming Cleanup
 

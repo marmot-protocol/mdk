@@ -593,6 +593,17 @@ fn mutable_container_images_require_an_explicit_local_opt_out() {
         participant.container_image = Some(format!("marmot-conformance@sha256:{digest}"));
     }
     manifest.validate().unwrap();
+
+    let local_image_id = format!("sha256:{digest}");
+    let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+        unreachable!();
+    };
+    container.default_participant_image = local_image_id.clone();
+    container.relay_image = local_image_id.clone();
+    for participant in &mut manifest.participants {
+        participant.container_image = Some(local_image_id.clone());
+    }
+    manifest.validate().unwrap();
 }
 
 #[test]

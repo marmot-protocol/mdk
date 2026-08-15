@@ -12,6 +12,7 @@ pub mod lane_observation;
 pub mod manifest;
 pub mod plan;
 mod relay_file_control;
+pub mod release_evidence;
 pub mod runner;
 
 pub use evidence::*;
@@ -21,6 +22,7 @@ pub use lane_observation::*;
 pub use manifest::*;
 pub use plan::*;
 pub use relay_file_control::*;
+pub use release_evidence::*;
 pub use runner::*;
 
 /// Runner-owned DNS alias attached only to the campaign relay container.

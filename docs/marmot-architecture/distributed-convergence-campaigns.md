@@ -205,6 +205,43 @@ the evaluation from the recorded observation and reviewed lane policy instead of
 fields. It rejects incomplete bundles, parent-traversing artifact paths, missing files, and SHA-256 mismatches by
 resolving artifacts relative to the bundle's directory. Valid bundles are written with owner-only permissions.
 
+The release workflow's `baseline_revision` is an exact lowercase 40-character commit that must be a distinct ancestor
+of the workflow source revision. The workflow checks out and builds both exact trees, resolves their local images to
+content-addressed `sha256:<image-id>` references, and distributes the two builds across the canonical four-party
+cross-route participants. `materialize-release-campaign` owns the canonical scenario serialization and manifest, so a
+workflow does not reconstruct the action schedule or accept mutable image labels. The current-source image owns the
+runner-controlled relay; participant nodes alternate current and baseline images.
+
+The human-reviewed claim is versioned separately under
+`crates/convergence-campaign-runner/release-claims/`. It pins the campaign id, scenario name and canonical IR digest,
+scoped claim, route/model/adapter inventory, mutation catalog, tested boundaries, assumptions, and untested surfaces.
+After a passing run, `assemble-release-evidence` requires that claim to match the selected scenario; verifies the
+mixed-build manifest, normalized manifest, completed receipt, accepted commands, clean cleanup, and strict public
+process report; recomputes the release budget from the raw observation; and requires successful observed records for
+both image builds and the release-hardening core. The shareable bundle does not copy the canonical scenario or raw
+process report because they contain synthetic application payloads. Instead it retains their SHA-256 values in a
+privacy-safe public-oracle verification record after validating the raw bytes. The reviewed claim, manifests, receipt,
+lane observation, budget decision, and step records are copied beside the bundle and bound by SHA-256 before
+`check-evidence` accepts it. The payload-bearing raw files remain private in the broader workflow artifact.
+
+Dispatch from the exact source revision and name a reviewed ancestor:
+
+```sh
+gh workflow run convergence-hardening.yml \
+  --ref <40-character-source-revision> \
+  -f lane=release_hardening \
+  -f baseline_revision=<40-character-ancestor-revision>
+```
+
+The retained GitHub artifact is `convergence-hardening-<run-id>`. Its source path is
+`target/cgka-hardening-lane-evidence/release-bundle/convergence-evidence.v1.json`; after the multi-path Actions artifact
+is downloaded, the common `target/` prefix is omitted and the bundle is at
+`cgka-hardening-lane-evidence/release-bundle/convergence-evidence.v1.json`, with byte-pinned inputs in the sibling
+`artifacts/` directory. The broader raw campaign and lane outputs remain in the same uploaded artifact. Tooling and a
+green run do not close the release gate: an engineer must still download the artifact, rerun `check-evidence` against
+the retained bytes, review the claim and residual gaps, and record the run URL and exact revisions in the tracking
+plan.
+
 ## Failure corpus lifecycle
 
 Generated simulator failures already write a portable capsule, a minimized Scenario IR reproducer, and—when enabled—a

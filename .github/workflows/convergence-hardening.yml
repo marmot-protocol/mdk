@@ -13,8 +13,8 @@ on:
         options:
           - weekly_manual
           - release_hardening
-      distributed_manifest:
-        description: Release manifest; output_dir must not nest under retained lane roots
+      baseline_revision:
+        description: Exact 40-character ancestor commit used for mixed-build release hardening
         required: false
         type: string
 
@@ -30,6 +30,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CGKA_LANE_EVIDENCE_DIR: ${{ github.workspace }}/target/cgka-hardening-lane-evidence
+  DISTRIBUTED_MANIFEST: ${{ github.workspace }}/target/cgka-hardening-lane-evidence/release-inputs/distributed-manifest.v1.json
 
 jobs:
   hardening:
@@ -43,6 +44,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -81,6 +83,62 @@ jobs:
             --output "$CGKA_LANE_EVIDENCE_DIR/steps/distributed-image-build.json" \
             -- docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
+      - name: Require an exact release baseline revision
+        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        env:
+          BASELINE_REVISION: ${{ inputs.baseline_revision }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$BASELINE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "baseline_revision must be an exact lowercase 40-character commit" >&2
+            exit 1
+          fi
+          test "$BASELINE_REVISION" != "$GITHUB_SHA"
+          git cat-file -e "$BASELINE_REVISION^{commit}"
+          git merge-base --is-ancestor "$BASELINE_REVISION" "$GITHUB_SHA"
+
+      - name: Check out exact release baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          path: baseline-source
+          persist-credentials: false
+          ref: ${{ inputs.baseline_revision }}
+
+      - name: Build baseline distributed campaign image
+        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        env:
+          BASELINE_REVISION: ${{ inputs.baseline_revision }}
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline-source rev-parse HEAD)" = "$BASELINE_REVISION"
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name baseline-image-build \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/baseline-image-build.json" \
+            -- docker build \
+              -f baseline-source/Dockerfile.convergence-campaign \
+              -t marmot-conformance:baseline \
+              baseline-source
+
+      - name: Materialize reviewed mixed-build release campaign
+        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        env:
+          BASELINE_REVISION: ${{ inputs.baseline_revision }}
+        run: |
+          set -euo pipefail
+          current_image="$(docker image inspect --format '{{.Id}}' marmot-conformance:local)"
+          baseline_image="$(docker image inspect --format '{{.Id}}' marmot-conformance:baseline)"
+          release_input_dir="$CGKA_LANE_EVIDENCE_DIR/release-inputs"
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            materialize-release-campaign \
+            --output-dir "$release_input_dir" \
+            --current-revision "$GITHUB_SHA" \
+            --current-image "$current_image" \
+            --baseline-revision "$BASELINE_REVISION" \
+            --baseline-image "$baseline_image"
+
       - name: Run weekly/manual lane
         if: github.event_name == 'schedule' || inputs.lane == 'weekly_manual'
         run: |
@@ -103,18 +161,8 @@ jobs:
             -- cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
               --run-ignored ignored-only --no-tests fail
 
-      - name: Require a release manifest
-        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
-        env:
-          DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
-        run: |
-          test -n "$DISTRIBUTED_MANIFEST"
-          test -f "$DISTRIBUTED_MANIFEST"
-
       - name: Run release-hardening lane
         if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
-        env:
-          DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
         run: |
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             observe-step \
@@ -143,16 +191,18 @@ jobs:
 
       - name: Collect release-hardening lane observation
         if: always() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
-        env:
-          DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
         run: |
+          manifest_args=()
+          if [[ -f "$DISTRIBUTED_MANIFEST" ]]; then
+            manifest_args=(--campaign-manifest "$DISTRIBUTED_MANIFEST")
+          fi
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             collect-observation \
             --step-dir "$CGKA_LANE_EVIDENCE_DIR/steps" \
             --artifact-root target/cgka-weekly-reliability \
             --artifact-root target/cgka-adversarial-reliability-ci \
             --artifact-root target/cgka-distributed-container-evidence \
-            --campaign-manifest "$DISTRIBUTED_MANIFEST" \
+            "${manifest_args[@]}" \
             --disk-root target \
             --output "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json"
 
@@ -162,6 +212,22 @@ jobs:
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             check-budget release_hardening "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
             --output "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json"
+
+      - name: Assemble and verify release-hardening evidence bundle
+        if: success() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        run: |
+          bundle="$CGKA_LANE_EVIDENCE_DIR/release-bundle/convergence-evidence.v1.json"
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            assemble-release-evidence \
+            --claim crates/convergence-campaign-runner/release-claims/cross-route-mixed-build.v1.json \
+            --source-revision "$GITHUB_SHA" \
+            --manifest "$DISTRIBUTED_MANIFEST" \
+            --observation "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
+            --budget "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json" \
+            --step-dir "$CGKA_LANE_EVIDENCE_DIR/steps" \
+            --output "$bundle"
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            check-evidence "$bundle"
 
       - name: Upload convergence evidence inputs
         if: always()

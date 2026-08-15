@@ -1,0 +1,84 @@
+{
+  "schema_version": "1",
+  "lane": "release_hardening",
+  "campaign_id": "cross-route-mixed-build-v1",
+  "scenario_name": "cross-route-app-runtime-recovery/v1",
+  "canonical_ir_sha256": "1d416034df130ffeb7490c29c5ef9620ed0dce5a53aaf62bc00a2db74104dcc6",
+  "assurance_claim": "At the recorded source revision, the exact four-party canonical cross-route scenario completed through a mixed-build container run using the source revision and one exact ancestor build; the validated public process report reached one stable protocol and application projection, and the complete scheduled lane stayed within its reviewed resource and flake budgets.",
+  "covered_decision_routes": [
+    "ordinary_ingest",
+    "stored_convergence",
+    "retained_history_replay",
+    "crash_restart_recovery"
+  ],
+  "models": [
+    "canonical_scenario_ir_v2",
+    "cross_route_public_projection_oracle_v1",
+    "independent_reference_model",
+    "lifecycle_model"
+  ],
+  "adapters": [
+    "marmot_app_process",
+    "container_runner",
+    "retained_relay_control"
+  ],
+  "mutation_results": {
+    "app_witness_admission_removal": true,
+    "cutoff_boundary_admission": true,
+    "frozen_member_persistence": true,
+    "group_profile_projection": true,
+    "output_invalidation": true,
+    "provisional_winner_terminalization": true,
+    "publication_acknowledgement": true,
+    "retained_history_expiration_boundary": true,
+    "scheduler_deadline_rearm": true,
+    "selector_comparison_order": true,
+    "witness_sender_epoch_deduplication": true
+  },
+  "tested_boundaries": [
+    {
+      "dimension": "participants",
+      "minimum": "4",
+      "maximum": "4"
+    },
+    {
+      "dimension": "source_revisions",
+      "minimum": "2",
+      "maximum": "2"
+    },
+    {
+      "dimension": "content_addressed_participant_images",
+      "minimum": "2",
+      "maximum": "2"
+    },
+    {
+      "dimension": "retained_relay_topologies",
+      "minimum": "1",
+      "maximum": "1"
+    },
+    {
+      "dimension": "participant_restarts",
+      "minimum": "1",
+      "maximum": "1"
+    },
+    {
+      "dimension": "terminal_application_probes",
+      "minimum": "4",
+      "maximum": "4"
+    }
+  ],
+  "unresolved_counterexamples": [],
+  "residual_assumptions": [
+    "The selected ancestor build implements the same versioned node control and canonical Scenario IR contracts; incompatibility fails the run rather than being translated.",
+    "The source revision's mandatory pull-request formal gate is trusted by revision identity and is not rerun by the release-hardening workflow.",
+    "Mutation results are inherited from the exact release-hardening lane dependency and its successful observed step; this bundle does not retain a separate per-mutant transcript.",
+    "Eventual access to the complete runner-owned retained relay history is provided by the campaign topology."
+  ],
+  "untested_surfaces": [
+    "Exact MLS exporter-state equality through public process and container adapters.",
+    "Engine-private input dispositions unavailable through the public process protocol.",
+    "Restart permutations around every durable convergence transition.",
+    "VM-only kernel, filesystem, block-device latency, and host-isolation behavior.",
+    "Unbounded executions and incident-derived production corpora."
+  ]
+}

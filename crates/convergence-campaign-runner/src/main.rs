@@ -7,8 +7,9 @@ use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
     CampaignAdapterV1, CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1,
     ConvergenceEvidenceBundleV1, DistributedBackendV1, FailureClassificationV1,
-    INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, collect_lane_observation,
-    evidence_bundle_base_dir, load_manifest, observation_from_capsule, observe_lane_step,
+    INFRASTRUCTURE_COMMAND_TIMEOUT, assemble_release_evidence, build_execution_plan,
+    collect_lane_observation, evidence_bundle_base_dir, load_manifest,
+    materialize_release_campaign, observation_from_capsule, observe_lane_step,
     promote_capsule_into_corpus, run_manifest, update_failure_corpus, validate_scenario_bytes,
     verify_manifest_inputs, write_lane_observation_private,
 };
@@ -42,6 +43,19 @@ enum Commands {
     Doctor { manifest: PathBuf },
     /// Execute the campaign and write owner-only reports under output_dir.
     Run { manifest: PathBuf },
+    /// Write the shared mixed-build release scenario and manifest privately.
+    MaterializeReleaseCampaign {
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        current_revision: String,
+        #[arg(long)]
+        current_image: String,
+        #[arg(long)]
+        baseline_revision: String,
+        #[arg(long)]
+        baseline_image: String,
+    },
     /// Print or privately write the reviewed policy for an execution lane.
     Lane {
         lane: CampaignLaneV1,
@@ -79,6 +93,23 @@ enum Commands {
     },
     /// Validate that an evidence bundle contains every required assurance section.
     CheckEvidence { bundle: PathBuf },
+    /// Assemble a completed mixed-build run into a byte-verified evidence bundle.
+    AssembleReleaseEvidence {
+        #[arg(long)]
+        claim: PathBuf,
+        #[arg(long)]
+        source_revision: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        observation: PathBuf,
+        #[arg(long)]
+        budget: PathBuf,
+        #[arg(long)]
+        step_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Add an automatically written simulator capsule to the durable failure corpus.
     IndexCapsule {
         corpus: PathBuf,
@@ -191,6 +222,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("completed {}", receipt.campaign_id);
         }
+        Commands::MaterializeReleaseCampaign {
+            output_dir,
+            current_revision,
+            current_image,
+            baseline_revision,
+            baseline_image,
+        } => {
+            let manifest = materialize_release_campaign(
+                &output_dir,
+                &current_revision,
+                &current_image,
+                &baseline_revision,
+                &baseline_image,
+            )?;
+            println!("release-manifest {}", manifest.display());
+        }
         Commands::Lane { lane, output } => {
             let config = CampaignLaneConfigV1::builtin(lane);
             let bytes = serde_json::to_vec_pretty(&config)?;
@@ -261,6 +308,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::from_slice(&std::fs::read(&bundle_path)?)?;
             bundle.validate_artifacts(base_dir)?;
             println!("valid-evidence {}", bundle.source_revision);
+        }
+        Commands::AssembleReleaseEvidence {
+            claim,
+            source_revision,
+            manifest,
+            observation,
+            budget,
+            step_dir,
+            output,
+        } => {
+            let bundle = assemble_release_evidence(
+                &claim,
+                &source_revision,
+                &manifest,
+                &observation,
+                &budget,
+                &step_dir,
+                &output,
+            )?;
+            println!(
+                "release-evidence {} {}",
+                bundle.source_revision,
+                output.display()
+            );
         }
         Commands::IndexCapsule {
             corpus,

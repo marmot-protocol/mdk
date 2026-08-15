@@ -127,6 +127,30 @@ fn scheduled_workflows_collect_and_enforce_lane_observations() {
     assert!(release_collection.contains("--campaign-manifest"));
 }
 
+#[test]
+fn release_workflow_builds_exact_ancestor_image_and_verifies_one_bundle() {
+    let hardening = include_str!("../../../.github/workflows/convergence-hardening.yml");
+    for contract in [
+        "baseline_revision:",
+        "git merge-base --is-ancestor",
+        "test \"$(git -C baseline-source rev-parse HEAD)\" = \"$BASELINE_REVISION\"",
+        "--name baseline-image-build",
+        "docker image inspect --format '{{.Id}}' marmot-conformance:local",
+        "docker image inspect --format '{{.Id}}' marmot-conformance:baseline",
+        "materialize-release-campaign",
+        "assemble-release-evidence",
+        "release-claims/cross-route-mixed-build.v1.json",
+        "check-evidence \"$bundle\"",
+    ] {
+        assert!(
+            hardening.contains(contract),
+            "missing release contract: {contract}"
+        );
+    }
+    assert!(!hardening.contains("inputs.distributed_manifest"));
+    assert!(hardening.contains("if [[ -f \"$DISTRIBUTED_MANIFEST\" ]]"));
+}
+
 fn assert_artifact_retention(workflow: &str, artifact_name: &str, expected: &str) {
     let artifact_step = workflow
         .split_once(artifact_name)
