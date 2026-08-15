@@ -1002,18 +1002,26 @@ pub(crate) struct KeyPackageDeletionResult {
     pub result: Result<usize, AppError>,
 }
 
-/// Per-account unread aggregate, suitable for an account-switcher badge
-/// (mdk#461). Computed from each account's materialized chat-list
-/// projection without loading a full session/timeline, so it can be reported
-/// for accounts that are not the active/running one.
+/// Per-account unread aggregate, suitable for an account-switcher and
+/// application badge (mdk#461, mdk#1460). Computed from each account's
+/// materialized chat-list projection without loading a full session/timeline,
+/// so it can be reported for accounts that are not the active/running one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountUnread {
     pub account_id_hex: String,
     /// Total unread messages across all unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations with at least one unread message.
+    /// Number of unarchived conversations that require badge attention:
+    /// unread messages, a manual-unread reminder, or a pending invitation.
     pub unread_conversations: u64,
-    /// Whether the account has any unread message at all.
+    /// Conversations that contribute badge attention solely because they are
+    /// manually marked unread or pending confirmation. A row that already has
+    /// unread messages is omitted so hosts can compute
+    /// `unread_count + attention_only_conversations` without overlap.
+    #[serde(default)]
+    pub attention_only_conversations: u64,
+    /// Whether the account has any badge-worthy conversation, including a
+    /// manual-only reminder or pending invitation with no unread messages.
     pub has_unread: bool,
 }
 
@@ -2304,11 +2312,13 @@ impl MarmotApp {
             .map_err(chat_pin_error_from_storage)
     }
 
-    /// Per-account unread aggregate for the account-switcher badge
-    /// (mdk#461). Each account's count is read from its materialized
-    /// `chat_list_rows` projection (a single grouped `COUNT`/`SUM`), so this
-    /// does not require switching into, or loading a full session/timeline for,
-    /// any account — non-active accounts are reported too.
+    /// Per-account unread aggregate for the account-switcher and application
+    /// badge (mdk#461, mdk#1460). Each account's count is read from its
+    /// materialized `chat_list_rows` projection (a single grouped
+    /// `COUNT`/`SUM`), so this does not require switching into, or loading a
+    /// full session/timeline for, any account — non-active accounts are
+    /// reported too. `attention_only_conversations` covers pending invitations
+    /// and manual-only unread rows without overlapping unread-message totals.
     ///
     /// Only local-signing accounts are reported (matching `managed_accounts`).
     /// The chat-list projection is built from the on-disk store if missing;
@@ -2350,6 +2360,7 @@ impl MarmotApp {
             account_id_hex: account.account_id_hex.clone(),
             unread_count: total.unread_count,
             unread_conversations: total.unread_conversations,
+            attention_only_conversations: total.attention_only_conversations,
             has_unread: total.has_unread(),
         })
     }

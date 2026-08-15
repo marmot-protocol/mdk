@@ -3181,10 +3181,10 @@ impl MarmotAppRuntime {
         Ok(state)
     }
 
-    /// Per-account unread aggregate for the account-switcher badge
-    /// (mdk#461). Computed from each account's materialized chat-list
-    /// projection without loading a full session/timeline, so accounts that are
-    /// not the active/running one are reported too.
+    /// Per-account unread aggregate for the account-switcher and application
+    /// badge (mdk#461, mdk#1460). Computed from each account's materialized
+    /// chat-list projection without loading a full session/timeline, so
+    /// accounts that are not the active/running one are reported too.
     pub fn account_unread_summary(&self) -> Result<Vec<AccountUnread>, AppError> {
         self.accounts.app.account_unread_summary()
     }

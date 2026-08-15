@@ -15,18 +15,25 @@ pub struct AccountSummaryFfi {
     pub running: bool,
 }
 
-/// Per-account unread aggregate for the account-switcher badge
-/// (mdk#461). Computed from each account's materialized chat-list
-/// projection without loading a full session/timeline, so accounts that are
-/// not the active/running one are reported too.
+/// Per-account unread aggregate for the account-switcher and application
+/// badge (mdk#461, mdk#1460). Computed from each account's materialized
+/// chat-list projection without loading a full session/timeline, so accounts
+/// that are not the active/running one are reported too.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountUnreadFfi {
     pub account_id_hex: String,
     /// Total unread messages across all unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations with at least one unread message.
+    /// Number of unarchived conversations that require badge attention:
+    /// unread messages, a manual-unread reminder, or a pending invitation.
     pub unread_conversations: u64,
-    /// Whether the account has any unread message at all.
+    /// Conversations that contribute badge attention solely because they are
+    /// manually marked unread or pending confirmation. A row that already has
+    /// unread messages is omitted so hosts can compute
+    /// `unread_count + attention_only_conversations` without overlap.
+    pub attention_only_conversations: u64,
+    /// Whether the account has any badge-worthy conversation, including a
+    /// manual-only reminder or pending invitation with no unread messages.
     pub has_unread: bool,
 }
 
@@ -36,6 +43,7 @@ impl From<AccountUnread> for AccountUnreadFfi {
             account_id_hex: value.account_id_hex,
             unread_count: value.unread_count,
             unread_conversations: value.unread_conversations,
+            attention_only_conversations: value.attention_only_conversations,
             has_unread: value.has_unread,
         }
     }
@@ -283,6 +291,22 @@ mod tests {
     // A disposition the host cannot read is not a signal. #1177 is only closed
     // if `accepted_pending` survives the FFI boundary as a typed value rather
     // than being flattened away with the rest of the summary.
+    #[test]
+    fn badge_attention_crosses_ffi_without_overlapping_unread_totals() {
+        let ffi = AccountUnreadFfi::from(AccountUnread {
+            account_id_hex: "aa".repeat(32),
+            unread_count: 4,
+            unread_conversations: 3,
+            attention_only_conversations: 2,
+            has_unread: true,
+        });
+
+        assert_eq!(ffi.unread_count, 4);
+        assert_eq!(ffi.unread_conversations, 3);
+        assert_eq!(ffi.attention_only_conversations, 2);
+        assert!(ffi.has_unread);
+    }
+
     #[test]
     fn accepted_pending_crosses_ffi_as_a_typed_disposition() {
         let ffi = SendSummaryFfi::from(SendSummary {

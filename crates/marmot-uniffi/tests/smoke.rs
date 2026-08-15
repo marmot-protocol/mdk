@@ -249,6 +249,7 @@ async fn account_unread_summary_reports_local_accounts_without_session_load() {
     assert_eq!(entry.account_id_hex, account.account_id_hex);
     assert_eq!(entry.unread_count, 0);
     assert_eq!(entry.unread_conversations, 0);
+    assert_eq!(entry.attention_only_conversations, 0);
     assert!(!entry.has_unread);
 }
 
