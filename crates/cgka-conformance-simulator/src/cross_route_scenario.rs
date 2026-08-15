@@ -451,9 +451,11 @@ fn build_cross_route_app_runtime_recovery_scenario(
         steps.push(in_group(ScenarioStep::Observe {
             clients: clients.clone(),
         }));
-        steps.push(in_group(ScenarioStep::ObserveAdminPolicy {
-            clients: clients.clone(),
-        }));
+        if restart_permutation.is_some() {
+            steps.push(in_group(ScenarioStep::ObserveAdminPolicy {
+                clients: clients.clone(),
+            }));
+        }
     }
     if strict_engine_tail {
         steps.extend([
@@ -626,7 +628,7 @@ pub fn validate_cross_route_public_process_report(
             "process execution reported the wrong Scenario IR digest: {report:#?}"
         ));
     }
-    let expected_checkpoint_count = schedule
+    let checkpoint_actions = schedule
         .actions
         .iter()
         .filter(|action| {
@@ -637,7 +639,8 @@ pub fn validate_cross_route_public_process_report(
                     | ScenarioStep::ObserveAdminPolicy { .. }
             )
         })
-        .count();
+        .collect::<Vec<_>>();
+    let expected_checkpoint_count = checkpoint_actions.len();
     if spec.clients.is_empty()
         || expected_checkpoint_count < 4
         || report.observations.len() != spec.clients.len() * expected_checkpoint_count
@@ -670,10 +673,22 @@ pub fn validate_cross_route_public_process_report(
     }
     let baseline = &checkpoints[0];
     let routed = &checkpoints[1];
-    let first_settled = &checkpoints[checkpoints.len() - 2];
-    let settled = checkpoints
-        .last()
-        .expect("at least four checkpoints were required above");
+    let terminal_observe_indices = checkpoint_actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            matches!(&action.step, ScenarioStep::Observe { .. }).then_some(index)
+        })
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>();
+    let [settled_index, first_settled_index] = terminal_observe_indices.as_slice() else {
+        return Err(format!(
+            "canonical schedule lacks two terminal public observations: {report:#?}"
+        ));
+    };
+    let first_settled = &checkpoints[*first_settled_index];
+    let settled = &checkpoints[*settled_index];
     if routed["zeta"].protocol.epoch != 4
         || routed["alpha"].protocol.epoch != 4
         || routed["yankee"].protocol.epoch != 4
@@ -815,6 +830,11 @@ mod tests {
             .filter(|step| matches!(step, ScenarioStep::RestartClient { .. }))
             .count();
         assert_eq!(baseline_restarts, 1);
+        assert!(baseline.steps.iter().all(|step| !matches!(
+            step,
+            ScenarioStep::InGroup { action, .. }
+                if matches!(action.as_ref(), ScenarioStep::ObserveAdminPolicy { .. })
+        )));
 
         let variants = (0..CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64)
             .map(|case_index| cross_route_restart_permutation_public_scenario(0, case_index))
@@ -853,6 +873,20 @@ mod tests {
                     .count(),
                 baseline_restarts + 1,
                 "{} must add exactly one reviewed restart",
+                scenario.name
+            );
+            assert_eq!(
+                scenario
+                    .steps
+                    .iter()
+                    .filter(|step| matches!(
+                        step,
+                        ScenarioStep::InGroup { action, .. }
+                            if matches!(action.as_ref(), ScenarioStep::ObserveAdminPolicy { .. })
+                    ))
+                    .count(),
+                1,
+                "{} must carry the catalog-only portable admin observation",
                 scenario.name
             );
             let permutation_id = scenario
