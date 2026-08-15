@@ -142,6 +142,11 @@ pub fn build_scenario_oracle_report(
 ) -> ScenarioOracleReport {
     let stimuli = scenario_stimuli(spec);
     let mut oracle_behaviors = expected_behaviors(expected_trace, expected_outcomes);
+    for behavior in assertion_behaviors(spec) {
+        if !oracle_behaviors.contains(&behavior) {
+            oracle_behaviors.push(behavior);
+        }
+    }
     if spec
         .steps
         .iter()
@@ -149,8 +154,8 @@ pub fn build_scenario_oracle_report(
         && !oracle_behaviors.contains(&OracleBehavior::QuiescenceState)
     {
         oracle_behaviors.push(OracleBehavior::QuiescenceState);
-        oracle_behaviors.sort();
     }
+    oracle_behaviors.sort();
     let mut observed_behaviors = trace_behaviors(observed_trace);
     if expected_outcomes.iter().any(|expectation| {
         matches!(expectation, TraceExpectation::ClientsNotEquivalent { .. })
@@ -450,6 +455,36 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
     }
 
     stimuli.into_iter().collect()
+}
+
+/// Executable scenario assertions are oracle evidence. A positive payload-count
+/// check covers `AppMessage` without inventing a cross-sender `received_payloads`
+/// order, which MLS does not define.
+fn assertion_behaviors(spec: &ScenarioSpec) -> BTreeSet<OracleBehavior> {
+    let mut behaviors = BTreeSet::new();
+    for step in &spec.steps {
+        let mut step = step;
+        while let ScenarioStep::InGroup { action, .. } = step {
+            step = action.as_ref();
+        }
+        let ScenarioStep::Assert { assertion } = step else {
+            continue;
+        };
+        let predicate = match assertion {
+            crate::ScenarioAssertionV2::Exactly { predicate }
+            | crate::ScenarioAssertionV2::Eventually { predicate, .. }
+            | crate::ScenarioAssertionV2::Within { predicate, .. } => predicate,
+            crate::ScenarioAssertionV2::Never { .. }
+            | crate::ScenarioAssertionV2::Resource { .. } => continue,
+        };
+        if matches!(
+            predicate,
+            crate::ScenarioPredicateV2::PayloadCount { count, .. } if *count > 0
+        ) {
+            behaviors.insert(OracleBehavior::DeliveredPayload);
+        }
+    }
+    behaviors
 }
 
 pub fn expected_behaviors(
@@ -1017,6 +1052,108 @@ mod tests {
 
         assert!(behaviors.contains(&OracleBehavior::BidirectionalDecryptabilityObserved));
         assert!(behaviors.contains(&OracleBehavior::DeliveredPayload));
+    }
+
+    #[test]
+    fn positive_payload_count_assert_covers_app_message() {
+        let spec = ScenarioSpec {
+            name: "payload-count-covers-app".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into(), "carol".into()],
+            steps: vec![
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "eve-witness".into(),
+                },
+                ScenarioStep::Assert {
+                    assertion: crate::ScenarioAssertionV2::Exactly {
+                        predicate: crate::ScenarioPredicateV2::PayloadCount {
+                            client: "carol".into(),
+                            payload: "eve-witness".into(),
+                            count: 1,
+                        },
+                    },
+                },
+            ],
+        };
+        let report = build_scenario_oracle_report(&spec, None, &[], &trace(Vec::new()), &[]);
+        assert!(
+            report
+                .oracle_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "{report:#?}"
+        );
+        assert!(
+            report.weak_oracle_warnings.is_empty(),
+            "{:#?}",
+            report.weak_oracle_warnings
+        );
+    }
+
+    #[test]
+    fn zero_payload_count_assert_does_not_cover_app_message() {
+        let spec = ScenarioSpec {
+            name: "payload-absent-does-not-cover-app".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into(), "carol".into()],
+            steps: vec![
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "david-witness".into(),
+                },
+                ScenarioStep::Assert {
+                    assertion: crate::ScenarioAssertionV2::Exactly {
+                        predicate: crate::ScenarioPredicateV2::PayloadCount {
+                            client: "carol".into(),
+                            payload: "david-witness".into(),
+                            count: 0,
+                        },
+                    },
+                },
+            ],
+        };
+        let report = build_scenario_oracle_report(&spec, None, &[], &trace(Vec::new()), &[]);
+        assert!(
+            !report
+                .oracle_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .weak_oracle_warnings
+                .iter()
+                .any(|warning| warning.stimulus == ScenarioStimulus::AppMessage),
+            "{:#?}",
+            report.weak_oracle_warnings
+        );
+    }
+
+    #[test]
+    fn app_witness_value_family_covers_app_message_under_strict_oracle() {
+        let generated = crate::generate_adversarial_reliability_case(7, 9);
+        assert!(
+            generated.scenario.name.contains("app-witness-value"),
+            "{}",
+            generated.scenario.name
+        );
+        let report = build_scenario_oracle_report(
+            &generated.scenario,
+            None,
+            &generated.expected_outcomes,
+            &trace(Vec::new()),
+            &[],
+        );
+        assert!(
+            report
+                .weak_oracle_warnings
+                .iter()
+                .all(|warning| warning.stimulus != ScenarioStimulus::AppMessage),
+            "{:#?}",
+            report.weak_oracle_warnings
+        );
     }
 
     #[test]

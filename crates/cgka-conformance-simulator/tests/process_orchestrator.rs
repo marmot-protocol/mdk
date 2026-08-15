@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::process_orchestrator::{
-    ProcessNodeLaunchV1, ProcessOrchestrator, ProcessScenarioReportV1,
+    ProcessActionStatusV1, ProcessNodeLaunchV1, ProcessOrchestrator, ProcessScenarioReportV1,
 };
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeObservationV1, GeneratedScenarioCase, GeneratedScenarioInputV1,
@@ -94,10 +94,7 @@ fn process_scenario(name: &str, lifecycle: bool) -> ScenarioSpec {
             },
         ),
         ScenarioStep::AwaitQuiescence {
-            policy: cgka_conformance_simulator::QuiescencePolicy {
-                max_iterations: 100,
-                ..Default::default()
-            },
+            policy: Default::default(),
         },
         in_group(
             "main",
@@ -1157,9 +1154,21 @@ async fn process_failures_write_replayable_privacy_safe_capsules() {
     )
     .await
     .unwrap();
-    let report = orchestrator.run().await.unwrap();
-    assert!(!report.completed);
-    assert_eq!(report.failure_capsules.len(), 1);
+    let report = orchestrator.run().await.unwrap_or_else(|error| {
+        panic!("orchestrator-level failure before the expected process capsule: {error}");
+    });
+    let failed = report
+        .actions
+        .iter()
+        .find(|action| action.status == ProcessActionStatusV1::Failed)
+        .unwrap_or_else(|| panic!("process report has no failed action: {report:#?}"));
+    assert_eq!(
+        failed.action_type, "expect_update_admin_policy_error",
+        "failed action {} ({}) was not the expected process refusal: {report:#?}",
+        failed.action_id, failed.action_type
+    );
+    assert!(!report.completed, "{report:#?}");
+    assert_eq!(report.failure_capsules.len(), 1, "{report:#?}");
     let capsule_path = &report.failure_capsules[0];
     #[cfg(unix)]
     {
@@ -1177,13 +1186,20 @@ async fn process_failures_write_replayable_privacy_safe_capsules() {
     assert!(!encoded.contains(marker));
     let capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
         serde_json::from_str(&encoded).unwrap();
-    assert_eq!(capsule.participant, "alice");
+    assert_eq!(
+        capsule.participant, "alice",
+        "action_id={} code={}",
+        capsule.action_id, capsule.code
+    );
     assert!(
         capsule
             .action_id
-            .contains("expect_update_admin_policy_error")
+            .contains("expect_update_admin_policy_error"),
+        "action_id={} code={}",
+        capsule.action_id,
+        capsule.code
     );
-    assert_eq!(capsule.layer, "app_process");
+    assert_eq!(capsule.layer, "app_process", "code={}", capsule.code);
     assert!(!capsule.replay.steps.is_empty());
     assert!(!capsule.sensitive_data_included);
     orchestrator.shutdown().await;
@@ -1341,7 +1357,24 @@ fn process_cli_failure_report_keeps_capsules_after_exit() {
     assert!(!output.status.success());
     let report: cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1 =
         serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
-    assert!(!report.completed);
-    assert_eq!(report.failure_capsules.len(), 1);
+    assert!(!report.completed, "{report:#?}");
+    let failed = report
+        .actions
+        .iter()
+        .find(|action| action.status == ProcessActionStatusV1::Failed)
+        .unwrap_or_else(|| panic!("process report has no failed action: {report:#?}"));
+    assert_eq!(
+        failed.action_type, "expect_update_admin_policy_error",
+        "failed action {} ({}) was not the expected process refusal: {report:#?}",
+        failed.action_id, failed.action_type
+    );
+    assert_eq!(report.failure_capsules.len(), 1, "{report:#?}");
     assert!(report.failure_capsules[0].is_file());
+    let capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
+        serde_json::from_slice(&std::fs::read(&report.failure_capsules[0]).unwrap()).unwrap();
+    assert_eq!(
+        capsule.participant, "alice",
+        "action_id={} code={}",
+        capsule.action_id, capsule.code
+    );
 }

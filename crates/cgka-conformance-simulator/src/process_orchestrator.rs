@@ -582,19 +582,22 @@ impl ProcessOrchestrator {
                     status,
                 }),
                 Err((participant, error)) => {
-                    let capsule_path = self.write_failure_capsule(
-                        participant.as_deref().unwrap_or("orchestrator"),
-                        &action_id,
-                        &error,
-                    )?;
-                    report.failure_capsules.push(capsule_path);
                     report.actions.push(ProcessActionResultV1 {
-                        action_id,
+                        action_id: action_id.clone(),
                         action_type: action.schedule.action_type.clone(),
-                        participants: participant.into_iter().collect(),
+                        participants: participant.iter().cloned().collect(),
                         status: ProcessActionStatusV1::Failed,
                     });
                     report.lifecycle = self.lifecycle.clone();
+                    let Some(owner) = process_failure_capsule_participant(participant.as_deref())
+                    else {
+                        return Err(ProcessOrchestratorError::new(
+                            error.code,
+                            format!("{} (action {action_id})", error.message),
+                        ));
+                    };
+                    let capsule_path = self.write_failure_capsule(owner, &action_id, &error)?;
+                    report.failure_capsules.push(capsule_path);
                     return Ok(report);
                 }
             }
@@ -1956,6 +1959,13 @@ fn action_participant(step: &ScenarioStep) -> Option<String> {
     }
 }
 
+/// App-process capsules are participant-attributed node evidence. Quiescence
+/// timeouts and relay waits belong to the orchestrator and must not be recorded
+/// as if a named process produced them.
+fn process_failure_capsule_participant(participant: Option<&str>) -> Option<&str> {
+    participant.filter(|label| !label.is_empty())
+}
+
 fn validate_auto_published_acknowledgement(
     accepted_publications: &BTreeMap<String, BTreeSet<String>>,
     client: &str,
@@ -2110,6 +2120,16 @@ mod tests {
         .unwrap_err();
         assert_eq!(rollback.code, "publication_rollback_rejected");
         assert_eq!(rollback.category, SubjectFailureCategory::ExpectedRefusal);
+    }
+
+    #[test]
+    fn orchestrator_level_failures_do_not_own_app_process_capsules() {
+        assert_eq!(process_failure_capsule_participant(None), None);
+        assert_eq!(
+            process_failure_capsule_participant(Some("alice")),
+            Some("alice")
+        );
+        assert_eq!(process_failure_capsule_participant(Some("")), None);
     }
 
     #[test]
