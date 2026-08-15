@@ -421,15 +421,18 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<(), EngineError> {
         match self.storage.get_group(group_id) {
             Ok(_) => {
-                // An own transport echo must not erase the delivery-aware
-                // payload flavor of a retained outbound Welcome. The row is
-                // already durable when its id enters `sent_message_ids`.
+                // An own transport echo must not erase the lifecycle-aware
+                // payload flavor of a retained or staged outbound Welcome. The
+                // row is already durable when its id enters `sent_message_ids`.
                 if self
                     .storage
                     .get_message(&msg.id)
                     .ok()
                     .and_then(|record| StoredMessagePayload::decode(&record.payload).ok())
-                    .is_some_and(|payload| payload.as_outbound_welcome().is_some())
+                    .is_some_and(|payload| {
+                        payload.as_outbound_welcome().is_some()
+                            || payload.as_staged_invite_welcome().is_some()
+                    })
                 {
                     return Ok(());
                 }
@@ -848,5 +851,41 @@ mod tests {
         let record = storage.get_message(&msg.id).unwrap();
         let stored = StoredMessagePayload::decode(&record.payload).unwrap();
         assert!(stored.as_openmls_wire().is_some());
+
+        // An own transport echo may re-enter through the raw ingest path while
+        // an invite commit is still staged. It must not erase the
+        // non-deliverable payload flavor and make the Welcome fetchable.
+        let origin_commit_id = MessageId::new(b"origin-commit".to_vec());
+        let mut staged_welcome = msg.clone();
+        staged_welcome.envelope = TransportEnvelope::Welcome {
+            recipient: cgka_traits::MemberId::new(vec![9; 32]),
+        };
+        engine
+            .persist_stored_message_payload(
+                staged_welcome.id.clone(),
+                &group_id,
+                EpochId(3),
+                MessageState::Sent,
+                StoredMessagePayload::staged_invite_welcome(
+                    staged_welcome.clone(),
+                    origin_commit_id.clone(),
+                ),
+            )
+            .unwrap();
+        engine
+            .persist_transport_message_for_existing_group(
+                &staged_welcome,
+                &group_id,
+                EpochId(3),
+                MessageState::Sent,
+            )
+            .unwrap();
+        let record = storage.get_message(&staged_welcome.id).unwrap();
+        let stored = StoredMessagePayload::decode(&record.payload).unwrap();
+        assert_eq!(
+            stored.as_staged_invite_welcome().map(|(_, origin)| origin),
+            Some(&origin_commit_id),
+            "own echo must preserve staged Welcome ownership"
+        );
     }
 }
