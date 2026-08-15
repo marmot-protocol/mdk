@@ -594,6 +594,28 @@ Generated cases are deterministic for a fixed family, seed, and case index. They
 A generated case becomes a vector only when we want it to be a stable named contract: for example, when it caught a
 regression, covers a new semantic edge, or is the smallest readable example of a behavior.
 
+### `cross-route-restart-permutations/v1`
+
+- Generator: `generate_cross_route_restart_permutation_family` (generator version `1`).
+- Setup: the shared current-build four-party cross-route topology creates simultaneous competing profile branches,
+  grows the selected branch, carries an application witness, repairs retained history, and sends a terminal probe from
+  every participant.
+- Pressure: twelve catalog entries add one durable reopen after each reviewed publication/ingest boundary and after
+  retained-history repair for each participant. A seed rotates the catalog order; twelve consecutive cases cover it.
+- Expected: the app-runtime subject reaches epoch 5 with the exact four-member roster, three-member admin set,
+  depth-two selected profile, and an order-insensitive multiset containing exactly one copy of every witness/probe
+  payload. The explicit retained-engine form
+  additionally requires exact private state, no pending work, and all twelve decryptability directions. The process
+  form binds every restart action to a matching durable lifecycle event and applies the shared strict public oracle.
+- Replay: the isolated family runner saves the complete selected input before execution and retains reports, fixture
+  candidates, process measurements, and failure capsules per case. The exact retained-engine companion is registered
+  separately as `cross-route-exact-restart-permutations/v1`, ensuring a panic in one private-state case cannot stop
+  the rest of the catalog. Public and exact inputs use distinct scenario-name prefixes. The complete public seed-0
+  execution passed 12/12; the exact execution passed 9/12. Restarting Zeta at the three initial accepted
+  publication boundaries produced a structured `PendingPublish` refusal, a `PendingPublish` panic, and an
+  epoch-3/pending-work/decryptability stall respectively; every later branch/repair boundary passed. Those are
+  counterexamples, not allowed results.
+
 ### `chat-journey/v1`
 
 - Generator: `generate_stateful_chat_journey_family` (generator version `1`).

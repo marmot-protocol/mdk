@@ -117,6 +117,13 @@ pub enum TraceExpectation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removed_members: Option<Vec<String>>,
     },
+    /// Require the latest application projection to contain exactly this
+    /// payload multiset. Cross-sender order is deliberately ignored while
+    /// duplicate and missing deliveries remain observable.
+    ApplicationPayloadMultiset {
+        client: String,
+        payloads: Vec<String>,
+    },
     /// Require the latest public profile projection to equal the requested
     /// values, rather than merely agreeing across clients.
     GroupProfile {
@@ -331,6 +338,33 @@ impl TraceExpectation {
                 }),
                 None => missing_client(client, self, mismatches),
             },
+            TraceExpectation::ApplicationPayloadMultiset { client, payloads } => {
+                match client_legacy_observation(observed, client) {
+                    Some(observation) => {
+                        let mut expected = payloads.clone();
+                        expected.sort();
+                        let mut actual = observation.received_payloads.clone();
+                        actual.sort();
+                        if actual != expected {
+                            mismatches.push(ExpectationFailure {
+                                kind: "application_payload_multiset_mismatch".into(),
+                                message: format!(
+                                    "client {client} application payload multiset differed"
+                                ),
+                                expected: json!({
+                                    "client": client,
+                                    "payloads": expected,
+                                }),
+                                actual: json!({
+                                    "client": client,
+                                    "payloads": actual,
+                                }),
+                            });
+                        }
+                    }
+                    None => missing_client(client, self, mismatches),
+                }
+            }
             TraceExpectation::GroupProfile {
                 client,
                 name,
@@ -1373,6 +1407,28 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn application_payload_multiset_ignores_order_but_preserves_multiplicity() {
+        let mut alice = observation("alice", 2, 2);
+        alice.received_payloads = vec!["from-bob".into(), "from-alice".into(), "from-bob".into()];
+        let observed = trace(vec![alice]);
+        let expected = TraceExpectation::ApplicationPayloadMultiset {
+            client: "alice".into(),
+            payloads: vec!["from-alice".into(), "from-bob".into(), "from-bob".into()],
+        };
+        assert!(
+            compare_trace_expectations(None, std::slice::from_ref(&expected), &observed).is_empty()
+        );
+
+        let missing_duplicate = TraceExpectation::ApplicationPayloadMultiset {
+            client: "alice".into(),
+            payloads: vec!["from-alice".into(), "from-bob".into()],
+        };
+        let failures = compare_trace_expectations(None, &[missing_duplicate], &observed);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "application_payload_multiset_mismatch");
     }
 
     #[test]

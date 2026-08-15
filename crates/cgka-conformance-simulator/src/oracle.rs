@@ -707,6 +707,12 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
                 behaviors.insert(OracleBehavior::MemberRemoved);
             }
         }
+        TraceExpectation::ApplicationPayloadMultiset { payloads, .. } => {
+            behaviors.insert(OracleBehavior::ClientState);
+            if !payloads.is_empty() {
+                behaviors.insert(OracleBehavior::DeliveredPayload);
+            }
+        }
         TraceExpectation::GroupProfile { .. } => {
             behaviors.insert(OracleBehavior::ClientState);
         }

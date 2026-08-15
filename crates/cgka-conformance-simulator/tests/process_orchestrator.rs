@@ -955,8 +955,7 @@ fn validate_four_party_cross_route_process_report(
     cgka_conformance_simulator::validate_cross_route_public_process_report(spec, report)
 }
 
-async fn execute_cross_route_process_trial() -> CrossRouteProcessTrial {
-    let spec = cross_route_app_runtime_scenario(false);
+async fn execute_cross_route_process_spec(spec: ScenarioSpec) -> CrossRouteProcessTrial {
     let artifacts = tempfile::tempdir().map_err(|error| error.to_string())?;
     let mut process = ProcessOrchestrator::launch(
         env!("CARGO_BIN_EXE_cgka-conformance-node"),
@@ -975,6 +974,10 @@ async fn execute_cross_route_process_trial() -> CrossRouteProcessTrial {
     let report = process.run().await.map_err(|error| error.to_string());
     process.shutdown().await;
     Ok((spec, report?))
+}
+
+async fn execute_cross_route_process_trial() -> CrossRouteProcessTrial {
+    execute_cross_route_process_spec(cross_route_app_runtime_scenario(false)).await
 }
 
 async fn run_four_party_cross_route_process_trial() -> Result<(), String> {
@@ -997,6 +1000,14 @@ async fn four_party_cross_route_recovery_processes_match_unified_route() {
         error.contains("exactly one observation per participant"),
         "{error}"
     );
+
+    let mut missing_restart_evidence = report.clone();
+    missing_restart_evidence
+        .lifecycle
+        .retain(|event| event.event != "restarted");
+    let error = validate_four_party_cross_route_process_report(&spec, &missing_restart_evidence)
+        .unwrap_err();
+    assert!(error.contains("did not durably reopen"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1011,6 +1022,31 @@ async fn four_party_cross_route_recovery_process_equivalence_soak() {
     assert!(
         failures.is_empty(),
         "the unified route produced non-equivalent process outcomes: {failures:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual twelve-case durable-transition restart campaign"]
+async fn four_party_cross_route_process_restart_permutations_match_unified_route() {
+    let mut failures = Vec::new();
+    for case_index in
+        0..cgka_conformance_simulator::CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64
+    {
+        let spec = cgka_conformance_simulator::cross_route_restart_permutation_public_scenario(
+            0, case_index,
+        );
+        match execute_cross_route_process_spec(spec).await {
+            Ok((spec, report)) => {
+                if let Err(error) = validate_four_party_cross_route_process_report(&spec, &report) {
+                    failures.push((case_index, spec.name, error));
+                }
+            }
+            Err(error) => failures.push((case_index, "launch-or-run".into(), error)),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cross-route process restart permutations failed: {failures:#?}"
     );
 }
 

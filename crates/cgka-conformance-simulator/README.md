@@ -516,6 +516,49 @@ accepted/invalidated/accepted commit-disposition subset and exact retained-sync 
 remain harness-local because there is no portable relay-sync expectation and a complete ledger expectation would also
 pin unrelated probe ids and counters.
 
+The generated `cross-route-restart-permutations/v1` family applies the current-build four-party cross-route topology
+to a bounded twelve-case restart catalog. It reopens the durable author/consumer after accepted create, admin-policy,
+and competing profile transitions; after the branch witness and branch ingestion; and reopens each participant after
+retained-history repair. Twelve consecutive case indices cover every catalog entry exactly once; the seed rotates the
+order for deterministic sharding. Each generated case runs through the full app-runtime adapter with a strict public
+epoch/roster/profile/admin-policy oracle and an order-insensitive exact payload multiset. Exact retained-engine and isolated-process
+forms reuse the same scenario builder in explicit manual tests. Run the file-backed app-runtime campaign with:
+
+```sh
+just cross-route-restart-campaign 0 12 target/cross-route-restart-seed-0
+```
+
+The command writes each generated input before execution and retains its report, fixture candidate, process metrics,
+and failure capsule using the ordinary isolated campaign path. The exact retained-engine companion is a separate
+family so a panic-shaped private-state failure cannot prevent later catalog cases from running:
+
+```sh
+just cross-route-exact-restart-campaign 0 12 target/cross-route-exact-restart-seed-0
+```
+
+Run the isolated-process adapter catalog explicitly with:
+
+```sh
+cargo test -p cgka-conformance-simulator --test process_orchestrator --locked -- \
+  --ignored four_party_cross_route_process_restart_permutations_match_unified_route
+```
+
+The builder names relay-visibility boundaries by publication (`zeta-root` and `alpha-root`) and resolves them to the
+adapter-supported stable action ids only after inserting a restart. A shifted schedule therefore cannot silently
+retarget or disable the intended branch topology. The two non-publication boundaries match the complete semantic
+sequence that ends them (reconnect/incremental-sync/tick for Zeta ingestion and Observer reconnect/full-sync/tick for
+the first repair), and a table-driven test pins every inserted restart's exact step and client.
+
+The complete seed-0 public app-runtime execution passed 12/12 cases. The corresponding exact current-build execution
+passed 9/12 and found three early-publication
+counterexamples. `after-create-accepted-zeta` later rejected an admin update from durable `PendingPublish` and wrote a
+shareable capsule; `after-promote-alpha-accepted-zeta` panicked on the next update from `PendingPublish` (the exact
+input and exit 101 survive, but no report/capsule does); and `after-promote-yankee-accepted-zeta` stranded Zeta at epoch
+3 with pending work, quiescence timeouts, and failed inbound decryptability. All later branch/repair boundaries passed.
+The catalog does not encode these surfaces as acceptable behavior or include a production fix. Public and exact
+artifacts carry distinct scenario-name prefixes so evidence remains attributable to the subject and oracle that
+produced it.
+
 The process adapter accepts the same saved input in place of a raw Scenario IR file:
 
 ```sh

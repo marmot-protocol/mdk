@@ -245,6 +245,20 @@ failing scenario after execution. `tests/stateful_generator.rs` independently re
 checks the complete action vocabulary across adjacent cases, runs both profiles through the report path, and verifies
 that the input fixture was saved privately before execution.
 
+### `cross-route-restart-permutations/v1`
+
+This bounded current-build catalog adds one reviewed durable reopen to the shared four-party cross-route scenario.
+Twelve consecutive cases cover accepted create/admin/profile publications, the branch witness, branch ingestion, and
+all four participants after retained-history repair. Seeds rotate the catalog rather than changing its membership, so
+shards remain deterministic and a twelve-case run has a clear completeness claim. The generated family exercises the
+full app runtime and strict public projection/payload oracle. A separate exact retained-engine family uses the same
+isolated child runner so panic-shaped failures do not abort later cases. The complete public seed-0 catalog passed
+12/12; the corresponding exact run passed 9/12: the three
+early Zeta publication-boundary restarts produced two `PendingPublish` failures (one structured, one panic) and one
+epoch-3/pending-work/decryptability stall, while every later branch/repair boundary passed. An explicit ignored test replays the catalog through the
+isolated-process adapter, whose validation binds every restart action id to a matching durable `restarted` lifecycle
+event.
+
 ## Current Gaps
 
 - The shrinkable `HarnessIntent` strategy remains intentionally limited to send/leave. Invites and group-profile
@@ -253,4 +267,6 @@ that the input fixture was saved privately before execution.
 - Partition behavior is covered by fixed scenarios and generated families. The property-test delivery profiles cover
   FIFO, reverse, and seeded random delivery.
 - File-backed restart and subprocess-kill coverage exercises close/reopen and crash recovery with an intact encrypted
-  database and WAL. Recovery from genuinely missing or corrupted local records is still future work.
+  database and WAL. The current cross-route catalog covers reviewed public/durable action boundaries, while the
+  engine's separate crash-hook matrix covers its four internal convergence-pass phases. Recovery from genuinely
+  missing or corrupted local records is still future work.

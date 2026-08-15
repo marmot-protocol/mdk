@@ -19,6 +19,92 @@ use crate::topology::{
     ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioTopologyV2,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossRouteRestartBoundaryV1 {
+    PublicationAccepted(&'static str),
+    BranchWitnessSent,
+    AlphaRootIngestedByZeta,
+    FirstFullHistoryRepairCompleted,
+}
+
+/// One reviewed restart point in the current-build four-party cross-route
+/// campaign. The id and target are durable campaign vocabulary; the private
+/// boundary matcher keeps action indices out of that contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrossRouteRestartPermutationV1 {
+    pub id: &'static str,
+    pub client: &'static str,
+    boundary: CrossRouteRestartBoundaryV1,
+}
+
+/// Versioned, bounded restart catalog for `cross-route-app-runtime-recovery`.
+///
+/// The first eight cases reopen the participant that durably authored or
+/// consumed the named transition. The final four reopen every participant
+/// after the first complete retained-history repair, before terminal probes.
+pub const CROSS_ROUTE_RESTART_PERMUTATIONS_V1: [CrossRouteRestartPermutationV1; 12] = [
+    CrossRouteRestartPermutationV1 {
+        id: "after-create-accepted",
+        client: "zeta",
+        boundary: CrossRouteRestartBoundaryV1::PublicationAccepted("create"),
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-promote-alpha-accepted",
+        client: "zeta",
+        boundary: CrossRouteRestartBoundaryV1::PublicationAccepted("promote-alpha"),
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-promote-yankee-accepted",
+        client: "zeta",
+        boundary: CrossRouteRestartBoundaryV1::PublicationAccepted("promote-yankee"),
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-zeta-root-accepted",
+        client: "zeta",
+        boundary: CrossRouteRestartBoundaryV1::PublicationAccepted("zeta-root"),
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-branch-witness-sent",
+        client: "yankee",
+        boundary: CrossRouteRestartBoundaryV1::BranchWitnessSent,
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-alpha-root-accepted",
+        client: "alpha",
+        boundary: CrossRouteRestartBoundaryV1::PublicationAccepted("alpha-root"),
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-alpha-root-ingested-by-zeta",
+        client: "zeta",
+        boundary: CrossRouteRestartBoundaryV1::AlphaRootIngestedByZeta,
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-zeta-child-accepted",
+        client: "yankee",
+        boundary: CrossRouteRestartBoundaryV1::PublicationAccepted("zeta-child"),
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-repair-zeta",
+        client: "zeta",
+        boundary: CrossRouteRestartBoundaryV1::FirstFullHistoryRepairCompleted,
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-repair-alpha",
+        client: "alpha",
+        boundary: CrossRouteRestartBoundaryV1::FirstFullHistoryRepairCompleted,
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-repair-yankee",
+        client: "yankee",
+        boundary: CrossRouteRestartBoundaryV1::FirstFullHistoryRepairCompleted,
+    },
+    CrossRouteRestartPermutationV1 {
+        id: "after-repair-observer",
+        client: "observer",
+        boundary: CrossRouteRestartBoundaryV1::FirstFullHistoryRepairCompleted,
+    },
+];
+
 fn in_group(action: ScenarioStep) -> ScenarioStep {
     ScenarioStep::InGroup {
         group: "main".into(),
@@ -64,16 +150,42 @@ fn single_relay_topology(clients: &[String]) -> ScenarioTopologyV2 {
 
 /// The exact engine-capable form of `cross-route-app-runtime-recovery/v1`.
 pub fn cross_route_app_runtime_recovery_exact_scenario() -> ScenarioSpec {
-    build_cross_route_app_runtime_recovery_scenario(true)
+    build_cross_route_app_runtime_recovery_scenario(true, None)
 }
 
 /// The public-projection form of `cross-route-app-runtime-recovery/v1` used by
 /// app-runtime, process, container, and VM adapters.
 pub fn cross_route_app_runtime_recovery_public_scenario() -> ScenarioSpec {
-    build_cross_route_app_runtime_recovery_scenario(false)
+    build_cross_route_app_runtime_recovery_scenario(false, None)
 }
 
-fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> ScenarioSpec {
+/// Exact retained-engine form with one additional restart selected from the
+/// reviewed v1 catalog. Seeds rotate the catalog while case indices enumerate
+/// it, so twelve consecutive cases always cover every boundary.
+pub fn cross_route_restart_permutation_exact_scenario(seed: u64, case_index: u64) -> ScenarioSpec {
+    let permutation = restart_permutation(seed, case_index);
+    build_cross_route_app_runtime_recovery_scenario(true, Some(permutation))
+}
+
+/// Public app/process/container/VM form of one reviewed restart permutation.
+pub fn cross_route_restart_permutation_public_scenario(seed: u64, case_index: u64) -> ScenarioSpec {
+    let permutation = restart_permutation(seed, case_index);
+    build_cross_route_app_runtime_recovery_scenario(false, Some(permutation))
+}
+
+fn restart_permutation(seed: u64, case_index: u64) -> CrossRouteRestartPermutationV1 {
+    let offset = usize::try_from(seed % CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64)
+        .expect("catalog length fits usize");
+    let index = usize::try_from(case_index % CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64)
+        .expect("bounded case index fits usize");
+    CROSS_ROUTE_RESTART_PERMUTATIONS_V1
+        [(offset + index) % CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len()]
+}
+
+fn build_cross_route_app_runtime_recovery_scenario(
+    strict_engine_tail: bool,
+    restart_permutation: Option<CrossRouteRestartPermutationV1>,
+) -> ScenarioSpec {
     let clients = vec![
         "zeta".into(),
         "alpha".into(),
@@ -181,7 +293,7 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
-                action_id: Some("step-16:update_group_data@main".into()),
+                publication: Some("zeta-root".into()),
                 ..Default::default()
             },
             clients: vec!["alpha".into(), "observer".into()],
@@ -220,7 +332,7 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
-                action_id: Some("step-25:update_group_data@main".into()),
+                publication: Some("alpha-root".into()),
                 ..Default::default()
             },
             clients: vec!["yankee".into(), "observer".into()],
@@ -252,7 +364,7 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
-                action_id: Some("step-16:update_group_data@main".into()),
+                publication: Some("zeta-root".into()),
                 ..Default::default()
             },
             clients: vec!["alpha".into(), "observer".into()],
@@ -261,7 +373,7 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
         ScenarioStep::SetRelayEventVisibility {
             relay: "relay:shared".into(),
             selector: ScenarioMessageSelectorV2 {
-                action_id: Some("step-25:update_group_data@main".into()),
+                publication: Some("alpha-root".into()),
                 ..Default::default()
             },
             clients: vec!["yankee".into(), "observer".into()],
@@ -288,6 +400,10 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
             clients: clients.clone(),
         },
     ];
+    if let Some(permutation) = restart_permutation {
+        insert_restart_permutation(&mut steps, permutation, &clients);
+    }
+    bind_relay_visibility_action_ids(&mut steps);
     if strict_engine_tail {
         steps.push(ScenarioStep::AwaitQuiescence {
             policy: crate::QuiescencePolicy {
@@ -335,6 +451,11 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
         steps.push(in_group(ScenarioStep::Observe {
             clients: clients.clone(),
         }));
+        if restart_permutation.is_some() {
+            steps.push(in_group(ScenarioStep::ObserveAdminPolicy {
+                clients: clients.clone(),
+            }));
+        }
     }
     if strict_engine_tail {
         steps.extend([
@@ -346,12 +467,132 @@ fn build_cross_route_app_runtime_recovery_scenario(strict_engine_tail: bool) -> 
             }),
         ]);
     }
+    let name = restart_permutation.map_or_else(
+        || "cross-route-app-runtime-recovery/v1".into(),
+        |permutation| {
+            let family = if strict_engine_tail {
+                "cross-route-exact-restart-permutations/v1"
+            } else {
+                "cross-route-restart-permutations/v1"
+            };
+            format!("{family}/{}-{}", permutation.id, permutation.client)
+        },
+    );
     ScenarioSpec {
-        name: "cross-route-app-runtime-recovery/v1".into(),
+        name,
         spec_version: "2".into(),
         topology: single_relay_topology(&clients),
         clients,
         steps,
+    }
+}
+
+fn insert_restart_permutation(
+    steps: &mut Vec<ScenarioStep>,
+    permutation: CrossRouteRestartPermutationV1,
+    clients: &[String],
+) {
+    let boundary_index = match permutation.boundary {
+        CrossRouteRestartBoundaryV1::PublicationAccepted(publication) => {
+            steps.iter().position(|step| {
+                matches!(
+                    step,
+                    ScenarioStep::AcknowledgeOutbound {
+                        publication: Some(observed),
+                        outcome: SubjectOutboundOutcome::Accepted,
+                        ..
+                    } if observed == publication
+                )
+            })
+        }
+        CrossRouteRestartBoundaryV1::BranchWitnessSent => steps.iter().position(|step| {
+            matches!(
+                step,
+                ScenarioStep::InGroup { action, .. }
+                    if matches!(
+                        action.as_ref(),
+                        ScenarioStep::SendAppMessage { payload, .. }
+                            if payload == "zeta-branch-witness"
+                    )
+            )
+        }),
+        CrossRouteRestartBoundaryV1::AlphaRootIngestedByZeta => steps
+            .windows(3)
+            .position(|window| {
+                matches!(
+                    window,
+                    [
+                        ScenarioStep::ReconnectClient { client },
+                        ScenarioStep::SyncRelayHistory {
+                            clients,
+                            sync: ScenarioRelaySyncModeV2::Incremental,
+                        },
+                        ScenarioStep::Tick {
+                            clients: tick_clients,
+                        },
+                    ] if client == "zeta"
+                        && clients == &["zeta".to_owned()]
+                        && tick_clients == clients
+                )
+            })
+            .map(|window_start| window_start + 2),
+        CrossRouteRestartBoundaryV1::FirstFullHistoryRepairCompleted => steps
+            .windows(3)
+            .position(|window| {
+                matches!(
+                    window,
+                    [
+                        ScenarioStep::ReconnectClient { client },
+                        ScenarioStep::SyncRelayHistory {
+                            clients: sync_clients,
+                            sync: ScenarioRelaySyncModeV2::FullHistory,
+                        },
+                        ScenarioStep::Tick {
+                            clients: tick_clients,
+                        },
+                    ] if client == "observer"
+                        && sync_clients == clients
+                        && tick_clients == clients
+                )
+            })
+            .map(|window_start| window_start + 2),
+    }
+    .unwrap_or_else(|| panic!("missing cross-route restart boundary {}", permutation.id));
+    steps.insert(
+        boundary_index + 1,
+        ScenarioStep::RestartClient {
+            client: permutation.client.into(),
+        },
+    );
+}
+
+fn bind_relay_visibility_action_ids(steps: &mut [ScenarioStep]) {
+    let publication_actions = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(step_index, step)| match step {
+            ScenarioStep::InGroup { action, .. } => match action.as_ref() {
+                ScenarioStep::UpdateGroupData { pending, .. } => {
+                    Some((pending.clone(), crate::stable_action_id(step_index, step)))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for step in steps {
+        let ScenarioStep::SetRelayEventVisibility { selector, .. } = step else {
+            continue;
+        };
+        let Some(publication) = selector.publication.take() else {
+            continue;
+        };
+        selector.action_id = Some(
+            publication_actions
+                .get(&publication)
+                .unwrap_or_else(|| panic!("missing relay publication action {publication}"))
+                .clone(),
+        );
     }
 }
 
@@ -387,9 +628,25 @@ pub fn validate_cross_route_public_process_report(
             "process execution reported the wrong Scenario IR digest: {report:#?}"
         ));
     }
-    if spec.clients.is_empty() || report.observations.len() != spec.clients.len() * 4 {
+    let checkpoint_actions = schedule
+        .actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                &action.step,
+                ScenarioStep::Observe { .. }
+                    | ScenarioStep::ObserveExact { .. }
+                    | ScenarioStep::ObserveAdminPolicy { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected_checkpoint_count = checkpoint_actions.len();
+    if spec.clients.is_empty()
+        || expected_checkpoint_count < 4
+        || report.observations.len() != spec.clients.len() * expected_checkpoint_count
+    {
         return Err(format!(
-            "expected four complete process checkpoints: {report:#?}"
+            "expected {expected_checkpoint_count} complete process checkpoints from the canonical schedule: {report:#?}"
         ));
     }
     let checkpoints = report
@@ -416,8 +673,22 @@ pub fn validate_cross_route_public_process_report(
     }
     let baseline = &checkpoints[0];
     let routed = &checkpoints[1];
-    let first_settled = &checkpoints[2];
-    let settled = &checkpoints[3];
+    let terminal_observe_indices = checkpoint_actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            matches!(&action.step, ScenarioStep::Observe { .. }).then_some(index)
+        })
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>();
+    let [settled_index, first_settled_index] = terminal_observe_indices.as_slice() else {
+        return Err(format!(
+            "canonical schedule lacks two terminal public observations: {report:#?}"
+        ));
+    };
+    let first_settled = &checkpoints[*first_settled_index];
+    let settled = &checkpoints[*settled_index];
     if routed["zeta"].protocol.epoch != 4
         || routed["alpha"].protocol.epoch != 4
         || routed["yankee"].protocol.epoch != 4
@@ -522,16 +793,191 @@ pub fn validate_cross_route_public_process_report(
             "process participants disagree on their public state commitment: {settled:#?}"
         ));
     }
-    let zeta_launches = report
-        .lifecycle
-        .iter()
-        .filter(|event| event.participant == "zeta" && event.event == "launched")
-        .count();
-    if zeta_launches < 2 {
-        return Err(format!(
-            "zeta did not reopen through the process lifecycle: {:#?}",
-            report.lifecycle
-        ));
+    for action in &schedule.actions {
+        let ScenarioStep::RestartClient { client } = &action.step else {
+            continue;
+        };
+        if !report.lifecycle.iter().any(|event| {
+            event.action_id == action.schedule.action_id
+                && event.participant == *client
+                && event.event == "restarted"
+        }) {
+            return Err(format!(
+                "{client} did not durably reopen at {}: {:#?}",
+                action.schedule.action_id, report.lifecycle
+            ));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_catalog_is_complete_unique_and_compilable() {
+        let ids = CROSS_ROUTE_RESTART_PERMUTATIONS_V1
+            .iter()
+            .map(|permutation| permutation.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len());
+
+        let baseline = cross_route_app_runtime_recovery_public_scenario();
+        let baseline_restarts = baseline
+            .steps
+            .iter()
+            .filter(|step| matches!(step, ScenarioStep::RestartClient { .. }))
+            .count();
+        assert_eq!(baseline_restarts, 1);
+        assert!(baseline.steps.iter().all(|step| !matches!(
+            step,
+            ScenarioStep::InGroup { action, .. }
+                if matches!(action.as_ref(), ScenarioStep::ObserveAdminPolicy { .. })
+        )));
+
+        let variants = (0..CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64)
+            .map(|case_index| cross_route_restart_permutation_public_scenario(0, case_index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            variants
+                .iter()
+                .map(|scenario| scenario.name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len()
+        );
+        let expected_restart_loci = [
+            ("after-create-accepted", ("zeta", 2)),
+            ("after-promote-alpha-accepted", ("zeta", 6)),
+            ("after-promote-yankee-accepted", ("zeta", 10)),
+            ("after-zeta-root-accepted", ("zeta", 18)),
+            ("after-branch-witness-sent", ("yankee", 21)),
+            ("after-alpha-root-accepted", ("alpha", 27)),
+            ("after-alpha-root-ingested-by-zeta", ("zeta", 30)),
+            ("after-zeta-child-accepted", ("yankee", 37)),
+            ("after-repair-zeta", ("zeta", 45)),
+            ("after-repair-alpha", ("alpha", 45)),
+            ("after-repair-yankee", ("yankee", 45)),
+            ("after-repair-observer", ("observer", 45)),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        for scenario in variants {
+            compile_scenario(&scenario).expect("restart permutation compiles");
+            assert_eq!(
+                scenario
+                    .steps
+                    .iter()
+                    .filter(|step| matches!(step, ScenarioStep::RestartClient { .. }))
+                    .count(),
+                baseline_restarts + 1,
+                "{} must add exactly one reviewed restart",
+                scenario.name
+            );
+            assert_eq!(
+                scenario
+                    .steps
+                    .iter()
+                    .filter(|step| matches!(
+                        step,
+                        ScenarioStep::InGroup { action, .. }
+                            if matches!(action.as_ref(), ScenarioStep::ObserveAdminPolicy { .. })
+                    ))
+                    .count(),
+                1,
+                "{} must carry the catalog-only portable admin observation",
+                scenario.name
+            );
+            let permutation_id = scenario
+                .name
+                .rsplit_once('/')
+                .expect("catalog scenario has a family prefix")
+                .1
+                .rsplit_once('-')
+                .expect("catalog scenario names its restart client")
+                .0;
+            let (expected_client, expected_index) = expected_restart_loci
+                .get(permutation_id)
+                .unwrap_or_else(|| panic!("missing pinned locus for {permutation_id}"));
+            assert!(
+                matches!(
+                    &scenario.steps[*expected_index],
+                    ScenarioStep::RestartClient { client } if client == expected_client
+                ),
+                "{} moved from pinned restart step {}",
+                scenario.name,
+                expected_index
+            );
+        }
+    }
+
+    #[test]
+    fn exact_and_public_restart_artifacts_have_distinct_names() {
+        let public = cross_route_restart_permutation_public_scenario(0, 0);
+        let exact = cross_route_restart_permutation_exact_scenario(0, 0);
+        assert!(
+            public
+                .name
+                .starts_with("cross-route-restart-permutations/v1/")
+        );
+        assert!(
+            exact
+                .name
+                .starts_with("cross-route-exact-restart-permutations/v1/")
+        );
+        assert_ne!(public.name, exact.name);
+    }
+
+    #[test]
+    fn relay_visibility_action_ids_follow_inserted_restart_indices() {
+        for scenario in std::iter::once(cross_route_app_runtime_recovery_public_scenario()).chain(
+            (0..CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64)
+                .map(|case_index| cross_route_restart_permutation_public_scenario(0, case_index)),
+        ) {
+            let publication_actions = scenario
+                .steps
+                .iter()
+                .enumerate()
+                .filter_map(|(step_index, step)| match step {
+                    ScenarioStep::InGroup { action, .. } => match action.as_ref() {
+                        ScenarioStep::UpdateGroupData { pending, .. }
+                            if pending == "zeta-root" || pending == "alpha-root" =>
+                        {
+                            Some(crate::stable_action_id(step_index, step))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let selectors = scenario.steps.iter().filter_map(|step| match step {
+                ScenarioStep::SetRelayEventVisibility { selector, .. } => Some(selector),
+                _ => None,
+            });
+            for selector in selectors {
+                assert!(
+                    selector
+                        .action_id
+                        .as_ref()
+                        .is_some_and(|action_id| publication_actions.contains(action_id)),
+                    "{} has a stale visibility selector: {selector:?}",
+                    scenario.name
+                );
+                assert!(selector.publication.is_none(), "{}", scenario.name);
+            }
+        }
+    }
+
+    #[test]
+    fn seed_rotates_but_does_not_change_the_restart_catalog() {
+        let names = |seed| {
+            (0..CROSS_ROUTE_RESTART_PERMUTATIONS_V1.len() as u64)
+                .map(|case_index| {
+                    cross_route_restart_permutation_public_scenario(seed, case_index).name
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(names(0), names(7));
+    }
 }
