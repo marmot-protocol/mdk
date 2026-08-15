@@ -1,7 +1,7 @@
 //! Account-device runtime: drives session effects through transport publish,
 //! confirmation, and rollback, and the effect aggregates it produces.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,6 +121,97 @@ struct PreparedLegacyPublishAttempt {
     request: TransportPublishRequest,
 }
 
+struct WelcomePublishMetadata {
+    recipient: Option<MemberId>,
+    welcome_id: cgka_traits::MessageId,
+    effects: AccountDeviceEffects,
+}
+
+struct PreparedWelcomePublish {
+    group_id: Option<GroupId>,
+    metadata: Vec<WelcomePublishMetadata>,
+    completions: Vec<Option<LegacyPublishCompletion>>,
+    pending: VecDeque<(usize, Box<PreparedLegacyPublishAttempt>)>,
+}
+
+struct CompletedWelcomePublish {
+    group_id: Option<GroupId>,
+    metadata: Vec<WelcomePublishMetadata>,
+    completions: Vec<Option<LegacyPublishCompletion>>,
+}
+
+/// Relay-only half of a prepared Welcome retry.
+///
+/// The account worker may run this task independently of its serialized
+/// engine/SQLite owner. Preparation has already retained the exact event and
+/// endpoint snapshot; [`AccountDeviceRuntime::finish_welcome_publish_task`]
+/// must reconcile the returned completion before another retry is started.
+#[doc(hidden)]
+#[must_use = "a prepared Welcome publish task must be run and reconciled"]
+pub struct PreparedWelcomePublishTask {
+    adapter: Arc<dyn TransportAdapter>,
+    prepared: PreparedWelcomePublish,
+    message_ids: Vec<cgka_traits::MessageId>,
+}
+
+/// Opaque relay results from [`PreparedWelcomePublishTask::run`].
+#[doc(hidden)]
+pub struct CompletedWelcomePublishTask {
+    completed: CompletedWelcomePublish,
+    message_ids: Vec<cgka_traits::MessageId>,
+}
+
+impl PreparedWelcomePublishTask {
+    /// Exact message ids reserved by this task while relay I/O is in flight.
+    pub fn message_ids(&self) -> &[cgka_traits::MessageId] {
+        &self.message_ids
+    }
+
+    /// Run only the bounded relay publication phase. This owns no engine or
+    /// SQLite state and is therefore safe to poll beside the account worker.
+    pub async fn run(self) -> CompletedWelcomePublishTask {
+        CompletedWelcomePublishTask {
+            completed: self.prepared.publish(self.adapter.as_ref()).await,
+            message_ids: self.message_ids,
+        }
+    }
+}
+
+impl PreparedWelcomePublish {
+    fn network_message_ids(&self) -> Vec<cgka_traits::MessageId> {
+        self.pending
+            .iter()
+            .map(|(_, attempt)| attempt.message_id.clone())
+            .collect()
+    }
+
+    async fn publish(mut self, adapter: &dyn TransportAdapter) -> CompletedWelcomePublish {
+        let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+            let result = adapter.publish(attempt.request.clone()).await;
+            (index, attempt, result)
+        };
+        let mut in_flight = FuturesUnordered::new();
+        while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
+            let Some((index, attempt)) = self.pending.pop_front() else {
+                break;
+            };
+            in_flight.push(publish(index, attempt));
+        }
+        while let Some((index, attempt, result)) = in_flight.next().await {
+            self.completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
+            if let Some((next_index, next_attempt)) = self.pending.pop_front() {
+                in_flight.push(publish(next_index, next_attempt));
+            }
+        }
+
+        CompletedWelcomePublish {
+            group_id: self.group_id,
+            metadata: self.metadata,
+            completions: self.completions,
+        }
+    }
+}
+
 /// A locally staged commit whose transport publication has not started.
 ///
 /// Keeping the pending handle beside the extracted Welcomes lets callers
@@ -166,6 +257,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_paused: bool,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Exact Welcome events whose relay-only publish phase currently runs
+    /// outside the serialized account owner. Other maintenance/manual retry
+    /// paths skip these ids until their results are reconciled, preventing two
+    /// concurrent publications of the same retained event.
+    detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
@@ -189,6 +285,7 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
+            detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
         }
     }
@@ -1778,6 +1875,60 @@ where
         Ok(output)
     }
 
+    /// Prepare a startup Welcome retry whose relay I/O can run independently
+    /// from the serialized account worker.
+    ///
+    /// Preparation persists the exact event/endpoint attempts and reserves
+    /// their message ids in-memory before this returns. The returned task owns
+    /// only a cloned transport adapter; callers must pass its completion to
+    /// [`Self::finish_welcome_publish_task`] or release its reservation with
+    /// [`Self::abandon_welcome_publish_task`].
+    #[doc(hidden)]
+    pub fn prepare_welcome_retry_task_with_audit_context(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        context: AuditEventContext,
+    ) -> AccountResult<PreparedWelcomePublishTask>
+    where
+        A: Clone + 'static,
+    {
+        let prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
+        let message_ids = prepared.network_message_ids();
+        self.detached_welcome_publishes
+            .extend(message_ids.iter().cloned());
+        Ok(PreparedWelcomePublishTask {
+            adapter: Arc::new(self.adapter.clone()),
+            prepared,
+            message_ids,
+        })
+    }
+
+    /// Reconcile every relay result from a detached Welcome publish in input
+    /// order, then release its in-memory exact-event reservations.
+    #[doc(hidden)]
+    pub async fn finish_welcome_publish_task(
+        &mut self,
+        task: CompletedWelcomePublishTask,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let CompletedWelcomePublishTask {
+            completed,
+            message_ids,
+        } = task;
+        let mut output = AccountDeviceEffects::default();
+        let result = self.finish_welcome_publish(completed, &mut output).await;
+        self.abandon_welcome_publish_task(&message_ids);
+        result.map(|()| output)
+    }
+
+    /// Release the in-memory reservation after a detached relay task is
+    /// cancelled or panics. Durable fanout remains retryable.
+    #[doc(hidden)]
+    pub fn abandon_welcome_publish_task(&mut self, message_ids: &[cgka_traits::MessageId]) {
+        for message_id in message_ids {
+            self.detached_welcome_publishes.remove(message_id);
+        }
+    }
+
     pub async fn queue_app_message_with_audit_context(
         &mut self,
         group_id: GroupId,
@@ -2434,6 +2585,18 @@ where
         context: Option<AuditEventContext>,
         force_retry: bool,
     ) -> AccountResult<()> {
+        let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
+        let completed = prepared.publish(&self.adapter).await;
+        self.finish_welcome_publish(completed, output).await
+    }
+
+    fn prepare_welcome_publish(
+        &self,
+        welcomes: Vec<TransportMessage>,
+        group_id: Option<GroupId>,
+        context: Option<AuditEventContext>,
+        force_retry: bool,
+    ) -> AccountResult<PreparedWelcomePublish> {
         let mut metadata = Vec::with_capacity(welcomes.len());
         let mut completions = Vec::with_capacity(welcomes.len());
         completions.resize_with(welcomes.len(), || None);
@@ -2453,28 +2616,31 @@ where
                 }
                 PreparedLegacyPublish::Network(attempt) => pending.push_back((index, attempt)),
             }
-            metadata.push((recipient, welcome_id, effects));
+            metadata.push(WelcomePublishMetadata {
+                recipient,
+                welcome_id,
+                effects,
+            });
         }
 
-        let adapter = &self.adapter;
-        let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
-            let result = adapter.publish(attempt.request.clone()).await;
-            (index, attempt, result)
-        };
-        let mut in_flight = FuturesUnordered::new();
-        while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
-            let Some((index, attempt)) = pending.pop_front() else {
-                break;
-            };
-            in_flight.push(publish(index, attempt));
-        }
-        while let Some((index, attempt, result)) = in_flight.next().await {
-            completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
-            if let Some((next_index, next_attempt)) = pending.pop_front() {
-                in_flight.push(publish(next_index, next_attempt));
-            }
-        }
+        Ok(PreparedWelcomePublish {
+            group_id,
+            metadata,
+            completions,
+            pending,
+        })
+    }
 
+    async fn finish_welcome_publish(
+        &mut self,
+        completed: CompletedWelcomePublish,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        let CompletedWelcomePublish {
+            group_id,
+            metadata,
+            completions,
+        } = completed;
         // Every network attempt above has already been exposed to relays, so a
         // finish-stage failure for one recipient must not skip completion
         // bookkeeping for the rest: reconcile every completion in input order
@@ -2483,9 +2649,12 @@ where
         // would stay `Unattempted` and a restart could republish Welcomes that
         // were already delivered.
         let mut first_error = None;
-        for ((recipient, welcome_id, mut effects), completion) in
-            metadata.into_iter().zip(completions)
-        {
+        for (metadata, completion) in metadata.into_iter().zip(completions) {
+            let WelcomePublishMetadata {
+                recipient,
+                welcome_id,
+                mut effects,
+            } = metadata;
             let status = match completion.expect("every Welcome publish completed") {
                 LegacyPublishCompletion::Complete(status) => Ok(status),
                 LegacyPublishCompletion::Network(attempt, result) => {
@@ -2648,6 +2817,9 @@ where
         message_id: &cgka_traits::MessageId,
         output: &mut AccountDeviceEffects,
     ) -> AccountResult<()> {
+        if self.detached_welcome_publishes.contains(message_id) {
+            return Ok(());
+        }
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
@@ -3062,6 +3234,12 @@ where
         retry_immediately: bool,
     ) -> AccountResult<PreparedLegacyPublish> {
         let message_id = message.id.clone();
+        if self.detached_welcome_publishes.contains(&message_id) {
+            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                retry_deferred: true,
+                ..PublishStatus::default()
+            }));
+        }
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
         // publish request. The post-wrap relay event id / ephemeral pubkey are

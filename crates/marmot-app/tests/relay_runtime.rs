@@ -9387,10 +9387,18 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     .await
     .expect("rejected confirmed-invite Welcome must remain pending");
     runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
 
     welcome_policy.reject(false);
     welcome_policy.block();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
     let runtime = MarmotAppRuntime::new(app);
+    let mut restarted_events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
@@ -9408,6 +9416,30 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     timeout(Duration::from_secs(15), welcome_policy.wait_until_blocked())
         .await
         .expect("startup recovery must begin the retained Welcome publish");
+
+    runtime
+        .send_message(
+            &bob_id,
+            &group_id,
+            b"inbound while Welcome recovery is blocked".to_vec(),
+        )
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(5),
+        wait_for_event(&mut restarted_events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::MessageReceived(message)
+                    if message.account_id_hex == alice_id
+                        && message.message.group_id == group_id
+                        && message.message.plaintext
+                            == "inbound while Welcome recovery is blocked"
+            )
+        }),
+    )
+    .await
+    .expect("inbound processing must continue while startup Welcome relay I/O is blocked");
 
     timeout(
         Duration::from_secs(2),

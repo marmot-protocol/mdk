@@ -21,7 +21,9 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::StreamExt;
-use marmot_account::PreparedSessionSend;
+use marmot_account::{
+    CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
+};
 use marmot_forensics::AuditEventContext;
 use nostr::NostrSigner;
 
@@ -83,6 +85,29 @@ pub(crate) struct UnpublishedWelcomeDelivery {
     group_id: GroupId,
     audit_context: AuditEventContext,
     kind: UnpublishedWelcomeKind,
+}
+
+pub(crate) struct PendingWelcomeDeliveryRecovery {
+    welcome_ids: Vec<String>,
+    publish: PreparedWelcomePublishTask,
+}
+
+pub(crate) struct CompletedWelcomeDeliveryRecovery {
+    welcome_ids: Vec<String>,
+    publish: CompletedWelcomePublishTask,
+}
+
+impl PendingWelcomeDeliveryRecovery {
+    pub(crate) fn message_ids(&self) -> &[MessageId] {
+        self.publish.message_ids()
+    }
+
+    pub(crate) async fn run(self) -> CompletedWelcomeDeliveryRecovery {
+        CompletedWelcomeDeliveryRecovery {
+            welcome_ids: self.welcome_ids,
+            publish: self.publish.run().await,
+        }
+    }
 }
 
 pub(crate) struct EncryptedMediaUploadHttp {
@@ -3909,28 +3934,31 @@ impl AppClient {
         std::mem::take(&mut self.pending_welcome_delivery_events)
     }
 
-    /// Give every engine-authoritative outstanding Welcome one bounded startup
-    /// retry fanout.
+    /// Prepare one bounded startup retry for every engine-authoritative
+    /// outstanding Welcome.
     ///
-    /// The pending index is reconciled from `OutboundWelcome` records first, so
-    /// this resumes the exact retained artifact after process death rather than
-    /// reconstructing or re-committing the invite.
-    pub(crate) async fn retry_pending_welcome_deliveries_best_effort(&mut self) {
+    /// Only relay I/O moves into the returned task. Exact artifacts, endpoint
+    /// snapshots, and attempt reservations are durable/owned by this client so
+    /// the account worker can keep processing inbound traffic and commands
+    /// without creating a second retry for the same message id.
+    pub(crate) fn prepare_pending_welcome_delivery_recovery_best_effort(
+        &mut self,
+    ) -> Option<PendingWelcomeDeliveryRecovery> {
         let pending = match self.runtime.outstanding_welcome_deliveries() {
             Ok(pending) => pending,
             Err(error) => {
                 let error = AppError::from(error);
                 tracing::warn!(
                     target: "marmot_app::client",
-                    method = "retry_pending_welcome_deliveries_best_effort",
+                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
                     error_kind = error.privacy_safe_kind(),
                     "could not enumerate retained Welcome obligations at startup"
                 );
-                return;
+                return None;
             }
         };
         if pending.is_empty() {
-            return;
+            return None;
         }
         let welcome_ids = pending
             .iter()
@@ -3940,24 +3968,58 @@ impl AppClient {
             .into_iter()
             .map(|(_, welcome)| welcome)
             .collect::<Vec<_>>();
+        let publish = match self
+            .runtime
+            .prepare_welcome_retry_task_with_audit_context(welcomes, AuditEventContext::default())
+        {
+            Ok(publish) => publish,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not prepare retained Welcome obligations at startup"
+                );
+                return None;
+            }
+        };
+        Some(PendingWelcomeDeliveryRecovery {
+            welcome_ids,
+            publish,
+        })
+    }
+
+    /// Reconcile a detached startup retry back through the serialized account
+    /// owner and retire only obligations whose acknowledgement policy landed.
+    pub(crate) async fn finish_pending_welcome_delivery_recovery_best_effort(
+        &mut self,
+        completed: CompletedWelcomeDeliveryRecovery,
+    ) {
         match self
             .runtime
-            .retry_welcome_messages_with_audit_context(welcomes, AuditEventContext::default())
+            .finish_welcome_publish_task(completed.publish)
             .await
         {
             Ok(effects) => {
-                let _ = self.clear_delivered_founding_welcome_intents(&welcome_ids, &effects);
+                let _ =
+                    self.clear_delivered_founding_welcome_intents(&completed.welcome_ids, &effects);
                 self.remember_published_reports(&effects);
             }
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::client",
-                    method = "retry_pending_welcome_deliveries_best_effort",
+                    method = "finish_pending_welcome_delivery_recovery_best_effort",
                     error_kind = AppError::from(error).privacy_safe_kind(),
                     "startup Welcome retry left obligations pending"
                 );
             }
         }
+    }
+
+    /// Release an in-memory retry reservation after its relay task panics or is
+    /// cancelled. The exact durable obligation remains available for restart.
+    pub(crate) fn abandon_pending_welcome_delivery_recovery(&mut self, message_ids: &[MessageId]) {
+        self.runtime.abandon_welcome_publish_task(message_ids);
     }
 
     /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest

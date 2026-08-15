@@ -45,6 +45,20 @@ async fn accept_group_invite_retrying_busy(
     Err(last_retryable)
 }
 
+fn group_command_requires_welcome_drain(command: &GroupCommand) -> bool {
+    matches!(
+        command,
+        GroupCommand::Create { .. } | GroupCommand::Invite { .. }
+    )
+}
+
+fn groups_command_requires_welcome_drain(command: &GroupsCommand) -> bool {
+    matches!(
+        command,
+        GroupsCommand::Create { .. } | GroupsCommand::AddMembers { .. }
+    )
+}
+
 pub(crate) async fn group_command(
     account_home: &AccountHome,
     app: &MarmotApp,
@@ -52,12 +66,16 @@ pub(crate) async fn group_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
+    let requires_welcome_drain = group_command_requires_welcome_drain(&command);
     let result =
         group_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
-    // Drain in-flight Welcome fanout while the relay plane is still live.
-    // Create/invite now reply at the canonical MLS boundary; without this
-    // wait, one-shot CLI would cancel delivery on exit.
-    let drain_result = runtime.drain_in_flight_work().await;
+    // Only create/invite launch post-response Welcome fanout. Read-only and
+    // unrelated mutation commands must not join a retained startup Welcome.
+    let drain_result = if requires_welcome_drain {
+        runtime.drain_in_flight_work().await
+    } else {
+        Ok(())
+    };
     runtime.shutdown().await;
     drain_result?;
     result
@@ -267,9 +285,14 @@ pub(crate) async fn groups_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
+    let requires_welcome_drain = groups_command_requires_welcome_drain(&command);
     let result =
         groups_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
-    let drain_result = runtime.drain_in_flight_work().await;
+    let drain_result = if requires_welcome_drain {
+        runtime.drain_in_flight_work().await
+    } else {
+        Ok(())
+    };
     runtime.shutdown().await;
     drain_result?;
     result
@@ -815,4 +838,89 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, 
             }))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_welcome_launching_group_commands_require_a_drain() {
+        assert!(group_command_requires_welcome_drain(
+            &GroupCommand::Create {
+                name: "name".into(),
+                members: Vec::new(),
+                description: None,
+            }
+        ));
+        assert!(group_command_requires_welcome_drain(
+            &GroupCommand::Invite {
+                group: "group".into(),
+                members: vec!["member".into()],
+            }
+        ));
+
+        assert!(!group_command_requires_welcome_drain(
+            &GroupCommand::Members {
+                group: "group".into(),
+            }
+        ));
+        assert!(!group_command_requires_welcome_drain(
+            &GroupCommand::Remove {
+                group: "group".into(),
+                members: vec!["member".into()],
+            }
+        ));
+        assert!(!group_command_requires_welcome_drain(
+            &GroupCommand::Update {
+                group: "group".into(),
+                name: Some("name".into()),
+                description: None,
+            }
+        ));
+        assert!(!group_command_requires_welcome_drain(
+            &GroupCommand::SetAvatarUrl {
+                group: "group".into(),
+                url: None,
+                dim: None,
+                thumbhash: None,
+                clear: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn only_welcome_launching_groups_commands_require_a_drain() {
+        assert!(groups_command_requires_welcome_drain(
+            &GroupsCommand::Create {
+                name: "name".into(),
+                members: Vec::new(),
+                description: None,
+            }
+        ));
+        assert!(groups_command_requires_welcome_drain(
+            &GroupsCommand::AddMembers {
+                group_id: "group".into(),
+                members: vec!["member".into()],
+            }
+        ));
+
+        assert!(!groups_command_requires_welcome_drain(&GroupsCommand::List));
+        assert!(!groups_command_requires_welcome_drain(
+            &GroupsCommand::Show {
+                group_id: "group".into(),
+            }
+        ));
+        assert!(!groups_command_requires_welcome_drain(
+            &GroupsCommand::RemoveMembers {
+                group_id: "group".into(),
+                members: vec!["member".into()],
+            }
+        ));
+        assert!(!groups_command_requires_welcome_drain(
+            &GroupsCommand::Members {
+                group_id: "group".into(),
+            }
+        ));
+    }
 }

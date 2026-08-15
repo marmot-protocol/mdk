@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::{GroupId, SecretBytes};
+use cgka_traits::{GroupId, MessageId, SecretBytes};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -24,7 +24,7 @@ use super::{
     wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::AppPerformanceOperation;
-use crate::client::EncryptedMediaUploadFinish;
+use crate::client::{CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish};
 use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
@@ -414,6 +414,21 @@ enum DeferredStartupCommand {
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
     CatchUp(oneshot::Sender<Result<(), String>>),
+}
+
+/// Relay-only startup Welcome work. Dropping the worker aborts the task so no
+/// detached publication can outlive relay-plane/account shutdown; the exact
+/// durable artifact remains retryable on the next open.
+struct WelcomeRecoveryTask {
+    handle: JoinHandle<CompletedWelcomeDeliveryRecovery>,
+    message_ids: Vec<MessageId>,
+    drain_waiters: Vec<oneshot::Sender<()>>,
+}
+
+impl Drop for WelcomeRecoveryTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 pub(crate) fn spawn_app_runtime_account_worker(
@@ -870,40 +885,22 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
-    // Recovery is durable, exact-artifact work, so it can yield to account
-    // commands without losing its place. A Drain command is the exception: it
-    // joins the bounded retry before acknowledging the shutdown barrier.
-    let mut welcome_recovery_pending = true;
+    // Prepare exact Welcome attempts under the serialized owner, then let only
+    // relay I/O run independently. The worker stays available for inbound
+    // delivery, maintenance, media completions, timers, and commands while a
+    // degraded relay is slow. Drain waiters join reconciliation below.
+    let mut welcome_recovery = client
+        .prepare_pending_welcome_delivery_recovery_best_effort()
+        .map(|recovery| {
+            let message_ids = recovery.message_ids().to_vec();
+            WelcomeRecoveryTask {
+                handle: tokio::spawn(recovery.run()),
+                message_ids,
+                drain_waiters: Vec::new(),
+            }
+        });
 
     'worker: loop {
-        if welcome_recovery_pending && pending.is_empty() {
-            let mut recovery =
-                std::pin::pin!(client.retry_pending_welcome_deliveries_best_effort());
-            tokio::select! {
-                biased;
-                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                    return;
-                }
-                _ = &mut shutdown => {
-                    return;
-                }
-                command = commands.recv() => {
-                    let Some(command) = command else {
-                        return;
-                    };
-                    if matches!(command, AccountWorkerCommand::Drain { .. }) {
-                        recovery.await;
-                        welcome_recovery_pending = false;
-                    }
-                    // Dropping an interrupted retry is safe: exact message ids
-                    // remain durable and relay publication is idempotent.
-                    pending.push_back(command);
-                }
-                _ = &mut recovery => {
-                    welcome_recovery_pending = false;
-                }
-            }
-        }
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -911,6 +908,37 @@ async fn run_app_runtime_account_worker(
             }
             _ = &mut shutdown => {
                 return;
+            }
+            recovered = async {
+                let recovery = welcome_recovery
+                    .as_mut()
+                    .expect("Welcome recovery branch requires a live task");
+                (&mut recovery.handle).await
+            }, if welcome_recovery.is_some() => {
+                let mut recovery = welcome_recovery
+                    .take()
+                    .expect("completed Welcome recovery task must still be owned");
+                match recovered {
+                    Ok(completed) => {
+                        client
+                            .finish_pending_welcome_delivery_recovery_best_effort(completed)
+                            .await;
+                    }
+                    Err(error) => {
+                        client.abandon_pending_welcome_delivery_recovery(
+                            &recovery.message_ids,
+                        );
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "startup_welcome_recovery",
+                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                            "startup Welcome relay task ended before reconciliation"
+                        );
+                    }
+                }
+                for respond in recovery.drain_waiters.drain(..) {
+                    let _ = respond.send(());
+                }
             }
             _ = scheduled_convergence.timer.as_mut() => {
                 let groups = scheduled_convergence.take_ready();
@@ -1025,6 +1053,17 @@ async fn run_app_runtime_account_worker(
                     Some(command) => {
                         pending.push_back(command);
                         while let Some(command) = pending.pop_front() {
+                            let command = match command {
+                                AccountWorkerCommand::Drain { respond } => {
+                                    if let Some(recovery) = &mut welcome_recovery {
+                                        recovery.drain_waiters.push(respond);
+                                    } else {
+                                        let _ = respond.send(());
+                                    }
+                                    continue;
+                                }
+                                command => command,
+                            };
                             let may_change_push_registration_work =
                                 command.may_change_push_registration_work();
                             match command {
