@@ -6685,7 +6685,7 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
         home.path(),
         &["--account", &alice, "group", "invite", group_id, &carol],
     );
-    assert_eq!(invite["published"], 2);
+    assert_eq!(invite["published"], 1);
     sync_until_member(home.path(), &bob, group_id, &carol);
     sync_until_joined(home.path(), test_relay_url(), &carol, group_id);
 
@@ -6805,7 +6805,7 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
         home.path(),
         &["--account", &alice, "group", "invite", group_id, &carol],
     );
-    assert_eq!(invite["published"], 2);
+    assert_eq!(invite["published"], 1);
     run_json(home.path(), &["--account", &bob, "sync"]);
     let carol_join = sync_until_joined(home.path(), test_relay_url(), &carol, group_id);
     assert_eq!(carol_join["joined_groups"][0], group_id);

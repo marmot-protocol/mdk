@@ -431,10 +431,20 @@ impl Marmot {
             .await?)
     }
 
-    /// Invite `member_refs` into an existing group. Pass the same refs in
-    /// `initial_admin_refs` to grant admin in the invite commit instead of a
-    /// follow-on promote. An empty `initial_admin_refs` keeps add-only invite.
+    /// Invite `member_refs` into an existing group.
     pub async fn invite_members(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_refs: Vec<String>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        self.invite_members_with_initial_admins(account_ref, group_id_hex, member_refs, Vec::new())
+            .await
+    }
+
+    /// Invite `member_refs` and grant admin to `initial_admin_refs` in the
+    /// same invite commit. Each initial admin must be one of the invitees.
+    pub async fn invite_members_with_initial_admins(
         &self,
         account_ref: String,
         group_id_hex: String,
@@ -745,8 +755,25 @@ impl Marmot {
     }
 
     /// Same as [`Self::invite_members`], returning the post-mutation group
-    /// snapshot. `initial_admin_refs` grants admin in the invite commit.
+    /// snapshot.
     pub async fn invite_members_detailed(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_refs: Vec<String>,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        self.invite_members_detailed_with_initial_admins(
+            account_ref,
+            group_id_hex,
+            member_refs,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Same as [`Self::invite_members_with_initial_admins`], returning the
+    /// post-mutation group snapshot.
+    pub async fn invite_members_detailed_with_initial_admins(
         &self,
         account_ref: String,
         group_id_hex: String,

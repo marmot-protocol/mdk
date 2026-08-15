@@ -21,14 +21,15 @@ async fn accept_group_invite_retrying_busy(
     group_id: &GroupId,
 ) -> Result<AppGroupRecord, AppError> {
     // A one-shot `wn groups accept` starts its own runtime and can race that
-    // runtime's initial catch-up. Keep the same runtime alive for a bounded
-    // 30-second retry window; restarting the CLI would only recreate the race.
+    // runtime's initial catch-up, and the inviter may have returned before the
+    // Welcome landed. Keep the same runtime alive for a bounded 30-second
+    // retry window; restarting the CLI would only recreate the race.
     const BUSY_RETRY_ATTEMPTS: usize = 600;
     const BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
     for attempt in 0..BUSY_RETRY_ATTEMPTS {
         match runtime.accept_group_invite(account_ref, group_id).await {
-            Err(AppError::AccountWorkerBusy) => {
+            Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
                 if attempt + 1 < BUSY_RETRY_ATTEMPTS {
                     tokio::time::sleep(BUSY_RETRY_DELAY).await;
                 }
@@ -49,7 +50,13 @@ pub(crate) async fn group_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    group_command_with_runtime(account_home, app, &runtime, command, account_flag).await
+    let result =
+        group_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
+    // Drain in-flight Welcome fanout before the process drops this runtime.
+    // Create/invite now reply at the canonical MLS boundary; without this
+    // wait, one-shot CLI would cancel delivery on exit.
+    runtime.shutdown().await;
+    result
 }
 
 pub(crate) async fn group_command_with_runtime(
@@ -256,7 +263,10 @@ pub(crate) async fn groups_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    groups_command_with_runtime(account_home, app, &runtime, command, account_flag).await
+    let result =
+        groups_command_with_runtime(account_home, app, &runtime, command, account_flag).await;
+    runtime.shutdown().await;
+    result
 }
 
 pub(crate) async fn groups_command_with_runtime(

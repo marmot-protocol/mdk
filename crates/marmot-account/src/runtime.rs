@@ -1629,6 +1629,25 @@ where
         Ok(output)
     }
 
+    /// Confirm an outbound intent locally and extract Welcome payloads without
+    /// publishing the remaining session effects.
+    ///
+    /// The caller must record exact Welcome delivery obligations before
+    /// [`Self::publish_prepared_session_effects_with_audit_context`] exposes the
+    /// commit on the wire.
+    pub async fn confirm_commit_without_publish_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<(SessionEffects, Vec<TransportMessage>)> {
+        let mut session_effects = self
+            .session
+            .send_with_audit_context(intent, context)
+            .await?;
+        let welcomes = take_deferred_welcomes(&mut session_effects);
+        Ok((session_effects, welcomes))
+    }
+
     /// Confirm an outbound intent's commit without waiting for Welcome fanout.
     ///
     /// Founding creates and existing-group invites persist exact Welcome bytes
@@ -1643,11 +1662,9 @@ where
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
-        let mut session_effects = self
-            .session
-            .send_with_audit_context(intent, context.clone())
+        let (session_effects, welcomes) = self
+            .confirm_commit_without_publish_with_audit_context(intent, context.clone())
             .await?;
-        let welcomes = take_deferred_welcomes(&mut session_effects);
         let mut output = self
             .publish_session_effects_with_audit_context(session_effects, Some(context))
             .await?;

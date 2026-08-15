@@ -291,10 +291,10 @@ pub struct AppClient {
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
 }
 
-/// Cross the point-of-no-return for current-profile group creation without
-/// allowing repairable follow-up work to turn a canonical group into an
-/// apparent create failure. Returning `Err` after that boundary encourages a
-/// caller to retry and create a second group. The engine's retained outbound
+/// Cross the point-of-no-return for a current-profile group mutation without
+/// allowing repairable follow-up work to turn a canonical change into an
+/// apparent failure. Returning `Err` after that boundary encourages a caller
+/// to retry an already-applied create or invite. The engine's retained outbound
 /// Welcome index and account-open reconciliation repair any missed projection
 /// work.
 fn recover_post_canonical_result<T: Default>(
@@ -308,7 +308,7 @@ fn recover_post_canonical_result<T: Default>(
                 target: "marmot_app::client",
                 method = method,
                 error_kind = error.privacy_safe_kind(),
-                "canonical group creation outpaced repairable follow-up work"
+                "canonical group mutation outpaced repairable follow-up work"
             );
             T::default()
         }
@@ -1432,7 +1432,7 @@ impl AppClient {
         let engine_publish_started_at = Instant::now();
         let commit = self
             .runtime
-            .send_confirming_commit_with_audit_context(
+            .confirm_commit_without_publish_with_audit_context(
                 SendIntent::Invite {
                     group_id: group_id.clone(),
                     key_packages,
@@ -1441,19 +1441,35 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await
-            .map_err(AppError::from)
-            .and_then(|(effects, welcomes)| {
-                fail_if_publish_failed(&effects)?;
-                Ok((effects, welcomes))
-            });
-        record_app_performance(
-            telemetry,
-            AppPerformanceOperation::GroupInviteEnginePublish,
-            engine_publish_started_at.elapsed(),
-            commit.is_ok(),
-        );
-        let (effects, welcomes) = commit?;
-        let welcome_intents = self.record_welcome_delivery_intents(group_id, &welcomes)?;
+            .map_err(AppError::from);
+        let (session_effects, welcomes) = match commit {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        // The MLS invite is already canonical. Record exact Welcome destinations
+        // and stash fanout before the commit is exposed on the wire, then treat
+        // local projection as repairable follow-up so a later index failure
+        // cannot tell the caller to retry an applied invite or skip the first
+        // Welcome attempt.
+        let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_fail_invite_welcome_intent
+        {
+            Err(AppError::Publish(
+                "injected invite welcome intent failure".into(),
+            ))
+        } else {
+            self.record_welcome_delivery_intents(group_id, &welcomes)
+        };
+        let welcome_intents =
+            recover_post_canonical_result("record_welcome_delivery_intents", welcome_intent_result);
         self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
             group_id: group_id.clone(),
             audit_context: audit_context.clone(),
@@ -1463,8 +1479,35 @@ impl AppClient {
             },
         });
 
+        let published = self
+            .runtime
+            .publish_prepared_session_effects_with_audit_context(
+                session_effects,
+                audit_context.clone(),
+            )
+            .await
+            .map_err(AppError::from)
+            .and_then(|effects| {
+                fail_if_publish_failed(&effects)?;
+                Ok(effects)
+            });
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInviteEnginePublish,
+            engine_publish_started_at.elapsed(),
+            published.is_ok(),
+        );
+        let effects = published?;
+
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
+            if cfg!(feature = "test-policy-overrides")
+                && self.app.config.dev_fail_invite_local_refresh
+            {
+                return Err(AppError::Publish(
+                    "injected invite local refresh failure".into(),
+                ));
+            }
             self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
             self.remember_published_reports(&effects);
@@ -1480,7 +1523,7 @@ impl AppClient {
             local_refresh_started_at.elapsed(),
             local_refresh.is_ok(),
         );
-        local_refresh?;
+        recover_post_canonical_result("invite_members_local_refresh", local_refresh);
 
         let summary = send_summary_from_effects(&effects);
 
@@ -3610,7 +3653,7 @@ impl AppClient {
         for welcome in welcomes {
             let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
                 return Err(AppError::Publish(
-                    "founding delivery artifact was not a Welcome".into(),
+                    "delivery artifact was not a Welcome".into(),
                 ));
             };
             let message_id_hex = hex::encode(welcome.id.as_slice());

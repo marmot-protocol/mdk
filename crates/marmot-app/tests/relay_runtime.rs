@@ -72,7 +72,9 @@ async fn accept_group_invite_retrying_busy(
     timeout(Duration::from_secs(5), async {
         loop {
             match runtime.accept_group_invite(account_ref, group_id).await {
-                Err(AppError::AccountWorkerBusy) => sleep(Duration::from_millis(10)).await,
+                Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
+                    sleep(Duration::from_millis(10)).await
+                }
                 result => return result,
             }
         }
@@ -303,14 +305,23 @@ async fn gift_wrap_blocking_app(
     dir: &tempfile::TempDir,
     gate: BlockNextGiftWraps,
 ) -> (LocalRelay, MarmotApp, String) {
+    gift_wrap_blocking_app_with_config(
+        dir,
+        gate,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    )
+    .await
+}
+
+async fn gift_wrap_blocking_app_with_config(
+    dir: &tempfile::TempDir,
+    gate: BlockNextGiftWraps,
+    config: MarmotAppConfig,
+) -> (LocalRelay, MarmotApp, String) {
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
-    );
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
     (relay, app, url)
 }
 
@@ -8570,6 +8581,13 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
         .expect("the founding Welcome should still be blocked after create returns");
+    timeout(
+        Duration::from_millis(250),
+        runtime.group_members(&alice.account.account_id_hex, &group_id),
+    )
+    .await
+    .expect("same-account post-create projection reads must not queue behind Welcome fanout")
+    .expect("founder membership should be readable while Welcome is blocked");
     let alice_group = app
         .groups(&alice.account.label)
         .unwrap()
@@ -8650,6 +8668,23 @@ async fn invite_members_returns_before_blocked_welcome() {
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
         .expect("the invite Welcome should still be blocked after invite returns");
+    let (members, mls_state) = timeout(Duration::from_millis(250), async {
+        let members = runtime
+            .group_members(&alice.account.account_id_hex, &group_id)
+            .await?;
+        let mls_state = runtime
+            .group_mls_state(&alice.account.account_id_hex, &group_id)
+            .await?;
+        Ok::<_, AppError>((members, mls_state))
+    })
+    .await
+    .expect("same-account post-invite projection reads must not queue behind Welcome fanout")
+    .expect("invite_members_detailed worker reads should succeed while Welcome is blocked");
+    assert!(
+        members.len() >= 3,
+        "invite commit must be visible to worker reads while Welcome is still blocked"
+    );
+    assert!(mls_state.member_count >= 3);
     let members = app
         .groups(&alice.account.label)
         .unwrap()
@@ -8668,6 +8703,103 @@ async fn invite_members_returns_before_blocked_welcome() {
     })
     .await;
     runtime.shutdown().await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn invite_members_survives_injected_post_canonical_failure(config: MarmotAppConfig) {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGiftWraps::new();
+    let (_relay, app, url) = gift_wrap_blocking_app_with_config(&dir, gate.clone(), config).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let carol = runtime.create_identity(setup).await.unwrap();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "canonical invite despite post-confirm failure",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob.account.account_id_hex && joined_group == &group_id
+        )
+    })
+    .await;
+
+    gate.arm(1);
+    timeout(
+        Duration::from_secs(5),
+        runtime.invite_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&carol.account.account_id_hex),
+        ),
+    )
+    .await
+    .expect("invite_members must return while a Welcome is still blocked")
+    .expect("canonical invite must not tell the caller to retry after a post-confirm failure");
+
+    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+        .await
+        .expect("the exact Welcome must still get its first attempt after a post-confirm failure");
+
+    gate.release();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &carol_id && joined_group == &group_id
+        )
+    })
+    .await;
+    runtime.shutdown().await;
+}
+
+/// mdk#1451: an injected Welcome-intent index failure after confirm must not
+/// fail the caller or suppress the first Welcome attempt.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn invite_members_returns_when_welcome_intent_recording_fails() {
+    invite_members_survives_injected_post_canonical_failure(
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_fail_invite_welcome_intent(true),
+    )
+    .await;
+}
+
+/// mdk#1451: an injected local-projection failure after confirm must not fail
+/// the caller or suppress the first Welcome attempt.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn invite_members_returns_when_local_refresh_fails() {
+    invite_members_survives_injected_post_canonical_failure(
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_fail_invite_local_refresh(true),
+    )
+    .await;
 }
 
 /// mdk#1298: inviting a member as admin is one group evolution. The invitee is

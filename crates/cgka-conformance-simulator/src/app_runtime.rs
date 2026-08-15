@@ -1369,7 +1369,7 @@ pub(crate) async fn accept_group_invite_retrying_busy(
         .await
         {
             Ok(Ok(_)) => return Ok(()),
-            Ok(Err(AppError::AccountWorkerBusy)) => {
+            Ok(Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_))) => {
                 if attempt + 1 < BUSY_RETRY_ATTEMPTS {
                     tokio::time::sleep(BUSY_RETRY_DELAY).await;
                 }
