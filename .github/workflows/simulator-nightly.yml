@@ -17,6 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  CGKA_LANE_EVIDENCE_DIR: ${{ github.workspace }}/target/cgka-nightly-lane-evidence
 
 jobs:
   simulator-nightly:
@@ -50,6 +51,14 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      - name: Prepare private evidence roots
+        run: |
+          install -d -m 700 \
+            "$CGKA_LANE_EVIDENCE_DIR/steps" \
+            target/cgka-adversarial-reliability-ci \
+            target/cgka-conformance-simulator-nightly-reports \
+            target/cgka-distributed-container-evidence
+
       - name: Run nightly convergence lane
         id: convergence_lane
         continue-on-error: true
@@ -58,7 +67,11 @@ jobs:
           # process enough memlock headroom so the runner does not amplify one
           # warning per allocation when its inherited limit is exhausted.
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
-          just convergence-nightly-lane
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name nightly-core \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/nightly-core.json" \
+            -- just convergence-nightly-lane
 
       - name: Capture failed adversarial scenarios
         if: steps.convergence_lane.outcome == 'failure'
@@ -79,29 +92,66 @@ jobs:
         run: exit 1
 
       - name: Run simulator doctests
-        run: cargo test -p cgka-conformance-simulator --doc --locked
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name simulator-doctests \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/simulator-doctests.json" \
+            -- cargo test -p cgka-conformance-simulator --doc --locked
 
       - name: Build current distributed campaign image
-        run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name distributed-image-build \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/distributed-image-build.json" \
+            -- docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
       - name: Run selected real-container convergence campaign
         env:
           CGKA_CONVERGENCE_IMAGE: marmot-conformance:local
           CGKA_DISTRIBUTED_ARTIFACTS_DIR: ${{ github.workspace }}/target/cgka-distributed-container-evidence
         run: |
-          cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
-            --run-ignored ignored-only --no-tests fail \
-            -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state) | test(=four_party_cross_route_recovery_containers_match_unified_route)'
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name selected-container-campaigns \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/selected-container-campaigns.json" \
+            -- cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+              --run-ignored ignored-only --no-tests fail \
+              -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state) | test(=four_party_cross_route_recovery_containers_match_unified_route)'
 
       - name: Run encrypted file-backed vector report
         run: |
-          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
-            --vectors crates/cgka-conformance-simulator/vectors \
-            --out target/cgka-conformance-simulator-nightly-reports \
-            --storage file \
-            --strict-oracle
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            observe-step \
+            --name file-backed-vector-report \
+            --output "$CGKA_LANE_EVIDENCE_DIR/steps/file-backed-vector-report.json" \
+            -- cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
+              --vectors crates/cgka-conformance-simulator/vectors \
+              --out target/cgka-conformance-simulator-nightly-reports \
+              --storage file \
+              --strict-oracle
           jq -s -e 'all(.[]; .metadata.storage_backend == "encrypted-file-sqlite")' \
             target/cgka-conformance-simulator-nightly-reports/*-report.json >/dev/null
+
+      - name: Collect nightly lane observation
+        if: always()
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            collect-observation \
+            --step-dir "$CGKA_LANE_EVIDENCE_DIR/steps" \
+            --artifact-root target/cgka-adversarial-reliability-ci \
+            --artifact-root target/cgka-conformance-simulator-nightly-reports \
+            --artifact-root target/cgka-distributed-container-evidence \
+            --disk-root target \
+            --output "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json"
+
+      - name: Enforce nightly lane budget
+        if: always()
+        run: |
+          cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
+            check-budget nightly "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
+            --output "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json"
 
       - name: Upload nightly vector report
         if: always()
@@ -111,6 +161,7 @@ jobs:
           path: |
             target/cgka-conformance-simulator-nightly-reports
             target/cgka-distributed-container-evidence
+            target/cgka-nightly-lane-evidence
           if-no-files-found: warn
           retention-days: 30
 

@@ -168,8 +168,22 @@ Accordingly, `incident_corpus` is false until a lane has a real, reviewed incide
 Every lane defines maximum wall time, CPU time, peak RSS, disk use, artifact bytes, artifact retention, flake retries,
 and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-usage JSON document and exits nonzero if
 any limit is exceeded. It also rejects zero executed cases, observations below the lane minimum, and flaky-case counts
-larger than executed-case counts. The scheduled workflows do not yet emit this aggregate observation or invoke
-`check-budget`; these limits are machine-checkable reviewed policy, not yet a green-workflow attestation.
+larger than executed-case counts. The nightly, weekly/manual, and release-hardening workflows wrap each lane command
+with `observe-step`, aggregate the private step records with `collect-observation`, then invoke `check-budget` even
+after an earlier failure. A failed wrapped command writes its step record before returning nonzero, so failure evidence
+is retained rather than replaced by a generic red workflow.
+
+On the scheduled Linux runner, each step records elapsed wall time, `wait4` user/system CPU, peak RSS, exit or signal,
+and a filesystem-block-write lower bound. Executed cases come from Nextest's experimental structured suite summaries;
+retry counts come from its retry-status records. The aggregate sums sequential step wall/CPU time and case/retry
+counts, takes the maximum per-step RSS, and measures final regular-file bytes below the declared working and retained
+artifact roots without following symlinks. These are deliberately bounded observations: setup/tool installation,
+GitHub upload time, peak transient Docker disk use, non-Nextest case notions, and the collector's own metadata bytes are
+not included; process usage also excludes work performed outside the command's child tree, such as the Docker daemon.
+Non-Unix observations lack required CPU/RSS fields and therefore cannot satisfy scheduled collection.
+The retained raw observation and budget decision live under `target/cgka-nightly-lane-evidence` or
+`target/cgka-hardening-lane-evidence` beside the per-step records.
+
 `minimum_executed_cases` is therefore only a liveness floor: it prevents empty evidence, but does not prove that every
 declared capability ran. Capability-specific evidence remains required before a lane can support an assurance claim.
 

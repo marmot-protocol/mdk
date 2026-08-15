@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 
@@ -6,9 +7,10 @@ use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
     CampaignAdapterV1, CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1,
     ConvergenceEvidenceBundleV1, DistributedBackendV1, FailureClassificationV1,
-    INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, evidence_bundle_base_dir, load_manifest,
-    observation_from_capsule, promote_capsule_into_corpus, run_manifest, update_failure_corpus,
-    validate_scenario_bytes, verify_manifest_inputs,
+    INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, collect_lane_observation,
+    evidence_bundle_base_dir, load_manifest, observation_from_capsule, observe_lane_step,
+    promote_capsule_into_corpus, run_manifest, update_failure_corpus, validate_scenario_bytes,
+    verify_manifest_inputs, write_lane_observation_private,
 };
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -52,6 +54,28 @@ enum Commands {
         observation: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Run one trusted workflow command and privately record its resource and retry evidence.
+    ObserveStep {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Aggregate measured workflow steps and retained artifact roots into one budget observation.
+    CollectObservation {
+        #[arg(long)]
+        step_dir: PathBuf,
+        #[arg(long, required = true)]
+        artifact_root: Vec<PathBuf>,
+        #[arg(long, required = true)]
+        disk_root: Vec<PathBuf>,
+        #[arg(long)]
+        campaign_manifest: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Validate that an evidence bundle contains every required assurance section.
     CheckEvidence { bundle: PathBuf },
@@ -192,6 +216,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if !evaluation.passed {
                 return Err("campaign exceeded its reviewed lane budget".into());
+            }
+        }
+        Commands::ObserveStep {
+            name,
+            output,
+            command,
+        } => {
+            let observation = observe_lane_step(name, &command)?;
+            observation.write_private(&output)?;
+            println!("lane-step-observation {}", output.display());
+            if !observation.succeeded() {
+                return Err("observed lane step failed".into());
+            }
+        }
+        Commands::CollectObservation {
+            step_dir,
+            artifact_root,
+            disk_root,
+            campaign_manifest,
+            output,
+        } => {
+            let collected = collect_lane_observation(
+                &step_dir,
+                &artifact_root,
+                &disk_root,
+                &campaign_manifest,
+            )?;
+            write_lane_observation_private(&collected.observation, &output)?;
+            println!("lane-observation {}", output.display());
+            if !collected.failed_steps.is_empty() {
+                return Err(format!(
+                    "observed lane steps failed: {}",
+                    collected.failed_steps.join(",")
+                )
+                .into());
             }
         }
         Commands::CheckEvidence {

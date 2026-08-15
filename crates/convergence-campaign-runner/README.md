@@ -49,6 +49,16 @@ driver receives the normalized, versioned ownership record for the exact run.
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.
 
+Scheduled execution lanes use the same binary to collect and enforce resource
+evidence. `observe-step --name <name> --output <step.json> -- <argv...>` runs one
+trusted workflow command, preserves its ordinary output, and writes a private
+step record. `collect-observation` combines those records with final
+artifact and working-directory sizes into `observed-usage.v1.json`, and
+`check-budget <lane>` evaluates it against the compiled reviewed policy. The
+nightly workflow retains these files under
+`target/cgka-nightly-lane-evidence`; weekly/manual and release-hardening runs
+use `target/cgka-hardening-lane-evidence`.
+
 Failed distributed executions append a privacy-safe entry to the private
 `failure-corpus.v1.json` in the campaign output directory. `index-capsule` and
 `index-node-capsule` add simulator or process failures, `classify-failure`
