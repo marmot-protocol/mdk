@@ -22,6 +22,7 @@ use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::StreamExt;
 use marmot_forensics::AuditEventContext;
+use nostr::NostrSigner;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
@@ -64,6 +65,84 @@ pub(crate) use sync::is_own_relay_echo;
 pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+
+pub(crate) struct EncryptedMediaUploadHttp {
+    request: MediaUploadRequest,
+    source_epoch: u64,
+    media_secret: SecretBytes,
+    nostr_signer: Arc<dyn NostrSigner>,
+    version: EncryptedMediaVersion,
+    default_endpoints: Vec<AppBlobEndpoint>,
+    allowed_locator_kinds: Vec<String>,
+    allow_loopback_http: bool,
+}
+
+impl EncryptedMediaUploadHttp {
+    pub(crate) async fn run(self) -> Result<MediaUploadResult, AppError> {
+        upload_encrypted_media(
+            self.request,
+            self.source_epoch,
+            self.media_secret.as_ref(),
+            self.nostr_signer.as_ref(),
+            MediaOperationPolicy {
+                version: self.version,
+                default_endpoints: &self.default_endpoints,
+                allowed_locator_kinds: &self.allowed_locator_kinds,
+                allow_loopback_http: self.allow_loopback_http,
+            },
+        )
+        .await
+    }
+}
+
+pub(crate) struct EncryptedMediaUploadFinish {
+    group_id: GroupId,
+    source_epoch: u64,
+    media_secret: SecretBytes,
+    should_send: bool,
+    caption: Option<String>,
+}
+
+pub(crate) struct EncryptedMediaDownloadHttp {
+    reference: MediaAttachmentReference,
+    media_secret: SecretBytes,
+    default_blob_endpoints: Vec<AppBlobEndpoint>,
+    allowed_locator_kinds: Vec<String>,
+    allow_loopback: bool,
+}
+
+impl EncryptedMediaDownloadHttp {
+    pub(crate) async fn run(self) -> Result<MediaDownloadResult, AppError> {
+        download_encrypted_media(
+            self.reference,
+            self.media_secret.as_ref(),
+            &self.default_blob_endpoints,
+            &self.allowed_locator_kinds,
+            self.allow_loopback,
+        )
+        .await
+    }
+}
+
+pub(crate) struct GroupImageDownloadHttp {
+    image_hash_hex: String,
+    image_key_hex: String,
+    image_nonce_hex: String,
+    media_type: String,
+}
+
+impl GroupImageDownloadHttp {
+    pub(crate) async fn run(self) -> Result<Vec<u8>, AppError> {
+        fetch_group_image(
+            &self.image_hash_hex,
+            &self.image_key_hex,
+            &self.image_nonce_hex,
+            &self.media_type,
+            None,
+        )
+        .await
+    }
+}
 
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. All started work finishes before deterministic error selection,
@@ -2534,6 +2613,21 @@ impl AppClient {
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<MediaUploadResult, AppError> {
+        let (http, finish) = self
+            .prepare_encrypted_media_upload(group_id, request)
+            .await?;
+        let result = http.run().await?;
+        self.finish_encrypted_media_upload(finish, result).await
+    }
+
+    /// Cheap exclusive-client setup for an encrypted-media upload. The returned
+    /// HTTP job must run without holding `&mut AppClient` so the account worker
+    /// can keep polling inbound delivery.
+    pub(crate) async fn prepare_encrypted_media_upload(
+        &mut self,
+        group_id: &GroupId,
+        request: MediaUploadRequest,
+    ) -> Result<(EncryptedMediaUploadHttp, EncryptedMediaUploadFinish), AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
@@ -2581,54 +2675,67 @@ impl AppClient {
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
-        let nostr_signer = signer.as_nostr_signer();
         let should_send = request.send;
         let caption = request.caption.clone();
-        let mut result = upload_encrypted_media(
-            request,
-            source_epoch,
-            media_secret.as_ref(),
-            nostr_signer.as_ref(),
-            MediaOperationPolicy {
+        Ok((
+            EncryptedMediaUploadHttp {
+                request,
+                source_epoch,
+                media_secret: media_secret.clone(),
+                nostr_signer: signer.as_nostr_signer(),
                 version: policy.version,
-                default_endpoints: &default_endpoints,
-                allowed_locator_kinds: &policy.allowed_locator_kinds,
+                default_endpoints,
+                allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
             },
-        )
-        .await?;
-        if should_send {
-            let attachments = result
-                .attachments
-                .iter()
-                .map(|attachment| attachment.reference.clone())
-                .collect();
-            let summary = self
-                .send_media_attachments(group_id, attachments, caption)
-                .await?;
-            // The post-publish projection now durably references this source
-            // epoch. Persist again so a prior final-reference retirement cannot
-            // suppress the secret needed by the newly retained message.
-            if self
-                .remember_encrypted_media_epoch_secret(
-                    group_id,
-                    source_epoch,
-                    media_secret.as_ref(),
-                )
-                .is_err()
-            {
-                // Publication already succeeded. Do not report a false send
-                // failure that could make the caller publish a duplicate; the
-                // normal current-epoch cache pass can retry this durable write.
-                tracing::warn!(
-                    target: "marmot_app::media",
-                    method = "upload_media",
-                    error_code = "encrypted_media_secret_cache_skipped",
-                    "failed to cache encrypted media source epoch secret after publish",
-                );
-            }
-            result.sent = Some(summary);
+            EncryptedMediaUploadFinish {
+                group_id: group_id.clone(),
+                source_epoch,
+                media_secret,
+                should_send,
+                caption,
+            },
+        ))
+    }
+
+    pub(crate) async fn finish_encrypted_media_upload(
+        &mut self,
+        finish: EncryptedMediaUploadFinish,
+        mut result: MediaUploadResult,
+    ) -> Result<MediaUploadResult, AppError> {
+        if !finish.should_send {
+            return Ok(result);
         }
+        let attachments = result
+            .attachments
+            .iter()
+            .map(|attachment| attachment.reference.clone())
+            .collect();
+        let summary = self
+            .send_media_attachments(&finish.group_id, attachments, finish.caption)
+            .await?;
+        // The post-publish projection now durably references this source
+        // epoch. Persist again so a prior final-reference retirement cannot
+        // suppress the secret needed by the newly retained message.
+        if self
+            .remember_encrypted_media_epoch_secret(
+                &finish.group_id,
+                finish.source_epoch,
+                finish.media_secret.as_ref(),
+            )
+            .is_err()
+        {
+            // Publication already succeeded. Do not report a false send
+            // failure that could make the caller publish a duplicate; the
+            // normal current-epoch cache pass can retry this durable write.
+            tracing::warn!(
+                target: "marmot_app::media",
+                method = "finish_encrypted_media_upload",
+                error_code = "encrypted_media_secret_cache_skipped",
+                "failed to cache encrypted media source epoch secret after publish",
+            );
+        }
+        result.sent = Some(summary);
         Ok(result)
     }
 
@@ -2637,6 +2744,17 @@ impl AppClient {
         group_id: &GroupId,
         reference: MediaAttachmentReference,
     ) -> Result<MediaDownloadResult, AppError> {
+        self.prepare_encrypted_media_download(group_id, reference)
+            .await?
+            .run()
+            .await
+    }
+
+    pub(crate) async fn prepare_encrypted_media_download(
+        &mut self,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+    ) -> Result<EncryptedMediaDownloadHttp, AppError> {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
@@ -2650,14 +2768,13 @@ impl AppClient {
             reference.source_epoch,
             reference_version.component_id(),
         )?;
-        download_encrypted_media(
+        Ok(EncryptedMediaDownloadHttp {
             reference,
-            media_secret.as_ref(),
-            &policy.default_blob_endpoints,
-            &policy.allowed_locator_kinds,
-            self.app.allow_loopback_blob_endpoints(),
-        )
-        .await
+            media_secret,
+            default_blob_endpoints: policy.default_blob_endpoints,
+            allowed_locator_kinds: policy.allowed_locator_kinds,
+            allow_loopback: self.app.allow_loopback_blob_endpoints(),
+        })
     }
 
     /// Encrypt + upload a group avatar to Blossom, then publish the
@@ -2713,6 +2830,16 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<u8>, AppError> {
+        self.prepare_group_image_download(group_id)
+            .await?
+            .run()
+            .await
+    }
+
+    pub(crate) async fn prepare_group_image_download(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<GroupImageDownloadHttp, AppError> {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let input = self.image_for_group(group_id);
@@ -2721,14 +2848,12 @@ impl AppClient {
                 "group has no image set".into(),
             ));
         }
-        fetch_group_image(
-            &input.image_hash_hex,
-            &input.image_key_hex,
-            &input.image_nonce_hex,
-            input.media_type.as_deref().unwrap_or_default(),
-            None,
-        )
-        .await
+        Ok(GroupImageDownloadHttp {
+            image_hash_hex: input.image_hash_hex,
+            image_key_hex: input.image_key_hex,
+            image_nonce_hex: input.image_nonce_hex,
+            media_type: input.media_type.unwrap_or_default(),
+        })
     }
 
     pub async fn start_agent_text_stream(

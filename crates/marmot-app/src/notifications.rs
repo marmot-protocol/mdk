@@ -32,8 +32,8 @@ use cgka_traits::group::ProtocolProfile;
 
 use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
 use crate::{
-    AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
-    tag_value,
+    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
+    ReceivedMessage, RuntimeMessageReceived, tag_value,
 };
 use storage_sqlite::TimelineMessageTarget;
 
@@ -62,6 +62,10 @@ const LEGACY_PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
 const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
 const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
+/// Bounded recent-history window used to rebuild missed notifications after
+/// broadcast lag. Large enough to cover a slow consumer, small enough that
+/// recovery stays a snapshot rather than a full-history hydrate.
+const NOTIFICATION_LAG_RECOVERY_LIMIT: usize = 64;
 
 #[cfg(test)]
 std::thread_local! {
@@ -1462,6 +1466,83 @@ pub(crate) fn notification_update_from_event(
     notification_update_from_event_cached(app, &mut resolver, event)
 }
 
+/// Re-derive candidate notifications from recent stored messages after the
+/// live broadcast ring overflows. Callers still dedupe against already-emitted
+/// `notification_key`s so recovery cannot replay a notification the subscriber
+/// already saw. `min_observed_at` is a per-subscription watermark in the same
+/// second-resolution units as `recorded_at` / `received_at`; rows strictly
+/// before it are pre-subscription history and must not become fresh OS alerts.
+/// Same-second rows stay eligible so in-session events are not dropped.
+pub(crate) fn recover_notification_updates(
+    app: &MarmotApp,
+    min_observed_at: Option<u64>,
+) -> Result<Vec<NotificationUpdate>, AppError> {
+    let mut resolver = NotificationResolver::default();
+    let mut updates = Vec::new();
+    for account in app.account_home().accounts()? {
+        let records = app.messages_with_query(
+            &account.label,
+            AppMessageQuery {
+                group_id_hex: None,
+                limit: Some(NOTIFICATION_LAG_RECOVERY_LIMIT),
+            },
+        )?;
+        for record in records {
+            if !notification_recovery_is_fresh(&record, min_observed_at) {
+                continue;
+            }
+            let Ok(group_id) = hex::decode(&record.group_id_hex) else {
+                continue;
+            };
+            let sender_display_name = app
+                .display_name_for_account_id(&record.sender)
+                .ok()
+                .flatten();
+            let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+                account_id_hex: account.account_id_hex.clone(),
+                account_label: account.label.clone(),
+                message: ReceivedMessage {
+                    message_id_hex: record.message_id_hex,
+                    source_message_id_hex: String::new(),
+                    sender: record.sender,
+                    sender_display_name,
+                    group_id: cgka_traits::GroupId::new(group_id),
+                    source_epoch: record.source_epoch.unwrap_or(0),
+                    retention: record.retention,
+                    plaintext: record.plaintext,
+                    kind: record.kind,
+                    tags: record.tags,
+                    recorded_at: record.recorded_at,
+                    received_at: record.received_at,
+                },
+            });
+            match notification_update_from_event_cached(app, &mut resolver, &event) {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) | Err(AppError::NotificationsDisabled) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "recover_notification_updates",
+                        error_code = "notification_projection_skipped",
+                        "recovered notification projection skipped",
+                    );
+                }
+            }
+        }
+    }
+    Ok(dedupe_notification_updates(updates))
+}
+
+pub(crate) fn notification_recovery_is_fresh(
+    record: &AppMessageRecord,
+    min_observed_at: Option<u64>,
+) -> bool {
+    // `recorded_at` is sender-authenticated and intentionally not clamped.
+    // Only this device's local observation time can define whether a row was
+    // received before or after the subscription boundary.
+    min_observed_at.is_none_or(|min| record.received_at >= min)
+}
+
 /// Build a notification for one event, reusing `resolver`'s memoized
 /// settings/group/user lookups across a batch of events (#639).
 pub(crate) fn notification_update_from_event_cached(
@@ -1937,6 +2018,13 @@ pub(crate) fn unix_now_ms() -> i64 {
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+pub(crate) fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

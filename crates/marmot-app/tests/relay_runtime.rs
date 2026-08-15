@@ -2441,7 +2441,21 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
     accept_group_invite_retrying_busy(&runtime, &bob_id, &second_group_id)
         .await
         .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
     let second_group_id_hex = hex::encode(second_group_id.as_slice());
+    let mut bob_chats = runtime.subscribe_chats(&bob_id, false).await.unwrap();
+    assert!(
+        bob_chats
+            .snapshot
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+    );
+    assert!(
+        bob_chats
+            .snapshot
+            .iter()
+            .any(|group| group.group_id_hex == second_group_id_hex)
+    );
 
     runtime
         .send_message(&alice_id, &group_id, b"local rows must be wiped".to_vec())
@@ -2458,7 +2472,6 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
     })
     .await;
 
-    let group_id_hex = hex::encode(group_id.as_slice());
     runtime
         .initialize_chat_read_state(&bob_id, &group_id_hex)
         .unwrap();
@@ -2495,12 +2508,22 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             .await
             .unwrap()
     );
+    let deleted_chat = wait_for_chat_update(&mut bob_chats, |group| {
+        group.group_id_hex == group_id_hex && group.archived
+    })
+    .await;
+    assert!(deleted_chat.archived);
     assert!(
         runtime
             .delete_group_local(&bob_id, &second_group_id)
             .await
             .unwrap()
     );
+    let second_deleted_chat = wait_for_chat_update(&mut bob_chats, |group| {
+        group.group_id_hex == second_group_id_hex && group.archived
+    })
+    .await;
+    assert!(second_deleted_chat.archived);
 
     assert!(app.group(&bob_label, &group_id_hex).unwrap().is_none());
     assert!(
@@ -4324,6 +4347,22 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     assert_eq!(declined.summary.published, 1);
     assert!(!declined.group.pending_confirmation);
     assert!(declined.group.archived);
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupStateUpdated {
+                account_id_hex,
+                group_id: updated,
+                ..
+            } if account_id_hex == &bob_id && updated == &group_id
+        ) || matches!(
+            event,
+            MarmotAppEvent::ProjectionUpdated(update)
+                if update.account_id_hex == bob_id
+                    && update.update.group_id_hex == group_id_hex
+        )
+    })
+    .await;
 
     let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert!(!reloaded.pending_confirmation);
@@ -4700,6 +4739,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 
     let mut bob_chats = runtime
         .subscribe_chats(&bob.account.account_id_hex, false)
+        .await
         .unwrap();
     assert!(bob_chats.snapshot.is_empty());
 
@@ -4718,6 +4758,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 
     let mut group_state = runtime
         .subscribe_group_state(&bob.account.account_id_hex, &group_id_hex)
+        .await
         .unwrap();
     assert_eq!(group_state.snapshot.group_id_hex, group_id_hex);
 
@@ -4805,6 +4846,7 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
 
     let mut group_state = runtime
         .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
         .unwrap();
 
     let renamed = "renamed during retained send".to_owned();
@@ -4914,6 +4956,7 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
 
     let mut group_state = runtime
         .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
         .unwrap();
 
     let renamed = "renamed during rejected send".to_owned();
@@ -4992,6 +5035,7 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
     };
     let mut timeline = runtime
         .subscribe_timeline_messages(&alice_id, query.clone())
+        .await
         .unwrap();
     assert!(timeline.take_snapshot().messages.is_empty());
 
@@ -5017,6 +5061,7 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
 
     let reopened = runtime
         .subscribe_timeline_messages(&alice_id, query)
+        .await
         .unwrap();
     let reopened_snapshot = reopened.take_snapshot();
     assert_eq!(reopened_snapshot.messages.len(), 1);
@@ -5098,6 +5143,7 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
     };
     let timeline = runtime
         .subscribe_timeline_messages(&alice_id, query)
+        .await
         .unwrap();
     let snapshot = timeline.take_snapshot();
     assert_eq!(snapshot.messages.len(), 2);

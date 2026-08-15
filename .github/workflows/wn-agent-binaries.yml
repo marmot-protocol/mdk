@@ -249,6 +249,8 @@ jobs:
           enable-cache: false
 
       - name: Prepare isolated Hermes dev root
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           dev_root="$RUNNER_TEMP/hermes-marmot-integration"

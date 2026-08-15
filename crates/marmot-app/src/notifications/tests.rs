@@ -1720,3 +1720,34 @@ fn signed_record_survives_wire_round_trip_and_verifies() {
         other => panic!("expected upsert, got {other:?}"),
     }
 }
+
+#[test]
+fn recovery_skips_rows_before_the_subscription_watermark() {
+    let mut record = AppMessageRecord {
+        message_id_hex: "11".repeat(32),
+        direction: "received".to_owned(),
+        group_id_hex: "22".repeat(16),
+        sender: "33".repeat(32),
+        plaintext: "old local observation".to_owned(),
+        kind: 9,
+        tags: Vec::new(),
+        source_epoch: Some(1),
+        retention: None,
+        recorded_at: u64::MAX,
+        received_at: 10,
+        insert_order: 1,
+        invalidated: false,
+        moderation_grant: false,
+    };
+
+    assert!(
+        !notification_recovery_is_fresh(&record, Some(11)),
+        "a sender-controlled future timestamp must not revive stale history"
+    );
+    record.received_at = 11;
+    assert!(notification_recovery_is_fresh(&record, Some(11)));
+    record.received_at = 12;
+    assert!(notification_recovery_is_fresh(&record, Some(11)));
+    record.received_at = 1;
+    assert!(notification_recovery_is_fresh(&record, None));
+}
