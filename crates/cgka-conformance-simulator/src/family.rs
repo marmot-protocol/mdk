@@ -342,14 +342,8 @@ pub fn generate_cross_route_restart_permutation_case(
     seed: u64,
     case_index: u64,
 ) -> GeneratedScenarioCase {
-    let mut scenario = crate::cross_route_restart_permutation_public_scenario(seed, case_index);
+    let scenario = crate::cross_route_restart_permutation_public_scenario(seed, case_index);
     let clients = scenario.clients.clone();
-    scenario.steps.push(ScenarioStep::InGroup {
-        group: "main".into(),
-        action: Box::new(ScenarioStep::ObserveAdminPolicy {
-            clients: clients.clone(),
-        }),
-    });
     let expected_payloads = clients
         .iter()
         .map(|sender| format!("probe-from-{sender}"))
@@ -4093,6 +4087,11 @@ mod tests {
         );
         for case in cases {
             assert_eq!(case.subject, GeneratedSubjectKind::AppRuntime);
+            assert_eq!(
+                case.scenario,
+                crate::cross_route_restart_permutation_public_scenario(case.seed, case.case_index,),
+                "the generated app-runtime input must remain the portable public IR"
+            );
             assert!(
                 case.expected_outcomes.iter().any(|expectation| matches!(
                     expectation,
@@ -4141,6 +4140,9 @@ mod tests {
                         expectation,
                         TraceExpectation::ClientsBidirectionallyDecryptable { .. }
                     )
+                })
+                && case.expected_outcomes.iter().any(|expectation| {
+                    matches!(expectation, TraceExpectation::NoPendingWork { .. })
                 })
         }));
     }

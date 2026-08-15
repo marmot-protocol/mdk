@@ -610,7 +610,8 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Replay: the isolated family runner saves the complete selected input before execution and retains reports, fixture
   candidates, process measurements, and failure capsules per case. The exact retained-engine companion is registered
   separately as `cross-route-exact-restart-permutations/v1`, ensuring a panic in one private-state case cannot stop
-  the rest of the catalog. The first seed-0 execution passed 9/12. Restarting Zeta at the three initial accepted
+  the rest of the catalog. Public and exact inputs use distinct scenario-name prefixes. The complete public seed-0
+  execution passed 12/12; the exact execution passed 9/12. Restarting Zeta at the three initial accepted
   publication boundaries produced a structured `PendingPublish` refusal, a `PendingPublish` panic, and an
   epoch-3/pending-work/decryptability stall respectively; every later branch/repair boundary passed. Those are
   counterexamples, not allowed results.

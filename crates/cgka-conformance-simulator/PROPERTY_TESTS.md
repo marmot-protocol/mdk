@@ -252,7 +252,8 @@ Twelve consecutive cases cover accepted create/admin/profile publications, the b
 all four participants after retained-history repair. Seeds rotate the catalog rather than changing its membership, so
 shards remain deterministic and a twelve-case run has a clear completeness claim. The generated family exercises the
 full app runtime and strict public projection/payload oracle. A separate exact retained-engine family uses the same
-isolated child runner so panic-shaped failures do not abort later cases. The first seed-0 run passed 9/12: the three
+isolated child runner so panic-shaped failures do not abort later cases. The complete public seed-0 catalog passed
+12/12; the corresponding exact run passed 9/12: the three
 early Zeta publication-boundary restarts produced two `PendingPublish` failures (one structured, one panic) and one
 epoch-3/pending-work/decryptability stall, while every later branch/repair boundary passed. An explicit ignored test replays the catalog through the
 isolated-process adapter, whose validation binds every restart action id to a matching durable `restarted` lifecycle

@@ -369,13 +369,14 @@ convergence-weekly-lane: convergence-nightly-lane
 
 # Current-build four-party route assurance with one additional durable reopen
 # per reviewed transition boundary. Twelve cases cover the complete v1 catalog;
-# larger counts repeat it under the same deterministic seed rotation.
-cross-route-restart-campaign seed="1" cases="12" out="target/cross-route-restart-campaign":
+# larger counts repeat it under the same deterministic seed rotation. These
+# production-policy runs intentionally omit test-policy-overrides.
+cross-route-restart-campaign seed="0" cases="12" out="target/cross-route-restart-campaign":
     cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked -- --family cross-route-restart-permutations/v1 --seed "{{seed}}" --cases "{{cases}}" --case-timeout-secs 300 --out "{{out}}" --storage file
 
 # Exact/private-state companion. Process isolation is required because a
 # panic-shaped engine failure in one case must not prevent later cases running.
-cross-route-exact-restart-campaign seed="1" cases="12" out="target/cross-route-exact-restart-campaign":
+cross-route-exact-restart-campaign seed="0" cases="12" out="target/cross-route-exact-restart-campaign":
     cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked -- --family cross-route-exact-restart-permutations/v1 --seed "{{seed}}" --cases "{{cases}}" --case-timeout-secs 300 --out "{{out}}" --storage file
 
 # A release run must name a reviewed mixed-build manifest rather

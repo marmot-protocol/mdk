@@ -545,14 +545,19 @@ cargo test -p cgka-conformance-simulator --test process_orchestrator --locked --
 
 The builder names relay-visibility boundaries by publication (`zeta-root` and `alpha-root`) and resolves them to the
 adapter-supported stable action ids only after inserting a restart. A shifted schedule therefore cannot silently
-retarget or disable the intended branch topology.
+retarget or disable the intended branch topology. The two non-publication boundaries match the complete semantic
+sequence that ends them (reconnect/incremental-sync/tick for Zeta ingestion and Observer reconnect/full-sync/tick for
+the first repair), and a table-driven test pins every inserted restart's exact step and client.
 
-The first complete seed-0 exact current-build execution passed 9/12 cases and found three early-publication
+The complete seed-0 public app-runtime execution passed 12/12 cases. The corresponding exact current-build execution
+passed 9/12 and found three early-publication
 counterexamples. `after-create-accepted-zeta` later rejected an admin update from durable `PendingPublish` and wrote a
 shareable capsule; `after-promote-alpha-accepted-zeta` panicked on the next update from `PendingPublish` (the exact
 input and exit 101 survive, but no report/capsule does); and `after-promote-yankee-accepted-zeta` stranded Zeta at epoch
 3 with pending work, quiescence timeouts, and failed inbound decryptability. All later branch/repair boundaries passed.
-The catalog does not encode these surfaces as acceptable behavior or include a production fix.
+The catalog does not encode these surfaces as acceptable behavior or include a production fix. Public and exact
+artifacts carry distinct scenario-name prefixes so evidence remains attributable to the subject and oracle that
+produced it.
 
 The process adapter accepts the same saved input in place of a raw Scenario IR file:
 
