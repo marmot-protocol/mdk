@@ -3708,6 +3708,17 @@ impl AccountManager {
         result
     }
 
+    async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
+        if let Err(error) = self.deactivate_account(account_ref).await {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "restore_signed_out_after_key_package_failure",
+                error_kind = error.privacy_safe_kind(),
+                "failed to restore signed-out state after key package publication failure"
+            );
+        }
+    }
+
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
         let _worker_transaction = self.worker_transactions.lock().await;
@@ -4276,7 +4287,8 @@ impl AccountManager {
                         // worker. The same nsec can then resume this exact
                         // lifecycle attempt instead of failing AccountExists.
                         if reactivating_existing {
-                            self.deactivate_account(&account.label).await?;
+                            self.restore_signed_out_after_key_package_failure(&account.label)
+                                .await;
                         }
                         return Err(err);
                     }
@@ -4370,6 +4382,7 @@ impl AccountManager {
             .app
             .account_home()
             .add_external_signer_account(&public_key)?;
+        let reactivating_existing = account.signed_out;
         if let Err(err) = self
             .app
             .register_external_signer(&account.account_id_hex, signer)
@@ -4451,12 +4464,20 @@ impl AccountManager {
                     )?;
                     Some(bytes)
                 }
-                // Session lifecycle state owns exact signed bytes and private
-                // material before network exposure. Once KeyPackage setup has
-                // started, deleting a freshly-added external account could
-                // orphan an ambiguously accepted publication; keep it for an
-                // exact-byte retry instead.
-                Err(err) => return Err(err),
+                Err(err) => {
+                    // Session lifecycle state owns exact signed bytes and
+                    // private material before network exposure. Once
+                    // KeyPackage setup has started, deleting a freshly-added
+                    // external account could orphan an ambiguously accepted
+                    // publication; keep it for an exact-byte retry instead.
+                    // A previously signed-out account is different: restore
+                    // that durable state while retaining its setup journal.
+                    if reactivating_existing {
+                        self.restore_signed_out_after_key_package_failure(&account.label)
+                            .await;
+                    }
+                    return Err(err);
+                }
             }
         } else {
             None

@@ -3484,9 +3484,10 @@ impl MarmotApp {
                 Err(_) => delete_failure_count += 1,
             }
         }
-        if delete_failure_count == 0 && self.mark_key_package_cutover_scan_complete(label).is_err()
-        {
-            delete_failure_count += 1;
+        if delete_failure_count == 0 {
+            // The marker helper emits its own privacy-safe warning. It is not
+            // a relay deletion failure, so do not fold it into this counter.
+            let _ = self.mark_key_package_cutover_scan_complete(label);
         }
         if non_current_event_count > 0 {
             tracing::info!(
@@ -5147,6 +5148,9 @@ impl MarmotApp {
             .account_publish_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The signer is intentionally ignored on a cache hit. Callers that
+        // replace an account signer must evict this entry first, as
+        // register_external_signer and drop_account_caches do today.
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {

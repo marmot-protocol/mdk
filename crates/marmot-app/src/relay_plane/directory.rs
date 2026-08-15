@@ -15,6 +15,13 @@ use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryRelayConnectOutcome {
+    Connected,
+    TimedOut,
+    Failed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DirectoryEventQuery {
     pub(crate) kind: u64,
@@ -349,37 +356,55 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
         let relay_urls = parsed_directory_relay_urls(&request.endpoints)?;
         let mut connect_candidates = Vec::new();
+        let mut added = vec![false; relay_urls.len()];
+        let mut add_failure_count = 0usize;
         for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
             if self.client.add_relay(relay_url.clone()).await.is_ok() {
+                added[index] = true;
                 connect_candidates.push((index, relay_url));
+            } else {
+                add_failure_count += 1;
             }
         }
         let mut connects = JoinSet::new();
         for (index, relay_url) in connect_candidates {
             let client = self.client.clone();
             connects.spawn(async move {
-                let connected = matches!(
-                    timeout(
-                        DIRECTORY_RELAY_CONNECT_WAIT,
-                        client.connect_relay(relay_url.clone()),
-                    )
-                    .await,
-                    Ok(Ok(()))
-                );
-                (index, relay_url, connected)
+                let outcome = match timeout(
+                    DIRECTORY_RELAY_CONNECT_WAIT,
+                    client.connect_relay(relay_url),
+                )
+                .await
+                {
+                    Ok(Ok(())) => DirectoryRelayConnectOutcome::Connected,
+                    Ok(Err(_)) => DirectoryRelayConnectOutcome::Failed,
+                    Err(_) => DirectoryRelayConnectOutcome::TimedOut,
+                };
+                (index, outcome)
             });
         }
         let mut connected = vec![false; relay_urls.len()];
-        let mut failed_urls = Vec::new();
+        let mut connect_timeout_count = 0usize;
+        let mut connect_failure_count = 0usize;
+        let mut task_failure_count = 0usize;
         while let Some(result) = connects.join_next().await {
             match result {
-                Ok((index, _relay_url, true)) => connected[index] = true,
-                Ok((_index, relay_url, false)) => failed_urls.push(relay_url),
-                Err(_) => {}
+                Ok((index, DirectoryRelayConnectOutcome::Connected)) => connected[index] = true,
+                Ok((_index, DirectoryRelayConnectOutcome::TimedOut)) => {
+                    connect_timeout_count += 1;
+                }
+                Ok((_index, DirectoryRelayConnectOutcome::Failed)) => {
+                    connect_failure_count += 1;
+                }
+                Err(_) => task_failure_count += 1,
             }
         }
-        for relay_url in failed_urls {
-            let _ = self.client.remove_relay(relay_url).await;
+        // A task that panics or is cancelled never flips its index to
+        // connected, so this also removes relays from failed JoinSet tasks.
+        for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
+            if added[index] && !connected[index] {
+                let _ = self.client.remove_relay(relay_url).await;
+            }
         }
         let relay_urls = relay_urls
             .into_iter()
@@ -387,7 +412,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .filter_map(|(relay_url, connected)| connected.then_some(relay_url))
             .collect::<Vec<_>>();
         if relay_urls.is_empty() {
-            return Err("connect relays failed".to_owned());
+            return Err(format!(
+                "connect relays failed: add_failures={add_failure_count}, connect_timeouts={connect_timeout_count}, connect_failures={connect_failure_count}, task_failures={task_failure_count}"
+            ));
         }
 
         let mut records = Vec::new();

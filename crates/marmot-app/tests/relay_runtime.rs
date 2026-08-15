@@ -1097,6 +1097,75 @@ async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
 }
 
 #[tokio::test]
+async fn failed_external_signer_reactivation_restores_signed_out_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let keys = Keys::generate();
+    let public_key = keys.public_key().to_hex();
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        discovery_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let created = runtime
+        .login_external_signer(
+            public_key.clone(),
+            TestExternalAccountSigner { keys: keys.clone() },
+            setup(),
+        )
+        .await
+        .expect("initial external-signer login should publish its KeyPackage");
+    runtime.shutdown().await;
+    AccountHome::open(dir.path())
+        .set_account_signed_out(&created.account.label, true)
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let runtime = MarmotAppRuntime::new(app);
+
+    rejecting.store(true, Ordering::Relaxed);
+    runtime
+        .login_external_signer(
+            public_key.clone(),
+            TestExternalAccountSigner { keys: keys.clone() },
+            setup(),
+        )
+        .await
+        .expect_err("external-signer reactivation must surface KeyPackage rejection");
+    assert!(
+        AccountHome::open(dir.path())
+            .account(&public_key)
+            .unwrap()
+            .signed_out,
+        "failed external-signer reactivation must restore signed-out state"
+    );
+
+    rejecting.store(false, Ordering::Relaxed);
+    let retried = runtime
+        .login_external_signer(
+            public_key.clone(),
+            TestExternalAccountSigner { keys },
+            setup(),
+        )
+        .await
+        .expect("external-signer reactivation retry must resume");
+    assert_eq!(retried.account.account_id_hex, public_key);
+    assert!(!retried.account.signed_out);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
