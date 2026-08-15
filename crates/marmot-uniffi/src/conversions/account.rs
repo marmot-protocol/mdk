@@ -155,6 +155,32 @@ impl From<UserProfileMetadata> for UserProfileMetadataFfi {
     }
 }
 
+/// One row of [`crate::Marmot::cached_identity_projections`].
+///
+/// `profile` is the only signal that remotely cached kind:0 metadata is
+/// available. `resolved_name` may come from a local account label and must not
+/// be treated as remote identity.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct CachedIdentityProjectionFfi {
+    pub requested_id: String,
+    pub account_id_hex: Option<String>,
+    pub profile: Option<UserProfileMetadataFfi>,
+    pub local_label: Option<String>,
+    pub resolved_name: Option<String>,
+}
+
+impl From<marmot_app::CachedIdentityProjection> for CachedIdentityProjectionFfi {
+    fn from(value: marmot_app::CachedIdentityProjection) -> Self {
+        Self {
+            requested_id: value.requested_id,
+            account_id_hex: value.account_id_hex,
+            profile: value.profile.map(Into::into),
+            local_label: value.local_label,
+            resolved_name: value.resolved_name,
+        }
+    }
+}
+
 impl From<UserProfileMetadataFfi> for UserProfileMetadata {
     fn from(value: UserProfileMetadataFfi) -> Self {
         Self {

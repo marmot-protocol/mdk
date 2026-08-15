@@ -12,6 +12,8 @@ pub enum MarmotKitError {
     UnknownGroup { group_id_hex: String },
     #[error("group membership page exceeds the maximum of {max_groups} groups")]
     InvalidGroupMembershipPage { max_groups: u64 },
+    #[error("cached identity page exceeds the maximum of {max_accounts} accounts")]
+    InvalidCachedIdentityPage { max_accounts: u64 },
     /// The group exists but its full hydration has not completed yet
     /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
     /// group shortly after account readiness, and worker-routed reads wait
@@ -259,6 +261,9 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
                 max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
             },
+            AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
+                max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
+            },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
             AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
@@ -410,6 +415,16 @@ mod tests {
         assert!(matches!(
             ffi,
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 100 }
+        ));
+    }
+
+    #[test]
+    fn oversized_cached_identity_page_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError =
+            AppError::InvalidCachedIdentityPage("too many accounts".into()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::InvalidCachedIdentityPage { max_accounts: 100 }
         ));
     }
 

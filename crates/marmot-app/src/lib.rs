@@ -142,10 +142,11 @@ pub use config::{
     RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
-    DirectoryKeyPackage, MatchQuality, MatchedField, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
-    UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
-    UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
-    UserSearchUpdate, sort_user_search_results,
+    CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
+    MatchedField, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserDirectoryLocalAccount,
+    UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
+    UserProfileMetadata, UserSearchParams, UserSearchSubscription, UserSearchUpdate,
+    sort_user_search_results,
 };
 pub use drafts::{
     MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
@@ -231,6 +232,7 @@ use conversions::{
     stored_app_event_from_projection, stored_push_registration_from_account,
     stored_state_from_account_state,
 };
+use directory::records::display_name_for_profile;
 use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
 use key_package_records::{
@@ -483,6 +485,8 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    directory_handle_acquire_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     local_open_gates: local_open_test_gate::LocalOpenGates,
     #[cfg(test)]
@@ -1261,6 +1265,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
             local_open_gates: local_open_test_gate::LocalOpenGates::default(),
             #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
@@ -1328,6 +1334,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             local_open_gates: local_open_test_gate::LocalOpenGates::default(),
             #[cfg(test)]
@@ -4199,7 +4207,7 @@ impl MarmotApp {
             .collect())
     }
 
-    fn local_account_labels_by_id(&self) -> Result<HashMap<String, String>, AppError> {
+    pub(crate) fn local_account_labels_by_id(&self) -> Result<HashMap<String, String>, AppError> {
         Ok(self
             .account_home()
             .accounts()?
@@ -5723,17 +5731,6 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
 
         Ok(KeyPackagePublishReceipt { accepted, failed })
     }
-}
-
-fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<String> {
-    let profile = profile?;
-    profile
-        .display_name
-        .as_deref()
-        .or(profile.name.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {

@@ -12,9 +12,9 @@ pub(crate) use cache::DirectorySearchGraphRecord;
 pub(crate) use methods::cached_or_unknown_follow_list;
 pub(crate) use records::FetchedFollowList;
 pub use records::{
-    DirectoryKeyPackage, MatchQuality, MatchedField, UserDirectoryLocalAccount,
-    UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
-    UserProfileMetadata,
+    CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
+    MatchedField, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
+    UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
 pub use search::{
     OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams, UserSearchSubscription,
