@@ -360,6 +360,18 @@ pub mod metric_names {
     /// Failed group invite notification triggers.
     pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_FAILURES: &str =
         "app_group_invite_notification_trigger_failures";
+    /// Group invite Welcome fanout duration histogram.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_DURATION: &str =
+        "app_group_invite_welcome_publish_duration_ms";
+    /// Group invite Welcome fanout attempts.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_ATTEMPTS: &str =
+        "app_group_invite_welcome_publish_attempts";
+    /// Successful group invite Welcome fanouts.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_SUCCESSES: &str =
+        "app_group_invite_welcome_publish_successes";
+    /// Failed group invite Welcome fanouts.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_FAILURES: &str =
+        "app_group_invite_welcome_publish_failures";
     /// Group invite post-mutation catch-up duration histogram.
     pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_DURATION: &str =
         "app_group_invite_post_mutation_catch_up_duration_ms";
@@ -942,6 +954,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_ATTEMPTS,
         metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_SUCCESSES,
         metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_welcome_publish,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_DURATION,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_FAILURES,
     );
     append_app_operation_points(
         points,

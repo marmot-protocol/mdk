@@ -2175,10 +2175,18 @@ async fn handle_account_worker_command(
                     group_id,
                 );
             }
-            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
             let created = result.is_ok();
             let _ = respond.send(result);
             if created {
+                client
+                    .drive_unpublished_welcome_delivery(Some(&telemetry))
+                    .await;
+                publish_pending_welcome_delivery_events(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    client,
+                );
                 let subscription_started_at = Instant::now();
                 let subscription_refresh = client.sync_runtime_groups().await;
                 telemetry.record(
@@ -2400,9 +2408,9 @@ async fn handle_account_worker_command(
             members,
             respond,
         } => {
+            let telemetry = shared.app_performance_telemetry();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                let telemetry = shared.app_performance_telemetry();
                 client
                     .invite_members_with_telemetry(&group_id, &member_refs, &telemetry)
                     .await
@@ -2422,8 +2430,19 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
+            let invited = result.is_ok();
             let _ = respond.send(result);
+            if invited {
+                client
+                    .drive_unpublished_welcome_delivery(Some(&telemetry))
+                    .await;
+                publish_pending_welcome_delivery_events(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    client,
+                );
+            }
         }
         AccountWorkerCommand::RemoveMembers {
             group_id,

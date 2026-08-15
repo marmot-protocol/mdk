@@ -47,7 +47,7 @@ use crate::time::{
 };
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
-const FOUNDING_WELCOME_PUBLISH_CONCURRENCY: usize = 8;
+const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
 const KEY_PACKAGE_REFRESH_MAX_LEAD_SECS: u64 = 21 * 24 * 60 * 60;
@@ -1629,6 +1629,50 @@ where
         Ok(output)
     }
 
+    /// Confirm an outbound intent's commit without waiting for Welcome fanout.
+    ///
+    /// Founding creates and existing-group invites persist exact Welcome bytes
+    /// before this returns. The caller records those obligations, returns the
+    /// canonical mutation, then drives [`Self::publish_welcome_messages_with_audit_context`].
+    pub async fn send_confirming_commit_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<(AccountDeviceEffects, Vec<TransportMessage>)> {
+        let disposition_group = match &intent {
+            SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
+            _ => None,
+        };
+        let mut session_effects = self
+            .session
+            .send_with_audit_context(intent, context.clone())
+            .await?;
+        let welcomes = take_deferred_welcomes(&mut session_effects);
+        let mut output = self
+            .publish_session_effects_with_audit_context(session_effects, Some(context))
+            .await?;
+        if let Some(group_id) = disposition_group
+            && self.post_join_rotation_pending(&group_id)?
+        {
+            output.maintenance_disposition =
+                SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
+        }
+        Ok((output, welcomes))
+    }
+
+    /// Publish previously deferred Welcome obligations with bounded concurrency.
+    pub async fn publish_welcome_messages_with_audit_context(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        group_id: Option<GroupId>,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let mut output = AccountDeviceEffects::default();
+        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context))
+            .await?;
+        Ok(output)
+    }
+
     pub async fn queue_app_message_with_audit_context(
         &mut self,
         group_id: GroupId,
@@ -2271,6 +2315,19 @@ where
             GroupEvent::GroupCreated { group_id } => Some(group_id.clone()),
             _ => None,
         });
+        self.publish_welcome_fanout(welcomes, group_id, output, context)
+            .await
+    }
+
+    /// Bounded-concurrency Welcome publication used by founding creates and by
+    /// deferred existing-group invite fanout after the commit is confirmed.
+    async fn publish_welcome_fanout(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        group_id: Option<GroupId>,
+        output: &mut AccountDeviceEffects,
+        context: Option<AuditEventContext>,
+    ) -> AccountResult<()> {
         let mut metadata = Vec::with_capacity(welcomes.len());
         let mut completions = Vec::with_capacity(welcomes.len());
         completions.resize_with(welcomes.len(), || None);
@@ -2294,7 +2351,7 @@ where
             (index, attempt, result)
         };
         let mut in_flight = FuturesUnordered::new();
-        while in_flight.len() < FOUNDING_WELCOME_PUBLISH_CONCURRENCY {
+        while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
             let Some((index, attempt)) = pending.pop_front() else {
                 break;
             };
@@ -3447,6 +3504,28 @@ fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timest
         .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
 }
 
+/// Pull Welcome payloads off publish work so the commit/create can confirm
+/// without waiting for recipient delivery. Empty Welcome vectors remain on the
+/// original work items so later publish still confirms the commit.
+fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage> {
+    let mut welcomes = Vec::new();
+    for work in &mut effects.publish {
+        match work {
+            PublishWork::GroupEvolution {
+                welcomes: items, ..
+            }
+            | PublishWork::GroupCreated {
+                welcomes: items, ..
+            }
+            | PublishWork::FoundingGroupCreated { welcomes: items } => {
+                welcomes.append(items);
+            }
+            _ => {}
+        }
+    }
+    welcomes
+}
+
 /// The welcome recipient carried in the message's transport envelope, if the
 /// message is a welcome.
 fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
@@ -3656,11 +3735,8 @@ mod tests {
                 }
             });
 
-            let expected_parallelism = item_count.min(FOUNDING_WELCOME_PUBLISH_CONCURRENCY);
-            let task = tokio::spawn(collect_bounded_ordered(
-                work,
-                FOUNDING_WELCOME_PUBLISH_CONCURRENCY,
-            ));
+            let expected_parallelism = item_count.min(WELCOME_PUBLISH_CONCURRENCY);
+            let task = tokio::spawn(collect_bounded_ordered(work, WELCOME_PUBLISH_CONCURRENCY));
             timeout(Duration::from_secs(1), async {
                 while max_active.load(Ordering::SeqCst) < expected_parallelism {
                     tokio::task::yield_now().await;

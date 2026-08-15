@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_session::PublishWork;
+use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
@@ -65,6 +65,24 @@ pub(crate) use sync::is_own_relay_echo;
 pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+const INVITE_LOOKUP_CONCURRENCY: usize = CREATE_GROUP_LOOKUP_CONCURRENCY;
+
+pub(crate) enum UnpublishedWelcomeKind {
+    Founding {
+        effects: SessionEffects,
+        welcome_intents: Vec<String>,
+    },
+    Invite {
+        welcomes: Vec<cgka_traits::transport::TransportMessage>,
+        welcome_intents: Vec<String>,
+    },
+}
+
+pub(crate) struct UnpublishedWelcomeDelivery {
+    group_id: GroupId,
+    audit_context: AuditEventContext,
+    kind: UnpublishedWelcomeKind,
+}
 
 pub(crate) struct EncryptedMediaUploadHttp {
     request: MediaUploadRequest,
@@ -254,6 +272,9 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Canonical create/invite work whose Welcome fanout has not run yet.
+    /// The managed account worker replies first, then drives this delivery.
+    pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
     /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
@@ -754,6 +775,7 @@ impl AppClient {
                 None,
             )
             .await?;
+        self.drive_unpublished_welcome_delivery(None).await;
         // Direct `AppClient` callers do not have the managed account worker to
         // refresh subscriptions after its response. Preserve that API's
         // historical readiness guarantee; the managed runtime uses the
@@ -928,41 +950,19 @@ impl AppClient {
             "record_founding_welcome_delivery_intents",
             self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
         );
-        let welcome_publish_started_at = Instant::now();
-        let publish_result = self
-            .runtime
-            .publish_prepared_session_effects_with_audit_context(
-                prepared.effects,
-                audit_context.clone(),
-            )
-            .await
-            .map_err(AppError::from);
-        record_app_performance(
-            telemetry,
-            AppPerformanceOperation::GroupCreateWelcomePublish,
-            welcome_publish_started_at.elapsed(),
-            publish_result.is_ok(),
-        );
-        let effects =
-            recover_post_canonical_result("publish_prepared_founding_group", publish_result);
-        recover_post_canonical_result(
-            "clear_delivered_founding_welcome_intents",
-            self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects),
-        );
-        recover_post_canonical_result(
-            "classify_founding_welcome_publish",
-            fail_if_publish_failed(&effects),
-        );
-        recover_post_canonical_result(
-            "record_founding_welcome_delivery_failures",
-            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
-        );
-        self.record_human_action_succeeded(&group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        // The engine group is already published and confirmed. Projection,
-        // state persistence, and subscription refresh are downstream repairable
-        // work; none can roll the group back, so none may turn this operation
-        // into a false failure that invites the caller to create a duplicate.
+        self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
+            group_id: group_id.clone(),
+            audit_context: audit_context.clone(),
+            kind: UnpublishedWelcomeKind::Founding {
+                effects: prepared.effects,
+                welcome_intents: founding_welcome_intents,
+            },
+        });
+        // The engine group is already canonical. Projection and state
+        // persistence are downstream repairable work; none can roll the group
+        // back, so none may turn this operation into a false failure that
+        // invites the caller to create a duplicate. Welcome fanout is driven
+        // after the caller-visible return.
         let local_projection_started_at = Instant::now();
         let local_projection_saved = match self.add_group(&group_id) {
             Ok(()) => match self.save_state_with_pending_local_group_deletion_frontier_clears() {
@@ -987,7 +987,6 @@ impl AppClient {
                 false
             }
         };
-        self.queue_own_group_system_projection_updates(&effects);
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupCreateLocalProjectionSave,
@@ -1342,8 +1341,11 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_optional_telemetry(group_id, member_refs, None)
-            .await
+        let summary = self
+            .invite_members_with_optional_telemetry(group_id, member_refs, None)
+            .await?;
+        self.drive_unpublished_welcome_delivery(None).await;
+        Ok(summary)
     }
 
     pub(crate) async fn invite_members_with_telemetry(
@@ -1365,14 +1367,15 @@ impl AppClient {
         self.ensure_group(group_id)?;
 
         let key_package_started_at = Instant::now();
-        let key_packages = async {
-            let mut key_packages = Vec::with_capacity(member_refs.len());
-            for member in member_refs {
-                key_packages.push(self.app.member_key_package(member).await?);
-            }
-            Ok::<_, AppError>(key_packages)
-        }
-        .await;
+        let lookups = member_refs
+            .iter()
+            .map(|member| {
+                let app = self.app.clone();
+                let member = (*member).to_owned();
+                async move { app.member_key_package(&member).await }
+            })
+            .collect::<Vec<_>>();
+        let key_packages = collect_bounded_ordered(lookups, INVITE_LOOKUP_CONCURRENCY).await;
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,
@@ -1409,9 +1412,9 @@ impl AppClient {
         pre_send_sync?;
 
         let engine_publish_started_at = Instant::now();
-        let effects = self
+        let commit = self
             .runtime
-            .send_with_audit_context(
+            .send_confirming_commit_with_audit_context(
                 SendIntent::Invite {
                     group_id: group_id.clone(),
                     key_packages,
@@ -1420,17 +1423,26 @@ impl AppClient {
             )
             .await
             .map_err(AppError::from)
-            .and_then(|effects| {
+            .and_then(|(effects, welcomes)| {
                 fail_if_publish_failed(&effects)?;
-                Ok(effects)
+                Ok((effects, welcomes))
             });
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteEnginePublish,
             engine_publish_started_at.elapsed(),
-            effects.is_ok(),
+            commit.is_ok(),
         );
-        let effects = effects?;
+        let (effects, welcomes) = commit?;
+        let welcome_intents = self.record_welcome_delivery_intents(group_id, &welcomes)?;
+        self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
+            group_id: group_id.clone(),
+            audit_context: audit_context.clone(),
+            kind: UnpublishedWelcomeKind::Invite {
+                welcomes,
+                welcome_intents,
+            },
+        });
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
@@ -3557,29 +3569,39 @@ impl AppClient {
         group_id: &GroupId,
         effects: &cgka_session::SessionEffects,
     ) -> Result<Vec<String>, AppError> {
+        let mut welcomes = Vec::new();
+        for work in &effects.publish {
+            let PublishWork::FoundingGroupCreated { welcomes: items } = work else {
+                continue;
+            };
+            welcomes.extend(items.iter().cloned());
+        }
+        self.record_welcome_delivery_intents(group_id, &welcomes)
+    }
+
+    fn record_welcome_delivery_intents(
+        &mut self,
+        group_id: &GroupId,
+        welcomes: &[cgka_traits::transport::TransportMessage],
+    ) -> Result<Vec<String>, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
         let recorded_at = unix_now_seconds();
         let storage = self.app.account_storage(&self.state.label)?;
         let mut message_ids = Vec::new();
-        for work in &effects.publish {
-            let PublishWork::FoundingGroupCreated { welcomes } = work else {
-                continue;
+        for welcome in welcomes {
+            let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+                return Err(AppError::Publish(
+                    "founding delivery artifact was not a Welcome".into(),
+                ));
             };
-            for welcome in welcomes {
-                let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
-                    return Err(AppError::Publish(
-                        "founding delivery artifact was not a Welcome".into(),
-                    ));
-                };
-                let message_id_hex = hex::encode(welcome.id.as_slice());
-                storage.record_pending_welcome_delivery(
-                    &message_id_hex,
-                    &group_id_hex,
-                    &hex::encode(recipient.as_slice()),
-                    recorded_at,
-                )?;
-                message_ids.push(message_id_hex);
-            }
+            let message_id_hex = hex::encode(welcome.id.as_slice());
+            storage.record_pending_welcome_delivery(
+                &message_id_hex,
+                &group_id_hex,
+                &hex::encode(recipient.as_slice()),
+                recorded_at,
+            )?;
+            message_ids.push(message_id_hex);
         }
         Ok(message_ids)
     }
@@ -3662,6 +3684,101 @@ impl AppClient {
             )?;
         }
         Ok(())
+    }
+
+    /// Publish Welcome obligations stashed at the canonical create/invite
+    /// boundary. Managed workers call this after replying; direct AppClient
+    /// callers still await it so existing tests keep a complete delivery path.
+    pub(crate) async fn drive_unpublished_welcome_delivery(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) {
+        let Some(work) = self.unpublished_welcome_delivery.take() else {
+            return;
+        };
+        match work.kind {
+            UnpublishedWelcomeKind::Founding {
+                effects,
+                welcome_intents,
+            } => {
+                let welcome_publish_started_at = Instant::now();
+                let publish_result = self
+                    .runtime
+                    .publish_prepared_session_effects_with_audit_context(
+                        effects,
+                        work.audit_context.clone(),
+                    )
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupCreateWelcomePublish,
+                    welcome_publish_started_at.elapsed(),
+                    publish_result.is_ok(),
+                );
+                let effects = recover_post_canonical_result(
+                    "publish_prepared_founding_group",
+                    publish_result,
+                );
+                recover_post_canonical_result(
+                    "clear_delivered_founding_welcome_intents",
+                    self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects),
+                );
+                recover_post_canonical_result(
+                    "classify_founding_welcome_publish",
+                    fail_if_publish_failed(&effects),
+                );
+                recover_post_canonical_result(
+                    "record_founding_welcome_delivery_failures",
+                    self.record_welcome_delivery_failures(
+                        &hex::encode(work.group_id.as_slice()),
+                        &effects,
+                    ),
+                );
+                self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
+                self.remember_published_reports(&effects);
+                self.queue_own_group_system_projection_updates(&effects);
+            }
+            UnpublishedWelcomeKind::Invite {
+                welcomes,
+                welcome_intents,
+            } => {
+                let welcome_publish_started_at = Instant::now();
+                let publish_result = self
+                    .runtime
+                    .publish_welcome_messages_with_audit_context(
+                        welcomes,
+                        Some(work.group_id.clone()),
+                        work.audit_context,
+                    )
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteWelcomePublish,
+                    welcome_publish_started_at.elapsed(),
+                    publish_result.is_ok(),
+                );
+                let effects = match publish_result {
+                    Ok(effects) => effects,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "marmot_app::client",
+                            method = "drive_unpublished_welcome_delivery",
+                            error_kind = error.privacy_safe_kind(),
+                            "confirmed invite outpaced Welcome fanout; pending obligations remain retryable"
+                        );
+                        return;
+                    }
+                };
+                let _ = self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects);
+                let _ = self.record_welcome_delivery_failures(
+                    &hex::encode(work.group_id.as_slice()),
+                    &effects,
+                );
+                self.remember_published_reports(&effects);
+            }
+        }
     }
 
     /// Drain the welcomes queued for re-delivery during the last create/invite,
@@ -3781,7 +3898,7 @@ fn local_account_removed_from_roster(
 #[cfg(test)]
 mod post_canonical_create_tests {
     use super::{
-        CREATE_GROUP_LOOKUP_CONCURRENCY, collect_bounded_ordered,
+        CREATE_GROUP_LOOKUP_CONCURRENCY, INVITE_LOOKUP_CONCURRENCY, collect_bounded_ordered,
         preferred_initial_group_image_component, recover_post_canonical_result,
     };
     use crate::AppError;
@@ -3840,7 +3957,7 @@ mod post_canonical_create_tests {
         for item_count in [1, 5, 20] {
             let cached = collect_bounded_ordered(
                 (0..item_count).map(|index| std::future::ready(Ok::<_, &'static str>(index))),
-                CREATE_GROUP_LOOKUP_CONCURRENCY,
+                INVITE_LOOKUP_CONCURRENCY,
             )
             .await
             .unwrap();
