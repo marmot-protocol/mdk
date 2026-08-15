@@ -15,11 +15,15 @@ Map for portable JSON vector fixtures.
 - Byte-level fixtures live under `byte-fixtures/` and follow `byte-fixtures/schema.v1.json`.
 - Keep fixture names stable and versioned, usually `name.v1.json`.
 - Do not store OpenMLS protocol bytes in fixtures.
+- Never commit a sensitive replay capsule, participant database, incident export, or real identifier/payload as a
+  vector. Only reviewed synthetic-shareable failures are eligible for promotion.
 - Keep traces implementation-neutral: epochs, members, payload observations, pending resolutions, app invalidations, and
   recovery observations are fine. Use semantic expectations when randomized MLS bytes can change which client observes
   recovery.
 - After editing a fixture, run the vector fixture test. Use the report CLI when you also want JSON reports and a
   pass/fail summary.
+- A generated `*-fixture.v1.json` is only a candidate. Review its scenario meaning and expectations before copying it
+  here, then update `manifest.v1.json` and `../SCENARIOS.md`.
 
 ## Verification
 

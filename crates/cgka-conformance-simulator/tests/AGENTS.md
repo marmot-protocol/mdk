@@ -2,6 +2,9 @@
 
 Map for simulator tests.
 
+Read `../RUNNING_CAMPAIGNS.md` for the supported operator entrypoints and `../SCALING_CAMPAIGNS.md` for the required
+determinism, reachability, interaction-coverage, and promotion checks when adding generated coverage.
+
 ## Files
 
 - **File:** `agent_text_stream_vectors.rs`
@@ -71,6 +74,10 @@ Map for simulator tests.
   internals.
 - Keep default property-test counts fast. Use `conformance-slow` for the wider pass, with case counts chosen by test
   cost.
+- A generated-family test must not rely only on successful execution. Pin deterministic replay/prefix behavior and
+  prove that the strict oracle observes the operation or interaction the family claims to cover.
+- Keep real process/container/VM tests explicit or ignored when their cost or external dependencies make them
+  unsuitable for the ordinary crate test. Document the exact manual command and artifact path.
 
 ## Verification
 

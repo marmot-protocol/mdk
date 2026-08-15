@@ -12,7 +12,12 @@ manifest selects either:
 - a container backend (`docker` or `podman`) for ordinary distributed runs;
 - an external VM driver when a campaign requires kernel, block-device,
   filesystem, or stronger host-isolation behavior that containers cannot
-  represent faithfully.
+represent faithfully.
+
+For the end-to-end operator workflow, including when *not* to use containers or VMs, read
+[`../cgka-conformance-simulator/RUNNING_CAMPAIGNS.md`](../cgka-conformance-simulator/RUNNING_CAMPAIGNS.md). For
+large seed/case matrices, promotion rules, and family design, read
+[`../cgka-conformance-simulator/SCALING_CAMPAIGNS.md`](../cgka-conformance-simulator/SCALING_CAMPAIGNS.md).
 
 The selected scenario path may contain raw canonical Scenario IR or a
 `GeneratedScenarioInputV1` saved by the simulator report runner. Generated

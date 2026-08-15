@@ -611,10 +611,11 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   candidates, process measurements, and failure capsules per case. The exact retained-engine companion is registered
   separately as `cross-route-exact-restart-permutations/v1`, ensuring a panic in one private-state case cannot stop
   the rest of the catalog. Public and exact inputs use distinct scenario-name prefixes. The complete public seed-0
-  execution passed 12/12; the exact execution passed 9/12. Restarting Zeta at the three initial accepted
-  publication boundaries produced a structured `PendingPublish` refusal, a `PendingPublish` panic, and an
-  epoch-3/pending-work/decryptability stall respectively; every later branch/repair boundary passed. Those are
-  counterexamples, not allowed results.
+  execution passes 12/12. The first exact execution passed 9/12 and exposed three early-publication failures;
+  minimization traced all three to the simulator carrying process-local pending handles across engine incarnations.
+  MDK #1465 scoped that bookkeeping to the issuing incarnation, and the exact seed-0 catalog now passes 12/12 without
+  changing production engine or protocol behavior. The original failures remain historical discovery evidence, not
+  allowed results.
 
 ### `chat-journey/v1`
 
