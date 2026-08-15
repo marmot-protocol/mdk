@@ -106,15 +106,15 @@ pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLea
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
-    AgentTextStreamCryptoContext, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
-    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RelayFailure, RuntimeAccountError,
-    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
-    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    AgentTextStreamCryptoContext, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
+    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RelayFailure,
+    RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
+    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
+    SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
     default_directory_discovery_relays,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
@@ -159,7 +159,7 @@ pub use groups::{
     AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
     AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
     AppInitialGroupImage, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
-    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, group_system_event_from_message,
+    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -1510,6 +1510,8 @@ impl MarmotApp {
             pending_epoch_backfill: None,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
+            encrypted_media_not_required_epochs: HashMap::new(),
+            checkpoint_route_refresh_recomputes: 0,
         };
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
@@ -3054,6 +3056,61 @@ impl MarmotApp {
     pub fn pending_leave_requests(&self, label: &str) -> Result<HashMap<String, u64>, AppError> {
         self.ensure_account_state(label)?;
         Ok(self.account_storage(label)?.pending_leave_requests()?)
+    }
+
+    /// Group invites still pending the local device's confirmation decision.
+    ///
+    /// This is the invite-policy reconciliation read (mdk#1380): unlike
+    /// [`Self::groups`], it touches only the two projection columns the policy
+    /// decision needs — never the seen-event window, component blobs, or
+    /// disband tables — so a periodic enumeration over an idle session reads
+    /// O(pending invites) rows instead of the full account projection.
+    ///
+    /// A row whose stored ids cannot be decoded is skipped with a privacy-safe
+    /// warning (the same policy `routing_for` applies to malformed persisted
+    /// group routes): one corrupt row must not disable policy reconciliation
+    /// for every valid invite in the account.
+    pub fn pending_group_invites(&self, label: &str) -> Result<Vec<PendingGroupInvite>, AppError> {
+        self.ensure_account_state(label)?;
+        let mut invites = Vec::new();
+        for invite in self
+            .account_storage(label)?
+            .pending_confirmation_group_invites()?
+        {
+            let group_id_hex = invite.group_id_hex.trim().to_ascii_lowercase();
+            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "pending_group_invites",
+                    error_kind = "invalid_persisted_group_record",
+                    "skipping malformed persisted pending invite",
+                );
+                continue;
+            };
+            let welcomer = match invite.welcomer_account_id_hex.as_deref() {
+                Some(welcomer) => {
+                    let welcomer = welcomer.trim().to_ascii_lowercase();
+                    match hex::decode(&welcomer) {
+                        Ok(welcomer) => Some(MemberId::new(welcomer)),
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app",
+                                method = "pending_group_invites",
+                                error_kind = "invalid_persisted_welcomer_record",
+                                "skipping malformed persisted pending invite",
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+            invites.push(PendingGroupInvite {
+                group_id: GroupId::new(group_id_bytes),
+                welcomer,
+            });
+        }
+        Ok(invites)
     }
 
     pub fn visible_groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {

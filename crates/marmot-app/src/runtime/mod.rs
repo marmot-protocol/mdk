@@ -1128,6 +1128,13 @@ impl MarmotAppRuntime {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
+        self.accounts.catch_up_accounts().await.map(|_| ())
+    }
+
+    /// Catch up every running account worker and report how many account
+    /// workers were considered. Used by reconciliation drivers that expose
+    /// aggregate per-pass work telemetry (mdk#1380).
+    pub async fn catch_up_accounts_reporting(&self) -> Result<CatchUpAccountsSummary, AppError> {
         self.accounts.catch_up_accounts().await
     }
 
@@ -3470,6 +3477,14 @@ impl MarmotAppRuntime {
     }
 }
 
+/// Aggregate result of one [`MarmotAppRuntime::catch_up_accounts_reporting`]
+/// pass. Privacy-safe: counts only, no account/group identifiers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatchUpAccountsSummary {
+    /// Number of running account workers that received a catch-up command.
+    pub accounts_considered: usize,
+}
+
 impl AccountManager {
     fn new(
         app: MarmotApp,
@@ -3917,13 +3932,17 @@ impl AccountManager {
         self.reconcile_locked().await
     }
 
-    pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
+    pub async fn catch_up_accounts(&self) -> Result<CatchUpAccountsSummary, AppError> {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
             self.reconcile().await?;
             let commands = self.running_account_commands().await;
-            self.catch_up_account_commands(commands).await
+            let accounts_considered = commands.len();
+            self.catch_up_account_commands(commands).await?;
+            Ok(CatchUpAccountsSummary {
+                accounts_considered,
+            })
         }
         .await;
         self.shared.app_performance_telemetry().record(

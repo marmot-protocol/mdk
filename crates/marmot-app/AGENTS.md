@@ -26,6 +26,11 @@ App runtime bridge for the first real Marmot app surfaces.
   per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
   are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
+  Steady-state sync passes must not rescan full retained state (no full `MlsGroup::load` sweeps, no full
+  account-projection loads; cheap per-group probes are acceptable): the encrypted-media epoch-secret warm pass
+  skips authoritative (`MlsGroup::load`) component re-checks at an unchanged group epoch
+  (`encrypted_media_not_required_epochs`, mdk#1380), and the sync checkpoint skips its second
+  `refresh_group_routes` when the drained prefix carried zero deliveries and clean routes.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).

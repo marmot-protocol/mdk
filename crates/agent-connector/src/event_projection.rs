@@ -277,9 +277,10 @@ pub(crate) fn media_refs_from_tags(
 use cgka_traits::engine::GroupStateChange;
 use cgka_traits::{GroupId, engine::GroupEvent};
 use marmot_app::{AppError, AppMessageRecord, MarmotAppEvent, MarmotAppRuntime};
+use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
-use crate::INBOUND_CATCH_UP_INTERVAL;
+use crate::reconcile_telemetry::{ReconcileSource, ReconcileTelemetry};
 use crate::validation::normalize_hex;
 
 pub(crate) fn control_actor(
@@ -999,17 +1000,71 @@ pub(crate) enum InboundCatchUpEvent {
     Completed,
 }
 
+/// Cadence for the catch-up safety net. Production builds use
+/// [`crate::INBOUND_CATCH_UP_BASE_INTERVAL`] / [`crate::INBOUND_CATCH_UP_MAX_INTERVAL`];
+/// tests inject shorter intervals to exercise the adaptive schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InboundCatchUpSchedule {
+    pub(crate) base: Duration,
+    pub(crate) max: Duration,
+}
+
+/// One shared catch-up driver for every live `SubscribeInbound` subscription
+/// (mdk#574). The driver's scheduled passes are a *safety net*: steady-state
+/// delivery is push-driven through each account worker's live receive loop, so
+/// a pass exists to heal silent notification gaps, not to fetch messages —
+/// which is why the net may back off when nothing is happening (mdk#1380).
+///
+/// Scheduling discipline:
+/// - Subscription initial catch-ups arrive out-of-band through
+///   [`Self::request`] and run promptly (serialization lock coalesces them).
+/// - Scheduled passes start at `base` after the first subscription and double
+///   after every pass that observed no qualifying runtime activity, capped at
+///   `max`.
+/// - Qualifying activity — any runtime event except `AccountError` (errors can
+///   be our own failing passes and must not self-stimulate), or a lagged event
+///   stream — resets the interval to `base`. Activity observed while the
+///   driver was sleeping wakes a pass immediately, but only once the previous
+///   pass is at least `base` old, so a busy account never escalates BEYOND the
+///   base cadence.
+/// - A failed pass keeps backing off (relay outage: the per-worker reconnect
+///   backoff owns transport repair); recovery surfaces as activity events.
+/// - The driver quiesces when the last subscription drops, exactly as before.
 #[derive(Clone)]
 pub(crate) struct InboundCatchUpDriver {
     runtime: MarmotAppRuntime,
-    lock: Arc<AsyncMutex<()>>,
+    /// Serializes scheduled and explicit catch-up passes. `pub(crate)` so the
+    /// regression harness can hold a pass queued behind the lock and prove the
+    /// schedule preserves delayed cadence afterwards (mdk#1380 review).
+    pub(crate) lock: Arc<AsyncMutex<()>>,
     events: broadcast::Sender<InboundCatchUpEvent>,
     pub(crate) started: Arc<AtomicBool>,
     pub(crate) active: Arc<AtomicU64>,
+    schedule: InboundCatchUpSchedule,
+    telemetry: Arc<ReconcileTelemetry>,
+    /// Test-only activity channel override. Production drivers subscribe to the
+    /// runtime event broadcast; tests inject a channel they can publish
+    /// synthetic events into.
+    activity_override: Option<broadcast::Sender<MarmotAppEvent>>,
 }
 
 impl InboundCatchUpDriver {
-    pub(crate) fn new(runtime: MarmotAppRuntime) -> Self {
+    pub(crate) fn new(runtime: MarmotAppRuntime, telemetry: Arc<ReconcileTelemetry>) -> Self {
+        Self::with_schedule(
+            runtime,
+            telemetry,
+            InboundCatchUpSchedule {
+                base: crate::INBOUND_CATCH_UP_BASE_INTERVAL,
+                max: crate::INBOUND_CATCH_UP_MAX_INTERVAL,
+            },
+        )
+    }
+
+    pub(crate) fn with_schedule(
+        runtime: MarmotAppRuntime,
+        telemetry: Arc<ReconcileTelemetry>,
+        schedule: InboundCatchUpSchedule,
+    ) -> Self {
         let (events, _) = broadcast::channel(16);
         Self {
             runtime,
@@ -1017,7 +1072,19 @@ impl InboundCatchUpDriver {
             events,
             started: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicU64::new(0)),
+            schedule,
+            telemetry,
+            activity_override: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn override_activity_for_test(
+        mut self,
+        activity: broadcast::Sender<MarmotAppEvent>,
+    ) -> Self {
+        self.activity_override = Some(activity);
+        self
     }
 
     fn spawn(&self) {
@@ -1026,29 +1093,120 @@ impl InboundCatchUpDriver {
         }
         let driver = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
-                INBOUND_CATCH_UP_INTERVAL,
-            );
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                if driver.active.load(Ordering::Acquire) == 0 {
-                    driver.started.store(false, Ordering::Release);
-                    if driver.active.load(Ordering::Acquire) == 0 {
-                        break;
-                    }
-                    if driver
-                        .started
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                let _ = driver.request().await;
-            }
+            driver.run().await;
         });
+    }
+
+    fn activity_receiver(&self) -> broadcast::Receiver<MarmotAppEvent> {
+        match &self.activity_override {
+            Some(sender) => sender.subscribe(),
+            None => self.runtime.subscribe(),
+        }
+    }
+
+    async fn run(self) {
+        let mut activity = self.activity_receiver();
+        // First scheduled pass fires one base interval after spawn, unchanged
+        // from the pre-adaptive driver (the subscription's own initial request
+        // covers the "catch up now" case).
+        let mut interval = self
+            .schedule
+            .base
+            .max(Duration::from_millis(1))
+            .min(self.schedule.max);
+        // Deadlines anchor at pass COMPLETION, preserving the old
+        // `MissedTickBehavior::Delay` semantics: a pass that runs long (or
+        // queues behind an explicit request on the serialization lock) inserts
+        // the full interval before the next pass instead of firing
+        // back-to-back (mdk#1380 review).
+        let mut last_pass_completed = tokio::time::Instant::now();
+        loop {
+            if self.active.load(Ordering::Acquire) == 0 {
+                self.started.store(false, Ordering::Release);
+                if self.active.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                if self
+                    .started
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let deadline = last_pass_completed + interval;
+            let wake = wait_for_catch_up_wake(
+                deadline,
+                last_pass_completed,
+                &self.schedule,
+                &mut activity,
+            )
+            .await;
+            // A pass that observed activity since the previous pass began —
+            // the wake reason itself, plus anything buffered while the pass
+            // ran — keeps the next pass at the base interval.
+            let observed_activity =
+                matches!(wake, CatchUpWake::Activity) || drain_pending_activity(&mut activity);
+            let result = self.scheduled_pass(observed_activity).await;
+            last_pass_completed = tokio::time::Instant::now();
+            match result {
+                Ok(()) if observed_activity => {
+                    interval = self
+                        .schedule
+                        .base
+                        .max(Duration::from_millis(1))
+                        .min(self.schedule.max);
+                }
+                Ok(()) => interval = (interval * 2).min(self.schedule.max),
+                Err(()) => interval = (interval * 2).min(self.schedule.max),
+            }
+        }
+    }
+
+    /// Run one scheduled catch-up pass, recording aggregate telemetry and a
+    /// per-pass tracing event (source/duration/result/accounts considered).
+    async fn scheduled_pass(&self, observed_activity: bool) -> Result<(), ()> {
+        let started = tokio::time::Instant::now();
+        let _guard = self.lock.lock().await;
+        ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_started);
+        let result = self.runtime.catch_up_accounts_reporting().await;
+        match &result {
+            Ok(summary) => {
+                ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_completed);
+                ReconcileTelemetry::add(
+                    &self.telemetry.catch_up_accounts_considered,
+                    summary.accounts_considered,
+                );
+                if observed_activity {
+                    ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_with_activity);
+                }
+                let _ = self.events.send(InboundCatchUpEvent::Completed);
+                tracing::debug!(
+                    target: "agent_connector",
+                    method = "inbound_catch_up_scheduled_pass",
+                    source = ReconcileSource::InboundCatchUp.as_str(),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    result = "ok",
+                    observed_activity,
+                    accounts_considered = summary.accounts_considered,
+                    "scheduled inbound catch-up pass completed"
+                );
+                Ok(())
+            }
+            Err(_) => {
+                ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_failed);
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "inbound_catch_up_scheduled_pass",
+                    source = ReconcileSource::InboundCatchUp.as_str(),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    result = "error",
+                    error_code = "catch_up_failed",
+                    "scheduled inbound catch-up pass failed"
+                );
+                Err(())
+            }
+        }
     }
 
     pub(crate) fn subscribe(
@@ -1067,7 +1225,12 @@ impl InboundCatchUpDriver {
         )
     }
 
+    /// Run one out-of-band catch-up (a subscription's initial pass). Explicit
+    /// requests are not counted as scheduled passes and do not perturb the
+    /// adaptive schedule: the activity they surface arrives as runtime events,
+    /// which reset the net through the usual path.
     pub(crate) async fn request(&self) -> Result<(), AppError> {
+        ReconcileTelemetry::bump(&self.telemetry.catch_up_explicit_requests);
         let _guard = self.lock.lock().await;
         let result = self.runtime.catch_up_accounts().await;
         if result.is_ok() {
@@ -1082,6 +1245,82 @@ impl InboundCatchUpDriver {
         }
         result
     }
+}
+
+/// What ended the wait between scheduled passes.
+enum CatchUpWake {
+    Timer,
+    Activity,
+}
+
+/// Wait until `deadline`, returning early ([`CatchUpWake::Activity`]) when
+/// qualifying runtime activity arrives. Activity noticed less than the base
+/// interval after `last_pass_completed` is deferred to that base boundary: a
+/// busy account stays at the base cadence (never one pass per event), while a
+/// backed-off (quiet) driver notices fresh work promptly (mdk#1380).
+async fn wait_for_catch_up_wake(
+    deadline: tokio::time::Instant,
+    last_pass_completed: tokio::time::Instant,
+    schedule: &InboundCatchUpSchedule,
+    activity: &mut broadcast::Receiver<MarmotAppEvent>,
+) -> CatchUpWake {
+    let timer = tokio::time::sleep_until(deadline);
+    tokio::pin!(timer);
+    let base = schedule.base.max(Duration::from_millis(1));
+    // The cadence floor follows the previous pass completion. The scheduled
+    // deadline never precedes it (interval >= base).
+    let cadence_floor = last_pass_completed + base;
+    loop {
+        tokio::select! {
+            _ = &mut timer => return CatchUpWake::Timer,
+            event = activity.recv() => {
+                let qualifying = match event {
+                    Ok(event) => event_counts_as_catch_up_activity(&event),
+                    // A lagged stream means events were evicted while we waited:
+                    // conservatively treat as activity. A closed stream (runtime
+                    // shut down) leaves only the timer; the pass fails and the
+                    // driver's own backoff governs.
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(broadcast::error::RecvError::Closed) => false,
+                };
+                if !qualifying {
+                    continue;
+                }
+                if tokio::time::Instant::now() >= cadence_floor {
+                    return CatchUpWake::Activity;
+                }
+                // Too soon for an immediate pass: absorb this activity and run
+                // at the cadence floor instead of discarding the signal.
+                tokio::time::sleep_until(cadence_floor).await;
+                return CatchUpWake::Activity;
+            }
+        }
+    }
+}
+
+/// Drain buffered runtime events non-blockingly after a pass; any qualifying
+/// event (or lag) counts as activity observed during the pass.
+fn drain_pending_activity(activity: &mut broadcast::Receiver<MarmotAppEvent>) -> bool {
+    loop {
+        match activity.try_recv() {
+            Ok(event) => {
+                if event_counts_as_catch_up_activity(&event) {
+                    return true;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return true,
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => return false,
+        }
+    }
+}
+
+/// Which runtime events mean "state changed, the safety net should be hot
+/// again". Everything except `AccountError`: account errors may be produced by
+/// the driver's own failing passes, and counting them would pin the net at the
+/// base interval for the duration of an outage (mdk#1380).
+fn event_counts_as_catch_up_activity(event: &MarmotAppEvent) -> bool {
+    !matches!(event, MarmotAppEvent::AccountError(_))
 }
 
 pub(crate) struct InboundCatchUpSubscription {

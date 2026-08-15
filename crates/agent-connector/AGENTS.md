@@ -35,7 +35,15 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `replay_missed_inbound` recovery after broadcast
   lag.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist
-  (worker spawn, reconcile, candidate enumeration, apply).
+  (worker spawn, reconcile, candidate enumeration, apply). Event- and retry-driven: `GroupJoined` events apply
+  immediately, per-candidate retries wake on their own backoff, and full enumeration is an adaptive safety net
+  (base `INVITE_POLICY_RECONCILE_INTERVAL`, doubling to `INVITE_POLICY_RECONCILE_MAX_INTERVAL` while passes find
+  nothing) over the targeted `MarmotApp::pending_group_invites` read — never a full `app.groups()` projection
+  load (mdk#1380). Enumeration failures back off on a separate failure floor so a failing store cannot spin the
+  worker even with a matured retry pending.
+- `src/reconcile_telemetry.rs` — privacy-safe aggregate counters for the background reconciliation loops
+  (`ReconcileTelemetry` on the connector: passes, outcomes, accounts/candidate rows considered) plus the
+  `ReconcileSource` label used on per-pass tracing events (mdk#1380).
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account welcomer allowlist persistence.
@@ -49,7 +57,11 @@ several files in the same crate); methods shared across those files are `pub(cra
   `$TMPDIR/marmot-media/`.
 - `src/quic.rs` — QUIC broker candidate parsing, address resolution, and trust selection.
 - `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
-  `InboundCatchUpDriver`.
+  `InboundCatchUpDriver`. The driver's scheduled passes are an adaptive safety net (base
+  `INBOUND_CATCH_UP_BASE_INTERVAL`, doubling to `INBOUND_CATCH_UP_MAX_INTERVAL` while the runtime is quiet):
+  steady-state delivery is push-driven by each account worker, so qualifying runtime activity (anything but
+  `AccountError`, which a failing pass could self-emit) resets the net and wakes a backed-off pass, never faster
+  than the base cadence (mdk#1380). Subscription initial catch-ups stay prompt out-of-band requests.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
 - `src/bootstrap.rs` — `wn-agent bootstrap` flow.
 - `src/bin/wn-agent.rs` — the `wn-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`

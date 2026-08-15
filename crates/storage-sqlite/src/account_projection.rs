@@ -107,6 +107,17 @@ pub struct StoredAccountState {
     pub groups: Vec<StoredAccountGroup>,
 }
 
+/// Minimal outline of a group still pending the local device's join
+/// confirmation, for invite-policy reconciliation. Deliberately carries no
+/// profile/component payload: the policy decision needs only the group id and
+/// the (optional) welcomer identity (mdk#1380).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPendingGroupInvite {
+    pub group_id_hex: String,
+    /// Account id of the welcomer who authenticated the invite, when known.
+    pub welcomer_account_id_hex: Option<String>,
+}
+
 /// `image_key_hex`/`image_upload_key_hex` are key material mirrored from the
 /// blossom image component for chat-list projection. They are stored in
 /// SQLCipher, but must not appear in `Debug` output. Nested
@@ -405,6 +416,39 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         Ok(())
+    }
+
+    /// Read only the pending-confirmation, non-archived group outlines.
+    ///
+    /// Reconciliation policies (the agent connector's welcomer-allowlist
+    /// invite policy, mdk#1380) need exactly these two columns. Unlike
+    /// [`Self::load_account_projection_state`], this never scans the seen-event
+    /// window, group components, or disband tables, so a periodic policy pass
+    /// over an idle session reads O(pending invites) rows — typically zero —
+    /// rather than the full account projection.
+    pub fn pending_confirmation_group_invites(
+        &self,
+    ) -> StorageResult<Vec<StoredPendingGroupInvite>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT group_id_hex, welcomer_account_id_hex
+                 FROM account_groups
+                 WHERE pending_confirmation = 1 AND archived = 0
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        let invites = statement
+            .query_map([], |row| {
+                Ok(StoredPendingGroupInvite {
+                    group_id_hex: row.get(0)?,
+                    welcomer_account_id_hex: row.get(1)?,
+                })
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        Ok(invites)
     }
 
     pub fn load_account_projection_state(

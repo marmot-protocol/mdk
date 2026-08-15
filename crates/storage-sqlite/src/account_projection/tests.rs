@@ -407,6 +407,117 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 }
 
 #[test]
+fn pending_confirmation_group_invites_reads_only_pending_outlines() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    // One applied member group, one pending invite with a welcomer, one
+    // pending invite without a welcomer, and one pending-but-archived group.
+    // Seen events and component rows are present so the outline result proves
+    // the query never fans out into them (mdk#1380).
+    let member = group("member-group", "member group");
+    let mut invited = group("invited-group", "invited group");
+    invited.pending_confirmation = true;
+    invited.welcomer_account_id_hex = Some("cc".repeat(32));
+    let mut unframed = group("unframed-invite", "unframed invite");
+    unframed.pending_confirmation = true;
+    let mut archived = group("archived-invite", "archived invite");
+    archived.pending_confirmation = true;
+    archived.archived = true;
+
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: vec!["seen-a".to_owned(), "seen-b".to_owned()],
+        last_transport_timestamp: None,
+        groups: vec![member, invited, unframed, archived],
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+
+    let invites = store.pending_confirmation_group_invites().unwrap();
+    assert_eq!(
+        invites,
+        vec![
+            StoredPendingGroupInvite {
+                group_id_hex: "invited-group".to_owned(),
+                welcomer_account_id_hex: Some("cc".repeat(32)),
+            },
+            StoredPendingGroupInvite {
+                group_id_hex: "unframed-invite".to_owned(),
+                welcomer_account_id_hex: None,
+            },
+        ]
+    );
+
+    // A once-pending group that got applied drops out of the outline set on
+    // the next reconciliation. (Full projection saves replace the snapshot,
+    // so resave the whole set.)
+    let member = group("member-group", "member group");
+    let mut invited = group("invited-group", "invited group");
+    invited.pending_confirmation = true;
+    invited.welcomer_account_id_hex = Some("cc".repeat(32));
+    let mut applied = group("unframed-invite", "unframed invite");
+    applied.pending_confirmation = false;
+    let mut archived = group("archived-invite", "archived invite");
+    archived.pending_confirmation = true;
+    archived.archived = true;
+    let state = StoredAccountState {
+        groups: vec![member, invited, applied, archived],
+        ..state
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    let invites = store.pending_confirmation_group_invites().unwrap();
+    assert_eq!(
+        invites,
+        vec![StoredPendingGroupInvite {
+            group_id_hex: "invited-group".to_owned(),
+            welcomer_account_id_hex: Some("cc".repeat(32)),
+        }]
+    );
+}
+
+#[test]
+fn pending_confirmation_group_invites_uses_the_partial_covering_index() {
+    // mdk#1380 review: the invite-policy predicate must not scan retained
+    // group state. The partial covering index keeps examined rows at
+    // O(pending invites); pin the query plan so a regression that drops the
+    // index (or rewrites the query out of it) fails deterministically.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let conn = store.lock().unwrap();
+    let mut statement = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT group_id_hex, welcomer_account_id_hex
+             FROM account_groups
+             WHERE pending_confirmation = 1 AND archived = 0
+             ORDER BY group_id_hex",
+        )
+        .unwrap();
+    let plan = statement
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    assert!(
+        plan.contains("idx_account_groups_pending_invites"),
+        "the pending-invite predicate must use its partial covering index, got:\n{plan}"
+    );
+    // A scan of the PARTIAL index only visits rows matching the predicate
+    // (O(pending invites)); the regression to catch is a scan of the full
+    // table or of the whole primary-key index (O(retained groups)).
+    for line in plan.lines() {
+        if line.contains("SCAN account_groups") {
+            assert!(
+                line.contains("idx_account_groups_pending_invites"),
+                "the pending-invite query must not scan the full group table or its primary-key index, got:\n{plan}"
+            );
+        }
+    }
+}
+
+#[test]
 fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     {

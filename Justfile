@@ -63,6 +63,15 @@ bench-startup:
 bench-storage-upgrade:
     cargo test --release -p storage-sqlite migrations::tests::storage_format_upgrade_benchmark -- --ignored --exact --nocapture --test-threads=1
 
+# Idle reconciliation regression benchmark (mdk#1380). Builds one agent
+# account with several joined groups, idles a long-lived inbound subscription
+# over many compressed former-intervals, asserts the adaptive safety nets stay
+# bounded, and prints stable `MDK_BENCH ...` lines for pass counts, per-pass
+# latency, invite candidate rows, and the activity wake gap. Override the
+# default 8 groups with `MDK_IDLE_RECONCILE_GROUPS=<count>`.
+bench-idle-reconciliation:
+    cargo test --release -p agent-connector --lib tests::bench_idle_reconciliation_scaling -- --ignored --exact --nocapture --test-threads=1
+
 relay-up:
     docker compose up -d
     ./scripts/wait_for_relays.sh

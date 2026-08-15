@@ -268,6 +268,21 @@ pub struct AppClient {
     /// maintenance obligation is waiting for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
+    /// Per-group (in-memory) epoch at which the warm pass last confirmed the
+    /// authoritative encrypted-media component is NOT required. A group's
+    /// signed component can only change with a commit, and a commit always
+    /// advances the epoch, so an unchanged epoch means the negative answer is
+    /// still authoritative — the per-sync warm pass skips the expensive
+    /// `MlsGroup::load` re-check for those groups (mdk#1380). Derived state
+    /// only: never persisted, rebuilt by the first pass after open, and
+    /// entries are recorded only on successful lookups so transient failures
+    /// keep re-checking on the next pass.
+    pub(crate) encrypted_media_not_required_epochs: HashMap<String, u64>,
+    /// Count of checkpoint route recomputations actually executed (mdk#1380
+    /// harness observability: an idle catch-up pass must skip the second
+    /// per-sync `refresh_group_routes` because no delivery or drained effect
+    /// could have changed routing since the sync-start pass).
+    pub(crate) checkpoint_route_refresh_recomputes: u64,
 }
 
 /// Cross the point-of-no-return for current-profile group creation without
@@ -3300,9 +3315,45 @@ impl AppClient {
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
     }
+}
 
-    pub(crate) fn cache_current_encrypted_media_epoch_secrets(&self) {
+/// Per-pass accounting for one encrypted-media epoch-secret warm sweep.
+/// Aggregate counts only (privacy-safe).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EncryptedMediaWarmStats {
+    /// Groups visited from the in-memory account projection.
+    pub(crate) groups_considered: usize,
+    /// Groups skipped because the authoritative component was already
+    /// confirmed not-required at the group's current epoch in this client.
+    pub(crate) skipped_unchanged_epoch: usize,
+    /// Authoritative component lookups (`MlsGroup::load`) performed. This
+    /// is the expensive step the epoch map exists to bound.
+    pub(crate) authoritative_checks: usize,
+    /// Groups whose current-epoch secret was cached this pass.
+    pub(crate) warmed: usize,
+    /// Groups skipped after a transient lookup/warm failure (retried next
+    /// pass).
+    pub(crate) failures: usize,
+}
+
+impl AppClient {
+    pub(crate) fn cache_current_encrypted_media_epoch_secrets(
+        &mut self,
+    ) -> EncryptedMediaWarmStats {
+        let mut stats = EncryptedMediaWarmStats::default();
+        // Drop confirmations for groups no longer in the projection (leave,
+        // archive, local deletion): the map must stay bounded by the live
+        // group set.
+        let live: HashSet<&str> = self
+            .state
+            .groups
+            .iter()
+            .map(|group| group.group_id_hex.as_str())
+            .collect();
+        self.encrypted_media_not_required_epochs
+            .retain(|group_id_hex, _| live.contains(group_id_hex.as_str()));
         for group in &self.state.groups {
+            stats.groups_considered += 1;
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
                 tracing::warn!(
                     target: "marmot_app::media",
@@ -3310,6 +3361,7 @@ impl AppClient {
                     error_code = "encrypted_media_group_record_skipped",
                     "skipping malformed encrypted media group record",
                 );
+                stats.failures += 1;
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
@@ -3318,11 +3370,45 @@ impl AppClient {
             // stale (a rebuild error can leave it lagging the signed
             // component), so it must re-check the authoritative component
             // before skipping — a missed warm here can strand a
-            // historical epoch's media once the group advances.
-            if !group.encrypted_media.required
-                && !self.encrypted_media_for_group(&group_id).required
-            {
-                continue;
+            // historical epoch's media once the group advances. A confirmed
+            // negative is authoritative until the next commit, and a commit
+            // always advances the group epoch, so a confirmed-negative entry
+            // keyed on the current engine epoch skips the re-check (mdk#1380).
+            if !group.encrypted_media.required {
+                let epoch = match self.runtime.group_record(&group_id) {
+                    Ok(record) => record.epoch.0,
+                    Err(_) => {
+                        // Transient read failure: leave the group unconfirmed
+                        // so a later pass retries the authoritative lookup.
+                        stats.failures += 1;
+                        continue;
+                    }
+                };
+                if self
+                    .encrypted_media_not_required_epochs
+                    .get(&group.group_id_hex)
+                    .is_some_and(|confirmed| *confirmed == epoch)
+                {
+                    stats.skipped_unchanged_epoch += 1;
+                    continue;
+                }
+                let component = match self.try_encrypted_media_for_group(&group_id) {
+                    Ok(component) => component,
+                    Err(_) => {
+                        stats.failures += 1;
+                        continue;
+                    }
+                };
+                stats.authoritative_checks += 1;
+                if !component.required {
+                    self.encrypted_media_not_required_epochs
+                        .insert(group.group_id_hex.clone(), epoch);
+                    continue;
+                }
+                // Authoritative required: drop any stale confirmation so the
+                // map only ever holds live negatives.
+                self.encrypted_media_not_required_epochs
+                    .remove(&group.group_id_hex);
             }
             if self
                 .remember_current_encrypted_media_secret(&group_id)
@@ -3334,8 +3420,12 @@ impl AppClient {
                     error_code = "encrypted_media_secret_cache_skipped",
                     "failed to cache encrypted media epoch secret for one group",
                 );
+                stats.failures += 1;
+            } else {
+                stats.warmed += 1;
             }
         }
+        stats
     }
 
     fn remember_encrypted_media_epoch_secret(
