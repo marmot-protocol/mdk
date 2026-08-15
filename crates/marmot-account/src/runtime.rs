@@ -132,6 +132,15 @@ pub struct PreparedSessionCommit {
     pending: PendingStateRef,
 }
 
+/// Result of accepting an intent at the pre-publication boundary.
+///
+/// Convergence may durably queue an invite without staging an MLS commit. That
+/// is successful `AcceptedPending` work, not a malformed prepared commit.
+pub enum PreparedSessionSend {
+    Commit(PreparedSessionCommit),
+    Queued(SessionEffects),
+}
+
 impl PreparedSessionCommit {
     pub fn welcomes(&self) -> &[TransportMessage] {
         &self.welcomes
@@ -1654,40 +1663,23 @@ where
         Ok(output)
     }
 
-    /// Stage an outbound commit locally and extract Welcome payloads without
-    /// publishing or confirming the remaining session effects.
+    /// Accept an outbound commit intent without publishing it.
     ///
-    /// The caller must record exact Welcome delivery obligations before
-    /// [`Self::publish_prepared_session_effects_with_audit_context`] exposes the
-    /// commit on the wire.
+    /// A ready group returns a staged commit with extracted Welcome payloads;
+    /// unsettled convergence returns the durable queued effects instead. For a
+    /// staged commit, the caller must record exact Welcome delivery obligations
+    /// before [`Self::publish_prepared_session_effects_with_audit_context`]
+    /// exposes the commit on the wire.
     pub async fn confirm_commit_without_publish_with_audit_context(
         &mut self,
         intent: SendIntent,
         context: AuditEventContext,
-    ) -> AccountResult<PreparedSessionCommit> {
-        let mut session_effects = self
+    ) -> AccountResult<PreparedSessionSend> {
+        let session_effects = self
             .session
             .send_with_audit_context(intent, context)
             .await?;
-        let pending = session_effects
-            .publish
-            .iter()
-            .find_map(|work| match work {
-                PublishWork::GroupEvolution { pending, .. }
-                | PublishWork::GroupCreated { pending, .. } => Some(*pending),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                cgka_traits::EngineError::Backend(
-                    "prepared commit did not contain a pending MLS evolution".into(),
-                )
-            })?;
-        let welcomes = take_deferred_welcomes(&mut session_effects);
-        Ok(PreparedSessionCommit {
-            effects: session_effects,
-            welcomes,
-            pending,
-        })
+        classify_prepared_session_send(session_effects)
     }
 
     /// Roll back a prepared commit before any transport side effect.
@@ -1711,7 +1703,8 @@ where
         Ok(output)
     }
 
-    /// Confirm an outbound intent's commit without waiting for Welcome fanout.
+    /// Confirm an outbound intent's commit without waiting for Welcome fanout,
+    /// or preserve its accepted-pending disposition when convergence queued it.
     ///
     /// Founding creates and existing-group invites persist exact Welcome bytes
     /// before this returns. The caller records those obligations, returns the
@@ -1728,7 +1721,13 @@ where
         let prepared = self
             .confirm_commit_without_publish_with_audit_context(intent, context.clone())
             .await?;
-        let (session_effects, welcomes, _pending) = prepared.into_parts();
+        let (session_effects, welcomes) = match prepared {
+            PreparedSessionSend::Commit(prepared) => {
+                let (effects, welcomes, _pending) = prepared.into_parts();
+                (effects, welcomes)
+            }
+            PreparedSessionSend::Queued(effects) => (effects, Vec::new()),
+        };
         let mut output = self
             .publish_session_effects_with_audit_context(session_effects, Some(context))
             .await?;
@@ -3607,6 +3606,32 @@ fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage>
     welcomes
 }
 
+fn classify_prepared_session_send(
+    mut effects: SessionEffects,
+) -> AccountResult<PreparedSessionSend> {
+    let pending = effects.publish.iter().find_map(|work| match work {
+        PublishWork::GroupEvolution { pending, .. } | PublishWork::GroupCreated { pending, .. } => {
+            Some(*pending)
+        }
+        _ => None,
+    });
+    let Some(pending) = pending else {
+        if !effects.queued.is_empty() {
+            return Ok(PreparedSessionSend::Queued(effects));
+        }
+        return Err(cgka_traits::EngineError::Backend(
+            "prepared send contained neither a pending MLS evolution nor a queued intent".into(),
+        )
+        .into());
+    };
+    let welcomes = take_deferred_welcomes(&mut effects);
+    Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
+        effects,
+        welcomes,
+        pending,
+    }))
+}
+
 /// The welcome recipient carried in the message's transport envelope, if the
 /// message is a welcome.
 fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
@@ -3786,6 +3811,29 @@ mod tests {
         });
 
         assert_eq!(combined.published_app_messages, vec![first, second]);
+    }
+
+    #[test]
+    fn prepared_send_preserves_a_durably_queued_invite() {
+        let queued = QueuedIntentRef {
+            group_id: GroupId::new(vec![7]),
+            intent_id: cgka_traits::MessageId::new(vec![9]),
+        };
+        let classified = classify_prepared_session_send(SessionEffects {
+            events: Vec::new(),
+            publish: Vec::new(),
+            queued: vec![queued.clone()],
+            pending_convergence: vec![queued.group_id.clone()],
+        })
+        .expect("queued acceptance is not a malformed prepared commit");
+
+        match classified {
+            PreparedSessionSend::Queued(effects) => {
+                assert_eq!(effects.queued, vec![queued]);
+                assert_eq!(effects.pending_convergence.len(), 1);
+            }
+            PreparedSessionSend::Commit(_) => panic!("queued invite must not pretend to be staged"),
+        }
     }
 
     #[tokio::test]

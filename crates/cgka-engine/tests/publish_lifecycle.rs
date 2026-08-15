@@ -421,7 +421,8 @@ async fn self_update_restart_republishes_the_identical_signed_event() {
 
 #[tokio::test]
 async fn invite_publish_failed_rolls_back_projected_member_set() {
-    let mut alice = build(b"alice");
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
 
@@ -455,8 +456,17 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         })
         .await
         .unwrap();
-    let inv_pending = match invite {
-        SendResult::GroupEvolution { pending, .. } => pending,
+    let (inv_pending, failed_welcome_id) = match invite {
+        SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } => (
+            pending,
+            welcomes
+                .first()
+                .expect("invite produces a Welcome")
+                .id
+                .clone(),
+        ),
         _ => panic!("expected GroupEvolution"),
     };
     assert_eq!(
@@ -469,6 +479,23 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
 
     // Transport publish "fails" — engine rolls back.
     alice.publish_failed(inv_pending).await.unwrap();
+    let retired = storage.get_message(&failed_welcome_id).unwrap();
+    assert_eq!(retired.state, MessageState::Failed);
+    assert!(
+        StoredMessagePayload::decode(&retired.payload)
+            .unwrap()
+            .as_outbound_welcome()
+            .is_some(),
+        "rolled-back Welcome remains tracked but is no longer deliverable"
+    );
+    assert!(
+        alice
+            .outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .all(|(_, welcome)| welcome.id != failed_welcome_id),
+        "rolled-back invite must not expose its Welcome as a delivery obligation"
+    );
 
     // Alice is back at epoch 1 with just alice + bob.
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
@@ -485,11 +512,37 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         })
         .await
         .expect("post-rollback invite must succeed");
-    let retry_pending = match retry {
-        SendResult::GroupEvolution { pending, .. } => pending,
+    let (retry_pending, retry_welcome_id) = match retry {
+        SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } => (
+            pending,
+            welcomes
+                .first()
+                .expect("retry produces a Welcome")
+                .id
+                .clone(),
+        ),
         _ => panic!("expected GroupEvolution"),
     };
     alice.confirm_published(retry_pending).await.unwrap();
+    let retained = storage.get_message(&retry_welcome_id).unwrap();
+    assert_eq!(retained.state, MessageState::Sent);
+    assert!(
+        StoredMessagePayload::decode(&retained.payload)
+            .unwrap()
+            .as_outbound_welcome()
+            .is_some(),
+        "confirmed invite Welcome must become engine-authoritative"
+    );
+    assert!(
+        alice
+            .outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .any(|(_, welcome)| welcome.id == retry_welcome_id),
+        "confirmed invite Welcome must be restart-discoverable"
+    );
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
 }

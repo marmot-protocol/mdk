@@ -11,7 +11,7 @@ use cgka_traits::message::{
     StoredMessagePayload,
 };
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 
 fn fresh_deferred_peel_lifecycle(
@@ -30,6 +30,41 @@ fn fresh_deferred_peel_lifecycle(
         distinct_context_attempts: 0,
         last_context_fingerprint: None,
     }
+}
+
+/// Promote or retire the raw Welcome artifacts produced beside one staged
+/// invite commit.
+///
+/// An existing-group invite is the only send operation that writes outbound
+/// Welcome rows at its source epoch. Keeping the exact-epoch check here makes
+/// the staged commit and those rows one recovery unit without teaching storage
+/// about MLS pending references.
+pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    source_epoch: EpochId,
+    state: MessageState,
+) -> Result<(), EngineError> {
+    debug_assert!(matches!(state, MessageState::Sent | MessageState::Failed));
+    for mut record in storage.list_messages(group_id, source_epoch)? {
+        if record.epoch != source_epoch || record.state != MessageState::Sent {
+            continue;
+        }
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        let Some(message) = payload.as_raw_transport() else {
+            continue;
+        };
+        if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            continue;
+        }
+        record.payload = StoredMessagePayload::outbound_welcome(message.clone())
+            .encode()
+            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        record.state = state;
+        storage.put_message(&record)?;
+    }
+    Ok(())
 }
 
 /// Return the effective deferred-peel lifecycle for the current clock domain.

@@ -9254,6 +9254,112 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     runtime.shutdown().await;
 }
 
+/// mdk#1451: once an existing-group Add commit is confirmed, its exact
+/// Welcome is engine-authoritative and receives a startup retry after process
+/// death without staging another invite commit.
+#[tokio::test]
+async fn confirmed_invite_welcome_resumes_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "resume confirmed invite welcome",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    rejecting.store(true, Ordering::SeqCst);
+    runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !runtime
+                .pending_welcome_deliveries(&alice_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("rejected confirmed-invite Welcome must remain pending");
+    runtime.shutdown().await;
+
+    rejecting.store(false, Ordering::SeqCst);
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match runtime.pending_welcome_deliveries(&alice_id).await {
+                Ok(pending) if pending.is_empty() => break,
+                Ok(_) | Err(AppError::AccountWorkerBusy) | Err(AppError::TransportClosed) => {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("pending Welcome query failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("startup must retry and retire the confirmed-invite Welcome");
+    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == carol_id)
+            .count(),
+        1,
+        "Welcome recovery must not stage a duplicate invite"
+    );
+    runtime.shutdown().await;
+}
+
 /// mdk#352 review follow-up: the welcome re-delivery surface is reachable end
 /// to end through the runtime worker. A create whose welcome delivered leaves
 /// nothing pending, and re-delivering an unknown welcome id is a clean error

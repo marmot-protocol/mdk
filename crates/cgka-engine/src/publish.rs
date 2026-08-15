@@ -161,6 +161,16 @@ impl<S: StorageProvider> Engine<S> {
                             .expect("pending commit produced a stamp")
                             .consumed_proposal_refs,
                     )?;
+                    // Existing-group invites retain exact raw Welcome artifacts
+                    // while the Add commit is merely staged. Promote them to
+                    // engine-authoritative delivery obligations in the same
+                    // transaction that makes the membership canonical.
+                    crate::message_processor::transition_staged_invite_welcomes(
+                        storage,
+                        &group_id,
+                        source_epoch,
+                        MessageState::Sent,
+                    )?;
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                     mls_group
@@ -406,6 +416,16 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 if has_pending_commit {
+                    let source_epoch = EpochId(mls_group.epoch().as_u64());
+                    // No endpoint accepted this staged evolution. Retire its
+                    // exact Welcomes in the same transaction as the MLS rewind
+                    // so a higher-layer repair index cannot deliver an orphan.
+                    crate::message_processor::transition_staged_invite_welcomes(
+                        storage,
+                        &group_id,
+                        source_epoch,
+                        MessageState::Failed,
+                    )?;
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                     mls_group

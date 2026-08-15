@@ -16,6 +16,7 @@ pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
 #[cfg(feature = "test-conformance-snapshot")]
 pub(crate) use store::normalized_deferred_peel_lifecycle;
+pub(crate) use store::transition_staged_invite_welcomes;
 
 use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};

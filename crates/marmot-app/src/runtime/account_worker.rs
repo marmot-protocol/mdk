@@ -803,6 +803,26 @@ async fn run_app_runtime_account_worker(
             DeferredStartupCommand::Command(command) => *command,
         })
         .collect::<VecDeque<_>>();
+    // Confirmed invite/create Welcomes are engine-authoritative durable work.
+    // Give each retained obligation one exact-artifact retry before replaying
+    // newly arrived mutations. Safe reads can still use this post-catch-up
+    // snapshot; mutations remain FIFO behind the older delivery work.
+    let welcome_recovery_snapshot = capture_group_read_snapshot(
+        &client,
+        &events,
+        &account_id_hex,
+        &account_label,
+        "startup Welcome recovery snapshot failed",
+    );
+    serve_snapshot_reads_until(
+        welcome_recovery_snapshot,
+        client.retry_pending_welcome_deliveries_best_effort(),
+        &mut commands,
+        &mut pending,
+        &app,
+        &account_label,
+    )
+    .await;
     // Every remaining startup command is visible to snapshot serving in this
     // one FIFO. Live commands received during fanout append behind it, so a
     // later read cannot bypass an earlier deferred mutation.
@@ -2639,7 +2659,10 @@ async fn handle_account_worker_command(
                     .await
             }
             .await;
-            if result.is_ok() {
+            let canonical = result.as_ref().is_ok_and(|summary| {
+                summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+            });
+            if canonical {
                 publish_client_pending_projection_updates(
                     client,
                     events,
@@ -2653,9 +2676,8 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let invited = result.is_ok();
             let _ = respond.send(result);
-            if invited {
+            if canonical {
                 // Reply first so the inviter is not blocked on Welcome publish.
                 // Snapshot reads (members, MLS state, roster) are served from a
                 // post-commit snapshot while fanout owns the live client.

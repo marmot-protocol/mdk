@@ -21,6 +21,7 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::StreamExt;
+use marmot_account::PreparedSessionSend;
 use marmot_forensics::AuditEventContext;
 use nostr::NostrSigner;
 
@@ -1443,7 +1444,24 @@ impl AppClient {
             .await
             .map_err(AppError::from);
         let prepared = match commit {
-            Ok(prepared) => prepared,
+            Ok(PreparedSessionSend::Commit(prepared)) => prepared,
+            Ok(PreparedSessionSend::Queued(session_effects)) => {
+                let queued = self
+                    .runtime
+                    .publish_prepared_session_effects_with_audit_context(
+                        session_effects,
+                        audit_context,
+                    )
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    queued.is_ok(),
+                );
+                return queued.map(|effects| send_summary_from_effects(&effects));
+            }
             Err(error) => {
                 record_app_performance(
                     telemetry,
@@ -1524,7 +1542,17 @@ impl AppClient {
             engine_publish_started_at.elapsed(),
             published.is_ok(),
         );
-        let effects = published?;
+        let effects = match published {
+            Ok(effects) => effects,
+            Err(error) => {
+                // The account runtime has either rolled the unexposed commit
+                // back or retained its durable fanout for exact retry. Do not
+                // let this in-memory slot independently publish Welcomes after
+                // a failed caller-visible commit attempt.
+                self.unpublished_welcome_delivery = None;
+                return Err(error);
+            }
+        };
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
@@ -3727,11 +3755,12 @@ impl AppClient {
     /// Reconcile the app-facing repair index from the engine's authoritative
     /// retained Welcome obligations.
     ///
-    /// The engine persists founding Welcomes in the same transaction that
-    /// makes the group canonical. This closes the crash window between
-    /// `prepare_create_group` returning and the app recording its convenience
-    /// index: a cold restart can rebuild missing rows without re-creating the
-    /// group or re-consuming KeyPackages.
+    /// The engine persists founding Welcomes at canonical creation and promotes
+    /// invite Welcomes in the transaction that confirms their Add commit. This
+    /// closes the crash window between the canonical boundary and this
+    /// convenience index: a cold restart can rebuild missing rows without
+    /// re-creating the group, re-committing the invite, or re-consuming
+    /// KeyPackages.
     fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
         let outstanding = self.runtime.outstanding_welcome_deliveries()?;
         let tracked_ids = self
@@ -3878,6 +3907,44 @@ impl AppClient {
     /// (mdk#352).
     pub(crate) fn take_pending_welcome_delivery_events(&mut self) -> Vec<PendingWelcomeDelivery> {
         std::mem::take(&mut self.pending_welcome_delivery_events)
+    }
+
+    /// Give every engine-authoritative outstanding Welcome one startup retry.
+    ///
+    /// The pending index is reconciled from `OutboundWelcome` records first, so
+    /// this resumes the exact retained artifact after process death rather than
+    /// reconstructing or re-committing the invite.
+    pub(crate) async fn retry_pending_welcome_deliveries_best_effort(&mut self) {
+        let pending = match self.pending_welcome_deliveries() {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "retry_pending_welcome_deliveries_best_effort",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not enumerate retained Welcome obligations at startup"
+                );
+                return;
+            }
+        };
+        let mut failed_count = 0usize;
+        for delivery in pending {
+            if self
+                .redeliver_welcome(&delivery.message_id_hex)
+                .await
+                .is_err()
+            {
+                failed_count = failed_count.saturating_add(1);
+            }
+        }
+        if failed_count > 0 {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "retry_pending_welcome_deliveries_best_effort",
+                failed_count,
+                "startup Welcome retry left obligations pending"
+            );
+        }
     }
 
     /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest

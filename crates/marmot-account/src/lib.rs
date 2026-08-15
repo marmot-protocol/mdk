@@ -27,7 +27,8 @@ pub use key_package::{
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, PendingResolution,
-    PreparedSessionCommit, PublishFailure, PublishedApplicationMessage, WelcomeDeliveryFailure,
+    PreparedSessionCommit, PreparedSessionSend, PublishFailure, PublishedApplicationMessage,
+    WelcomeDeliveryFailure,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
 pub use time::{
