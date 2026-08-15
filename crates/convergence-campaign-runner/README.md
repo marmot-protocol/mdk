@@ -62,6 +62,21 @@ Release manifests must keep `output_dir` disjoint from the retained weekly,
 adversarial, and distributed-container artifact roots; nested roots are rejected
 to prevent double-counting.
 
+Release hardening takes an exact lowercase 40-character ancestor commit rather
+than an operator-authored mutable image tag. The workflow builds the current and
+ancestor campaign images from their exact source trees, resolves both to local
+`sha256:<image-id>` references, and uses `materialize-release-campaign` to write
+the shared four-party cross-route scenario plus its mixed-build manifest.
+`assemble-release-evidence` then joins the reviewed claim under
+`release-claims/` to the completed normalized manifest, successful command
+receipt, strict public process oracle, lane observation, budget evaluation, and
+required step records. It copies privacy-safe inputs into one owner-only bundle
+tree and writes a validation record containing only the canonical scenario and
+raw process-report digests—not their payload-bearing bytes. `check-evidence`
+then verifies every bundled SHA-256 digest. A generated bundle is evidence for
+its exact source and baseline revisions only; it is not a universal
+convergence claim.
+
 Failed distributed executions append a privacy-safe entry to the private
 `failure-corpus.v1.json` in the campaign output directory. `index-capsule` and
 `index-node-capsule` add simulator or process failures, `classify-failure`

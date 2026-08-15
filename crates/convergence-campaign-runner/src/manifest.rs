@@ -56,7 +56,8 @@ pub struct ContainerBackendV1 {
     /// Safe, operator-selected namespace for the runtime network and relay.
     pub namespace: String,
     /// Local development may opt out explicitly; hardened campaigns require
-    /// every image reference to carry an immutable sha256 manifest digest.
+    /// every image reference to carry an immutable sha256 manifest digest or
+    /// an exact local content-addressed image id.
     #[serde(default)]
     pub allow_mutable_image_references: bool,
     /// Explicit operator approval for the campaign-only cleartext hop from a
@@ -319,7 +320,7 @@ impl DistributedCampaignManifestV1 {
                 {
                     return Err(RunnerError::validation(
                         "mutable_container_image",
-                        "container images must use NAME@sha256:DIGEST unless the manifest explicitly enables mutable local references",
+                        "container images must use NAME@sha256:DIGEST or sha256:IMAGE_ID unless the manifest explicitly enables mutable local references",
                     ));
                 }
                 if self
@@ -557,6 +558,9 @@ fn validate_container_namespace(value: &str) -> Result<(), RunnerError> {
 }
 
 fn is_digest_pinned_image(image: &str) -> bool {
+    if let Some(digest) = image.strip_prefix("sha256:") {
+        return digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
     let Some((name, digest)) = image.rsplit_once("@sha256:") else {
         return false;
     };
