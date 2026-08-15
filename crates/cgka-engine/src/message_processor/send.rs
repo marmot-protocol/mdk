@@ -329,7 +329,12 @@ impl<S: StorageProvider> Engine<S> {
                 self.peeler.wrap_welcome(&payload, &recipient).await
             }
             .map_err(EngineError::Peeler)?;
-            self.record_sent_message(&wrapped, &group_id, pre_commit_epoch)?;
+            self.record_staged_invite_welcome(
+                &wrapped,
+                &commit_msg.id,
+                &group_id,
+                pre_commit_epoch,
+            )?;
             welcomes.push(wrapped);
         }
 

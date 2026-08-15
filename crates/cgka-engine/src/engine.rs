@@ -1690,6 +1690,7 @@ impl<S: StorageProvider> Engine<S> {
                         storage,
                         group_id,
                         source_epoch,
+                        None,
                         MessageState::Failed,
                     )?;
                     let tx_provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -2682,14 +2683,22 @@ impl<S: StorageProvider> Engine<S> {
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
-        let message = payload
-            .as_outbound_welcome()
-            .or_else(|| payload.as_raw_transport())
-            .ok_or_else(|| {
-                EngineError::Backend(
-                    "stored message is not an outbound Welcome transport record".into(),
-                )
-            })?;
+        let message = match &payload {
+            StoredMessagePayload::OutboundWelcome(message) => Some(message),
+            // `RawTransport` is the explicit legacy representation used before
+            // delivery-aware and staged Welcome variants existed. New invite
+            // paths never use it while a commit is unconfirmed.
+            StoredMessagePayload::RawTransport(message) => Some(message),
+            StoredMessagePayload::StagedInviteWelcome { .. }
+            | StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::SignedOpenMlsWire { .. }
+            | StoredMessagePayload::OwnCommitWire { .. } => None,
+        }
+        .ok_or_else(|| {
+            EngineError::Backend(
+                "stored message is not an outbound Welcome transport record".into(),
+            )
+        })?;
         if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
             return Err(EngineError::Backend(
                 "stored message is not a welcome".into(),
@@ -2734,13 +2743,13 @@ impl<S: StorageProvider> Engine<S> {
         Ok(welcomes)
     }
 
-    /// IDs of every delivery-aware outbound Welcome retained by this engine,
-    /// including completed obligations.
+    /// IDs of every delivery-aware or explicitly staged outbound Welcome
+    /// retained by this engine, including completed obligations.
     ///
-    /// Higher layers use this to reconcile founding/invite projection rows,
-    /// including terminal invite rows retired with a rolled-back Add commit,
-    /// without disturbing older pending-delivery rows intentionally backed by
-    /// historical raw `Sent` payloads.
+    /// Higher layers use this to reconcile founding/invite projection rows.
+    /// Staged invite ids are tracked but not outstanding, so a pre-confirmation
+    /// app projection cannot expose them for delivery. Historical raw `Sent`
+    /// payloads remain outside this lifecycle.
     pub fn tracked_outbound_welcome_ids(&self) -> Result<Vec<MessageId>, EngineError> {
         let mut ids = Vec::new();
         for group_id in self.storage.list_groups()? {
@@ -2751,7 +2760,9 @@ impl<S: StorageProvider> Engine<S> {
                 let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                     continue;
                 };
-                if payload.as_outbound_welcome().is_some() {
+                if payload.as_outbound_welcome().is_some()
+                    || payload.as_staged_invite_welcome().is_some()
+                {
                     ids.push(record.id);
                 }
             }

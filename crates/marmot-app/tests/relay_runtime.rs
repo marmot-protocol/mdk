@@ -344,6 +344,64 @@ impl WritePolicy for RejectGiftWrapsWhileArmed {
     }
 }
 
+#[derive(Clone, Debug)]
+struct RejectThenBlockGiftWraps {
+    rejecting: Arc<AtomicBool>,
+    blocking: Arc<AtomicBool>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl RejectThenBlockGiftWraps {
+    fn new() -> Self {
+        Self {
+            rejecting: Arc::new(AtomicBool::new(false)),
+            blocking: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    fn reject(&self, rejecting: bool) {
+        self.rejecting.store(rejecting, Ordering::SeqCst);
+    }
+
+    fn block(&self) {
+        self.blocking.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.blocking.store(false, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+impl WritePolicy for RejectThenBlockGiftWraps {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind != Kind::GiftWrap {
+                return PolicyResult::Accept;
+            }
+            if self.rejecting.load(Ordering::SeqCst) {
+                return PolicyResult::Reject("injected gift-wrap rejection".into());
+            }
+            if self.blocking.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
 impl WritePolicy for BlockKeyPackagesWhileArmed {
     fn admit_event<'a>(
         &'a self,
@@ -9260,10 +9318,8 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
 #[tokio::test]
 async fn confirmed_invite_welcome_resumes_after_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let rejecting = Arc::new(AtomicBool::new(false));
-    let relay = LocalRelay::new(
-        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
-    );
+    let welcome_policy = RejectThenBlockGiftWraps::new();
+    let relay = LocalRelay::new(RelayBuilder::default().write_policy(welcome_policy.clone()));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let app = MarmotApp::with_relay_and_config(
@@ -9310,7 +9366,7 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     })
     .await;
 
-    rejecting.store(true, Ordering::SeqCst);
+    welcome_policy.reject(true);
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
@@ -9332,9 +9388,42 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     .expect("rejected confirmed-invite Welcome must remain pending");
     runtime.shutdown().await;
 
-    rejecting.store(false, Ordering::SeqCst);
+    welcome_policy.reject(false);
+    welcome_policy.block();
     let runtime = MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match runtime.pending_welcome_deliveries(&alice_id).await {
+                Ok(pending) if !pending.is_empty() => break,
+                Ok(_) | Err(AppError::AccountWorkerBusy) | Err(AppError::TransportClosed) => {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("pending Welcome query failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("confirmed Welcome must remain pending before startup retry");
+    timeout(Duration::from_secs(15), welcome_policy.wait_until_blocked())
+        .await
+        .expect("startup recovery must begin the retained Welcome publish");
+
+    timeout(
+        Duration::from_secs(2),
+        runtime.set_group_archived(&alice_id, &hex::encode(group_id.as_slice()), true),
+    )
+    .await
+    .expect("unrelated mutation must not wait for recovered Welcome delivery")
+    .unwrap();
+
+    assert!(
+        timeout(Duration::from_millis(250), runtime.drain_in_flight_work())
+            .await
+            .is_err(),
+        "drain must wait for the blocked recovery fanout"
+    );
+    welcome_policy.release();
     timeout(Duration::from_secs(10), async {
         loop {
             match runtime.pending_welcome_deliveries(&alice_id).await {

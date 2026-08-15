@@ -126,6 +126,7 @@ struct PreparedLegacyPublishAttempt {
 /// Keeping the pending handle beside the extracted Welcomes lets callers
 /// either publish the commit after durable Welcome-intent persistence or roll
 /// the staged MLS change back while external exposure is still impossible.
+#[must_use = "a prepared commit must be published or rolled back; dropping it strands the staged MLS commit"]
 pub struct PreparedSessionCommit {
     effects: SessionEffects,
     welcomes: Vec<TransportMessage>,
@@ -1675,6 +1676,13 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<PreparedSessionSend> {
+        if !supports_deferred_commit_publish(&intent) {
+            return Err(cgka_traits::EngineError::Other(
+                "deferred-publish acceptance requires a commit-producing or durably queued intent"
+                    .into(),
+            )
+            .into());
+        }
         let session_effects = self
             .session
             .send_with_audit_context(intent, context)
@@ -1682,7 +1690,9 @@ where
         classify_prepared_session_send(session_effects)
     }
 
-    /// Roll back a prepared commit before any transport side effect.
+    /// Roll back a prepared commit before that commit has any transport side
+    /// effect, then publish any independent work generated while buffered input
+    /// is replayed against the restored group state.
     pub async fn rollback_prepared_session_commit(
         &mut self,
         prepared: PreparedSessionCommit,
@@ -1699,7 +1709,9 @@ where
             .pending
             .push(PendingResolution::RolledBack { pending });
         output.absorb_session_effects(rollback_effects, &mut queue);
-        debug_assert!(queue.is_empty());
+        self.publish_queue(&mut output, &mut queue, None).await?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_superseded_maintenance(&output.events)?;
         Ok(output)
     }
 
@@ -1748,7 +1760,20 @@ where
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
-        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context))
+        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context), false)
+            .await?;
+        Ok(output)
+    }
+
+    /// Retry retained Welcome obligations immediately with the shared bounded
+    /// fanout, bypassing the automatic backoff for this explicit startup pass.
+    pub async fn retry_welcome_messages_with_audit_context(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let mut output = AccountDeviceEffects::default();
+        self.publish_welcome_fanout(welcomes, None, &mut output, Some(context), true)
             .await?;
         Ok(output)
     }
@@ -2395,7 +2420,7 @@ where
             GroupEvent::GroupCreated { group_id } => Some(group_id.clone()),
             _ => None,
         });
-        self.publish_welcome_fanout(welcomes, group_id, output, context)
+        self.publish_welcome_fanout(welcomes, group_id, output, context, false)
             .await
     }
 
@@ -2407,6 +2432,7 @@ where
         group_id: Option<GroupId>,
         output: &mut AccountDeviceEffects,
         context: Option<AuditEventContext>,
+        force_retry: bool,
     ) -> AccountResult<()> {
         let mut metadata = Vec::with_capacity(welcomes.len());
         let mut completions = Vec::with_capacity(welcomes.len());
@@ -2416,7 +2442,12 @@ where
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
             let mut effects = AccountDeviceEffects::default();
-            match self.prepare_legacy_publish(welcome, &mut effects, context.clone(), false)? {
+            match self.prepare_legacy_publish(
+                welcome,
+                &mut effects,
+                context.clone(),
+                force_retry,
+            )? {
                 PreparedLegacyPublish::Complete(status) => {
                     completions[index] = Some(LegacyPublishCompletion::Complete(status));
                 }
@@ -3606,6 +3637,18 @@ fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage>
     welcomes
 }
 
+fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
+    matches!(
+        intent,
+        SendIntent::Invite { .. }
+            | SendIntent::RemoveMembers { .. }
+            | SendIntent::SelfUpdate { .. }
+            | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::UpdateGroupData { .. }
+            | SendIntent::EnableDisbanding { .. }
+    )
+}
+
 fn classify_prepared_session_send(
     mut effects: SessionEffects,
 ) -> AccountResult<PreparedSessionSend> {
@@ -3836,8 +3879,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deferred_publish_boundary_rejects_non_commit_intents() {
+        let group_id = GroupId::new(vec![1]);
+        assert!(!supports_deferred_commit_publish(&SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: Vec::new(),
+        }));
+        assert!(!supports_deferred_commit_publish(&SendIntent::Leave {
+            group_id: group_id.clone(),
+        }));
+        assert!(supports_deferred_commit_publish(
+            &SendIntent::RemoveMembers {
+                group_id,
+                members: Vec::new(),
+            }
+        ));
+    }
+
     #[tokio::test]
-    async fn founding_welcome_work_is_bounded_concurrent_and_ordered() {
+    async fn welcome_publish_work_is_bounded_concurrent_and_ordered() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Semaphore;

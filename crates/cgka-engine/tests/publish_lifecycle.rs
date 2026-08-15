@@ -456,19 +456,31 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         })
         .await
         .unwrap();
-    let (inv_pending, failed_welcome_id) = match invite {
+    let (inv_pending, invite_commit_id, failed_welcome) = match invite {
         SendResult::GroupEvolution {
-            pending, welcomes, ..
+            msg,
+            pending,
+            welcomes,
         } => (
             pending,
-            welcomes
-                .first()
-                .expect("invite produces a Welcome")
-                .id
-                .clone(),
+            msg.id,
+            welcomes.first().expect("invite produces a Welcome").clone(),
         ),
         _ => panic!("expected GroupEvolution"),
     };
+    let failed_welcome_id = failed_welcome.id.clone();
+    let staged = storage.get_message(&failed_welcome_id).unwrap();
+    let staged_payload = StoredMessagePayload::decode(&staged.payload).unwrap();
+    assert_eq!(
+        staged_payload
+            .as_staged_invite_welcome()
+            .map(|(_, origin_commit_id)| origin_commit_id),
+        Some(&invite_commit_id)
+    );
+    assert!(
+        alice.stored_sent_welcome(&failed_welcome_id).is_err(),
+        "a staged invite Welcome must not be deliverable before commit confirmation"
+    );
     assert_eq!(
         alice.members(&gid).unwrap().len(),
         3,
@@ -512,19 +524,51 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         })
         .await
         .expect("post-rollback invite must succeed");
-    let (retry_pending, retry_welcome_id) = match retry {
+    let (retry_pending, retry_welcome) = match retry {
         SendResult::GroupEvolution {
             pending, welcomes, ..
         } => (
             pending,
-            welcomes
-                .first()
-                .expect("retry produces a Welcome")
-                .id
-                .clone(),
+            welcomes.first().expect("retry produces a Welcome").clone(),
         ),
         _ => panic!("expected GroupEvolution"),
     };
+    let retry_welcome_id = retry_welcome.id.clone();
+    // A stale staged Welcome at the same source epoch must not be promoted by
+    // this new commit's confirmation.
+    let stale_welcome_id = MessageId::new(b"stale-same-epoch-welcome".to_vec());
+    let mut stale_welcome = retry_welcome.clone();
+    stale_welcome.id = stale_welcome_id.clone();
+    storage
+        .put_message(&MessageRecord {
+            id: stale_welcome_id.clone(),
+            group_id: gid.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Sent,
+            payload: StoredMessagePayload::staged_invite_welcome(
+                stale_welcome,
+                MessageId::new(b"rolled-back-origin-commit".to_vec()),
+            )
+            .encode()
+            .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+    let legacy_stale_welcome_id = MessageId::new(b"legacy-stale-same-epoch-welcome".to_vec());
+    let mut legacy_stale_welcome = retry_welcome.clone();
+    legacy_stale_welcome.id = legacy_stale_welcome_id.clone();
+    storage
+        .put_message(&MessageRecord {
+            id: legacy_stale_welcome_id.clone(),
+            group_id: gid.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Sent,
+            payload: StoredMessagePayload::raw_transport(legacy_stale_welcome)
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
     alice.confirm_published(retry_pending).await.unwrap();
     let retained = storage.get_message(&retry_welcome_id).unwrap();
     assert_eq!(retained.state, MessageState::Sent);
@@ -543,6 +587,22 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
             .any(|(_, welcome)| welcome.id == retry_welcome_id),
         "confirmed invite Welcome must be restart-discoverable"
     );
+    let stale = storage.get_message(&stale_welcome_id).unwrap();
+    assert_eq!(stale.state, MessageState::Failed);
+    assert!(
+        StoredMessagePayload::decode(&stale.payload)
+            .unwrap()
+            .as_staged_invite_welcome()
+            .is_some(),
+        "same-epoch Welcome owned by another commit must remain explicitly staged"
+    );
+    assert!(alice.stored_sent_welcome(&stale_welcome_id).is_err());
+    assert_eq!(
+        storage.get_message(&legacy_stale_welcome_id).unwrap().state,
+        MessageState::Failed,
+        "ambiguous legacy Welcome at the source epoch must be retired"
+    );
+    assert!(alice.stored_sent_welcome(&legacy_stale_welcome_id).is_err());
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
 }

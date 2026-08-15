@@ -76,6 +76,9 @@ pub struct OwnApplicationConvergenceStamp {
 ///   distinct from historical `RawTransport` `Sent` rows lets cold-restart
 ///   recovery find only delivery obligations created by versions that track
 ///   their completion.
+/// - `StagedInviteWelcome`: a locally produced Welcome that is bound to one
+///   exact, not-yet-confirmed invite commit. This representation is deliberately
+///   not deliverable until that commit is confirmed.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
 ///   wire bytes. This variant, `SignedOpenMlsWire`, and `OwnCommitWire` are
 ///   eligible for OpenMLS projection and convergence replay.
@@ -92,6 +95,10 @@ pub struct OwnApplicationConvergenceStamp {
 pub enum StoredMessagePayload {
     RawTransport(TransportMessage),
     OutboundWelcome(TransportMessage),
+    StagedInviteWelcome {
+        message: TransportMessage,
+        origin_commit_id: MessageId,
+    },
     OpenMlsWire(TransportMessage),
     SignedOpenMlsWire {
         exact_message: TransportMessage,
@@ -114,6 +121,13 @@ impl StoredMessagePayload {
 
     pub fn outbound_welcome(message: TransportMessage) -> Self {
         Self::OutboundWelcome(message)
+    }
+
+    pub fn staged_invite_welcome(message: TransportMessage, origin_commit_id: MessageId) -> Self {
+        Self::StagedInviteWelcome {
+            message,
+            origin_commit_id,
+        }
     }
 
     pub fn openmls_wire(message: TransportMessage) -> Self {
@@ -177,6 +191,7 @@ impl StoredMessagePayload {
         match self {
             Self::RawTransport(message) => Some(message),
             Self::OutboundWelcome(_)
+            | Self::StagedInviteWelcome { .. }
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
             | Self::OwnCommitWire { .. } => None,
@@ -187,6 +202,21 @@ impl StoredMessagePayload {
         match self {
             Self::OutboundWelcome(message) => Some(message),
             Self::RawTransport(_)
+            | Self::StagedInviteWelcome { .. }
+            | Self::OpenMlsWire(_)
+            | Self::SignedOpenMlsWire { .. }
+            | Self::OwnCommitWire { .. } => None,
+        }
+    }
+
+    pub fn as_staged_invite_welcome(&self) -> Option<(&TransportMessage, &MessageId)> {
+        match self {
+            Self::StagedInviteWelcome {
+                message,
+                origin_commit_id,
+            } => Some((message, origin_commit_id)),
+            Self::RawTransport(_)
+            | Self::OutboundWelcome(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
             | Self::OwnCommitWire { .. } => None,
@@ -195,7 +225,9 @@ impl StoredMessagePayload {
 
     pub fn as_openmls_wire(&self) -> Option<&TransportMessage> {
         match self {
-            Self::RawTransport(_) | Self::OutboundWelcome(_) => None,
+            Self::RawTransport(_) | Self::OutboundWelcome(_) | Self::StagedInviteWelcome { .. } => {
+                None
+            }
             Self::OpenMlsWire(message) | Self::OwnCommitWire { message, .. } => Some(message),
             Self::SignedOpenMlsWire {
                 openmls_message, ..
@@ -208,7 +240,9 @@ impl StoredMessagePayload {
         match self {
             Self::RawTransport(message) | Self::OutboundWelcome(message) => Some(message),
             Self::SignedOpenMlsWire { exact_message, .. } => Some(exact_message),
-            Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
+            Self::StagedInviteWelcome { .. }
+            | Self::OpenMlsWire(_)
+            | Self::OwnCommitWire { .. } => None,
         }
     }
 
@@ -216,7 +250,10 @@ impl StoredMessagePayload {
     /// published-and-confirmed commit.
     pub fn own_commit_stamp(&self) -> Option<&OwnCommitConvergenceStamp> {
         match self {
-            Self::RawTransport(_) | Self::OutboundWelcome(_) | Self::OpenMlsWire(_) => None,
+            Self::RawTransport(_)
+            | Self::OutboundWelcome(_)
+            | Self::StagedInviteWelcome { .. }
+            | Self::OpenMlsWire(_) => None,
             Self::SignedOpenMlsWire { stamp, .. } => stamp.as_ref(),
             Self::OwnCommitWire { stamp, .. } => Some(stamp),
         }
@@ -231,6 +268,7 @@ impl StoredMessagePayload {
             } => own_application_stamp.as_deref(),
             Self::RawTransport(_)
             | Self::OutboundWelcome(_)
+            | Self::StagedInviteWelcome { .. }
             | Self::OpenMlsWire(_)
             | Self::OwnCommitWire { .. } => None,
         }
@@ -242,6 +280,7 @@ impl StoredMessagePayload {
             | Self::OutboundWelcome(message)
             | Self::OpenMlsWire(message)
             | Self::OwnCommitWire { message, .. } => message,
+            Self::StagedInviteWelcome { message, .. } => message,
             Self::SignedOpenMlsWire {
                 openmls_message, ..
             } => openmls_message,
@@ -288,6 +327,18 @@ fn encode_stored_message_payload_v2(
         StoredMessagePayload::OutboundWelcome(message) => {
             out.push(1);
             encode_transport_message(message, &mut out)?;
+        }
+        StoredMessagePayload::StagedInviteWelcome {
+            message,
+            origin_commit_id,
+        } => {
+            out.push(5);
+            encode_transport_message(message, &mut out)?;
+            encode_var_bytes(
+                origin_commit_id.as_slice(),
+                &mut out,
+                "staged Welcome origin commit id",
+            )?;
         }
         StoredMessagePayload::OpenMlsWire(message) => {
             out.push(2);
@@ -344,6 +395,10 @@ fn decode_stored_message_payload_v2(
         4 => StoredMessagePayload::OwnCommitWire {
             message: decoder.transport_message()?,
             stamp: decoder.own_commit_stamp()?,
+        },
+        5 => StoredMessagePayload::StagedInviteWelcome {
+            message: decoder.transport_message()?,
+            origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
         },
         variant => {
             return Err(invalid(format!(
@@ -750,7 +805,11 @@ mod stored_payload_codec_tests {
         };
         let values = [
             StoredMessagePayload::RawTransport(group_message.clone()),
-            StoredMessagePayload::OutboundWelcome(welcome),
+            StoredMessagePayload::OutboundWelcome(welcome.clone()),
+            StoredMessagePayload::StagedInviteWelcome {
+                message: welcome,
+                origin_commit_id: MessageId::new([0x55, 0x56]),
+            },
             StoredMessagePayload::OpenMlsWire(group_message.clone()),
             StoredMessagePayload::SignedOpenMlsWire {
                 exact_message: group_message.clone(),

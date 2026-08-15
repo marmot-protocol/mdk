@@ -803,26 +803,6 @@ async fn run_app_runtime_account_worker(
             DeferredStartupCommand::Command(command) => *command,
         })
         .collect::<VecDeque<_>>();
-    // Confirmed invite/create Welcomes are engine-authoritative durable work.
-    // Give each retained obligation one exact-artifact retry before replaying
-    // newly arrived mutations. Safe reads can still use this post-catch-up
-    // snapshot; mutations remain FIFO behind the older delivery work.
-    let welcome_recovery_snapshot = capture_group_read_snapshot(
-        &client,
-        &events,
-        &account_id_hex,
-        &account_label,
-        "startup Welcome recovery snapshot failed",
-    );
-    serve_snapshot_reads_until(
-        welcome_recovery_snapshot,
-        client.retry_pending_welcome_deliveries_best_effort(),
-        &mut commands,
-        &mut pending,
-        &app,
-        &account_label,
-    )
-    .await;
     // Every remaining startup command is visible to snapshot serving in this
     // one FIFO. Live commands received during fanout append behind it, so a
     // later read cannot bypass an earlier deferred mutation.
@@ -890,8 +870,40 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
+    // Recovery is durable, exact-artifact work, so it can yield to account
+    // commands without losing its place. A Drain command is the exception: it
+    // joins the bounded retry before acknowledging the shutdown barrier.
+    let mut welcome_recovery_pending = true;
 
     'worker: loop {
+        if welcome_recovery_pending && pending.is_empty() {
+            let mut recovery =
+                std::pin::pin!(client.retry_pending_welcome_deliveries_best_effort());
+            tokio::select! {
+                biased;
+                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                    return;
+                }
+                _ = &mut shutdown => {
+                    return;
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    if matches!(command, AccountWorkerCommand::Drain { .. }) {
+                        recovery.await;
+                        welcome_recovery_pending = false;
+                    }
+                    // Dropping an interrupted retry is safe: exact message ids
+                    // remain durable and relay publication is idempotent.
+                    pending.push_back(command);
+                }
+                _ = &mut recovery => {
+                    welcome_recovery_pending = false;
+                }
+            }
+        }
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1003,7 +1015,12 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
-            command = commands.recv() => {
+            command = async {
+                match pending.pop_front() {
+                    Some(command) => Some(command),
+                    None => commands.recv().await,
+                }
+            } => {
                 match command {
                     Some(command) => {
                         pending.push_back(command);

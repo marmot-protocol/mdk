@@ -32,17 +32,20 @@ fn fresh_deferred_peel_lifecycle(
     }
 }
 
-/// Promote or retire the raw Welcome artifacts produced beside one staged
-/// invite commit.
+/// Promote or retire the non-deliverable Welcome artifacts produced beside one
+/// staged invite commit.
 ///
-/// An existing-group invite is the only send operation that writes outbound
-/// Welcome rows at its source epoch. Keeping the exact-epoch check here makes
-/// the staged commit and those rows one recovery unit without teaching storage
-/// about MLS pending references.
+/// Normal publish resolution supplies the exact origin commit id, so another
+/// staged or stale Welcome at the same group epoch cannot be promoted with the
+/// current commit. Raw Welcome rows at this exact epoch came from a legacy
+/// binary and cannot be coupled to the surviving commit; retire them rather
+/// than risk delivering an orphan. Cold compatibility rollback may pass `None`
+/// to retire every still-staged artifact at that source epoch.
 pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     source_epoch: EpochId,
+    origin_commit_id: Option<&MessageId>,
     state: MessageState,
 ) -> Result<(), EngineError> {
     debug_assert!(matches!(state, MessageState::Sent | MessageState::Failed));
@@ -52,10 +55,22 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
-        let Some(message) = payload.as_raw_transport() else {
+        if let Some(message) = payload.as_raw_transport()
+            && matches!(message.envelope, TransportEnvelope::Welcome { .. })
+        {
+            record.state = MessageState::Failed;
+            storage.put_message(&record)?;
+            continue;
+        }
+        let Some((message, staged_origin_commit_id)) = payload.as_staged_invite_welcome() else {
             continue;
         };
         if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            continue;
+        }
+        if origin_commit_id.is_some_and(|expected| expected != staged_origin_commit_id) {
+            record.state = MessageState::Failed;
+            storage.put_message(&record)?;
             continue;
         }
         record.payload = StoredMessagePayload::outbound_welcome(message.clone())
@@ -206,6 +221,23 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<(), EngineError> {
         self.sent_message_ids.insert(msg.id.clone());
         self.persist_transport_message(msg, group_id, epoch, MessageState::Sent)
+    }
+
+    pub(crate) fn record_staged_invite_welcome(
+        &mut self,
+        msg: &TransportMessage,
+        origin_commit_id: &MessageId,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        self.sent_message_ids.insert(msg.id.clone());
+        self.persist_stored_message_payload(
+            msg.id.clone(),
+            group_id,
+            epoch,
+            MessageState::Sent,
+            StoredMessagePayload::staged_invite_welcome(msg.clone(), origin_commit_id.clone()),
+        )
     }
 
     pub(crate) fn record_sent_openmls_message(

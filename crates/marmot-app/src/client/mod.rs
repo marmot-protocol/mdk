@@ -3909,15 +3909,17 @@ impl AppClient {
         std::mem::take(&mut self.pending_welcome_delivery_events)
     }
 
-    /// Give every engine-authoritative outstanding Welcome one startup retry.
+    /// Give every engine-authoritative outstanding Welcome one bounded startup
+    /// retry fanout.
     ///
     /// The pending index is reconciled from `OutboundWelcome` records first, so
     /// this resumes the exact retained artifact after process death rather than
     /// reconstructing or re-committing the invite.
     pub(crate) async fn retry_pending_welcome_deliveries_best_effort(&mut self) {
-        let pending = match self.pending_welcome_deliveries() {
+        let pending = match self.runtime.outstanding_welcome_deliveries() {
             Ok(pending) => pending,
             Err(error) => {
+                let error = AppError::from(error);
                 tracing::warn!(
                     target: "marmot_app::client",
                     method = "retry_pending_welcome_deliveries_best_effort",
@@ -3927,23 +3929,34 @@ impl AppClient {
                 return;
             }
         };
-        let mut failed_count = 0usize;
-        for delivery in pending {
-            if self
-                .redeliver_welcome(&delivery.message_id_hex)
-                .await
-                .is_err()
-            {
-                failed_count = failed_count.saturating_add(1);
-            }
+        if pending.is_empty() {
+            return;
         }
-        if failed_count > 0 {
-            tracing::warn!(
-                target: "marmot_app::client",
-                method = "retry_pending_welcome_deliveries_best_effort",
-                failed_count,
-                "startup Welcome retry left obligations pending"
-            );
+        let welcome_ids = pending
+            .iter()
+            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
+            .collect::<Vec<_>>();
+        let welcomes = pending
+            .into_iter()
+            .map(|(_, welcome)| welcome)
+            .collect::<Vec<_>>();
+        match self
+            .runtime
+            .retry_welcome_messages_with_audit_context(welcomes, AuditEventContext::default())
+            .await
+        {
+            Ok(effects) => {
+                let _ = self.clear_delivered_founding_welcome_intents(&welcome_ids, &effects);
+                self.remember_published_reports(&effects);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "retry_pending_welcome_deliveries_best_effort",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "startup Welcome retry left obligations pending"
+                );
+            }
         }
     }
 
