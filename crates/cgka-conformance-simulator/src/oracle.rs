@@ -4,8 +4,8 @@
 //! those inputs actually checked. This module keeps that second job explicit.
 
 use crate::{
-    QuiescenceObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
-    TraceExpectation, compare_trace_expectations,
+    QuiescenceObservation, ScenarioAssertionObservationV2, ScenarioReport, ScenarioSpec,
+    ScenarioStep, ScenarioTrace, TraceExpectation, compare_trace_expectations,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -138,6 +138,7 @@ pub fn build_scenario_oracle_report(
     expected_trace: Option<&ScenarioTrace>,
     expected_outcomes: &[TraceExpectation],
     observed_trace: &ScenarioTrace,
+    assertion_observations: &[ScenarioAssertionObservationV2],
     quiescence_observations: &[QuiescenceObservation],
 ) -> ScenarioOracleReport {
     let stimuli = scenario_stimuli(spec);
@@ -157,6 +158,12 @@ pub fn build_scenario_oracle_report(
     }
     oracle_behaviors.sort();
     let mut observed_behaviors = trace_behaviors(observed_trace);
+    for behavior in observed_assertion_behaviors(assertion_observations) {
+        if !observed_behaviors.contains(&behavior) {
+            observed_behaviors.push(behavior);
+        }
+    }
+    observed_behaviors.sort();
     if expected_outcomes.iter().any(|expectation| {
         matches!(expectation, TraceExpectation::ClientsNotEquivalent { .. })
             && compare_trace_expectations(None, std::slice::from_ref(expectation), observed_trace)
@@ -459,7 +466,8 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
 
 /// Executable scenario assertions are oracle evidence. A positive payload-count
 /// check covers `AppMessage` without inventing a cross-sender `received_payloads`
-/// order, which MLS does not define.
+/// order, which MLS does not define. Declared asserts contribute expected
+/// coverage; only passing assertion observations count as observed evidence.
 fn assertion_behaviors(spec: &ScenarioSpec) -> BTreeSet<OracleBehavior> {
     let mut behaviors = BTreeSet::new();
     for step in &spec.steps {
@@ -470,21 +478,38 @@ fn assertion_behaviors(spec: &ScenarioSpec) -> BTreeSet<OracleBehavior> {
         let ScenarioStep::Assert { assertion } = step else {
             continue;
         };
-        let predicate = match assertion {
-            crate::ScenarioAssertionV2::Exactly { predicate }
-            | crate::ScenarioAssertionV2::Eventually { predicate, .. }
-            | crate::ScenarioAssertionV2::Within { predicate, .. } => predicate,
-            crate::ScenarioAssertionV2::Never { .. }
-            | crate::ScenarioAssertionV2::Resource { .. } => continue,
-        };
-        if matches!(
-            predicate,
-            crate::ScenarioPredicateV2::PayloadCount { count, .. } if *count > 0
-        ) {
+        if payload_count_covers_delivery(assertion) {
             behaviors.insert(OracleBehavior::DeliveredPayload);
         }
     }
     behaviors
+}
+
+fn observed_assertion_behaviors(
+    observations: &[ScenarioAssertionObservationV2],
+) -> BTreeSet<OracleBehavior> {
+    let mut behaviors = BTreeSet::new();
+    for observation in observations {
+        if observation.passed && payload_count_covers_delivery(&observation.assertion) {
+            behaviors.insert(OracleBehavior::DeliveredPayload);
+        }
+    }
+    behaviors
+}
+
+fn payload_count_covers_delivery(assertion: &crate::ScenarioAssertionV2) -> bool {
+    let predicate = match assertion {
+        crate::ScenarioAssertionV2::Exactly { predicate }
+        | crate::ScenarioAssertionV2::Eventually { predicate, .. }
+        | crate::ScenarioAssertionV2::Within { predicate, .. } => predicate,
+        crate::ScenarioAssertionV2::Never { .. } | crate::ScenarioAssertionV2::Resource { .. } => {
+            return false;
+        }
+    };
+    matches!(
+        predicate,
+        crate::ScenarioPredicateV2::PayloadCount { count, .. } if *count > 0
+    )
 }
 
 pub fn expected_behaviors(
@@ -984,6 +1009,7 @@ mod tests {
             std::slice::from_ref(&expectation),
             &trace(vec![david, eve]),
             &[],
+            &[],
         );
 
         assert!(
@@ -1026,6 +1052,7 @@ mod tests {
             std::slice::from_ref(&expectation),
             &trace(vec![alice, bob, david]),
             &[],
+            &[],
         );
 
         assert!(
@@ -1054,8 +1081,65 @@ mod tests {
         assert!(behaviors.contains(&OracleBehavior::DeliveredPayload));
     }
 
+    fn payload_count_assertion(
+        client: &str,
+        payload: &str,
+        count: usize,
+    ) -> crate::ScenarioAssertionV2 {
+        crate::ScenarioAssertionV2::Exactly {
+            predicate: crate::ScenarioPredicateV2::PayloadCount {
+                client: client.into(),
+                payload: payload.into(),
+                count,
+            },
+        }
+    }
+
+    fn payload_count_observation(
+        assertion: crate::ScenarioAssertionV2,
+        passed: bool,
+    ) -> crate::ScenarioAssertionObservationV2 {
+        crate::ScenarioAssertionObservationV2 {
+            step_index: 1,
+            assertion,
+            passed,
+            samples: 1,
+            elapsed_virtual_ms: 0,
+            final_actual: serde_json::json!(if passed { 1 } else { 0 }),
+        }
+    }
+
+    fn passing_payload_count_observations(
+        spec: &ScenarioSpec,
+    ) -> Vec<crate::ScenarioAssertionObservationV2> {
+        spec.steps
+            .iter()
+            .enumerate()
+            .filter_map(|(step_index, step)| {
+                let mut step = step;
+                while let ScenarioStep::InGroup { action, .. } = step {
+                    step = action.as_ref();
+                }
+                let ScenarioStep::Assert { assertion } = step else {
+                    return None;
+                };
+                payload_count_covers_delivery(assertion).then(|| {
+                    crate::ScenarioAssertionObservationV2 {
+                        step_index,
+                        assertion: assertion.clone(),
+                        passed: true,
+                        samples: 1,
+                        elapsed_virtual_ms: 0,
+                        final_actual: serde_json::json!(1),
+                    }
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn positive_payload_count_assert_covers_app_message() {
+        let assertion = payload_count_assertion("carol", "eve-witness", 1);
         let spec = ScenarioSpec {
             name: "payload-count-covers-app".into(),
             spec_version: "2".into(),
@@ -1067,23 +1151,60 @@ mod tests {
                     payload: "eve-witness".into(),
                 },
                 ScenarioStep::Assert {
-                    assertion: crate::ScenarioAssertionV2::Exactly {
-                        predicate: crate::ScenarioPredicateV2::PayloadCount {
-                            client: "carol".into(),
-                            payload: "eve-witness".into(),
-                            count: 1,
-                        },
-                    },
+                    assertion: assertion.clone(),
                 },
             ],
         };
-        let report = build_scenario_oracle_report(&spec, None, &[], &trace(Vec::new()), &[]);
+        let undeclared_execution =
+            build_scenario_oracle_report(&spec, None, &[], &trace(Vec::new()), &[], &[]);
+        assert!(
+            undeclared_execution
+                .oracle_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "{undeclared_execution:#?}"
+        );
+        assert!(
+            undeclared_execution.weak_oracle_warnings.is_empty(),
+            "{:#?}",
+            undeclared_execution.weak_oracle_warnings
+        );
+        assert!(
+            undeclared_execution
+                .missing_observed_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "a declared assert without a passing observation must remain missing: {undeclared_execution:#?}"
+        );
+
+        let failed = build_scenario_oracle_report(
+            &spec,
+            None,
+            &[],
+            &trace(Vec::new()),
+            &[payload_count_observation(assertion.clone(), false)],
+            &[],
+        );
+        assert!(
+            failed
+                .missing_observed_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "a failed payload-count assert is not observed delivery: {failed:#?}"
+        );
+
+        let report = build_scenario_oracle_report(
+            &spec,
+            None,
+            &[],
+            &trace(Vec::new()),
+            &[payload_count_observation(assertion, true)],
+            &[],
+        );
         assert!(
             report
-                .oracle_behaviors
+                .observed_behaviors
                 .contains(&OracleBehavior::DeliveredPayload),
             "{report:#?}"
         );
+        assert!(report.missing_observed_behaviors.is_empty(), "{report:#?}");
         assert!(
             report.weak_oracle_warnings.is_empty(),
             "{:#?}",
@@ -1104,17 +1225,11 @@ mod tests {
                     payload: "david-witness".into(),
                 },
                 ScenarioStep::Assert {
-                    assertion: crate::ScenarioAssertionV2::Exactly {
-                        predicate: crate::ScenarioPredicateV2::PayloadCount {
-                            client: "carol".into(),
-                            payload: "david-witness".into(),
-                            count: 0,
-                        },
-                    },
+                    assertion: payload_count_assertion("carol", "david-witness", 0),
                 },
             ],
         };
-        let report = build_scenario_oracle_report(&spec, None, &[], &trace(Vec::new()), &[]);
+        let report = build_scenario_oracle_report(&spec, None, &[], &trace(Vec::new()), &[], &[]);
         assert!(
             !report
                 .oracle_behaviors
@@ -1139,11 +1254,17 @@ mod tests {
             "{}",
             generated.scenario.name
         );
+        let passing = passing_payload_count_observations(&generated.scenario);
+        assert!(
+            !passing.is_empty(),
+            "app-witness-value must declare positive payload-count asserts"
+        );
         let report = build_scenario_oracle_report(
             &generated.scenario,
             None,
             &generated.expected_outcomes,
             &trace(Vec::new()),
+            &passing,
             &[],
         );
         assert!(
@@ -1153,6 +1274,18 @@ mod tests {
                 .all(|warning| warning.stimulus != ScenarioStimulus::AppMessage),
             "{:#?}",
             report.weak_oracle_warnings
+        );
+        assert!(
+            report
+                .observed_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "{report:#?}"
+        );
+        assert!(
+            !report
+                .missing_observed_behaviors
+                .contains(&OracleBehavior::DeliveredPayload),
+            "{report:#?}"
         );
     }
 

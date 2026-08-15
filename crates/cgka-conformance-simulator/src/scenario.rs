@@ -1385,6 +1385,7 @@ async fn run_scenario_report_inner(
         expected_trace.as_ref(),
         &expected_outcomes,
         &observed_trace,
+        &assertion_observations,
         &quiescence_observations,
     );
 

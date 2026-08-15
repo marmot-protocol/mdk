@@ -78,7 +78,8 @@ the property-test registry. This file is the agent-facing model.
 - **Module:** `src/oracle.rs`
   - **Role:** Scenario oracle and coverage evidence. Computes scenario stimuli, expected behavior classes, observed
     behavior classes, weak-oracle warnings, and coverage matrix rows. Executable `PayloadCount` asserts with a
-    positive count cover `AppMessage` without inventing a cross-sender payload order.
+    positive count cover `AppMessage` without inventing a cross-sender payload order. Declared asserts are
+    expected coverage; only passing assertion observations count as observed evidence.
 
 - **Module:** `cgka_engine::openmls_projection`
   - **Role:** Bytes-first OpenMLS projection and candidate materialization helpers, re-exported by this crate for tests.
