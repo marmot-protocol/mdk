@@ -3948,6 +3948,16 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
     assert!(!accepted.pending_confirmation);
     assert!(!accepted.archived);
 
+    // The accept path records its caller-visible phase on the runtime's
+    // app-performance snapshot (mdk#1303). The retrying helper may have
+    // logged busy rejections before this success, so assert the success side
+    // only.
+    let performance = runtime.app_performance_snapshot();
+    assert!(
+        performance.group_accept_invite.successes >= 1,
+        "accept-invite phase must record the successful accept: {performance:?}"
+    );
+
     let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert!(!reloaded.pending_confirmation);
     assert!(!reloaded.archived);

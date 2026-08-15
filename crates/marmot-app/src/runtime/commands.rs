@@ -632,16 +632,26 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<AppGroupRecord, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::AcceptGroupInvite {
-                group_id: group_id.clone(),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::AcceptGroupInvite {
+                    group_id: group_id.clone(),
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            local_account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupAcceptInvite,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub async fn decline_group_invite(

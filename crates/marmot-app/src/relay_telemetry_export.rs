@@ -404,6 +404,14 @@ pub mod metric_names {
     pub const APP_GROUP_ROSTER_READ_SUCCESSES: &str = "app_group_roster_read_successes";
     /// Failed group roster reads.
     pub const APP_GROUP_ROSTER_READ_FAILURES: &str = "app_group_roster_read_failures";
+    /// Group invite accept duration histogram (caller-visible accept latency).
+    pub const APP_GROUP_ACCEPT_INVITE_DURATION: &str = "app_group_accept_invite_duration_ms";
+    /// Group invite accept attempts.
+    pub const APP_GROUP_ACCEPT_INVITE_ATTEMPTS: &str = "app_group_accept_invite_attempts";
+    /// Successful group invite accepts.
+    pub const APP_GROUP_ACCEPT_INVITE_SUCCESSES: &str = "app_group_accept_invite_successes";
+    /// Failed group invite accepts.
+    pub const APP_GROUP_ACCEPT_INVITE_FAILURES: &str = "app_group_accept_invite_failures";
     /// Media upload duration histogram.
     pub const APP_MEDIA_UPLOAD_DURATION: &str = "app_media_upload_duration_ms";
     /// Media upload attempts.
@@ -974,6 +982,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS,
         metric_names::APP_GROUP_ROSTER_READ_SUCCESSES,
         metric_names::APP_GROUP_ROSTER_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_accept_invite,
+        metric_names::APP_GROUP_ACCEPT_INVITE_DURATION,
+        metric_names::APP_GROUP_ACCEPT_INVITE_ATTEMPTS,
+        metric_names::APP_GROUP_ACCEPT_INVITE_SUCCESSES,
+        metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES,
     );
     append_app_operation_points(
         points,

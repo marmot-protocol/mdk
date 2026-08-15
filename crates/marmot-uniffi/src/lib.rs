@@ -44,13 +44,15 @@ uniffi::setup_scaffolding!();
 
 pub use commands::{InitialGroupImageFfi, parse_media_imeta_tag};
 pub use conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi, AuditDataModeFfi,
+    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,
+    AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi, AuditDataModeFfi,
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
     AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceFfi,
     BackgroundNotificationCollectionFfi, ChatConversationKindFfi, ChatListAttachmentKindFfi,
     ChatListAvatarFfi, ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
-    ChatPinStateFfi, CursorPersistenceFfi, EncryptedMediaVersionFfi, GroupEvolutionStatusFfi,
+    ChatPinStateFfi, CursorPersistenceFfi, DurationHistogramBucketFfi,
+    DurationHistogramSnapshotFfi, EncryptedMediaVersionFfi, GroupEvolutionStatusFfi,
     GroupMaintenanceStatusFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
     GroupSystemEventFfi, HostPerformanceOperationFfi, HostPerformanceOutcomeFfi,
     KeyPackageMaintenanceStatusFfi, LocalPushRegistrationDebugFfi, MaintenanceObligationFfi,
