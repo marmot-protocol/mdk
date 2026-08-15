@@ -8509,3 +8509,114 @@ fn pending_group_invites_skips_malformed_rows() {
         Some("cc".repeat(32))
     );
 }
+
+#[test]
+fn account_unread_summary_includes_badge_attention_without_session_load() {
+    // mdk#1460: one cheap summary must return unread totals plus
+    // attention-only rows (pending invites / manual unread) for accounts that
+    // have never been started.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    let zero = app
+        .account_unread_summary()
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.account_id_hex == alice.account_id_hex)
+        .expect("zero-state account");
+    assert_eq!(zero.unread_count, 0);
+    assert_eq!(zero.unread_conversations, 0);
+    assert_eq!(zero.attention_only_conversations, 0);
+    assert!(!zero.has_unread);
+
+    let pending_id = "aa".repeat(16);
+    let manual_id = "bb".repeat(16);
+    let overlap_id = "cc".repeat(16);
+    let archived_id = "dd".repeat(16);
+    let seed_group =
+        |group_id_hex: &str, pending: bool, archived: bool| storage_sqlite::StoredAccountGroup {
+            group_id_hex: group_id_hex.to_owned(),
+            endpoint: "wss://relay.example".to_owned(),
+            profile_name: "seeded".to_owned(),
+            profile_description: String::new(),
+            image_hash_hex: String::new(),
+            image_key_hex: String::new(),
+            image_nonce_hex: String::new(),
+            image_upload_key_hex: String::new(),
+            image_media_type: None,
+            admin_keys_hex: String::new(),
+            archived,
+            pending_confirmation: pending,
+            member_count: None,
+            welcomer_account_id_hex: None,
+            via_welcome_message_id_hex: None,
+            nostr_routing_last_epoch: 0,
+            prior_nostr_routes: Vec::new(),
+            self_membership: storage_sqlite::SelfMembership::Member,
+            components: Vec::new(),
+        };
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![
+                    seed_group(&pending_id, true, false),
+                    seed_group(&manual_id, false, false),
+                    seed_group(&overlap_id, false, false),
+                    seed_group(&archived_id, true, true),
+                ],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    storage
+        .refresh_chat_list_rows(&alice.account_id_hex, &|_, _| false)
+        .unwrap();
+
+    app.set_chat_manually_unread("alice", &manual_id, true)
+        .unwrap();
+    app.set_chat_manually_unread("alice", &archived_id, true)
+        .unwrap();
+
+    let chat = |id: &str, at: u64| storage_sqlite::StoredAppEvent {
+        group_id_hex: overlap_id.clone(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: None,
+        direction: "received".to_owned(),
+        sender: "ee".repeat(32),
+        plaintext: "hello".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    storage.record_app_event(&chat("old", 10)).unwrap();
+    storage
+        .initialize_chat_read_state(&alice.account_id_hex, &overlap_id, &|_, _| false)
+        .unwrap();
+    storage.record_app_event(&chat("new", 11)).unwrap();
+    storage
+        .refresh_chat_list_row(&alice.account_id_hex, &overlap_id, &|_, _| false)
+        .unwrap();
+    app.set_chat_manually_unread("alice", &overlap_id, true)
+        .unwrap();
+
+    let summary = app
+        .account_unread_summary()
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.account_id_hex == alice.account_id_hex)
+        .expect("seeded account");
+    assert_eq!(summary.unread_count, 1);
+    assert_eq!(summary.unread_conversations, 3);
+    assert_eq!(summary.attention_only_conversations, 2);
+    assert!(summary.has_unread);
+}

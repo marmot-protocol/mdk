@@ -161,6 +161,13 @@ fn manual_unread_is_independent_durable_and_cleared_by_mark_read() {
         store.account_unread_total().unwrap().unread_conversations,
         1
     );
+    assert_eq!(
+        store
+            .account_unread_total()
+            .unwrap()
+            .attention_only_conversations,
+        1
+    );
 
     store
         .record_app_event(&chat("incoming", REMOTE, 20, "new message"))
@@ -1846,6 +1853,200 @@ fn account_unread_total_preserves_rows_without_account_group_row() {
     let total = store.account_unread_total().unwrap();
     assert_eq!(total.unread_count, 1);
     assert_eq!(total.unread_conversations, 1);
+}
+
+fn chat_in(group_id_hex: &str, id: &str, sender: &str, at: u64, plaintext: &str) -> StoredAppEvent {
+    let mut event = chat(id, sender, at, plaintext);
+    event.group_id_hex = group_id_hex.to_owned();
+    event
+}
+
+fn materialize_one_unread(store: &SqliteAccountStorage, group_id_hex: &str) {
+    store
+        .record_app_event(&chat_in(
+            group_id_hex,
+            "old",
+            REMOTE,
+            10,
+            "before first open",
+        ))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, group_id_hex, &no_mentions)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, group_id_hex, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat_in(
+            group_id_hex,
+            "new",
+            REMOTE,
+            11,
+            "after first open",
+        ))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, group_id_hex, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+}
+
+fn put_disband_tombstone_for(store: &SqliteAccountStorage, group_id_hex: &str) {
+    use cgka_traits::DisbandTombstone;
+    use cgka_traits::storage::DisbandTombstoneStorage;
+    use cgka_traits::types::{EpochId, MemberId};
+
+    store
+        .put_disband_tombstone(
+            &GroupId::new(hex::decode(group_id_hex).expect("group id hex")),
+            &DisbandTombstone {
+                epoch: EpochId(1),
+                actor: MemberId::new(vec![0xbb; 4]),
+                origin_commit_id: None,
+                commit_digest: [0; 32],
+                local_was_committer_leaf: false,
+                former_members: Vec::new(),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn account_unread_total_counts_pending_invite_as_attention_only() {
+    let mut pending = group();
+    pending.pending_confirmation = true;
+    let store = setup_store_with_group(pending);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 0);
+    assert_eq!(total.unread_conversations, 1);
+    assert_eq!(total.attention_only_conversations, 1);
+    assert!(total.has_unread());
+}
+
+#[test]
+fn account_unread_total_does_not_double_count_unread_plus_manual() {
+    let store = setup_store_with_one_unread();
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap();
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+    assert_eq!(total.attention_only_conversations, 0);
+}
+
+#[test]
+fn account_unread_total_does_not_double_count_unread_plus_pending() {
+    let mut pending = group();
+    pending.pending_confirmation = true;
+    let store = setup_store_with_group(pending);
+    materialize_one_unread(&store, GROUP);
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+    assert_eq!(total.attention_only_conversations, 0);
+}
+
+#[test]
+fn account_unread_total_excludes_archived_attention_only_rows() {
+    let mut archived_pending = group();
+    archived_pending.pending_confirmation = true;
+    archived_pending.archived = true;
+    let store = setup_store_with_group(archived_pending);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap();
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total, AccountUnreadTotal::default());
+    assert!(!total.has_unread());
+}
+
+#[test]
+fn account_unread_total_suppresses_left_removed_and_disbanded_attention() {
+    let mut pending = group();
+    pending.pending_confirmation = true;
+    let store = setup_store_with_group(pending);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    assert_eq!(
+        store
+            .account_unread_total()
+            .unwrap()
+            .attention_only_conversations,
+        1
+    );
+
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Left)
+        .unwrap();
+    assert_eq!(
+        store.account_unread_total().unwrap(),
+        AccountUnreadTotal::default()
+    );
+
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Member)
+        .unwrap();
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Removed)
+        .unwrap();
+    assert_eq!(
+        store.account_unread_total().unwrap(),
+        AccountUnreadTotal::default()
+    );
+
+    store
+        .set_group_self_membership(GROUP, SelfMembership::Member)
+        .unwrap();
+    put_disband_tombstone_for(&store, GROUP);
+    assert_eq!(
+        store.account_unread_total().unwrap(),
+        AccountUnreadTotal::default()
+    );
+}
+
+#[test]
+fn account_unread_total_sums_distinct_attention_only_rows() {
+    let pending = StoredAccountGroup {
+        group_id_hex: "22".to_owned(),
+        pending_confirmation: true,
+        ..group()
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), pending],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap();
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 0);
+    assert_eq!(total.unread_conversations, 2);
+    assert_eq!(total.attention_only_conversations, 2);
+    assert!(total.has_unread());
 }
 
 #[test]

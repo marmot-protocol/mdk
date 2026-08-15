@@ -53,13 +53,20 @@ pub type MentionClassifier<'a> = dyn Fn(&str, &[Vec<String>]) -> bool + 'a;
 pub struct AccountUnreadTotal {
     /// Sum of `unread_count` across all unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations with at least one unread message.
+    /// Number of unarchived conversations that require badge attention:
+    /// unread messages, a manual-unread reminder, or a pending invitation.
     pub unread_conversations: u64,
+    /// Unarchived conversations that contribute badge attention solely because
+    /// they are manually marked unread or pending confirmation. A row that
+    /// already has `unread_count > 0` is omitted so
+    /// `unread_count + attention_only_conversations` is the application badge.
+    pub attention_only_conversations: u64,
 }
 
 impl AccountUnreadTotal {
-    /// Whether the account has any unread conversation, including a
-    /// manual-only reminder with no unread incoming messages.
+    /// Whether the account has any badge-worthy conversation, including a
+    /// manual-only reminder or pending invitation with no unread incoming
+    /// messages.
     pub fn has_unread(&self) -> bool {
         self.unread_conversations > 0
     }
@@ -402,13 +409,23 @@ impl SqliteAccountStorage {
     /// longer in — `account_groups.self_membership` of `'left'` or `'removed'`
     /// — are also excluded; unknown membership (`'member'`, the default, or no
     /// matching `account_groups` row) preserves the unread count so uncertainty
-    /// never suppresses.
+    /// never suppresses. Pending invitations and manual-only unread rows count
+    /// as badge attention; a row with unread messages is not counted again in
+    /// `attention_only_conversations`.
     pub fn account_unread_total(&self) -> StorageResult<AccountUnreadTotal> {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT COALESCE(SUM(row.unread_count), 0),
                     COUNT(CASE
-                        WHEN row.unread_count > 0 OR row.manually_marked_unread = 1
+                        WHEN row.unread_count > 0
+                          OR row.manually_marked_unread = 1
+                          OR row.pending_confirmation = 1
+                        THEN 1
+                    END),
+                    COUNT(CASE
+                        WHEN row.unread_count = 0
+                         AND (row.manually_marked_unread = 1
+                           OR row.pending_confirmation = 1)
                         THEN 1
                     END)
              FROM chat_list_rows AS row
@@ -420,15 +437,24 @@ impl SqliteAccountStorage {
                    WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
                )",
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )
         .storage()
-        .and_then(|(unread_count, unread_conversations)| {
-            Ok(AccountUnreadTotal {
-                unread_count: i64_to_u64(unread_count)?,
-                unread_conversations: i64_to_u64(unread_conversations)?,
-            })
-        })
+        .and_then(
+            |(unread_count, unread_conversations, attention_only_conversations)| {
+                Ok(AccountUnreadTotal {
+                    unread_count: i64_to_u64(unread_count)?,
+                    unread_conversations: i64_to_u64(unread_conversations)?,
+                    attention_only_conversations: i64_to_u64(attention_only_conversations)?,
+                })
+            },
+        )
     }
 
     pub fn ensure_chat_list_rows(
