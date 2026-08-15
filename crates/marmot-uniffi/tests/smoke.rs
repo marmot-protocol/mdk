@@ -1058,6 +1058,16 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
         .expect_err("invalid group hex should fail before account lookup");
     assert!(format!("{invalid_mute_clear}").contains("invalid hex"));
 
+    let invalid_chat_list_row = kit
+        .chat_list_row("missing".into(), "not-hex".into())
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_chat_list_row}").contains("invalid hex"));
+
+    let missing_chat_list_row_account = kit
+        .chat_list_row("missing".into(), "00aa".into())
+        .expect_err("missing account should fail");
+    assert!(format!("{missing_chat_list_row_account}").contains("missing"));
+
     let subscribe_error = match kit.subscribe_chat_list("missing".into(), false).await {
         Ok(_) => panic!("missing account subscription should fail"),
         Err(err) => err,

@@ -230,6 +230,12 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failures: 0,
             duration_ms: hist(1),
         },
+        chat_list_row_read: AppPerformanceOperationSnapshot {
+            attempts: 3,
+            successes: 3,
+            failures: 0,
+            duration_ms: hist(1),
+        },
         group_roster_read: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
@@ -312,6 +318,10 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS
             && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_CHAT_LIST_ROW_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(3)
     }));
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_SQLCIPHER_MIGRATION_PROBE_RUNS

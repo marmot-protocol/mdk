@@ -1032,6 +1032,16 @@ impl MarmotAppRuntime {
         );
     }
 
+    /// Record the fixed app-performance sample for the UniFFI single chat-list
+    /// row read.
+    pub fn record_chat_list_row_read(&self, duration: Duration, success: bool) {
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::ChatListRowRead,
+            duration,
+            success,
+        );
+    }
+
     pub fn is_stopping(&self) -> bool {
         self.shared.lifecycle().is_stopping()
     }
