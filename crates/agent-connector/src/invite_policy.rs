@@ -199,7 +199,7 @@ impl AgentConnector {
                     };
                     let now = tokio::time::Instant::now();
                     if retry_state.is_due(&candidate.key, now) {
-                        self.apply_invite_policy_candidate(candidate, &mut retry_state, now, &schedule)
+                        self.apply_invite_policy_candidate(candidate, &mut retry_state, &schedule)
                             .await;
                     }
                     // A joined group means reconcile-relevant state changed:
@@ -265,10 +265,11 @@ impl AgentConnector {
             .map(|candidate| candidate.key.clone())
             .collect::<HashSet<_>>();
         retry_state.retain_pending(&pending);
-        let now = tokio::time::Instant::now();
         for candidate in candidates {
-            if retry_state.is_due(&candidate.key, now) {
-                self.apply_invite_policy_candidate(candidate, retry_state, now, schedule)
+            // Fresh due-check time per candidate: an earlier attempt in this
+            // loop may itself have waited out a long worker timeout.
+            if retry_state.is_due(&candidate.key, tokio::time::Instant::now()) {
+                self.apply_invite_policy_candidate(candidate, retry_state, schedule)
                     .await;
             }
         }
@@ -283,19 +284,7 @@ impl AgentConnector {
     fn pending_invite_policy_candidates(
         &self,
     ) -> Result<(Vec<PendingInvitePolicyCandidate>, usize), ConnectorError> {
-        if cfg!(test) {
-            let remaining = self
-                .invite_enumeration_successes_before_failure
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if remaining == 0 {
-                return Err(marmot_app::AppError::BlockingTask(
-                    "injected invite enumeration failure (test only)".to_owned(),
-                )
-                .into());
-            }
-            self.invite_enumeration_successes_before_failure
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.fail_next_enumeration_for_test()?;
         let mut candidates = Vec::new();
         let accounts = self
             .account_home
@@ -323,9 +312,9 @@ impl AgentConnector {
         &self,
         candidate: PendingInvitePolicyCandidate,
         retry_state: &mut InvitePolicyRetryState,
-        now: tokio::time::Instant,
         schedule: &InvitePolicySchedule,
     ) {
+        self.apply_test_delay().await;
         match self
             .apply_invite_policy(
                 &candidate.key.account_id_hex,
@@ -339,9 +328,16 @@ impl AgentConnector {
                 ReconcileTelemetry::bump(&self.reconcile_telemetry.invite_policy_applied);
             }
             Err(err) => {
+                // The retry delay starts when the failed attempt RETURNS:
+                // accept can wait ~10s and decline ~2min on worker timeouts
+                // while the initial retry delay is 5s, so anchoring the
+                // backoff at attempt start would leave next_retry_at in the
+                // past and defeat the bounded retry (mdk#1380 review). A
+                // worker-response timeout may also still be completing
+                // server-side, so the pause must be real.
                 let (attempts, retry_delay) = retry_state.record_failure_with(
                     candidate.key,
-                    now,
+                    tokio::time::Instant::now(),
                     schedule.retry_base,
                     schedule.retry_max,
                 );
@@ -398,6 +394,60 @@ impl AgentConnector {
         }
         Ok(())
     }
+
+    /// Test-only fault injection: fail enumerations once the configured
+    /// success budget is spent. Production always succeeds here.
+    #[cfg(test)]
+    fn fail_next_enumeration_for_test(&self) -> Result<(), ConnectorError> {
+        let remaining = self
+            .test_hooks
+            .invite_enumeration_successes_before_failure
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if remaining == 0 {
+            return Err(marmot_app::AppError::BlockingTask(
+                "injected invite enumeration failure (test only)".to_owned(),
+            )
+            .into());
+        }
+        self.test_hooks
+            .invite_enumeration_successes_before_failure
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn fail_next_enumeration_for_test(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    /// Test-only fault injection: stretch an apply attempt to simulate a slow
+    /// account-worker response. Production returns immediately.
+    #[cfg(test)]
+    async fn apply_test_delay(&self) {
+        use std::sync::atomic::Ordering;
+        let delay_ms = self
+            .test_hooks
+            .invite_apply_delay_ms
+            .load(Ordering::Relaxed);
+        if delay_ms == 0 {
+            return;
+        }
+        if self
+            .test_hooks
+            .invite_apply_delays_remaining
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            return;
+        }
+        self.test_hooks
+            .invite_apply_delays_remaining
+            .fetch_sub(1, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+
+    #[cfg(not(test))]
+    async fn apply_test_delay(&self) {}
 }
 
 pub(crate) fn invite_policy_allows(

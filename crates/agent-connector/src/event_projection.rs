@@ -1255,21 +1255,21 @@ enum CatchUpWake {
 
 /// Wait until `deadline`, returning early ([`CatchUpWake::Activity`]) when
 /// qualifying runtime activity arrives. Activity noticed less than the base
-/// interval after `last_pass_started` is deferred to that base boundary: a
+/// interval after `last_pass_completed` is deferred to that base boundary: a
 /// busy account stays at the base cadence (never one pass per event), while a
 /// backed-off (quiet) driver notices fresh work promptly (mdk#1380).
 async fn wait_for_catch_up_wake(
     deadline: tokio::time::Instant,
-    last_pass_started: tokio::time::Instant,
+    last_pass_completed: tokio::time::Instant,
     schedule: &InboundCatchUpSchedule,
     activity: &mut broadcast::Receiver<MarmotAppEvent>,
 ) -> CatchUpWake {
     let timer = tokio::time::sleep_until(deadline);
     tokio::pin!(timer);
     let base = schedule.base.max(Duration::from_millis(1));
-    // The cadence floor follows the previous pass start. The scheduled
+    // The cadence floor follows the previous pass completion. The scheduled
     // deadline never precedes it (interval >= base).
-    let cadence_floor = last_pass_started + base;
+    let cadence_floor = last_pass_completed + base;
     loop {
         tokio::select! {
             _ = &mut timer => return CatchUpWake::Timer,

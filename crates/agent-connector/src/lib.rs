@@ -232,10 +232,10 @@ pub struct AgentConnector {
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
     /// Aggregate counters for the background reconciliation loops (mdk#1380).
     pub(crate) reconcile_telemetry: std::sync::Arc<reconcile_telemetry::ReconcileTelemetry>,
-    /// Test-only enumeration-failure injection for the invite-policy worker:
-    /// remaining successful enumerations before every later one fails.
-    /// `u64::MAX` means never fail. Read only under `cfg!(test)`.
-    pub(crate) invite_enumeration_successes_before_failure: std::sync::Arc<AtomicU64>,
+    /// Test-only fault-injection hooks for the invite-policy worker (absent
+    /// from production builds). Shared across connector clones.
+    #[cfg(test)]
+    pub(crate) test_hooks: std::sync::Arc<test_support::ConnectorTestHooks>,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
     /// Connections closed at accept time because the concurrency cap was hit.
@@ -281,9 +281,8 @@ impl AgentConnector {
             runtime,
             inbound_catch_up,
             reconcile_telemetry,
-            invite_enumeration_successes_before_failure: std::sync::Arc::new(AtomicU64::new(
-                u64::MAX,
-            )),
+            #[cfg(test)]
+            test_hooks: std::sync::Arc::new(test_support::ConnectorTestHooks::default()),
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
             connections_refused: Arc::new(AtomicU64::new(0)),

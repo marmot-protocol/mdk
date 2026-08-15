@@ -767,6 +767,7 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
     // Exactly one enumeration may succeed, then every later one fails (a
     // locked/closed account database in production).
     connector
+        .test_hooks
         .invite_enumeration_successes_before_failure
         .store(1, Ordering::Relaxed);
     // Stop the runtime so the one successful enumeration's apply fails
@@ -801,6 +802,73 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
         snapshot.invite_enumerations_started <= 14,
         "a failing enumeration with a matured retry must back off, not spin: {} attempts",
         snapshot.invite_enumerations_started
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn invite_policy_retry_delay_starts_after_the_failed_attempt_returns() {
+    let setup = setup_existing_pending_invite("retry delay after completion").await;
+    let connector = AgentConnector::open(test_config(
+        setup.dir.path(),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
+        vec![setup.relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Apply fails deterministically (stopped runtime), but only AFTER an
+    // 800ms attempt — far longer than the 200ms initial retry delay. Only the
+    // first attempt is stretched so the retry itself returns quickly.
+    connector
+        .test_hooks
+        .invite_apply_delay_ms
+        .store(800, Ordering::Relaxed);
+    connector
+        .test_hooks
+        .invite_apply_delays_remaining
+        .store(1, Ordering::Relaxed);
+    connector.runtime.shutdown().await;
+    let worker = connector.clone();
+    let handle = tokio::spawn(async move {
+        worker
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: TEST_INVITE_BASE,
+                max: TEST_INVITE_MAX,
+                retry_base: Duration::from_millis(200),
+                retry_max: TEST_INVITE_MAX,
+            })
+            .await;
+    });
+
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_policy_apply_failures
+        },
+        1,
+        Duration::from_secs(4),
+    )
+    .await;
+    let first_failure_at = std::time::Instant::now();
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_policy_apply_failures
+        },
+        2,
+        Duration::from_secs(4),
+    )
+    .await;
+    let gap = first_failure_at.elapsed();
+    assert!(
+        gap >= Duration::from_millis(150),
+        "the retry must wait the full delay after the attempt returns, gap was {gap:?} \
+         (an attempt-start-anchored backoff would already have been in the past)"
     );
     handle.abort();
 }
