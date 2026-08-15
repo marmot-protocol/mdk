@@ -94,6 +94,8 @@ mod migration_0046_message_group_state_epoch_index;
 mod migration_0047_normalized_message_records;
 #[path = "migrations/0048_deferred_peel_generations.rs"]
 mod migration_0048_deferred_peel_generations;
+#[path = "migrations/0049_pending_invite_index.rs"]
+mod migration_0049_pending_invite_index;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -348,6 +350,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 48,
         name: "0048_deferred_peel_generations",
         apply: migration_0048_deferred_peel_generations::apply,
+    },
+    Migration {
+        version: 49,
+        name: "0049_pending_invite_index",
+        apply: migration_0049_pending_invite_index::apply,
     },
 ];
 
@@ -876,7 +883,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 48,
+                found: 49,
                 latest_supported: 46,
             }
         ));
@@ -932,7 +939,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 48,
+                found: 49,
                 latest_supported: 46,
             }
         ));
@@ -1236,7 +1243,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 48,
+                found: 49,
                 latest_supported: 46,
             }
         ));

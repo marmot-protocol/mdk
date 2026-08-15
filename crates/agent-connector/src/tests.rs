@@ -656,6 +656,8 @@ async fn invite_policy_worker_backs_off_with_zero_candidates() {
             .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
                 base: TEST_INVITE_BASE,
                 max: TEST_INVITE_MAX,
+                retry_base: TEST_INVITE_BASE,
+                retry_max: TEST_INVITE_MAX,
             })
             .await;
     });
@@ -703,6 +705,104 @@ async fn invite_policy_worker_backs_off_with_zero_candidates() {
         "each enumeration accounted the single local account"
     );
     connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_preserves_delayed_cadence_after_a_slow_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.start().await.unwrap();
+    let (telemetry, driver, _activity) = adaptive_test_driver(runtime.clone());
+
+    // Hold the serialization lock well past the first scheduled pass's
+    // deadline — long enough that even the doubled follow-up interval would
+    // already be in the past if the deadline anchored at pass START. An
+    // explicit subscription request queues the same way in production.
+    let guard = driver.lock.lock().await;
+    let (_events, _subscription) = driver.subscribe();
+    sleep(4 * TEST_CATCH_UP_BASE).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        0,
+        "the queued pass must wait for the lock"
+    );
+    drop(guard);
+
+    // The queued pass runs. With delayed cadence the next deadline is one
+    // interval AFTER completion — not already-past — so there is no
+    // back-to-back rerun of a full catch-up (mdk#1380 review).
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        1,
+        Duration::from_millis(500),
+    )
+    .await;
+    sleep(TEST_CATCH_UP_BASE / 2).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        1,
+        "a slow/queued pass must not trigger an immediate rerun"
+    );
+    // And the cadence resumes normally afterwards.
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        2,
+        2 * TEST_CATCH_UP_BASE,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_retry() {
+    let setup = setup_existing_pending_invite("retry enumeration failure").await;
+    let connector = AgentConnector::open(test_config(
+        setup.dir.path(),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
+        vec![setup.relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Exactly one enumeration may succeed, then every later one fails (a
+    // locked/closed account database in production).
+    connector
+        .invite_enumeration_successes_before_failure
+        .store(1, Ordering::Relaxed);
+    // Stop the runtime so the one successful enumeration's apply fails
+    // deterministically and arms a retry that matures quickly.
+    connector.runtime.shutdown().await;
+    let worker = connector.clone();
+    let handle = tokio::spawn(async move {
+        worker
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: TEST_INVITE_BASE,
+                max: TEST_INVITE_MAX,
+                retry_base: TEST_INVITE_BASE,
+                retry_max: TEST_INVITE_MAX,
+            })
+            .await;
+    });
+
+    // Wait for the retry to mature several times over. Without the
+    // enumeration-failure floor, the matured retry deadline stays in the past
+    // and the worker would spin thousands of failing enumerations here.
+    sleep(Duration::from_millis(1_600)).await;
+    let snapshot = connector.reconcile_telemetry.snapshot();
+    assert!(
+        snapshot.invite_policy_apply_failures >= 1,
+        "the single successful enumeration must have armed a retry"
+    );
+    assert!(
+        snapshot.invite_enumerations_failed >= 1,
+        "later enumerations must be failing"
+    );
+    assert!(
+        snapshot.invite_enumerations_started <= 14,
+        "a failing enumeration with a matured retry must back off, not spin: {} attempts",
+        snapshot.invite_enumerations_started
+    );
+    handle.abort();
 }
 
 #[tokio::test]
@@ -5807,6 +5907,8 @@ async fn bench_idle_reconciliation_scaling() {
             .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
                 base: BENCH_BASE,
                 max: BENCH_MAX,
+                retry_base: BENCH_BASE,
+                retry_max: BENCH_MAX,
             })
             .await;
     });

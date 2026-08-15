@@ -8450,3 +8450,62 @@ fn idle_sync_skips_the_checkpoint_route_recomputation() {
         );
     });
 }
+
+#[test]
+fn pending_group_invites_skips_malformed_rows() {
+    // mdk#1380 review: one undecodable row must not disable policy
+    // reconciliation for the account's valid invites.
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    let pending_group =
+        |group_id_hex: &str, welcomer: Option<&str>| storage_sqlite::StoredAccountGroup {
+            group_id_hex: group_id_hex.to_owned(),
+            endpoint: "wss://relay.example".to_owned(),
+            profile_name: "pending".to_owned(),
+            profile_description: String::new(),
+            image_hash_hex: String::new(),
+            image_key_hex: String::new(),
+            image_nonce_hex: String::new(),
+            image_upload_key_hex: String::new(),
+            image_media_type: None,
+            admin_keys_hex: String::new(),
+            archived: false,
+            pending_confirmation: true,
+            member_count: None,
+            welcomer_account_id_hex: welcomer.map(str::to_owned),
+            via_welcome_message_id_hex: None,
+            nostr_routing_last_epoch: 0,
+            prior_nostr_routes: Vec::new(),
+            self_membership: storage_sqlite::SelfMembership::Member,
+            components: Vec::new(),
+        };
+    let state = storage_sqlite::StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![
+            pending_group("zz-not-hex", None),
+            pending_group(&"aa".repeat(32), Some("not-hex-either")),
+            pending_group(&"bb".repeat(32), Some(&"cc".repeat(32))),
+        ],
+    };
+    app.account_storage("alice")
+        .unwrap()
+        .save_account_projection_state(&state, 16, 300)
+        .unwrap();
+
+    let invites = app.pending_group_invites("alice").unwrap();
+    assert_eq!(invites.len(), 1);
+    assert_eq!(hex::encode(invites[0].group_id.as_slice()), "bb".repeat(32));
+    assert_eq!(
+        invites[0]
+            .welcomer
+            .as_ref()
+            .map(|welcomer| hex::encode(welcomer.as_slice())),
+        Some("cc".repeat(32))
+    );
+}

@@ -39,7 +39,8 @@ several files in the same crate); methods shared across those files are `pub(cra
   immediately, per-candidate retries wake on their own backoff, and full enumeration is an adaptive safety net
   (base `INVITE_POLICY_RECONCILE_INTERVAL`, doubling to `INVITE_POLICY_RECONCILE_MAX_INTERVAL` while passes find
   nothing) over the targeted `MarmotApp::pending_group_invites` read — never a full `app.groups()` projection
-  load (mdk#1380).
+  load (mdk#1380). Enumeration failures back off on a separate failure floor so a failing store cannot spin the
+  worker even with a matured retry pending.
 - `src/reconcile_telemetry.rs` — privacy-safe aggregate counters for the background reconciliation loops
   (`ReconcileTelemetry` on the connector: passes, outcomes, accounts/candidate rows considered) plus the
   `ReconcileSource` label used on per-pass tracing events (mdk#1380).

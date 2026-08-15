@@ -3065,23 +3065,52 @@ impl MarmotApp {
     /// decision needs — never the seen-event window, component blobs, or
     /// disband tables — so a periodic enumeration over an idle session reads
     /// O(pending invites) rows instead of the full account projection.
+    ///
+    /// A row whose stored ids cannot be decoded is skipped with a privacy-safe
+    /// warning (the same policy `routing_for` applies to malformed persisted
+    /// group routes): one corrupt row must not disable policy reconciliation
+    /// for every valid invite in the account.
     pub fn pending_group_invites(&self, label: &str) -> Result<Vec<PendingGroupInvite>, AppError> {
         self.ensure_account_state(label)?;
-        self.account_storage(label)?
+        let mut invites = Vec::new();
+        for invite in self
+            .account_storage(label)?
             .pending_confirmation_group_invites()?
-            .into_iter()
-            .map(|invite| {
-                let group_id_hex = invite.group_id_hex.trim().to_ascii_lowercase();
-                let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-                let welcomer = invite
-                    .welcomer_account_id_hex
-                    .as_deref()
-                    .map(|welcomer| welcomer.trim().to_ascii_lowercase())
-                    .map(|welcomer| hex::decode(welcomer).map(MemberId::new))
-                    .transpose()?;
-                Ok(PendingGroupInvite { group_id, welcomer })
-            })
-            .collect()
+        {
+            let group_id_hex = invite.group_id_hex.trim().to_ascii_lowercase();
+            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "pending_group_invites",
+                    error_kind = "invalid_persisted_group_record",
+                    "skipping malformed persisted pending invite",
+                );
+                continue;
+            };
+            let welcomer = match invite.welcomer_account_id_hex.as_deref() {
+                Some(welcomer) => {
+                    let welcomer = welcomer.trim().to_ascii_lowercase();
+                    match hex::decode(&welcomer) {
+                        Ok(welcomer) => Some(MemberId::new(welcomer)),
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app",
+                                method = "pending_group_invites",
+                                error_kind = "invalid_persisted_welcomer_record",
+                                "skipping malformed persisted pending invite",
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+            invites.push(PendingGroupInvite {
+                group_id: GroupId::new(group_id_bytes),
+                welcomer,
+            });
+        }
+        Ok(invites)
     }
 
     pub fn visible_groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {

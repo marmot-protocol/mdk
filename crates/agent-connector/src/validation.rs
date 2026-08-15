@@ -8,9 +8,10 @@ use cgka_traits::{GroupId, MemberId};
 
 use crate::error::ConnectorError;
 use crate::{
-    AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE, AgentConnectorConfig, INVITE_POLICY_RETRY_BASE,
-    INVITE_POLICY_RETRY_MAX, MAX_PROFILE_NAME_CHARS,
+    AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE, AgentConnectorConfig, MAX_PROFILE_NAME_CHARS,
 };
+#[cfg(test)]
+use crate::{INVITE_POLICY_RETRY_BASE, INVITE_POLICY_RETRY_MAX};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct InvitePolicyKey {
@@ -76,17 +77,35 @@ impl InvitePolicyRetryState {
             .min()
     }
 
+    /// Record a failure on the production backoff constants. The worker uses
+    /// [`Self::record_failure_with`] (its schedule is injectable for tests);
+    /// this convenience remains for tests that pin the production constants.
+    #[cfg(test)]
     pub(crate) fn record_failure(
         &mut self,
         key: InvitePolicyKey,
         now: tokio::time::Instant,
+    ) -> (u32, Duration) {
+        self.record_failure_with(key, now, INVITE_POLICY_RETRY_BASE, INVITE_POLICY_RETRY_MAX)
+    }
+
+    /// Record a failure with an explicit backoff schedule. Production callers
+    /// use [`Self::record_failure`] (the crate constants); the worker passes
+    /// its [`crate::invite_policy::InvitePolicySchedule`] through so tests can
+    /// compress the schedule.
+    pub(crate) fn record_failure_with(
+        &mut self,
+        key: InvitePolicyKey,
+        now: tokio::time::Instant,
+        retry_base: Duration,
+        retry_max: Duration,
     ) -> (u32, Duration) {
         let attempts = self
             .failures
             .get(&key)
             .map(|retry| retry.attempts.saturating_add(1))
             .unwrap_or(1);
-        let delay = invite_policy_retry_delay(attempts);
+        let delay = invite_policy_retry_delay_with(attempts, retry_base, retry_max);
         self.failures.insert(
             key,
             InvitePolicyRetry {
@@ -98,13 +117,15 @@ impl InvitePolicyRetryState {
     }
 }
 
-pub(crate) fn invite_policy_retry_delay(attempts: u32) -> Duration {
+pub(crate) fn invite_policy_retry_delay_with(
+    attempts: u32,
+    retry_base: Duration,
+    retry_max: Duration,
+) -> Duration {
     let exponent = attempts.saturating_sub(1).min(10);
     let factor = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
-    let delay = INVITE_POLICY_RETRY_BASE
-        .checked_mul(factor)
-        .unwrap_or(INVITE_POLICY_RETRY_MAX);
-    std::cmp::min(delay, INVITE_POLICY_RETRY_MAX)
+    let delay = retry_base.checked_mul(factor).unwrap_or(retry_max);
+    std::cmp::min(delay, retry_max)
 }
 
 pub(crate) fn unsupported_request_message(request: &AgentControlRequest) -> &'static str {

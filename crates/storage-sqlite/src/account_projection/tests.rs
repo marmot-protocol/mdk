@@ -478,6 +478,46 @@ fn pending_confirmation_group_invites_reads_only_pending_outlines() {
 }
 
 #[test]
+fn pending_confirmation_group_invites_uses_the_partial_covering_index() {
+    // mdk#1380 review: the invite-policy predicate must not scan retained
+    // group state. The partial covering index keeps examined rows at
+    // O(pending invites); pin the query plan so a regression that drops the
+    // index (or rewrites the query out of it) fails deterministically.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let conn = store.lock().unwrap();
+    let mut statement = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT group_id_hex, welcomer_account_id_hex
+             FROM account_groups
+             WHERE pending_confirmation = 1 AND archived = 0
+             ORDER BY group_id_hex",
+        )
+        .unwrap();
+    let plan = statement
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    assert!(
+        plan.contains("idx_account_groups_pending_invites"),
+        "the pending-invite predicate must use its partial covering index, got:\n{plan}"
+    );
+    // A scan of the PARTIAL index only visits rows matching the predicate
+    // (O(pending invites)); the regression to catch is a scan of the full
+    // table or of the whole primary-key index (O(retained groups)).
+    for line in plan.lines() {
+        if line.contains("SCAN account_groups") {
+            assert!(
+                line.contains("idx_account_groups_pending_invites"),
+                "the pending-invite query must not scan the full group table or its primary-key index, got:\n{plan}"
+            );
+        }
+    }
+}
+
+#[test]
 fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     {

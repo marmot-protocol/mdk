@@ -1033,7 +1033,10 @@ pub(crate) struct InboundCatchUpSchedule {
 #[derive(Clone)]
 pub(crate) struct InboundCatchUpDriver {
     runtime: MarmotAppRuntime,
-    lock: Arc<AsyncMutex<()>>,
+    /// Serializes scheduled and explicit catch-up passes. `pub(crate)` so the
+    /// regression harness can hold a pass queued behind the lock and prove the
+    /// schedule preserves delayed cadence afterwards (mdk#1380 review).
+    pub(crate) lock: Arc<AsyncMutex<()>>,
     events: broadcast::Sender<InboundCatchUpEvent>,
     pub(crate) started: Arc<AtomicBool>,
     pub(crate) active: Arc<AtomicU64>,
@@ -1111,7 +1114,12 @@ impl InboundCatchUpDriver {
             .base
             .max(Duration::from_millis(1))
             .min(self.schedule.max);
-        let mut last_pass_started = tokio::time::Instant::now();
+        // Deadlines anchor at pass COMPLETION, preserving the old
+        // `MissedTickBehavior::Delay` semantics: a pass that runs long (or
+        // queues behind an explicit request on the serialization lock) inserts
+        // the full interval before the next pass instead of firing
+        // back-to-back (mdk#1380 review).
+        let mut last_pass_completed = tokio::time::Instant::now();
         loop {
             if self.active.load(Ordering::Acquire) == 0 {
                 self.started.store(false, Ordering::Release);
@@ -1126,17 +1134,22 @@ impl InboundCatchUpDriver {
                     break;
                 }
             }
-            let deadline = last_pass_started + interval;
-            let wake =
-                wait_for_catch_up_wake(deadline, last_pass_started, &self.schedule, &mut activity)
-                    .await;
-            last_pass_started = tokio::time::Instant::now();
+            let deadline = last_pass_completed + interval;
+            let wake = wait_for_catch_up_wake(
+                deadline,
+                last_pass_completed,
+                &self.schedule,
+                &mut activity,
+            )
+            .await;
             // A pass that observed activity since the previous pass began —
             // the wake reason itself, plus anything buffered while the pass
             // ran — keeps the next pass at the base interval.
             let observed_activity =
                 matches!(wake, CatchUpWake::Activity) || drain_pending_activity(&mut activity);
-            match self.scheduled_pass(observed_activity).await {
+            let result = self.scheduled_pass(observed_activity).await;
+            last_pass_completed = tokio::time::Instant::now();
+            match result {
                 Ok(()) if observed_activity => {
                     interval = self
                         .schedule
@@ -1154,8 +1167,8 @@ impl InboundCatchUpDriver {
     /// per-pass tracing event (source/duration/result/accounts considered).
     async fn scheduled_pass(&self, observed_activity: bool) -> Result<(), ()> {
         let started = tokio::time::Instant::now();
-        ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_started);
         let _guard = self.lock.lock().await;
+        ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_started);
         let result = self.runtime.catch_up_accounts_reporting().await;
         match &result {
             Ok(summary) => {

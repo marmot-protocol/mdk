@@ -19,16 +19,57 @@ use crate::reconcile_telemetry::{ReconcileSource, ReconcileTelemetry};
 use crate::validation::{InvitePolicyKey, InvitePolicyRetryState, PendingInvitePolicyCandidate};
 use crate::{
     AgentConnector, INVITE_POLICY_RECONCILE_INTERVAL, INVITE_POLICY_RECONCILE_MAX_INTERVAL,
+    INVITE_POLICY_RETRY_BASE, INVITE_POLICY_RETRY_MAX,
 };
 
-/// Cadence for the invite-policy safety-net enumeration. Production builds use
-/// [`crate::INVITE_POLICY_RECONCILE_INTERVAL`] /
-/// [`crate::INVITE_POLICY_RECONCILE_MAX_INTERVAL`]; tests may inject shorter
-/// intervals to exercise the adaptive schedule.
+/// Cadence for the invite-policy safety-net enumeration and the per-candidate
+/// retry backoff. Production builds use [`crate::INVITE_POLICY_RECONCILE_INTERVAL`] /
+/// [`crate::INVITE_POLICY_RECONCILE_MAX_INTERVAL`] and
+/// [`crate::INVITE_POLICY_RETRY_BASE`] / [`crate::INVITE_POLICY_RETRY_MAX`];
+/// tests may inject shorter intervals to exercise the adaptive schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InvitePolicySchedule {
     pub(crate) base: std::time::Duration,
     pub(crate) max: std::time::Duration,
+    pub(crate) retry_base: std::time::Duration,
+    pub(crate) retry_max: std::time::Duration,
+}
+
+impl Default for InvitePolicySchedule {
+    fn default() -> Self {
+        Self {
+            base: INVITE_POLICY_RECONCILE_INTERVAL,
+            max: INVITE_POLICY_RECONCILE_MAX_INTERVAL,
+            retry_base: INVITE_POLICY_RETRY_BASE,
+            retry_max: INVITE_POLICY_RETRY_MAX,
+        }
+    }
+}
+
+/// Track one enumeration outcome for the failure floor. Consecutive
+/// enumeration failures (e.g. a locked account database) double the floor up
+/// to `max`; any success clears it. The floor pushes the retry-driven wake
+/// into the future so a matured retry deadline plus a failing enumeration
+/// cannot spin the worker at full CPU (mdk#1380 review): the worker never
+/// parks — event-driven `GroupJoined` applies stay live — only the failing
+/// enumeration's re-attempts are rate-limited.
+fn note_enumeration_result(
+    failed_until: &mut Option<tokio::time::Instant>,
+    failure_delay: &mut std::time::Duration,
+    result: Option<usize>,
+    base: std::time::Duration,
+    max: std::time::Duration,
+) {
+    match result {
+        Some(_) => {
+            *failed_until = None;
+            *failure_delay = base;
+        }
+        None => {
+            *failed_until = Some(tokio::time::Instant::now() + *failure_delay);
+            *failure_delay = (*failure_delay * 2).min(max);
+        }
+    }
 }
 
 impl AgentConnector {
@@ -36,10 +77,7 @@ impl AgentConnector {
         let connector = self.clone();
         tokio::spawn(async move {
             connector
-                .run_invite_policy_worker(InvitePolicySchedule {
-                    base: INVITE_POLICY_RECONCILE_INTERVAL,
-                    max: INVITE_POLICY_RECONCILE_MAX_INTERVAL,
-                })
+                .run_invite_policy_worker(InvitePolicySchedule::default())
                 .await;
         });
     }
@@ -49,15 +87,29 @@ impl AgentConnector {
         let mut retry_state = InvitePolicyRetryState::default();
         let base = schedule.base.max(std::time::Duration::from_millis(1));
         let mut safety_interval = base.min(schedule.max);
+        let mut enumeration_failure_delay = base;
+        let mut enumeration_failed_until: Option<tokio::time::Instant> = None;
         // A pending invite can survive a process restart without any live
         // event ever reaching this worker: the startup enumeration is the
         // one pass that must always run.
-        let _ = self
-            .reconcile_pending_invite_policies(&mut retry_state)
+        let startup_result = self
+            .reconcile_pending_invite_policies(&mut retry_state, &schedule)
             .await;
+        note_enumeration_result(
+            &mut enumeration_failed_until,
+            &mut enumeration_failure_delay,
+            startup_result,
+            base,
+            schedule.max,
+        );
         let mut safety_deadline = tokio::time::Instant::now() + safety_interval;
         loop {
-            let retry_due = retry_state.next_due();
+            // The retry wake honors the enumeration-failure floor: when the
+            // last enumeration failed, a matured retry deadline is pushed out
+            // to the floor instead of completing immediately forever.
+            let retry_due = retry_state
+                .next_due()
+                .map(|due| enumeration_failed_until.map_or(due, |floor| due.max(floor)));
             let retry_sleep = async move {
                 match retry_due {
                     Some(due) => tokio::time::sleep_until(due).await,
@@ -66,24 +118,43 @@ impl AgentConnector {
             };
             tokio::select! {
                 _ = tokio::time::sleep_until(safety_deadline) => {
-                    let found_work = self
-                        .reconcile_pending_invite_policies(&mut retry_state)
-                        .await
-                        .is_some_and(|candidates| candidates > 0)
-                        || retry_state.has_pending();
-                    safety_interval = if found_work {
-                        base
-                    } else {
-                        (safety_interval * 2).min(schedule.max)
+                    let result = self
+                        .reconcile_pending_invite_policies(&mut retry_state, &schedule)
+                        .await;
+                    note_enumeration_result(
+                        &mut enumeration_failed_until,
+                        &mut enumeration_failure_delay,
+                        result,
+                        base,
+                        schedule.max,
+                    );
+                    safety_interval = match result {
+                        // A failing enumeration backs off on the failure floor
+                        // even while retries are pending: the per-candidate
+                        // retry wake is what keeps re-attempting due work.
+                        None => enumeration_failure_delay.min(schedule.max),
+                        Some(candidates)
+                            if candidates > 0 || retry_state.has_pending() =>
+                        {
+                            base
+                        }
+                        Some(_) => (safety_interval * 2).min(schedule.max),
                     };
                     safety_deadline = tokio::time::Instant::now() + safety_interval;
                 }
                 _ = retry_sleep, if retry_due.is_some() => {
                     // A matured retry is just an enumeration whose due gate now
                     // passes; it does not perturb the safety net's cadence.
-                    let _ = self
-                        .reconcile_pending_invite_policies(&mut retry_state)
+                    let result = self
+                        .reconcile_pending_invite_policies(&mut retry_state, &schedule)
                         .await;
+                    note_enumeration_result(
+                        &mut enumeration_failed_until,
+                        &mut enumeration_failure_delay,
+                        result,
+                        base,
+                        schedule.max,
+                    );
                 }
                 event = events.recv() => {
                     let event = match event {
@@ -95,9 +166,16 @@ impl AgentConnector {
                                 lagged,
                                 "invite policy event stream lagged; reconciling pending invites"
                             );
-                            let _ = self
-                                .reconcile_pending_invite_policies(&mut retry_state)
+                            let result = self
+                                .reconcile_pending_invite_policies(&mut retry_state, &schedule)
                                 .await;
+                            note_enumeration_result(
+                                &mut enumeration_failed_until,
+                                &mut enumeration_failure_delay,
+                                result,
+                                base,
+                                schedule.max,
+                            );
                             safety_interval = base;
                             safety_deadline = tokio::time::Instant::now() + safety_interval;
                             continue;
@@ -121,7 +199,7 @@ impl AgentConnector {
                     };
                     let now = tokio::time::Instant::now();
                     if retry_state.is_due(&candidate.key, now) {
-                        self.apply_invite_policy_candidate(candidate, &mut retry_state, now)
+                        self.apply_invite_policy_candidate(candidate, &mut retry_state, now, &schedule)
                             .await;
                     }
                     // A joined group means reconcile-relevant state changed:
@@ -141,6 +219,7 @@ impl AgentConnector {
     async fn reconcile_pending_invite_policies(
         &self,
         retry_state: &mut InvitePolicyRetryState,
+        schedule: &InvitePolicySchedule,
     ) -> Option<usize> {
         let started = tokio::time::Instant::now();
         ReconcileTelemetry::bump(&self.reconcile_telemetry.invite_enumerations_started);
@@ -189,7 +268,7 @@ impl AgentConnector {
         let now = tokio::time::Instant::now();
         for candidate in candidates {
             if retry_state.is_due(&candidate.key, now) {
-                self.apply_invite_policy_candidate(candidate, retry_state, now)
+                self.apply_invite_policy_candidate(candidate, retry_state, now, schedule)
                     .await;
             }
         }
@@ -204,6 +283,19 @@ impl AgentConnector {
     fn pending_invite_policy_candidates(
         &self,
     ) -> Result<(Vec<PendingInvitePolicyCandidate>, usize), ConnectorError> {
+        if cfg!(test) {
+            let remaining = self
+                .invite_enumeration_successes_before_failure
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if remaining == 0 {
+                return Err(marmot_app::AppError::BlockingTask(
+                    "injected invite enumeration failure (test only)".to_owned(),
+                )
+                .into());
+            }
+            self.invite_enumeration_successes_before_failure
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut candidates = Vec::new();
         let accounts = self
             .account_home
@@ -232,6 +324,7 @@ impl AgentConnector {
         candidate: PendingInvitePolicyCandidate,
         retry_state: &mut InvitePolicyRetryState,
         now: tokio::time::Instant,
+        schedule: &InvitePolicySchedule,
     ) {
         match self
             .apply_invite_policy(
@@ -246,7 +339,12 @@ impl AgentConnector {
                 ReconcileTelemetry::bump(&self.reconcile_telemetry.invite_policy_applied);
             }
             Err(err) => {
-                let (attempts, retry_delay) = retry_state.record_failure(candidate.key, now);
+                let (attempts, retry_delay) = retry_state.record_failure_with(
+                    candidate.key,
+                    now,
+                    schedule.retry_base,
+                    schedule.retry_max,
+                );
                 ReconcileTelemetry::bump(&self.reconcile_telemetry.invite_policy_apply_failures);
                 tracing::warn!(
                     target: "agent_connector",
