@@ -20,7 +20,10 @@ cat >"$auth_fake_bin/git" <<'SCRIPT'
 set -euo pipefail
 
 capture_auth() {
-    printf '%s\n%s\n' "${GIT_CONFIG_KEY_0:-}" "${GIT_CONFIG_VALUE_0:-}" >>"$AUTH_CAPTURE"
+    printf 'count=%s\nkey=%s\nvalue=%s\n' \
+        "${GIT_CONFIG_COUNT:-}" \
+        "${GIT_CONFIG_KEY_0:-}" \
+        "${GIT_CONFIG_VALUE_0:-}" >>"$AUTH_CAPTURE"
 }
 
 case " $* " in
@@ -50,8 +53,9 @@ env \
         --hermes-ref "test-ref" \
         --no-enable-plugin
 expected_basic="$(printf 'x-access-token:%s' 'test-actions-token' | base64 | tr -d '\r\n')"
-[ "$(grep -Fxc 'http.https://github.com/.extraheader' "$auth_capture")" -eq 2 ]
-[ "$(grep -Fxc "AUTHORIZATION: basic $expected_basic" "$auth_capture")" -eq 2 ]
+[ "$(grep -Fxc 'count=1' "$auth_capture")" -eq 2 ]
+[ "$(grep -Fxc 'key=http.https://github.com/.extraheader' "$auth_capture")" -eq 2 ]
+[ "$(grep -Fxc "value=AUTHORIZATION: basic $expected_basic" "$auth_capture")" -eq 2 ]
 if grep -F 'test-actions-token' "$auth_capture" >/dev/null; then
     echo "raw GitHub token leaked into git configuration" >&2
     exit 1

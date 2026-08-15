@@ -1964,7 +1964,7 @@ fn reserve_media_http(media_http: &MediaHttpContext) -> Result<OwnedSemaphorePer
         .permits
         .clone()
         .try_acquire_owned()
-        .map_err(|_| AppError::BlockingTask("media HTTP capacity exhausted".to_owned()))
+        .map_err(|_| AppError::AccountWorkerBusy)
 }
 
 async fn complete_media_http(
@@ -3907,9 +3907,9 @@ mod tests {
         assert!(
             matches!(
                 reserve_media_http(&media_http),
-                Err(AppError::BlockingTask(_))
+                Err(AppError::AccountWorkerBusy)
             ),
-            "a queued whole-blob result must continue to consume capacity"
+            "a queued whole-blob result must continue to consume capacity and report retryable backpressure"
         );
 
         drop(completion);
