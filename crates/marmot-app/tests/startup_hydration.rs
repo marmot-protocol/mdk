@@ -164,6 +164,7 @@ async fn held_hydration_body() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account(BENCH_ACCOUNT).unwrap();
+    let creator_id = home.account(BENCH_ACCOUNT).unwrap().account_id_hex;
     let mut group_ids = Vec::new();
     {
         let app_fixture = open_store(&dir, &url, None);
@@ -216,9 +217,16 @@ async fn held_hydration_body() {
     );
 
     // The identifier-only roster page is the bounded companion read for that
-    // chat projection (mdk#1314). One worker command promotes only the named
-    // groups from durable state and returns every roster without waiting for
-    // the held background pipeline or doing profile enrichment.
+    // chat projection (mdk#1314 / mdk#1461). One worker command promotes only
+    // the named groups from durable state and returns every member and admin
+    // identifier without waiting for the held background pipeline or doing
+    // profile enrichment.
+    let roster_reads_before = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot()
+        .group_roster_read
+        .attempts;
     let page_started = Instant::now();
     let member_ids_page = tokio::time::timeout(
         Duration::from_millis(BATCH_HOLD_MS / 2),
@@ -232,7 +240,25 @@ async fn held_hydration_body() {
         assert_eq!(row.group_id_hex, hex::encode(group_id.as_slice()));
         assert_eq!(row.member_ids_hex.len(), 2);
         assert!(row.member_ids_hex.contains(&donor_id));
+        assert!(
+            row.admin_ids_hex.contains(&creator_id),
+            "admin identifiers must be available before deferred hydration completes"
+        );
+        assert!(
+            !row.admin_ids_hex.contains(&donor_id),
+            "invited members must not be reported as admins"
+        );
     }
+    assert_eq!(
+        runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .group_roster_read
+            .attempts,
+        roster_reads_before,
+        "admin metadata for a page of groups must not fan out to group_roster"
+    );
     assert!(
         page_started.elapsed() < Duration::from_millis(BATCH_HOLD_MS / 2),
         "bounded membership read must not wait out the pipeline hold"

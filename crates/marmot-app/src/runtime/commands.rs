@@ -240,8 +240,8 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
-    /// Read identifier-only rosters for a bounded page of groups in one
-    /// account-worker round trip.
+    /// Read identifier-only member and admin rosters for a bounded page of
+    /// groups in one account-worker round trip.
     ///
     /// The response preserves input order and fails as a whole if any group is
     /// unknown or hydration-quarantined; it never returns a partial page.

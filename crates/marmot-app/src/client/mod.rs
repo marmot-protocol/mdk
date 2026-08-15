@@ -352,12 +352,20 @@ impl GroupReadSnapshot {
             .iter()
             .map(|group_id| {
                 let members = self.members(group_id)?;
+                let admin_ids_hex = self
+                    .groups
+                    .get(group_id)
+                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?
+                    .admin_policy
+                    .admins
+                    .clone();
                 Ok(crate::AppGroupMemberIds {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     member_ids_hex: members
                         .into_iter()
                         .map(|member| member.member_id_hex)
                         .collect(),
+                    admin_ids_hex,
                 })
             })
             .collect()
@@ -1034,6 +1042,7 @@ impl AppClient {
                 Ok(crate::AppGroupMemberIds {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     member_ids_hex,
+                    admin_ids_hex: self.admin_policy_for_group(group_id).admins,
                 })
             })
             .collect()

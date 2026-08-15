@@ -2724,6 +2724,14 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     assert_eq!(member_ids_page.len(), 1);
     assert!(member_ids_page[0].member_ids_hex.contains(&alice_id));
     assert!(member_ids_page[0].member_ids_hex.contains(&bob_id));
+    assert!(
+        member_ids_page[0].admin_ids_hex.contains(&alice_id),
+        "creator admin identifier must be present on the bounded page"
+    );
+    assert!(
+        !member_ids_page[0].admin_ids_hex.contains(&bob_id),
+        "invited member must not be reported as an admin"
+    );
     assert_eq!(
         account_sync_attempts(),
         before_restart,
