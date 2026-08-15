@@ -14,9 +14,12 @@ mod media_roots;
 mod media_temp;
 mod messaging;
 mod quic;
+mod reconcile_telemetry;
 mod socket;
 mod stream;
 mod stream_session;
+#[cfg(test)]
+mod test_support;
 mod timeline;
 mod validation;
 
@@ -77,8 +80,19 @@ pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 /// resolution. A peer cannot reset it by trickling bytes or partial progress.
 pub(crate) const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const CONTROL_BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
-pub(crate) const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const INBOUND_CATCH_UP_BASE_INTERVAL: Duration = Duration::from_secs(5);
+/// Upper bound for the inbound catch-up safety net's adaptive backoff
+/// (mdk#1380). Steady-state delivery is push-driven through each account
+/// worker's live receive loop; the driver's scheduled passes only heal silent
+/// notification gaps, so an idle subscription may sink to this cadence while
+/// any qualifying runtime activity snaps it back to the base interval.
+pub(crate) const INBOUND_CATCH_UP_MAX_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Upper bound for the invite-policy worker's idle safety enumeration
+/// (mdk#1380). Event-driven joins, the startup enumeration, and per-candidate
+/// retry wake-ups cover the hot paths; a fully idle safety pass only needs to
+/// rediscover state that survived a missed event or process restart.
+pub(crate) const INVITE_POLICY_RECONCILE_MAX_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
 /// Maximum time a stream compose session may sit without an append/status/progress
@@ -216,6 +230,8 @@ pub struct AgentConnector {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: MarmotAppRuntime,
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
+    /// Aggregate counters for the background reconciliation loops (mdk#1380).
+    pub(crate) reconcile_telemetry: std::sync::Arc<reconcile_telemetry::ReconcileTelemetry>,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
     /// Connections closed at accept time because the concurrency cap was hit.
@@ -239,7 +255,10 @@ impl AgentConnector {
                 .with_allow_loopback_relay_endpoints(config.allow_loopback_relays),
         )?;
         let runtime = MarmotAppRuntime::new(app.clone());
-        let inbound_catch_up = InboundCatchUpDriver::new(runtime.clone());
+        let reconcile_telemetry =
+            std::sync::Arc::new(reconcile_telemetry::ReconcileTelemetry::default());
+        let inbound_catch_up =
+            InboundCatchUpDriver::new(runtime.clone(), reconcile_telemetry.clone());
         let allowlists = AllowlistStore::new(&config.home);
         let (debug_events, _) = broadcast::channel(1024);
         Ok(Self {
@@ -257,6 +276,7 @@ impl AgentConnector {
             app,
             runtime,
             inbound_catch_up,
+            reconcile_telemetry,
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
             connections_refused: Arc::new(AtomicU64::new(0)),

@@ -8330,3 +8330,123 @@ async fn a_send_that_reaches_the_transport_reports_published() {
 
     runtime.shutdown().await;
 }
+
+// ---- mdk#1380: steady-state reconciliation passes must not rescan full state ----
+
+#[test]
+fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
+    run_composed_app_runtime_test("encrypted-media-warm-epoch-skip", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("warm pass", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        assert_eq!(client.state.groups.len(), 1);
+        assert!(client.state.groups[0].encrypted_media.required);
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+
+        // A group still marked as requiring encrypted media warms through the
+        // per-epoch secret cache without any authoritative component load.
+        for _ in 0..2 {
+            let stats = client.cache_current_encrypted_media_epoch_secrets();
+            assert_eq!(stats.groups_considered, 1);
+            assert_eq!(stats.warmed, 1);
+            assert_eq!(stats.authoritative_checks, 0);
+            assert_eq!(stats.skipped_unchanged_epoch, 0);
+            assert_eq!(stats.failures, 0);
+        }
+
+        // A projection saying "not required" is only a hint: with no confirmed
+        // negative on record the pass re-checks the authoritative component.
+        client.state.groups[0].encrypted_media = crate::AppGroupEncryptedMediaComponent::disabled();
+        let stats = client.cache_current_encrypted_media_epoch_secrets();
+        assert_eq!(stats.authoritative_checks, 1);
+        assert_eq!(stats.skipped_unchanged_epoch, 0);
+        assert!(
+            !client
+                .encrypted_media_not_required_epochs
+                .contains_key(&group_id_hex),
+            "an authoritative REQUIRED answer must not be latched as confirmed-negative"
+        );
+
+        // Seed a confirmed-negative at the current epoch (the state left by an
+        // authoritative not-required answer): passes skip the expensive
+        // recheck while the epoch is unchanged.
+        client
+            .encrypted_media_not_required_epochs
+            .insert(group_id_hex.clone(), epoch.0);
+        let stats = client.cache_current_encrypted_media_epoch_secrets();
+        assert_eq!(stats.groups_considered, 1);
+        assert_eq!(stats.skipped_unchanged_epoch, 1);
+        assert_eq!(stats.authoritative_checks, 0);
+        assert_eq!(stats.failures, 0);
+
+        // A commit advances the epoch and rebuilds the projection from the
+        // signed components: the group is required=true again and the stale
+        // seeded negative must be evicted, with the current-epoch secret
+        // re-warmed through the live projection path.
+        client
+            .update_group_profile(&group_id, Some("warm pass renamed"), None)
+            .await
+            .unwrap();
+        let advanced = client.runtime.group_record(&group_id).unwrap().epoch;
+        assert!(
+            advanced.0 > epoch.0,
+            "a profile commit must advance the epoch"
+        );
+        let stats = client.cache_current_encrypted_media_epoch_secrets();
+        assert_eq!(stats.groups_considered, 1);
+        assert_eq!(stats.warmed, 1);
+        assert_eq!(stats.failures, 0);
+
+        // If the group's projection later says "not required" again (a
+        // projection rebuild healed the required flag backwards — the scenario
+        // the authoritative re-check exists for), the stale map entry from the
+        // OLD epoch must not suppress the re-check.
+        client.state.groups[0].encrypted_media = crate::AppGroupEncryptedMediaComponent::disabled();
+        let stats = client.cache_current_encrypted_media_epoch_secrets();
+        assert_eq!(stats.authoritative_checks, 1);
+        assert_eq!(stats.skipped_unchanged_epoch, 0);
+        assert!(
+            !client
+                .encrypted_media_not_required_epochs
+                .contains_key(&group_id_hex),
+            "an authoritative REQUIRED answer must evict the stale confirmed-negative"
+        );
+    });
+}
+
+#[test]
+fn idle_sync_skips_the_checkpoint_route_recomputation() {
+    run_composed_app_runtime_test("idle-sync-checkpoint-skip", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+
+        let mut client = app.client("alice").await.unwrap();
+        client.create_group("idle sync", &[]).await.unwrap();
+
+        // Settle startup/replay traffic, then reset the counter: syncs below
+        // drain an empty channel, so nothing can have changed routing.
+        client.sync().await.unwrap();
+        client.checkpoint_route_refresh_recomputes = 0;
+
+        client.sync().await.unwrap();
+        client.sync().await.unwrap();
+        assert_eq!(
+            client.checkpoint_route_refresh_recomputes, 0,
+            "a zero-delivery, clean-routes checkpoint re-scanning every group \
+             is pure read amplification (mdk#1380)"
+        );
+    });
+}

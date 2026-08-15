@@ -28,7 +28,7 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::{Group, ProtocolProfile};
-use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
+use cgka_traits::{GroupId, MemberId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
 
 use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
@@ -71,6 +71,17 @@ impl std::fmt::Debug for AppInitialGroupImage {
             .field("thumbhash", &self.thumbhash)
             .finish()
     }
+}
+
+/// A group invite still pending the local device's confirmation decision
+/// (`pending_confirmation && !archived` in the account projection). Carries
+/// only what an invite policy needs to accept or decline; returned by
+/// [`crate::MarmotApp::pending_group_invites`] (mdk#1380).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingGroupInvite {
+    pub group_id: GroupId,
+    /// Account id of the welcomer who authenticated the invite, when known.
+    pub welcomer: Option<MemberId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

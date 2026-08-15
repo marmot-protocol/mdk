@@ -431,7 +431,10 @@ async fn control_event_emits_stream_update_for_agent_stream_started() {
 async fn inbound_catch_up_driver_tracks_active_subscriptions() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    let driver = InboundCatchUpDriver::new(runtime.clone());
+    let driver = InboundCatchUpDriver::new(
+        runtime.clone(),
+        std::sync::Arc::new(crate::reconcile_telemetry::ReconcileTelemetry::default()),
+    );
 
     let (_first_events, first_subscription) = driver.subscribe();
     assert_eq!(driver.active.load(Ordering::Acquire), 1);
@@ -454,7 +457,10 @@ async fn inbound_catch_up_driver_failure_does_not_close_subscribers() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     runtime.shutdown().await;
-    let driver = InboundCatchUpDriver::new(runtime);
+    let driver = InboundCatchUpDriver::new(
+        runtime,
+        std::sync::Arc::new(crate::reconcile_telemetry::ReconcileTelemetry::default()),
+    );
     let (mut events, _subscription) = driver.subscribe();
 
     assert!(driver.request().await.is_err());
@@ -463,6 +469,240 @@ async fn inbound_catch_up_driver_failure_does_not_close_subscribers() {
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
     assert_eq!(driver.active.load(Ordering::Acquire), 1);
+}
+
+// ---- mdk#1380 regression harness: adaptive reconciliation scheduling ----
+//
+// These tests drive the shared catch-up driver and the invite-policy worker at
+// compressed intervals and assert *deterministic operation counters* (passes,
+// enumerations, candidate rows read) instead of wall-clock CPU. The window in
+// every test spans many "former intervals" (the whole fixed 5s cadence the
+// loops used to run at, compressed to milliseconds), so a regression to
+// fixed-rate polling overshoots the asserted bounds by a wide margin.
+
+const TEST_CATCH_UP_BASE: Duration = Duration::from_millis(150);
+const TEST_CATCH_UP_MAX: Duration = Duration::from_millis(600);
+const TEST_INVITE_BASE: Duration = Duration::from_millis(100);
+const TEST_INVITE_MAX: Duration = Duration::from_millis(400);
+
+fn adaptive_test_driver(
+    runtime: MarmotAppRuntime,
+) -> (
+    std::sync::Arc<crate::reconcile_telemetry::ReconcileTelemetry>,
+    InboundCatchUpDriver,
+    tokio::sync::broadcast::Sender<MarmotAppEvent>,
+) {
+    let telemetry = std::sync::Arc::new(crate::reconcile_telemetry::ReconcileTelemetry::default());
+    let (activity, _) = tokio::sync::broadcast::channel(16);
+    let driver = crate::event_projection::InboundCatchUpDriver::with_schedule(
+        runtime,
+        telemetry.clone(),
+        crate::event_projection::InboundCatchUpSchedule {
+            base: TEST_CATCH_UP_BASE,
+            max: TEST_CATCH_UP_MAX,
+        },
+    )
+    .override_activity_for_test(activity.clone());
+    (telemetry, driver, activity)
+}
+
+async fn wait_for_counter(counts: impl Fn() -> u64, expected: u64, within: Duration) {
+    timeout(within, async move {
+        loop {
+            if counts() >= expected {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("counter should reach {expected} within {within:?}"));
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_backs_off_while_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.start().await.unwrap();
+    let (telemetry, driver, _activity) = adaptive_test_driver(runtime.clone());
+    let (mut events, subscription) = driver.subscribe();
+
+    // A subscription's initial catch-up still runs promptly and out-of-band.
+    driver.request().await.unwrap();
+    assert_eq!(telemetry.snapshot().catch_up_explicit_requests, 1);
+
+    // Span many former fixed intervals: at the old cadence this window would
+    // see one pass per base interval (~16); the adaptive net must stay far
+    // below that while still running periodically.
+    sleep(Duration::from_millis(2_400)).await;
+    let snapshot = telemetry.snapshot();
+    assert!(
+        snapshot.catch_up_passes_started >= 3,
+        "the safety net must still run while quiet: {} passes",
+        snapshot.catch_up_passes_started
+    );
+    assert!(
+        snapshot.catch_up_passes_started <= 8,
+        "idle safety net must back off: {} passes over ~16 base intervals",
+        snapshot.catch_up_passes_started
+    );
+    assert_eq!(snapshot.catch_up_passes_failed, 0);
+    // No accounts: passes ran but considered zero workers.
+    assert_eq!(snapshot.catch_up_accounts_considered, 0);
+    assert_eq!(snapshot.catch_up_passes_with_activity, 0);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::event_projection::InboundCatchUpEvent::Completed)
+    ));
+
+    // Dropping the last subscription still quiesces the driver (mdk#574).
+    drop(subscription);
+    sleep(2 * TEST_CATCH_UP_MAX).await;
+    let settled = telemetry.snapshot().catch_up_passes_started;
+    sleep(3 * TEST_CATCH_UP_MAX).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        settled,
+        "driver must quiesce once no subscription remains"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_resets_promptly_on_runtime_activity() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.start().await.unwrap();
+    let (telemetry, driver, activity) = adaptive_test_driver(runtime.clone());
+    let (_events, _subscription) = driver.subscribe();
+
+    // Let the schedule back off past the base interval (passes at ~150ms,
+    // ~450ms, then the capped 600ms, ...).
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        2,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // AccountError events must NOT wake the net: they can be produced by the
+    // driver's own failing passes and would pin the cadence during an outage.
+    let filtered_base = telemetry.snapshot().catch_up_passes_started;
+    let _ = activity.send(MarmotAppEvent::AccountError(
+        marmot_app::RuntimeAccountError {
+            account_id_hex: "self".repeat(16),
+            account_label: "self".to_owned(),
+            message: "synthetic outage marker".to_owned(),
+        },
+    ));
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        filtered_base,
+        "account errors must not count as qualifying activity"
+    );
+
+    // Qualifying runtime activity wakes a pass promptly even though the net is
+    // backed off to several base intervals.
+    let _ = activity.send(MarmotAppEvent::GroupStateUpdated {
+        account_id_hex: "ab".repeat(32),
+        account_label: "agent".to_owned(),
+        group_id: GroupId::new(vec![0x11; 32]),
+    });
+    let observed = telemetry.snapshot().catch_up_passes_started;
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        observed + 1,
+        Duration::from_millis(250),
+    )
+    .await;
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_with_activity,
+        1,
+        Duration::from_millis(250),
+    )
+    .await;
+
+    // With activity observed, the cadence resets toward the base interval:
+    // another pass lands within roughly two base intervals.
+    let after_reset = telemetry.snapshot().catch_up_passes_started;
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        after_reset + 1,
+        3 * TEST_CATCH_UP_BASE,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn invite_policy_worker_backs_off_with_zero_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    // The runtime only needs to be alive enough to broadcast events; no relays.
+    connector.runtime.start().await.unwrap();
+    let connector_worker = connector.clone();
+    tokio::spawn(async move {
+        connector_worker
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: TEST_INVITE_BASE,
+                max: TEST_INVITE_MAX,
+            })
+            .await;
+    });
+
+    // The startup enumeration always runs.
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_enumerations_completed
+        },
+        1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // The fixture has an account but zero pending invites. Over many former
+    // fixed intervals the enumeration count must stay logarithmic, and the
+    // read-amplification counter (candidate rows) must stay exactly zero
+    // because no group is pending — even though the account has a projection.
+    sleep(Duration::from_millis(2_000)).await;
+    let snapshot = connector.reconcile_telemetry.snapshot();
+    assert_eq!(
+        snapshot.invite_enumerations_failed, 0,
+        "idle enumerations must succeed"
+    );
+    assert!(
+        snapshot.invite_enumerations_completed >= 2,
+        "the safety net must still enumerate periodically: {}",
+        snapshot.invite_enumerations_completed
+    );
+    assert!(
+        snapshot.invite_enumerations_completed <= 7,
+        "idle enumerations must back off: {} over ~20 base intervals",
+        snapshot.invite_enumerations_completed
+    );
+    assert_eq!(
+        snapshot.invite_candidate_rows_considered, 0,
+        "an idle session must not surface candidate rows"
+    );
+    assert_eq!(snapshot.invite_policy_apply_failures, 0);
+    assert!(
+        snapshot.invite_accounts_considered >= snapshot.invite_enumerations_completed,
+        "each enumeration accounted the single local account"
+    );
+    connector.runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -2245,6 +2485,47 @@ fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
 
     retry_state.clear(&key);
     assert!(retry_state.is_due(&key, now));
+}
+
+#[test]
+fn invite_policy_retry_state_reports_next_due_wake() {
+    let mut retry_state = crate::validation::InvitePolicyRetryState::default();
+    let key_a = crate::validation::InvitePolicyKey::new("aa", "11");
+    let key_b = crate::validation::InvitePolicyKey::new("bb", "22");
+    let now = tokio::time::Instant::now();
+
+    assert!(!retry_state.has_pending());
+    assert_eq!(retry_state.next_due(), None);
+
+    retry_state.record_failure(key_a.clone(), now);
+    assert!(retry_state.has_pending());
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + crate::INVITE_POLICY_RETRY_BASE)
+    );
+
+    // A second, later failure must not move the earliest wake earlier.
+    retry_state.record_failure(key_b.clone(), now + Duration::from_millis(500));
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + crate::INVITE_POLICY_RETRY_BASE)
+    );
+
+    retry_state.record_failure(key_a.clone(), now + Duration::from_millis(500));
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + Duration::from_millis(500) + crate::INVITE_POLICY_RETRY_BASE)
+    );
+
+    retry_state.clear(&key_b);
+    // key_a's second failure carries the doubled backoff.
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + Duration::from_millis(500) + crate::INVITE_POLICY_RETRY_BASE * 2)
+    );
+    retry_state.clear(&key_a);
+    assert!(!retry_state.has_pending());
+    assert_eq!(retry_state.next_due(), None);
 }
 
 #[tokio::test]
@@ -5444,4 +5725,193 @@ async fn quic_candidate_resolve_opt_in_admits_loopback_only() {
             "{authority} must be rejected even with the dev opt-in"
         );
     }
+}
+
+// ---- mdk#1380 opt-in large-session reconciliation benchmark ----
+//
+// `just bench-idle-reconciliation` runs this ignored test (release profile).
+// It builds one agent account with several joined groups, lets one long-lived
+// inbound subscription idle over many compressed former-intervals, then proves
+// with deterministic counters that (a) steady-state idle reconciliation no
+// longer scales as repeated full-state scans and (b) a real state change still
+// triggers a prompt pass. The MDK_BENCH lines are the recorded profile result.
+
+#[tokio::test]
+#[ignore = "opt-in reconciliation benchmark; run via just bench-idle-reconciliation"]
+async fn bench_idle_reconciliation_scaling() {
+    const BENCH_BASE: Duration = Duration::from_millis(250);
+    const BENCH_MAX: Duration = Duration::from_millis(2_000);
+    let group_total: usize = std::env::var("MDK_IDLE_RECONCILE_GROUPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let mut group_ids = Vec::new();
+    for index in 0..group_total {
+        let group_id = setup_runtime
+            .create_group(
+                &human.account.account_id_hex,
+                &format!("idle reconcile bench {index}"),
+                std::slice::from_ref(&agent.account.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        accept_group_invite_retrying_busy(&setup_runtime, &agent.account.account_id_hex, &group_id)
+            .await;
+        group_ids.push(group_id);
+    }
+    setup_runtime.shutdown().await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.start().await.unwrap();
+
+    // Drive the shared catch-up driver and the invite-policy worker over the
+    // connector's real runtime at compressed intervals, on the connector's own
+    // telemetry so the counters attribute both sources in one process.
+    let driver = crate::event_projection::InboundCatchUpDriver::with_schedule(
+        connector.runtime.clone(),
+        connector.reconcile_telemetry.clone(),
+        crate::event_projection::InboundCatchUpSchedule {
+            base: BENCH_BASE,
+            max: BENCH_MAX,
+        },
+    );
+    let (_catch_up_events, _catch_up_subscription) = driver.subscribe();
+    let invite_connector = connector.clone();
+    let invite_worker = tokio::spawn(async move {
+        invite_connector
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: BENCH_BASE,
+                max: BENCH_MAX,
+            })
+            .await;
+    });
+
+    // One long-lived, otherwise-idle subscription: initial catch-up plus the
+    // safety net over ~10 seconds (40 former base intervals at fixed rate).
+    driver.request().await.unwrap();
+    sleep(Duration::from_millis(10_000)).await;
+
+    let snapshot = connector.reconcile_telemetry.snapshot();
+    let performance = connector
+        .runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(snapshot.catch_up_passes_failed, 0);
+    assert_eq!(snapshot.invite_enumerations_failed, 0);
+    assert!(
+        snapshot.catch_up_passes_started >= 3,
+        "safety net must still run while quiet"
+    );
+    assert!(
+        snapshot.catch_up_passes_started <= 10,
+        "idle passes must back off, got {}",
+        snapshot.catch_up_passes_started
+    );
+    assert!(
+        snapshot.invite_enumerations_completed <= 12,
+        "idle enumerations must back off, got {}",
+        snapshot.invite_enumerations_completed
+    );
+    assert_eq!(
+        snapshot.invite_candidate_rows_considered, 0,
+        "no pending invites: the enumeration must read zero candidate rows"
+    );
+    let catch_up_avg_ms = performance
+        .account_catch_up
+        .duration_ms
+        .sum_ms
+        .checked_div(performance.account_catch_up.attempts.max(1))
+        .unwrap_or(0);
+    let sync_avg_ms = performance
+        .account_sync
+        .duration_ms
+        .sum_ms
+        .checked_div(performance.account_sync.attempts.max(1))
+        .unwrap_or(0);
+    crate::test_support::emit_benchmark_line(format!(
+        "MDK_BENCH idle groups={group_total} scheduled_passes={} pass_avg_ms={catch_up_avg_ms} sync_avg_ms={sync_avg_ms}",
+        snapshot.catch_up_passes_started,
+    ));
+    crate::test_support::emit_benchmark_line(format!(
+        "MDK_BENCH idle invite_enumerations={} candidate_rows={} accounts={}",
+        snapshot.invite_enumerations_completed,
+        snapshot.invite_candidate_rows_considered,
+        snapshot.invite_accounts_considered,
+    ));
+
+    // A real state change must pull the net back promptly: send a live message
+    // and measure the gap until the next scheduled pass starts.
+    let before = connector
+        .reconcile_telemetry
+        .snapshot()
+        .catch_up_passes_started;
+    connector
+        .runtime
+        .send_message(
+            &agent.account.label,
+            &group_ids[0],
+            b"bench activity marker".to_vec(),
+        )
+        .await
+        .unwrap();
+    let sent_at = std::time::Instant::now();
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .catch_up_passes_started
+        },
+        before + 1,
+        4 * BENCH_BASE,
+    )
+    .await;
+    let wake_gap_ms = sent_at.elapsed().as_millis();
+    crate::test_support::emit_benchmark_line(format!(
+        "MDK_BENCH activity wake_gap_ms={wake_gap_ms} base_ms=250"
+    ));
+    assert!(
+        wake_gap_ms <= 2 * BENCH_BASE.as_millis() + 250,
+        "activity must reset the net promptly, took {wake_gap_ms}ms"
+    );
+
+    let session_db = dir
+        .path()
+        .join("accounts")
+        .join(&agent.account.label)
+        .join("session.sqlite");
+    if let Ok(metadata) = std::fs::metadata(&session_db) {
+        crate::test_support::emit_benchmark_line(format!(
+            "MDK_BENCH session_db_bytes={}",
+            metadata.len()
+        ));
+    }
+    invite_worker.abort();
+    connector.runtime.shutdown().await;
 }

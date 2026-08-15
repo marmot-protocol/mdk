@@ -661,6 +661,28 @@ impl AppClient {
             })
     }
 
+    /// Authoritative encrypted-media component lookup for the epoch-secret warm
+    /// path. Unlike [`Self::encrypted_media_for_group`], lookup failures are NOT
+    /// collapsed into "disabled": a transient storage read failure must keep the
+    /// warm pass retryable instead of being latched as an authoritative
+    /// negative for the group's whole epoch.
+    pub(crate) fn try_encrypted_media_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<AppGroupEncryptedMediaComponent, AppError> {
+        let profile = self.runtime.group_record(group_id)?.protocol_profile;
+        let component_id = Self::encrypted_media_component_id(profile);
+        match self.runtime.app_component(group_id, component_id)? {
+            Some(bytes) => Ok(AppGroupEncryptedMediaComponent::from_bytes(
+                component_id,
+                &bytes,
+            )),
+            None => Ok(AppGroupEncryptedMediaComponent::disabled_for_profile(
+                profile.into(),
+            )),
+        }
+    }
+
     pub(crate) fn image_for_group(&self, group_id: &GroupId) -> AppGroupImageInput {
         self.runtime
             .app_component(group_id, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)

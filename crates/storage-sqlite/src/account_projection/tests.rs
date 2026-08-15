@@ -407,6 +407,77 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 }
 
 #[test]
+fn pending_confirmation_group_invites_reads_only_pending_outlines() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    // One applied member group, one pending invite with a welcomer, one
+    // pending invite without a welcomer, and one pending-but-archived group.
+    // Seen events and component rows are present so the outline result proves
+    // the query never fans out into them (mdk#1380).
+    let member = group("member-group", "member group");
+    let mut invited = group("invited-group", "invited group");
+    invited.pending_confirmation = true;
+    invited.welcomer_account_id_hex = Some("cc".repeat(32));
+    let mut unframed = group("unframed-invite", "unframed invite");
+    unframed.pending_confirmation = true;
+    let mut archived = group("archived-invite", "archived invite");
+    archived.pending_confirmation = true;
+    archived.archived = true;
+
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: vec!["seen-a".to_owned(), "seen-b".to_owned()],
+        last_transport_timestamp: None,
+        groups: vec![member, invited, unframed, archived],
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+
+    let invites = store.pending_confirmation_group_invites().unwrap();
+    assert_eq!(
+        invites,
+        vec![
+            StoredPendingGroupInvite {
+                group_id_hex: "invited-group".to_owned(),
+                welcomer_account_id_hex: Some("cc".repeat(32)),
+            },
+            StoredPendingGroupInvite {
+                group_id_hex: "unframed-invite".to_owned(),
+                welcomer_account_id_hex: None,
+            },
+        ]
+    );
+
+    // A once-pending group that got applied drops out of the outline set on
+    // the next reconciliation. (Full projection saves replace the snapshot,
+    // so resave the whole set.)
+    let member = group("member-group", "member group");
+    let mut invited = group("invited-group", "invited group");
+    invited.pending_confirmation = true;
+    invited.welcomer_account_id_hex = Some("cc".repeat(32));
+    let mut applied = group("unframed-invite", "unframed invite");
+    applied.pending_confirmation = false;
+    let mut archived = group("archived-invite", "archived invite");
+    archived.pending_confirmation = true;
+    archived.archived = true;
+    let state = StoredAccountState {
+        groups: vec![member, invited, applied, archived],
+        ..state
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    let invites = store.pending_confirmation_group_invites().unwrap();
+    assert_eq!(
+        invites,
+        vec![StoredPendingGroupInvite {
+            group_id_hex: "invited-group".to_owned(),
+            welcomer_account_id_hex: Some("cc".repeat(32)),
+        }]
+    );
+}
+
+#[test]
 fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     {

@@ -189,14 +189,32 @@ impl AppClient {
         }
     }
 
-    pub(crate) async fn sync_runtime_groups(&self) -> Result<(), AppError> {
+    pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
-        self.cache_current_encrypted_media_epoch_secrets();
+        self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
         self.runtime.sync_transport_groups(rebuild_since).await?;
-        self.cache_current_encrypted_media_epoch_secrets();
+        self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
+    }
+
+    /// Warm the encrypted-media epoch-secret cache around a subscription sync,
+    /// recording the aggregate pass shape so idle steady-state passes are
+    /// provably free of authoritative (`MlsGroup::load`) re-checks (mdk#1380).
+    fn warm_encrypted_media_epoch_secrets(&mut self, phase: &'static str) {
+        let stats = self.cache_current_encrypted_media_epoch_secrets();
+        tracing::debug!(
+            target: "marmot_app::media",
+            method = "warm_encrypted_media_epoch_secrets",
+            phase,
+            groups_considered = stats.groups_considered,
+            skipped_unchanged_epoch = stats.skipped_unchanged_epoch,
+            authoritative_checks = stats.authoritative_checks,
+            warmed = stats.warmed,
+            failures = stats.failures,
+            "encrypted media epoch-secret warm pass"
+        );
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
@@ -229,12 +247,12 @@ impl AppClient {
         Ok(false)
     }
 
-    pub(crate) async fn prepare_transport(&self) -> Result<(), AppError> {
+    pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
         self.prepare_transport_with_telemetry(None).await
     }
 
     async fn prepare_transport_with_telemetry(
-        &self,
+        &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<(), AppError> {
         // Before any subscription goes out: auth-gated relays (NIP-42)
@@ -888,10 +906,22 @@ impl AppClient {
         routes_dirty: bool,
         deliveries: u64,
     ) -> Result<(), SyncCheckpointError> {
-        let routes_changed = self
-            .refresh_group_routes()
-            .map_err(SyncCheckpointError::BeforePersistence)?
-            .routing_changed;
+        // The checkpoint re-runs `refresh_group_routes` only when the drained
+        // prefix could have changed routing: deliveries advance epochs (which
+        // gate prior-route pruning) and can mark groups disbanded. With zero
+        // deliveries and no dirty routes, engine-visible group state is
+        // byte-identical to what the sync-start refresh already read, so the
+        // recomputation here would rescan every group only to install the same
+        // routing snapshot (mdk#1380).
+        let routes_changed = if deliveries > 0 || routes_dirty {
+            self.checkpoint_route_refresh_recomputes =
+                self.checkpoint_route_refresh_recomputes.saturating_add(1);
+            self.refresh_group_routes()
+                .map_err(SyncCheckpointError::BeforePersistence)?
+                .routing_changed
+        } else {
+            false
+        };
         let checkpoint = if cfg!(feature = "test-policy-overrides")
             && self
                 .app

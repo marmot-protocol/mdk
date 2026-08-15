@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-08-14
+updated: 2026-08-15
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -23,6 +23,7 @@ runtime. It complements the policy docs:
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
 | Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
+| Agent connector reconciliation telemetry | Always collected while `wn-agent` runs: process-local cumulative counters for the shared inbound catch-up driver and the invite-policy worker (passes, outcomes, accounts/candidate rows considered), plus one privacy-safe `tracing` event per scheduled pass carrying a `source` label, duration, result, and aggregate counts (mdk#1380). | No. Counters are process-local; tracing events follow the no-ids/no-urls/no-content rules. | [`reconcile_telemetry.rs`](../../crates/agent-connector/src/reconcile_telemetry.rs), [`event_projection.rs`](../../crates/agent-connector/src/event_projection.rs), [`invite_policy.rs`](../../crates/agent-connector/src/invite_policy.rs) |
 | Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
 
@@ -246,6 +247,29 @@ These app-performance samples deliberately do not include account labels, accoun
 ids, relay URLs, media URLs, payload sizes, content types, upload endpoints, download endpoints, or error strings.
 Host applications can only select the closed `HostPerformanceOperation` enum; callers cannot supply metric names,
 label names, or label values. Adding a new cross-platform operation requires an MDK API change and review.
+
+### Agent connector reconciliation telemetry
+
+`ReconcileTelemetry` (in `crates/agent-connector/src/reconcile_telemetry.rs`) holds process-local cumulative
+counters for the two background reconciliation loops in `wn-agent` (mdk#1380): the shared inbound catch-up driver
+(`source = "inbound_catch_up"`) and the welcomer-allowlist invite-policy worker (`source = "invite_policy"`). Both
+loops schedule event- or retry-driven work with an adaptive safety net, so the counters exist to prove idle passes
+stay rare and cheap.
+
+| Counter | Meaning | Sensitivity |
+| --- | --- | --- |
+| `catch_up_passes_started/completed/failed` | Scheduled safety-net catch-up passes and their outcomes. | Aggregate counts. |
+| `catch_up_passes_with_activity` | Completed passes that observed qualifying runtime activity (these hold the net at its base interval). | Aggregate count. |
+| `catch_up_accounts_considered` | Sum of running account workers fanned out across completed passes. | Aggregate count. |
+| `catch_up_explicit_requests` | Out-of-band catch-ups (e.g. a `SubscribeInbound` initial catch-up), which never perturb the adaptive schedule. | Aggregate count. |
+| `invite_enumerations_started/completed/failed` | Pending-invite safety enumerations and their outcomes. | Aggregate counts. |
+| `invite_accounts_considered` | Sum of local-signing accounts enumerated across passes. | Aggregate count. |
+| `invite_candidate_rows_considered` | Sum of pending-invite projection rows read across enumerations. Zero on an idle session regardless of retained history size; this is the database-read amplification gauge. | Aggregate count. |
+| `invite_policy_applied` / `invite_policy_apply_failures` | Policy decisions applied vs. retry-pending failures. | Aggregate counts. |
+
+Each scheduled pass also emits one `tracing` event (debug on success, warn on failure) with explicit
+`target`/`method`, a `source` label, `duration_ms`, a coarse `result`, and aggregate counts only — no account
+ids, group ids, message ids, relay URLs, or content.
 
 ## How local relay telemetry is recorded
 

@@ -59,6 +59,23 @@ impl InvitePolicyRetryState {
         self.failures.retain(|key, _| pending.contains(key));
     }
 
+    /// Whether any failed candidate is still pending retry. Pending retries
+    /// keep the invite-policy worker's safety enumeration at its base interval
+    /// (mdk#1380).
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// Earliest retry wake-up across all failed candidates; `None` when no
+    /// failure is pending. The worker sleeps until this instead of polling on
+    /// a fixed cadence.
+    pub(crate) fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.failures
+            .values()
+            .map(|retry| retry.next_retry_at)
+            .min()
+    }
+
     pub(crate) fn record_failure(
         &mut self,
         key: InvitePolicyKey,
