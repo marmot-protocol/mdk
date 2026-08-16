@@ -61,16 +61,23 @@ generator_version="6"
 case_count="25"
 case_timeout_secs="300"
 parallelism="4"
+run_id="seeds-1000-1007-cases-$case_count-attempt-1"
 
 cargo build -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked
 
 umask 077
-campaign_root="target/convergence-scale/$source_revision/convergence-chaos-v1-g$generator_version"
-mkdir -p "$campaign_root"
+campaign_parent="target/convergence-scale/$source_revision/convergence-chaos-v1-g$generator_version"
+campaign_root="$campaign_parent/$run_id"
+mkdir -p "$campaign_parent"
+mkdir "$campaign_root" || {
+  echo "refusing to overwrite campaign evidence root: $campaign_root" >&2
+  exit 1
+}
 printf '%s\n' \
   "source_revision=$source_revision" \
   "family_name=$family_name" \
   "generator_version=$generator_version" \
+  "run_id=$run_id" \
   "seeds=1000..1007" \
   "cases_per_seed=$case_count" \
   "case_timeout_secs=$case_timeout_secs" \
@@ -112,7 +119,9 @@ workers that fit in the memory/disk budget. The campaign summary records the mea
 operational limit.
 
 Use a separate immutable directory per `(source revision, family name, generator version, seed)`. The runner's
-overwrite refusal protects evidence and catches accidental shard collisions.
+per-case overwrite refusal protects shard artifacts, while the recipe's exclusive run-leaf creation protects the
+top-level provenance manifest. For a second execution of the same matrix, choose a fresh `run_id`; never reuse or
+empty an earlier evidence root.
 
 ### Stage 3: sustained depth
 
