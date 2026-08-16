@@ -4,12 +4,11 @@ use rusqlite::Transaction;
 
 /// Peer-keyed index for existing-direct-conversation reuse (mdk#1463).
 ///
-/// Hosts look up "the reusable DM with this peer" without paging every
-/// unnamed two-member chat. The covering index on `member_id_hex` lets that
-/// read examine only groups that already contain the peer; other-peer DMs
-/// never enter the candidate set. Rows are written from the account
-/// projection whenever a group is classified Direct (empty name, roster
-/// size 2) and dropped when it is not.
+/// This migration creates the table and covering member index only. It cannot
+/// obtain live MLS rosters. New Direct groups write both member hexes from
+/// the account projection; existing Direct groups are filled once on the
+/// account-worker hydration path and gated by an import marker. The covering
+/// index on `member_id_hex` is the driving relation for reuse lookup.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"

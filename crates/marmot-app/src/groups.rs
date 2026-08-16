@@ -761,7 +761,10 @@ impl AppGroupRecord {
         }
     }
 
-    fn set_direct_member_ids_from_roster(&mut self, members: &[cgka_traits::group::Member]) {
+    pub(crate) fn set_direct_member_ids_from_roster(
+        &mut self,
+        members: &[cgka_traits::group::Member],
+    ) {
         self.direct_member_ids_hex = if self.profile.name.trim().is_empty() && members.len() == 2 {
             Some(
                 members

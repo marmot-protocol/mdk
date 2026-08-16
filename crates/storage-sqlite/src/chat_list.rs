@@ -430,6 +430,10 @@ impl SqliteAccountStorage {
     /// Candidate order is durable activity (`activity_sort_at DESC`, then
     /// `group_id_hex`), not the pin-first order used by the visible chat
     /// list. Reuse must follow conversation activity, not local pin state.
+    ///
+    /// The query is driven by `idx_direct_conversation_members_member`, then
+    /// joins the matching chat-list rows. It does not scan every chat to
+    /// find the peer.
     pub fn direct_conversation_candidate_rows(
         &self,
         peer_account_id_hex: &str,
@@ -438,11 +442,32 @@ impl SqliteAccountStorage {
         direct_conversation_candidate_rows_tx(&conn, peer_account_id_hex)
     }
 
+    /// `EXPLAIN QUERY PLAN` for the peer-keyed candidate read.
+    ///
+    /// Used by the regression that requires
+    /// `idx_direct_conversation_members_member` as the driving index.
+    pub fn direct_conversation_candidate_query_plan(
+        &self,
+        peer_account_id_hex: &str,
+    ) -> StorageResult<Vec<String>> {
+        let peer_account_id_hex = peer_account_id_hex.trim().to_ascii_lowercase();
+        if peer_account_id_hex.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        let sql = format!("EXPLAIN QUERY PLAN {}", direct_conversation_candidate_sql());
+        let mut statement = conn.prepare(&sql).storage()?;
+        statement
+            .query_map(params![peer_account_id_hex], |row| row.get::<_, String>(3))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
     /// Direct groups that still have no peer-index rows.
     ///
-    /// Used once after upgrade to backfill `direct_conversation_members`
-    /// from live rosters. When the index is complete this returns empty
-    /// without loading chat-list rows.
+    /// Used only by the once-per-open upgrade backfill. Steady-state lookup
+    /// does not call this.
     pub fn unindexed_direct_conversation_group_ids(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         let mut statement = conn
@@ -1829,6 +1854,25 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
     Ok(rows)
 }
 
+fn direct_conversation_candidate_sql() -> String {
+    // Drive from the peer index, then join the matching chat-list row.
+    // Durable activity order, not pin-first chat-list order.
+    format!(
+        "{CHAT_LIST_ROW_SELECT_LIST}
+         FROM direct_conversation_members AS dcm
+         JOIN chat_list_rows AS row ON row.group_id_hex = dcm.group_id_hex
+         LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
+         LEFT JOIN chat_notification_settings AS mute
+            ON mute.group_id_hex = row.group_id_hex
+         LEFT JOIN chat_pin_positions AS pin
+            ON pin.group_id_hex = row.group_id_hex
+         WHERE dcm.member_id_hex = ?1
+           AND TRIM(row.group_name) = ''
+           AND ag.member_count = 2
+         ORDER BY row.activity_sort_at DESC, row.group_id_hex"
+    )
+}
+
 fn direct_conversation_candidate_rows_tx(
     tx: &Connection,
     peer_account_id_hex: &str,
@@ -1837,19 +1881,7 @@ fn direct_conversation_candidate_rows_tx(
     if peer_account_id_hex.is_empty() {
         return Ok(Vec::new());
     }
-    // Durable activity order, not pin-first chat-list order. A local pin
-    // must not change which historical Direct group is selected for reuse.
-    let sql = format!(
-        "{CHAT_LIST_ROW_SELECT_AND_JOINS}
-         WHERE TRIM(row.group_name) = ''
-           AND ag.member_count = 2
-           AND EXISTS (
-                SELECT 1 FROM direct_conversation_members AS dcm
-                WHERE dcm.group_id_hex = row.group_id_hex
-                  AND dcm.member_id_hex = ?1
-           )
-         ORDER BY row.activity_sort_at DESC, row.group_id_hex"
-    );
+    let sql = direct_conversation_candidate_sql();
     let now_ms = unix_now_ms();
     let mut stmt = tx.prepare(&sql).storage()?;
     let mut rows = stmt
@@ -1901,6 +1933,37 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
 
 // Keep this projection in one place: `chat_list_row_from_row` decodes it by
 // index, so list and single-row queries must never drift in column order.
+// `CHAT_LIST_ROW_SELECT_LIST` must stay column-identical to
+// `CHAT_LIST_ROW_SELECT_AND_JOINS` so the peer-driven candidate query
+// decodes the same way.
+const CHAT_LIST_ROW_SELECT_LIST: &str =
+    "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
+            row.title, row.group_name, row.avatar_url,
+            row.avatar_image_hash_hex, row.avatar_image_key_hex,
+            row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
+            row.avatar_media_type, row.last_message_id_hex,
+            row.last_message_sender, row.last_message_preview,
+            row.last_message_kind, row.last_message_timeline_at,
+            row.last_message_deleted, row.last_message_media_json,
+            row.last_message_delivery_state, row.unread_count,
+            row.manually_marked_unread, row.unread_mention_count,
+            row.first_unread_message_id_hex, row.last_read_message_id_hex,
+            row.last_read_timeline_at, row.conversation_created_at,
+            row.activity_sort_at, row.updated_at, row.self_membership,
+            ag.member_count,
+            mute.group_id_hex IS NOT NULL,
+            mute.muted_until_ms,
+            EXISTS (
+                SELECT 1 FROM cgka_disband_tombstones AS tomb
+                WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
+            ),
+            pin.group_id_hex IS NOT NULL,
+            CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
+                SELECT COUNT(*)
+                FROM chat_pin_positions AS earlier_pin
+                WHERE earlier_pin.ordinal < pin.ordinal
+            ) END";
+
 const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
     "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
             row.title, row.group_name, row.avatar_url,

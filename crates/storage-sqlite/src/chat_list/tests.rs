@@ -624,6 +624,108 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
     let mut expected_members = vec![local, peer];
     expected_members.sort();
     assert_eq!(loaded_members, expected_members);
+
+    let plan = store
+        .direct_conversation_candidate_query_plan(&hex_id(0xbb, 32))
+        .unwrap()
+        .join("\n")
+        .to_ascii_lowercase();
+    assert!(
+        plan.contains("idx_direct_conversation_members_member"),
+        "peer lookup must be driven by the member index: {plan}"
+    );
+    assert!(
+        !plan.contains("scan chat_list_rows") && !plan.contains("scan account_groups"),
+        "peer lookup must not full-scan chat tables: {plan}"
+    );
+}
+
+#[test]
+fn fill_unindexed_direct_conversation_members_does_not_clobber_newer_rows() {
+    let local = hex_id(0xaa, 32);
+    let old_peer = hex_id(0xbb, 32);
+    let new_peer = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &old_peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), new_peer.clone()])
+        .unwrap();
+    assert!(
+        !store
+            .fill_unindexed_direct_conversation_members(
+                &group_id,
+                &[local.clone(), old_peer.clone()]
+            )
+            .unwrap(),
+        "a later projection save must win over a stale backfill write"
+    );
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&new_peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&old_peer)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn fill_unindexed_direct_conversation_members_writes_when_empty() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let mut unindexed = direct_group(&group_id, &local, &peer);
+    unindexed.direct_member_ids_hex = None;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![unindexed],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![group_id.clone()]
+    );
+    assert!(
+        store
+            .fill_unindexed_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
 }
 
 #[test]

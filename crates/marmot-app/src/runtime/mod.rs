@@ -3153,6 +3153,8 @@ impl MarmotAppRuntime {
     /// `peer_account_id` accepts hex or `npub`. The read is keyed by this
     /// account plus that peer: it does not return the full chat list, and
     /// membership is loaded only for peer-index hits that still look reusable.
+    /// Upgrade backfill of the peer index runs once on account open, not on
+    /// this read.
     /// See [`storage_sqlite::select_reusable_direct_conversation`] for the
     /// reuse policy and activity-order tie-break.
     pub async fn existing_direct_conversation(
@@ -3165,8 +3167,6 @@ impl MarmotAppRuntime {
         if peer_account_id_hex == account.account_id_hex {
             return Ok(None);
         }
-        self.backfill_direct_conversation_members(account_ref, &account.label)
-            .await?;
         let candidates = self
             .accounts
             .app
@@ -3180,40 +3180,6 @@ impl MarmotAppRuntime {
             &peer_account_id_hex,
             &memberships,
         ))
-    }
-
-    async fn backfill_direct_conversation_members(
-        &self,
-        account_ref: &str,
-        label: &str,
-    ) -> Result<(), AppError> {
-        let storage = self.accounts.app.account_storage(label)?;
-        let unindexed = storage.unindexed_direct_conversation_group_ids()?;
-        if unindexed.is_empty() {
-            return Ok(());
-        }
-        let mut group_ids = Vec::with_capacity(unindexed.len());
-        for group_id_hex in &unindexed {
-            let bytes = hex::decode(group_id_hex)?;
-            if bytes.is_empty() {
-                return Err(AppError::InvalidGroupMembershipPage(
-                    "direct conversation group id is empty".to_owned(),
-                ));
-            }
-            group_ids.push(GroupId::new(bytes));
-        }
-        for chunk in group_ids.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
-            let page = self
-                .direct_conversation_member_ids_page(account_ref, chunk)
-                .await?;
-            for item in page {
-                storage.replace_direct_conversation_members(
-                    &item.group_id_hex,
-                    &item.member_ids_hex,
-                )?;
-            }
-        }
-        Ok(())
     }
 
     async fn direct_conversation_memberships(

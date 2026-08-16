@@ -251,6 +251,10 @@ const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection
 /// `account_groups.self_membership` from current engine state for rows that
 /// predate migration 0018 (where every row defaulted to `'member'`).
 const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
+/// Once-only marker for the open/upgrade backfill that writes
+/// `direct_conversation_members` from live rosters for Direct groups that
+/// predate migration 0050.
+const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-members-backfill-v1";
 /// Invalidation reason for a sent app event that will never reach anyone,
 /// whether it was refused at send time or its group turned terminal while the
 /// engine still held it. The derived-state SQL keys the app-facing `Failed`

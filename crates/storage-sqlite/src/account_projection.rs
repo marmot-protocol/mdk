@@ -963,9 +963,8 @@ impl SqliteAccountStorage {
 
     /// Replace the peer-keyed Direct-conversation member index for one group.
     ///
-    /// Used to backfill rows that existed before the index was introduced.
-    /// Passing fewer or more than two member ids clears the index for that
-    /// group; only a two-member roster is stored.
+    /// Authoritative writes from a current projection save. Passing fewer or
+    /// more than two member ids clears the index for that group.
     pub fn replace_direct_conversation_members(
         &self,
         group_id_hex: &str,
@@ -979,6 +978,40 @@ impl SqliteAccountStorage {
                 Some(member_ids_hex),
                 member_ids_hex.len() == 2,
             )
+        })
+    }
+
+    /// Write index rows only while the group is still unindexed.
+    ///
+    /// Used by the once-per-open upgrade backfill so a stale roster cannot
+    /// overwrite a newer projection save that already populated the index.
+    /// Returns `true` when this call inserted rows.
+    pub fn fill_unindexed_direct_conversation_members(
+        &self,
+        group_id_hex: &str,
+        member_ids_hex: &[String],
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let already_indexed = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM direct_conversation_members WHERE group_id_hex = ?1
+                     )",
+                    params![group_id_hex],
+                    |row| row.get::<_, bool>(0),
+                )
+                .storage()?;
+            if already_indexed {
+                return Ok(false);
+            }
+            replace_direct_conversation_members_tx(
+                &conn,
+                group_id_hex,
+                Some(member_ids_hex),
+                member_ids_hex.len() == 2,
+            )?;
+            Ok(true)
         })
     }
 
