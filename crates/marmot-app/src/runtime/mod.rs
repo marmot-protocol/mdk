@@ -3154,7 +3154,9 @@ impl MarmotAppRuntime {
     /// account plus that peer: it does not return the full chat list, and
     /// membership is loaded only for peer-index hits that still look reusable.
     /// Upgrade backfill of the peer index runs once on account open, not on
-    /// this read.
+    /// this read. Until that completion marker is set, this returns
+    /// [`AppError::DirectConversationIndexNotReady`] instead of `Ok(None)` so
+    /// a first open after migration 50 cannot be mistaken for a miss.
     /// See [`storage_sqlite::select_reusable_direct_conversation`] for the
     /// reuse policy and activity-order tie-break.
     pub async fn existing_direct_conversation(
@@ -3166,6 +3168,12 @@ impl MarmotAppRuntime {
         let peer_account_id_hex = account_id_hex_from_ref(peer_account_id)?;
         if peer_account_id_hex == account.account_id_hex {
             return Ok(None);
+        }
+        if !self.accounts.app.account_import_marker(
+            &account.label,
+            crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+        )? {
+            return Err(AppError::DirectConversationIndexNotReady);
         }
         let candidates = self
             .accounts

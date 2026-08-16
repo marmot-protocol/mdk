@@ -3017,6 +3017,22 @@ impl MarmotApp {
         Ok(())
     }
 
+    /// Test seam: empty the peer index and clear its completion marker so the
+    /// next account-worker open looks like the first open after migration 50.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub fn reset_direct_conversation_members_backfill_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .reset_direct_conversation_members_backfill(
+                DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+            )?;
+        Ok(())
+    }
+
     pub(crate) fn remove_stale_group_push_tokens(
         &self,
         account_ref: &str,

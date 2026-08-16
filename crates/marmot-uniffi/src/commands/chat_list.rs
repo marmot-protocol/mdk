@@ -73,7 +73,10 @@ impl Marmot {
     ///
     /// Well-formed unknown peers, self lookups, and non-reusable historical
     /// groups return `None`. Malformed peer ids and unknown accounts keep the
-    /// same typed errors as the other identity commands.
+    /// same typed errors as the other identity commands. After an account
+    /// upgrade that introduces the peer index, this read returns
+    /// [`MarmotKitError::DirectConversationIndexNotReady`] until the one-time
+    /// backfill finishes; that is retryable and must not be treated as a miss.
     pub async fn existing_direct_conversation(
         &self,
         account_ref: String,
@@ -231,6 +234,20 @@ mod tests {
 
     use super::*;
     use crate::{ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi};
+
+    fn reusable_direct_conversation_winner(
+        left: &ChatListRowFfi,
+        right: &ChatListRowFfi,
+    ) -> String {
+        if left.activity_sort_at > right.activity_sort_at
+            || (left.activity_sort_at == right.activity_sort_at
+                && left.group_id_hex < right.group_id_hex)
+        {
+            left.group_id_hex.clone()
+        } else {
+            right.group_id_hex.clone()
+        }
+    }
 
     #[test]
     fn chat_pins_round_trip_across_runtime_and_ffi() {
@@ -711,6 +728,15 @@ mod tests {
             .expect("bump activity on the newer duplicate");
         kit.set_chat_pinned(account_ref.clone(), first.clone(), true)
             .expect("pin older duplicate; pin must not win reuse");
+        let first_row = kit
+            .chat_list_row(account_ref.clone(), first.clone())
+            .expect("read first duplicate row")
+            .expect("first projection exists");
+        let second_row = kit
+            .chat_list_row(account_ref.clone(), second.clone())
+            .expect("read second duplicate row")
+            .expect("second projection exists");
+        let expected_group_id = reusable_direct_conversation_winner(&first_row, &second_row);
 
         for _ in 0..3 {
             let other_peer = kit
@@ -776,8 +802,10 @@ mod tests {
             "lookup must record one sample regardless of unrelated chat count"
         );
         assert!(found.reusable);
-        assert_eq!(found.group_id_hex, second);
-        assert_ne!(found.group_id_hex, first);
+        assert_eq!(
+            found.group_id_hex, expected_group_id,
+            "reuse must follow stored activity_sort_at DESC, then group_id_hex ASC, not pin order"
+        );
         assert!(matches!(
             found.self_membership,
             crate::conversions::SelfMembershipFfi::Member

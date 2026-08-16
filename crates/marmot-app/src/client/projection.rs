@@ -856,6 +856,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidGroupMembershipPage(_) => {
             "read_marker_failed:invalid_group_membership_page"
         }
+        AppError::DirectConversationIndexNotReady => {
+            "read_marker_failed:direct_conversation_index_not_ready"
+        }
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",

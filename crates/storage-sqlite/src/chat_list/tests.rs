@@ -729,6 +729,60 @@ fn fill_unindexed_direct_conversation_members_writes_when_empty() {
 }
 
 #[test]
+fn reset_direct_conversation_members_backfill_clears_index_and_marker() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    store
+        .mark_account_import_complete("direct-conversation-members-backfill-v1")
+        .unwrap();
+    assert!(
+        !store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .account_import_marker("direct-conversation-members-backfill-v1")
+            .unwrap()
+    );
+
+    store
+        .reset_direct_conversation_members_backfill("direct-conversation-members-backfill-v1")
+        .unwrap();
+
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !store
+            .account_import_marker("direct-conversation-members-backfill-v1")
+            .unwrap()
+    );
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![group_id]
+    );
+}
+
+#[test]
 fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
     let local = hex_id(0xaa, 32);
     let peer = hex_id(0xbb, 32);

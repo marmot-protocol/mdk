@@ -1015,6 +1015,28 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Empty the peer index and clear its completion marker.
+    ///
+    /// Used by upgrade-race tests to recreate the first open after migration
+    /// 50: Direct groups exist, but `direct_conversation_members` is empty and
+    /// the once-only backfill has not been recorded.
+    pub fn reset_direct_conversation_members_backfill(
+        &self,
+        marker_name: &str,
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute("DELETE FROM direct_conversation_members", [])
+                .storage()?;
+            conn.execute(
+                "DELETE FROM account_import_markers WHERE name = ?1",
+                params![marker_name],
+            )
+            .storage()?;
+            Ok(())
+        })
+    }
+
     /// Transactionally removes all app-local data for one group without touching
     /// the stored MLS/OpenMLS group state. This is the storage primitive for the
     /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
