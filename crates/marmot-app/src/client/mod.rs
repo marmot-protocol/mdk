@@ -1032,7 +1032,9 @@ impl AppClient {
         group_ids
             .iter()
             .map(|group_id| {
-                self.ensure_group(group_id)?;
+                let group_record = self
+                    .state_group_record(group_id)
+                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?;
                 let member_ids_hex = self
                     .runtime
                     .members(group_id)?
@@ -1042,7 +1044,7 @@ impl AppClient {
                 Ok(crate::AppGroupMemberIds {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     member_ids_hex,
-                    admin_ids_hex: self.admin_policy_for_group(group_id).admins,
+                    admin_ids_hex: group_record.admin_policy.admins,
                 })
             })
             .collect()
