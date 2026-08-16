@@ -198,11 +198,14 @@ pub struct AppGroupMemberRecord {
 /// Lightweight local roster projection for one group.
 ///
 /// This deliberately contains identifiers only: profile/display-name
-/// enrichment remains on the group-detail path.
+/// enrichment remains on the group-detail path. Admin identifiers come from
+/// the durable admin-policy component so recipient-selection screens can
+/// decide add-to-group eligibility without a per-group roster read.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupMemberIds {
     pub group_id_hex: String,
     pub member_ids_hex: Vec<String>,
+    pub admin_ids_hex: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -327,7 +327,9 @@ impl Marmot {
     ///
     /// This is the chat-projection companion read: it is one worker command,
     /// performs no profile enrichment, and fails the whole page if any group
-    /// is unknown or quarantined.
+    /// is unknown or quarantined. Each row includes member and admin
+    /// identifiers so recipient-selection screens do not need a per-group
+    /// `group_roster` fanout.
     pub async fn group_member_ids_page(
         &self,
         account_ref: String,

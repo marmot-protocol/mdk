@@ -1304,8 +1304,9 @@ impl MarmotAppRuntime {
         self.accounts.group_members(account_ref, group_id).await
     }
 
-    /// Identifier-only membership for a bounded page of groups, served in one
-    /// per-account worker command without profile enrichment.
+    /// Identifier-only membership and admin identifiers for a bounded page of
+    /// groups, served in one per-account worker command without profile
+    /// enrichment.
     pub async fn group_member_ids_page(
         &self,
         account_ref: &str,

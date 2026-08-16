@@ -8570,6 +8570,59 @@ fn idle_sync_skips_the_checkpoint_route_recomputation() {
 }
 
 #[test]
+fn member_ids_page_reads_admins_from_the_durable_group_projection() {
+    run_composed_app_runtime_test("member-ids-page-durable-admins", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("durable admins", &[]).await.unwrap();
+        assert_eq!(
+            client.admin_policy_for_group(&group_id).admins,
+            vec![alice.account_id_hex.clone()],
+            "live MLS still reports the creator as admin"
+        );
+
+        let projected_admin = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let projected_admin_bytes: [u8; 32] = hex::decode(projected_admin)
+            .expect("projected admin hex")
+            .try_into()
+            .expect("32-byte projected admin");
+        client.state.groups[0].admin_policy =
+            AppGroupAdminPolicyComponent::new(vec![projected_admin_bytes]);
+
+        let page = client
+            .member_ids_page(std::slice::from_ref(&group_id))
+            .expect("steady-state page must succeed from the durable row");
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0].admin_ids_hex,
+            vec![projected_admin.to_owned()],
+            "admin identifiers must come from the durable projection, not a live MLS reload"
+        );
+        assert_ne!(
+            page[0].admin_ids_hex,
+            client.admin_policy_for_group(&group_id).admins,
+            "a live admin-policy miss must not replace the durable admin list"
+        );
+
+        client.state.groups.clear();
+        assert!(
+            matches!(
+                client.member_ids_page(std::slice::from_ref(&group_id)),
+                Err(AppError::UnknownGroup(_))
+            ),
+            "a missing durable row must fail closed instead of reporting no admins"
+        );
+    });
+}
+
+#[test]
 fn pending_group_invites_skips_malformed_rows() {
     // mdk#1380 review: one undecodable row must not disable policy
     // reconciliation for the account's valid invites.
