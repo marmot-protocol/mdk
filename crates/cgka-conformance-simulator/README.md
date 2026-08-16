@@ -2,6 +2,16 @@
 
 In-process multi-client simulator for the CGKA engine.
 
+## Start here
+
+- [`RUNNING_CAMPAIGNS.md`](RUNNING_CAMPAIGNS.md): operator manual for vectors, generated cases, saved-input replay,
+  app/process adapters, containers, VMs, artifacts, and failure handling.
+- [`SCALING_CAMPAIGNS.md`](SCALING_CAMPAIGNS.md): how to shard thousands of cases, choose execution layers, retain
+  evidence, and add high-value workload families.
+- [`SCENARIO_IR.md`](SCENARIO_IR.md): canonical scenario and authoring contracts.
+- [`SCENARIOS.md`](SCENARIOS.md): fixed and generated scenario registry.
+- [`AGENTS.md`](AGENTS.md): agent-facing code map and safe operating workflow.
+
 The engine crate proves local engine rules. This crate asks the bigger question: if several clients run that engine and
 the network behaves badly, do they still end up with the same group state?
 
@@ -495,10 +505,11 @@ permissions before executing its case. It preserves the full generated case, inc
 semantic expectations, so a crash or panic cannot erase the exact executable input. Replay one directly with
 `--generated-input FILE`. Add `--adapter engine|retained-relay|app-runtime` to deliberately run the embedded canonical
 Scenario IR through a different in-process adapter; capability preflight still rejects unsupported operations before
-action zero. Reports retain the producer's family/version/seed/case/subject provenance plus separate SHA-256 digests for
-the selected envelope bytes and the selected canonical Scenario IR inside it. An adapter override adds the executing
-adapter to report and failure-capsule filenames so A/B runs cannot overwrite one another. Override runs do not mint a
-promotable vector candidate; only the generator-recorded subject may supply that adapter-neutral fixture.
+action zero. Reports retain the producer's family name, independent generator version, seed, case index, and subject
+provenance plus separate SHA-256 digests for the selected envelope bytes and the selected canonical Scenario IR inside
+it. An adapter override adds the executing adapter to report and failure-capsule filenames so A/B runs cannot
+overwrite one another. Override runs do not mint a promotable vector candidate; only the generator-recorded subject
+may supply that adapter-neutral fixture.
 
 The fixed `cross-route-retained-history-recovery/v1` input uses the same envelope to pin the retained-relay adapter and
 the semantic oracle for the four-party cross-route regression. Run its strict encrypted-SQLite replay with:
@@ -549,15 +560,14 @@ retarget or disable the intended branch topology. The two non-publication bounda
 sequence that ends them (reconnect/incremental-sync/tick for Zeta ingestion and Observer reconnect/full-sync/tick for
 the first repair), and a table-driven test pins every inserted restart's exact step and client.
 
-The complete seed-0 public app-runtime execution passed 12/12 cases. The corresponding exact current-build execution
-passed 9/12 and found three early-publication
-counterexamples. `after-create-accepted-zeta` later rejected an admin update from durable `PendingPublish` and wrote a
-shareable capsule; `after-promote-alpha-accepted-zeta` panicked on the next update from `PendingPublish` (the exact
-input and exit 101 survive, but no report/capsule does); and `after-promote-yankee-accepted-zeta` stranded Zeta at epoch
-3 with pending work, quiescence timeouts, and failed inbound decryptability. All later branch/repair boundaries passed.
-The catalog does not encode these surfaces as acceptable behavior or include a production fix. Public and exact
-artifacts carry distinct scenario-name prefixes so evidence remains attributable to the subject and oracle that
-produced it.
+The complete seed-0 public app-runtime execution passes 12/12 cases. The first exact current-build execution passed
+9/12 and exposed three early-publication failures. Minimization showed that all three were simulator false positives:
+the harness compared process-local pending handles across engine incarnations, so a newly reused handle could skip the
+real publication confirmation. Incarnation-scoped pending/outbound bookkeeping fixed the adapter defect in
+[MDK #1465](https://github.com/marmot-protocol/mdk/pull/1465); the exact seed-0 catalog now passes 12/12 without a
+production engine or protocol change. The original inputs and failure digests remain useful historical discovery
+evidence. Public and exact artifacts carry distinct scenario-name prefixes so every result remains attributable to
+the subject and oracle that produced it.
 
 The process adapter accepts the same saved input in place of a raw Scenario IR file:
 

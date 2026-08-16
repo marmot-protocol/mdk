@@ -1,8 +1,41 @@
 # AGENTS.md — cgka-conformance-simulator
 
-Read [`README.md`](README.md) for the human framing, [`SCENARIO_IR.md`](SCENARIO_IR.md) for canonical and authoring
-semantics, [`SCENARIOS.md`](SCENARIOS.md) for the scenario registry, and [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for
-the property-test registry. This file is the agent-facing model.
+Read [`README.md`](README.md) for the human framing, [`RUNNING_CAMPAIGNS.md`](RUNNING_CAMPAIGNS.md) for exact operator
+commands and artifact handling, [`SCALING_CAMPAIGNS.md`](SCALING_CAMPAIGNS.md) for large matrices and family design,
+[`SCENARIO_IR.md`](SCENARIO_IR.md) for canonical and authoring semantics, [`SCENARIOS.md`](SCENARIOS.md) for the
+scenario registry, and [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the property-test registry. This file is the
+agent-facing code model.
+
+## Agent operating workflow
+
+When asked to run, extend, diagnose, or report on convergence campaigns:
+
+1. Identify the claim before choosing the execution layer. Use an engine-capable subject for exact MLS-private state,
+   durable input dispositions, pending work, and active decryptability. Use app/process/container projections only for
+   public facts they can actually expose.
+2. Start with a strict, file-backed canary. Do not use `--allow-weak-oracle` to make an assurance run green.
+3. For broad discovery, use `cgka-conformance-campaign`: it persists the exact input before action zero, isolates each
+   case in a child, enforces a deadline, and verifies artifacts. Build once and shard distinct seeds when scaling.
+4. Reproduce from the saved `*-generated-input.json`, not from a remembered command alone. Record family version,
+   seed, case index, selected/executed IR digests, adapter, storage mode, source revision, and output path.
+5. Move a failure down to the smallest compatible adapter before debugging it. Move representative cases outward to
+   process/container/VM only when that layer answers a named hypothesis.
+6. Preserve reports and capsules before changing code. Sensitive replay capsules contain key material: keep them
+   owner-only, never commit them, and never quote their contents into issues or logs.
+7. Classify a failure before fixing it: product defect, protocol ambiguity, environment failure, or expected resource
+   refusal. A timeout, unsupported capability, weak oracle, and semantic mismatch are not interchangeable.
+8. After a fix, rerun the minimized input, original input, family canary, relevant focused test, and widest adapter
+   needed by the claim. Report local gates, remote CI, and retained evidence separately.
+
+Use a new output directory for every run; overwrite refusal is an evidence-integrity feature. Direct binary execution
+requires `RUST_MIN_STACK=4194304`; Cargo-launched commands inherit the repository configuration. Keep `--locked` on
+CI-like Cargo commands.
+
+Do not infer that more `--cases` means more complex scenarios. Cases are independent indices and seed selects their
+deterministic choices. The stable identity is `(family_name, generator_version, seed, case_index)`, plus an
+independently versioned workload profile when applicable. The CLI has no case-start offset, so shard large campaigns
+by distinct seeds rather than overlapping prefixes of the same seed. Generated inputs/reports do not embed the tested
+Git commit; require a clean build and retain the exact source revision plus command matrix beside durable evidence.
 
 ## Pieces
 

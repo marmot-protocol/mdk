@@ -2,7 +2,30 @@
 
 Read [`README.md`](README.md) for the operator overview and
 [`../../docs/marmot-architecture/distributed-convergence-campaigns.md`](../../docs/marmot-architecture/distributed-convergence-campaigns.md)
-for the durable evidence contract.
+for the durable evidence contract. Also read
+[`../cgka-conformance-simulator/RUNNING_CAMPAIGNS.md`](../cgka-conformance-simulator/RUNNING_CAMPAIGNS.md) before
+running a wider adapter and [`../cgka-conformance-simulator/SCALING_CAMPAIGNS.md`](../cgka-conformance-simulator/SCALING_CAMPAIGNS.md)
+before designing a large matrix.
+
+## Agent operating workflow
+
+1. Confirm that the scenario already passes the smallest subject capable of its oracle. Containers and VMs add
+   environment evidence; they do not repair an invalid scenario or oracle.
+2. Resolve and verify the exact scenario/generated-input bytes, source revision, participant images, adapter
+   capabilities, and output root. Preserve selected and executed IR digests.
+3. Run `validate`, `plan`, and `doctor` before `run`. Inspect argv, image assignment, namespace/resource token, faults,
+   cleanup, deadlines, and artifact paths. Manifests never contain shell fragments.
+4. Use containers for sockets, network namespaces, real transport lifecycle, participant image separation, and
+   supported network/disk faults. Use the external VM backend only for a named kernel, filesystem, block-device,
+   reboot, or stronger host-isolation hypothesis.
+5. Keep broad seed discovery in the simulator's isolated worker runner. Promote only representative saved inputs,
+   failures, slow/resource boundaries, and mixed-build cases to this crate.
+6. On any setup, mutation, timeout, or cleanup failure, retain every receipt and fail closed. Never manually delete
+   namespace-only resources belonging to a potentially concurrent campaign.
+7. Treat public process/container projection as public evidence only. Pair it with an exact engine-capable control for
+   cryptographic state, input dispositions, pending work, or active decryptability claims.
+8. Record exact revisions/image digests and keep evidence owner-only. Never use public relays, real identifiers,
+   payloads, credentials, ciphertext, plaintext, or key material.
 
 ## Scope
 

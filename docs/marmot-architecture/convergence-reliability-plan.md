@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-15
+updated: 2026-08-16
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -132,7 +132,32 @@ The baseline is now a functioning reliability lab, but it does not yet justify t
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | complete | Headline workload families produce bounded, diagnosable results |
 | 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | complete | Model and tests detect seeded policy/lifecycle defects |
 | 5. App and process simulation | Real projections and lifecycle in one or many isolated runtimes | complete | The same case agrees in-process and across N processes |
-| 6. Route assurance and distributed campaigns | Decision-route equivalence plus container/VM/network/disk/version hardening and campaign operations | in-progress | Repeatable route-equivalence, soak, and release campaigns retain actionable artifacts |
+| 6. Route assurance and distributed campaigns | Decision-route equivalence plus container/VM/network/disk/version hardening and campaign operations | deferred | The core defect-discovery lab is operational; residual cross-VM, incident, and release evidence resumes on a named trigger |
+
+## Program Checkpoint (2026-08-15)
+
+The original practical goal is met: the repository has a useful, strict, repeatable convergence defect-discovery lab.
+It can generate legal and adversarial scenarios, run them with encrypted file-backed storage in isolated workers,
+preserve exact inputs and failure capsules, minimize and classify failures, compare progressively more
+production-shaped subjects, execute real multi-container checkpoints, and enforce scheduled resource/flake budgets.
+The lab has already exposed both production defects and simulator false positives, which is the intended feedback
+loop.
+
+Milestone 6 is now `deferred`, not falsely marked complete. Its remaining items are stronger assurance or specialized
+environment evidence, not prerequisites for useful large-scale local campaigns:
+
+- complete exact/public route-equivalence evidence over every suitable app/process/container/VM adapter;
+- execution of a reviewed incident-derived corpus;
+- a reviewed mixed-build release-hardening evidence bundle;
+- wider container soak and VM-only kernel/filesystem/block-device evidence; and
+- the post-milestone shared legality/profile architecture in section 6.6.
+
+Resume those residuals when a production convergence semantic, constant, storage/lifecycle path, or adapter changes;
+when a production incident supplies a new archetype; before a release requiring mixed-build assurance; or when a
+specific kernel, network, filesystem, block-device, or host-isolation hypothesis justifies the wider layer. Routine
+confidence work should now use the operator and scaling guides beside the simulator:
+[`RUNNING_CAMPAIGNS.md`](../../crates/cgka-conformance-simulator/RUNNING_CAMPAIGNS.md) and
+[`SCALING_CAMPAIGNS.md`](../../crates/cgka-conformance-simulator/SCALING_CAMPAIGNS.md).
 
 ## Milestone 0: Assurance Foundation
 
@@ -982,9 +1007,13 @@ just fast-ci
 
 ## Milestone 6: Route Assurance And Distributed Campaigns
 
+Status: `deferred`. The operational defect-discovery core is complete; the unchecked items below are preserved as
+trigger-driven assurance work described in the program checkpoint rather than an active implementation queue.
+
 Milestone 6 strengthens and quantifies the assurance case; it does not claim an exhaustive proof that every possible
-production execution is correct. Completion means that the declared decision routes, adapters, failure dimensions,
-and bounded state spaces have evidence, and that residual assumptions and untested surfaces are explicit. Formal
+production execution is correct. A future full completion would mean that the declared decision routes, adapters,
+failure dimensions, and bounded state spaces have evidence, and that residual assumptions and untested surfaces are
+explicit. Formal
 models prove the rules represented in those models, while campaigns test the implementation routes actually placed
 under observation. Neither substitutes for checking that every production decision route is represented.
 
@@ -1080,7 +1109,7 @@ catalog next into container/VM execution. The exact early-publication counterexa
 not evidence for a production convergence rewrite. Do not project app/process/container public evidence
 into exact cryptographic, durable-disposition, or active-decryptability claims that those adapters cannot expose.
 
-Current exact seed-0 restart findings (generator version `1`):
+Historical exact seed-0 restart discovery findings (generator version `1`):
 
 | Case | Boundary | Result | Stable evidence |
 | --- | --- | --- | --- |
@@ -1094,8 +1123,8 @@ identity defect: `PendingStateRef` is process-local, but accepted outbound recor
 with raw handles from the new engine incarnation. The harness now scopes pending labels, outbound sibling decisions,
 confirmation, and rollback to the issuing incarnation. The focused reused-handle regression passes, followed by all
 12 exact seed-0 restart cases. No production convergence behavior changed. The failure digests above remain the
-historical discovery evidence; the post-fix local output directory is supporting evidence until the merge commit and
-its CI run provide the durable record.
+historical discovery evidence. [MDK #1465](https://github.com/marmot-protocol/mdk/pull/1465), merge `735c8ff2`, and
+its green [CI run](https://github.com/marmot-protocol/mdk/actions/runs/31900189547) are the durable post-fix record.
 
 [MDK #1329](https://github.com/marmot-protocol/mdk/pull/1329) merged the fail-closed missing-anchor behavior and
 Welcome-repair retirement. Its formerly stacked [MDK #1293](https://github.com/marmot-protocol/mdk/pull/1293) has now
@@ -1245,9 +1274,10 @@ operations and cross-operation interactions actually occurred.
 - [ ] Add explicit workload-size controls for dimensions such as actions, participants, message volume, commit/proposal
   frequency, and offline backlog. Do not overload `--cases` or `--seed`: cases remains the number of independently
   generated scenarios, while the seed selects reproducible choices within each case.
-- [ ] Preserve reproducibility as `(family/profile version, seed, case index)`: increasing `--cases` must preserve the
-  existing case prefix, saved inputs must replay independently, and output-changing generator work must bump the
-  generator/profile version rather than silently changing an existing corpus.
+- [ ] Preserve reproducibility as `(family_name, generator_version, seed, case_index)`, plus an independently
+  versioned workload profile where applicable: increasing `--cases` must preserve the existing case prefix, saved
+  inputs must replay independently, and output-changing generator/profile work must bump its corresponding version
+  rather than silently changing an existing corpus.
 
 Verification for this follow-up must include:
 
@@ -1373,9 +1403,9 @@ rerun remains useful release evidence and must still identify its own exact sour
 - [ ] The #1285 same-source-epoch cross-route regression passes across engine, app-runtime, process, container, and VM
   adapters using the shared public oracle, while every engine-capable adapter additionally proves exact cryptographic
   agreement, active decryptability, and complete application-input dispositions.
-- [ ] Campaigns are repeatable from saved configuration and artifact manifests.
-- [ ] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
-- [ ] Resource and flake budgets prevent silent campaign degradation.
+- [x] Campaigns are repeatable from saved configuration and artifact manifests.
+- [x] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
+- [x] Resource and flake budgets prevent silent campaign degradation.
 - [ ] Release hardening produces a reviewed convergence evidence bundle that lists covered decision routes, models,
   adapters, mutation results, workload/constant boundaries, unresolved counterexamples, residual assumptions, and
   untested surfaces. The bundle makes a scoped assurance claim rather than asserting universal implementation
@@ -1419,23 +1449,22 @@ minimized reproducer
 The artifact schema must distinguish synthetic shareable data from sensitive incident evidence. Local sensitive
 artifacts use restrictive creation helpers and are never committed.
 
-## Immediate Implementation Sequence
+## Current Operating Sequence
 
-The first implementation series is deliberately ordered:
+The implementation sequence has landed. Ongoing use should follow this evidence ladder:
 
-1. strict Tamarin warning/derivation gate;
-2. assurance contract and constant-ledger review against the canonical protocol;
-3. exact state/scenario-input oracle;
-4. public subject boundary and complete quiescence;
-5. failure capsule;
-6. Scenario IR v2;
-7. retained multi-relay model;
-8. required workload families;
-9. independent/liveness models and mutation campaign;
-10. app-runtime, process, and distributed adapters.
+1. run a strict file-backed canary and preserve exact generated inputs;
+2. shard broad discovery across distinct seeds in isolated case workers;
+3. reproduce and semantically minimize every failure at the smallest compatible adapter;
+4. promote representative saved inputs to app-runtime and separate-process execution;
+5. use containers only for real-socket, namespace, image, or supported network/storage hypotheses; and
+6. use VMs only for a named kernel, filesystem, block-device, reboot, or host-isolation question.
 
-Large-scale process or VM work does not begin before Milestone 1 establishes that the simulator can recognize an
-incorrect result.
+The exact commands, artifacts, failure workflow, and confidence limits are maintained in
+[`RUNNING_CAMPAIGNS.md`](../../crates/cgka-conformance-simulator/RUNNING_CAMPAIGNS.md). Sharding, retention, family
+design, and high-value chaos motifs are maintained in
+[`SCALING_CAMPAIGNS.md`](../../crates/cgka-conformance-simulator/SCALING_CAMPAIGNS.md). The unchecked Milestone 6
+items resume only under the triggers in the program checkpoint.
 
 ## Progress Log
 
@@ -1526,6 +1555,7 @@ incorrect result.
 | 2026-08-15 | 6.3 release evidence production path | Replaced the release lane's unprovisioned manifest-path input with an exact ancestor revision, two source-built content-addressed images, one runner-materialized canonical cross-route manifest, and deterministic evidence assembly. The assembler binds the reviewed claim to the canonical IR, normalized mixed-build execution, strict public oracle, successful receipt, raw lane observation, recomputed budget, and private digest-pinned artifact copies. No release assurance item closes until an actual workflow artifact is downloaded and reviewed. | `materialize-release-campaign`; `assemble-release-evidence`; `cross-route-mixed-build.v1.json`; release workflow contract tests |
 | 2026-08-15 | 6.1 durable-transition restart catalog | Added a bounded twelve-case current-build catalog over the shared four-party cross-route topology. The builder resolves named publication boundaries to adapter-supported action ids only after inserting each restart, keeping relay faults invariant as the schedule shifts; semantic sequence and insertion-index tests pin every boundary. Public cases run through the full app runtime with strict state/admin and order-insensitive exact-payload expectations; a separate exact retained-engine family uses isolated workers so one panic cannot abort later cases. The reviewed seed-0 public catalog passed 12/12. The exact catalog passed 9/12 and localized all failures to Zeta's three early accepted-publication boundaries: structured `PendingPublish`, panic from `PendingPublish`, and epoch-3/pending-work/decryptability stall. Structured failures wrote shareable capsules; the panic preserved exact input and exit 101 but no report/capsule. Every later branch/repair restart passed, including all four restarts after the corrected first repair round. Isolated-process cases share the catalog and bind every restart to a durable lifecycle event. This is discovery evidence, not a fix; diagnosis/remediation, process/container/VM execution, and complete app-input dispositions remain open. | `cross-route-restart-permutations/v1`; `cross-route-exact-restart-permutations/v1`; public seed-0 12/12; exact seed-0 9/12; failure capsules/digests; process catalog test |
 | 2026-08-15 | 6.1 exact-restart harness remediation | Minimized all three early Zeta failures to one simulator identity bug: `PendingStateRef` is process-local, while the harness retained accepted outbound records across restart and compared only the raw handle. A fresh engine could reuse that handle, causing the adapter to report transport acceptance but skip `confirm_published` for the new staged evolution. Pending labels and outbound sibling/confirmation/rollback decisions are now scoped by client incarnation, and old-incarnation transport outcomes cannot mutate new engine state. The focused reused-handle regression failed with the original `PendingPublish` panic before the fix and passes afterward; the exact seed-0 catalog moved from 9/12 to 12/12. No production engine, storage, app, or protocol behavior changed. | `accepted_publication_before_restart_cannot_confirm_reused_pending_ref`; `just cross-route-exact-restart-campaign 0 12`; simulator adapter only |
+| 2026-08-15 | Program closeout and operator manuals | Recorded the defect-discovery lab as operational, deferred only the stronger cross-VM/incident/release assurance residuals behind explicit resumption triggers, and added human and agent workflows for strict execution, replay, artifact handling, scale-out, family design, and adapter promotion. The historical exact restart failures are now tied to #1465's merged simulator-only remediation and green CI evidence. | [`RUNNING_CAMPAIGNS.md`](../../crates/cgka-conformance-simulator/RUNNING_CAMPAIGNS.md); [`SCALING_CAMPAIGNS.md`](../../crates/cgka-conformance-simulator/SCALING_CAMPAIGNS.md); [MDK #1465](https://github.com/marmot-protocol/mdk/pull/1465); merge `735c8ff2` |
 
 ## Capability Naming Cleanup
 
