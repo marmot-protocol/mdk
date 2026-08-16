@@ -1085,6 +1085,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![legacy_kp],
+            initial_admins: vec![],
         })
         .await
         .expect_err("current group must reject a legacy KeyPackage");
@@ -1489,6 +1490,8 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id,
             key_packages: vec![invitee_key_package],
+
+            initial_admins: vec![],
         })
         .await
         .expect_err("strict cutover must freeze legacy-group membership");

@@ -993,6 +993,8 @@ fn prepare_rejoin_with_history(
         .block_on(alice.send(SendIntent::Invite {
             group_id,
             key_packages: vec![rejoin_kp],
+
+            initial_admins: vec![],
         }))
         .expect("re-invite succeeds");
     let SendResult::GroupEvolution {

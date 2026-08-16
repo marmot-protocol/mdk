@@ -67,7 +67,9 @@ async fn accept_group_invite_retrying_busy(
         loop {
             match runtime.accept_group_invite(account_ref, group_id).await {
                 Ok(_) => return,
-                Err(AppError::AccountWorkerBusy) => sleep(Duration::from_millis(10)).await,
+                Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
+                    sleep(Duration::from_millis(10)).await
+                }
                 Err(error) => panic!("invite acceptance failed: {error}"),
             }
         }

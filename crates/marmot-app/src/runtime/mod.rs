@@ -1448,8 +1448,19 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         members: &[String],
     ) -> Result<SendSummary, AppError> {
+        self.invite_members_with_initial_admins(account_ref, group_id, members, &[])
+            .await
+    }
+
+    pub async fn invite_members_with_initial_admins(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        members: &[String],
+        initial_admins: &[String],
+    ) -> Result<SendSummary, AppError> {
         self.accounts
-            .invite_members(account_ref, group_id, members)
+            .invite_members_with_initial_admins(account_ref, group_id, members, initial_admins)
             .await
     }
 
@@ -3415,6 +3426,12 @@ impl MarmotAppRuntime {
         self.accounts.create_or_import_account(request).await
     }
 
+    /// Wait until in-flight create/invite Welcome fanout has finished on every
+    /// managed worker, while the relay plane is still live.
+    pub async fn drain_in_flight_work(&self) -> Result<(), AppError> {
+        self.accounts.drain_in_flight_work().await
+    }
+
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
@@ -5086,6 +5103,32 @@ impl AccountManager {
                 "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
             ))),
         }
+    }
+
+    /// Wait until in-flight create/invite Welcome fanout has finished on every
+    /// managed worker. One-shot CLI calls this before [`Self::shutdown`] so the
+    /// relay plane is still available for that publish.
+    pub async fn drain_in_flight_work(&self) -> Result<(), AppError> {
+        let senders = {
+            let workers = self.workers.lock().await;
+            workers
+                .values()
+                .map(|worker| worker.commands.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut responses = Vec::with_capacity(senders.len());
+        for commands in senders {
+            let (respond, response) = oneshot::channel();
+            commands
+                .send(AccountWorkerCommand::Drain { respond })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            responses.push(response);
+        }
+        for response in responses {
+            response.await.map_err(|_| AppError::TransportClosed)?;
+        }
+        Ok(())
     }
 
     pub async fn shutdown(&self) {

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_session::PublishWork;
+use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
@@ -21,6 +21,9 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::StreamExt;
+use marmot_account::{
+    CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
+};
 use marmot_forensics::AuditEventContext;
 use nostr::NostrSigner;
 
@@ -65,6 +68,47 @@ pub(crate) use sync::is_own_relay_echo;
 pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+const INVITE_LOOKUP_CONCURRENCY: usize = CREATE_GROUP_LOOKUP_CONCURRENCY;
+
+pub(crate) enum UnpublishedWelcomeKind {
+    Founding {
+        effects: SessionEffects,
+        welcome_intents: Vec<String>,
+    },
+    Invite {
+        welcomes: Vec<cgka_traits::transport::TransportMessage>,
+        welcome_intents: Vec<String>,
+    },
+}
+
+pub(crate) struct UnpublishedWelcomeDelivery {
+    group_id: GroupId,
+    audit_context: AuditEventContext,
+    kind: UnpublishedWelcomeKind,
+}
+
+pub(crate) struct PendingWelcomeDeliveryRecovery {
+    welcome_ids: Vec<String>,
+    publish: PreparedWelcomePublishTask,
+}
+
+pub(crate) struct CompletedWelcomeDeliveryRecovery {
+    welcome_ids: Vec<String>,
+    publish: CompletedWelcomePublishTask,
+}
+
+impl PendingWelcomeDeliveryRecovery {
+    pub(crate) fn message_ids(&self) -> &[MessageId] {
+        self.publish.message_ids()
+    }
+
+    pub(crate) async fn run(self) -> CompletedWelcomeDeliveryRecovery {
+        CompletedWelcomeDeliveryRecovery {
+            welcome_ids: self.welcome_ids,
+            publish: self.publish.run().await,
+        }
+    }
+}
 
 pub(crate) struct EncryptedMediaUploadHttp {
     request: MediaUploadRequest,
@@ -254,6 +298,9 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Canonical create/invite work whose Welcome fanout has not run yet.
+    /// The managed account worker replies first, then drives this delivery.
+    pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
     /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
@@ -285,10 +332,10 @@ pub struct AppClient {
     pub(crate) checkpoint_route_refresh_recomputes: u64,
 }
 
-/// Cross the point-of-no-return for current-profile group creation without
-/// allowing repairable follow-up work to turn a canonical group into an
-/// apparent create failure. Returning `Err` after that boundary encourages a
-/// caller to retry and create a second group. The engine's retained outbound
+/// Cross the point-of-no-return for a current-profile group mutation without
+/// allowing repairable follow-up work to turn a canonical change into an
+/// apparent failure. Returning `Err` after that boundary encourages a caller
+/// to retry an already-applied create or invite. The engine's retained outbound
 /// Welcome index and account-open reconciliation repair any missed projection
 /// work.
 fn recover_post_canonical_result<T: Default>(
@@ -302,7 +349,7 @@ fn recover_post_canonical_result<T: Default>(
                 target: "marmot_app::client",
                 method = method,
                 error_kind = error.privacy_safe_kind(),
-                "canonical group creation outpaced repairable follow-up work"
+                "canonical group mutation outpaced repairable follow-up work"
             );
             T::default()
         }
@@ -769,6 +816,7 @@ impl AppClient {
                 None,
             )
             .await?;
+        self.drive_unpublished_welcome_delivery(None).await;
         // Direct `AppClient` callers do not have the managed account worker to
         // refresh subscriptions after its response. Preserve that API's
         // historical readiness guarantee; the managed runtime uses the
@@ -943,41 +991,19 @@ impl AppClient {
             "record_founding_welcome_delivery_intents",
             self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
         );
-        let welcome_publish_started_at = Instant::now();
-        let publish_result = self
-            .runtime
-            .publish_prepared_session_effects_with_audit_context(
-                prepared.effects,
-                audit_context.clone(),
-            )
-            .await
-            .map_err(AppError::from);
-        record_app_performance(
-            telemetry,
-            AppPerformanceOperation::GroupCreateWelcomePublish,
-            welcome_publish_started_at.elapsed(),
-            publish_result.is_ok(),
-        );
-        let effects =
-            recover_post_canonical_result("publish_prepared_founding_group", publish_result);
-        recover_post_canonical_result(
-            "clear_delivered_founding_welcome_intents",
-            self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects),
-        );
-        recover_post_canonical_result(
-            "classify_founding_welcome_publish",
-            fail_if_publish_failed(&effects),
-        );
-        recover_post_canonical_result(
-            "record_founding_welcome_delivery_failures",
-            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
-        );
-        self.record_human_action_succeeded(&group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        // The engine group is already published and confirmed. Projection,
-        // state persistence, and subscription refresh are downstream repairable
-        // work; none can roll the group back, so none may turn this operation
-        // into a false failure that invites the caller to create a duplicate.
+        self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
+            group_id: group_id.clone(),
+            audit_context: audit_context.clone(),
+            kind: UnpublishedWelcomeKind::Founding {
+                effects: prepared.effects,
+                welcome_intents: founding_welcome_intents,
+            },
+        });
+        // The engine group is already canonical. Projection and state
+        // persistence are downstream repairable work; none can roll the group
+        // back, so none may turn this operation into a false failure that
+        // invites the caller to create a duplicate. Welcome fanout is driven
+        // after the caller-visible return.
         let local_projection_started_at = Instant::now();
         let local_projection_saved = match self.add_group(&group_id) {
             Ok(()) => match self.save_state_with_pending_local_group_deletion_frontier_clears() {
@@ -1002,7 +1028,6 @@ impl AppClient {
                 false
             }
         };
-        self.queue_own_group_system_projection_updates(&effects);
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupCreateLocalProjectionSave,
@@ -1357,37 +1382,48 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_optional_telemetry(group_id, member_refs, None)
-            .await
+        let summary = self
+            .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
+            .await?;
+        self.drive_unpublished_welcome_delivery(None).await;
+        Ok(summary)
     }
 
     pub(crate) async fn invite_members_with_telemetry(
         &mut self,
         group_id: &GroupId,
         member_refs: &[&str],
+        initial_admin_refs: &[&str],
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_optional_telemetry(group_id, member_refs, Some(telemetry))
-            .await
+        self.invite_members_with_optional_telemetry(
+            group_id,
+            member_refs,
+            initial_admin_refs,
+            Some(telemetry),
+        )
+        .await
     }
 
     async fn invite_members_with_optional_telemetry(
         &mut self,
         group_id: &GroupId,
         member_refs: &[&str],
+        initial_admin_refs: &[&str],
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
         let key_package_started_at = Instant::now();
-        let key_packages = async {
-            let mut key_packages = Vec::with_capacity(member_refs.len());
-            for member in member_refs {
-                key_packages.push(self.app.member_key_package(member).await?);
-            }
-            Ok::<_, AppError>(key_packages)
-        }
-        .await;
+        let lookups = member_refs
+            .iter()
+            .map(|member| {
+                let app = self.app.clone();
+                let member = (*member).to_owned();
+                async move { app.member_key_package(&member).await }
+            })
+            .collect::<Vec<_>>();
+        let key_packages = collect_bounded_ordered(lookups, INVITE_LOOKUP_CONCURRENCY).await;
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,
@@ -1395,6 +1431,11 @@ impl AppClient {
             key_packages.is_ok(),
         );
         let key_packages = key_packages?;
+
+        let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
+        for admin in initial_admin_refs {
+            initial_admins.push(self.app.member_id(admin)?);
+        }
 
         let routing_refresh_started_at = Instant::now();
         let routing_refresh = self.refresh_routing();
@@ -1406,10 +1447,16 @@ impl AppClient {
         );
         routing_refresh?;
 
+        let mut affected_fields = vec!["members"];
+        let mut affected_components = Vec::new();
+        if !initial_admin_refs.is_empty() {
+            affected_fields.push("admins");
+            affected_components.push(GROUP_ADMIN_POLICY_COMPONENT_ID);
+        }
         let audit_context = Self::local_human_action_context(
             "invite_members",
-            vec!["members"],
-            Vec::new(),
+            affected_fields,
+            affected_components,
             Some(member_refs.len() as u64),
         );
 
@@ -1424,13 +1471,103 @@ impl AppClient {
         pre_send_sync?;
 
         let engine_publish_started_at = Instant::now();
-        let effects = self
+        let commit = self
             .runtime
-            .send_with_audit_context(
+            .confirm_commit_without_publish_with_audit_context(
                 SendIntent::Invite {
                     group_id: group_id.clone(),
                     key_packages,
+                    initial_admins,
                 },
+                audit_context.clone(),
+            )
+            .await
+            .map_err(AppError::from);
+        let prepared = match commit {
+            Ok(PreparedSessionSend::Commit(prepared)) => prepared,
+            Ok(PreparedSessionSend::Queued(session_effects)) => {
+                let queued = self
+                    .runtime
+                    .publish_prepared_session_effects_with_audit_context(
+                        session_effects,
+                        audit_context,
+                    )
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    queued.is_ok(),
+                );
+                return queued.map(|effects| send_summary_from_effects(&effects));
+            }
+            Err(error) => {
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        // The invite is staged locally but not canonical yet. Record every
+        // Welcome destination atomically before exposing the commit; if that
+        // persistence fails, roll back the staged MLS change and return the
+        // original error so a retry cannot create phantom local membership.
+        let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_fail_invite_welcome_intent
+        {
+            Err(AppError::Publish(
+                "injected invite welcome intent failure".into(),
+            ))
+        } else {
+            self.record_welcome_delivery_intents(group_id, prepared.welcomes())
+        };
+        let welcome_intents = match welcome_intent_result {
+            Ok(welcome_intents) => welcome_intents,
+            Err(error) => {
+                let rollback = self
+                    .runtime
+                    .rollback_prepared_session_commit(prepared)
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    false,
+                );
+                rollback?;
+                self.refresh_group(group_id);
+                if let Err(refresh_error) =
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()
+                {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "invite_members_intent_failure_rollback",
+                        error_kind = refresh_error.privacy_safe_kind(),
+                        "rolled back staged invite but could not persist the refreshed app projection"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let (session_effects, welcomes) = prepared.into_effects_and_welcomes();
+        self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
+            group_id: group_id.clone(),
+            audit_context: audit_context.clone(),
+            kind: UnpublishedWelcomeKind::Invite {
+                welcomes,
+                welcome_intents,
+            },
+        });
+
+        let published = self
+            .runtime
+            .publish_prepared_session_effects_with_audit_context(
+                session_effects,
                 audit_context.clone(),
             )
             .await
@@ -1443,12 +1580,29 @@ impl AppClient {
             telemetry,
             AppPerformanceOperation::GroupInviteEnginePublish,
             engine_publish_started_at.elapsed(),
-            effects.is_ok(),
+            published.is_ok(),
         );
-        let effects = effects?;
+        let effects = match published {
+            Ok(effects) => effects,
+            Err(error) => {
+                // The account runtime has either rolled the unexposed commit
+                // back or retained its durable fanout for exact retry. Do not
+                // let this in-memory slot independently publish Welcomes after
+                // a failed caller-visible commit attempt.
+                self.unpublished_welcome_delivery = None;
+                return Err(error);
+            }
+        };
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
+            if cfg!(feature = "test-policy-overrides")
+                && self.app.config.dev_fail_invite_local_refresh
+            {
+                return Err(AppError::Publish(
+                    "injected invite local refresh failure".into(),
+                ));
+            }
             self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
             self.remember_published_reports(&effects);
@@ -1464,7 +1618,7 @@ impl AppClient {
             local_refresh_started_at.elapsed(),
             local_refresh.is_ok(),
         );
-        local_refresh?;
+        recover_post_canonical_result("invite_members_local_refresh", local_refresh);
 
         let summary = send_summary_from_effects(&effects);
 
@@ -3647,31 +3801,44 @@ impl AppClient {
         group_id: &GroupId,
         effects: &cgka_session::SessionEffects,
     ) -> Result<Vec<String>, AppError> {
+        let mut welcomes = Vec::new();
+        for work in &effects.publish {
+            let PublishWork::FoundingGroupCreated { welcomes: items } = work else {
+                continue;
+            };
+            welcomes.extend(items.iter().cloned());
+        }
+        self.record_welcome_delivery_intents(group_id, &welcomes)
+    }
+
+    fn record_welcome_delivery_intents(
+        &mut self,
+        group_id: &GroupId,
+        welcomes: &[cgka_traits::transport::TransportMessage],
+    ) -> Result<Vec<String>, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
         let recorded_at = unix_now_seconds();
         let storage = self.app.account_storage(&self.state.label)?;
-        let mut message_ids = Vec::new();
-        for work in &effects.publish {
-            let PublishWork::FoundingGroupCreated { welcomes } = work else {
-                continue;
+        let mut records = Vec::with_capacity(welcomes.len());
+        for welcome in welcomes {
+            let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+                return Err(AppError::Publish(
+                    "delivery artifact was not a Welcome".into(),
+                ));
             };
-            for welcome in welcomes {
-                let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
-                    return Err(AppError::Publish(
-                        "founding delivery artifact was not a Welcome".into(),
-                    ));
-                };
-                let message_id_hex = hex::encode(welcome.id.as_slice());
-                storage.record_pending_welcome_delivery(
-                    &message_id_hex,
-                    &group_id_hex,
-                    &hex::encode(recipient.as_slice()),
-                    recorded_at,
-                )?;
-                message_ids.push(message_id_hex);
-            }
+            let message_id_hex = hex::encode(welcome.id.as_slice());
+            records.push(storage_sqlite::PendingWelcomeDeliveryRecord {
+                message_id_hex,
+                group_id_hex: group_id_hex.clone(),
+                recipient_hex: hex::encode(recipient.as_slice()),
+                recorded_at,
+            });
         }
-        Ok(message_ids)
+        storage.record_pending_welcome_deliveries(&records)?;
+        Ok(records
+            .into_iter()
+            .map(|record| record.message_id_hex)
+            .collect())
     }
 
     /// Clear only intent rows whose exact Welcome met its acknowledgement
@@ -3703,11 +3870,12 @@ impl AppClient {
     /// Reconcile the app-facing repair index from the engine's authoritative
     /// retained Welcome obligations.
     ///
-    /// The engine persists founding Welcomes in the same transaction that
-    /// makes the group canonical. This closes the crash window between
-    /// `prepare_create_group` returning and the app recording its convenience
-    /// index: a cold restart can rebuild missing rows without re-creating the
-    /// group or re-consuming KeyPackages.
+    /// The engine persists founding Welcomes at canonical creation and promotes
+    /// invite Welcomes in the transaction that confirms their Add commit. This
+    /// closes the crash window between the canonical boundary and this
+    /// convenience index: a cold restart can rebuild missing rows without
+    /// re-creating the group, re-committing the invite, or re-consuming
+    /// KeyPackages.
     fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
         let outstanding = self.runtime.outstanding_welcome_deliveries()?;
         let tracked_ids = self
@@ -3754,11 +3922,194 @@ impl AppClient {
         Ok(())
     }
 
+    /// Publish Welcome obligations stashed at the canonical create/invite
+    /// boundary. Managed workers call this after replying; direct AppClient
+    /// callers still await it so existing tests keep a complete delivery path.
+    pub(crate) async fn drive_unpublished_welcome_delivery(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) {
+        let Some(work) = self.unpublished_welcome_delivery.take() else {
+            return;
+        };
+        match work.kind {
+            UnpublishedWelcomeKind::Founding {
+                effects,
+                welcome_intents,
+            } => {
+                let welcome_publish_started_at = Instant::now();
+                let publish_result = self
+                    .runtime
+                    .publish_prepared_session_effects_with_audit_context(
+                        effects,
+                        work.audit_context.clone(),
+                    )
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupCreateWelcomePublish,
+                    welcome_publish_started_at.elapsed(),
+                    publish_result.is_ok(),
+                );
+                let effects = recover_post_canonical_result(
+                    "publish_prepared_founding_group",
+                    publish_result,
+                );
+                recover_post_canonical_result(
+                    "clear_delivered_founding_welcome_intents",
+                    self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects),
+                );
+                recover_post_canonical_result(
+                    "classify_founding_welcome_publish",
+                    fail_if_publish_failed(&effects),
+                );
+                recover_post_canonical_result(
+                    "record_founding_welcome_delivery_failures",
+                    self.record_welcome_delivery_failures(
+                        &hex::encode(work.group_id.as_slice()),
+                        &effects,
+                    ),
+                );
+                self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
+                self.remember_published_reports(&effects);
+                self.queue_own_group_system_projection_updates(&effects);
+            }
+            UnpublishedWelcomeKind::Invite {
+                welcomes,
+                welcome_intents,
+            } => {
+                let welcome_publish_started_at = Instant::now();
+                let publish_result = self
+                    .runtime
+                    .publish_welcome_messages_with_audit_context(
+                        welcomes,
+                        Some(work.group_id.clone()),
+                        work.audit_context,
+                    )
+                    .await
+                    .map_err(AppError::from);
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteWelcomePublish,
+                    welcome_publish_started_at.elapsed(),
+                    publish_result.is_ok(),
+                );
+                let effects = match publish_result {
+                    Ok(effects) => effects,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "marmot_app::client",
+                            method = "drive_unpublished_welcome_delivery",
+                            error_kind = error.privacy_safe_kind(),
+                            "confirmed invite outpaced Welcome fanout; pending obligations remain retryable"
+                        );
+                        return;
+                    }
+                };
+                let _ = self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects);
+                let _ = self.record_welcome_delivery_failures(
+                    &hex::encode(work.group_id.as_slice()),
+                    &effects,
+                );
+                self.remember_published_reports(&effects);
+            }
+        }
+    }
+
     /// Drain the welcomes queued for re-delivery during the last create/invite,
     /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
     pub(crate) fn take_pending_welcome_delivery_events(&mut self) -> Vec<PendingWelcomeDelivery> {
         std::mem::take(&mut self.pending_welcome_delivery_events)
+    }
+
+    /// Prepare one bounded startup retry for every engine-authoritative
+    /// outstanding Welcome.
+    ///
+    /// Only relay I/O moves into the returned task. Exact artifacts, endpoint
+    /// snapshots, and attempt reservations are durable/owned by this client so
+    /// the account worker can keep processing inbound traffic and commands
+    /// without creating a second retry for the same message id.
+    pub(crate) fn prepare_pending_welcome_delivery_recovery_best_effort(
+        &mut self,
+    ) -> Option<PendingWelcomeDeliveryRecovery> {
+        let pending = match self.runtime.outstanding_welcome_deliveries() {
+            Ok(pending) => pending,
+            Err(error) => {
+                let error = AppError::from(error);
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not enumerate retained Welcome obligations at startup"
+                );
+                return None;
+            }
+        };
+        if pending.is_empty() {
+            return None;
+        }
+        let welcome_ids = pending
+            .iter()
+            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
+            .collect::<Vec<_>>();
+        let welcomes = pending
+            .into_iter()
+            .map(|(_, welcome)| welcome)
+            .collect::<Vec<_>>();
+        let publish = match self
+            .runtime
+            .prepare_welcome_retry_task_with_audit_context(welcomes, AuditEventContext::default())
+        {
+            Ok(publish) => publish,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not prepare retained Welcome obligations at startup"
+                );
+                return None;
+            }
+        };
+        Some(PendingWelcomeDeliveryRecovery {
+            welcome_ids,
+            publish,
+        })
+    }
+
+    /// Reconcile a detached startup retry back through the serialized account
+    /// owner and retire only obligations whose acknowledgement policy landed.
+    pub(crate) async fn finish_pending_welcome_delivery_recovery_best_effort(
+        &mut self,
+        completed: CompletedWelcomeDeliveryRecovery,
+    ) {
+        match self
+            .runtime
+            .finish_welcome_publish_task(completed.publish)
+            .await
+        {
+            Ok(effects) => {
+                let _ =
+                    self.clear_delivered_founding_welcome_intents(&completed.welcome_ids, &effects);
+                self.remember_published_reports(&effects);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "finish_pending_welcome_delivery_recovery_best_effort",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "startup Welcome retry left obligations pending"
+                );
+            }
+        }
+    }
+
+    /// Release an in-memory retry reservation after its relay task panics or is
+    /// cancelled. The exact durable obligation remains available for restart.
+    pub(crate) fn abandon_pending_welcome_delivery_recovery(&mut self, message_ids: &[MessageId]) {
+        self.runtime.abandon_welcome_publish_task(message_ids);
     }
 
     /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest
@@ -3871,7 +4222,7 @@ fn local_account_removed_from_roster(
 #[cfg(test)]
 mod post_canonical_create_tests {
     use super::{
-        CREATE_GROUP_LOOKUP_CONCURRENCY, collect_bounded_ordered,
+        CREATE_GROUP_LOOKUP_CONCURRENCY, INVITE_LOOKUP_CONCURRENCY, collect_bounded_ordered,
         preferred_initial_group_image_component, recover_post_canonical_result,
     };
     use crate::AppError;
@@ -3930,7 +4281,7 @@ mod post_canonical_create_tests {
         for item_count in [1, 5, 20] {
             let cached = collect_bounded_ordered(
                 (0..item_count).map(|index| std::future::ready(Ok::<_, &'static str>(index))),
-                CREATE_GROUP_LOOKUP_CONCURRENCY,
+                INVITE_LOOKUP_CONCURRENCY,
             )
             .await
             .unwrap();

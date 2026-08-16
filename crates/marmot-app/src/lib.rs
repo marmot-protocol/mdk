@@ -1514,6 +1514,7 @@ impl MarmotApp {
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
+            unpublished_welcome_delivery: None,
             epoch_stall: Default::default(),
             pending_epoch_backfill: None,
             queued_epoch_backfills: std::collections::VecDeque::new(),

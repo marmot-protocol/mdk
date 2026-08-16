@@ -20,8 +20,9 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::GroupStorage;
+use cgka_traits::storage::{GroupStorage, MessageStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -179,6 +180,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
     let key = SqlCipherKey::new("pending commit recovery key").unwrap();
 
     let group_id;
+    let stranded_welcome_id;
 
     // ── Phase 1: create + confirm a group, then stage an invite and "crash"
     //    before resolving the publish. ───────────────────────────────────────
@@ -219,10 +221,18 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![carol_kp],
+                initial_admins: vec![],
             })
             .await
             .unwrap();
-        assert!(matches!(invite, SendResult::GroupEvolution { .. }));
+        stranded_welcome_id = match invite {
+            SendResult::GroupEvolution { welcomes, .. } => welcomes
+                .first()
+                .expect("invite produces a Welcome")
+                .id
+                .clone(),
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
         assert_eq!(
             alice.members(&group_id).unwrap().len(),
             3,
@@ -244,6 +254,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         "stranded projection persisted across the crash"
     );
 
+    let reopened_store_probe = reopened_store.clone();
     let mut alice = build_client(reopened_store, b"alice-pcr");
     alice
         .hydrate_all_stored_groups()
@@ -271,6 +282,36 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         2,
         "carol dropped after recovery"
     );
+    let retired_welcome = reopened_store_probe
+        .get_message(&stranded_welcome_id)
+        .expect("rolled-back Welcome remains a terminal tracked artifact");
+    assert_eq!(retired_welcome.state, MessageState::Failed);
+    assert!(
+        StoredMessagePayload::decode(&retired_welcome.payload)
+            .unwrap()
+            .as_outbound_welcome()
+            .is_some(),
+        "cold rollback must make the app index able to retire the orphan"
+    );
+    assert!(
+        alice
+            .outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .all(|(_, welcome)| welcome.id != stranded_welcome_id),
+        "cold rollback must leave no deliverable Welcome for the stranded invite"
+    );
+    assert!(
+        alice
+            .tracked_outbound_welcome_ids()
+            .unwrap()
+            .contains(&stranded_welcome_id),
+        "the app repair index must be able to recognize and retire the canceled row"
+    );
+    assert!(
+        alice.stored_sent_welcome(&stranded_welcome_id).is_err(),
+        "an explicit redelivery handle must reject the rolled-back Welcome"
+    );
 
     // The group is no longer wedged: a fresh commit-creating operation must
     // succeed rather than failing on the leftover pending commit.
@@ -280,6 +321,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("post-recovery invite must succeed");

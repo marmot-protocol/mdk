@@ -1347,6 +1347,7 @@ async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_membe
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3265,6 +3266,7 @@ async fn update_group_data_during_pending_publish_is_rejected() {
         .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

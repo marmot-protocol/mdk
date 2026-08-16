@@ -556,6 +556,7 @@ async fn run_child_case(database: &Path) {
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![david_kp],
+                initial_admins: vec![],
             })
             .await
             .expect("alice invite"),
@@ -580,6 +581,7 @@ async fn run_child_case(database: &Path) {
         bob.send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("bob invite"),

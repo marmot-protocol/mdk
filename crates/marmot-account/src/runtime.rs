@@ -1,7 +1,7 @@
 //! Account-device runtime: drives session effects through transport publish,
 //! confirmation, and rollback, and the effect aggregates it produces.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ use crate::time::{
 };
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
-const FOUNDING_WELCOME_PUBLISH_CONCURRENCY: usize = 8;
+const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
 const KEY_PACKAGE_REFRESH_MAX_LEAD_SECS: u64 = 21 * 24 * 60 * 60;
@@ -121,6 +121,132 @@ struct PreparedLegacyPublishAttempt {
     request: TransportPublishRequest,
 }
 
+struct WelcomePublishMetadata {
+    recipient: Option<MemberId>,
+    welcome_id: cgka_traits::MessageId,
+    effects: AccountDeviceEffects,
+}
+
+struct PreparedWelcomePublish {
+    group_id: Option<GroupId>,
+    metadata: Vec<WelcomePublishMetadata>,
+    completions: Vec<Option<LegacyPublishCompletion>>,
+    pending: VecDeque<(usize, Box<PreparedLegacyPublishAttempt>)>,
+}
+
+struct CompletedWelcomePublish {
+    group_id: Option<GroupId>,
+    metadata: Vec<WelcomePublishMetadata>,
+    completions: Vec<Option<LegacyPublishCompletion>>,
+}
+
+/// Relay-only half of a prepared Welcome retry.
+///
+/// The account worker may run this task independently of its serialized
+/// engine/SQLite owner. Preparation has already retained the exact event and
+/// endpoint snapshot; [`AccountDeviceRuntime::finish_welcome_publish_task`]
+/// must reconcile the returned completion before another retry is started.
+#[doc(hidden)]
+#[must_use = "a prepared Welcome publish task must be run and reconciled"]
+pub struct PreparedWelcomePublishTask {
+    adapter: Arc<dyn TransportAdapter>,
+    prepared: PreparedWelcomePublish,
+    message_ids: Vec<cgka_traits::MessageId>,
+}
+
+/// Opaque relay results from [`PreparedWelcomePublishTask::run`].
+#[doc(hidden)]
+pub struct CompletedWelcomePublishTask {
+    completed: CompletedWelcomePublish,
+    message_ids: Vec<cgka_traits::MessageId>,
+}
+
+impl PreparedWelcomePublishTask {
+    /// Exact message ids reserved by this task while relay I/O is in flight.
+    pub fn message_ids(&self) -> &[cgka_traits::MessageId] {
+        &self.message_ids
+    }
+
+    /// Run only the bounded relay publication phase. This owns no engine or
+    /// SQLite state and is therefore safe to poll beside the account worker.
+    pub async fn run(self) -> CompletedWelcomePublishTask {
+        CompletedWelcomePublishTask {
+            completed: self.prepared.publish(self.adapter.as_ref()).await,
+            message_ids: self.message_ids,
+        }
+    }
+}
+
+impl PreparedWelcomePublish {
+    fn network_message_ids(&self) -> Vec<cgka_traits::MessageId> {
+        self.pending
+            .iter()
+            .map(|(_, attempt)| attempt.message_id.clone())
+            .collect()
+    }
+
+    async fn publish(mut self, adapter: &dyn TransportAdapter) -> CompletedWelcomePublish {
+        let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+            let result = adapter.publish(attempt.request.clone()).await;
+            (index, attempt, result)
+        };
+        let mut in_flight = FuturesUnordered::new();
+        while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
+            let Some((index, attempt)) = self.pending.pop_front() else {
+                break;
+            };
+            in_flight.push(publish(index, attempt));
+        }
+        while let Some((index, attempt, result)) = in_flight.next().await {
+            self.completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
+            if let Some((next_index, next_attempt)) = self.pending.pop_front() {
+                in_flight.push(publish(next_index, next_attempt));
+            }
+        }
+
+        CompletedWelcomePublish {
+            group_id: self.group_id,
+            metadata: self.metadata,
+            completions: self.completions,
+        }
+    }
+}
+
+/// A locally staged commit whose transport publication has not started.
+///
+/// Keeping the pending handle beside the extracted Welcomes lets callers
+/// either publish the commit after durable Welcome-intent persistence or roll
+/// the staged MLS change back while external exposure is still impossible.
+#[must_use = "a prepared commit must be published or rolled back; dropping it strands the staged MLS commit"]
+pub struct PreparedSessionCommit {
+    effects: SessionEffects,
+    welcomes: Vec<TransportMessage>,
+    pending: PendingStateRef,
+}
+
+/// Result of accepting an intent at the pre-publication boundary.
+///
+/// Convergence may durably queue an invite without staging an MLS commit. That
+/// is successful `AcceptedPending` work, not a malformed prepared commit.
+pub enum PreparedSessionSend {
+    Commit(PreparedSessionCommit),
+    Queued(SessionEffects),
+}
+
+impl PreparedSessionCommit {
+    pub fn welcomes(&self) -> &[TransportMessage] {
+        &self.welcomes
+    }
+
+    pub fn into_effects_and_welcomes(self) -> (SessionEffects, Vec<TransportMessage>) {
+        (self.effects, self.welcomes)
+    }
+
+    fn into_parts(self) -> (SessionEffects, Vec<TransportMessage>, PendingStateRef) {
+        (self.effects, self.welcomes, self.pending)
+    }
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -131,6 +257,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_paused: bool,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Exact Welcome events whose relay-only publish phase currently runs
+    /// outside the serialized account owner. Other maintenance/manual retry
+    /// paths skip these ids until their results are reconciled, preventing two
+    /// concurrent publications of the same retained event.
+    detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
@@ -154,6 +285,7 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
+            detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
         }
     }
@@ -1629,6 +1761,174 @@ where
         Ok(output)
     }
 
+    /// Accept an outbound commit intent without publishing it.
+    ///
+    /// A ready group returns a staged commit with extracted Welcome payloads;
+    /// unsettled convergence returns the durable queued effects instead. For a
+    /// staged commit, the caller must record exact Welcome delivery obligations
+    /// before [`Self::publish_prepared_session_effects_with_audit_context`]
+    /// exposes the commit on the wire.
+    pub async fn confirm_commit_without_publish_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<PreparedSessionSend> {
+        if !supports_deferred_commit_publish(&intent) {
+            return Err(cgka_traits::EngineError::Other(
+                "deferred-publish acceptance requires a commit-producing or durably queued intent"
+                    .into(),
+            )
+            .into());
+        }
+        let session_effects = self
+            .session
+            .send_with_audit_context(intent, context)
+            .await?;
+        classify_prepared_session_send(session_effects)
+    }
+
+    /// Roll back a prepared commit before that commit has any transport side
+    /// effect, then publish any independent work generated while buffered input
+    /// is replayed against the restored group state.
+    pub async fn rollback_prepared_session_commit(
+        &mut self,
+        prepared: PreparedSessionCommit,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
+        prepared_effects.publish.clear();
+
+        let mut output = AccountDeviceEffects::default();
+        let mut queue = VecDeque::new();
+        output.absorb_session_effects(prepared_effects, &mut queue);
+
+        let rollback_effects = self.session.publish_failed(pending).await?;
+        output
+            .pending
+            .push(PendingResolution::RolledBack { pending });
+        output.absorb_session_effects(rollback_effects, &mut queue);
+        self.publish_queue(&mut output, &mut queue, None).await?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_superseded_maintenance(&output.events)?;
+        Ok(output)
+    }
+
+    /// Confirm an outbound intent's commit without waiting for Welcome fanout,
+    /// or preserve its accepted-pending disposition when convergence queued it.
+    ///
+    /// Founding creates and existing-group invites persist exact Welcome bytes
+    /// before this returns. The caller records those obligations, returns the
+    /// canonical mutation, then drives [`Self::publish_welcome_messages_with_audit_context`].
+    pub async fn send_confirming_commit_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<(AccountDeviceEffects, Vec<TransportMessage>)> {
+        let disposition_group = match &intent {
+            SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
+            _ => None,
+        };
+        let prepared = self
+            .confirm_commit_without_publish_with_audit_context(intent, context.clone())
+            .await?;
+        let (session_effects, welcomes) = match prepared {
+            PreparedSessionSend::Commit(prepared) => {
+                let (effects, welcomes, _pending) = prepared.into_parts();
+                (effects, welcomes)
+            }
+            PreparedSessionSend::Queued(effects) => (effects, Vec::new()),
+        };
+        let mut output = self
+            .publish_session_effects_with_audit_context(session_effects, Some(context))
+            .await?;
+        if let Some(group_id) = disposition_group
+            && self.post_join_rotation_pending(&group_id)?
+        {
+            output.maintenance_disposition =
+                SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
+        }
+        Ok((output, welcomes))
+    }
+
+    /// Publish previously deferred Welcome obligations with bounded concurrency.
+    pub async fn publish_welcome_messages_with_audit_context(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        group_id: Option<GroupId>,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let mut output = AccountDeviceEffects::default();
+        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context), false)
+            .await?;
+        Ok(output)
+    }
+
+    /// Retry retained Welcome obligations immediately with the shared bounded
+    /// fanout, bypassing the automatic backoff for this explicit startup pass.
+    pub async fn retry_welcome_messages_with_audit_context(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let mut output = AccountDeviceEffects::default();
+        self.publish_welcome_fanout(welcomes, None, &mut output, Some(context), true)
+            .await?;
+        Ok(output)
+    }
+
+    /// Prepare a startup Welcome retry whose relay I/O can run independently
+    /// from the serialized account worker.
+    ///
+    /// Preparation persists the exact event/endpoint attempts and reserves
+    /// their message ids in-memory before this returns. The returned task owns
+    /// only a cloned transport adapter; callers must pass its completion to
+    /// [`Self::finish_welcome_publish_task`] or release its reservation with
+    /// [`Self::abandon_welcome_publish_task`].
+    #[doc(hidden)]
+    pub fn prepare_welcome_retry_task_with_audit_context(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        context: AuditEventContext,
+    ) -> AccountResult<PreparedWelcomePublishTask>
+    where
+        A: Clone + 'static,
+    {
+        let prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
+        let message_ids = prepared.network_message_ids();
+        self.detached_welcome_publishes
+            .extend(message_ids.iter().cloned());
+        Ok(PreparedWelcomePublishTask {
+            adapter: Arc::new(self.adapter.clone()),
+            prepared,
+            message_ids,
+        })
+    }
+
+    /// Reconcile every relay result from a detached Welcome publish in input
+    /// order, then release its in-memory exact-event reservations.
+    #[doc(hidden)]
+    pub async fn finish_welcome_publish_task(
+        &mut self,
+        task: CompletedWelcomePublishTask,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let CompletedWelcomePublishTask {
+            completed,
+            message_ids,
+        } = task;
+        let mut output = AccountDeviceEffects::default();
+        let result = self.finish_welcome_publish(completed, &mut output).await;
+        self.abandon_welcome_publish_task(&message_ids);
+        result.map(|()| output)
+    }
+
+    /// Release the in-memory reservation after a detached relay task is
+    /// cancelled or panics. Durable fanout remains retryable.
+    #[doc(hidden)]
+    pub fn abandon_welcome_publish_task(&mut self, message_ids: &[cgka_traits::MessageId]) {
+        for message_id in message_ids {
+            self.detached_welcome_publishes.remove(message_id);
+        }
+    }
+
     pub async fn queue_app_message_with_audit_context(
         &mut self,
         group_id: GroupId,
@@ -2271,6 +2571,32 @@ where
             GroupEvent::GroupCreated { group_id } => Some(group_id.clone()),
             _ => None,
         });
+        self.publish_welcome_fanout(welcomes, group_id, output, context, false)
+            .await
+    }
+
+    /// Bounded-concurrency Welcome publication used by founding creates and by
+    /// deferred existing-group invite fanout after the commit is confirmed.
+    async fn publish_welcome_fanout(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        group_id: Option<GroupId>,
+        output: &mut AccountDeviceEffects,
+        context: Option<AuditEventContext>,
+        force_retry: bool,
+    ) -> AccountResult<()> {
+        let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
+        let completed = prepared.publish(&self.adapter).await;
+        self.finish_welcome_publish(completed, output).await
+    }
+
+    fn prepare_welcome_publish(
+        &self,
+        welcomes: Vec<TransportMessage>,
+        group_id: Option<GroupId>,
+        context: Option<AuditEventContext>,
+        force_retry: bool,
+    ) -> AccountResult<PreparedWelcomePublish> {
         let mut metadata = Vec::with_capacity(welcomes.len());
         let mut completions = Vec::with_capacity(welcomes.len());
         completions.resize_with(welcomes.len(), || None);
@@ -2279,34 +2605,42 @@ where
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
             let mut effects = AccountDeviceEffects::default();
-            match self.prepare_legacy_publish(welcome, &mut effects, context.clone(), false)? {
+            match self.prepare_legacy_publish(
+                welcome,
+                &mut effects,
+                context.clone(),
+                force_retry,
+            )? {
                 PreparedLegacyPublish::Complete(status) => {
                     completions[index] = Some(LegacyPublishCompletion::Complete(status));
                 }
                 PreparedLegacyPublish::Network(attempt) => pending.push_back((index, attempt)),
             }
-            metadata.push((recipient, welcome_id, effects));
+            metadata.push(WelcomePublishMetadata {
+                recipient,
+                welcome_id,
+                effects,
+            });
         }
 
-        let adapter = &self.adapter;
-        let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
-            let result = adapter.publish(attempt.request.clone()).await;
-            (index, attempt, result)
-        };
-        let mut in_flight = FuturesUnordered::new();
-        while in_flight.len() < FOUNDING_WELCOME_PUBLISH_CONCURRENCY {
-            let Some((index, attempt)) = pending.pop_front() else {
-                break;
-            };
-            in_flight.push(publish(index, attempt));
-        }
-        while let Some((index, attempt, result)) = in_flight.next().await {
-            completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
-            if let Some((next_index, next_attempt)) = pending.pop_front() {
-                in_flight.push(publish(next_index, next_attempt));
-            }
-        }
+        Ok(PreparedWelcomePublish {
+            group_id,
+            metadata,
+            completions,
+            pending,
+        })
+    }
 
+    async fn finish_welcome_publish(
+        &mut self,
+        completed: CompletedWelcomePublish,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        let CompletedWelcomePublish {
+            group_id,
+            metadata,
+            completions,
+        } = completed;
         // Every network attempt above has already been exposed to relays, so a
         // finish-stage failure for one recipient must not skip completion
         // bookkeeping for the rest: reconcile every completion in input order
@@ -2315,9 +2649,12 @@ where
         // would stay `Unattempted` and a restart could republish Welcomes that
         // were already delivered.
         let mut first_error = None;
-        for ((recipient, welcome_id, mut effects), completion) in
-            metadata.into_iter().zip(completions)
-        {
+        for (metadata, completion) in metadata.into_iter().zip(completions) {
+            let WelcomePublishMetadata {
+                recipient,
+                welcome_id,
+                mut effects,
+            } = metadata;
             let status = match completion.expect("every Welcome publish completed") {
                 LegacyPublishCompletion::Complete(status) => Ok(status),
                 LegacyPublishCompletion::Network(attempt, result) => {
@@ -2480,6 +2817,9 @@ where
         message_id: &cgka_traits::MessageId,
         output: &mut AccountDeviceEffects,
     ) -> AccountResult<()> {
+        if self.detached_welcome_publishes.contains(message_id) {
+            return Ok(());
+        }
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
@@ -2894,6 +3234,12 @@ where
         retry_immediately: bool,
     ) -> AccountResult<PreparedLegacyPublish> {
         let message_id = message.id.clone();
+        if self.detached_welcome_publishes.contains(&message_id) {
+            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                retry_deferred: true,
+                ..PublishStatus::default()
+            }));
+        }
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
         // publish request. The post-wrap relay event id / ephemeral pubkey are
@@ -3447,6 +3793,66 @@ fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timest
         .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
 }
 
+/// Pull Welcome payloads off publish work so the commit/create can confirm
+/// without waiting for recipient delivery. Empty Welcome vectors remain on the
+/// original work items so later publish still confirms the commit.
+fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage> {
+    let mut welcomes = Vec::new();
+    for work in &mut effects.publish {
+        match work {
+            PublishWork::GroupEvolution {
+                welcomes: items, ..
+            }
+            | PublishWork::GroupCreated {
+                welcomes: items, ..
+            }
+            | PublishWork::FoundingGroupCreated { welcomes: items } => {
+                welcomes.append(items);
+            }
+            _ => {}
+        }
+    }
+    welcomes
+}
+
+fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
+    matches!(
+        intent,
+        SendIntent::Invite { .. }
+            | SendIntent::RemoveMembers { .. }
+            | SendIntent::SelfUpdate { .. }
+            | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::UpdateGroupData { .. }
+            | SendIntent::EnableDisbanding { .. }
+    )
+}
+
+fn classify_prepared_session_send(
+    mut effects: SessionEffects,
+) -> AccountResult<PreparedSessionSend> {
+    let pending = effects.publish.iter().find_map(|work| match work {
+        PublishWork::GroupEvolution { pending, .. } | PublishWork::GroupCreated { pending, .. } => {
+            Some(*pending)
+        }
+        _ => None,
+    });
+    let Some(pending) = pending else {
+        if !effects.queued.is_empty() {
+            return Ok(PreparedSessionSend::Queued(effects));
+        }
+        return Err(cgka_traits::EngineError::Backend(
+            "prepared send contained neither a pending MLS evolution nor a queued intent".into(),
+        )
+        .into());
+    };
+    let welcomes = take_deferred_welcomes(&mut effects);
+    Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
+        effects,
+        welcomes,
+        pending,
+    }))
+}
+
 /// The welcome recipient carried in the message's transport envelope, if the
 /// message is a welcome.
 fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
@@ -3628,8 +4034,49 @@ mod tests {
         assert_eq!(combined.published_app_messages, vec![first, second]);
     }
 
+    #[test]
+    fn prepared_send_preserves_a_durably_queued_invite() {
+        let queued = QueuedIntentRef {
+            group_id: GroupId::new(vec![7]),
+            intent_id: cgka_traits::MessageId::new(vec![9]),
+        };
+        let classified = classify_prepared_session_send(SessionEffects {
+            events: Vec::new(),
+            publish: Vec::new(),
+            queued: vec![queued.clone()],
+            pending_convergence: vec![queued.group_id.clone()],
+        })
+        .expect("queued acceptance is not a malformed prepared commit");
+
+        match classified {
+            PreparedSessionSend::Queued(effects) => {
+                assert_eq!(effects.queued, vec![queued]);
+                assert_eq!(effects.pending_convergence.len(), 1);
+            }
+            PreparedSessionSend::Commit(_) => panic!("queued invite must not pretend to be staged"),
+        }
+    }
+
+    #[test]
+    fn deferred_publish_boundary_rejects_non_commit_intents() {
+        let group_id = GroupId::new(vec![1]);
+        assert!(!supports_deferred_commit_publish(&SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: Vec::new(),
+        }));
+        assert!(!supports_deferred_commit_publish(&SendIntent::Leave {
+            group_id: group_id.clone(),
+        }));
+        assert!(supports_deferred_commit_publish(
+            &SendIntent::RemoveMembers {
+                group_id,
+                members: Vec::new(),
+            }
+        ));
+    }
+
     #[tokio::test]
-    async fn founding_welcome_work_is_bounded_concurrent_and_ordered() {
+    async fn welcome_publish_work_is_bounded_concurrent_and_ordered() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Semaphore;
@@ -3656,11 +4103,8 @@ mod tests {
                 }
             });
 
-            let expected_parallelism = item_count.min(FOUNDING_WELCOME_PUBLISH_CONCURRENCY);
-            let task = tokio::spawn(collect_bounded_ordered(
-                work,
-                FOUNDING_WELCOME_PUBLISH_CONCURRENCY,
-            ));
+            let expected_parallelism = item_count.min(WELCOME_PUBLISH_CONCURRENCY);
+            let task = tokio::spawn(collect_bounded_ordered(work, WELCOME_PUBLISH_CONCURRENCY));
             timeout(Duration::from_secs(1), async {
                 while max_active.load(Ordering::SeqCst) < expected_parallelism {
                     tokio::task::yield_now().await;

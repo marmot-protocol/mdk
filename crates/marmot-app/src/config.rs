@@ -97,6 +97,14 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this exercises the account
     /// worker's degraded catch-up path without corrupting a real database.
     pub dev_force_group_read_snapshot_failure: bool,
+    /// Dev/test-only override that fails invite Welcome-intent recording.
+    /// Honored only with `test-policy-overrides`; this proves a canonical
+    /// invite still returns success and attempts Welcome fanout.
+    pub dev_fail_invite_welcome_intent: bool,
+    /// Dev/test-only override that fails invite local projection refresh.
+    /// Honored only with `test-policy-overrides`; this proves a canonical
+    /// invite still returns success and attempts Welcome fanout.
+    pub dev_fail_invite_local_refresh: bool,
     /// Dev/test-only fault injected before the next delivery after this many
     /// completed catch-up deliveries. Honored only with
     /// `test-policy-overrides`; this exercises truthful partial-progress
@@ -165,6 +173,8 @@ impl Default for MarmotAppConfig {
             dev_scheduled_convergence_delay_ms: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
+            dev_fail_invite_welcome_intent: false,
+            dev_fail_invite_local_refresh: false,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
             dev_fail_ingest_after_application_event_ack: false,
@@ -259,6 +269,20 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
         self.dev_force_group_read_snapshot_failure = enabled;
+        self
+    }
+
+    /// Fail invite Welcome-intent recording in test-policy builds.
+    /// Normal builds ignore this field.
+    pub fn with_dev_fail_invite_welcome_intent(mut self, enabled: bool) -> Self {
+        self.dev_fail_invite_welcome_intent = enabled;
+        self
+    }
+
+    /// Fail invite local projection refresh in test-policy builds.
+    /// Normal builds ignore this field.
+    pub fn with_dev_fail_invite_local_refresh(mut self, enabled: bool) -> Self {
+        self.dev_fail_invite_local_refresh = enabled;
         self
     }
 

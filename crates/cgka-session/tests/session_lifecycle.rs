@@ -779,6 +779,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         .send(SendIntent::Invite {
             group_id: created.group_id.clone(),
             key_packages: vec![david_key_package],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

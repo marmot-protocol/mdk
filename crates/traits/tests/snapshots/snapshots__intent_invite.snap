@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackage::new(vec![0xEF; 4])], }"
+expression: "SendIntent::Invite { group_id: gid(), key_packages: vec![KeyPackage::new(vec![0xEF; 4])], initial_admins: vec![], }"
 ---
 {
   "Invite": {
@@ -20,6 +20,7 @@ expression: "SendIntent::Invite\n{ group_id: gid(), key_packages: vec![KeyPackag
         ],
         "protocol_profile": "legacy"
       }
-    ]
+    ],
+    "initial_admins": []
   }
 }

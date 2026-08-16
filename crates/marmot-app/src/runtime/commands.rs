@@ -522,6 +522,17 @@ impl AccountManager {
         group_id: &GroupId,
         members: &[String],
     ) -> Result<SendSummary, AppError> {
+        self.invite_members_with_initial_admins(account_ref, group_id, members, &[])
+            .await
+    }
+
+    pub async fn invite_members_with_initial_admins(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        members: &[String],
+        initial_admins: &[String],
+    ) -> Result<SendSummary, AppError> {
         let started_at = Instant::now();
         let result = async {
             let command = self.worker_commands(account_ref).await?;
@@ -530,6 +541,7 @@ impl AccountManager {
                 .send(AccountWorkerCommand::InviteMembers {
                     group_id: group_id.clone(),
                     members: members.to_vec(),
+                    initial_admins: initial_admins.to_vec(),
                     respond,
                 })
                 .await

@@ -723,6 +723,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -730,6 +731,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -913,6 +915,7 @@ async fn contested_fork_delivers_late_pre_fork_application() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![common_invitee.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -939,6 +942,7 @@ async fn contested_fork_delivers_late_pre_fork_application() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![alice_invitee.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -946,6 +950,7 @@ async fn contested_fork_delivers_late_pre_fork_application() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![bob_invitee.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1054,6 +1059,7 @@ async fn rebuilt_sender_keeps_own_sent_app_valid_through_convergence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1168,6 +1174,7 @@ async fn own_sent_app_witnesses_only_its_matching_fork_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1175,6 +1182,7 @@ async fn own_sent_app_witnesses_only_its_matching_fork_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1602,6 +1610,7 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -1609,6 +1618,7 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2208,6 +2218,7 @@ async fn engine_does_not_apply_stored_branch_before_stability_gate() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2268,6 +2279,7 @@ async fn engine_ingest_buffers_commit_for_convergence_before_quiescence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2326,6 +2338,7 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2337,6 +2350,7 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2440,6 +2454,7 @@ async fn application_replay_is_invariant_to_opposite_arrival_order() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2454,6 +2469,7 @@ async fn application_replay_is_invariant_to_opposite_arrival_order() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2594,6 +2610,7 @@ async fn retained_application_delivery_is_invariant_to_convergence_pass_partitio
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![invitee.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
             })
             .await
             .unwrap();
@@ -2721,6 +2738,7 @@ async fn engine_reuses_bfs_materialized_candidates_when_no_pending_app_messages(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2732,6 +2750,7 @@ async fn engine_reuses_bfs_materialized_candidates_when_no_pending_app_messages(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2801,6 +2820,7 @@ async fn engine_defers_child_commit_until_parent_arrives() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -2813,6 +2833,7 @@ async fn engine_defers_child_commit_until_parent_arrives() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3351,6 +3372,7 @@ async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
         SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![cgka_traits::engine::KeyPackage::new(b"garbage".to_vec())],
+            initial_admins: vec![],
         },
         1_000_001,
     );
@@ -3679,6 +3701,7 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3697,6 +3720,7 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3787,6 +3811,7 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3805,6 +3830,7 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3897,6 +3923,7 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -3926,6 +3953,7 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4030,6 +4058,7 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4052,6 +4081,7 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4160,6 +4190,7 @@ async fn rewind_and_no_rewind_routes_agree_on_losing_commit_disposition() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4178,6 +4209,7 @@ async fn rewind_and_no_rewind_routes_agree_on_losing_commit_disposition() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4264,6 +4296,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4284,6 +4317,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4453,6 +4487,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4474,6 +4509,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4615,6 +4651,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![repair_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -4743,6 +4780,7 @@ async fn retain_intent_then_halt_awaiting_repair() -> HaltedAwaitingRepair {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![repair_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap()
@@ -5022,6 +5060,7 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5187,6 +5226,7 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5206,6 +5246,7 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5279,6 +5320,7 @@ async fn engine_does_not_reseed_commit_older_than_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5290,6 +5332,7 @@ async fn engine_does_not_reseed_commit_older_than_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5308,6 +5351,7 @@ async fn engine_does_not_reseed_commit_older_than_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5401,6 +5445,7 @@ async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![frank_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5412,6 +5457,7 @@ async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5430,6 +5476,7 @@ async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5505,6 +5552,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5584,6 +5632,7 @@ async fn future_app_without_reachable_commit_is_retained_without_gating_sends() 
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5675,6 +5724,7 @@ async fn terminal_undecryptable_app_emits_invalidation_without_message_received(
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5805,6 +5855,7 @@ async fn future_epoch_app_message_stays_deferred_until_commit_arrives() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5818,6 +5869,7 @@ async fn future_epoch_app_message_stays_deferred_until_commit_arrives() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5931,6 +5983,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -5938,6 +5991,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6060,6 +6114,7 @@ async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6067,6 +6122,7 @@ async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6175,6 +6231,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6264,6 +6321,7 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6346,6 +6404,7 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6454,6 +6513,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6461,6 +6521,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6711,6 +6772,7 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6746,6 +6808,7 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6802,6 +6865,7 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6934,6 +6998,7 @@ async fn app_witness_beside_competing_commits_resets_convergence_quiescence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -6941,6 +7006,7 @@ async fn app_witness_beside_competing_commits_resets_convergence_quiescence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7015,6 +7081,7 @@ async fn far_future_app_is_not_admitted_to_an_active_pass() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7024,6 +7091,7 @@ async fn far_future_app_is_not_admitted_to_an_active_pass() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7338,6 +7406,7 @@ async fn buffered_convergence_pass_fixture(group_name: &str) -> BufferedPassFixt
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7605,6 +7674,7 @@ async fn frozen_pass_member_tampering_fails_closed_to_unrecoverable() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7662,6 +7732,7 @@ async fn missing_frozen_pass_member_fails_closed_to_unrecoverable() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7724,6 +7795,7 @@ async fn malformed_convergence_input_does_not_reset_quiescence() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7783,6 +7855,7 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -7922,6 +7995,7 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![invitee_kp],
+                initial_admins: vec![],
             })
             .await
             .unwrap();
@@ -8012,6 +8086,7 @@ async fn never_validating_commit_is_terminal_and_does_not_gate_sends() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8255,6 +8330,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8267,6 +8343,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8368,6 +8445,7 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8475,6 +8553,7 @@ async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epo
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![invitee_kp],
+                initial_admins: vec![],
             })
             .await
             .unwrap();
@@ -8557,6 +8636,7 @@ async fn engine_queues_group_evolution_until_convergence_is_settled() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8572,6 +8652,7 @@ async fn engine_queues_group_evolution_until_convergence_is_settled() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![eve_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8663,6 +8744,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();
@@ -8852,6 +8934,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             intent: SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![carol_kp],
+                initial_admins: vec![],
             },
             created_at_ms: 0,
         })
@@ -8975,6 +9058,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
+            initial_admins: vec![],
         })
         .await
         .unwrap();

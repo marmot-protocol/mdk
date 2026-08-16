@@ -598,6 +598,7 @@ fn snapshot_send_intents() {
         SendIntent::Invite {
             group_id: gid(),
             key_packages: vec![KeyPackage::new(vec![0xEF; 4])],
+            initial_admins: vec![],
         }
     );
     insta::assert_json_snapshot!(

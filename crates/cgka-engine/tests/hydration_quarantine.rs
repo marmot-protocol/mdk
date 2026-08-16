@@ -1198,6 +1198,7 @@ async fn bob_invites_carol(
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![carol_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("bob invites carol");
@@ -1446,6 +1447,7 @@ async fn rejoin_welcome_clears_quarantine() {
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![alice_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("bob invites alice");
@@ -1546,6 +1548,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
         .send(cgka_traits::engine::SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![alice_kp],
+            initial_admins: vec![],
         })
         .await
         .expect("bob invites alice");

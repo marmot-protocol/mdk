@@ -48,6 +48,7 @@ pub(crate) enum AppPerformanceOperation {
     GroupInviteEnginePublish,
     GroupInviteLocalRefresh,
     GroupInviteNotificationTrigger,
+    GroupInviteWelcomePublish,
     GroupInvitePostMutationCatchUp,
     GroupPromoteAdmin,
     GroupDetailsRead,
@@ -156,6 +157,8 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub group_invite_notification_trigger: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub group_invite_welcome_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub group_invite_post_mutation_catch_up: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_promote_admin: AppPerformanceOperationSnapshot,
@@ -214,6 +217,7 @@ struct AppPerformanceTelemetryInner {
     group_invite_engine_publish: AppPerformanceOperationTelemetry,
     group_invite_local_refresh: AppPerformanceOperationTelemetry,
     group_invite_notification_trigger: AppPerformanceOperationTelemetry,
+    group_invite_welcome_publish: AppPerformanceOperationTelemetry,
     group_invite_post_mutation_catch_up: AppPerformanceOperationTelemetry,
     group_promote_admin: AppPerformanceOperationTelemetry,
     group_details_read: AppPerformanceOperationTelemetry,
@@ -416,6 +420,9 @@ impl AppPerformanceTelemetry {
                     .group_invite_notification_trigger
                     .record(duration, success);
             }
+            AppPerformanceOperation::GroupInviteWelcomePublish => {
+                inner.group_invite_welcome_publish.record(duration, success);
+            }
             AppPerformanceOperation::GroupInvitePostMutationCatchUp => {
                 inner
                     .group_invite_post_mutation_catch_up
@@ -515,6 +522,7 @@ impl AppPerformanceTelemetry {
             group_invite_engine_publish: inner.group_invite_engine_publish.snapshot(),
             group_invite_local_refresh: inner.group_invite_local_refresh.snapshot(),
             group_invite_notification_trigger: inner.group_invite_notification_trigger.snapshot(),
+            group_invite_welcome_publish: inner.group_invite_welcome_publish.snapshot(),
             group_invite_post_mutation_catch_up: inner
                 .group_invite_post_mutation_catch_up
                 .snapshot(),

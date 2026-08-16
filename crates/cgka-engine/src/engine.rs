@@ -1685,6 +1685,14 @@ impl<S: StorageProvider> Engine<S> {
             // crash mid-clear cannot leave torn group state.
             self.storage
                 .with_transaction(|storage| {
+                    let source_epoch = EpochId(mls_group.epoch().as_u64());
+                    crate::message_processor::transition_staged_invite_welcomes(
+                        storage,
+                        group_id,
+                        source_epoch,
+                        None,
+                        MessageState::Failed,
+                    )?;
                     let tx_provider = crate::provider::EngineOpenMlsProvider::<S>::new(
                         &self.crypto,
                         storage.mls_storage(),
@@ -2655,11 +2663,13 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Return the stored outbound welcome for `id` along with its group.
     ///
-    /// New wrapped welcomes are persisted at wrap time as delivery-aware
-    /// `OutboundWelcome` records. Historical `Sent` raw-transport Welcome
-    /// records remain directly re-deliverable by a known id for compatibility,
-    /// but are not rediscovered as outstanding after an upgrade because older
-    /// versions did not persist acknowledgement completion (mdk#352).
+    /// Founding Welcomes are persisted at canonical creation and invite
+    /// Welcomes are promoted when their Add commit confirms, both as
+    /// delivery-aware `OutboundWelcome` records. Historical `Sent`
+    /// raw-transport Welcome records remain directly re-deliverable by a known
+    /// id for compatibility, but are not rediscovered as outstanding after an
+    /// upgrade because older versions did not persist acknowledgement
+    /// completion (mdk#352).
     pub fn stored_sent_welcome(
         &self,
         id: &MessageId,
@@ -2673,14 +2683,22 @@ impl<S: StorageProvider> Engine<S> {
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
-        let message = payload
-            .as_outbound_welcome()
-            .or_else(|| payload.as_raw_transport())
-            .ok_or_else(|| {
-                EngineError::Backend(
-                    "stored message is not an outbound Welcome transport record".into(),
-                )
-            })?;
+        let message = match &payload {
+            StoredMessagePayload::OutboundWelcome(message) => Some(message),
+            // `RawTransport` is the explicit legacy representation used before
+            // delivery-aware and staged Welcome variants existed. New invite
+            // paths never use it while a commit is unconfirmed.
+            StoredMessagePayload::RawTransport(message) => Some(message),
+            StoredMessagePayload::StagedInviteWelcome { .. }
+            | StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::SignedOpenMlsWire { .. }
+            | StoredMessagePayload::OwnCommitWire { .. } => None,
+        }
+        .ok_or_else(|| {
+            EngineError::Backend(
+                "stored message is not an outbound Welcome transport record".into(),
+            )
+        })?;
         if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
             return Err(EngineError::Backend(
                 "stored message is not a welcome".into(),
@@ -2692,12 +2710,13 @@ impl<S: StorageProvider> Engine<S> {
     /// Return every retained outbound Welcome whose delivery policy has not
     /// yet been acknowledged.
     ///
-    /// Founding creation persists delivery-aware `OutboundWelcome` records in
-    /// the same transaction that makes the group canonical. This scan is
-    /// therefore the authoritative cold-restart recovery index even if a
-    /// higher-layer pending-delivery projection was not written before process
-    /// termination. Historical raw `Sent` Welcome rows are deliberately
-    /// excluded because their acknowledgement state is unknowable.
+    /// Founding creation and existing-group invite confirmation persist
+    /// delivery-aware `OutboundWelcome` records in the same transaction that
+    /// makes their group state canonical. This scan is therefore the
+    /// authoritative cold-restart recovery index even if a higher-layer
+    /// pending-delivery projection was not written before process termination.
+    /// Historical raw `Sent` Welcome rows are deliberately excluded because
+    /// their acknowledgement state is unknowable.
     pub fn outstanding_sent_welcomes(
         &self,
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
@@ -2724,12 +2743,13 @@ impl<S: StorageProvider> Engine<S> {
         Ok(welcomes)
     }
 
-    /// IDs of every delivery-aware outbound Welcome retained by this engine,
-    /// including completed obligations.
+    /// IDs of every delivery-aware or explicitly staged outbound Welcome
+    /// retained by this engine, including completed obligations.
     ///
-    /// Higher layers use this to distinguish their founding-Welcome projection
-    /// rows from older pending-delivery rows that are intentionally backed by
-    /// historical raw `Sent` payloads.
+    /// Higher layers use this to reconcile founding/invite projection rows.
+    /// Staged invite ids are tracked but not outstanding, so a pre-confirmation
+    /// app projection cannot expose them for delivery. Historical raw `Sent`
+    /// payloads remain outside this lifecycle.
     pub fn tracked_outbound_welcome_ids(&self) -> Result<Vec<MessageId>, EngineError> {
         let mut ids = Vec::new();
         for group_id in self.storage.list_groups()? {
@@ -2740,7 +2760,9 @@ impl<S: StorageProvider> Engine<S> {
                 let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                     continue;
                 };
-                if payload.as_outbound_welcome().is_some() {
+                if payload.as_outbound_welcome().is_some()
+                    || payload.as_staged_invite_welcome().is_some()
+                {
                     ids.push(record.id);
                 }
             }

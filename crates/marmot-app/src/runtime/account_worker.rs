@@ -2,13 +2,14 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::{GroupId, SecretBytes};
+use cgka_traits::{GroupId, MessageId, SecretBytes};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -23,7 +24,7 @@ use super::{
     wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::AppPerformanceOperation;
-use crate::client::EncryptedMediaUploadFinish;
+use crate::client::{CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish};
 use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
@@ -96,6 +97,12 @@ pub(crate) enum AccountWorkerCommand {
     CatchUp {
         respond: oneshot::Sender<Result<(), String>>,
     },
+    /// Startup-coalesced catch-up response held in the same FIFO as deferred
+    /// mutations so later live reads cannot bypass those mutations.
+    StartupCatchUpResult {
+        result: Result<(), String>,
+        respond: oneshot::Sender<Result<(), String>>,
+    },
     RepairFullHistory {
         respond: oneshot::Sender<Result<(), String>>,
     },
@@ -141,6 +148,12 @@ pub(crate) enum AccountWorkerCommand {
     NetworkStartupSettled {
         respond: oneshot::Sender<()>,
     },
+    /// Wait until in-flight create/invite Welcome fanout (and any mutations
+    /// queued ahead of this command) have finished, then reply. One-shot CLI
+    /// uses this before shutting the relay plane.
+    Drain {
+        respond: oneshot::Sender<()>,
+    },
     RetryHydrateQuarantinedGroup {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -159,6 +172,7 @@ pub(crate) enum AccountWorkerCommand {
     InviteMembers {
         group_id: GroupId,
         members: Vec<String>,
+        initial_admins: Vec<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     RemoveMembers {
@@ -400,6 +414,21 @@ enum DeferredStartupCommand {
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
     CatchUp(oneshot::Sender<Result<(), String>>),
+}
+
+/// Relay-only startup Welcome work. Dropping the worker aborts the task so no
+/// detached publication can outlive relay-plane/account shutdown; the exact
+/// durable artifact remains retryable on the next open.
+struct WelcomeRecoveryTask {
+    handle: JoinHandle<CompletedWelcomeDeliveryRecovery>,
+    message_ids: Vec<MessageId>,
+    drain_waiters: Vec<oneshot::Sender<()>>,
+}
+
+impl Drop for WelcomeRecoveryTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 pub(crate) fn spawn_app_runtime_account_worker(
@@ -767,7 +796,9 @@ async fn run_app_runtime_account_worker(
     };
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
-    // with the initial catch-up's result.
+    // with the initial catch-up's result. Replay uses the live command queue so
+    // post-canonical snapshot reads (Members / GroupRoster / …) can land while
+    // a deferred create/invite still owns Welcome fanout.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
@@ -775,24 +806,58 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         worker_lifetime: media_http_worker_lifetime,
     };
-    for deferred_command in deferred {
-        match deferred_command {
+    let mut pending = deferred
+        .into_iter()
+        .map(|deferred_command| match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
-                let _ = respond.send(catch_up_result.clone());
+                AccountWorkerCommand::StartupCatchUpResult {
+                    result: catch_up_result.clone(),
+                    respond,
+                }
             }
-            DeferredStartupCommand::Command(command) => {
+            DeferredStartupCommand::Command(command) => *command,
+        })
+        .collect::<VecDeque<_>>();
+    // Every remaining startup command is visible to snapshot serving in this
+    // one FIFO. Live commands received during fanout append behind it, so a
+    // later read cannot bypass an earlier deferred mutation.
+    while let Some(command) = pending.pop_front() {
+        match command {
+            AccountWorkerCommand::CatchUp { respond } => {
+                handle_account_worker_catch_up(
+                    &mut client,
+                    respond,
+                    &mut commands,
+                    &mut pending,
+                    AccountWorkerCatchUpContext {
+                        app: &app,
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
+                )
+                .await;
+            }
+            command => {
                 handle_account_worker_command(
                     &mut client,
-                    *command,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    &shared,
-                    &media_http,
+                    command,
+                    AccountWorkerCommandContext {
+                        commands: &mut commands,
+                        pending: &mut pending,
+                        app: &app,
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                        media_http: &media_http,
+                    },
                 )
                 .await;
             }
         }
+        schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
     }
     scheduled_runtime_group_subscription_refresh.observe_pending(
         client.has_pending_runtime_group_subscription_refresh(),
@@ -820,6 +885,20 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
+    // Prepare exact Welcome attempts under the serialized owner, then let only
+    // relay I/O run independently. The worker stays available for inbound
+    // delivery, maintenance, media completions, timers, and commands while a
+    // degraded relay is slow. Drain waiters join reconciliation below.
+    let mut welcome_recovery = client
+        .prepare_pending_welcome_delivery_recovery_best_effort()
+        .map(|recovery| {
+            let message_ids = recovery.message_ids().to_vec();
+            WelcomeRecoveryTask {
+                handle: tokio::spawn(recovery.run()),
+                message_ids,
+                drain_waiters: Vec::new(),
+            }
+        });
 
     'worker: loop {
         tokio::select! {
@@ -829,6 +908,37 @@ async fn run_app_runtime_account_worker(
             }
             _ = &mut shutdown => {
                 return;
+            }
+            recovered = async {
+                let recovery = welcome_recovery
+                    .as_mut()
+                    .expect("Welcome recovery branch requires a live task");
+                (&mut recovery.handle).await
+            }, if welcome_recovery.is_some() => {
+                let mut recovery = welcome_recovery
+                    .take()
+                    .expect("completed Welcome recovery task must still be owned");
+                match recovered {
+                    Ok(completed) => {
+                        client
+                            .finish_pending_welcome_delivery_recovery_best_effort(completed)
+                            .await;
+                    }
+                    Err(error) => {
+                        client.abandon_pending_welcome_delivery_recovery(
+                            &recovery.message_ids,
+                        );
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "startup_welcome_recovery",
+                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                            "startup Welcome relay task ended before reconciliation"
+                        );
+                    }
+                }
+                for respond in recovery.drain_waiters.drain(..) {
+                    let _ = respond.send(());
+                }
             }
             _ = scheduled_convergence.timer.as_mut() => {
                 let groups = scheduled_convergence.take_ready();
@@ -933,11 +1043,27 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
-            command = commands.recv() => {
+            command = async {
+                match pending.pop_front() {
+                    Some(command) => Some(command),
+                    None => commands.recv().await,
+                }
+            } => {
                 match command {
                     Some(command) => {
-                        let mut pending = VecDeque::from([command]);
+                        pending.push_back(command);
                         while let Some(command) = pending.pop_front() {
+                            let command = match command {
+                                AccountWorkerCommand::Drain { respond } => {
+                                    if let Some(recovery) = &mut welcome_recovery {
+                                        recovery.drain_waiters.push(respond);
+                                    } else {
+                                        let _ = respond.send(());
+                                    }
+                                    continue;
+                                }
+                                command => command,
+                            };
                             let may_change_push_registration_work =
                                 command.may_change_push_registration_work();
                             match command {
@@ -961,11 +1087,16 @@ async fn run_app_runtime_account_worker(
                                     handle_account_worker_command(
                                         &mut client,
                                         command,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        &shared,
-                                        &media_http,
+                                        AccountWorkerCommandContext {
+                                            commands: &mut commands,
+                                            pending: &mut pending,
+                                            app: &app,
+                                            events: &events,
+                                            account_id_hex: &account_id_hex,
+                                            account_label: &account_label,
+                                            shared: &shared,
+                                            media_http: &media_http,
+                                        },
                                     )
                                     .await;
                                 }
@@ -2010,26 +2141,172 @@ async fn complete_media_http(
     drop(permit);
 }
 
-/// Process a single account-worker command against the live session.
-///
-/// Extracted so the worker can drive commands from two places: the steady-state
-/// command loop, and the deferred-command replay that runs after catch-up
-/// completes (commands that arrived while catch-up held `&mut client`). Read
-/// commands (`Members` / `MemberIdsPage` / `GroupMlsState` /
-/// `QuarantinedGroups`) are also
-/// intercepted inline during catch-up and answered from a `GroupReadSnapshot`;
-/// here they read the live session.
-async fn handle_account_worker_command(
-    client: &mut AppClient,
-    command: AccountWorkerCommand,
+/// Closed command channel for handlers that never serve concurrent commands
+/// (unit tests that call `handle_account_worker_command` directly). Startup
+/// deferred replay uses the live worker queue instead.
+#[cfg(test)]
+fn unused_account_worker_command_io() -> (
+    mpsc::Receiver<AccountWorkerCommand>,
+    VecDeque<AccountWorkerCommand>,
+) {
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    (rx, VecDeque::new())
+}
+
+fn capture_group_read_snapshot(
+    client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
-    shared: &RuntimeSharedServices,
-    media_http: &MediaHttpContext,
+    method: &'static str,
+) -> Option<crate::client::GroupReadSnapshot> {
+    match client.group_read_snapshot() {
+        Ok(snapshot) => Some(snapshot),
+        Err(err) => {
+            publish_app_runtime_account_error(
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message(method, &err),
+            );
+            None
+        }
+    }
+}
+
+/// Serve safe snapshot reads while `work` exclusively borrows the live client.
+/// Mutations stay queued FIFO behind `work`; once a mutation is deferred,
+/// later reads wait with it. Worker-owned catch-up is remembered without
+/// poisoning those reads, because create/invite spawn it immediately after
+/// the caller-visible reply.
+async fn serve_snapshot_reads_until<Fut>(
+    read_snapshot: Option<crate::client::GroupReadSnapshot>,
+    work: Fut,
+    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+    pending: &mut VecDeque<AccountWorkerCommand>,
+    app: &MarmotApp,
+    account_label: &str,
+) -> Fut::Output
+where
+    Fut: Future,
+{
+    let mut deferred = VecDeque::new();
+    let mut follow_up = VecDeque::new();
+    let mut commands_open = true;
+    let mut work = std::pin::pin!(work);
+    let output = loop {
+        let command = if let Some(command) = pending.pop_front() {
+            Some(command)
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut work => break result,
+                command = commands.recv(), if commands_open => {
+                    if command.is_none() {
+                        commands_open = false;
+                    }
+                    command
+                }
+            }
+        };
+        let Some(command) = command else {
+            continue;
+        };
+        let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
+        match command {
+            AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
+                let snapshot = read_snapshot
+                    .as_ref()
+                    .expect("snapshot availability checked above");
+                let _ = respond.send(snapshot.members(&group_id));
+            }
+            AccountWorkerCommand::MemberIdsPage { group_ids, respond }
+                if snapshot_reads_available =>
+            {
+                let snapshot = read_snapshot
+                    .as_ref()
+                    .expect("snapshot availability checked above");
+                let _ = respond.send(snapshot.member_ids_page(&group_ids));
+            }
+            AccountWorkerCommand::GroupMlsState { group_id, respond }
+                if snapshot_reads_available =>
+            {
+                let snapshot = read_snapshot
+                    .as_ref()
+                    .expect("snapshot availability checked above");
+                let _ = respond.send(snapshot.group_mls_state(&group_id));
+            }
+            AccountWorkerCommand::GroupRoster { group_id, respond } if snapshot_reads_available => {
+                let snapshot = read_snapshot
+                    .as_ref()
+                    .expect("snapshot availability checked above");
+                let _ = respond.send(group_roster_from_snapshot(
+                    app,
+                    account_label,
+                    snapshot,
+                    &group_id,
+                ));
+            }
+            AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
+                let snapshot = read_snapshot
+                    .as_ref()
+                    .expect("snapshot availability checked above");
+                let _ = respond.send(Ok(snapshot.quarantined_groups()));
+            }
+            AccountWorkerCommand::CatchUp { .. } => {
+                follow_up.push_back(command);
+            }
+            AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
+                let _ = respond.send(true);
+            }
+            command => deferred.push_back(command),
+        }
+    };
+    pending.append(&mut deferred);
+    pending.append(&mut follow_up);
+    output
+}
+
+struct AccountWorkerCommandContext<'a> {
+    commands: &'a mut mpsc::Receiver<AccountWorkerCommand>,
+    pending: &'a mut VecDeque<AccountWorkerCommand>,
+    app: &'a MarmotApp,
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
+    media_http: &'a MediaHttpContext,
+}
+
+/// Commands that arrived while a previous handler held `&mut client` stay in
+/// `pending` until that handler returns. Read commands (`Members` /
+/// `MemberIdsPage` / `GroupMlsState` / `GroupRoster` / `QuarantinedGroups`) are
+/// intercepted inline during catch-up and Welcome fanout and answered from a
+/// `GroupReadSnapshot`; here they read the live session.
+async fn handle_account_worker_command(
+    client: &mut AppClient,
+    command: AccountWorkerCommand,
+    context: AccountWorkerCommandContext<'_>,
 ) {
+    let AccountWorkerCommandContext {
+        commands,
+        pending,
+        app,
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+        media_http,
+    } = context;
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
+            let _ = respond.send(());
+        }
+        AccountWorkerCommand::StartupCatchUpResult { result, respond } => {
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::Drain { respond } => {
             let _ = respond.send(());
         }
         AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
@@ -2175,28 +2452,53 @@ async fn handle_account_worker_command(
                     group_id,
                 );
             }
-            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
             let created = result.is_ok();
             let _ = respond.send(result);
             if created {
-                let subscription_started_at = Instant::now();
-                let subscription_refresh = client.sync_runtime_groups().await;
-                telemetry.record(
-                    AppPerformanceOperation::GroupCreateSubscriptionRefresh,
-                    subscription_started_at.elapsed(),
-                    subscription_refresh.is_ok(),
+                let read_snapshot = capture_group_read_snapshot(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    "runtime post-create snapshot failed",
                 );
-                if let Err(error) = subscription_refresh {
-                    tracing::warn!(
-                        target: "marmot_app::runtime",
-                        method = "create_group_subscription_refresh",
-                        error_kind = error.privacy_safe_kind(),
-                        "confirmed group creation could not refresh subscriptions immediately"
-                    );
-                }
-                client
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                serve_snapshot_reads_until(
+                    read_snapshot,
+                    async {
+                        client
+                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                            .await;
+                        publish_pending_welcome_delivery_events(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            client,
+                        );
+                        let subscription_started_at = Instant::now();
+                        let subscription_refresh = client.sync_runtime_groups().await;
+                        telemetry.record(
+                            AppPerformanceOperation::GroupCreateSubscriptionRefresh,
+                            subscription_started_at.elapsed(),
+                            subscription_refresh.is_ok(),
+                        );
+                        if let Err(error) = subscription_refresh {
+                            tracing::warn!(
+                                target: "marmot_app::runtime",
+                                method = "create_group_subscription_refresh",
+                                error_kind = error.privacy_safe_kind(),
+                                "confirmed group creation could not refresh subscriptions immediately"
+                            );
+                        }
+                        client
+                            .retry_pending_push_registration_shares_best_effort()
+                            .await;
+                    },
+                    commands,
+                    pending,
+                    app,
+                    account_label,
+                )
+                .await;
             }
         }
         AccountWorkerCommand::Members { group_id, respond } => {
@@ -2398,17 +2700,25 @@ async fn handle_account_worker_command(
         AccountWorkerCommand::InviteMembers {
             group_id,
             members,
+            initial_admins,
             respond,
         } => {
+            let telemetry = shared.app_performance_telemetry();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                let telemetry = shared.app_performance_telemetry();
+                let admin_refs = initial_admins
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 client
-                    .invite_members_with_telemetry(&group_id, &member_refs, &telemetry)
+                    .invite_members_with_telemetry(&group_id, &member_refs, &admin_refs, &telemetry)
                     .await
             }
             .await;
-            if result.is_ok() {
+            let canonical = result.as_ref().is_ok_and(|summary| {
+                summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+            });
+            if canonical {
                 publish_client_pending_projection_updates(
                     client,
                     events,
@@ -2422,8 +2732,39 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
             let _ = respond.send(result);
+            if canonical {
+                // Reply first so the inviter is not blocked on Welcome publish.
+                // Snapshot reads (members, MLS state, roster) are served from a
+                // post-commit snapshot while fanout owns the live client.
+                // Later mutations stay queued FIFO behind this delivery.
+                let read_snapshot = capture_group_read_snapshot(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    "runtime post-invite snapshot failed",
+                );
+                serve_snapshot_reads_until(
+                    read_snapshot,
+                    async {
+                        client
+                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                            .await;
+                        publish_pending_welcome_delivery_events(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            client,
+                        );
+                    },
+                    commands,
+                    pending,
+                    app,
+                    account_label,
+                )
+                .await;
+            }
         }
         AccountWorkerCommand::RemoveMembers {
             group_id,
@@ -4360,14 +4701,20 @@ mod tests {
             permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
             worker_lifetime: media_http_worker_lifetime,
         };
+        let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
         handle_account_worker_command(
             &mut client,
             AccountWorkerCommand::RepairFullHistory { respond },
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            &media_http,
+            AccountWorkerCommandContext {
+                commands: &mut unused_commands,
+                pending: &mut unused_pending,
+                app: &app,
+                events: &events,
+                account_id_hex: "account-id",
+                account_label: "alice",
+                shared: &shared,
+                media_http: &media_http,
+            },
         )
         .await;
 

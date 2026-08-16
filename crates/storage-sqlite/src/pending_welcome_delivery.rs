@@ -26,8 +26,27 @@ impl SqliteAccountStorage {
         recipient_hex: &str,
         recorded_at: u64,
     ) -> StorageResult<()> {
-        self.lock()?
-            .execute(
+        self.record_pending_welcome_deliveries(&[PendingWelcomeDeliveryRecord {
+            message_id_hex: message_id_hex.to_owned(),
+            group_id_hex: group_id_hex.to_owned(),
+            recipient_hex: recipient_hex.to_owned(),
+            recorded_at,
+        }])
+    }
+
+    /// Record a complete set of Welcome obligations atomically.
+    ///
+    /// A multi-member invite must never leave a prefix of repair handles if a
+    /// later row fails: the associated MLS commit has not been exposed yet and
+    /// will be rolled back as one unit.
+    pub fn record_pending_welcome_deliveries(
+        &self,
+        records: &[PendingWelcomeDeliveryRecord],
+    ) -> StorageResult<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        for record in records {
+            tx.execute(
                 "INSERT INTO app_pending_welcome_delivery (
                     message_id_hex, group_id_hex, recipient_hex, recorded_at
                  )
@@ -37,13 +56,15 @@ impl SqliteAccountStorage {
                     recipient_hex = excluded.recipient_hex,
                     recorded_at = excluded.recorded_at",
                 params![
-                    message_id_hex,
-                    group_id_hex,
-                    recipient_hex,
-                    u64_to_i64(recorded_at)?
+                    record.message_id_hex,
+                    record.group_id_hex,
+                    record.recipient_hex,
+                    u64_to_i64(record.recorded_at)?
                 ],
             )
             .storage()?;
+        }
+        tx.commit().storage()?;
         Ok(())
     }
 
@@ -136,6 +157,33 @@ mod tests {
                 recipient_hex: "cc2".to_owned(),
                 recorded_at: 9,
             }
+        );
+    }
+
+    #[test]
+    fn batch_failure_rolls_back_every_welcome_intent() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let records = vec![
+            PendingWelcomeDeliveryRecord {
+                message_id_hex: "first".to_owned(),
+                group_id_hex: "group".to_owned(),
+                recipient_hex: "alice".to_owned(),
+                recorded_at: 1,
+            },
+            PendingWelcomeDeliveryRecord {
+                message_id_hex: "second".to_owned(),
+                group_id_hex: "group".to_owned(),
+                recipient_hex: "bob".to_owned(),
+                recorded_at: u64::MAX,
+            },
+        ];
+
+        store
+            .record_pending_welcome_deliveries(&records)
+            .expect_err("second row must fail integer conversion");
+        assert!(
+            store.list_pending_welcome_deliveries().unwrap().is_empty(),
+            "the first row must roll back with the failed batch"
         );
     }
 
