@@ -783,6 +783,149 @@ fn reset_direct_conversation_members_backfill_clears_index_and_marker() {
 }
 
 #[test]
+fn persist_direct_index_follows_two_member_ids_not_stale_count() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let extra = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+
+    let mut stale_count = direct_group(&group_id, &local, &peer);
+    stale_count.member_count = Some(3);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![stale_count],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    let loaded = store
+        .load_account_projection_state("alice", 16)
+        .unwrap()
+        .groups
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id)
+        .expect("stale-count group");
+    let mut loaded_members = loaded.direct_member_ids_hex.expect("persisted members");
+    loaded_members.sort();
+    let mut expected_members = vec![local.clone(), peer.clone()];
+    expected_members.sort();
+    assert_eq!(
+        loaded_members, expected_members,
+        "empty-name projections with exactly two member ids must persist the index"
+    );
+
+    let mut stale_ids = direct_group(&group_id, &local, &peer);
+    stale_ids.direct_member_ids_hex = Some(vec![local.clone(), peer.clone(), extra]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![stale_ids],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty(),
+        "a three-member id slice must not persist the peer index"
+    );
+}
+
+#[test]
+fn replace_direct_conversation_members_rejects_non_two_member_slices() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let extra = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+
+    store
+        .replace_direct_conversation_members(&group_id, std::slice::from_ref(&local))
+        .unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone(), extra])
+        .unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
+        .unwrap();
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+}
+
+#[test]
+fn unindexed_direct_conversation_group_ids_skip_malformed_hex() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let valid_id = hex_id(0x11, 16);
+    let mut malformed = direct_group("not-hex", &local, &peer);
+    malformed.direct_member_ids_hex = None;
+    let mut valid = direct_group(&valid_id, &local, &peer);
+    valid.direct_member_ids_hex = None;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![malformed, valid],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![valid_id]
+    );
+}
+
+#[test]
 fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
     let local = hex_id(0xaa, 32);
     let peer = hex_id(0xbb, 32);

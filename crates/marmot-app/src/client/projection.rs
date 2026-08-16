@@ -476,9 +476,10 @@ impl AppClient {
             };
             let mut dirty = false;
             if let Ok(group) = self.runtime.group_record(&group_id) {
-                if projected_group.member_count.is_none() {
-                    projected_group.member_count = u64::try_from(group.members.len()).ok();
-                    dirty |= projected_group.member_count.is_some();
+                let live_count = u64::try_from(group.members.len()).ok();
+                if projected_group.member_count != live_count {
+                    projected_group.member_count = live_count;
+                    dirty = true;
                 }
                 let previous_direct_members = projected_group.direct_member_ids_hex.clone();
                 projected_group.set_direct_member_ids_from_roster(&group.members);

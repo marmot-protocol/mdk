@@ -947,7 +947,7 @@ impl SqliteAccountStorage {
                     &conn,
                     &group.group_id_hex,
                     group.direct_member_ids_hex.as_deref(),
-                    group.profile_name.trim().is_empty() && group.member_count == Some(2),
+                    persist_direct_conversation_members(group),
                 )?;
             }
             for message_id in application_event_ids_to_ack {
@@ -963,8 +963,9 @@ impl SqliteAccountStorage {
 
     /// Replace the peer-keyed Direct-conversation member index for one group.
     ///
-    /// Authoritative writes from a current projection save. Passing fewer or
-    /// more than two member ids clears the index for that group.
+    /// Authoritative writes from a current projection save. The transaction
+    /// inserts only an exact two-member slice; any other length clears the
+    /// index for that group.
     pub fn replace_direct_conversation_members(
         &self,
         group_id_hex: &str,
@@ -3472,6 +3473,14 @@ fn load_direct_conversation_members(
     Ok(members_by_group)
 }
 
+fn persist_direct_conversation_members(group: &StoredAccountGroup) -> bool {
+    group.profile_name.trim().is_empty()
+        && group
+            .direct_member_ids_hex
+            .as_ref()
+            .is_some_and(|ids| ids.len() == 2)
+}
+
 pub(crate) fn replace_direct_conversation_members_tx(
     conn: &Connection,
     group_id_hex: &str,
@@ -3489,11 +3498,15 @@ pub(crate) fn replace_direct_conversation_members_tx(
     let Some(member_ids_hex) = member_ids_hex else {
         return Ok(());
     };
+    let member_ids_hex = member_ids_hex
+        .iter()
+        .map(|member_id_hex| member_id_hex.trim().to_ascii_lowercase())
+        .filter(|member_id_hex| !member_id_hex.is_empty())
+        .collect::<Vec<_>>();
+    if member_ids_hex.len() != 2 {
+        return Ok(());
+    }
     for member_id_hex in member_ids_hex {
-        let member_id_hex = member_id_hex.trim().to_ascii_lowercase();
-        if member_id_hex.is_empty() {
-            continue;
-        }
         conn.execute(
             "INSERT OR IGNORE INTO direct_conversation_members (group_id_hex, member_id_hex)
              VALUES (?1, ?2)",
