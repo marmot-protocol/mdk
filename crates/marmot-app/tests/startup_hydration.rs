@@ -343,3 +343,106 @@ async fn held_hydration_body() {
     }
     runtime.shutdown().await;
 }
+
+#[test]
+fn existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held() {
+    let thread = std::thread::Builder::new()
+        .name("startup-hydration-direct-index".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(held_direct_conversation_index_body());
+        })
+        .unwrap();
+    thread.join().unwrap();
+}
+
+/// First open after migration 50: Direct groups exist, the peer index is
+/// empty, and readiness is signaled before the hydration-lane backfill.
+/// Lookup must return a retryable error, never `Ok(None)`, until the worker
+/// finishes reconciliation and the existing group becomes visible.
+async fn held_direct_conversation_index_body() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+
+    let dir_donor = tempfile::tempdir().unwrap();
+    let home_donor = AccountHome::open(dir_donor.path());
+    home_donor.create_account("donor").unwrap();
+    let donor_id = home_donor.account("donor").unwrap().account_id_hex;
+    {
+        let app_donor = open_store(&dir_donor, &url, None);
+        let mut donor = app_donor.client("donor").await.unwrap();
+        donor.publish_key_package().await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account(BENCH_ACCOUNT).unwrap();
+    let group_id;
+    {
+        let app_fixture = open_store(&dir, &url, None);
+        let mut client = app_fixture.client(BENCH_ACCOUNT).await.unwrap();
+        group_id = client.create_group("", &[donor_id.as_str()]).await.unwrap();
+    }
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let app = open_store(&dir, &url, Some(BATCH_HOLD_MS));
+    app.reset_direct_conversation_members_backfill_for_test(BENCH_ACCOUNT)
+        .unwrap();
+    assert!(
+        app.direct_conversation_candidates(BENCH_ACCOUNT, &donor_id)
+            .unwrap()
+            .is_empty(),
+        "upgrade fixture must start from an empty peer index"
+    );
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let start_started = Instant::now();
+    runtime.start().await.unwrap();
+    assert!(
+        start_started.elapsed() < Duration::from_millis(BATCH_HOLD_MS / 2),
+        "readiness must not wait on the held hydration pipeline"
+    );
+
+    let held = tokio::time::timeout(
+        Duration::from_millis(BATCH_HOLD_MS / 2),
+        runtime.existing_direct_conversation(BENCH_ACCOUNT, &donor_id),
+    )
+    .await
+    .expect("lookup during the hold must not wait out hydration");
+    assert!(
+        matches!(held, Err(AppError::DirectConversationIndexNotReady)),
+        "held lookup must be retryable, not a miss: {held:?}"
+    );
+    runtime.shutdown().await;
+
+    let app = open_store(&dir, &url, None);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let found = loop {
+        let result = runtime
+            .existing_direct_conversation(BENCH_ACCOUNT, &donor_id)
+            .await;
+        match result {
+            Ok(Some(found)) => break found,
+            Ok(None) => panic!(
+                "upgrade lookup must never return None before or after the peer-index backfill"
+            ),
+            Err(AppError::DirectConversationIndexNotReady) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "peer-index backfill did not complete after hydration was released"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(other) => panic!("unexpected lookup error after hydration release: {other:?}"),
+        }
+    };
+    assert_eq!(found.group_id_hex, group_id_hex);
+    assert!(found.reusable);
+    runtime.shutdown().await;
+}

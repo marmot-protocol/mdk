@@ -282,6 +282,9 @@ jobs:
       - name: Run relay runtime tests serially
         run: cargo test -p marmot-app --test relay_runtime --features test-policy-overrides --locked -- --test-threads=1
 
+      - name: Run held peer-index upgrade lookup
+        run: cargo test -p marmot-app --test startup_hydration --features test-policy-overrides --locked -- --exact existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held
+
   relay-e2e:
     name: Relay CLI E2E
     runs-on: ubuntu-latest

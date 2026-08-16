@@ -8647,6 +8647,7 @@ fn pending_group_invites_skips_malformed_rows() {
             archived: false,
             pending_confirmation: true,
             member_count: None,
+            direct_member_ids_hex: None,
             welcomer_account_id_hex: welcomer.map(str::to_owned),
             via_welcome_message_id_hex: None,
             nostr_routing_last_epoch: 0,
@@ -8721,6 +8722,7 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
             archived,
             pending_confirmation: pending,
             member_count: None,
+            direct_member_ids_hex: None,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
             nostr_routing_last_epoch: 0,
@@ -8790,4 +8792,130 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
     assert_eq!(summary.unread_conversations, 3);
     assert_eq!(summary.attention_only_conversations, 2);
     assert!(summary.has_unread);
+}
+
+#[test]
+fn reconcile_repairs_stale_three_member_count_on_two_member_direct() {
+    run_composed_app_runtime_test(
+        "reconcile-stale-three-count",
+        reconcile_repairs_stale_three_member_count_on_two_member_direct_body,
+    );
+}
+
+async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let group_id_hex;
+    {
+        let mut bob = app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let group_id = alice.create_group("", &[bob_id.as_str()]).await.unwrap();
+        group_id_hex = hex::encode(group_id.as_slice());
+    }
+
+    let mut state = app.load_state("alice").unwrap();
+    let torn = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .expect("direct group");
+    torn.member_count = Some(3);
+    torn.direct_member_ids_hex = None;
+    app.save_state(&state).unwrap();
+    app.reset_direct_conversation_members_backfill_for_test("alice")
+        .unwrap();
+
+    {
+        let _alice = app.client("alice").await.unwrap();
+    }
+    assert!(
+        app.account_import_marker("alice", crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER)
+            .unwrap(),
+        "3-to-2 tear must let the peer-index backfill complete"
+    );
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let found = runtime
+        .existing_direct_conversation("alice", &bob_id)
+        .await
+        .expect("lookup after 3-to-2 repair")
+        .expect("reusable direct must be found");
+    assert_eq!(found.group_id_hex, group_id_hex);
+    runtime.shutdown().await;
+}
+
+#[test]
+fn reconcile_repairs_stale_two_member_count_on_three_member_group() {
+    run_composed_app_runtime_test(
+        "reconcile-stale-two-count",
+        reconcile_repairs_stale_two_member_count_on_three_member_group_body,
+    );
+}
+
+async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+    let carol_id = home.account("carol").unwrap().account_id_hex;
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let group_id_hex;
+    {
+        let mut bob = app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let mut carol = app.client("carol").await.unwrap();
+        carol.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let group_id = alice
+            .create_group("", &[bob_id.as_str(), carol_id.as_str()])
+            .await
+            .unwrap();
+        group_id_hex = hex::encode(group_id.as_slice());
+    }
+
+    let mut state = app.load_state("alice").unwrap();
+    let torn = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .expect("three-member group");
+    torn.member_count = Some(2);
+    torn.direct_member_ids_hex = Some(vec![alice_id.clone(), bob_id.clone()]);
+    app.save_state(&state).unwrap();
+    app.reset_direct_conversation_members_backfill_for_test("alice")
+        .unwrap();
+
+    {
+        let _alice = app.client("alice").await.unwrap();
+    }
+    assert!(
+        app.account_import_marker("alice", crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER)
+            .unwrap(),
+        "2-to-3 tear must not leave the peer-index backfill incomplete"
+    );
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let found = runtime
+        .existing_direct_conversation("alice", &bob_id)
+        .await
+        .expect("lookup after 2-to-3 repair");
+    assert!(
+        found.is_none(),
+        "a three-member conversation must not be reused as a direct"
+    );
+    runtime.shutdown().await;
 }

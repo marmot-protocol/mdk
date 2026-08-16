@@ -1394,6 +1394,7 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
+        AppError::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
         AppError::TransportClosed => "transport_closed",
@@ -1412,6 +1413,7 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
             | AppError::AccountWorkerBusy
             | AppError::RuntimeBusy
             | AppError::TransportClosed
+            | AppError::DirectConversationIndexNotReady
     ) {
         participant.retryable_failures = participant.retryable_failures.saturating_add(1);
     } else {
@@ -1425,6 +1427,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
         | AppError::AccountWorkerResponseTimedOut
+        | AppError::DirectConversationIndexNotReady
         | AppError::RuntimeStopping
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)

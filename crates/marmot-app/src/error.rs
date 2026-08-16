@@ -29,6 +29,10 @@ pub enum AppError {
     UnknownGroup(String),
     #[error("invalid group membership page: {0}")]
     InvalidGroupMembershipPage(String),
+    /// The once-per-open peer-index backfill has not finished. Retry after
+    /// account hydration/reconciliation completes; do not treat this as a miss.
+    #[error("direct conversation index is not ready; retry after account hydration")]
+    DirectConversationIndexNotReady,
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
     #[error("invalid chat pin: {0}")]
@@ -196,6 +200,7 @@ impl AppError {
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
+            Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",

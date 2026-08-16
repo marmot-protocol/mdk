@@ -474,14 +474,20 @@ impl AppClient {
             else {
                 continue;
             };
-            if projected_group.member_count.is_none()
-                && let Ok(group) = self.runtime.group_record(&group_id)
-            {
-                projected_group.member_count = u64::try_from(group.members.len()).ok();
-                if projected_group.member_count.is_some() {
-                    self.mark_group_projection_dirty_hex(group_id_hex);
-                    changed = true;
+            let mut dirty = false;
+            if let Ok(group) = self.runtime.group_record(&group_id) {
+                let live_count = u64::try_from(group.members.len()).ok();
+                if projected_group.member_count != live_count {
+                    projected_group.member_count = live_count;
+                    dirty = true;
                 }
+                let previous_direct_members = projected_group.direct_member_ids_hex.clone();
+                projected_group.set_direct_member_ids_from_roster(&group.members);
+                dirty |= projected_group.direct_member_ids_hex != previous_direct_members;
+            }
+            if dirty {
+                self.mark_group_projection_dirty_hex(group_id_hex);
+                changed = true;
             }
         }
         Ok(changed)
@@ -495,7 +501,8 @@ impl AppClient {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         self.reconcile_disband_drafts();
-        self.backfill_self_membership_once()
+        self.backfill_self_membership_once()?;
+        self.backfill_direct_conversation_members_once()
     }
 
     /// Finish the app-local half of durable disband acceptance after a crash
@@ -849,6 +856,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::InvalidGroupMembershipPage(_) => {
             "read_marker_failed:invalid_group_membership_page"
+        }
+        AppError::DirectConversationIndexNotReady => {
+            "read_marker_failed:direct_conversation_index_not_ready"
         }
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",

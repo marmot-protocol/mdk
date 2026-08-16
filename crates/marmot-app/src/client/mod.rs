@@ -2046,6 +2046,64 @@ impl AppClient {
         Ok(())
     }
 
+    /// One-time open/upgrade backfill of `direct_conversation_members`.
+    ///
+    /// Migration 0050 creates the peer index empty. Groups saved after that
+    /// write their Direct roster on the projection path. Accounts that already
+    /// had unnamed two-member chats need one serialized pass on this worker
+    /// lane after hydration can read those rosters. The import marker is set
+    /// only when every eligible group is indexed; a failed or not-yet-hydrated
+    /// group leaves the marker unset so the next open retries. Steady-state
+    /// lookup never scans for unindexed rows.
+    pub(crate) fn backfill_direct_conversation_members_once(&self) -> Result<(), AppError> {
+        if self.app.account_import_marker(
+            &self.state.label,
+            crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+        )? {
+            return Ok(());
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        let unindexed = storage.unindexed_direct_conversation_group_ids()?;
+        let mut hydration_pending = false;
+        for group_id_hex in unindexed {
+            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                continue;
+            };
+            if group_id_bytes.is_empty() {
+                continue;
+            }
+            let group_id = GroupId::new(group_id_bytes);
+            let members = match self.runtime.members(&group_id) {
+                Ok(members) => members,
+                Err(err) => {
+                    if matches!(
+                        AppError::from(err).as_engine_error(),
+                        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+                    ) {
+                        hydration_pending = true;
+                    }
+                    continue;
+                }
+            };
+            let member_ids_hex = members
+                .iter()
+                .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            storage.fill_unindexed_direct_conversation_members(&group_id_hex, &member_ids_hex)?;
+        }
+        if !hydration_pending
+            && storage
+                .unindexed_direct_conversation_group_ids()?
+                .is_empty()
+        {
+            self.app.mark_account_import_complete(
+                &self.state.label,
+                crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn accept_group_invite(&mut self, group_id: &GroupId) -> Result<AppGroupRecord, AppError> {
         self.set_group_invite_confirmation(group_id, false, false)
     }

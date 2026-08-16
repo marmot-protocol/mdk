@@ -96,6 +96,8 @@ mod migration_0047_normalized_message_records;
 mod migration_0048_deferred_peel_generations;
 #[path = "migrations/0049_pending_invite_index.rs"]
 mod migration_0049_pending_invite_index;
+#[path = "migrations/0050_direct_conversation_members.rs"]
+mod migration_0050_direct_conversation_members;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -355,6 +357,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 49,
         name: "0049_pending_invite_index",
         apply: migration_0049_pending_invite_index::apply,
+    },
+    Migration {
+        version: 50,
+        name: "0050_direct_conversation_members",
+        apply: migration_0050_direct_conversation_members::apply,
     },
 ];
 
@@ -883,7 +890,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 49,
+                found: 50,
                 latest_supported: 46,
             }
         ));
@@ -939,7 +946,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 49,
+                found: 50,
                 latest_supported: 46,
             }
         ));
@@ -1243,7 +1250,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 49,
+                found: 50,
                 latest_supported: 46,
             }
         ));
@@ -1711,6 +1718,28 @@ mod tests {
             column_default(&conn, "chat_list_rows", "last_message_delivery_state").as_deref(),
             Some("'not_applicable'")
         );
+    }
+
+    #[test]
+    fn direct_conversation_members_table_is_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'direct_conversation_members'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        assert!(connection_has_column(
+            &conn,
+            "direct_conversation_members",
+            "member_id_hex"
+        ));
     }
 
     #[test]

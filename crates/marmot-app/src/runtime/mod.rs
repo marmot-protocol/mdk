@@ -27,7 +27,7 @@ use crate::app_telemetry::{
     AppPerformanceOperation, AppPerformanceTelemetry, bounded_advisory_step,
 };
 use crate::directory::DirectorySyncHandle;
-use crate::ids::normalize_group_id_hex_app;
+use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
 use crate::notifications;
 use crate::{
@@ -40,17 +40,17 @@ use crate::{
     AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
     AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
     AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
-    ChatPinState, GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
-    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
+    KeyPackageDeletionResult, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp,
+    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, MessageDraft, MessageDraftAttachment,
+    MessageDraftSummary, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1046,6 +1046,16 @@ impl MarmotAppRuntime {
     pub fn record_chat_list_row_read(&self, duration: Duration, success: bool) {
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::ChatListRowRead,
+            duration,
+            success,
+        );
+    }
+
+    /// Record the fixed app-performance sample for the UniFFI existing
+    /// direct-conversation lookup.
+    pub fn record_existing_direct_conversation_read(&self, duration: Duration, success: bool) {
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::ExistingDirectConversationRead,
             duration,
             success,
         );
@@ -3136,6 +3146,139 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .chat_list_row(&account.label, group_id_hex)
+    }
+
+    /// Look up the reusable existing direct conversation with `peer_account_id`.
+    ///
+    /// `peer_account_id` accepts hex or `npub`. The read is keyed by this
+    /// account plus that peer: it does not return the full chat list, and
+    /// membership is loaded only for peer-index hits that still look reusable.
+    /// Upgrade backfill of the peer index runs once on account open, not on
+    /// this read. Until that completion marker is set, this returns
+    /// [`AppError::DirectConversationIndexNotReady`] instead of `Ok(None)` so
+    /// a first open after migration 50 cannot be mistaken for a miss.
+    /// See [`storage_sqlite::select_reusable_direct_conversation`] for the
+    /// reuse policy and activity-order tie-break.
+    pub async fn existing_direct_conversation(
+        &self,
+        account_ref: &str,
+        peer_account_id: &str,
+    ) -> Result<Option<ExistingDirectConversation>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let peer_account_id_hex = account_id_hex_from_ref(peer_account_id)?;
+        if peer_account_id_hex == account.account_id_hex {
+            return Ok(None);
+        }
+        if !self.accounts.app.account_import_marker(
+            &account.label,
+            crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+        )? {
+            return Err(AppError::DirectConversationIndexNotReady);
+        }
+        let candidates = self
+            .accounts
+            .app
+            .direct_conversation_candidates(&account.label, &peer_account_id_hex)?;
+        let memberships = self
+            .direct_conversation_memberships(account_ref, &candidates)
+            .await?;
+        Ok(storage_sqlite::select_reusable_direct_conversation(
+            &candidates,
+            &account.account_id_hex,
+            &peer_account_id_hex,
+            &memberships,
+        ))
+    }
+
+    async fn direct_conversation_memberships(
+        &self,
+        account_ref: &str,
+        candidates: &[ChatListRow],
+    ) -> Result<HashMap<String, Vec<String>>, AppError> {
+        let eligible = candidates
+            .iter()
+            .filter(|row| {
+                row.conversation_kind == crate::ChatConversationKind::Direct
+                    && row.self_membership == crate::SelfMembership::Member
+                    && row.lifecycle_state != cgka_traits::GroupLifecycleState::Disbanded
+                    && !row.disbanding
+                    && row.leave_requested_at_ms.is_none()
+            })
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut group_ids = Vec::with_capacity(eligible.len());
+        for row in &eligible {
+            let bytes = hex::decode(&row.group_id_hex)?;
+            if bytes.is_empty() {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation group id is empty".to_owned(),
+                ));
+            }
+            group_ids.push(GroupId::new(bytes));
+        }
+        let mut memberships = HashMap::new();
+        for chunk in group_ids.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
+            let page = self
+                .direct_conversation_member_ids_page(account_ref, chunk)
+                .await?;
+            for item in page {
+                memberships.insert(item.group_id_hex, item.member_ids_hex);
+            }
+        }
+        for row in eligible {
+            if !memberships.contains_key(&row.group_id_hex) {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation membership page omitted a requested group".to_owned(),
+                ));
+            }
+        }
+        Ok(memberships)
+    }
+
+    async fn direct_conversation_member_ids_page(
+        &self,
+        account_ref: &str,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        match self.group_member_ids_page(account_ref, group_ids).await {
+            Ok(page) => {
+                let mut seen = HashMap::new();
+                for item in page {
+                    seen.insert(item.group_id_hex.clone(), item);
+                }
+                let mut ordered = Vec::with_capacity(group_ids.len());
+                for group_id in group_ids {
+                    let group_id_hex = hex::encode(group_id.as_slice());
+                    match seen.remove(&group_id_hex) {
+                        Some(item) => ordered.push(item),
+                        None => {
+                            return Err(AppError::InvalidGroupMembershipPage(
+                                "direct conversation membership page omitted a requested group"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                }
+                Ok(ordered)
+            }
+            Err(_) => {
+                let mut page = Vec::with_capacity(group_ids.len());
+                for group_id in group_ids {
+                    let members = self.group_members(account_ref, group_id).await?;
+                    page.push(crate::AppGroupMemberIds {
+                        group_id_hex: hex::encode(group_id.as_slice()),
+                        member_ids_hex: members
+                            .into_iter()
+                            .map(|member| member.member_id_hex)
+                            .collect(),
+                        admin_ids_hex: Vec::new(),
+                    });
+                }
+                Ok(page)
+            }
+        }
     }
 
     /// Pin or unpin one unarchived chat in an account-device's local store.

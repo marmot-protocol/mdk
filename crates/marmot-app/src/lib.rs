@@ -200,9 +200,10 @@ pub use relay_telemetry_export::{
 };
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, MAX_TIMELINE_LIMIT, SelfMembership,
-    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
-    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, ExistingDirectConversation,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    select_reusable_direct_conversation,
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -250,6 +251,10 @@ const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection
 /// `account_groups.self_membership` from current engine state for rows that
 /// predate migration 0018 (where every row defaulted to `'member'`).
 const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
+/// Once-only marker for the open/upgrade backfill that writes
+/// `direct_conversation_members` from live rosters for Direct groups that
+/// predate migration 0050.
+const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-members-backfill-v1";
 /// Invalidation reason for a sent app event that will never reach anyone,
 /// whether it was refused at send time or its group turned terminal while the
 /// engine still held it. The derived-state SQL keys the app-facing `Failed`
@@ -2293,6 +2298,25 @@ impl MarmotApp {
         Ok(row)
     }
 
+    /// Direct-conversation candidates for a peer-keyed reuse lookup.
+    ///
+    /// This is the SQL-filtered chat-list projection only: empty group name,
+    /// roster size 2, and a persisted member-index hit for `peer_account_id_hex`.
+    /// It does not transfer named chats, 3+ member chats, or Direct chats with
+    /// a different peer, and it does not hydrate last-message display names.
+    pub fn direct_conversation_candidates(
+        &self,
+        label: &str,
+        peer_account_id_hex: &str,
+    ) -> Result<Vec<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .direct_conversation_candidate_rows(peer_account_id_hex)?)
+    }
+
     /// Pin or unpin one unarchived local chat and return the complete
     /// authoritative pin order after the transaction.
     pub fn set_chat_pinned(
@@ -2990,6 +3014,22 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
             .mark_account_import_complete(name)?;
+        Ok(())
+    }
+
+    /// Test seam: empty the peer index and clear its completion marker so the
+    /// next account-worker open looks like the first open after migration 50.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub fn reset_direct_conversation_members_backfill_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .reset_direct_conversation_members_backfill(
+                DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+            )?;
         Ok(())
     }
 
