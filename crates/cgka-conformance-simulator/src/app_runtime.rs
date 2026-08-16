@@ -1438,6 +1438,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::Hex(_)
         | AppError::InvalidChatPin(_)
         | AppError::InvalidGroupMembershipPage(_)
+        | AppError::InvalidCachedIdentityPage(_)
         | AppError::InvalidMessageDraft(_)
         | AppError::InvalidPublicKey
         | AppError::UnexpectedPrivateKey

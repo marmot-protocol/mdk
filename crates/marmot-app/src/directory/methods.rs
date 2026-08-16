@@ -20,12 +20,13 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::records::{
-    DirectoryKeyPackage, FetchedFollowList, UserDirectoryLocalAccount, UserDirectoryRecord,
+    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList,
+    MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    follow_list_from_record, latest_follow_list_from_records, latest_fresh_profiles_from_records,
-    profile_content_json, profile_from_record, public_directory_user_record,
-    select_newer_directory_entry, source_relays_from_record, upsert_newer_directory_entry,
-    user_directory_record_from_public, user_record_match,
+    cached_identity_projection, follow_list_from_record, latest_follow_list_from_records,
+    latest_fresh_profiles_from_records, profile_content_json, profile_from_record,
+    public_directory_user_record, select_newer_directory_entry, source_relays_from_record,
+    upsert_newer_directory_entry, user_directory_record_from_public, user_record_match,
 };
 use crate::directory::{
     DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
@@ -62,6 +63,12 @@ impl MarmotApp {
     #[cfg(test)]
     pub(crate) fn directory_cache_open_count_for_test(&self) -> usize {
         self.directory_cache_open_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn directory_handle_acquire_count_for_test(&self) -> usize {
+        self.directory_handle_acquire_count
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -383,6 +390,59 @@ impl MarmotApp {
         let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
         self.directory_entry_for_account_id_with_handles(&account_id_hex, &caches, &shared_storage)
+    }
+
+    /// Bounded local cached-identity page for many account IDs.
+    ///
+    /// Acquires directory caches and shared storage once, then projects each
+    /// requested id in input order. Invalid IDs become rows rather than failing
+    /// the page. This is a cache read, not a network refresh.
+    pub fn cached_identity_projections_for_account_ids(
+        &self,
+        account_id_hexes: &[String],
+    ) -> Result<Vec<CachedIdentityProjection>, AppError> {
+        if account_id_hexes.len() > MAX_CACHED_IDENTITY_PAGE_SIZE {
+            return Err(AppError::InvalidCachedIdentityPage(format!(
+                "requested {} accounts; maximum page size is {MAX_CACHED_IDENTITY_PAGE_SIZE}",
+                account_id_hexes.len()
+            )));
+        }
+        if account_id_hexes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let caches = self.directory_caches()?;
+        let shared_storage = self.shared_storage()?;
+        let local_labels = self.local_account_labels_by_id()?;
+        let mut projections = Vec::with_capacity(account_id_hexes.len());
+
+        for requested_id in account_id_hexes {
+            let Ok(account_id_hex) = parse_account_id_hex(requested_id) else {
+                projections.push(cached_identity_projection(
+                    requested_id.clone(),
+                    None,
+                    None,
+                    None,
+                ));
+                continue;
+            };
+            let profile = self
+                .directory_entry_for_account_id_with_handles(
+                    &account_id_hex,
+                    &caches,
+                    &shared_storage,
+                )?
+                .and_then(|entry| entry.profile);
+            let local_label = local_labels.get(&account_id_hex).cloned();
+            projections.push(cached_identity_projection(
+                requested_id.clone(),
+                Some(account_id_hex),
+                profile,
+                local_label,
+            ));
+        }
+
+        Ok(projections)
     }
 
     pub async fn refresh_user_directory_for_account_id(
@@ -1212,6 +1272,9 @@ impl MarmotApp {
     }
 
     pub(crate) fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
+        #[cfg(test)]
+        self.directory_handle_acquire_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let accounts = self
             .account_home()
             .accounts()?

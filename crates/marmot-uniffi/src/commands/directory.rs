@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use marmot_app::UserSearchParams;
 
-use crate::conversions::{UserProfileMetadataFfi, normalize_member_ref_ffi};
+use crate::conversions::{
+    CachedIdentityProjectionFfi, UserProfileMetadataFfi, normalize_member_ref_ffi,
+};
 use crate::errors::MarmotKitError;
 use crate::markdown::{self, MarkdownDocumentFfi};
 use crate::subscriptions::UserSearchSubscription;
@@ -53,6 +55,31 @@ impl Marmot {
     ) -> Result<Option<UserProfileMetadataFfi>, MarmotKitError> {
         let entry = self.app.directory_entry_for_account_id(&account_id_hex)?;
         Ok(entry.and_then(|record| record.profile).map(Into::into))
+    }
+
+    /// Bounded local cached-identity page for many account IDs.
+    ///
+    /// This is a cache read, not a network refresh. The page is order-stable
+    /// and returns one row per input, including duplicates. Invalid IDs become
+    /// rows with `account_id_hex = None` rather than failing the page.
+    /// `profile` is the only signal that remotely cached kind:0 metadata is
+    /// available; a local-only `resolved_name` must not be treated as remote
+    /// identity. Maximum page size is 100 account IDs.
+    pub fn cached_identity_projections(
+        &self,
+        account_id_hexes: Vec<String>,
+    ) -> Result<Vec<CachedIdentityProjectionFfi>, MarmotKitError> {
+        if account_id_hexes.len() > marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE {
+            return Err(MarmotKitError::InvalidCachedIdentityPage {
+                max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
+            });
+        }
+        Ok(self
+            .app
+            .cached_identity_projections_for_account_ids(&account_id_hexes)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     /// Cached Nostr kind:0 `website` metadata for an account id, when it is a
@@ -143,6 +170,7 @@ impl Marmot {
 #[cfg(test)]
 mod tests {
     use cgka_traits::TransportEndpoint;
+    use marmot_account::AccountHome;
     use marmot_app::{AccountSetupRequest, MarmotApp};
     use nostr_relay_builder::MockRelay;
 
@@ -150,6 +178,135 @@ mod tests {
     use crate::conversions::{
         MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserSearchUpdateFfi,
     };
+
+    #[test]
+    fn cached_identity_projections_cover_mixed_local_unknown_duplicate_and_malformed_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AccountHome::open(dir.path());
+        let alice = home.create_account("alice").expect("create alice");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let unknown = format!("{:064x}", 47);
+
+        let page = kit
+            .cached_identity_projections(vec![
+                alice.account_id_hex.clone(),
+                "not-a-public-key".to_owned(),
+                unknown.clone(),
+                alice.account_id_hex.clone(),
+            ])
+            .expect("project page");
+
+        assert_eq!(page.len(), 4);
+        assert_eq!(
+            page[0].account_id_hex.as_deref(),
+            Some(alice.account_id_hex.as_str())
+        );
+        assert!(page[0].profile.is_none());
+        assert_eq!(page[0].local_label.as_deref(), Some("alice"));
+        assert_eq!(page[0].resolved_name.as_deref(), Some("alice"));
+
+        assert_eq!(page[1].requested_id, "not-a-public-key");
+        assert_eq!(page[1].account_id_hex, None);
+        assert!(page[1].profile.is_none());
+        assert_eq!(page[1].resolved_name, None);
+
+        assert_eq!(page[2].account_id_hex.as_deref(), Some(unknown.as_str()));
+        assert!(page[2].profile.is_none());
+        assert_eq!(page[2].local_label, None);
+        assert_eq!(page[2].resolved_name, None);
+
+        assert_eq!(page[3].requested_id, alice.account_id_hex);
+        assert_eq!(page[3].local_label.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn cached_identity_projections_reject_an_oversized_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let oversized = vec!["00".repeat(32); marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE + 1];
+
+        assert!(matches!(
+            kit.cached_identity_projections(oversized),
+            Err(MarmotKitError::InvalidCachedIdentityPage { max_accounts: 100 })
+        ));
+    }
+
+    #[test]
+    fn cached_identity_projections_include_a_published_local_profile() {
+        let test_thread = std::thread::Builder::new()
+            .name("ffi-cached-identity-profile".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let test_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                test_runtime.block_on(cached_identity_published_profile_body());
+            })
+            .unwrap();
+        test_thread.join().unwrap();
+    }
+
+    async fn cached_identity_published_profile_body() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url);
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+        let account_id_hex = account.account.account_id_hex;
+
+        kit.publish_user_profile(
+            account_id_hex.clone(),
+            UserProfileMetadataFfi {
+                name: Some("needle".to_owned()),
+                display_name: Some("Needle".to_owned()),
+                ..Default::default()
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("publish profile");
+
+        let unknown = format!("{:064x}", 47);
+        let page = kit
+            .cached_identity_projections(vec![account_id_hex.clone(), unknown.clone()])
+            .expect("project page");
+
+        assert_eq!(
+            page[0].account_id_hex.as_deref(),
+            Some(account_id_hex.as_str())
+        );
+        assert_eq!(
+            page[0]
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.display_name.as_deref()),
+            Some("Needle")
+        );
+        assert!(page[0].local_label.is_some());
+        assert_eq!(page[0].resolved_name.as_deref(), Some("Needle"));
+        assert_eq!(page[1].account_id_hex.as_deref(), Some(unknown.as_str()));
+        assert!(page[1].profile.is_none());
+        assert_eq!(page[1].resolved_name, None);
+    }
 
     #[test]
     fn user_search_streams_typed_results_through_the_ffi_subscription() {

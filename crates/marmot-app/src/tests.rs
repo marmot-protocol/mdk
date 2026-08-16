@@ -4458,6 +4458,124 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
 }
 
 #[test]
+fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let remote = format!("{:064x}", 46);
+    let unknown = format!("{:064x}", 47);
+    let malformed = "not-a-public-key".to_owned();
+
+    app.save_directory_entry(&test_directory_record(&remote, "Remote Peer", 1))
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    let requested = vec![
+        remote.clone(),
+        alice.account_id_hex.clone(),
+        malformed.clone(),
+        unknown.clone(),
+        remote.clone(),
+        bob.account_id_hex.clone(),
+    ];
+    let page = app
+        .cached_identity_projections_for_account_ids(&requested)
+        .unwrap();
+
+    assert_eq!(page.len(), requested.len());
+    assert_eq!(page[0].requested_id, remote);
+    assert_eq!(page[0].account_id_hex.as_deref(), Some(remote.as_str()));
+    assert_eq!(
+        page[0]
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.name.as_deref()),
+        Some("Remote Peer")
+    );
+    assert_eq!(page[0].local_label, None);
+    assert_eq!(page[0].resolved_name.as_deref(), Some("Remote Peer"));
+
+    assert_eq!(
+        page[1].account_id_hex.as_deref(),
+        Some(alice.account_id_hex.as_str())
+    );
+    assert_eq!(page[1].profile, None);
+    assert_eq!(page[1].local_label.as_deref(), Some("alice"));
+    assert_eq!(page[1].resolved_name.as_deref(), Some("alice"));
+
+    assert_eq!(page[2].requested_id, malformed);
+    assert_eq!(page[2].account_id_hex, None);
+    assert_eq!(page[2].profile, None);
+    assert_eq!(page[2].local_label, None);
+    assert_eq!(page[2].resolved_name, None);
+
+    assert_eq!(page[3].account_id_hex.as_deref(), Some(unknown.as_str()));
+    assert_eq!(page[3].profile, None);
+    assert_eq!(page[3].local_label, None);
+    assert_eq!(page[3].resolved_name, None);
+
+    assert_eq!(page[4].requested_id, remote);
+    assert_eq!(
+        page[4]
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.name.as_deref()),
+        Some("Remote Peer")
+    );
+
+    assert_eq!(page[5].local_label.as_deref(), Some("bob"));
+    assert_eq!(page[5].resolved_name.as_deref(), Some("bob"));
+}
+
+#[test]
+fn cached_identity_page_rejects_oversized_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let oversized = vec!["00".repeat(32); MAX_CACHED_IDENTITY_PAGE_SIZE + 1];
+
+    assert!(matches!(
+        app.cached_identity_projections_for_account_ids(&oversized),
+        Err(AppError::InvalidCachedIdentityPage(_))
+    ));
+}
+
+#[test]
+fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let remote = format!("{:064x}", 48);
+    app.save_directory_entry(&test_directory_record(&remote, "Bulk Peer", 1))
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    let mut requested = vec![remote.clone()];
+    requested.extend((49..148).map(|value| format!("{value:064x}")));
+    assert_eq!(requested.len(), 100);
+
+    let before = app.directory_handle_acquire_count_for_test();
+    let page = app
+        .cached_identity_projections_for_account_ids(&requested)
+        .unwrap();
+    let after_page = app.directory_handle_acquire_count_for_test();
+
+    assert_eq!(page.len(), 100);
+    assert_eq!(page[0].resolved_name.as_deref(), Some("Bulk Peer"));
+    assert_eq!(after_page, before + 1);
+
+    for account_id in &requested {
+        let _ = app.directory_entry_for_account_id(account_id);
+    }
+    assert_eq!(
+        app.directory_handle_acquire_count_for_test(),
+        after_page + requested.len()
+    );
+}
+
+#[test]
 fn warm_directory_storage_opens_shared_and_local_directory_handles() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

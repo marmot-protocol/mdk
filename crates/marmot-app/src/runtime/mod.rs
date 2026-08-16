@@ -1014,6 +1014,15 @@ impl MarmotAppRuntime {
             .display_names_for_account_ids(account_id_hexes)
     }
 
+    pub fn cached_identity_projections_for_account_ids(
+        &self,
+        account_id_hexes: &[String],
+    ) -> Result<Vec<crate::CachedIdentityProjection>, AppError> {
+        self.accounts
+            .app
+            .cached_identity_projections_for_account_ids(account_id_hexes)
+    }
+
     pub fn accounts(&self) -> AccountManager {
         self.accounts.clone()
     }

@@ -67,6 +67,59 @@ pub struct UserProfileMetadata {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Maximum number of account IDs accepted by one cached-identity page read.
+///
+/// Hosts hydrating profile caches should page larger sets. The bound keeps a
+/// single local cache read from monopolizing directory-handle acquisition.
+pub const MAX_CACHED_IDENTITY_PAGE_SIZE: usize = 100;
+
+/// One row of a bounded local cached-identity page.
+///
+/// This is a cache read, not a network refresh. [`Self::profile`] is the only
+/// signal that remotely cached kind:0 metadata is available; [`Self::resolved_name`]
+/// may come from a local account label and must not be treated as remote
+/// identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedIdentityProjection {
+    /// Original requested identifier, preserving host input order.
+    pub requested_id: String,
+    /// Canonical hex account id when `requested_id` is a valid public key.
+    pub account_id_hex: Option<String>,
+    /// Cached kind:0 profile when the directory has one.
+    pub profile: Option<UserProfileMetadata>,
+    /// Local account label when this id is one of our own accounts.
+    pub local_label: Option<String>,
+    /// Best display string: profile `display_name`/`name`, else local label.
+    pub resolved_name: Option<String>,
+}
+
+pub(crate) fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<String> {
+    let profile = profile?;
+    profile
+        .display_name
+        .as_deref()
+        .or(profile.name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+pub(crate) fn cached_identity_projection(
+    requested_id: String,
+    account_id_hex: Option<String>,
+    profile: Option<UserProfileMetadata>,
+    local_label: Option<String>,
+) -> CachedIdentityProjection {
+    let resolved_name = display_name_for_profile(profile.as_ref()).or_else(|| local_label.clone());
+    CachedIdentityProjection {
+        requested_id,
+        account_id_hex,
+        profile,
+        local_label,
+        resolved_name,
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserDirectoryRefresh {
     pub account_id_hex: String,
@@ -676,5 +729,31 @@ mod tests {
             Some(&serde_json::json!("https://example.test"))
         );
         assert!(!cached.extra.contains_key("banner"));
+    }
+
+    #[test]
+    fn cached_identity_projection_prefers_profile_name_over_local_label() {
+        let profile = UserProfileMetadata {
+            display_name: Some("Remote Name".to_owned()),
+            ..UserProfileMetadata::default()
+        };
+        let both = cached_identity_projection(
+            "requested".to_owned(),
+            Some("aa".repeat(32)),
+            Some(profile.clone()),
+            Some("local-label".to_owned()),
+        );
+        assert_eq!(both.resolved_name.as_deref(), Some("Remote Name"));
+        assert_eq!(both.local_label.as_deref(), Some("local-label"));
+        assert!(both.profile.is_some());
+
+        let local_only = cached_identity_projection(
+            "requested".to_owned(),
+            Some("aa".repeat(32)),
+            None,
+            Some("local-label".to_owned()),
+        );
+        assert_eq!(local_only.resolved_name.as_deref(), Some("local-label"));
+        assert_eq!(local_only.profile, None);
     }
 }
