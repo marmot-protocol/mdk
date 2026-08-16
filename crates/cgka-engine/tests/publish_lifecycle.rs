@@ -2115,7 +2115,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
         // reports that the regenerated message reached the transport. Until
         // then the row is still owed a delivery, so it still occupies the cap.
         let (_, intent_id) = alice
-            .take_regenerated_queued_intent_for_message(&msg.id)
+            .regenerated_queued_intent_for_message(&msg.id)
             .expect("a drained retained intent must be attributable to its durable row");
         alice.confirm_queued_outbound_intent(&intent_id).unwrap();
     }

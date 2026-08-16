@@ -308,9 +308,10 @@ pub fn generate_bounded_convergence_pressure_case(
     let (mut scenario, mut expected_outcomes) =
         bounded_convergence_pressure_case(&mut rng, case_index);
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name: "bounded-convergence-pressure/v1".into(),
-        generator_version: "1".into(),
+        generator_version: "2".into(),
         seed,
         case_index,
         subject: GeneratedSubjectKind::Engine,

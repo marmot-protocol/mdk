@@ -210,8 +210,10 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
     /// Queued intents regenerated into standalone publish work. The session
-    /// consumes these associations when it builds `PublishWork`, then deletes
-    /// the durable intent only after the transport reports acceptance.
+    /// reads these associations when it builds `PublishWork`, then deletes
+    /// the durable intent only after the transport reports acceptance. An
+    /// intent present here is in flight: the drain must not regenerate it a
+    /// second time until the host confirms or retries it (mdk#1472).
     pub(crate) queued_intent_by_message: HashMap<MessageId, (GroupId, MessageId)>,
 
     /// Queued group evolutions stay associated with their pending publish so
@@ -2944,8 +2946,8 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.confirm_regenerated_queued_intent(intent_id)
     }
 
-    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId) {
-        self.retry_regenerated_queued_intent(group_id);
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId, intent_id: &MessageId) {
+        self.retry_regenerated_queued_intent(group_id, intent_id);
     }
 
     async fn confirm_published(

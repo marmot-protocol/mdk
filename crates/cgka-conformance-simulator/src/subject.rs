@@ -1654,9 +1654,9 @@ impl ConvergenceSubject for EngineHarnessSubject {
                         .resolution = Some(outcome);
                 }
 
-                if let Some((group_id, _)) = &record.queued_intent {
+                if let Some((group_id, intent_id)) = &record.queued_intent {
                     self.client_mut(client)?
-                        .retry_regenerated_queued_intent(group_id);
+                        .retry_regenerated_queued_intent(group_id, intent_id);
                     self.client_mut(client)?
                         .forget_regenerated_queued_intent(&record.artifact.message.id);
                 }

@@ -1023,7 +1023,7 @@ impl AccountDeviceSession {
 
     pub fn retry_regenerated_queued_intent(&mut self, intent: &QueuedIntentRef) {
         self.engine
-            .retry_regenerated_queued_intent(&intent.group_id);
+            .retry_regenerated_queued_intent(&intent.group_id, &intent.intent_id);
     }
 
     pub async fn confirm_published(
@@ -1240,7 +1240,7 @@ impl AccountDeviceSession {
                 } => {
                     let queued_intent = self
                         .engine
-                        .take_regenerated_queued_intent_for_message(&msg.id)
+                        .regenerated_queued_intent_for_message(&msg.id)
                         .map(|(group_id, intent_id)| QueuedIntentRef {
                             group_id,
                             intent_id,
@@ -1257,7 +1257,7 @@ impl AccountDeviceSession {
                 SendResult::Proposal { msg } => {
                     let queued_intent = self
                         .engine
-                        .take_regenerated_queued_intent_for_message(&msg.id)
+                        .regenerated_queued_intent_for_message(&msg.id)
                         .map(|(group_id, intent_id)| QueuedIntentRef {
                             group_id,
                             intent_id,

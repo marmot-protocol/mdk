@@ -763,8 +763,10 @@ pub trait CgkaEngine: Send + Sync {
     fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError>;
 
     /// Re-arm a group after a regenerated standalone queued publish reached no
-    /// endpoint. The durable intent remains intact until confirmation.
-    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId);
+    /// endpoint. The durable intent remains intact until confirmation; the
+    /// named intent's in-flight association is cleared so the next drain
+    /// regenerates a fresh artifact for it.
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId, intent_id: &MessageId);
 
     /// Confirm that a [`SendResult::GroupEvolution`] (or legacy-profile
     /// [`SendResult::GroupCreated`]) was successfully published to the
