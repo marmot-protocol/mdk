@@ -32,8 +32,10 @@ requires `RUST_MIN_STACK=4194304`; Cargo-launched commands inherit the repositor
 CI-like Cargo commands.
 
 Do not infer that more `--cases` means more complex scenarios. Cases are independent indices and seed selects their
-deterministic choices. The stable identity is `(family/profile version, seed, case index)`. The CLI has no case-start
-offset, so shard large campaigns by distinct seeds rather than overlapping prefixes of the same seed.
+deterministic choices. The stable identity is `(family_name, generator_version, seed, case_index)`, plus an
+independently versioned workload profile when applicable. The CLI has no case-start offset, so shard large campaigns
+by distinct seeds rather than overlapping prefixes of the same seed. Generated inputs/reports do not embed the tested
+Git commit; require a clean build and retain the exact source revision plus command matrix beside durable evidence.
 
 ## Pieces
 

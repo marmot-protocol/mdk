@@ -23,7 +23,7 @@ not duplicate the entire cheap corpus.
 The stable logical identity is:
 
 ```text
-(family or profile version, seed, case index)
+(family_name, generator_version, seed, case_index[, profile_version])
 ```
 
 `--cases N` generates indices `0..N-1`. It is not a complexity setting. Increasing it must preserve the existing
@@ -32,7 +32,9 @@ shards. Do not run the same seed with several different case counts unless inten
 acceptable.
 
 Always retain `*-generated-input.json`. It pins more than the tuple: the selected subject, expectations, exact
-canonical IR, provenance, and digests. Any output-changing generator change requires a family/profile version bump.
+canonical IR, provenance, and digests. `family_name` and `generator_version` are independent fields; a family-name
+version does not replace the generator version. Include a separately versioned workload profile when applicable. Any
+output-changing generator or profile change requires its corresponding version bump.
 
 ## A staged campaign
 
@@ -43,37 +45,74 @@ or artifact-integrity errors before spending the larger budget.
 
 ### Stage 2: breadth matrix
 
-Build once, then invoke the worker binary directly so parallel shards do not contend on Cargo compilation:
+Require a clean source revision, build once, and put that exact revision plus the command matrix beside the evidence.
+The generated-input and report schemas do not currently carry a Git commit, so this companion metadata is required to
+identify the implementation under test:
 
-```sh
+```bash
+set -euo pipefail
+test -z "$(git status --porcelain)" || {
+  echo "refusing to build campaign evidence from a dirty worktree" >&2
+  exit 1
+}
+source_revision="$(git rev-parse HEAD)"
+family_name="convergence-chaos/v1"
+generator_version="6"
+case_count="25"
+case_timeout_secs="300"
+parallelism="4"
+
 cargo build -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked
-```
 
-For example, run eight seed shards with bounded parallelism:
-
-```sh
-campaign_root="target/convergence-scale/chaos"
+umask 077
+campaign_root="target/convergence-scale/$source_revision/convergence-chaos-v1-g$generator_version"
 mkdir -p "$campaign_root"
-export campaign_root
-seq 1000 1007 | xargs -P 4 -I SEED sh -c '
+printf '%s\n' \
+  "source_revision=$source_revision" \
+  "family_name=$family_name" \
+  "generator_version=$generator_version" \
+  "seeds=1000..1007" \
+  "cases_per_seed=$case_count" \
+  "case_timeout_secs=$case_timeout_secs" \
+  "storage=file" \
+  "parallelism=$parallelism" \
+  >"$campaign_root/campaign-matrix.txt"
+rustc --version --verbose >>"$campaign_root/campaign-matrix.txt"
+
+export campaign_root family_name case_count case_timeout_secs
+seq 1000 1007 | xargs -P "$parallelism" -I SEED sh -c '
   seed="$1"
   RUST_MIN_STACK=4194304 target/debug/cgka-conformance-campaign \
-    --family convergence-chaos/v1 \
+    --family "$family_name" \
     --seed "$seed" \
-    --cases 25 \
-    --case-timeout-secs 300 \
+    --cases "$case_count" \
+    --case-timeout-secs "$case_timeout_secs" \
     --storage file \
     --out "$campaign_root/seed-$seed"
 ' sh SEED
+
+expected_inputs="$((8 * case_count))"
+actual_inputs="$(find "$campaign_root" -name '*-generated-input.json' -type f | wc -l | tr -d ' ')"
+test "$actual_inputs" -eq "$expected_inputs"
+find "$campaign_root" -name '*-generated-input.json' -type f -print0 |
+  while IFS= read -r -d '' input; do
+    jq -e \
+      --arg family_name "$family_name" \
+      --arg generator_version "$generator_version" \
+      '.case.family_name == $family_name and .case.generator_version == $generator_version' \
+      "$input" >/dev/null
+  done
 ```
 
-This example is 200 cases. Increase the seed range, cases per seed, or both only after measuring peak RSS, disk use,
-and case time. Start parallelism conservatively. A useful limit is the smaller of available CPU capacity and the
-number of worst-case workers that fit in the memory/disk budget. The campaign summary records the measurements needed
-to tune that operational limit.
+This example is a clean-build, source-bound 200-case campaign across eight seed shards. Update the recorded generator
+version whenever the selected family changes; the final check fails when it does not match the generated inputs.
+Increase the seed range, cases per seed, or both only after measuring peak RSS, disk use, and case time. Start
+parallelism conservatively. A useful limit is the smaller of available CPU capacity and the number of worst-case
+workers that fit in the memory/disk budget. The campaign summary records the measurements needed to tune that
+operational limit.
 
-Use a separate immutable directory per `(source revision, family, seed)`. The runner's overwrite refusal protects
-evidence and catches accidental shard collisions.
+Use a separate immutable directory per `(source revision, family name, generator version, seed)`. The runner's
+overwrite refusal protects evidence and catches accidental shard collisions.
 
 ### Stage 3: sustained depth
 
@@ -158,7 +197,8 @@ For each motif, specify:
    [`RUNNING_CAMPAIGNS.md`](RUNNING_CAMPAIGNS.md).
 8. Run a small memory/file-backed batch, then the isolated worker. Promote stable synthetic failures into fixed vectors
    only after review.
-9. Bump the family/profile version if any existing `(version, seed, case index)` changes meaning or output.
+9. Bump `generator_version` if any existing `(family_name, generator_version, seed, case_index)` changes meaning or
+   output. Bump an independently versioned profile when its choices or meaning change.
 
 ## Aggregation and retention
 

@@ -505,10 +505,11 @@ permissions before executing its case. It preserves the full generated case, inc
 semantic expectations, so a crash or panic cannot erase the exact executable input. Replay one directly with
 `--generated-input FILE`. Add `--adapter engine|retained-relay|app-runtime` to deliberately run the embedded canonical
 Scenario IR through a different in-process adapter; capability preflight still rejects unsupported operations before
-action zero. Reports retain the producer's family/version/seed/case/subject provenance plus separate SHA-256 digests for
-the selected envelope bytes and the selected canonical Scenario IR inside it. An adapter override adds the executing
-adapter to report and failure-capsule filenames so A/B runs cannot overwrite one another. Override runs do not mint a
-promotable vector candidate; only the generator-recorded subject may supply that adapter-neutral fixture.
+action zero. Reports retain the producer's family name, independent generator version, seed, case index, and subject
+provenance plus separate SHA-256 digests for the selected envelope bytes and the selected canonical Scenario IR inside
+it. An adapter override adds the executing adapter to report and failure-capsule filenames so A/B runs cannot
+overwrite one another. Override runs do not mint a promotable vector candidate; only the generator-recorded subject
+may supply that adapter-neutral fixture.
 
 The fixed `cross-route-retained-history-recovery/v1` input uses the same envelope to pin the retained-relay adapter and
 the semantic oracle for the four-party cross-route regression. Run its strict encrypted-SQLite replay with:

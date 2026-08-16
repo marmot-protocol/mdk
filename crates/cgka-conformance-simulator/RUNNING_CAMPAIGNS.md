@@ -37,6 +37,10 @@ Use a new output directory for every run. The isolated campaign runner intention
 evidence. Keep generated inputs and failure artifacts private: sensitive replay capsules can contain recipient
 database/OpenMLS state and key material and must never be committed.
 
+Generated inputs and reports do not currently embed the tested Git commit. For evidence that must outlive the local
+session, require a clean worktree and preserve the exact `git rev-parse HEAD` value plus the command matrix beside the
+artifacts. [`SCALING_CAMPAIGNS.md`](SCALING_CAMPAIGNS.md) provides a private-by-default shard recipe that does this.
+
 For a quick installation and compile check:
 
 ```sh
@@ -85,10 +89,12 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/convergence-manual/chat-journey-seed-42-case-0-replay
 ```
 
-The stable logical identity of a generated case is `(family version, seed, case index)`. The saved input is stronger
-than remembering those three values because it pins the resolved scenario, subject, expectations, provenance, and
-digest. Logical replay does not recreate randomized MLS bytes. A checkpoint-bearing sensitive capsule is required for
-byte replay:
+The stable logical identity of a generated case is
+`(family_name, generator_version, seed, case_index)`, plus an independently versioned workload profile when one is
+defined. `family_name` and `generator_version` are separate: for example, `convergence-chaos/v1` currently uses
+generator version `6`. The saved input is stronger than remembering that tuple because it pins the resolved scenario,
+subject, expectations, provenance, and digest. Logical replay does not recreate randomized MLS bytes. A
+checkpoint-bearing sensitive capsule is required for byte replay:
 
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
@@ -251,27 +257,37 @@ canonical input and oracle as its cheaper control and add only the layer-specifi
 Do not move thousands of ordinary semantic cases into VMs. First discover and minimize locally, reproduce on the
 app/process boundary, then promote the smallest representative scenario to containers or VMs.
 
-## Scheduled and release lanes
+## Core recipes versus budgeted workflows
 
-Useful repository entrypoints are:
+These are useful local core-test recipes:
 
 ```sh
 just simulator-smoke
 just convergence-nightly-lane
 just convergence-weekly-lane
 just focused-convergence-regressions
-```
-
-Nightly and weekly lanes evaluate checked-in wall-clock, CPU, RSS, disk, artifact, retry, and flake budgets. Their
-green result is evidence for the exact tested revision and declared lane contents. Release hardening additionally
-requires a reviewed mixed-build manifest:
-
-```sh
 just convergence-release-hardening-lane PATH_TO_MIXED_BUILD_MANIFEST
 ```
 
-The release lane is not complete assurance until its digest-pinned evidence bundle and scoped claim have been
-downloaded and reviewed.
+The bare Just recipes do **not** collect or enforce the checked-in wall-clock, CPU, RSS, disk, artifact, retry, and
+flake budgets. `convergence-weekly-lane` and recipes it invokes also remove fixed output roots before rerunning, so use
+them as local test entrypoints rather than retained campaign evidence.
+
+The GitHub workflows wrap the core commands with `observe-step`, `collect-observation`, `check-budget`, and artifact
+upload. Dispatch those workflows on the exact branch or tag to obtain a budget-evaluated, retained run:
+
+```sh
+gh workflow run simulator-nightly.yml --ref BRANCH_OR_TAG
+gh workflow run convergence-hardening.yml --ref BRANCH_OR_TAG -f lane=weekly_manual
+gh workflow run convergence-hardening.yml --ref BRANCH_OR_TAG \
+  -f lane=release_hardening \
+  -f baseline_revision=EXACT_40_CHARACTER_ANCESTOR_COMMIT
+```
+
+Use `gh run list --workflow WORKFLOW_FILE` to find the run, `gh run watch RUN_ID` to wait for it, and
+`gh run download RUN_ID` to retain its artifacts. A green workflow is evidence for the exact `GITHUB_SHA` it checked
+out and the declared lane contents. Release hardening additionally requires a reviewed baseline revision and is not
+complete assurance until its digest-pinned evidence bundle and scoped claim have been downloaded and reviewed.
 
 ## Failure handling checklist
 

@@ -590,7 +590,8 @@ These are real simulator scenarios that are still tied to Rust harness details.
 
 ## Generated Scenario Families
 
-Generated cases are deterministic for a fixed family, seed, and case index. They are run directly as generated coverage.
+Generated cases are deterministic for a fixed family name, independent generator version, seed, and case index, plus
+a separately versioned workload profile when applicable. They are run directly as generated coverage.
 A generated case becomes a vector only when we want it to be a stable named contract: for example, when it caught a
 regression, covers a new semantic edge, or is the smallest readable example of a behavior.
 

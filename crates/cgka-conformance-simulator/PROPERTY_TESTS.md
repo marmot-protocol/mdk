@@ -240,10 +240,11 @@ directly. The model tracks membership, administrator authority, connectivity, pr
 delivery. It emits membership and retained-history profiles separately so pre-admission transport retry state is not
 misclassified as a no-pending failure.
 
-The generator is deterministic by family version, seed, and case index. Existing semantic reduction minimizes a saved
-failing scenario after execution. `tests/stateful_generator.rs` independently replays the legal-action preconditions,
-checks the complete action vocabulary across adjacent cases, runs both profiles through the report path, and verifies
-that the input fixture was saved privately before execution.
+The generator is deterministic by family name, independent generator version, seed, and case index, plus a separately
+versioned workload profile when applicable. Existing semantic reduction minimizes a saved failing scenario after
+execution. `tests/stateful_generator.rs` independently replays the legal-action preconditions, checks the complete
+action vocabulary across adjacent cases, runs both profiles through the report path, and verifies that the input
+fixture was saved privately before execution.
 
 ### `cross-route-restart-permutations/v1`
 

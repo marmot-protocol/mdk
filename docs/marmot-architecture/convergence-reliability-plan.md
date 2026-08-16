@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-15
+updated: 2026-08-16
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -1274,9 +1274,10 @@ operations and cross-operation interactions actually occurred.
 - [ ] Add explicit workload-size controls for dimensions such as actions, participants, message volume, commit/proposal
   frequency, and offline backlog. Do not overload `--cases` or `--seed`: cases remains the number of independently
   generated scenarios, while the seed selects reproducible choices within each case.
-- [ ] Preserve reproducibility as `(family/profile version, seed, case index)`: increasing `--cases` must preserve the
-  existing case prefix, saved inputs must replay independently, and output-changing generator work must bump the
-  generator/profile version rather than silently changing an existing corpus.
+- [ ] Preserve reproducibility as `(family_name, generator_version, seed, case_index)`, plus an independently
+  versioned workload profile where applicable: increasing `--cases` must preserve the existing case prefix, saved
+  inputs must replay independently, and output-changing generator/profile work must bump its corresponding version
+  rather than silently changing an existing corpus.
 
 Verification for this follow-up must include:
 
