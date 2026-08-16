@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit SHA on master to publish as an immutable Apple platform snapshot
+        description: Full 40-character commit SHA on master to publish as an immutable MarmotKit snapshot
         required: true
         type: string
 
@@ -279,7 +279,6 @@ jobs:
     name: Build Android bindings
     runs-on: ubuntu-latest
     needs: metadata
-    if: needs.metadata.outputs.is_snapshot == 'false'
     timeout-minutes: 60
 
     steps:
@@ -287,13 +286,20 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
           ref: ${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source
 
       - name: Install Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
           rustup target add \
@@ -341,8 +347,13 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: packaged-source -> target
 
       - name: Build MarmotKit Kotlin and JNI bindings
+        env:
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: ./crates/marmot-uniffi/kotlin-bindings.sh
 
       - name: Package Android bundle
@@ -351,20 +362,21 @@ jobs:
           RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
           RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
           version="$RELEASE_ID"
-          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' packaged-source/Cargo.toml | head -n 1)"
+          lock_sha="$(shasum -a 256 packaged-source/Cargo.lock | awk '{print $1}')"
           stage_parent="$RUNNER_TEMP/marmotkit-android-stage"
           bundle_dir="$stage_parent/marmotkit-android-$version"
           asset="$RUNNER_TEMP/marmotkit-android-$version.zip"
 
           rm -rf "$stage_parent" "$asset" "$asset.sha256"
           mkdir -p "$bundle_dir"
-          cp -R crates/marmot-uniffi/output/android/kotlin "$bundle_dir/"
-          cp -R crates/marmot-uniffi/output/android/jniLibs "$bundle_dir/"
+          cp -R packaged-source/crates/marmot-uniffi/output/android/kotlin "$bundle_dir/"
+          cp -R packaged-source/crates/marmot-uniffi/output/android/jniLibs "$bundle_dir/"
 
           cat > "$bundle_dir/manifest.json" <<EOF
           {
@@ -372,6 +384,7 @@ jobs:
             "version": "$version",
             "tag": "$tag",
             "source_sha": "$SOURCE_SHA",
+            "builder_sha": "$BUILDER_SHA",
             "workspace_version": "$workspace_version",
             "cargo_lock_sha256": "$lock_sha",
             "rustc": "$(rustc --version)",
@@ -380,6 +393,8 @@ jobs:
             "android_api": "${ANDROID_API:-26}",
             "contents": [
               "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
+              "kotlin/dev/ipf/marmotkit/MarmotAndroid.kt",
+              "kotlin/io/crates/keyring/Keyring.kt",
               "jniLibs/arm64-v8a/libmarmot_uniffi.so",
               "jniLibs/armeabi-v7a/libmarmot_uniffi.so",
               "jniLibs/x86/libmarmot_uniffi.so",
@@ -416,7 +431,7 @@ jobs:
       needs.metadata.result == 'success' &&
       needs.ios-bindings.result == 'success' &&
       needs.macos-bindings.result == 'success' &&
-      (needs.android-bindings.result == 'success' || needs.android-bindings.result == 'skipped')
+      needs.android-bindings.result == 'success'
     timeout-minutes: 15
     permissions:
       actions: read
@@ -428,7 +443,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
-          IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
         run: |
           set -euo pipefail
           mkdir -p dist/ios dist/macos dist/android
@@ -436,10 +450,8 @@ jobs:
             --name "marmotkit-ios-$SOURCE_SHA" --dir dist/ios
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "marmotkit-macos-$SOURCE_SHA" --dir dist/macos
-          if [[ "$IS_SNAPSHOT" == "false" ]]; then
-            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-              --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
-          fi
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
 
       - name: Create and verify immutable release
         shell: bash
@@ -500,11 +512,17 @@ jobs:
 
           macOS SwiftPM checksum: \`$macos_checksum\`
 
+          Android assets:
+          - \`marmotkit-android-$version.zip\`: generated Kotlin bindings and JNI libraries for all supported ABIs.
+          - \`marmotkit-android-$version.zip.sha256\`: ordinary SHA-256 verification for the Android bundle.
+
           Shared:
           - \`MarmotKit-$version.swift\`: generated Swift source matching both binaries.
 
           Verify source and artifact provenance with \`marmotkit-ios-$version.manifest.json\`,
           \`marmotkit-macos-$version.manifest.json\`, and the matching \`.checksums.txt\` assets.
+          Verify the Android archive with its sibling \`.sha256\`; its embedded \`manifest.json\` records the exact
+          source and workflow builder commits.
           Assets on this release are immutable.
           EOF
 
@@ -524,9 +542,8 @@ jobs:
             exit 1
           fi
 
-          assets=(dist/ios/* dist/macos/*)
+          assets=(dist/ios/* dist/macos/* dist/android/*)
           if [[ "$IS_SNAPSHOT" == "false" ]]; then
-            assets+=(dist/android/*)
             title="v$version - MarmotKit"
             release_flags=(--latest=false)
           else

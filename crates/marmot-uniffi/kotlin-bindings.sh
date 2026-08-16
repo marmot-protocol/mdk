@@ -19,8 +19,11 @@ set -euo pipefail
 # targets installed through rustup are visible.
 export PATH="$HOME/.cargo/bin:$PATH"
 
-CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
+# Keep the workflow/build tooling at the builder commit while allowing it to
+# compile and package an exact source checkout, matching the Apple scripts.
+TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
+CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
 if [[ "$TARGET_DIR" != /* ]]; then
   TARGET_DIR="$WORKSPACE_DIR/$TARGET_DIR"

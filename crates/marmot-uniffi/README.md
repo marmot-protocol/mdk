@@ -15,8 +15,8 @@ package that shared surface:
 The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
 same UniFFI surface, and releases publish it once.
 
-See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable SwiftPM binary artifacts, exact release and snapshot URLs,
-checksums, provenance, and the generated Swift synchronization rule.
+See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
+checksums, provenance, and generated-source synchronization rules.
 
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
