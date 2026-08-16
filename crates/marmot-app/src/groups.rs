@@ -127,6 +127,10 @@ pub struct AppGroupRecord {
     /// projections that have not yet been hydrated by an upgraded runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u64>,
+    /// Hex member ids when this group is currently a Direct conversation
+    /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_member_ids_hex: Option<Vec<String>>,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily (`Left`) or was removed (`Removed`).
     #[serde(default)]
@@ -667,6 +671,7 @@ impl AppGroupRecord {
             archived: false,
             pending_confirmation: false,
             member_count: None,
+            direct_member_ids_hex: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
             disbanding: false,
@@ -711,6 +716,7 @@ impl AppGroupRecord {
             record.member_count = u64::try_from(group.members.len()).ok();
             record.unrecoverable = group.unrecoverable;
             record.disbanded = group.disbanded.is_some();
+            record.set_direct_member_ids_from_roster(&group.members);
         }
         record
     }
@@ -751,7 +757,21 @@ impl AppGroupRecord {
             self.member_count = u64::try_from(group.members.len()).ok();
             self.unrecoverable = group.unrecoverable;
             self.disbanded = group.disbanded.is_some();
+            self.set_direct_member_ids_from_roster(&group.members);
         }
+    }
+
+    fn set_direct_member_ids_from_roster(&mut self, members: &[cgka_traits::group::Member]) {
+        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() && members.len() == 2 {
+            Some(
+                members
+                    .iter()
+                    .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
+                    .collect(),
+            )
+        } else {
+            None
+        };
     }
 
     fn remember_prior_nostr_route(&mut self, last_epoch: u64) {
@@ -2088,6 +2108,9 @@ pub(crate) fn add_group(
         projection.image.clone(),
     );
     group.profile = projection.profile.clone();
+    if let Some(metadata) = projection.group_metadata {
+        group.set_direct_member_ids_from_roster(&metadata.members);
+    }
     group.apply_confirmation_state(confirmation);
     state.groups.push(group);
 }

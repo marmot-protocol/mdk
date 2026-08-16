@@ -3152,9 +3152,9 @@ impl MarmotAppRuntime {
     ///
     /// `peer_account_id` accepts hex or `npub`. The read is keyed by this
     /// account plus that peer: it does not return the full chat list, and
-    /// membership is loaded only for Direct candidates. See
-    /// [`storage_sqlite::select_reusable_direct_conversation`] for the reuse
-    /// policy and activity-order tie-break.
+    /// membership is loaded only for peer-index hits that still look reusable.
+    /// See [`storage_sqlite::select_reusable_direct_conversation`] for the
+    /// reuse policy and activity-order tie-break.
     pub async fn existing_direct_conversation(
         &self,
         account_ref: &str,
@@ -3165,10 +3165,12 @@ impl MarmotAppRuntime {
         if peer_account_id_hex == account.account_id_hex {
             return Ok(None);
         }
+        self.backfill_direct_conversation_members(account_ref, &account.label)
+            .await?;
         let candidates = self
             .accounts
             .app
-            .direct_conversation_candidates(&account.label)?;
+            .direct_conversation_candidates(&account.label, &peer_account_id_hex)?;
         let memberships = self
             .direct_conversation_memberships(account_ref, &candidates)
             .await?;
@@ -3178,6 +3180,40 @@ impl MarmotAppRuntime {
             &peer_account_id_hex,
             &memberships,
         ))
+    }
+
+    async fn backfill_direct_conversation_members(
+        &self,
+        account_ref: &str,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let storage = self.accounts.app.account_storage(label)?;
+        let unindexed = storage.unindexed_direct_conversation_group_ids()?;
+        if unindexed.is_empty() {
+            return Ok(());
+        }
+        let mut group_ids = Vec::with_capacity(unindexed.len());
+        for group_id_hex in &unindexed {
+            let bytes = hex::decode(group_id_hex)?;
+            if bytes.is_empty() {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation group id is empty".to_owned(),
+                ));
+            }
+            group_ids.push(GroupId::new(bytes));
+        }
+        for chunk in group_ids.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
+            let page = self
+                .direct_conversation_member_ids_page(account_ref, chunk)
+                .await?;
+            for item in page {
+                storage.replace_direct_conversation_members(
+                    &item.group_id_hex,
+                    &item.member_ids_hex,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     async fn direct_conversation_memberships(
@@ -3195,38 +3231,80 @@ impl MarmotAppRuntime {
                     && row.leave_requested_at_ms.is_none()
             })
             .collect::<Vec<_>>();
-        let mut memberships = HashMap::new();
-        for chunk in eligible.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
-            let mut group_ids = Vec::with_capacity(chunk.len());
-            for row in chunk {
-                match hex::decode(&row.group_id_hex) {
-                    Ok(bytes) if !bytes.is_empty() => group_ids.push(GroupId::new(bytes)),
-                    _ => continue,
-                }
+        if eligible.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut group_ids = Vec::with_capacity(eligible.len());
+        for row in &eligible {
+            let bytes = hex::decode(&row.group_id_hex)?;
+            if bytes.is_empty() {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation group id is empty".to_owned(),
+                ));
             }
-            match self.group_member_ids_page(account_ref, &group_ids).await {
-                Ok(page) => {
-                    for item in page {
-                        memberships.insert(item.group_id_hex, item.member_ids_hex);
-                    }
-                }
-                Err(_) => {
-                    for group_id in group_ids {
-                        let group_id_hex = hex::encode(group_id.as_slice());
-                        if let Ok(members) = self.group_members(account_ref, &group_id).await {
-                            memberships.insert(
-                                group_id_hex,
-                                members
-                                    .into_iter()
-                                    .map(|member| member.member_id_hex)
-                                    .collect(),
-                            );
-                        }
-                    }
-                }
+            group_ids.push(GroupId::new(bytes));
+        }
+        let mut memberships = HashMap::new();
+        for chunk in group_ids.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
+            let page = self
+                .direct_conversation_member_ids_page(account_ref, chunk)
+                .await?;
+            for item in page {
+                memberships.insert(item.group_id_hex, item.member_ids_hex);
+            }
+        }
+        for row in eligible {
+            if !memberships.contains_key(&row.group_id_hex) {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation membership page omitted a requested group".to_owned(),
+                ));
             }
         }
         Ok(memberships)
+    }
+
+    async fn direct_conversation_member_ids_page(
+        &self,
+        account_ref: &str,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        match self.group_member_ids_page(account_ref, group_ids).await {
+            Ok(page) => {
+                let mut seen = HashMap::new();
+                for item in page {
+                    seen.insert(item.group_id_hex.clone(), item);
+                }
+                let mut ordered = Vec::with_capacity(group_ids.len());
+                for group_id in group_ids {
+                    let group_id_hex = hex::encode(group_id.as_slice());
+                    match seen.remove(&group_id_hex) {
+                        Some(item) => ordered.push(item),
+                        None => {
+                            return Err(AppError::InvalidGroupMembershipPage(
+                                "direct conversation membership page omitted a requested group"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                }
+                Ok(ordered)
+            }
+            Err(_) => {
+                let mut page = Vec::with_capacity(group_ids.len());
+                for group_id in group_ids {
+                    let members = self.group_members(account_ref, group_id).await?;
+                    page.push(crate::AppGroupMemberIds {
+                        group_id_hex: hex::encode(group_id.as_slice()),
+                        member_ids_hex: members
+                            .into_iter()
+                            .map(|member| member.member_id_hex)
+                            .collect(),
+                        admin_ids_hex: Vec::new(),
+                    });
+                }
+                Ok(page)
+            }
+        }
     }
 
     /// Pin or unpin one unarchived chat in an account-device's local store.

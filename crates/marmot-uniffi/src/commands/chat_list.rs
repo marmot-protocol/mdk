@@ -86,6 +86,9 @@ impl Marmot {
             .await
             .map(|found| found.map(Into::into))
             .map_err(MarmotKitError::from);
+        // Telemetry is recorded before the result is returned. The proof lives
+        // in `existing_direct_conversation_lookup_is_keyed_and_independent_of_unrelated_chats`
+        // in this module, next to this wrapper — not in a separate commands suite.
         self.runtime
             .record_existing_direct_conversation_read(started_at.elapsed(), result.is_ok());
         result
@@ -624,7 +627,8 @@ mod tests {
             })
             .await
             .expect("create identity");
-        let account_ref = account.account.account_id_hex;
+        let account_ref = account.account.account_id_hex.clone();
+        let account_label = account.account.label.clone();
         let peer = kit
             .runtime
             .create_identity(AccountSetupRequest {
@@ -641,7 +645,7 @@ mod tests {
             .runtime
             .create_identity(AccountSetupRequest {
                 default_relays: vec![endpoint.clone()],
-                bootstrap_relays: vec![endpoint],
+                bootstrap_relays: vec![endpoint.clone()],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
                 ..AccountSetupRequest::default()
@@ -705,6 +709,40 @@ mod tests {
         kit.send_text(account_ref.clone(), second.clone(), "later".into())
             .await
             .expect("bump activity on the newer duplicate");
+        kit.set_chat_pinned(account_ref.clone(), first.clone(), true)
+            .expect("pin older duplicate; pin must not win reuse");
+
+        for _ in 0..3 {
+            let other_peer = kit
+                .runtime
+                .create_identity(AccountSetupRequest {
+                    default_relays: vec![endpoint.clone()],
+                    bootstrap_relays: vec![endpoint.clone()],
+                    publish_missing_relay_lists: true,
+                    publish_initial_key_package: true,
+                    ..AccountSetupRequest::default()
+                })
+                .await
+                .expect("create other-peer identity");
+            kit.create_group(
+                account_ref.clone(),
+                String::new(),
+                vec![other_peer.account.account_id_hex],
+                None,
+            )
+            .await
+            .expect("create other-peer direct conversation");
+        }
+
+        let candidates = kit
+            .app
+            .direct_conversation_candidates(&account_label, &peer_ref)
+            .expect("peer-keyed candidates");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "candidate work must stay bounded by this peer's DMs, not other-peer DMs"
+        );
 
         let isolated_from_other_account = kit
             .existing_direct_conversation(isolated_ref, peer_ref.clone())

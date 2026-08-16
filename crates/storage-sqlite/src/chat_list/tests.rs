@@ -34,6 +34,7 @@ fn group() -> StoredAccountGroup {
         archived: false,
         pending_confirmation: false,
         member_count: None,
+        direct_member_ids_hex: None,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
         nostr_routing_last_epoch: 0,
@@ -511,48 +512,178 @@ fn select_reusable_direct_conversation_covers_policy_cases() {
     assert_eq!(tied.group_id_hex, "aa");
 }
 
+fn hex_id(byte: u8, len: usize) -> String {
+    hex::encode(vec![byte; len])
+}
+
+fn direct_group(group_id_hex: &str, local: &str, peer: &str) -> StoredAccountGroup {
+    StoredAccountGroup {
+        group_id_hex: group_id_hex.to_owned(),
+        profile_name: String::new(),
+        member_count: Some(2),
+        direct_member_ids_hex: Some(vec![local.to_owned(), peer.to_owned()]),
+        ..group()
+    }
+}
+
 #[test]
-fn direct_conversation_candidate_rows_exclude_unrelated_chats() {
-    let mut direct = group();
-    direct.group_id_hex = "aa".to_owned();
-    direct.profile_name.clear();
-    direct.member_count = Some(2);
+fn direct_conversation_candidate_rows_are_keyed_by_peer() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let other = hex_id(0xcc, 32);
+    let match_id = hex_id(0x11, 16);
+    let older_match_id = hex_id(0x10, 16);
+    let named_id = hex_id(0x22, 16);
+    let expanded_id = hex_id(0x33, 16);
 
     let mut named = group();
-    named.group_id_hex = "bb".to_owned();
+    named.group_id_hex = named_id.clone();
     named.profile_name = "Team".to_owned();
     named.member_count = Some(2);
+    named.direct_member_ids_hex = Some(vec![local.clone(), peer.clone()]);
 
     let mut expanded = group();
-    expanded.group_id_hex = "cc".to_owned();
+    expanded.group_id_hex = expanded_id;
     expanded.profile_name.clear();
     expanded.member_count = Some(3);
+
+    let mut groups = vec![
+        direct_group(&older_match_id, &local, &peer),
+        direct_group(&match_id, &local, &peer),
+        named,
+        expanded,
+    ];
+    for index in 0..20u8 {
+        groups.push(direct_group(
+            &hex_id(0x40 + index, 16),
+            &local,
+            &hex_id(0xd0 + index, 32),
+        ));
+    }
 
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),
-                groups: vec![direct, named, expanded],
+                groups,
                 ..StoredAccountState::default()
             },
             256,
             MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups
+             SET conversation_created_at = CASE group_id_hex
+                 WHEN ?1 THEN 100
+                 WHEN ?2 THEN 300
+                 ELSE 200
+             END",
+            rusqlite::params![older_match_id, match_id],
+        )
+        .unwrap();
+    }
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
 
-    let candidates = store.direct_conversation_candidate_rows().unwrap();
+    let candidates = store.direct_conversation_candidate_rows(&peer).unwrap();
     assert_eq!(
         candidates
             .iter()
             .map(|row| row.group_id_hex.as_str())
             .collect::<Vec<_>>(),
-        vec!["aa"]
+        vec![match_id.as_str(), older_match_id.as_str()],
+        "other-peer DMs, named chats, and 3+ member chats must not enter the candidate set"
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|row| row.conversation_kind == ChatConversationKind::Direct)
+    );
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&other)
+            .unwrap()
+            .is_empty()
     );
     assert_eq!(
-        candidates[0].conversation_kind,
-        ChatConversationKind::Direct
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        Vec::<String>::new()
+    );
+    let loaded = store
+        .load_account_projection_state("alice", 16)
+        .unwrap()
+        .groups
+        .into_iter()
+        .find(|group| group.group_id_hex == match_id)
+        .expect("matching direct group");
+    let mut loaded_members = loaded.direct_member_ids_hex.expect("persisted members");
+    loaded_members.sort();
+    let mut expected_members = vec![local, peer];
+    expected_members.sort();
+    assert_eq!(loaded_members, expected_members);
+}
+
+#[test]
+fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let older_id = hex_id(0x11, 16);
+    let newer_id = hex_id(0x22, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![
+                    direct_group(&older_id, &local, &peer),
+                    direct_group(&newer_id, &local, &peer),
+                ],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups
+             SET conversation_created_at = CASE group_id_hex
+                 WHEN ?1 THEN 100
+                 WHEN ?2 THEN 300
+             END",
+            rusqlite::params![older_id, newer_id],
+        )
+        .unwrap();
+    }
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    store.set_chat_pinned(&older_id, true).unwrap();
+
+    let chat_list = store
+        .chat_list_rows(ChatListQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.group_id_hex)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chat_list,
+        vec![older_id.clone(), newer_id.clone()],
+        "visible chat list is pin-first"
+    );
+
+    let candidates = store
+        .direct_conversation_candidate_rows(&peer)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.group_id_hex)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        candidates,
+        vec![newer_id, older_id],
+        "reuse candidates follow durable activity, not local pin order"
     );
 }
 

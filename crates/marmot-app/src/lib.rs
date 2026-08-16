@@ -2296,19 +2296,21 @@ impl MarmotApp {
 
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
     ///
-    /// This is the SQL-filtered chat-list projection only: empty group name and
-    /// roster size 2. It does not transfer named or 3+ member chats and does
-    /// not hydrate last-message display names.
+    /// This is the SQL-filtered chat-list projection only: empty group name,
+    /// roster size 2, and a persisted member-index hit for `peer_account_id_hex`.
+    /// It does not transfer named chats, 3+ member chats, or Direct chats with
+    /// a different peer, and it does not hydrate last-message display names.
     pub fn direct_conversation_candidates(
         &self,
         label: &str,
+        peer_account_id_hex: &str,
     ) -> Result<Vec<ChatListRow>, AppError> {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(&account.label)?;
         self.ensure_chat_list_projection(&account)?;
         Ok(self
             .account_storage(&account.label)?
-            .direct_conversation_candidate_rows()?)
+            .direct_conversation_candidate_rows(peer_account_id_hex)?)
     }
 
     /// Pin or unpin one unarchived local chat and return the complete

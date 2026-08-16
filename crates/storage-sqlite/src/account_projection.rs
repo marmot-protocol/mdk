@@ -11,6 +11,7 @@ use rusqlite::{
     types::{Type, Value},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 const SECURE_DELETE_RETENTION_OPERATION: &str = "retention";
@@ -140,6 +141,11 @@ pub struct StoredAccountGroup {
     /// Current locally observed MLS roster size. `None` for legacy rows until a
     /// live group hydration persists the projection.
     pub member_count: Option<u64>,
+    /// Hex member ids for a Direct conversation (empty name, roster size 2).
+    /// Persisted in `direct_conversation_members` so reuse lookup can query by
+    /// peer without scanning every unnamed two-member chat. `None` when the
+    /// group is not currently classified as Direct.
+    pub direct_member_ids_hex: Option<Vec<String>>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
     pub nostr_routing_last_epoch: u64,
@@ -171,6 +177,7 @@ impl fmt::Debug for StoredAccountGroup {
             .field("archived", &self.archived)
             .field("pending_confirmation", &self.pending_confirmation)
             .field("member_count", &self.member_count)
+            .field("direct_member_ids_hex", &self.direct_member_ids_hex)
             .field("welcomer_account_id_hex", &self.welcomer_account_id_hex)
             .field(
                 "via_welcome_message_id_hex",
@@ -526,6 +533,7 @@ impl SqliteAccountStorage {
         drop(group_statement);
 
         let mut components_by_group = all_account_group_components(&conn)?;
+        let mut members_by_group = load_direct_conversation_members(&conn)?;
         let mut groups = Vec::with_capacity(raw_groups.len());
         for raw in raw_groups {
             let prior_nostr_routes = serde_json::from_str(&raw.prior_nostr_routes_json)
@@ -533,6 +541,7 @@ impl SqliteAccountStorage {
             let components = components_by_group
                 .remove(&raw.group_id_hex)
                 .unwrap_or_default();
+            let direct_member_ids_hex = members_by_group.remove(&raw.group_id_hex);
             groups.push(StoredAccountGroup {
                 group_id_hex: raw.group_id_hex,
                 endpoint: raw.endpoint,
@@ -547,6 +556,7 @@ impl SqliteAccountStorage {
                 archived: raw.archived,
                 pending_confirmation: raw.pending_confirmation,
                 member_count: raw.member_count.and_then(|value| value.try_into().ok()),
+                direct_member_ids_hex,
                 welcomer_account_id_hex: raw.welcomer_account_id_hex,
                 via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
                 nostr_routing_last_epoch: raw
@@ -933,6 +943,12 @@ impl SqliteAccountStorage {
                 for component in &group.components {
                     upsert_group_component(&conn, &group.group_id_hex, component, now_i64)?;
                 }
+                replace_direct_conversation_members_tx(
+                    &conn,
+                    &group.group_id_hex,
+                    group.direct_member_ids_hex.as_deref(),
+                    group.profile_name.trim().is_empty() && group.member_count == Some(2),
+                )?;
             }
             for message_id in application_event_ids_to_ack {
                 conn.execute(
@@ -942,6 +958,27 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
             Ok(())
+        })
+    }
+
+    /// Replace the peer-keyed Direct-conversation member index for one group.
+    ///
+    /// Used to backfill rows that existed before the index was introduced.
+    /// Passing fewer or more than two member ids clears the index for that
+    /// group; only a two-member roster is stored.
+    pub fn replace_direct_conversation_members(
+        &self,
+        group_id_hex: &str,
+        member_ids_hex: &[String],
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            replace_direct_conversation_members_tx(
+                &conn,
+                group_id_hex,
+                Some(member_ids_hex),
+                member_ids_hex.len() == 2,
+            )
         })
     }
 
@@ -3352,6 +3389,64 @@ fn i64_to_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(err))
     })
+}
+
+fn load_direct_conversation_members(
+    conn: &Connection,
+) -> StorageResult<HashMap<String, Vec<String>>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT group_id_hex, member_id_hex
+             FROM direct_conversation_members
+             ORDER BY group_id_hex, member_id_hex",
+        )
+        .storage()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .storage()?;
+    let mut members_by_group = HashMap::new();
+    for row in rows {
+        let (group_id_hex, member_id_hex) = row.storage()?;
+        members_by_group
+            .entry(group_id_hex)
+            .or_insert_with(Vec::new)
+            .push(member_id_hex);
+    }
+    Ok(members_by_group)
+}
+
+pub(crate) fn replace_direct_conversation_members_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    member_ids_hex: Option<&[String]>,
+    persist_direct: bool,
+) -> StorageResult<()> {
+    conn.execute(
+        "DELETE FROM direct_conversation_members WHERE group_id_hex = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
+    if !persist_direct {
+        return Ok(());
+    }
+    let Some(member_ids_hex) = member_ids_hex else {
+        return Ok(());
+    };
+    for member_id_hex in member_ids_hex {
+        let member_id_hex = member_id_hex.trim().to_ascii_lowercase();
+        if member_id_hex.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO direct_conversation_members (group_id_hex, member_id_hex)
+             VALUES (?1, ?2)",
+            params![group_id_hex, member_id_hex],
+        )
+        .storage()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
