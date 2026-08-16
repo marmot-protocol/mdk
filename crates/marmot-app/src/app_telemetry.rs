@@ -53,6 +53,7 @@ pub(crate) enum AppPerformanceOperation {
     GroupPromoteAdmin,
     GroupDetailsRead,
     ChatListRowRead,
+    ExistingDirectConversationRead,
     GroupMlsStateRead,
     GroupRosterRead,
     GroupAcceptInvite,
@@ -167,6 +168,8 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub chat_list_row_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub existing_direct_conversation_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub group_mls_state_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_roster_read: AppPerformanceOperationSnapshot,
@@ -222,6 +225,7 @@ struct AppPerformanceTelemetryInner {
     group_promote_admin: AppPerformanceOperationTelemetry,
     group_details_read: AppPerformanceOperationTelemetry,
     chat_list_row_read: AppPerformanceOperationTelemetry,
+    existing_direct_conversation_read: AppPerformanceOperationTelemetry,
     group_mls_state_read: AppPerformanceOperationTelemetry,
     group_roster_read: AppPerformanceOperationTelemetry,
     group_accept_invite: AppPerformanceOperationTelemetry,
@@ -437,6 +441,11 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::ChatListRowRead => {
                 inner.chat_list_row_read.record(duration, success);
             }
+            AppPerformanceOperation::ExistingDirectConversationRead => {
+                inner
+                    .existing_direct_conversation_read
+                    .record(duration, success);
+            }
             AppPerformanceOperation::GroupMlsStateRead => {
                 inner.group_mls_state_read.record(duration, success);
             }
@@ -529,6 +538,7 @@ impl AppPerformanceTelemetry {
             group_promote_admin: inner.group_promote_admin.snapshot(),
             group_details_read: inner.group_details_read.snapshot(),
             chat_list_row_read: inner.chat_list_row_read.snapshot(),
+            existing_direct_conversation_read: inner.existing_direct_conversation_read.snapshot(),
             group_mls_state_read: inner.group_mls_state_read.snapshot(),
             group_roster_read: inner.group_roster_read.snapshot(),
             group_accept_invite: inner.group_accept_invite.snapshot(),
@@ -750,6 +760,40 @@ mod tests {
         assert_eq!(snapshot.chat_list_row_read.failures, 1);
         assert_eq!(snapshot.chat_list_row_read.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.chat_list_row_read.duration_ms.sum_ms, 13);
+    }
+
+    #[test]
+    fn records_existing_direct_conversation_read_operation() {
+        let telemetry = AppPerformanceTelemetry::default();
+        telemetry.record(
+            AppPerformanceOperation::ExistingDirectConversationRead,
+            Duration::from_millis(5),
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::ExistingDirectConversationRead,
+            Duration::from_millis(8),
+            false,
+        );
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.existing_direct_conversation_read.attempts, 2);
+        assert_eq!(snapshot.existing_direct_conversation_read.successes, 1);
+        assert_eq!(snapshot.existing_direct_conversation_read.failures, 1);
+        assert_eq!(
+            snapshot
+                .existing_direct_conversation_read
+                .duration_ms
+                .sample_count(),
+            2
+        );
+        assert_eq!(
+            snapshot
+                .existing_direct_conversation_read
+                .duration_ms
+                .sum_ms,
+            13
+        );
     }
 
     #[test]

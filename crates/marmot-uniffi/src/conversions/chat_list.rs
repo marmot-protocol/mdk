@@ -3,7 +3,7 @@
 use marmot_app::{
     AppDisbandRequest, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListRow, ChatNotificationSettings,
-    ChatPinState, RuntimeChatListUpdate,
+    ChatPinState, ExistingDirectConversation, RuntimeChatListUpdate,
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
@@ -139,6 +139,40 @@ impl From<ChatConversationKind> for ChatConversationKindFfi {
             ChatConversationKind::Unknown => Self::Unknown,
             ChatConversationKind::Direct => Self::Direct,
             ChatConversationKind::Group => Self::Group,
+        }
+    }
+}
+
+/// Authoritative reuse decision for one existing direct conversation.
+///
+/// Returned by [`crate::Marmot::existing_direct_conversation`]. `reusable` is
+/// true only when MDK policy says this group can be opened instead of creating
+/// another direct conversation with the same peer.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ExistingDirectConversationFfi {
+    pub group_id_hex: String,
+    pub reusable: bool,
+    pub lifecycle_state: GroupLifecycleStateFfi,
+    pub self_membership: SelfMembershipFfi,
+    pub pending_confirmation: bool,
+    pub leave_request_pending: bool,
+    pub disbanding: bool,
+    pub archived: bool,
+    pub activity_sort_at: u64,
+}
+
+impl From<ExistingDirectConversation> for ExistingDirectConversationFfi {
+    fn from(value: ExistingDirectConversation) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            reusable: value.reusable,
+            lifecycle_state: value.lifecycle_state.into(),
+            self_membership: value.self_membership.into(),
+            pending_confirmation: value.pending_confirmation,
+            leave_request_pending: value.leave_request_pending,
+            disbanding: value.disbanding,
+            archived: value.archived,
+            activity_sort_at: value.activity_sort_at,
         }
     }
 }
@@ -417,6 +451,34 @@ mod tests {
             muted_until_ms: None,
             leave_requested_at_ms: None,
         }
+    }
+
+    #[test]
+    fn existing_direct_conversation_exports_reuse_state() {
+        let ffi = ExistingDirectConversationFfi::from(ExistingDirectConversation {
+            group_id_hex: "11".to_owned(),
+            reusable: true,
+            lifecycle_state: cgka_traits::GroupLifecycleState::Stable,
+            self_membership: marmot_app::SelfMembership::Member,
+            pending_confirmation: true,
+            leave_request_pending: false,
+            disbanding: false,
+            archived: true,
+            activity_sort_at: 200,
+        });
+
+        assert_eq!(ffi.group_id_hex, "11");
+        assert!(ffi.reusable);
+        assert!(matches!(
+            ffi.lifecycle_state,
+            GroupLifecycleStateFfi::Stable
+        ));
+        assert!(matches!(ffi.self_membership, SelfMembershipFfi::Member));
+        assert!(ffi.pending_confirmation);
+        assert!(!ffi.leave_request_pending);
+        assert!(!ffi.disbanding);
+        assert!(ffi.archived);
+        assert_eq!(ffi.activity_sort_at, 200);
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub use conversions::{
     ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
     ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi, ChatPinStateFfi, CursorPersistenceFfi,
     DurationHistogramBucketFfi, DurationHistogramSnapshotFfi, EncryptedMediaVersionFfi,
+    ExistingDirectConversationFfi,
     GroupEvolutionStatusFfi, GroupMaintenanceStatusFfi, GroupPushDebugInfoFfi,
     GroupPushTokenDebugEntryFfi, GroupSystemEventFfi, HostPerformanceOperationFfi,
     HostPerformanceOutcomeFfi, KeyPackageMaintenanceStatusFfi, LocalPushRegistrationDebugFfi,

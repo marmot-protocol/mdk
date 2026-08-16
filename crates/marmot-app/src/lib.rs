@@ -200,9 +200,10 @@ pub use relay_telemetry_export::{
 };
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, MAX_TIMELINE_LIMIT, SelfMembership,
-    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
-    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, ExistingDirectConversation,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    select_reusable_direct_conversation,
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -2291,6 +2292,23 @@ impl MarmotApp {
             .chat_list_row(group_id_hex)?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
+    }
+
+    /// Direct-conversation candidates for a peer-keyed reuse lookup.
+    ///
+    /// This is the SQL-filtered chat-list projection only: empty group name and
+    /// roster size 2. It does not transfer named or 3+ member chats and does
+    /// not hydrate last-message display names.
+    pub fn direct_conversation_candidates(
+        &self,
+        label: &str,
+    ) -> Result<Vec<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .direct_conversation_candidate_rows()?)
     }
 
     /// Pin or unpin one unarchived local chat and return the complete

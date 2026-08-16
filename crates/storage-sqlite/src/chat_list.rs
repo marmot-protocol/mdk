@@ -13,7 +13,7 @@ use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListQuery {
@@ -104,6 +104,113 @@ pub enum ChatConversationKind {
     Unknown,
     Direct,
     Group,
+}
+
+/// Authoritative reuse decision for one existing direct conversation.
+///
+/// MDK owns this policy so hosts do not re-derive directness, membership, or
+/// lifecycle eligibility from a full chat list. `reusable` is true only when
+/// the selected group can be opened instead of creating another direct group
+/// with the same peer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingDirectConversation {
+    pub group_id_hex: String,
+    pub reusable: bool,
+    pub lifecycle_state: cgka_traits::GroupLifecycleState,
+    pub self_membership: SelfMembership,
+    pub pending_confirmation: bool,
+    pub leave_request_pending: bool,
+    pub disbanding: bool,
+    pub archived: bool,
+    pub activity_sort_at: u64,
+}
+
+/// Select the reusable direct conversation with `peer_account_id_hex`, if any.
+///
+/// A row is a **direct** conversation when its group name is empty and the
+/// projected roster size is exactly two (`ChatConversationKind::Direct`).
+/// It is **reusable** with that peer when all of the following hold:
+///
+/// - `self_membership` is [`SelfMembership::Member`]
+/// - lifecycle is not terminal (`Disbanded`)
+/// - the group is not `disbanding`
+/// - no leave request is outstanding
+/// - the current roster is exactly `{local, peer}`
+///
+/// Pending confirmation does not block reuse: the invite is the same
+/// conversation. Archived rows remain reusable so hosts do not create a
+/// duplicate. Named groups, 3+ member groups, `Unknown` kind, `Left`,
+/// `Removed`, and a different peer are not matches.
+///
+/// When several reusable matches exist, selection follows durable chat-list
+/// activity order: highest `activity_sort_at`, then lowest `group_id_hex`.
+pub fn select_reusable_direct_conversation(
+    candidates: &[ChatListRow],
+    local_account_id_hex: &str,
+    peer_account_id_hex: &str,
+    memberships: &HashMap<String, Vec<String>>,
+) -> Option<ExistingDirectConversation> {
+    let local = local_account_id_hex.trim().to_ascii_lowercase();
+    let peer = peer_account_id_hex.trim().to_ascii_lowercase();
+    if local.is_empty() || peer.is_empty() || local == peer {
+        return None;
+    }
+
+    let mut selected: Option<&ChatListRow> = None;
+    for row in candidates {
+        if !direct_row_is_reusable(row) {
+            continue;
+        }
+        let Some(members) = memberships.get(&row.group_id_hex) else {
+            continue;
+        };
+        if !roster_is_direct_with_peer(members, &local, &peer) {
+            continue;
+        }
+        selected = Some(match selected {
+            Some(current) if !direct_activity_orders_before(row, current) => current,
+            _ => row,
+        });
+    }
+
+    selected.map(existing_direct_conversation_from_row)
+}
+
+fn direct_row_is_reusable(row: &ChatListRow) -> bool {
+    row.conversation_kind == ChatConversationKind::Direct
+        && row.self_membership == SelfMembership::Member
+        && row.lifecycle_state != cgka_traits::GroupLifecycleState::Disbanded
+        && !row.disbanding
+        && row.leave_requested_at_ms.is_none()
+}
+
+fn roster_is_direct_with_peer(members: &[String], local: &str, peer: &str) -> bool {
+    let ids = members
+        .iter()
+        .map(|member| member.trim().to_ascii_lowercase())
+        .filter(|member| !member.is_empty())
+        .collect::<HashSet<_>>();
+    ids.len() == 2 && ids.contains(local) && ids.contains(peer)
+}
+
+fn direct_activity_orders_before(left: &ChatListRow, right: &ChatListRow) -> bool {
+    left.activity_sort_at > right.activity_sort_at
+        || (left.activity_sort_at == right.activity_sort_at
+            && left.group_id_hex < right.group_id_hex)
+}
+
+fn existing_direct_conversation_from_row(row: &ChatListRow) -> ExistingDirectConversation {
+    ExistingDirectConversation {
+        group_id_hex: row.group_id_hex.clone(),
+        reusable: true,
+        lifecycle_state: row.lifecycle_state,
+        self_membership: row.self_membership,
+        pending_confirmation: row.pending_confirmation,
+        leave_request_pending: row.leave_requested_at_ms.is_some(),
+        disbanding: row.disbanding,
+        archived: row.archived,
+        activity_sort_at: row.activity_sort_at,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +412,18 @@ impl SqliteAccountStorage {
     pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_row_tx(&conn, group_id_hex)
+    }
+
+    /// Direct-conversation candidates for a peer-keyed reuse lookup.
+    ///
+    /// Returns only rows whose durable projection is currently classified as
+    /// [`ChatConversationKind::Direct`] (empty group name and roster size 2).
+    /// Unrelated named or 3+ member chats are excluded in SQL so lookup work
+    /// does not grow with those rows. Membership, leave, and disband stamps
+    /// are applied the same way as [`Self::chat_list_rows`].
+    pub fn direct_conversation_candidate_rows(&self) -> StorageResult<Vec<ChatListRow>> {
+        let conn = self.lock()?;
+        direct_conversation_candidate_rows_tx(&conn)
     }
 
     /// Pin or unpin one unarchived local chat and return the complete
@@ -1655,6 +1774,35 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
         .storage()?;
     // Derived at read time, inside the same transaction as the projection read,
     // so the pending-leave stamp is always consistent with the row it rides on.
+    let pending = pending_leave_requests_by_group_hex_tx(tx)?;
+    if !pending.is_empty() {
+        for row in &mut rows {
+            row.leave_requested_at_ms = pending.get(&row.group_id_hex).copied();
+        }
+    }
+    let disbanding = disbanding_group_ids_hex_tx(tx)?;
+    let disband_requests = disband_requests_by_group_hex_tx(tx)?;
+    for row in &mut rows {
+        row.disbanding = disbanding.contains(&row.group_id_hex);
+        row.disband_request = disband_requests.get(&row.group_id_hex).cloned();
+    }
+    Ok(rows)
+}
+
+fn direct_conversation_candidate_rows_tx(tx: &Connection) -> StorageResult<Vec<ChatListRow>> {
+    let sql = format!(
+        "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+         WHERE TRIM(row.group_name) = ''
+           AND ag.member_count = 2
+         ORDER BY row.activity_sort_at DESC, row.group_id_hex"
+    );
+    let now_ms = unix_now_ms();
+    let mut stmt = tx.prepare(&sql).storage()?;
+    let mut rows = stmt
+        .query_map([], |row| chat_list_row_from_row(row, now_ms))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
     let pending = pending_leave_requests_by_group_hex_tx(tx)?;
     if !pending.is_empty() {
         for row in &mut rows {

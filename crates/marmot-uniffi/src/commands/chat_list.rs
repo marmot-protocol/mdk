@@ -3,7 +3,8 @@
 use std::time::Instant;
 
 use crate::conversions::{
-    ChatListRowFfi, ChatNotificationSettingsFfi, ChatPinStateFfi, group_id_from_hex,
+    ChatListRowFfi, ChatNotificationSettingsFfi, ChatPinStateFfi, ExistingDirectConversationFfi,
+    group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::{Marmot, optional_message_id_hex};
@@ -51,7 +52,48 @@ impl Marmot {
             .record_chat_list_row_read(started_at.elapsed(), result.is_ok());
         result
     }
+}
 
+#[uniffi::export(async_runtime = "tokio")]
+impl Marmot {
+    /// Look up the reusable existing direct conversation with `peer_account_id`.
+    ///
+    /// `peer_account_id` accepts hex or `npub`. The read is keyed by this
+    /// account plus that peer and returns at most one typed result. It does
+    /// not transfer the complete chat list or require the host to page
+    /// membership.
+    ///
+    /// A match is reusable when it is a Direct conversation (empty name and
+    /// roster size 2), the local account is still an active member, lifecycle
+    /// is not terminal, the group is not disbanding or leaving, and the
+    /// current roster is exactly this account and the peer. Pending invites
+    /// and archived rows remain reusable so hosts do not create a duplicate.
+    /// When several reusable matches exist, selection follows durable
+    /// chat-list activity order.
+    ///
+    /// Well-formed unknown peers, self lookups, and non-reusable historical
+    /// groups return `None`. Malformed peer ids and unknown accounts keep the
+    /// same typed errors as the other identity commands.
+    pub async fn existing_direct_conversation(
+        &self,
+        account_ref: String,
+        peer_account_id: String,
+    ) -> Result<Option<ExistingDirectConversationFfi>, MarmotKitError> {
+        let started_at = Instant::now();
+        let result = self
+            .runtime
+            .existing_direct_conversation(&account_ref, &peer_account_id)
+            .await
+            .map(|found| found.map(Into::into))
+            .map_err(MarmotKitError::from);
+        self.runtime
+            .record_existing_direct_conversation_read(started_at.elapsed(), result.is_ok());
+        result
+    }
+}
+
+#[uniffi::export]
+impl Marmot {
     /// Establish the unread baseline the first time a user opens a group.
     /// Existing kind-9 history remains read; later remote kind-9 messages count
     /// until marked visible via `mark_timeline_message_read`.
@@ -543,6 +585,181 @@ mod tests {
             .expect("close store after row reads");
         let closed = kit
             .chat_list_row(account_ref, target)
+            .expect_err("closed storage must fail deterministically");
+        assert!(matches!(closed, MarmotKitError::StorageClosed { .. }));
+    }
+
+    #[test]
+    fn existing_direct_conversation_lookup_is_keyed_and_independent_of_unrelated_chats() {
+        let test_thread = std::thread::Builder::new()
+            .name("ffi-existing-direct-conversation".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let test_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                test_runtime.block_on(existing_direct_conversation_lookup_body());
+            })
+            .unwrap();
+        test_thread.join().unwrap();
+    }
+
+    async fn existing_direct_conversation_lookup_body() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url.clone());
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint.clone()],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+        let account_ref = account.account.account_id_hex;
+        let peer = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint.clone()],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create peer identity");
+        let peer_ref = peer.account.account_id_hex;
+        let isolated = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create isolated identity");
+        let isolated_ref = isolated.account.account_id_hex;
+
+        for title in ["Alpha", "Beta", "Gamma"] {
+            kit.create_group(account_ref.clone(), title.to_owned(), Vec::new(), None)
+                .await
+                .expect("create unrelated group");
+        }
+
+        let unknown_peer = "dd".repeat(32);
+        let missing = kit
+            .existing_direct_conversation(account_ref.clone(), unknown_peer)
+            .await
+            .expect("unknown peer is a miss, not an error");
+        assert!(missing.is_none());
+
+        let self_lookup = kit
+            .existing_direct_conversation(account_ref.clone(), account_ref.clone())
+            .await
+            .expect("self lookup is a miss");
+        assert!(self_lookup.is_none());
+
+        let malformed = kit
+            .existing_direct_conversation(account_ref.clone(), "not-a-key".into())
+            .await
+            .expect_err("malformed peer id is a typed identity error");
+        assert!(matches!(malformed, MarmotKitError::InvalidIdentity { .. }));
+
+        let unknown_account = kit
+            .existing_direct_conversation("missing-account".into(), peer_ref.clone())
+            .await
+            .expect_err("unknown account is typed");
+        assert!(matches!(
+            unknown_account,
+            MarmotKitError::UnknownAccount { .. }
+        ));
+
+        let first = kit
+            .create_group(
+                account_ref.clone(),
+                String::new(),
+                vec![peer_ref.clone()],
+                None,
+            )
+            .await
+            .expect("create first direct conversation");
+        let second = kit
+            .create_group(
+                account_ref.clone(),
+                String::new(),
+                vec![peer_ref.clone()],
+                None,
+            )
+            .await
+            .expect("create duplicate historical direct conversation");
+        kit.send_text(account_ref.clone(), second.clone(), "later".into())
+            .await
+            .expect("bump activity on the newer duplicate");
+
+        let isolated_from_other_account = kit
+            .existing_direct_conversation(isolated_ref, peer_ref.clone())
+            .await
+            .expect("foreign account is isolated");
+        assert!(isolated_from_other_account.is_none());
+
+        let peer_npub = kit
+            .normalize_member_ref(peer_ref.clone())
+            .expect("peer npub")
+            .npub;
+        let before = kit.app_performance_snapshot();
+        let found = kit
+            .existing_direct_conversation(account_ref.clone(), peer_npub)
+            .await
+            .expect("lookup existing direct")
+            .expect("reusable direct exists");
+        let after = kit.app_performance_snapshot();
+        assert_eq!(
+            after.existing_direct_conversation_read.attempts,
+            before.existing_direct_conversation_read.attempts + 1
+        );
+        assert_eq!(
+            after.existing_direct_conversation_read.successes,
+            before.existing_direct_conversation_read.successes + 1
+        );
+        assert_eq!(
+            after.existing_direct_conversation_read.attempts
+                - before.existing_direct_conversation_read.attempts,
+            1,
+            "lookup must record one sample regardless of unrelated chat count"
+        );
+        assert!(found.reusable);
+        assert_eq!(found.group_id_hex, second);
+        assert_ne!(found.group_id_hex, first);
+        assert!(matches!(
+            found.self_membership,
+            crate::conversions::SelfMembershipFfi::Member
+        ));
+        let row = kit
+            .chat_list_row(account_ref.clone(), found.group_id_hex.clone())
+            .expect("read selected row")
+            .expect("selected projection exists");
+        assert!(matches!(
+            row.conversation_kind,
+            crate::ChatConversationKindFfi::Direct
+        ));
+        assert_eq!(row.activity_sort_at, found.activity_sort_at);
+
+        kit.shutdown_and_close()
+            .await
+            .expect("close store after lookup");
+        let closed = kit
+            .existing_direct_conversation(account_ref, peer_ref)
+            .await
             .expect_err("closed storage must fail deterministically");
         assert!(matches!(closed, MarmotKitError::StorageClosed { .. }));
     }

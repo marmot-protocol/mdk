@@ -332,6 +332,230 @@ fn conversation_kind_uses_durable_current_roster_projection() {
     );
 }
 
+fn direct_row(group_id_hex: &str, activity_sort_at: u64) -> ChatListRow {
+    ChatListRow {
+        group_id_hex: group_id_hex.to_owned(),
+        pinned: false,
+        pinned_position: None,
+        archived: false,
+        pending_confirmation: false,
+        lifecycle_state: cgka_traits::GroupLifecycleState::Stable,
+        disbanding: false,
+        disband_request: None,
+        title: group_id_hex.to_owned(),
+        group_name: String::new(),
+        avatar_url: None,
+        avatar: None,
+        last_message: None,
+        unread_count: 0,
+        has_unread: false,
+        manually_marked_unread: false,
+        unread_mention_count: 0,
+        has_unread_mention: false,
+        first_unread_message_id_hex: None,
+        last_read_message_id_hex: None,
+        last_read_timeline_at: None,
+        conversation_created_at: activity_sort_at,
+        activity_sort_at,
+        updated_at: activity_sort_at,
+        self_membership: SelfMembership::Member,
+        conversation_kind: ChatConversationKind::Direct,
+        muted: false,
+        muted_until_ms: None,
+        leave_requested_at_ms: None,
+    }
+}
+
+fn roster(local: &str, peer: &str) -> Vec<String> {
+    vec![local.to_owned(), peer.to_owned()]
+}
+
+#[test]
+fn select_reusable_direct_conversation_covers_policy_cases() {
+    let local = "aa".repeat(32);
+    let peer = "bb".repeat(32);
+    let other = "cc".repeat(32);
+    let mut memberships = std::collections::HashMap::new();
+    memberships.insert("active".to_owned(), roster(&local, &peer));
+    memberships.insert("older".to_owned(), roster(&local, &peer));
+    memberships.insert("left".to_owned(), roster(&local, &peer));
+    memberships.insert("removed".to_owned(), roster(&local, &peer));
+    memberships.insert("disbanded".to_owned(), roster(&local, &peer));
+    memberships.insert("leaving".to_owned(), roster(&local, &peer));
+    memberships.insert("disbanding".to_owned(), roster(&local, &peer));
+    memberships.insert("named".to_owned(), roster(&local, &peer));
+    memberships.insert("other-peer".to_owned(), roster(&local, &other));
+    memberships.insert("pending".to_owned(), roster(&local, &peer));
+    memberships.insert("archived".to_owned(), roster(&local, &peer));
+
+    assert!(
+        select_reusable_direct_conversation(&[], &local, &peer, &memberships).is_none(),
+        "no match"
+    );
+    assert!(
+        select_reusable_direct_conversation(
+            &[direct_row("active", 20)],
+            &local,
+            &"dd".repeat(32),
+            &memberships
+        )
+        .is_none(),
+        "unknown peer"
+    );
+
+    let active = select_reusable_direct_conversation(
+        &[direct_row("active", 20)],
+        &local,
+        &peer,
+        &memberships,
+    )
+    .expect("active match");
+    assert_eq!(active.group_id_hex, "active");
+    assert!(active.reusable);
+    assert_eq!(active.self_membership, SelfMembership::Member);
+    assert_eq!(
+        active.lifecycle_state,
+        cgka_traits::GroupLifecycleState::Stable
+    );
+
+    let mut left = direct_row("left", 30);
+    left.self_membership = SelfMembership::Left;
+    assert!(
+        select_reusable_direct_conversation(&[left], &local, &peer, &memberships).is_none(),
+        "left groups are not reusable"
+    );
+
+    let mut removed = direct_row("removed", 30);
+    removed.self_membership = SelfMembership::Removed;
+    assert!(
+        select_reusable_direct_conversation(&[removed], &local, &peer, &memberships).is_none(),
+        "removed groups are not reusable"
+    );
+
+    let mut disbanded = direct_row("disbanded", 30);
+    disbanded.lifecycle_state = cgka_traits::GroupLifecycleState::Disbanded;
+    assert!(
+        select_reusable_direct_conversation(&[disbanded], &local, &peer, &memberships).is_none(),
+        "disbanded groups are not reusable"
+    );
+
+    let mut leaving = direct_row("leaving", 30);
+    leaving.leave_requested_at_ms = Some(1);
+    assert!(
+        select_reusable_direct_conversation(&[leaving], &local, &peer, &memberships).is_none(),
+        "pending leave is not reusable"
+    );
+
+    let mut disbanding = direct_row("disbanding", 30);
+    disbanding.disbanding = true;
+    assert!(
+        select_reusable_direct_conversation(&[disbanding], &local, &peer, &memberships).is_none(),
+        "disbanding groups are not reusable"
+    );
+
+    let mut named = direct_row("named", 40);
+    named.group_name = "Team".to_owned();
+    named.conversation_kind = ChatConversationKind::Group;
+    assert!(
+        select_reusable_direct_conversation(&[named], &local, &peer, &memberships).is_none(),
+        "named groups are not direct"
+    );
+
+    assert!(
+        select_reusable_direct_conversation(
+            &[direct_row("other-peer", 40)],
+            &local,
+            &peer,
+            &memberships
+        )
+        .is_none(),
+        "direct group with a different peer is not a match"
+    );
+
+    let mut pending = direct_row("pending", 15);
+    pending.pending_confirmation = true;
+    let pending = select_reusable_direct_conversation(&[pending], &local, &peer, &memberships)
+        .expect("pending invite remains reusable");
+    assert!(pending.reusable);
+    assert!(pending.pending_confirmation);
+
+    let mut archived = direct_row("archived", 10);
+    archived.archived = true;
+    let archived = select_reusable_direct_conversation(&[archived], &local, &peer, &memberships)
+        .expect("archived direct remains reusable");
+    assert!(archived.reusable);
+    assert!(archived.archived);
+
+    let selected = select_reusable_direct_conversation(
+        &[direct_row("older", 10), direct_row("active", 20)],
+        &local,
+        &peer,
+        &memberships,
+    )
+    .expect("duplicate historical groups pick durable activity order");
+    assert_eq!(selected.group_id_hex, "active");
+    assert_eq!(selected.activity_sort_at, 20);
+
+    let tied = select_reusable_direct_conversation(
+        &[direct_row("zz", 20), direct_row("aa", 20)],
+        &local,
+        &peer,
+        &{
+            let mut tied = memberships.clone();
+            tied.insert("aa".to_owned(), roster(&local, &peer));
+            tied.insert("zz".to_owned(), roster(&local, &peer));
+            tied
+        },
+    )
+    .expect("activity ties break on group id");
+    assert_eq!(tied.group_id_hex, "aa");
+}
+
+#[test]
+fn direct_conversation_candidate_rows_exclude_unrelated_chats() {
+    let mut direct = group();
+    direct.group_id_hex = "aa".to_owned();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+
+    let mut named = group();
+    named.group_id_hex = "bb".to_owned();
+    named.profile_name = "Team".to_owned();
+    named.member_count = Some(2);
+
+    let mut expanded = group();
+    expanded.group_id_hex = "cc".to_owned();
+    expanded.profile_name.clear();
+    expanded.member_count = Some(3);
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct, named, expanded],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let candidates = store.direct_conversation_candidate_rows().unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aa"]
+    );
+    assert_eq!(
+        candidates[0].conversation_kind,
+        ChatConversationKind::Direct
+    );
+}
+
 #[test]
 fn latest_preview_carries_exact_media_and_delivery_projection() {
     let store = setup_store();

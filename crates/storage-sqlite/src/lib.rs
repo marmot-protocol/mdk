@@ -29,7 +29,7 @@ pub use account_projection::{
 pub use chat_list::{
     AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,
-    ChatPinState,
+    ChatPinState, ExistingDirectConversation, select_reusable_direct_conversation,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
