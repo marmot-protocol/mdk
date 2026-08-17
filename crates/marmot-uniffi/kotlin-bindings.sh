@@ -22,6 +22,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Keep the workflow/build tooling at the builder commit while allowing it to
 # compile and package an exact source checkout, matching the Apple scripts.
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Keep production release behavior, debug-symbol policy, and compiled-in
+# routing defaults owned by the builder checkout. Source-specific API inputs
+# such as uniffi.toml and kotlin-support/ remain under CRATE_DIR below.
+source "$TOOL_DIR/marmotkit-release-profile.env"
 WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
 CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
@@ -34,7 +38,7 @@ JNI_OUT_DIR="$OUT_DIR/jniLibs"
 
 # Set public first-party endpoint defaults for values compiled via option_env!.
 # Tokens remain host-app runtime configuration.
-source "$CRATE_DIR/marmotkit-endpoints.env"
+source "$TOOL_DIR/marmotkit-endpoints.env"
 
 CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"

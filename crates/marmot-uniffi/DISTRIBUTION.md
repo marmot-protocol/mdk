@@ -157,4 +157,7 @@ publishing also fails if its derived tag already exists. Assets and snapshot tag
 changed build requires a new formal version or a new source SHA.
 
 Each platform manifest records both the packaged source SHA and the workflow builder SHA. Snapshot dispatches must use
-the workflow from `master`, so an older reachable source commit cannot substitute its own packaging logic.
+the workflow from `master`, so an older reachable source commit cannot substitute its own packaging logic. The
+builder SHA also owns the canonical Rust release profile and compiled-in public endpoint defaults. Source-coupled
+inputs—including the Cargo workspace, UniFFI configuration, and Kotlin support files—come from the packaged source
+SHA so the generated API and JNI libraries remain a matched set.

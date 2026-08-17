@@ -372,11 +372,27 @@ jobs:
           stage_parent="$RUNNER_TEMP/marmotkit-android-stage"
           bundle_dir="$stage_parent/marmotkit-android-$version"
           asset="$RUNNER_TEMP/marmotkit-android-$version.zip"
+          required_contents=(
+            "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt"
+            "kotlin/dev/ipf/marmotkit/MarmotAndroid.kt"
+            "kotlin/io/crates/keyring/Keyring.kt"
+            "jniLibs/arm64-v8a/libmarmot_uniffi.so"
+            "jniLibs/armeabi-v7a/libmarmot_uniffi.so"
+            "jniLibs/x86/libmarmot_uniffi.so"
+            "jniLibs/x86_64/libmarmot_uniffi.so"
+          )
 
           rm -rf "$stage_parent" "$asset" "$asset.sha256"
           mkdir -p "$bundle_dir"
           cp -R packaged-source/crates/marmot-uniffi/output/android/kotlin "$bundle_dir/"
           cp -R packaged-source/crates/marmot-uniffi/output/android/jniLibs "$bundle_dir/"
+
+          for entry in "${required_contents[@]}"; do
+            if [[ ! -f "$bundle_dir/$entry" ]]; then
+              echo "error: Android bundle is missing required file: $entry" >&2
+              exit 1
+            fi
+          done
 
           cat > "$bundle_dir/manifest.json" <<EOF
           {
@@ -407,6 +423,36 @@ jobs:
             cd "$stage_parent"
             zip -r "$asset" "marmotkit-android-$version"
           )
+
+          bundle_root="$(basename "$bundle_dir")"
+          manifest_path="$bundle_root/manifest.json"
+          archive_entries="$(unzip -Z1 "$asset")"
+          manifest="$(unzip -p "$asset" "$manifest_path")"
+          if ! jq -e '.contents | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' \
+            <<< "$manifest" >/dev/null; then
+            echo "error: Android manifest contents must be a non-empty string array" >&2
+            exit 1
+          fi
+          mapfile -t declared_contents < <(jq -r '.contents[]' <<< "$manifest")
+
+          for entry in "${declared_contents[@]}"; do
+            if [[ "$entry" == /* || "$entry" == ".." || "$entry" == ../* || "$entry" == */../* || "$entry" == */.. ]]; then
+              echo "error: Android manifest contains unsafe path: $entry" >&2
+              exit 1
+            fi
+            if ! grep -Fqx "$bundle_root/$entry" <<< "$archive_entries"; then
+              echo "error: Android manifest declares missing archive entry: $entry" >&2
+              exit 1
+            fi
+          done
+
+          for entry in "${required_contents[@]}"; do
+            if ! printf '%s\n' "${declared_contents[@]}" | grep -Fqx "$entry"; then
+              echo "error: Android manifest omits required archive entry: $entry" >&2
+              exit 1
+            fi
+          done
+
           shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
           mkdir -p dist
           cp "$asset" "$asset.sha256" dist/
