@@ -6,20 +6,17 @@ use cgka_traits::transport_adapter::{
 
 use super::subscriptions::chat_list_mute_expiries;
 use super::*;
+use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
 
 fn profile_relay_status(
     publish_relays: &[&str],
     bootstrap_relays: &[&str],
-    default_relays: &[&str],
 ) -> AccountRelayListStatus {
-    AccountRelayListStatus {
+    let mut status = AccountRelayListStatus {
         complete: false,
         missing: Vec::new(),
-        default_relays: default_relays
-            .iter()
-            .map(|relay| (*relay).to_owned())
-            .collect(),
+        default_relays: Vec::new(),
         bootstrap_relays: bootstrap_relays
             .iter()
             .map(|relay| (*relay).to_owned())
@@ -42,7 +39,9 @@ fn profile_relay_status(
             read_relays: Vec::new(),
             write_relays: Vec::new(),
         },
-    }
+    };
+    status.refresh();
+    status
 }
 
 #[test]
@@ -50,35 +49,23 @@ fn account_profile_publish_endpoint_selection_centralizes_fallback_and_safety() 
     let directory = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://configured.example");
 
-    let populated = profile_relay_status(
-        &["wss://publish.example"],
-        &["wss://bootstrap.example"],
-        &["wss://default.example"],
-    );
+    let populated = profile_relay_status(&["wss://publish.example"], &["wss://bootstrap.example"]);
     assert_eq!(
         app.account_profile_publish_endpoints(&populated).unwrap(),
         vec![TransportEndpoint("wss://publish.example".into())]
     );
 
-    let empty_publish = profile_relay_status(&[], &["wss://bootstrap.example"], &[]);
+    let empty_publish = profile_relay_status(&[], &["wss://bootstrap.example"]);
     assert_eq!(
         app.account_profile_publish_endpoints(&empty_publish)
             .unwrap(),
         vec![TransportEndpoint("wss://bootstrap.example".into())]
     );
 
-    let missing_bootstrap = profile_relay_status(&[], &[], &["wss://default.example"]);
-    assert_eq!(
-        app.account_profile_publish_endpoints(&missing_bootstrap)
-            .unwrap(),
-        vec![TransportEndpoint("wss://default.example".into())]
-    );
-
     let retired = format!("wss://{}", crate::retired_relay_hosts()[0]);
     let unsafe_with_safe_sibling = profile_relay_status(
         &["not-a-relay", retired.as_str(), "wss://safe.example"],
         &["wss://bootstrap.example"],
-        &[],
     );
     assert_eq!(
         app.account_profile_publish_endpoints(&unsafe_with_safe_sibling)
@@ -86,12 +73,65 @@ fn account_profile_publish_endpoint_selection_centralizes_fallback_and_safety() 
         vec![TransportEndpoint("wss://safe.example".into())]
     );
 
-    let unusable = profile_relay_status(&["not-a-relay", retired.as_str()], &[], &[]);
+    let unsafe_publish_with_safe_bootstrap = profile_relay_status(
+        &["not-a-relay", retired.as_str()],
+        &["wss://bootstrap.example"],
+    );
+    assert_eq!(
+        app.account_profile_publish_endpoints(&unsafe_publish_with_safe_bootstrap)
+            .unwrap(),
+        vec![TransportEndpoint("wss://bootstrap.example".into())]
+    );
+
+    let unusable = profile_relay_status(&[], &["not-a-relay", retired.as_str()]);
     assert!(matches!(
         app.account_profile_publish_endpoints(&unusable),
         Err(AppError::RelayDirectory(message))
             if message == "account relay configuration has no usable profile publication endpoints"
     ));
+}
+
+#[test]
+fn account_profile_publish_endpoint_selection_matches_canonical_outbox_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://configured.example");
+    // `refresh()` creates the production cache shape. A distinct default list
+    // represents a compatibility snapshot from an older cache schema; when
+    // both fallback lists exist, canonical publication still picks bootstrap.
+    let mut status = profile_relay_status(&[], &["wss://bootstrap.example"]);
+    status.default_relays = vec!["wss://default.example".into()];
+    app.remember_directory_relay_lists(&account.account_id_hex, &status)
+        .unwrap();
+
+    let bootstrap = AccountRelayListBootstrap::new(
+        status
+            .default_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+        status
+            .bootstrap_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+    );
+    let canonical = app.outbox_endpoints(
+        &account.account_id_hex,
+        publish_endpoints_from_bootstrap(&bootstrap),
+    );
+
+    assert_eq!(
+        app.account_profile_publish_endpoints(&status).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        canonical,
+        vec![TransportEndpoint("wss://bootstrap.example".into())]
+    );
 }
 
 #[tokio::test]

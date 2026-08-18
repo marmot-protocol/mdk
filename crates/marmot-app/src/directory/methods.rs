@@ -530,13 +530,14 @@ impl MarmotApp {
         &self,
         relay_lists: &AccountRelayListStatus,
     ) -> Result<Vec<TransportEndpoint>, AppError> {
-        let published = if relay_lists.nip65.relays.is_empty() {
-            &relay_lists.default_relays
-        } else {
-            &relay_lists.nip65.relays
-        };
         let published = self.retain_safe_discovered_endpoints(
-            published.iter().cloned().map(TransportEndpoint).collect(),
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
             "account-owned profile publish relays",
         );
         if !published.is_empty() {

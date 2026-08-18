@@ -7997,34 +7997,34 @@ async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configur
 
     runtime
         .publish_user_profile_using_account_relays(
-            &alice.account.account_id_hex,
+            &bob.account.account_id_hex,
             UserProfileMetadata {
-                name: Some("AliceAccountOwned".to_owned()),
+                name: Some("BobAccountOwned".to_owned()),
                 ..UserProfileMetadata::default()
             },
         )
         .await
         .unwrap();
 
-    let from_alice_relay = app
-        .fetch_current_user_profile_for_account_id(
-            &alice.account.account_id_hex,
-            vec![endpoint(&alice_relay_url)],
-        )
-        .await
-        .unwrap()
-        .and_then(|profile| profile.name);
-    assert_eq!(from_alice_relay.as_deref(), Some("AliceAccountOwned"));
-
     let from_bob_relay = app
         .fetch_current_user_profile_for_account_id(
-            &alice.account.account_id_hex,
+            &bob.account.account_id_hex,
             vec![endpoint(&bob_relay_url)],
         )
         .await
         .unwrap()
         .and_then(|profile| profile.name);
-    assert_ne!(from_bob_relay.as_deref(), Some("AliceAccountOwned"));
+    assert_eq!(from_bob_relay.as_deref(), Some("BobAccountOwned"));
+
+    let from_alice_relay = app
+        .fetch_current_user_profile_for_account_id(
+            &bob.account.account_id_hex,
+            vec![endpoint(&alice_relay_url)],
+        )
+        .await
+        .unwrap()
+        .and_then(|profile| profile.name);
+    assert_ne!(from_alice_relay.as_deref(), Some("BobAccountOwned"));
 
     assert_ne!(alice.account.account_id_hex, bob.account.account_id_hex);
 }
