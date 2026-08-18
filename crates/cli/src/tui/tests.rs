@@ -9790,6 +9790,35 @@ fn handle_paste_is_ignored_on_the_login_menu_and_when_messages_focused() {
 }
 
 #[test]
+fn handle_paste_fills_the_message_search_query_only_while_it_has_focus() {
+    // Typing edits the message-search query, so pasting one must too — otherwise
+    // the most natural way to search for a phrase you already have on the
+    // clipboard silently does nothing. The focus gate is what is under test: once
+    // the hits take focus the query is no longer accepting characters.
+    let mut app = app_with_open_chat(test_unused_client(), &[("m1", "the deploy is green")]);
+    app.open_message_search(None).expect("open search");
+
+    app.handle_paste("deploy".to_owned());
+    assert_eq!(
+        app.message_search.as_ref().expect("view").query.value(),
+        "deploy",
+        "paste fills the query the same way typing does"
+    );
+
+    app.message_search.as_mut().expect("view").focus = MessageSearchFocus::Results;
+    app.handle_paste(" ignored".to_owned());
+    assert_eq!(
+        app.message_search.as_ref().expect("view").query.value(),
+        "deploy",
+        "paste is ignored once the hits have focus"
+    );
+    assert!(
+        app.input.is_empty(),
+        "and never leaks into the composer behind the screen"
+    );
+}
+
+#[test]
 fn handle_paste_into_a_text_popup_lands_in_its_input_not_the_composer() {
     // Pasting an npub into the Add Member text popup fills the popup's input,
     // never the composer hidden behind it.
@@ -10069,6 +10098,50 @@ fn slash_search_runs_a_message_search_over_the_open_chat() {
     assert_eq!(view.results.len(), 1, "the hit folds in as a timeline row");
     assert_eq!(view.results[0].message_id, "m2");
     assert_eq!(view.results[0].plaintext, "the deploy is green");
+}
+
+#[cfg(unix)]
+#[test]
+fn message_search_runs_against_the_loaded_account_not_the_highlighted_one() {
+    // A failed `refresh_chats` commits the newly highlighted account while the
+    // pane keeps showing the previous account's chat. Search is a pane operation
+    // like send/reply/react/delete, so it must follow the pane: keying it on the
+    // highlight searches a database that does not hold the searched chat and
+    // reports a confident zero hits.
+    let loaded_account = "aa".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(
+        tempdir.path(),
+        r#"{"ok":true,"result":{"messages":[],"has_more_before":false,"has_more_after":false,"query":"deploy"}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = app_with_open_chat(client, &[("m1", "the deploy is green")]);
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: Some("Bob".to_owned()),
+        local_signing: true,
+    });
+    app.selected_account = 1;
+
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    app.settle_effects(1);
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let args: Vec<&str> = recorded.lines().collect();
+    let account = args
+        .iter()
+        .position(|arg| *arg == "--account")
+        .map(|index| args[index + 1])
+        .expect("the search spawns an --account-scoped child");
+    assert_eq!(
+        account, loaded_account,
+        "the search follows the loaded pane, not the highlighted row; got: {args:?}"
+    );
 }
 
 #[test]

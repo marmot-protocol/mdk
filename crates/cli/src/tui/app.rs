@@ -269,10 +269,11 @@ impl TuiApp {
     }
 
     /// Route pasted text (from bracketed paste) into whatever input is accepting
-    /// characters — the streaming composer, the nsec field, or the main composer —
-    /// as literal characters with no keybinding interpretation. Newlines are kept
-    /// (normalized to `\n`) so multi-line content lands verbatim. Paste elsewhere
-    /// is ignored, mirroring where typed characters are accepted.
+    /// characters — the streaming composer, a text popup's field, the nsec field,
+    /// the main composer, or a focused search query — as literal characters with
+    /// no keybinding interpretation. Newlines are kept (normalized to `\n`) so
+    /// multi-line content lands verbatim. Paste elsewhere is ignored, mirroring
+    /// where typed characters are accepted.
     pub(crate) fn handle_paste(&mut self, text: String) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         // A popup is modal (mirroring `handle_key`): a text-entry popup takes the
@@ -305,11 +306,18 @@ impl TuiApp {
         match self.screen {
             Screen::Login(LoginMode::NsecEntry) => self.input.insert_str(&text),
             Screen::Main if self.focus == Focus::Composer => self.input.insert_str(&text),
-            // Paste into the search query only while it has focus, mirroring
-            // where typed characters are accepted on that screen.
+            // Paste into a search query only while it has focus, mirroring where
+            // typed characters are accepted on those screens.
             Screen::UserSearch => {
                 if let Some(view) = self.user_search.as_mut()
                     && view.focus == UserSearchFocus::Query
+                {
+                    view.query.insert_str(&text);
+                }
+            }
+            Screen::MessageSearch => {
+                if let Some(view) = self.message_search.as_mut()
+                    && view.focus == MessageSearchFocus::Query
                 {
                     view.query.insert_str(&text);
                 }

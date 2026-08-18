@@ -1396,8 +1396,17 @@ impl TuiApp {
     /// Run the one-shot `messages timeline search` for the open search screen off
     /// the event loop; the hits fold in when they land. An empty query is a no-op
     /// with a hint, mirroring `run_user_search`.
+    ///
+    /// The account comes from the loaded pane, not the highlighted account row,
+    /// for the same reason `open_message_search` keys the group there: a hit is
+    /// only useful if the pane can jump to it, and the jump target is the pane's
+    /// account and group together. Resolving the two from different places lets a
+    /// search aim at a chat the jump would then refuse — reachable when a failed
+    /// `refresh_chats` commits a new selection while the pane still shows the old
+    /// one. Every other pane operation (send, reply, react, delete, retry,
+    /// load-older) already resolves the account this way.
     pub(crate) fn run_message_search(&mut self) -> TuiResult<()> {
-        let account_id = self.require_selected_local_account()?;
+        let account_id = self.message_account_id()?;
         let Some(view) = self.message_search.as_ref() else {
             return Ok(());
         };
