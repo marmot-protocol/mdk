@@ -4,7 +4,10 @@ use cgka_traits::TransportEndpoint;
 use marmot_app::{AccountSetupRequest, UserProfileMetadata, default_directory_discovery_relays};
 use zeroize::Zeroizing;
 
-use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi, normalize_member_ref_ffi};
+use crate::conversions::{
+    AccountSetupReadinessFfi, AccountSummaryFfi, IdentityCreationResultFfi, UserProfileMetadataFfi,
+    normalize_member_ref_ffi,
+};
 use crate::errors::MarmotKitError;
 use crate::external_signer::{ExternalAccountSignerAdapter, ExternalAccountSignerFfi};
 use crate::{Marmot, conversions, endpoints};
@@ -99,9 +102,11 @@ impl Marmot {
         Ok(self.runtime.sign_out(&account_ref, options).await?.into())
     }
 
-    /// Create a brand-new Nostr identity, store its secret in the platform
-    /// keychain, and publish initial relay lists, an empty follow list, and a
-    /// key package.
+    /// Compatibility entry point for creating a brand-new Nostr identity.
+    /// The secret, default profile, and exact initial KeyPackage publication
+    /// are durable when this returns; relay publication continues in the
+    /// background. New callers should use `create_identity_with_profile` to
+    /// receive the profile and explicit readiness state.
     pub async fn create_identity(
         &self,
         default_relays: Vec<String>,
@@ -125,6 +130,50 @@ impl Marmot {
             signed_out: result.account.signed_out,
             running: true,
         })
+    }
+
+    /// Create a generated identity and return at durable local readiness with
+    /// the exact locally persisted default profile. `readiness` remains the
+    /// authority for whether relay publication has completed; `LocalReady`
+    /// must not be presented as invite-receivable.
+    pub async fn create_identity_with_profile(
+        &self,
+        default_relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<IdentityCreationResultFfi, MarmotKitError> {
+        let request = AccountSetupRequest {
+            identity: None,
+            import_nsec: None,
+            default_relays: endpoints(&default_relays),
+            bootstrap_relays: endpoints(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        };
+        let result = self.runtime.create_identity(request).await?;
+        let profile = result.profile.ok_or_else(|| MarmotKitError::Runtime {
+            details: "generated profile is unavailable".into(),
+        })?;
+        Ok(IdentityCreationResultFfi {
+            account: AccountSummaryFfi {
+                label: result.account.label,
+                account_id_hex: result.account.account_id_hex,
+                local_signing: result.account.local_signing,
+                external_signing: result.account.external_signing,
+                signed_out: result.account.signed_out,
+                running: true,
+            },
+            profile: profile.into(),
+            readiness: result.readiness.into(),
+        })
+    }
+
+    /// Read setup readiness without performing network I/O.
+    pub fn account_setup_readiness(
+        &self,
+        account_ref: String,
+    ) -> Result<AccountSetupReadinessFfi, MarmotKitError> {
+        Ok(self.runtime.account_setup_readiness(&account_ref)?.into())
     }
 
     /// Log in with an existing identity. `identity` can be an `nsec` (private
@@ -561,6 +610,37 @@ mod tests {
     use nostr_relay_builder::MockRelay;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generated_identity_result_returns_the_exact_local_profile_and_readiness() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(root.path(), relay_url.clone());
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+
+        let created = kit
+            .create_identity_with_profile(vec![relay_url.clone()], vec![relay_url])
+            .await
+            .expect("create generated identity at local readiness");
+
+        assert_eq!(created.readiness, AccountSetupReadinessFfi::LocalReady);
+        let cached = kit
+            .app
+            .directory_entry_for_account_id(&created.account.account_id_hex)
+            .expect("read cached profile")
+            .and_then(|entry| entry.profile)
+            .expect("generated profile is locally durable");
+        assert_eq!(created.profile.name, cached.name);
+        assert_eq!(created.profile.display_name, cached.display_name);
+        assert_eq!(created.profile.about, cached.about);
+        assert_eq!(created.profile.picture, cached.picture);
+        assert_eq!(created.profile.banner, cached.banner);
+        assert_eq!(created.profile.nip05, cached.nip05);
+        assert_eq!(created.profile.lud16, cached.lud16);
+        kit.runtime.shutdown().await;
+    }
 
     #[test]
     fn account_unread_summary_reports_zero_attention_for_idle_local_account() {

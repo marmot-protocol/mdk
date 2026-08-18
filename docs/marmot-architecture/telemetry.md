@@ -220,6 +220,14 @@ Collected operations:
 | `account_subscription_registration` | Initial registration of the hydrated account's group subscriptions. | Runs after transport activation and before relay catch-up; a slow registration cannot delay local readiness. |
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
 | `account_sync` | The initial asynchronous account network/bootstrap phase and each later account-worker `client.sync()` catch-up. | The startup sample includes transport preparation, relay data drain, processing, projection/state update, and relay-dependent open maintenance; later samples cover catch-up only. |
+| `account_setup_identity_local` | Generated identity/keychain creation plus durable local account record initialization. | Ends before relay work. |
+| `account_setup_storage_local` | SQLCipher account-storage creation/open for the generated identity. | Separates database initialization from KeyPackage generation and signing. |
+| `account_setup_profile_local` | Exact default-profile selection and durable local directory projection. | The returned binding profile is this local value. |
+| `account_bootstrap_relay_and_follow_publish` / `account_default_profile_publish` | Generated bootstrap relay/follow records and the default profile publication. | Background, retryable, independently timed, and excluded from local-ready caller latency. |
+| `account_setup_key_package_local` | Initial KeyPackage generation, private-material persistence, signing, and exact signed-event persistence. | Completes before local-ready handoff and before any setup publication. |
+| `account_initial_key_package_publish` | Initial KeyPackage relay publication and durable confirmation. | Background and retryable from the exact persisted artifact. |
+| `account_setup_local_ready_handoff` | Complete generated-account caller latency through local worker readiness. | The host may render local state but must not claim invite readiness. |
+| `account_setup_network_ready` | Background work from local-ready scheduling through bootstrap and KeyPackage confirmation plus journal completion. | Success is the invite-receivable boundary. |
 | `outbound_message_send` | Worker `SendMessage` and `SendAppEvent` commands until their send call returns a `SendSummary` or error. | One-sided local send/publish confirmation only. It is not end-to-end remote delivery or read latency. |
 | `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension; includes either cache-only reuse or create-time relay resolution below. |
 | `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Aggregate duration only. No member count label, account/relay identity, reservation, or package consumption. |

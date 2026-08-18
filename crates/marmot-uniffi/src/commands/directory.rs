@@ -171,13 +171,28 @@ impl Marmot {
 mod tests {
     use cgka_traits::TransportEndpoint;
     use marmot_account::AccountHome;
-    use marmot_app::{AccountSetupRequest, MarmotApp};
+    use marmot_app::{AccountSetupReadiness, AccountSetupRequest, MarmotApp, MarmotAppRuntime};
     use nostr_relay_builder::MockRelay;
 
     use super::*;
     use crate::conversions::{
         MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserSearchUpdateFfi,
     };
+
+    async fn wait_for_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if runtime.account_setup_readiness(account_ref).unwrap()
+                    == AccountSetupReadiness::NetworkReady
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generated identity must become network-ready");
+    }
 
     #[test]
     fn cached_identity_projections_cover_mixed_local_unknown_duplicate_and_malformed_ids() {
@@ -271,6 +286,7 @@ mod tests {
             .await
             .expect("create identity");
         let account_id_hex = account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &account_id_hex).await;
 
         kit.publish_user_profile(
             account_id_hex.clone(),
@@ -347,6 +363,7 @@ mod tests {
             .await
             .expect("create identity");
         let account_id_hex = account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &account_id_hex).await;
 
         // Publishing the local account's own profile caches it, which puts a
         // findable record at radius 0 without reaching past the relay boundary.

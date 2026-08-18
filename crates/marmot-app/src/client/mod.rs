@@ -19,7 +19,7 @@ use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
-use cgka_traits::{GroupId, MessageId, SecretBytes};
+use cgka_traits::{GroupId, MessageId, SecretBytes, TransportEndpoint};
 #[cfg(test)]
 use futures::StreamExt;
 use marmot_account::{
@@ -518,6 +518,15 @@ fn record_app_performance(
 }
 
 impl AppClient {
+    /// Persist the exact first KeyPackage and signed publication artifact
+    /// without activating transport or contacting a relay.
+    pub(crate) async fn prepare_initial_key_package(
+        &mut self,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Result<KeyPackage, AppError> {
+        Ok(self.runtime.prepare_fresh_key_package(endpoints).await?)
+    }
+
     pub async fn publish_key_package(&mut self) -> Result<KeyPackage, AppError> {
         self.app
             .ensure_local_account_relay_lists(&self.state.label)

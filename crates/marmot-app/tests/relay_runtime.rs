@@ -15,9 +15,9 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 use marmot_app::{
-    AccountRelayListBootstrap, AccountSetupRequest, AppError, AppMessageQuery, AuditDataMode,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
+    AuditDataMode, AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp,
+    MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationWakeSource,
     PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate, SelfMembership, SignOutOptions,
     TimelineMessageQuery, TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
@@ -81,6 +81,30 @@ async fn accept_group_invite_retrying_busy(
     })
     .await
     .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
+}
+
+async fn wait_for_account_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if runtime.account_setup_readiness(account_ref).unwrap()
+                == marmot_app::AccountSetupReadiness::NetworkReady
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("account setup must reach network readiness");
+}
+
+async fn create_network_ready_identity(
+    runtime: &MarmotAppRuntime,
+    request: AccountSetupRequest,
+) -> AccountSetupResult {
+    let result = runtime.create_identity(request).await.unwrap();
+    wait_for_account_network_ready(runtime, &result.account.label).await;
+    result
 }
 
 async fn group_message_blocking_app(
@@ -1350,10 +1374,15 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
 
     let first_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
     let first_runtime = MarmotAppRuntime::new(first_app);
-    first_runtime
+    let first = first_runtime
         .create_identity(setup())
         .await
-        .expect_err("the first generated identity KeyPackage publish must fail");
+        .expect("KeyPackage rejection must not erase local readiness");
+    assert_eq!(
+        first.readiness,
+        marmot_app::AccountSetupReadiness::LocalReady
+    );
+    sleep(Duration::from_millis(100)).await;
     let first_home = AccountHome::open(dir.path());
     let first_account = first_home.accounts().unwrap().into_iter().next().unwrap();
     assert_eq!(
@@ -1373,6 +1402,7 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
         .create_identity(setup())
         .await
         .expect("create-identity retry must resume the generated identity");
+    wait_for_account_network_ready(&second_runtime, &retried.account.label).await;
     assert_eq!(retried.account.account_id_hex, first_account.account_id_hex);
     assert_eq!(AccountHome::open(dir.path()).accounts().unwrap().len(), 1);
     second_runtime.shutdown().await;
@@ -1643,19 +1673,30 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
 
     assert!(created.account.local_signing);
-    assert!(created.relay_lists.complete);
+    assert_eq!(
+        created.readiness,
+        marmot_app::AccountSetupReadiness::LocalReady
+    );
+    assert!(!created.relay_lists.complete);
     assert!(created.key_package_bytes.is_some_and(|bytes| bytes > 0));
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
+    assert!(
+        app.account_relay_list_status(&created.account.label)
+            .unwrap()
+            .complete
+    );
     let directory_entry = app
         .directory_entry_for_account_id(&created.account.account_id_hex)
         .unwrap()
@@ -1748,8 +1789,12 @@ async fn account_creation_succeeds_with_one_unreachable_bootstrap_relay() {
     .expect("one unreachable relay must not multiply setup deadlines")
     .expect("one acknowledged relay is sufficient for account setup");
 
-    assert!(created.relay_lists.complete);
+    assert_eq!(
+        created.readiness,
+        marmot_app::AccountSetupReadiness::LocalReady
+    );
     assert!(created.key_package_bytes.is_some());
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     runtime.shutdown().await;
 }
 
@@ -1760,14 +1805,17 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
     let runtime = MarmotAppRuntime::new(app.clone());
     let bootstrap = AccountRelayListBootstrap::new(vec![endpoint(&url)], vec![endpoint(&url)]);
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
 
     runtime
         .publish_user_profile(
@@ -1844,15 +1892,17 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let first = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
@@ -2049,15 +2099,17 @@ async fn key_package_fetch_rejects_future_event_and_keeps_cached_package() {
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let cached = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
@@ -2101,15 +2153,17 @@ async fn app_runtime_can_rotate_key_package_on_request() {
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let first = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
@@ -2320,15 +2374,17 @@ async fn app_runtime_ignores_invalid_legacy_json_cache_when_publishing() {
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     // Identity creation now returns at local readiness. Use a worker mutation
     // as a barrier so the asynchronous startup sync and open maintenance have
     // completed before this test injects a synthetic legacy cache file.
@@ -2390,11 +2446,10 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    wait_for_account_network_ready(&runtime, &alice.account.label).await;
+    wait_for_account_network_ready(&runtime, &bob.account.label).await;
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
@@ -2555,11 +2610,8 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -2822,11 +2874,8 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -3054,11 +3103,8 @@ async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -3114,11 +3160,8 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -3200,11 +3243,8 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -3288,11 +3328,8 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3533,11 +3570,8 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -3601,16 +3635,17 @@ async fn push_registration_settings_accept_apns_fcm_and_redact_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
-    let account = runtime
-        .create_identity(AccountSetupRequest {
+    let account = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap()
-        .account;
+        },
+    )
+    .await
+    .account;
     let server_pubkey = nostr::Keys::generate().public_key().to_hex();
 
     let settings = app
@@ -3665,11 +3700,8 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -3756,15 +3788,9 @@ async fn removed_member_triggers_local_push_token_cleanup() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -3845,11 +3871,8 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -3942,11 +3965,8 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -4000,8 +4020,8 @@ async fn overlapping_reciprocal_invites_deliver_both_incoming_welcomes() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup()).await.unwrap();
-    let bob = runtime.create_identity(setup()).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let alice_group = runtime
@@ -4085,11 +4105,8 @@ async fn successful_invite_delivers_while_overlapping_invite_fails() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup().relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup()).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
     let missing_key_package_member = nostr::Keys::generate().public_key().to_hex();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -4160,11 +4177,8 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
     let mut events = runtime.subscribe();
@@ -4232,11 +4246,8 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -4398,11 +4409,8 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
     let mut events = runtime.subscribe();
@@ -4499,11 +4507,8 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
     assert!(
@@ -4575,11 +4580,8 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
     let mut events = runtime.subscribe();
@@ -4701,15 +4703,16 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app);
-    runtime
-        .create_identity(AccountSetupRequest {
+    create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
 
     runtime.start().await.unwrap();
 
@@ -4736,15 +4739,18 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
-    let setup = runtime
-        .create_identity(AccountSetupRequest {
+    let setup = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+
+    wait_for_account_network_ready(&runtime, &setup.account.label).await;
 
     runtime.start().await.unwrap();
     // `create_identity` publishes a default profile (kind-0) for this account at
@@ -4787,16 +4793,19 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
-    let setup = runtime
-        .create_identity(AccountSetupRequest {
+    let setup = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
     let followed = format!("{:064x}", 77);
+
+    wait_for_account_network_ready(&runtime, &setup.account.label).await;
 
     runtime.start().await.unwrap();
     publish_follow_list_at(
@@ -4847,11 +4856,8 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
@@ -4997,11 +5003,8 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
 
     let mut bob_chats = runtime
         .subscribe_chats(&bob.account.account_id_hex, false)
@@ -5082,11 +5085,8 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -5192,11 +5192,8 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -5278,11 +5275,8 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
 
     let group_id = runtime
@@ -5352,11 +5346,8 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
 
     let group_id = runtime
@@ -7441,15 +7432,17 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
     let publisher_home = AccountHome::open(publisher_dir.path());
     let (_relay, publisher_app, relay_url) = mock_app(&publisher_dir).await;
     let publisher_runtime = MarmotAppRuntime::new(publisher_app.clone());
-    let created = publisher_runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &publisher_runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&relay_url)],
             bootstrap_relays: vec![endpoint(&relay_url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&publisher_runtime, &created.account.label).await;
     publish_account_relay_lists_at(
         &publisher_home,
         &created.account.label,
@@ -7991,15 +7984,17 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
     let runtime = MarmotAppRuntime::new(app.clone());
 
     // The account's NIP-65 write relay is the home relay.
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&home_url)],
             bootstrap_relays: vec![endpoint(&home_url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let id = created.account.account_id_hex.clone();
     let label = created.account.label.clone();
 
@@ -8055,15 +8050,17 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     let home = AccountHome::open(dir.path());
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex.clone();
 
     // The initial KeyPackage was published to the relay during setup, so the
@@ -8126,15 +8123,17 @@ async fn app_runtime_delete_key_package_event_nip09_succeeds_and_clears_matching
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let packages = runtime
         .account_key_packages(&created.account.account_id_hex, vec![endpoint(&url)])
         .await
@@ -8191,15 +8190,17 @@ async fn app_runtime_wipe_reports_deletion_failure_and_still_removes_local_accou
     let (_relay, app, url) = deletion_rejecting_app(&dir).await;
     let home = AccountHome::open(dir.path());
     let runtime = MarmotAppRuntime::new(app);
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex;
 
     let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
@@ -8232,11 +8233,10 @@ async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    wait_for_account_network_ready(&runtime, &alice.account.label).await;
+    wait_for_account_network_ready(&runtime, &bob.account.label).await;
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
     let mut events = runtime.subscribe();
@@ -8316,15 +8316,17 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     let home = AccountHome::open(dir.path());
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex.clone();
 
     // Setup published a KeyPackage to the relay, so the sign-out should find
@@ -8424,15 +8426,17 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
     let (_relay, app, url) = deletion_rejecting_app(&dir).await;
     let home = AccountHome::open(dir.path());
     let runtime = MarmotAppRuntime::new(app);
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex;
 
     let outcome = runtime
@@ -8460,15 +8464,17 @@ async fn app_runtime_sign_out_skips_key_package_deletion_when_disabled() {
     let home = AccountHome::open(dir.path());
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = runtime
-        .create_identity(AccountSetupRequest {
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
+    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex.clone();
 
     // Confirm a relay key package exists before signing out.
@@ -8558,7 +8564,7 @@ async fn runtime_data_mode_toggle_rotates_live_recorder_with_boundary() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup).await;
 
     // The live worker is recording in obfuscated mode.
     let before = app.audit_log_files().unwrap();
@@ -8638,7 +8644,7 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup).await;
     // Force a completed sync so the rebuild + drain rows are flushed to disk.
     runtime.catch_up_accounts().await.unwrap();
 
@@ -8705,11 +8711,8 @@ async fn create_group_returns_before_blocked_founding_welcome() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
@@ -8771,15 +8774,9 @@ async fn invite_members_returns_before_blocked_welcome() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
     let carol_id = carol.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
@@ -8881,15 +8878,9 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
@@ -9014,15 +9005,9 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
     let carol_id = carol.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
@@ -9095,24 +9080,19 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
-    let dave = runtime
-        .create_identity(AccountSetupRequest {
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let dave = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
@@ -9215,15 +9195,9 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
@@ -9331,11 +9305,8 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let alice_label = alice.account.label.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -9425,15 +9396,9 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let carol = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
@@ -9588,11 +9553,8 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
 
     let mut events = runtime.subscribe();
     let _group = runtime
@@ -9656,11 +9618,8 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -9752,11 +9711,8 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();

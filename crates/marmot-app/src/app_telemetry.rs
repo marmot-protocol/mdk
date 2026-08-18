@@ -41,6 +41,12 @@ pub(crate) enum AppPerformanceOperation {
     /// successful sample is zero; a non-zero sample would mean a future path
     /// allowed both network phases to run concurrently.
     AccountInitialSyncOverlap,
+    AccountSetupIdentityLocal,
+    AccountSetupStorageLocal,
+    AccountSetupProfileLocal,
+    AccountSetupKeyPackageLocal,
+    AccountSetupLocalReadyHandoff,
+    AccountSetupNetworkReady,
     OutboundMessageSend,
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
@@ -232,6 +238,18 @@ pub struct AppPerformanceSnapshot {
     /// sentinel: KeyPackage publication completed before sync began.
     #[serde(default)]
     pub account_initial_sync_overlap: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_identity_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_storage_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_profile_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_key_package_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_local_ready_handoff: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_network_ready: AppPerformanceOperationSnapshot,
     /// Interrupted-migration recovery probes executed since process start. Each
     /// probe is a full keyed SQLCipher open paying the passphrase KDF; the
     /// healthy steady state skips it via the cached v2-open verdict (mdk#1439).
@@ -335,6 +353,12 @@ struct AppPerformanceTelemetryInner {
     account_default_profile_publish: AppPerformanceOperationTelemetry,
     account_initial_key_package_publish: AppPerformanceOperationTelemetry,
     account_initial_sync_overlap: AppPerformanceOperationTelemetry,
+    account_setup_identity_local: AppPerformanceOperationTelemetry,
+    account_setup_storage_local: AppPerformanceOperationTelemetry,
+    account_setup_profile_local: AppPerformanceOperationTelemetry,
+    account_setup_key_package_local: AppPerformanceOperationTelemetry,
+    account_setup_local_ready_handoff: AppPerformanceOperationTelemetry,
+    account_setup_network_ready: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
@@ -539,6 +563,24 @@ impl AppPerformanceTelemetry {
                 .record(duration, success),
             AppPerformanceOperation::AccountInitialSyncOverlap => {
                 inner.account_initial_sync_overlap.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupIdentityLocal => {
+                inner.account_setup_identity_local.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupStorageLocal => {
+                inner.account_setup_storage_local.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupProfileLocal => {
+                inner.account_setup_profile_local.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupKeyPackageLocal => inner
+                .account_setup_key_package_local
+                .record(duration, success),
+            AppPerformanceOperation::AccountSetupLocalReadyHandoff => inner
+                .account_setup_local_ready_handoff
+                .record(duration, success),
+            AppPerformanceOperation::AccountSetupNetworkReady => {
+                inner.account_setup_network_ready.record(duration, success)
             }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
@@ -746,6 +788,12 @@ impl AppPerformanceTelemetry {
                 .account_initial_key_package_publish
                 .snapshot(),
             account_initial_sync_overlap: inner.account_initial_sync_overlap.snapshot(),
+            account_setup_identity_local: inner.account_setup_identity_local.snapshot(),
+            account_setup_storage_local: inner.account_setup_storage_local.snapshot(),
+            account_setup_profile_local: inner.account_setup_profile_local.snapshot(),
+            account_setup_key_package_local: inner.account_setup_key_package_local.snapshot(),
+            account_setup_local_ready_handoff: inner.account_setup_local_ready_handoff.snapshot(),
+            account_setup_network_ready: inner.account_setup_network_ready.snapshot(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send: inner.outbound_message_send.snapshot(),

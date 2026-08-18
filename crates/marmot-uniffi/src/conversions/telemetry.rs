@@ -95,6 +95,12 @@ pub struct AppPerformanceSnapshotFfi {
     /// successful zero-duration sample means publication completed before
     /// sync began; it is not a missing duration sample.
     pub account_initial_sync_overlap: AppPerformanceOperationSnapshotFfi,
+    pub account_setup_identity_local: AppPerformanceOperationSnapshotFfi,
+    pub account_setup_storage_local: AppPerformanceOperationSnapshotFfi,
+    pub account_setup_profile_local: AppPerformanceOperationSnapshotFfi,
+    pub account_setup_key_package_local: AppPerformanceOperationSnapshotFfi,
+    pub account_setup_local_ready_handoff: AppPerformanceOperationSnapshotFfi,
+    pub account_setup_network_ready: AppPerformanceOperationSnapshotFfi,
     /// Interrupted-migration recovery probes executed since process start.
     /// Process-wide aggregate: no account, path, or key information.
     pub sqlcipher_migration_probe_runs: u64,
@@ -162,6 +168,12 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             account_default_profile_publish,
             account_initial_key_package_publish,
             account_initial_sync_overlap,
+            account_setup_identity_local,
+            account_setup_storage_local,
+            account_setup_profile_local,
+            account_setup_key_package_local,
+            account_setup_local_ready_handoff,
+            account_setup_network_ready,
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send,
@@ -219,6 +231,12 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             account_default_profile_publish: account_default_profile_publish.into(),
             account_initial_key_package_publish: account_initial_key_package_publish.into(),
             account_initial_sync_overlap: account_initial_sync_overlap.into(),
+            account_setup_identity_local: account_setup_identity_local.into(),
+            account_setup_storage_local: account_setup_storage_local.into(),
+            account_setup_profile_local: account_setup_profile_local.into(),
+            account_setup_key_package_local: account_setup_key_package_local.into(),
+            account_setup_local_ready_handoff: account_setup_local_ready_handoff.into(),
+            account_setup_network_ready: account_setup_network_ready.into(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send: outbound_message_send.into(),

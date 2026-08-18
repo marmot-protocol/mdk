@@ -134,6 +134,13 @@ account runtime for activation, KeyPackage publication, and publish confirmation
 messages, emit application-visible group events, model losing-branch invalidations, and test generated delivery
 variants.
 
+Generated-account creation now has an explicit durable local-ready boundary. The identity, default profile, setup
+journal, stable KeyPackage slot, private KeyPackage material, and exact signed initial publication are persisted before
+the caller returns. Bootstrap/profile/KeyPackage publication then continues as restart-resumable background work.
+Hosts must use `AccountSetupReadiness`: `LocalReady` is sufficient for local reads and profile rendering, while only
+`NetworkReady` means the account may be presented as invite-receivable. `Publishing` includes retryable background
+publication, and `RecoveryRequired` requires an explicit recovery flow.
+
 ## Known gaps
 
 - **Production persistence hardening** — `storage-sqlite` provides encrypted persistence, atomic group snapshots,

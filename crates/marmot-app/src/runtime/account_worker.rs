@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
-use marmot_account::AccountSetupPhase;
+use marmot_account::{AccountSetupKind, AccountSetupPhase};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -542,6 +542,26 @@ async fn run_app_runtime_account_worker(
             true,
         );
     }
+    // Snapshot setup intent before publishing readiness. Generated-account
+    // local readiness deliberately returns while bootstrap publication is
+    // still background work, and that task may advance the journal as soon as
+    // the ready signal is observed. Capturing here preserves the narrow
+    // priority lane for the exact locally prepared KeyPackage.
+    let setup_key_package_phase =
+        app.account_home()
+            .account_setup_state(&account_label)
+            .map(|state| {
+                state.filter(|state| {
+                    state.kind == AccountSetupKind::GeneratedIdentity
+                        && matches!(
+                            state.phase,
+                            AccountSetupPhase::LocalReady
+                                | AccountSetupPhase::BootstrapPublicationStarted
+                                | AccountSetupPhase::BootstrapPublicationConfirmed
+                                | AccountSetupPhase::KeyPackagePublicationStarted
+                        )
+                })
+            });
     if let Some(ready) = ready.take() {
         shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountWorkerReadiness,
@@ -556,9 +576,8 @@ async fn run_app_runtime_account_worker(
     // publish (or retry) the lifecycle-owned exact KeyPackage before unrelated
     // hydration and initial catch-up. General mutations, including the public
     // PublishKeyPackage command, remain on the ordinary startup FIFO.
-    let mut setup_key_package_result = match app.account_home().account_setup_state(&account_label)
-    {
-        Ok(Some(state)) if state.phase == AccountSetupPhase::KeyPackagePublicationStarted => {
+    let mut setup_key_package_result = match setup_key_package_phase {
+        Ok(Some(_)) => {
             let started_at = Instant::now();
             let result = async {
                 let key_package = client.publish_setup_key_package().await?;

@@ -229,11 +229,26 @@ impl Marmot {
 #[cfg(test)]
 mod tests {
     use cgka_traits::TransportEndpoint;
-    use marmot_app::{AccountSetupRequest, MarmotApp};
+    use marmot_app::{AccountSetupReadiness, AccountSetupRequest, MarmotApp, MarmotAppRuntime};
     use nostr_relay_builder::MockRelay;
 
     use super::*;
     use crate::{ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi};
+
+    async fn wait_for_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if runtime.account_setup_readiness(account_ref).unwrap()
+                    == AccountSetupReadiness::NetworkReady
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generated identity must become network-ready");
+    }
 
     fn reusable_direct_conversation_winner(
         left: &ChatListRowFfi,
@@ -285,6 +300,7 @@ mod tests {
             .await
             .expect("create identity");
         let account_ref = account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &account_ref).await;
         let first = kit
             .create_group(
                 account_ref.clone(),
@@ -317,6 +333,7 @@ mod tests {
             .await
             .expect("create isolated identity");
         let isolated_account_ref = isolated_account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &isolated_account_ref).await;
         let isolated_group = kit
             .create_group(
                 isolated_account_ref.clone(),
@@ -493,6 +510,7 @@ mod tests {
             .await
             .expect("create identity");
         let account_ref = account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &account_ref).await;
 
         let isolated_endpoint = TransportEndpoint(relay_url);
         let isolated_account = kit
@@ -507,6 +525,7 @@ mod tests {
             .await
             .expect("create isolated identity");
         let isolated_account_ref = isolated_account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &isolated_account_ref).await;
         let isolated_group = kit
             .create_group(
                 isolated_account_ref.clone(),
@@ -646,6 +665,7 @@ mod tests {
             .expect("create identity");
         let account_ref = account.account.account_id_hex.clone();
         let account_label = account.account.label.clone();
+        wait_for_network_ready(&kit.runtime, &account_ref).await;
         let peer = kit
             .runtime
             .create_identity(AccountSetupRequest {
@@ -658,6 +678,7 @@ mod tests {
             .await
             .expect("create peer identity");
         let peer_ref = peer.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &peer_ref).await;
         let isolated = kit
             .runtime
             .create_identity(AccountSetupRequest {
@@ -670,6 +691,7 @@ mod tests {
             .await
             .expect("create isolated identity");
         let isolated_ref = isolated.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &isolated_ref).await;
 
         for title in ["Alpha", "Beta", "Gamma"] {
             kit.create_group(account_ref.clone(), title.to_owned(), Vec::new(), None)
@@ -750,6 +772,7 @@ mod tests {
                 })
                 .await
                 .expect("create other-peer identity");
+            wait_for_network_ready(&kit.runtime, &other_peer.account.account_id_hex).await;
             kit.create_group(
                 account_ref.clone(),
                 String::new(),
