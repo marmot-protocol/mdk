@@ -53,6 +53,7 @@ pub(crate) enum AppPerformanceOperation {
     GroupInvitePostMutationCatchUp,
     GroupPromoteAdmin,
     GroupDetailsRead,
+    GroupConversationSnapshotRead,
     ChatListRowRead,
     ExistingDirectConversationRead,
     GroupMlsStateRead,
@@ -259,6 +260,8 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub group_details_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub group_conversation_snapshot_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub chat_list_row_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub existing_direct_conversation_read: AppPerformanceOperationSnapshot,
@@ -317,6 +320,7 @@ struct AppPerformanceTelemetryInner {
     group_invite_post_mutation_catch_up: AppPerformanceOperationTelemetry,
     group_promote_admin: AppPerformanceOperationTelemetry,
     group_details_read: AppPerformanceOperationTelemetry,
+    group_conversation_snapshot_read: AppPerformanceOperationTelemetry,
     chat_list_row_read: AppPerformanceOperationTelemetry,
     existing_direct_conversation_read: AppPerformanceOperationTelemetry,
     group_mls_state_read: AppPerformanceOperationTelemetry,
@@ -563,6 +567,11 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::GroupDetailsRead => {
                 inner.group_details_read.record(duration, success);
             }
+            AppPerformanceOperation::GroupConversationSnapshotRead => {
+                inner
+                    .group_conversation_snapshot_read
+                    .record(duration, success);
+            }
             AppPerformanceOperation::ChatListRowRead => {
                 inner.chat_list_row_read.record(duration, success);
             }
@@ -686,6 +695,7 @@ impl AppPerformanceTelemetry {
                 .snapshot(),
             group_promote_admin: inner.group_promote_admin.snapshot(),
             group_details_read: inner.group_details_read.snapshot(),
+            group_conversation_snapshot_read: inner.group_conversation_snapshot_read.snapshot(),
             chat_list_row_read: inner.chat_list_row_read.snapshot(),
             existing_direct_conversation_read: inner.existing_direct_conversation_read.snapshot(),
             group_mls_state_read: inner.group_mls_state_read.snapshot(),

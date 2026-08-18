@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use marmot_app::{
     AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest, AppGroupAdminPolicyComponent,
-    AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupLifecycleState,
-    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
+    AppGroupHydrationQuarantineReason, AppGroupLifecycleState, AppGroupMemberIds,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
     AppQuarantinedGroup, GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
 };
@@ -258,6 +259,18 @@ pub struct GroupDetailsFfi {
     pub mls_state: AppGroupMlsStateFfi,
 }
 
+/// Conversation-loading projections derived from one worker snapshot.
+///
+/// `details.group`, `details.members`, and `details.mls_state` describe the
+/// same group state/epoch and local projection frontier. `management_state` is
+/// derived synchronously from those exact returned details, with no await or
+/// queue re-entry between the two projections.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupConversationSnapshotFfi {
+    pub details: GroupDetailsFfi,
+    pub management_state: GroupManagementStateFfi,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct GroupMemberActionStateFfi {
     pub member_id_hex: String,
@@ -393,6 +406,18 @@ pub(crate) fn group_details_ffi(
     })
 }
 
+pub(crate) fn group_details_from_conversation_snapshot_ffi(
+    snapshot: AppGroupConversationSnapshot,
+) -> Result<GroupDetailsFfi, MarmotKitError> {
+    group_details_ffi(
+        snapshot.group.into(),
+        snapshot.members.into_iter().map(Into::into).collect(),
+        snapshot.mls_state.into(),
+        &snapshot.my_account_id_hex,
+        snapshot.display_names,
+    )
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct GroupRosterFfi {
     pub group_id_hex: String,
@@ -526,6 +551,17 @@ pub(crate) fn group_management_state_ffi(
         disbanding_blockers: details.mls_state.disbanding_blockers.clone(),
         disband_request: details.mls_state.disband_request.clone(),
         member_actions,
+    }
+}
+
+pub(crate) fn group_conversation_snapshot_ffi(
+    my_account_id_hex: &str,
+    details: GroupDetailsFfi,
+) -> GroupConversationSnapshotFfi {
+    let management_state = group_management_state_ffi(my_account_id_hex, &details);
+    GroupConversationSnapshotFfi {
+        details,
+        management_state,
     }
 }
 

@@ -2961,6 +2961,89 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
 }
 
 #[tokio::test]
+async fn group_conversation_snapshot_is_internally_consistent_around_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let endpoint = endpoint(&url);
+    let alice = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint.clone()],
+            bootstrap_relays: vec![endpoint],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let alice_id = alice.account.account_id_hex;
+    let group_id = runtime
+        .create_group(&alice_id, "before snapshot", &[], None)
+        .await
+        .unwrap();
+
+    let before = runtime
+        .group_conversation_snapshot(&alice_id, &group_id)
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mutation_runtime = runtime.clone();
+    let mutation_account = alice_id.clone();
+    let mutation_group = group_id.clone();
+    let mutation_barrier = barrier.clone();
+    let mutation = tokio::spawn(async move {
+        mutation_barrier.wait().await;
+        mutation_runtime
+            .update_group_profile(
+                &mutation_account,
+                &mutation_group,
+                Some("after snapshot".to_owned()),
+                None,
+            )
+            .await
+    });
+    let read_runtime = runtime.clone();
+    let read_account = alice_id.clone();
+    let read_group = group_id.clone();
+    let read = tokio::spawn(async move {
+        barrier.wait().await;
+        read_runtime
+            .group_conversation_snapshot(&read_account, &read_group)
+            .await
+    });
+
+    let concurrent = read.await.unwrap().unwrap();
+    mutation.await.unwrap().unwrap();
+    let after = runtime
+        .group_conversation_snapshot(&alice_id, &group_id)
+        .await
+        .unwrap();
+
+    let observed = (
+        concurrent.group.profile.name.as_str(),
+        concurrent.mls_state.epoch,
+    );
+    let before_pair = (before.group.profile.name.as_str(), before.mls_state.epoch);
+    let after_pair = (after.group.profile.name.as_str(), after.mls_state.epoch);
+    assert!(
+        observed == before_pair || observed == after_pair,
+        "snapshot must be wholly before or wholly after the concurrent commit: observed {observed:?}, before {before_pair:?}, after {after_pair:?}"
+    );
+    assert_eq!(
+        concurrent.members.len(),
+        concurrent.mls_state.member_count,
+        "member rows and MLS member count must share one frontier"
+    );
+    assert!(concurrent.group.admin_policy.admins.iter().all(|admin| {
+        concurrent
+            .members
+            .iter()
+            .any(|member| &member.member_id_hex == admin)
+    }));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;

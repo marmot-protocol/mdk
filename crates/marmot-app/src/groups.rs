@@ -241,6 +241,23 @@ pub(crate) struct AppGroupRosterSession {
     pub mls_state: AppGroupMlsState,
 }
 
+/// One conversation-loading view captured from a single account-worker read.
+///
+/// `group`, `members`, and `mls_state` come from the same live-session or
+/// startup-snapshot frontier. The worker does not yield or re-enter its queue
+/// while capturing those three projections. `display_names` is optional
+/// directory-cache enrichment loaded in one synchronous batch after that
+/// authoritative snapshot; it does not participate in group-management
+/// decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppGroupConversationSnapshot {
+    pub my_account_id_hex: String,
+    pub group: AppGroupRecord,
+    pub members: Vec<AppGroupMemberRecord>,
+    pub mls_state: AppGroupMlsState,
+    pub display_names: HashMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRosterMember {
     pub member_id_hex: String,

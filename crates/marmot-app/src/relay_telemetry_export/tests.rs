@@ -236,6 +236,13 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failure_classifications: Vec::new(),
             duration_ms: hist(1),
         },
+        group_conversation_snapshot_read: AppPerformanceOperationSnapshot {
+            attempts: 4,
+            successes: 3,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(2),
+        },
         chat_list_row_read: AppPerformanceOperationSnapshot {
             attempts: 3,
             successes: 3,
@@ -356,6 +363,10 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS
             && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(4)
     }));
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_CHAT_LIST_ROW_READ_ATTEMPTS

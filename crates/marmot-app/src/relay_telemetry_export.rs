@@ -403,6 +403,18 @@ pub mod metric_names {
     pub const APP_GROUP_DETAILS_READ_SUCCESSES: &str = "app_group_details_read_successes";
     /// Failed group details reads.
     pub const APP_GROUP_DETAILS_READ_FAILURES: &str = "app_group_details_read_failures";
+    /// Combined conversation snapshot read duration histogram.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_DURATION: &str =
+        "app_group_conversation_snapshot_read_duration_ms";
+    /// Combined conversation snapshot read attempts.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_ATTEMPTS: &str =
+        "app_group_conversation_snapshot_read_attempts";
+    /// Successful combined conversation snapshot reads.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_SUCCESSES: &str =
+        "app_group_conversation_snapshot_read_successes";
+    /// Failed combined conversation snapshot reads.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_FAILURES: &str =
+        "app_group_conversation_snapshot_read_failures";
     /// Single chat-list row read duration histogram.
     pub const APP_CHAT_LIST_ROW_READ_DURATION: &str = "app_chat_list_row_read_duration_ms";
     /// Single chat-list row read attempts.
@@ -1023,6 +1035,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS,
         metric_names::APP_GROUP_DETAILS_READ_SUCCESSES,
         metric_names::APP_GROUP_DETAILS_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_conversation_snapshot_read,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_DURATION,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_ATTEMPTS,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_SUCCESSES,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_FAILURES,
     );
     append_app_operation_points(
         points,

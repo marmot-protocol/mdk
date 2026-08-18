@@ -231,6 +231,7 @@ Collected operations:
 | `group_invite_post_mutation_catch_up` | The `catch_up_accounts()` call run after `InviteMembers` returns from the account worker. | Also contributes to the aggregate `account_catch_up` metric; this operation scopes that same wait to invite flows. |
 | `group_promote_admin` | `AccountManager::promote_admin()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Covers the separate admin-policy mutation path used when invite-as-admin follows member invite. |
 | `group_details_read` | UniFFI `group_details_for()`, including account/group lookup, member read, display-name hydration, and DTO assembly. | Matches the FFI `groupDetails` surface consumed by apps. |
+| `group_conversation_snapshot_read` | UniFFI `group_conversation_snapshot_for()`, including one session-consistent worker read, display-name hydration, and both DTO projections. | Matches the combined conversation-loading surface; aggregate duration/counters only, with no group or account labels. |
 | `group_mls_state_read` | `AccountManager::group_mls_state()`, from worker command dispatch through the read response. | Captures projection reads used by the conversation developer/debug state surface. |
 | `group_accept_invite` | `AccountManager::accept_group_invite()`, from worker command dispatch through the worker response. | Caller-visible accept latency; a worker-busy rejection counts as a failed attempt, matching the `group_create_total_caller_latency` convention. The join itself is published by the invite catch-up flow, not by this envelope. |
 | `media_upload` | Worker `UploadMedia` command until `client.upload_media()` returns. | Measures local encryption/upload pipeline and endpoint response time as seen by this device. |
@@ -481,6 +482,10 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_outbound_message_send_attempts` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.attempts` |
 | `app_outbound_message_send_successes` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.successes` |
 | `app_outbound_message_send_failures` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.failures` |
+| `app_group_conversation_snapshot_read_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_conversation_snapshot_read.duration_ms` |
+| `app_group_conversation_snapshot_read_attempts` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.attempts` |
+| `app_group_conversation_snapshot_read_successes` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.successes` |
+| `app_group_conversation_snapshot_read_failures` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.failures` |
 | `app_group_accept_invite_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_accept_invite.duration_ms` |
 | `app_group_accept_invite_attempts` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.attempts` |
 | `app_group_accept_invite_successes` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.successes` |

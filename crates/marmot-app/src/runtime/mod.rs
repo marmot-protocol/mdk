@@ -37,8 +37,8 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
     AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread,
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
-    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
-    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
+    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
     ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
@@ -1043,6 +1043,16 @@ impl MarmotAppRuntime {
         );
     }
 
+    /// Record the fixed app-performance sample for the UniFFI combined
+    /// conversation snapshot builder.
+    pub fn record_group_conversation_snapshot_read(&self, duration: Duration, success: bool) {
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupConversationSnapshotRead,
+            duration,
+            success,
+        );
+    }
+
     /// Record the fixed app-performance sample for the UniFFI single chat-list
     /// row read.
     pub fn record_chat_list_row_read(&self, duration: Duration, success: bool) {
@@ -1362,6 +1372,16 @@ impl MarmotAppRuntime {
             result.is_ok(),
         );
         result
+    }
+
+    pub async fn group_conversation_snapshot(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupConversationSnapshot, AppError> {
+        self.accounts
+            .group_conversation_snapshot(account_ref, group_id)
+            .await
     }
 
     pub async fn enable_group_disbanding(
