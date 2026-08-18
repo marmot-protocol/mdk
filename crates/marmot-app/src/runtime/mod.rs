@@ -1351,7 +1351,8 @@ impl MarmotAppRuntime {
 
     /// Upload a staged founding image. Retrying the same opaque id reuses the
     /// exact encrypted bytes and content hash; an already uploaded artifact is
-    /// returned without another HTTP request.
+    /// returned without another HTTP request. A transfer failure is persisted
+    /// as `Failed` for status/resume queries and is also returned as `Err`.
     pub async fn upload_prepared_group_image(
         &self,
         account_ref: &str,
@@ -1359,6 +1360,21 @@ impl MarmotAppRuntime {
     ) -> Result<crate::AppPreparedGroupImageUpload, AppError> {
         self.accounts
             .upload_prepared_group_image(account_ref, upload_id)
+            .await
+    }
+
+    /// Benchmark/test seam for routing a prepared upload to a local Blossom
+    /// server. Loopback remains subject to the construction-time blob-endpoint
+    /// safety gate; production hosts should use [`Self::upload_prepared_group_image`].
+    #[doc(hidden)]
+    pub async fn upload_prepared_group_image_to_server_for_test(
+        &self,
+        account_ref: &str,
+        upload_id: String,
+        server: String,
+    ) -> Result<crate::AppPreparedGroupImageUpload, AppError> {
+        self.accounts
+            .upload_prepared_group_image_to_server(account_ref, upload_id, Some(server))
             .await
     }
 

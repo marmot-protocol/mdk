@@ -480,9 +480,10 @@ impl Marmot {
             .into())
     }
 
-    /// Upload a staged founding image. A failed status is durable and can be
-    /// retried with the same id; an already uploaded id performs no duplicate
-    /// HTTP transfer.
+    /// Upload a staged founding image. A transfer failure is returned as an
+    /// error after its failed status is durably recorded, and can be retried
+    /// with the same id; an already uploaded id performs no duplicate HTTP
+    /// transfer.
     pub async fn upload_prepared_group_image(
         &self,
         account_ref: String,

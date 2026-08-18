@@ -126,6 +126,7 @@ pub(crate) enum AccountWorkerCommand {
     },
     UploadPreparedGroupImage {
         upload_id: String,
+        server: Option<String>,
         respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
     },
     PreparedGroupImageStatus {
@@ -2296,12 +2297,19 @@ async fn complete_media_http(
             release_prepared_group_image_upload(media_http, &upload_id);
             let succeeded = result.is_ok();
             let status = client.finish_initial_group_image_upload(&upload_id, &result);
+            let response = match result {
+                Ok(()) => status,
+                Err(upload_error) => match status {
+                    Ok(_) => Err(upload_error),
+                    Err(persistence_error) => Err(persistence_error),
+                },
+            };
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::GroupCreateImageUpload,
                 started_at.elapsed(),
                 succeeded,
             );
-            let _ = respond.send(status);
+            let _ = respond.send(response);
         }
     }
     drop(permit);
@@ -2727,8 +2735,16 @@ async fn handle_account_worker_command(
             );
             let _ = respond.send(result);
         }
-        AccountWorkerCommand::UploadPreparedGroupImage { upload_id, respond } => {
-            match client.prepare_initial_group_image_upload(&upload_id, None, false) {
+        AccountWorkerCommand::UploadPreparedGroupImage {
+            upload_id,
+            server,
+            respond,
+        } => {
+            match client.prepare_initial_group_image_upload(
+                &upload_id,
+                server,
+                app.allow_loopback_blob_endpoints(),
+            ) {
                 Ok(PreparedGroupImageUploadStart::Complete(status)) => {
                     let _ = respond.send(Ok(status));
                 }
@@ -4580,6 +4596,63 @@ mod tests {
 
         drop(completion);
         assert!(reserve_media_http(&media_http).is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepared_group_image_upload_failure_is_durable_and_returned_as_error() {
+        use image::ImageEncoder as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&png, "image/png")
+            .unwrap();
+
+        let (media_http, _completions) = media_http_context(1);
+        reserve_prepared_group_image_upload(&media_http, &staged.upload_id).unwrap();
+        let permit = reserve_media_http(&media_http).unwrap();
+        let (respond, response) = oneshot::channel();
+        let done = MediaHttpDone {
+            permit,
+            completion: MediaHttpCompletion::PreparedGroupImageUpload {
+                upload_id: staged.upload_id.clone(),
+                result: Err(AppError::BlobStore("injected upload failure".into())),
+                respond,
+                started_at: Instant::now(),
+            },
+        };
+
+        complete_media_http(
+            &mut client,
+            done,
+            &RuntimeSharedServices::default(),
+            &media_http,
+        )
+        .await;
+
+        let error = response
+            .await
+            .unwrap()
+            .expect_err("a durable failed status must not turn upload failure into success");
+        assert_eq!(error.privacy_safe_kind(), "blob_store");
+        let status = client
+            .prepared_initial_group_image_status(&staged.upload_id)
+            .unwrap();
+        assert_eq!(
+            status.state,
+            crate::AppPreparedGroupImageUploadState::Failed
+        );
+        assert_eq!(status.attempt_count, 1);
+        assert_eq!(status.last_error_kind.as_deref(), Some("blob_store"));
     }
 
     #[tokio::test]

@@ -304,10 +304,24 @@ impl AccountManager {
         account_ref: &str,
         upload_id: String,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        self.upload_prepared_group_image_to_server(account_ref, upload_id, None)
+            .await
+    }
+
+    pub(crate) async fn upload_prepared_group_image_to_server(
+        &self,
+        account_ref: &str,
+        upload_id: String,
+        server: Option<String>,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::UploadPreparedGroupImage { upload_id, respond })
+            .send(AccountWorkerCommand::UploadPreparedGroupImage {
+                upload_id,
+                server,
+                respond,
+            })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         long_account_worker_response(response).await

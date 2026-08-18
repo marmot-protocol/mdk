@@ -215,7 +215,7 @@ pub(crate) enum PreparedGroupImageUploadStart {
     Http(PreparedGroupImageUploadHttp),
 }
 
-enum InitialGroupImageSource {
+pub(crate) enum InitialGroupImageSource {
     Inline(AppInitialGroupImage),
     Prepared {
         upload_id: String,
@@ -1117,20 +1117,28 @@ impl AppClient {
         }
 
         // Recover a crash after canonical creation but before the artifact's
-        // consumed marker. The exact randomized component bytes uniquely bind
-        // the artifact to the already-created group, so retry returns that
-        // group rather than creating a duplicate.
-        let component_data_hex = hex::encode(&record.component_data);
-        if let Some(group) = self
-            .state
-            .groups
-            .iter()
-            .find(|group| group.image.data_hex == component_data_hex)
-        {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+        // consumed marker. The app projection is explicitly best-effort after
+        // canonical creation, so inspect authoritative live engine components
+        // rather than relying on `state.groups`. The exact randomized
+        // component bytes uniquely bind the artifact to the already-created
+        // group, so retry returns that group rather than creating a duplicate.
+        let mut matching_group_id = None;
+        for group_id in self.runtime.live_group_ids()? {
+            if self
+                .runtime
+                .app_component(&group_id, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)?
+                .as_deref()
+                == Some(record.component_data.as_slice())
+            {
+                matching_group_id = Some(group_id);
+                break;
+            }
+        }
+        if let Some(group_id) = matching_group_id {
+            let group_id_hex = hex::encode(group_id.as_slice());
             storage.consume_prepared_group_image_upload(
                 upload_id,
-                &group.group_id_hex,
+                &group_id_hex,
                 unix_now_seconds(),
             )?;
             return Ok(CanonicalCreatedGroup {
@@ -1187,7 +1195,7 @@ impl AppClient {
         .await
     }
 
-    async fn create_group_with_initial_source_and_optional_telemetry(
+    pub(crate) async fn create_group_with_initial_source_and_optional_telemetry(
         &mut self,
         name: &str,
         description: String,
@@ -1374,6 +1382,32 @@ impl AppClient {
         );
         let prepared = prepared?;
         let group_id = prepared.group_id;
+        // Bind the idempotency key at the first post-canonical instruction.
+        // Projection and Welcome bookkeeping below are repairable and must not
+        // widen the crash window in which a retry could create a second group.
+        // If this best-effort write fails, retry scans the authoritative engine
+        // component state above before attempting another create.
+        if let Some(upload_id) = prepared_upload_id.as_deref()
+            && let Err(error) = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    storage
+                        .consume_prepared_group_image_upload(
+                            upload_id,
+                            &hex::encode(group_id.as_slice()),
+                            unix_now_seconds(),
+                        )
+                        .map_err(AppError::from)
+                })
+        {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "create_group",
+                error_kind = error.privacy_safe_kind(),
+                "confirmed group creation outpaced prepared-image consumption; retry will reconcile the engine component"
+            );
+        }
         // Current-profile founding creation is already canonical before
         // transport delivery: the engine transaction retained the exact
         // Welcome bytes and destinations. Derive only the in-memory ids used
@@ -1424,27 +1458,6 @@ impl AppClient {
             local_projection_started_at.elapsed(),
             local_projection.is_ok(),
         );
-        if let Some(upload_id) = prepared_upload_id
-            && let Err(error) = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    storage
-                        .consume_prepared_group_image_upload(
-                            &upload_id,
-                            &hex::encode(group_id.as_slice()),
-                            unix_now_seconds(),
-                        )
-                        .map_err(AppError::from)
-                })
-        {
-            tracing::warn!(
-                target: "marmot_app::client",
-                method = "create_group",
-                error_kind = error.privacy_safe_kind(),
-                "confirmed group creation outpaced prepared-image consumption; retry will reconcile the component"
-            );
-        }
         if let Err(error) = &local_projection {
             tracing::warn!(
                 target: "marmot_app::client",

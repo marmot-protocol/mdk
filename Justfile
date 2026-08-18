@@ -60,7 +60,7 @@ bench-startup:
 # rows include the prior serialized-path model and the new canonical-create
 # response boundary as stable `MDK_BENCH ...` fields.
 bench-group-image-create:
-    cargo test --release -p marmot-app --lib prepared_group_image_create_measurement_matrix -- --ignored --nocapture --test-threads=1
+    cargo test --release -p marmot-app --test group_image_create -- --ignored --nocapture --test-threads=1
 
 # Storage-format v1 -> v2 operational benchmark (mdk#1414). Builds a
 # file-backed schema-v46 database with legacy Welcome-heavy rows, samples the
