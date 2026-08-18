@@ -23,6 +23,7 @@ pub(crate) enum AppPerformanceOperation {
     DirectorySubscriptionSync,
     AccountReconcile,
     AccountOpen,
+    AccountWorkerReadiness,
     AccountSessionOpen,
     AccountGroupHydration,
     AccountProfileLoad,
@@ -32,6 +33,14 @@ pub(crate) enum AppPerformanceOperation {
     AccountCatchUp,
     AccountSync,
     AccountSetupAdvisoryStep,
+    AccountBootstrapRelayAndFollowPublish,
+    AccountDefaultProfilePublish,
+    AccountInitialKeyPackagePublish,
+    /// Time during which the initial KeyPackage publication and initial sync
+    /// overlap. The setup-priority path deliberately serializes them, so its
+    /// successful sample is zero; a non-zero sample would mean a future path
+    /// allowed both network phases to run concurrently.
+    AccountInitialSyncOverlap,
     OutboundMessageSend,
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
@@ -192,6 +201,8 @@ pub struct AppPerformanceSnapshot {
     pub account_reconcile: AppPerformanceOperationSnapshot,
     pub account_open: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub account_worker_readiness: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub account_session_open: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub account_group_hydration: AppPerformanceOperationSnapshot,
@@ -206,6 +217,17 @@ pub struct AppPerformanceSnapshot {
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
     pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_bootstrap_relay_and_follow_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_default_profile_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_initial_key_package_publish: AppPerformanceOperationSnapshot,
+    /// Overlap between initial KeyPackage publication and initial sync. A
+    /// successful zero-duration sample is the intentional setup-priority
+    /// sentinel: KeyPackage publication completed before sync began.
+    #[serde(default)]
+    pub account_initial_sync_overlap: AppPerformanceOperationSnapshot,
     /// Interrupted-migration recovery probes executed since process start. Each
     /// probe is a full keyed SQLCipher open paying the passphrase KDF; the
     /// healthy steady state skips it via the cached v2-open verdict (mdk#1439).
@@ -287,6 +309,7 @@ struct AppPerformanceTelemetryInner {
     directory_subscription_sync: AppPerformanceOperationTelemetry,
     account_reconcile: AppPerformanceOperationTelemetry,
     account_open: AppPerformanceOperationTelemetry,
+    account_worker_readiness: AppPerformanceOperationTelemetry,
     account_session_open: AppPerformanceOperationTelemetry,
     account_group_hydration: AppPerformanceOperationTelemetry,
     account_profile_load: AppPerformanceOperationTelemetry,
@@ -296,6 +319,10 @@ struct AppPerformanceTelemetryInner {
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
     account_setup_advisory_step: AppPerformanceOperationTelemetry,
+    account_bootstrap_relay_and_follow_publish: AppPerformanceOperationTelemetry,
+    account_default_profile_publish: AppPerformanceOperationTelemetry,
+    account_initial_key_package_publish: AppPerformanceOperationTelemetry,
+    account_initial_sync_overlap: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
@@ -458,6 +485,9 @@ impl AppPerformanceTelemetry {
                 inner.account_reconcile.record(duration, success);
             }
             AppPerformanceOperation::AccountOpen => inner.account_open.record(duration, success),
+            AppPerformanceOperation::AccountWorkerReadiness => {
+                inner.account_worker_readiness.record(duration, success);
+            }
             AppPerformanceOperation::AccountSessionOpen => {
                 inner.account_session_open.record(duration, success);
             }
@@ -481,6 +511,18 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::AccountCatchUp | AppPerformanceOperation::AccountSync => {}
             AppPerformanceOperation::AccountSetupAdvisoryStep => {
                 inner.account_setup_advisory_step.record(duration, success)
+            }
+            AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish => inner
+                .account_bootstrap_relay_and_follow_publish
+                .record(duration, success),
+            AppPerformanceOperation::AccountDefaultProfilePublish => inner
+                .account_default_profile_publish
+                .record(duration, success),
+            AppPerformanceOperation::AccountInitialKeyPackagePublish => inner
+                .account_initial_key_package_publish
+                .record(duration, success),
+            AppPerformanceOperation::AccountInitialSyncOverlap => {
+                inner.account_initial_sync_overlap.record(duration, success)
             }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
@@ -650,6 +692,7 @@ impl AppPerformanceTelemetry {
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
             account_reconcile: inner.account_reconcile.snapshot(),
             account_open: inner.account_open.snapshot(),
+            account_worker_readiness: inner.account_worker_readiness.snapshot(),
             account_session_open: inner.account_session_open.snapshot(),
             account_group_hydration: inner.account_group_hydration.snapshot(),
             account_profile_load: inner.account_profile_load.snapshot(),
@@ -659,6 +702,14 @@ impl AppPerformanceTelemetry {
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
             account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
+            account_bootstrap_relay_and_follow_publish: inner
+                .account_bootstrap_relay_and_follow_publish
+                .snapshot(),
+            account_default_profile_publish: inner.account_default_profile_publish.snapshot(),
+            account_initial_key_package_publish: inner
+                .account_initial_key_package_publish
+                .snapshot(),
+            account_initial_sync_overlap: inner.account_initial_sync_overlap.snapshot(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send: inner.outbound_message_send.snapshot(),
@@ -943,15 +994,24 @@ mod tests {
     fn records_account_open_stage_operations() {
         let telemetry = AppPerformanceTelemetry::default();
         for (operation, duration_ms) in [
+            (AppPerformanceOperation::AccountWorkerReadiness, 10),
             (AppPerformanceOperation::AccountSessionOpen, 120),
             (AppPerformanceOperation::AccountGroupHydration, 80),
             (AppPerformanceOperation::AccountProfileLoad, 15),
             (AppPerformanceOperation::AccountGroupReadSnapshot, 40),
+            (
+                AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
+                55,
+            ),
+            (AppPerformanceOperation::AccountDefaultProfilePublish, 35),
+            (AppPerformanceOperation::AccountInitialKeyPackagePublish, 25),
+            (AppPerformanceOperation::AccountInitialSyncOverlap, 0),
         ] {
             telemetry.record(operation, Duration::from_millis(duration_ms), true);
         }
 
         let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_worker_readiness.duration_ms.sum_ms, 10);
         assert_eq!(snapshot.account_session_open.successes, 1);
         assert_eq!(snapshot.account_session_open.duration_ms.sum_ms, 120);
         assert_eq!(snapshot.account_group_hydration.successes, 1);
@@ -960,6 +1020,26 @@ mod tests {
         assert_eq!(snapshot.account_profile_load.duration_ms.sum_ms, 15);
         assert_eq!(snapshot.account_group_read_snapshot.successes, 1);
         assert_eq!(snapshot.account_group_read_snapshot.duration_ms.sum_ms, 40);
+        assert_eq!(
+            snapshot
+                .account_bootstrap_relay_and_follow_publish
+                .duration_ms
+                .sum_ms,
+            55
+        );
+        assert_eq!(
+            snapshot.account_default_profile_publish.duration_ms.sum_ms,
+            35
+        );
+        assert_eq!(
+            snapshot
+                .account_initial_key_package_publish
+                .duration_ms
+                .sum_ms,
+            25
+        );
+        assert_eq!(snapshot.account_initial_sync_overlap.successes, 1);
+        assert_eq!(snapshot.account_initial_sync_overlap.duration_ms.sum_ms, 0);
     }
 
     #[test]

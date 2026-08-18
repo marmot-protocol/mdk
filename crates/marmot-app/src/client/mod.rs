@@ -520,6 +520,22 @@ impl AppClient {
             .await?;
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
+        self.publish_key_package_from_lifecycle().await
+    }
+
+    /// Publish the exact lifecycle-owned KeyPackage authorized by the durable
+    /// setup journal without installing receive subscriptions first. The
+    /// managed worker runs this only for `KeyPackagePublicationStarted`; all
+    /// general publication continues through [`Self::publish_key_package`].
+    pub(crate) async fn publish_setup_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        self.app
+            .ensure_local_account_relay_lists(&self.state.label)
+            .await?;
+        self.refresh_routing()?;
+        self.publish_key_package_from_lifecycle().await
+    }
+
+    async fn publish_key_package_from_lifecycle(&mut self) -> Result<KeyPackage, AppError> {
         let lifecycle = self.runtime.key_package_maintenance_status()?;
         if lifecycle.as_ref().is_some_and(|lifecycle| {
             lifecycle.pending_replacement.is_some() || lifecycle.current_key_package.is_none()

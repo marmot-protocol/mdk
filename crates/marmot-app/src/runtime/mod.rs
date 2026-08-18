@@ -4851,12 +4851,42 @@ impl AccountManager {
             )?;
         }
         self.shared.lifecycle().ensure_running()?;
-        let status = self
+        let publish_started_at = Instant::now();
+        let publication = match self
             .app
             .publish_generated_account_bootstrap(&account.label, bootstrap, &profile)
-            .await?;
+            .await
+        {
+            Ok(publication) => {
+                self.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
+                    publication.relay_and_follow_duration,
+                    true,
+                );
+                self.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::AccountDefaultProfilePublish,
+                    publication.default_profile_duration,
+                    true,
+                );
+                publication
+            }
+            Err(error) => {
+                let elapsed = publish_started_at.elapsed();
+                self.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
+                    elapsed,
+                    false,
+                );
+                self.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::AccountDefaultProfilePublish,
+                    elapsed,
+                    false,
+                );
+                return Err(error);
+            }
+        };
         self.mark_bootstrap_publication_confirmed(&account.label)?;
-        Ok((status, Some(profile)))
+        Ok((publication.status, Some(profile)))
     }
 
     fn setup_failure_can_roll_back(
@@ -5055,7 +5085,7 @@ impl AccountManager {
         // Publishing through the managed worker avoids the former one-shot
         // session open followed by a second worker session open. The command's
         // `worker_commands` lookup reconciles before dispatch.
-        self.publish_key_package(&account.label).await
+        self.publish_setup_key_package(&account.label).await
     }
 
     fn confirmed_setup_key_package_bytes(&self, label: &str) -> Result<Option<usize>, AppError> {

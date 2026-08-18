@@ -1397,6 +1397,19 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub(crate) async fn publish_setup_key_package(
+        &self,
+        account_ref: &str,
+    ) -> Result<usize, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PublishSetupKeyPackage { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn rotate_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();

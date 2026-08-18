@@ -78,6 +78,7 @@ pub struct AppPerformanceSnapshotFfi {
     pub directory_subscription_sync: AppPerformanceOperationSnapshotFfi,
     pub account_reconcile: AppPerformanceOperationSnapshotFfi,
     pub account_open: AppPerformanceOperationSnapshotFfi,
+    pub account_worker_readiness: AppPerformanceOperationSnapshotFfi,
     pub account_session_open: AppPerformanceOperationSnapshotFfi,
     pub account_group_hydration: AppPerformanceOperationSnapshotFfi,
     pub account_profile_load: AppPerformanceOperationSnapshotFfi,
@@ -87,6 +88,13 @@ pub struct AppPerformanceSnapshotFfi {
     pub account_catch_up: AppPerformanceOperationSnapshotFfi,
     pub account_sync: AppPerformanceOperationSnapshotFfi,
     pub account_setup_advisory_step: AppPerformanceOperationSnapshotFfi,
+    pub account_bootstrap_relay_and_follow_publish: AppPerformanceOperationSnapshotFfi,
+    pub account_default_profile_publish: AppPerformanceOperationSnapshotFfi,
+    pub account_initial_key_package_publish: AppPerformanceOperationSnapshotFfi,
+    /// Overlap between initial KeyPackage publication and initial sync. A
+    /// successful zero-duration sample means publication completed before
+    /// sync began; it is not a missing duration sample.
+    pub account_initial_sync_overlap: AppPerformanceOperationSnapshotFfi,
     /// Interrupted-migration recovery probes executed since process start.
     /// Process-wide aggregate: no account, path, or key information.
     pub sqlcipher_migration_probe_runs: u64,
@@ -136,6 +144,7 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             directory_subscription_sync,
             account_reconcile,
             account_open,
+            account_worker_readiness,
             account_session_open,
             account_group_hydration,
             account_profile_load,
@@ -145,6 +154,10 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             account_catch_up,
             account_sync,
             account_setup_advisory_step,
+            account_bootstrap_relay_and_follow_publish,
+            account_default_profile_publish,
+            account_initial_key_package_publish,
+            account_initial_sync_overlap,
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send,
@@ -183,6 +196,7 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             directory_subscription_sync: directory_subscription_sync.into(),
             account_reconcile: account_reconcile.into(),
             account_open: account_open.into(),
+            account_worker_readiness: account_worker_readiness.into(),
             account_session_open: account_session_open.into(),
             account_group_hydration: account_group_hydration.into(),
             account_profile_load: account_profile_load.into(),
@@ -192,6 +206,11 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             account_catch_up: account_catch_up.into(),
             account_sync: account_sync.into(),
             account_setup_advisory_step: account_setup_advisory_step.into(),
+            account_bootstrap_relay_and_follow_publish: account_bootstrap_relay_and_follow_publish
+                .into(),
+            account_default_profile_publish: account_default_profile_publish.into(),
+            account_initial_key_package_publish: account_initial_key_package_publish.into(),
+            account_initial_sync_overlap: account_initial_sync_overlap.into(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send: outbound_message_send.into(),
@@ -293,6 +312,11 @@ mod tests {
         assert_eq!(ffi.group_accept_invite.attempts, 0);
         assert_eq!(ffi.group_create_total_caller_latency.attempts, 0);
         assert_eq!(ffi.group_roster_read.attempts, 0);
+        assert_eq!(ffi.account_worker_readiness.attempts, 0);
+        assert_eq!(ffi.account_bootstrap_relay_and_follow_publish.attempts, 0);
+        assert_eq!(ffi.account_default_profile_publish.attempts, 0);
+        assert_eq!(ffi.account_initial_key_package_publish.attempts, 0);
+        assert_eq!(ffi.account_initial_sync_overlap.attempts, 0);
         // Process-wide counters mirror the source snapshot exactly.
         assert_eq!(
             ffi.sqlcipher_migration_probe_runs,
