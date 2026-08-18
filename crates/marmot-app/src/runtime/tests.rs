@@ -8,6 +8,121 @@ use super::subscriptions::chat_list_mute_expiries;
 use super::*;
 use crate::tests::ScriptedPushRelayClient;
 
+fn profile_relay_status(
+    publish_relays: &[&str],
+    bootstrap_relays: &[&str],
+    default_relays: &[&str],
+) -> AccountRelayListStatus {
+    AccountRelayListStatus {
+        complete: false,
+        missing: Vec::new(),
+        default_relays: default_relays
+            .iter()
+            .map(|relay| (*relay).to_owned())
+            .collect(),
+        bootstrap_relays: bootstrap_relays
+            .iter()
+            .map(|relay| (*relay).to_owned())
+            .collect(),
+        nip65: crate::AccountRelayListState {
+            kind: crate::KIND_NIP65_RELAY_LIST,
+            relays: publish_relays
+                .iter()
+                .map(|relay| (*relay).to_owned())
+                .collect(),
+            read_relays: Vec::new(),
+            write_relays: publish_relays
+                .iter()
+                .map(|relay| (*relay).to_owned())
+                .collect(),
+        },
+        inbox: crate::AccountRelayListState {
+            kind: crate::KIND_MARMOT_INBOX_RELAY_LIST,
+            relays: Vec::new(),
+            read_relays: Vec::new(),
+            write_relays: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn account_profile_publish_endpoint_selection_centralizes_fallback_and_safety() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://configured.example");
+
+    let populated = profile_relay_status(
+        &["wss://publish.example"],
+        &["wss://bootstrap.example"],
+        &["wss://default.example"],
+    );
+    assert_eq!(
+        app.account_profile_publish_endpoints(&populated).unwrap(),
+        vec![TransportEndpoint("wss://publish.example".into())]
+    );
+
+    let empty_publish = profile_relay_status(&[], &["wss://bootstrap.example"], &[]);
+    assert_eq!(
+        app.account_profile_publish_endpoints(&empty_publish)
+            .unwrap(),
+        vec![TransportEndpoint("wss://bootstrap.example".into())]
+    );
+
+    let missing_bootstrap = profile_relay_status(&[], &[], &["wss://default.example"]);
+    assert_eq!(
+        app.account_profile_publish_endpoints(&missing_bootstrap)
+            .unwrap(),
+        vec![TransportEndpoint("wss://default.example".into())]
+    );
+
+    let retired = format!("wss://{}", crate::retired_relay_hosts()[0]);
+    let unsafe_with_safe_sibling = profile_relay_status(
+        &["not-a-relay", retired.as_str(), "wss://safe.example"],
+        &["wss://bootstrap.example"],
+        &[],
+    );
+    assert_eq!(
+        app.account_profile_publish_endpoints(&unsafe_with_safe_sibling)
+            .unwrap(),
+        vec![TransportEndpoint("wss://safe.example".into())]
+    );
+
+    let unusable = profile_relay_status(&["not-a-relay", retired.as_str()], &[], &[]);
+    assert!(matches!(
+        app.account_profile_publish_endpoints(&unusable),
+        Err(AppError::RelayDirectory(message))
+            if message == "account relay configuration has no usable profile publication endpoints"
+    ));
+}
+
+#[tokio::test]
+async fn account_owned_profile_publish_rejects_signed_out_and_stopped_accounts() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    home.set_account_signed_out(&account.label, true).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app);
+
+    let signed_out = runtime
+        .publish_user_profile_using_account_relays(&account.label, UserProfileMetadata::default())
+        .await
+        .expect_err("signed-out account must not publish");
+    assert!(
+        matches!(
+            signed_out,
+            AppError::RelayDirectory(ref message) if message == "account is signed out"
+        ),
+        "unexpected signed-out error: {signed_out:?}"
+    );
+
+    runtime.shutdown().await;
+    let stopped = runtime
+        .publish_user_profile_using_account_relays(&account.label, UserProfileMetadata::default())
+        .await
+        .expect_err("stopped runtime must not publish");
+    assert!(matches!(stopped, AppError::RuntimeStopping));
+}
+
 #[test]
 fn default_directory_discovery_relays_use_live_indexers() {
     let relays = default_directory_discovery_relays();

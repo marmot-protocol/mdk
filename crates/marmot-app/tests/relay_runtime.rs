@@ -1785,13 +1785,13 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
                 ]),
                 ..UserProfileMetadata::default()
             },
-            bootstrap.clone(),
+            bootstrap,
         )
         .await
         .unwrap();
 
     let updated = runtime
-        .publish_user_profile(
+        .publish_user_profile_using_account_relays(
             &created.account.label,
             UserProfileMetadata {
                 name: Some("second".to_owned()),
@@ -1799,7 +1799,6 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
                 banner: Some("https://example.test/banner.png".to_owned()),
                 ..UserProfileMetadata::default()
             },
-            bootstrap,
         )
         .await
         .unwrap();
@@ -7963,6 +7962,71 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
         Some("OutboxTest"),
         "profile should be retrievable from the account's nip65 (home) relay"
     );
+}
+
+#[tokio::test]
+async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_alice_relay, alice_relay_url) = mock_relay().await;
+    let (_bob_relay, bob_relay_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        alice_relay_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let alice = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&alice_relay_url)],
+            bootstrap_relays: vec![endpoint(&alice_relay_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&bob_relay_url)],
+            bootstrap_relays: vec![endpoint(&bob_relay_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    runtime
+        .publish_user_profile_using_account_relays(
+            &alice.account.account_id_hex,
+            UserProfileMetadata {
+                name: Some("AliceAccountOwned".to_owned()),
+                ..UserProfileMetadata::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let from_alice_relay = app
+        .fetch_current_user_profile_for_account_id(
+            &alice.account.account_id_hex,
+            vec![endpoint(&alice_relay_url)],
+        )
+        .await
+        .unwrap()
+        .and_then(|profile| profile.name);
+    assert_eq!(from_alice_relay.as_deref(), Some("AliceAccountOwned"));
+
+    let from_bob_relay = app
+        .fetch_current_user_profile_for_account_id(
+            &alice.account.account_id_hex,
+            vec![endpoint(&bob_relay_url)],
+        )
+        .await
+        .unwrap()
+        .and_then(|profile| profile.name);
+    assert_ne!(from_bob_relay.as_deref(), Some("AliceAccountOwned"));
+
+    assert_ne!(alice.account.account_id_hex, bob.account.account_id_hex);
 }
 
 #[tokio::test]
