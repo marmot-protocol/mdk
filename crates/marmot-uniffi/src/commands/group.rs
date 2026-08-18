@@ -30,6 +30,25 @@ pub struct InitialGroupImageFfi {
     pub thumbhash: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MemberKeyPackagePrewarmSummaryFfi {
+    pub requested_members: u64,
+    pub unique_members: u64,
+    pub reused_members: u64,
+    pub network_resolved_members: u64,
+}
+
+impl From<marmot_app::MemberKeyPackagePrewarmSummary> for MemberKeyPackagePrewarmSummaryFfi {
+    fn from(value: marmot_app::MemberKeyPackagePrewarmSummary) -> Self {
+        Self {
+            requested_members: value.requested_members,
+            unique_members: value.unique_members,
+            reused_members: value.reused_members,
+            network_resolved_members: value.network_resolved_members,
+        }
+    }
+}
+
 impl std::fmt::Debug for InitialGroupImageFfi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InitialGroupImageFfi")
@@ -244,6 +263,21 @@ impl Marmot {
     // -----------------------------------------------------------------------
     // Groups
     // -----------------------------------------------------------------------
+
+    /// Resolve the current composition roster before Create is tapped. The
+    /// result is aggregate-only; no package is reserved or consumed, and the
+    /// later create call revalidates cached packages before MLS mutation.
+    pub async fn prewarm_group_member_key_packages(
+        &self,
+        account_ref: String,
+        member_refs: Vec<String>,
+    ) -> Result<MemberKeyPackagePrewarmSummaryFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .prewarm_group_member_key_packages(&account_ref, &member_refs)
+            .await?
+            .into())
+    }
 
     /// Create a new MLS group with `name` and the given members. Members are
     /// referenced by `npub` or hex account id. Returns the locally canonical

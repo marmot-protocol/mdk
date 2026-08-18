@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-07-26
+updated: 2026-08-18
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -142,7 +142,9 @@ variants.
   still need production wiring.
 - **App-core hardening** — `marmot-app` and `wn` now exercise real account setup, key storage, relay-list repair,
   KeyPackage publication/fetch, directory cache, group membership, group profile projection, message projection, local
-  archive state, and sync. The next hardening pass should keep app policy in `marmot-app`/`marmot-account` and keep
+  archive state, and sync. Group composition now resolves canonical deduplicated member sets through bounded
+  multi-author relay batches, with a non-reserving process-local prewarm path and final mutation-boundary revalidation.
+  The next hardening pass should keep app policy in `marmot-app`/`marmot-account` and keep
   `wn` focused on command presentation and stable JSON output. The current boundary is summarized in
   [`app-core-boundary.md`](./app-core-boundary.md).
 - **Production transport adapters** — `transport-nostr-adapter` now implements the Nostr adapter core over an injectable

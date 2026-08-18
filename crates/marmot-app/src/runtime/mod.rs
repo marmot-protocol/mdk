@@ -1288,6 +1288,16 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn prewarm_group_member_key_packages(
+        &self,
+        account_ref: &str,
+        members: &[String],
+    ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
+        self.accounts
+            .prewarm_group_member_key_packages(account_ref, members)
+            .await
+    }
+
     pub async fn create_group_with_initial_image(
         &self,
         account_ref: &str,

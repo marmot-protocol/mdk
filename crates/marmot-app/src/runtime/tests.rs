@@ -1622,6 +1622,26 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
 }
 
 #[tokio::test]
+async fn member_key_package_prewarm_refuses_work_after_shutdown_begins() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("alice")
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(
+        directory.path(),
+        "wss://relay.example",
+    ));
+    runtime.shared.lifecycle().begin_shutdown();
+
+    assert!(matches!(
+        runtime
+            .prewarm_group_member_key_packages(&account.label, &[])
+            .await,
+        Err(AppError::RuntimeStopping)
+    ));
+}
+
+#[tokio::test]
 async fn lifecycle_waits_for_account_opens_to_drain() {
     let lifecycle = RuntimeLifecycle::new();
     let permit = lifecycle

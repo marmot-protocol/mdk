@@ -20,6 +20,7 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
+#[cfg(test)]
 use futures::StreamExt;
 use marmot_account::{
     CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
@@ -67,7 +68,9 @@ use push::notification_trigger_for_intent;
 pub(crate) use sync::is_own_relay_echo;
 pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 
+#[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+#[cfg(test)]
 const INVITE_LOOKUP_CONCURRENCY: usize = CREATE_GROUP_LOOKUP_CONCURRENCY;
 
 pub(crate) enum UnpublishedWelcomeKind {
@@ -191,6 +194,7 @@ impl GroupImageDownloadHttp {
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. All started work finishes before deterministic error selection,
 /// so completion timing cannot change which member error the caller observes.
+#[cfg(test)]
 async fn collect_bounded_ordered<I, F, T, E>(work: I, limit: usize) -> Result<Vec<T>, E>
 where
     I: IntoIterator<Item = F>,
@@ -810,6 +814,18 @@ impl AppClient {
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
+    /// Resolve and cache the current composition roster without reserving or
+    /// consuming any KeyPackage. Group creation revalidates the cached bytes
+    /// and the MLS mutation boundary retains its ordinary validation.
+    pub async fn prewarm_group_member_key_packages(
+        &self,
+        member_refs: &[&str],
+    ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
+        self.app
+            .prewarm_group_member_key_packages(member_refs)
+            .await
+    }
+
     /// Create a locally canonical group and attempt each founding Welcome.
     ///
     /// `Ok(group_id)` reports group creation, not blanket invitation success.
@@ -885,22 +901,34 @@ impl AppClient {
     ) -> Result<GroupId, AppError> {
         validate_group_profile(name, description)?;
         let key_package_started_at = Instant::now();
-        let lookups = member_refs
-            .iter()
-            .map(|member| {
-                let app = self.app.clone();
-                let member = (*member).to_owned();
-                async move { app.member_key_package(&member).await }
-            })
-            .collect::<Vec<_>>();
-        let key_packages = collect_bounded_ordered(lookups, CREATE_GROUP_LOOKUP_CONCURRENCY).await;
+        let key_packages = self
+            .app
+            .resolve_member_key_packages_with_stats(
+                member_refs
+                    .iter()
+                    .map(|member_ref| (*member_ref).to_owned())
+                    .collect(),
+            )
+            .await;
+        let key_package_elapsed = key_package_started_at.elapsed();
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupCreateKeyPackageLookup,
-            key_package_started_at.elapsed(),
+            key_package_elapsed,
             key_packages.is_ok(),
         );
-        let members = key_packages?;
+        let resolved = key_packages?;
+        record_app_performance(
+            telemetry,
+            if resolved.stats.network_resolved_members == 0 {
+                AppPerformanceOperation::GroupCreateKeyPackageCacheReuse
+            } else {
+                AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution
+            },
+            key_package_elapsed,
+            true,
+        );
+        let members = resolved.key_packages;
         self.refresh_routing()?;
         let nostr_routing = self.app.new_nostr_routing()?;
         let nostr_routing_bytes =
@@ -980,7 +1008,7 @@ impl AppClient {
             "create_group",
             changed_fields,
             touched_components,
-            Some(member_refs.len() as u64),
+            Some(members.len() as u64),
         );
 
         let mls_started_at = Instant::now();
@@ -1442,15 +1470,7 @@ impl AppClient {
         self.ensure_group(group_id)?;
 
         let key_package_started_at = Instant::now();
-        let lookups = member_refs
-            .iter()
-            .map(|member| {
-                let app = self.app.clone();
-                let member = (*member).to_owned();
-                async move { app.member_key_package(&member).await }
-            })
-            .collect::<Vec<_>>();
-        let key_packages = collect_bounded_ordered(lookups, INVITE_LOOKUP_CONCURRENCY).await;
+        let key_packages = self.app.resolve_member_key_packages(member_refs).await;
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,
@@ -1484,7 +1504,7 @@ impl AppClient {
             "invite_members",
             affected_fields,
             affected_components,
-            Some(member_refs.len() as u64),
+            Some(key_packages.len() as u64),
         );
 
         let pre_send_sync_started_at = Instant::now();

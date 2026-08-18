@@ -42,7 +42,9 @@ pub use markdown::{
 
 uniffi::setup_scaffolding!();
 
-pub use commands::{InitialGroupImageFfi, parse_media_imeta_tag};
+pub use commands::{
+    InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi, parse_media_imeta_tag,
+};
 pub use conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,
     AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi, AuditDataModeFfi,
