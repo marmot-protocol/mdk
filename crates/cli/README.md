@@ -658,7 +658,8 @@ key. Because the help card is a popup, `q` under it closes the card instead of q
 
 Group detail (`g` from the chat list) shows the selected group's members with admin badges (and a `(you)` marker),
 its relay hints, and its name and description; `Esc` returns to the main view. Its keys: `j`/`k` move the member
-selection (the pane scrolls to keep the highlighted member on screen); `a` searches for someone to add (see user
+selection (the pane scrolls to keep the highlighted member on screen, and moving to the last member scrolls to the
+end of the pane so the relay hints below the list come into view); `a` searches for someone to add (see user
 search below) for when you do not have their pubkey to hand; `A` adds a member by npub/hex (text popup →
 `groups add-members`); `x` removes the selected member
 (confirm → `groups remove-members`); `P` promotes the selected member to admin (confirm → `groups promote`); `R`
@@ -693,6 +694,23 @@ Opened from group detail with `a`, the same screen is aimed at that group: the h
 skips the chat picker and confirms straight against that group, and `Esc` returns to the group detail rather than the
 main view. After the add lands, the group detail reopens and reloads, so the new member shows in the list you started
 from.
+
+Message search (`/search [query]`) searches the chat loaded in the messages pane
+(`messages timeline search --group <group>`, capped at 100 hits — a full page reports its count as `100+` and
+says to refine the query, since the screen is a scan-and-pick list with no paging). It follows the loaded pane rather than the
+highlighted chat row, because the two can differ while a flick-through preview is pending and a hit is only useful
+if it can be jumped to. The screen has the same two regions and two-state focus as user search: type the query
+(`j`/`k` are literal text) and `Enter` runs it; once there are matches, focus moves to the list where `j`/`k` (or
+arrows) navigate, `i` returns to the query, and `Esc` returns to the main view. Matches are listed newest first,
+two lines each — `[HH:MM] sender`, then the message text — styled like the messages pane so a match reads as the
+message it points at.
+
+`Enter` on a match jumps the messages pane to that message and focuses it. This works for messages inside the
+loaded history: the pane holds one contiguous run of messages ending at the newest, extended backwards a page at a
+time (100 per page, up to 1000 rows), with no way to represent a gap. A match older than that run reports
+`that message is older than the loaded history; press g to page back first` and leaves the view where it is,
+rather than splicing in a disconnected window that would render as continuous while silently skipping everything
+between. Page back with `g`/PageUp and search again to reach it.
 
 Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no
 avatar is fetched), nip05, lud16, and npub — from `profile show`, plus your follows from `follows list`. `j`/`k` move a
@@ -748,6 +766,7 @@ Composer slash commands:
 /name <display-name>
 /profile name <display-name>
 /users [query]
+/search [query]
 /stream [--stream-id <hex>] [--quic-candidate <quic-url>]
 /stream start [--stream-id <hex>] --quic-candidate <quic-url>
 /stream watch [--stream-id <hex>] [--insecure-local]

@@ -76,6 +76,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   repair.
   ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
 
+- `wn tui` can now search messages in the open chat with `/search [query]`
+  (`messages timeline search`), the one thing the CLI could do that the TUI could
+  not reach at all. Matches list newest first with sender, time, and text; `Enter`
+  jumps the messages pane to the highlighted match and focuses it. Matches are
+  capped at 100; a full page is reported as `100+` and asks you to refine the
+  query rather than presenting a truncated count as the total. Matches older
+  than the loaded history say so instead of moving the view, because the pane
+  holds one contiguous run of messages and cannot represent a gap — page back with
+  `g` and search again to reach them.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
+
 ### Changed
 
 - Account databases upgrade through storage migrations 47–50. Migration 47
@@ -159,6 +170,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   at all, leaving timelines and chat lists showing pending until some unrelated
   event woke them.
   ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
+
+- `wn tui` user search no longer leaves results under a query they do not answer.
+  Editing the query after results landed used to keep the old rows, their count,
+  and the highlight on screen, so `f`/`x` published a follow for whoever the
+  previous query had found and `c`/`a` opened a chat with them. An edit now clears
+  the results, and a page still in flight for the abandoned query is dropped
+  instead of landing — and taking focus mid-word with it. Moving the cursor, and
+  editing that changes nothing, still keep the results.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
+
+- `wn tui` group detail can now reach its relay hints. They sit below the member
+  list, so a group with more members than the pane is tall left them permanently
+  off-screen; moving the selection to the last member now scrolls to the end of
+  the pane and brings them into view with it.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
 
 ## [0.9.12] - 2026-08-13
 
