@@ -414,7 +414,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Tamarin dependencies
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -465,7 +465,7 @@ jobs:
           persist-credentials: false
 
       - name: Install system dependencies
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           venv_check_dir="${RUNNER_TEMP}/hermes-venv-check"
