@@ -126,6 +126,12 @@ pub mod metric_names {
     pub const APP_ACCOUNT_OPEN_SUCCESSES: &str = "app_account_open_successes";
     /// Failed account opens.
     pub const APP_ACCOUNT_OPEN_FAILURES: &str = "app_account_open_failures";
+    pub const APP_ACCOUNT_WORKER_READINESS_DURATION: &str =
+        "app_account_worker_readiness_duration_ms";
+    pub const APP_ACCOUNT_WORKER_READINESS_ATTEMPTS: &str = "app_account_worker_readiness_attempts";
+    pub const APP_ACCOUNT_WORKER_READINESS_SUCCESSES: &str =
+        "app_account_worker_readiness_successes";
+    pub const APP_ACCOUNT_WORKER_READINESS_FAILURES: &str = "app_account_worker_readiness_failures";
     /// Engine session open (storage + engine build + hydration) duration histogram.
     pub const APP_ACCOUNT_SESSION_OPEN_DURATION: &str = "app_account_session_open_duration_ms";
     pub const APP_ACCOUNT_SESSION_OPEN_ATTEMPTS: &str = "app_account_session_open_attempts";
@@ -191,6 +197,38 @@ pub mod metric_names {
         "app_account_setup_advisory_step_successes";
     pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES: &str =
         "app_account_setup_advisory_step_failures";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_DURATION: &str =
+        "app_account_bootstrap_relay_and_follow_publish_duration_ms";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_ATTEMPTS: &str =
+        "app_account_bootstrap_relay_and_follow_publish_attempts";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_SUCCESSES: &str =
+        "app_account_bootstrap_relay_and_follow_publish_successes";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_FAILURES: &str =
+        "app_account_bootstrap_relay_and_follow_publish_failures";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_DURATION: &str =
+        "app_account_default_profile_publish_duration_ms";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_ATTEMPTS: &str =
+        "app_account_default_profile_publish_attempts";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_SUCCESSES: &str =
+        "app_account_default_profile_publish_successes";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_FAILURES: &str =
+        "app_account_default_profile_publish_failures";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_DURATION: &str =
+        "app_account_initial_key_package_publish_duration_ms";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_ATTEMPTS: &str =
+        "app_account_initial_key_package_publish_attempts";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_SUCCESSES: &str =
+        "app_account_initial_key_package_publish_successes";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_FAILURES: &str =
+        "app_account_initial_key_package_publish_failures";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_DURATION: &str =
+        "app_account_initial_sync_overlap_duration_ms";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_ATTEMPTS: &str =
+        "app_account_initial_sync_overlap_attempts";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_SUCCESSES: &str =
+        "app_account_initial_sync_overlap_successes";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_FAILURES: &str =
+        "app_account_initial_sync_overlap_failures";
     /// Interrupted-migration recovery probes executed (each is one full keyed
     /// SQLCipher open paying the passphrase KDF, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_RUNS: &str = "app_sqlcipher_migration_probe_runs";
@@ -786,6 +824,14 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.account_worker_readiness,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_DURATION,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_ATTEMPTS,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_SUCCESSES,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.account_session_open,
         metric_names::APP_ACCOUNT_SESSION_OPEN_DURATION,
         metric_names::APP_ACCOUNT_SESSION_OPEN_ATTEMPTS,
@@ -855,6 +901,38 @@ fn append_app_performance_points(
         metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_ATTEMPTS,
         metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_SUCCESSES,
         metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_bootstrap_relay_and_follow_publish,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_DURATION,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_ATTEMPTS,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_SUCCESSES,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_default_profile_publish,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_DURATION,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_ATTEMPTS,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_SUCCESSES,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_initial_key_package_publish,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_DURATION,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_ATTEMPTS,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_SUCCESSES,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_initial_sync_overlap,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_DURATION,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_ATTEMPTS,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_SUCCESSES,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_FAILURES,
     );
     append_app_operation_points(
         points,

@@ -2919,7 +2919,7 @@ async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ac
         ..UserProfileMetadata::default()
     };
 
-    let status = app
+    let publication = app
         .publish_generated_account_bootstrap(
             &account.label,
             AccountRelayListBootstrap::new(
@@ -2930,6 +2930,7 @@ async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ac
         )
         .await
         .expect("acknowledged bootstrap must not depend on a relay refetch");
+    let status = publication.status;
 
     assert!(status.complete);
     assert_eq!(
@@ -2958,6 +2959,102 @@ async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ac
         app.account_relay_list_status(&account.label).unwrap(),
         status,
         "the acknowledged declaration must be the durable local projection"
+    );
+}
+
+#[tokio::test]
+async fn generated_account_setup_records_distinct_network_ready_phases() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app);
+
+    runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let telemetry = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(telemetry.account_worker_readiness.successes, 1);
+    assert_eq!(
+        telemetry
+            .account_bootstrap_relay_and_follow_publish
+            .successes,
+        1
+    );
+    assert_eq!(telemetry.account_default_profile_publish.successes, 1);
+    assert_eq!(telemetry.account_initial_key_package_publish.successes, 1);
+    assert_eq!(telemetry.account_initial_sync_overlap.successes, 1);
+    assert_eq!(
+        telemetry.account_initial_sync_overlap.duration_ms.sum_ms, 0,
+        "the setup-priority publication must finish before initial sync starts"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_setup_key_package_publishes_before_stalled_initial_sync_finishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    app.publish_generated_account_bootstrap(
+        &account.label,
+        AccountRelayListBootstrap::new(
+            vec![TransportEndpoint("wss://relay.example".into())],
+            vec![TransportEndpoint("wss://relay.example".into())],
+        ),
+        &UserProfileMetadata::default(),
+    )
+    .await
+    .unwrap();
+    home.set_account_setup_phase(
+        &account.label,
+        marmot_account::AccountSetupPhase::KeyPackagePublicationStarted,
+    )
+    .unwrap();
+    relay.block_account_inbox_subscribe(hex::decode(&account.account_id_hex).unwrap());
+    let runtime = MarmotAppRuntime::new(app);
+
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_subscribe())
+        .await
+        .expect("initial sync must reach the injected stalled subscription");
+    let key_package_published_before_sync = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == KIND_MARMOT_KEY_PACKAGE);
+    let setup_finished_before_sync = tokio::time::timeout(
+        Duration::from_millis(250),
+        runtime.accounts().publish_setup_key_package(&account.label),
+    )
+    .await
+    .expect("setup publication result must bypass stalled initial sync")
+    .is_ok();
+
+    relay.release_subscribe();
+    runtime.shutdown().await;
+
+    assert!(
+        key_package_published_before_sync,
+        "the journaled initial KeyPackage must publish before unrelated initial sync completes"
+    );
+    assert!(
+        setup_finished_before_sync,
+        "setup must receive the priority publication result without waiting for initial sync"
     );
 }
 

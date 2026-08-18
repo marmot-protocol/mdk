@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_traits::MessageId;
@@ -312,6 +312,16 @@ pub struct NostrEventPublishRequest {
     pub required_acks: usize,
 }
 
+/// Ordered outcomes and per-request completion latencies for one publish
+/// batch. Durations are local monotonic values measured from the start of the
+/// shared batch, so callers can compare fixed publication phases without
+/// adding relay-, account-, event-, or caller-defined labels.
+#[derive(Debug)]
+pub struct NostrPublishBatch {
+    pub outcomes: Vec<Result<NostrPublishOutcome, TransportAdapterError>>,
+    pub request_durations: Vec<Duration>,
+}
+
 /// Relay event as observed by the Nostr relay client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrRelayEvent {
@@ -358,6 +368,22 @@ pub trait NostrRelayClient: Send + Sync {
             );
         }
         outcomes
+    }
+
+    /// Publish an ordered batch and expose bounded per-request completion
+    /// timings. Injected clients inherit a conservative whole-batch duration;
+    /// socket implementations may override this with precise request timings.
+    async fn publish_events_with_timings(
+        &self,
+        requests: &[NostrEventPublishRequest],
+    ) -> NostrPublishBatch {
+        let started_at = Instant::now();
+        let outcomes = self.publish_events(requests).await;
+        let elapsed = started_at.elapsed();
+        NostrPublishBatch {
+            request_durations: vec![elapsed; outcomes.len()],
+            outcomes,
+        }
     }
 }
 

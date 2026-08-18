@@ -577,6 +577,12 @@ pub struct AccountRelayListStatus {
     pub inbox: AccountRelayListState,
 }
 
+pub(crate) struct GeneratedAccountBootstrapPublication {
+    pub status: AccountRelayListStatus,
+    pub relay_and_follow_duration: Duration,
+    pub default_profile_duration: Duration,
+}
+
 /// A relay list the account is missing. Typed so FFI clients can localize
 /// each kind without parsing protocol-jargon strings (mdk#565).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1693,7 +1699,7 @@ impl MarmotApp {
         label: &str,
         bootstrap: AccountRelayListBootstrap,
         profile: &UserProfileMetadata,
-    ) -> Result<AccountRelayListStatus, AppError> {
+    ) -> Result<GeneratedAccountBootstrapPublication, AppError> {
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
         }
@@ -1758,7 +1764,8 @@ impl MarmotApp {
             "contact list",
             "profile metadata",
         ];
-        let outcomes = relay_client.publish_events(&requests).await;
+        let batch = relay_client.publish_events_with_timings(&requests).await;
+        let outcomes = batch.outcomes;
         if outcomes.len() != record_kinds.len() {
             return Err(AppError::Publish(format!(
                 "account bootstrap returned {} outcomes for {} records",
@@ -1766,6 +1773,19 @@ impl MarmotApp {
                 record_kinds.len()
             )));
         }
+        if batch.request_durations.len() != record_kinds.len() {
+            return Err(AppError::Publish(format!(
+                "account bootstrap returned {} timings for {} records",
+                batch.request_durations.len(),
+                record_kinds.len()
+            )));
+        }
+        let relay_and_follow_duration = batch.request_durations[..3]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        let default_profile_duration = batch.request_durations[3];
         for (record_kind, outcome) in record_kinds.into_iter().zip(outcomes) {
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(format!(
@@ -1813,7 +1833,11 @@ impl MarmotApp {
             },
         )?;
         self.remember_directory_profile(&account.account_id_hex, profile)?;
-        Ok(status)
+        Ok(GeneratedAccountBootstrapPublication {
+            status,
+            relay_and_follow_duration,
+            default_profile_duration,
+        })
     }
 
     pub async fn publish_missing_account_relay_lists(

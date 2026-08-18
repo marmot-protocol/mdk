@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
+use marmot_account::AccountSetupPhase;
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -307,6 +308,12 @@ pub(crate) enum AccountWorkerCommand {
     PublishKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    /// Complete the exact KeyPackage publication authorized by the durable
+    /// account-setup journal. This is deliberately distinct from the general
+    /// publication command so no other mutation can enter the startup lane.
+    PublishSetupKeyPackage {
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
     RotateKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
@@ -450,6 +457,7 @@ async fn run_app_runtime_account_worker(
     ready: oneshot::Sender<Result<(), AppError>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let worker_started_at = Instant::now();
     let mut ready = Some(ready);
     let AccountWorkerRuntime {
         app,
@@ -535,8 +543,43 @@ async fn run_app_runtime_account_worker(
         );
     }
     if let Some(ready) = ready.take() {
+        shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AccountWorkerReadiness,
+            worker_started_at.elapsed(),
+            true,
+        );
         let _ = ready.send(Ok(()));
     }
+
+    // The durable setup journal records publication intent before the worker
+    // is reconciled. That marker authorizes exactly one narrow startup action:
+    // publish (or retry) the lifecycle-owned exact KeyPackage before unrelated
+    // hydration and initial catch-up. General mutations, including the public
+    // PublishKeyPackage command, remain on the ordinary startup FIFO.
+    let mut setup_key_package_result = match app.account_home().account_setup_state(&account_label)
+    {
+        Ok(Some(state)) if state.phase == AccountSetupPhase::KeyPackagePublicationStarted => {
+            let started_at = Instant::now();
+            let result = async {
+                let key_package = client.publish_setup_key_package().await?;
+                Ok(key_package.bytes().len())
+            }
+            .await;
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountInitialKeyPackagePublish,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountInitialSyncOverlap,
+                Duration::ZERO,
+                result.is_ok(),
+            );
+            Some(result)
+        }
+        Ok(_) => None,
+        Err(error) => Some(Err(error.into())),
+    };
 
     // Background hydration pipeline (mdk#1161): the deferred open above only
     // seeded stored groups, so fully hydrate them now — chat-list recency
@@ -555,6 +598,7 @@ async fn run_app_runtime_account_worker(
         &account_id_hex,
         &account_label,
         &shared,
+        &mut setup_key_package_result,
         &mut shutdown,
         &lifecycle,
     )
@@ -695,6 +739,16 @@ async fn run_app_runtime_account_worker(
                             // than starting a second sync; fulfilled in arrival
                             // order below when it completes.
                             deferred.push(DeferredStartupCommand::CatchUp(respond));
+                        }
+                        Some(AccountWorkerCommand::PublishSetupKeyPackage { respond }) => {
+                            match setup_key_package_result.take() {
+                                Some(result) => {
+                                    let _ = respond.send(result);
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                                ))),
+                            }
                         }
                         Some(other) => {
                             deferred.push(DeferredStartupCommand::Command(Box::new(other)))
@@ -1829,6 +1883,7 @@ async fn run_startup_hydration_pipeline(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
+    setup_key_package_result: &mut Option<Result<usize, AppError>>,
     shutdown: &mut oneshot::Receiver<()>,
     lifecycle: &RuntimeLifecycle,
 ) -> StartupHydrationOutcome {
@@ -1875,6 +1930,7 @@ async fn run_startup_hydration_pipeline(
                                 events,
                                 account_id_hex,
                                 account_label,
+                                setup_key_package_result,
                             )
                             .await;
                         }
@@ -1895,6 +1951,7 @@ async fn run_startup_hydration_pipeline(
                         events,
                         account_id_hex,
                         account_label,
+                        setup_key_package_result,
                     )
                     .await;
                 }
@@ -1989,6 +2046,7 @@ async fn handle_startup_hydration_command(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
+    setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
         AccountWorkerCommand::Members { group_id, respond } => {
@@ -2043,6 +2101,16 @@ async fn handle_startup_hydration_command(
         }
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
+        }
+        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
+            match setup_key_package_result.take() {
+                Some(result) => {
+                    let _ = respond.send(result);
+                }
+                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                ))),
+            }
         }
         other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
     }
@@ -3283,6 +3351,20 @@ async fn handle_account_worker_command(
                 Ok(key_package.bytes().len())
             }
             .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
+            let started_at = Instant::now();
+            let result = async {
+                let key_package = client.publish_setup_key_package().await?;
+                Ok(key_package.bytes().len())
+            }
+            .await;
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountInitialKeyPackagePublish,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
             let _ = respond.send(result);
         }
         AccountWorkerCommand::RotateKeyPackage { respond } => {
