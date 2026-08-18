@@ -8,13 +8,31 @@ use marmot_app::{
     AppGroupHydrationQuarantineReason, AppGroupLifecycleState, AppGroupMemberIds,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
-    AppQuarantinedGroup, GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
+    AppQuarantinedGroup, CreatedGroup, GroupInviteDeclineResult, account_id_hex_from_ref,
+    npub_for_account_id,
 };
 
 use super::account::SendSummaryFfi;
+use super::chat_list::ChatListRowFfi;
 use super::common::SelfMembershipFfi;
 use super::media::EncryptedMediaVersionFfi;
 use crate::errors::MarmotKitError;
+
+/// Canonical create result carrying the exact durable chat-list projection.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct CreatedGroupFfi {
+    pub group_id_hex: String,
+    pub chat_list_row: ChatListRowFfi,
+}
+
+impl From<CreatedGroup> for CreatedGroupFfi {
+    fn from(value: CreatedGroup) -> Self {
+        Self {
+            group_id_hex: hex::encode(value.group_id.as_slice()),
+            chat_list_row: value.chat_list_row.into(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppGroupRecordFfi {

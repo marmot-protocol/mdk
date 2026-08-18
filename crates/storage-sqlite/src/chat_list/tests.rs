@@ -142,6 +142,187 @@ fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
 }
 
 #[test]
+fn created_group_projection_and_chat_list_row_commit_atomically() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_created_chat_list_row
+             BEFORE INSERT ON chat_list_rows
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected created row failure');
+             END;",
+        )
+        .unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        groups: vec![group()],
+        ..StoredAccountState::default()
+    };
+
+    store
+        .save_account_projection_delta_and_refresh_chat_list_row(
+            &state,
+            256,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+            LOCAL,
+            GROUP,
+            &no_mentions,
+        )
+        .expect_err("the injected chat-list failure must roll back the projection delta");
+    assert!(
+        store
+            .load_account_projection_state("alice", 256)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "a crash/failure at the remaining app write boundary must expose neither half"
+    );
+
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_created_chat_list_row")
+        .unwrap();
+    let committed = store
+        .save_account_projection_delta_and_refresh_chat_list_row(
+            &state,
+            256,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+            LOCAL,
+            GROUP,
+            &no_mentions,
+        )
+        .unwrap()
+        .expect("created chat-list row");
+    assert_eq!(store.chat_list_row(GROUP).unwrap(), Some(committed));
+}
+
+/// Operational mdk#1487 benchmark for the post-canonical app-local tail.
+///
+/// Run with an optimized build so the recorded distribution reflects
+/// production-shaped encrypted file-backed storage rather than debug code:
+///
+/// `cargo test -p storage-sqlite file_backed_create_group_tail_benchmark_matrix --release -- --ignored --nocapture`
+#[test]
+#[ignore = "operational file-backed SQLCipher benchmark"]
+fn file_backed_create_group_tail_benchmark_matrix() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let samples = std::env::var("MDK_CREATE_TAIL_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .max(20);
+
+    for invitees in [1_usize, 8, 32] {
+        let baseline = measure_create_tail(samples, invitees, true, false);
+        let baseline_with_read = measure_create_tail(samples, invitees, true, true);
+        let optimized = measure_create_tail(samples, invitees, false, false);
+        tracing::info!(
+            target: "storage_sqlite::chat_list",
+            method = "file_backed_create_group_tail_benchmark_matrix",
+            invitees,
+            samples,
+            baseline_p50_us = percentile_micros(&baseline, 50),
+            baseline_p95_us = percentile_micros(&baseline, 95),
+            baseline_with_row_read_p50_us = percentile_micros(&baseline_with_read, 50),
+            baseline_with_row_read_p95_us = percentile_micros(&baseline_with_read, 95),
+            optimized_p50_us = percentile_micros(&optimized, 50),
+            optimized_p95_us = percentile_micros(&optimized, 95),
+            "measured file-backed create-group local tail"
+        );
+    }
+}
+
+fn measure_create_tail(
+    samples: usize,
+    invitees: usize,
+    baseline: bool,
+    include_row_read: bool,
+) -> Vec<u128> {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new(format!(
+        "create-tail-benchmark-{invitees}-{baseline}-{include_row_read}"
+    ))
+    .unwrap();
+    let store =
+        SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key).unwrap();
+    let mut durations = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let group_id_hex = format!("{invitees:02x}{sample:062x}");
+        let mut created_group = group();
+        created_group.group_id_hex = group_id_hex.clone();
+        created_group.member_count = Some((invitees + 1) as u64);
+        created_group.profile_name = format!("benchmark-{invitees}-{sample}");
+        let state = StoredAccountState {
+            label: "benchmark".to_owned(),
+            groups: vec![created_group],
+            ..StoredAccountState::default()
+        };
+        let pending = (0..invitees)
+            .map(|recipient| crate::PendingWelcomeDeliveryRecord {
+                message_id_hex: format!("{sample:056x}{recipient:08x}"),
+                group_id_hex: group_id_hex.clone(),
+                recipient_hex: format!("{recipient:064x}"),
+                recorded_at: sample as u64,
+            })
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        if baseline {
+            store.record_pending_welcome_deliveries(&pending).unwrap();
+            store
+                .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                    &state,
+                    256,
+                    MAX_FUTURE_SKEW_SECS,
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            if include_row_read {
+                std::hint::black_box(
+                    store
+                        .refresh_chat_list_row(LOCAL, &group_id_hex, &no_mentions)
+                        .unwrap()
+                        .expect("legacy read-after-create row"),
+                );
+            }
+        } else {
+            std::hint::black_box(
+                store
+                    .save_account_projection_delta_and_refresh_chat_list_row(
+                        &state,
+                        256,
+                        MAX_FUTURE_SKEW_SECS,
+                        &[],
+                        &[],
+                        LOCAL,
+                        &group_id_hex,
+                        &no_mentions,
+                    )
+                    .unwrap()
+                    .expect("created chat-list row"),
+            );
+        }
+        durations.push(started.elapsed().as_micros());
+    }
+    durations
+}
+
+fn percentile_micros(samples: &[u128], percentile: usize) -> u128 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[index]
+}
+
+#[test]
 fn manual_unread_is_independent_durable_and_cleared_by_mark_read() {
     let store = setup_store();
     store

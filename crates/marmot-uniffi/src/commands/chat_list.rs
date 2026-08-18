@@ -249,6 +249,54 @@ mod tests {
         }
     }
 
+    fn assert_created_chat_list_rows_equal(left: &ChatListRowFfi, right: &ChatListRowFfi) {
+        assert_eq!(left.group_id_hex, right.group_id_hex);
+        assert_eq!(left.pinned, right.pinned);
+        assert_eq!(left.pinned_position, right.pinned_position);
+        assert_eq!(left.archived, right.archived);
+        assert_eq!(left.pending_confirmation, right.pending_confirmation);
+        assert_eq!(
+            std::mem::discriminant(&left.lifecycle_state),
+            std::mem::discriminant(&right.lifecycle_state)
+        );
+        assert_eq!(left.disbanding, right.disbanding);
+        assert!(left.disband_request.is_none() && right.disband_request.is_none());
+        assert_eq!(left.title, right.title);
+        assert_eq!(left.group_name, right.group_name);
+        assert_eq!(left.avatar_url, right.avatar_url);
+        assert!(left.avatar.is_none() && right.avatar.is_none());
+        assert!(left.last_message.is_none() && right.last_message.is_none());
+        assert_eq!(left.unread_count, right.unread_count);
+        assert_eq!(left.has_unread, right.has_unread);
+        assert_eq!(left.manually_marked_unread, right.manually_marked_unread);
+        assert_eq!(left.unread_mention_count, right.unread_mention_count);
+        assert_eq!(left.unread_mention, right.unread_mention);
+        assert_eq!(
+            left.first_unread_message_id_hex,
+            right.first_unread_message_id_hex
+        );
+        assert_eq!(
+            left.last_read_message_id_hex,
+            right.last_read_message_id_hex
+        );
+        assert_eq!(left.last_read_timeline_at, right.last_read_timeline_at);
+        assert_eq!(left.conversation_created_at, right.conversation_created_at);
+        assert_eq!(left.activity_sort_at, right.activity_sort_at);
+        assert_eq!(left.updated_at, right.updated_at);
+        assert_eq!(
+            std::mem::discriminant(&left.self_membership),
+            std::mem::discriminant(&right.self_membership)
+        );
+        assert_eq!(
+            std::mem::discriminant(&left.conversation_kind),
+            std::mem::discriminant(&right.conversation_kind)
+        );
+        assert_eq!(left.muted, right.muted);
+        assert_eq!(left.muted_until_ms, right.muted_until_ms);
+        assert_eq!(left.leave_request_pending, right.leave_request_pending);
+        assert_eq!(left.leave_requested_at_ms, right.leave_requested_at_ms);
+    }
+
     #[test]
     fn chat_pins_round_trip_across_runtime_and_ffi() {
         let test_thread = std::thread::Builder::new()
@@ -517,7 +565,17 @@ mod tests {
             .await
             .expect("create isolated group");
 
-        let mut group_ids = Vec::new();
+        let detailed = kit
+            .create_group_detailed(account_ref.clone(), "Detailed".to_owned(), Vec::new(), None)
+            .await
+            .expect("create detailed group");
+        let queried_detailed = kit
+            .chat_list_row(account_ref.clone(), detailed.group_id_hex.clone())
+            .expect("query detailed group")
+            .expect("detailed group row");
+        assert_created_chat_list_rows_equal(&detailed.chat_list_row, &queried_detailed);
+
+        let mut group_ids = vec![detailed.group_id_hex];
         for title in ["Alpha", "Beta", "Gamma", "Delta"] {
             group_ids.push(
                 kit.create_group(account_ref.clone(), title.to_owned(), Vec::new(), None)

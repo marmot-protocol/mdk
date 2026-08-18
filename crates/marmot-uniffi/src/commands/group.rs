@@ -11,13 +11,13 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
-    AppGroupRecordFfi, AppQuarantinedGroupFfi, DisbandRequestFfi, GroupConversationSnapshotFfi,
-    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi,
-    GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
-    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
-    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
-    group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
-    group_roster_ffi, normalize_member_ref_ffi,
+    AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandRequestFfi,
+    GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
+    GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
+    GroupMutationResultFfi, GroupRosterFfi, KeyPackageMaintenanceStatusFfi,
+    MaintenanceRunSummaryFfi, MemberRefFfi, PeriodicMaintenancePolicyFfi, SendSummaryFfi,
+    group_conversation_snapshot_ffi, group_details_from_conversation_snapshot_ffi,
+    group_id_from_hex, group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -348,6 +348,38 @@ impl Marmot {
         Ok(hex::encode(group_id.as_slice()))
     }
 
+    /// Create a group and return the exact durable chat-list row available to
+    /// subscriptions and queries at the response boundary.
+    pub async fn create_group_detailed(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .create_group_detailed(&account_ref, &name, &member_refs, description)
+            .await?
+            .into())
+    }
+
+    /// Create a group with forward-compatible founding options and return the
+    /// exact durable chat-list row available at the response boundary.
+    pub async fn create_group_with_options_detailed(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        options: CreateGroupOptionsFfi,
+    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .create_group_with_options_detailed(&account_ref, &name, &member_refs, options.into())
+            .await?
+            .into())
+    }
+
     /// Create a group with an optional initial avatar. MDK prefers an
     /// encrypted Blossom image and uses `source_url` only when the founding
     /// members do not all support that component but do support URL avatars.
@@ -371,6 +403,34 @@ impl Marmot {
             )
             .await?;
         Ok(hex::encode(group_id.as_slice()))
+    }
+
+    pub async fn create_group_with_initial_image_detailed(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+        initial_image: Option<InitialGroupImageFfi>,
+    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+        let initial_image = initial_image.map(|image| marmot_app::AppInitialGroupImage {
+            plaintext: image.plaintext,
+            media_type: image.media_type,
+            source_url: image.source_url,
+            dim: image.dim,
+            thumbhash: image.thumbhash,
+        });
+        Ok(self
+            .runtime
+            .create_group_with_initial_image_detailed(
+                &account_ref,
+                &name,
+                &member_refs,
+                description,
+                initial_image,
+            )
+            .await?
+            .into())
     }
 
     /// Normalize a member reference for group-management UI. Accepts hex,

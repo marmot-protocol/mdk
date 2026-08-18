@@ -1849,6 +1849,78 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
 }
 
 #[test]
+fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
+    run_composed_app_runtime_test("create-derived-welcome-index", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        app.chat_list_projection_warmed
+            .lock()
+            .unwrap()
+            .remove("alice");
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .insert("alice".to_owned());
+
+        relay.block_next_publish();
+        let created = runtime
+            .create_group_detailed(
+                "alice",
+                "derived welcome index",
+                std::slice::from_ref(&bob.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
+            .await
+            .expect("post-response Welcome publish should be blocked");
+
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .list_pending_welcome_deliveries()
+                .unwrap()
+                .is_empty(),
+            "the engine-retained Welcome is authoritative; create must not pay a second convenience-index commit"
+        );
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .chat_list_row(&created.chat_list_row.group_id_hex)
+                .unwrap(),
+            Some(created.chat_list_row),
+            "the remaining post-canonical commit must already contain the durable host projection"
+        );
+        assert!(
+            app.chat_list_projection_stale
+                .lock()
+                .unwrap()
+                .contains("alice"),
+            "create refreshes only its returned row and must preserve a pre-existing full-list rebuild obligation"
+        );
+        assert!(
+            !app.chat_list_projection_warmed
+                .lock()
+                .unwrap()
+                .contains("alice"),
+            "refreshing one created row must not claim the full chat-list projection is warmed"
+        );
+
+        relay.release_publish();
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
 fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_during_catch_up() {
     run_composed_app_runtime_test("invite-catch-up-ordering", || async {
         let dir = tempfile::tempdir().unwrap();

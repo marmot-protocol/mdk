@@ -5,8 +5,8 @@ use crate::storage::disband_requests::{
 };
 use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
-    SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, i64_to_u64,
-    optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
+    SelfMembership, SqliteAccountStorage, SqliteResultExt, StoredAccountState, bool_i64,
+    i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
@@ -684,6 +684,45 @@ impl SqliteAccountStorage {
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
         self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            refresh_chat_list_row_tx(
+                &conn,
+                local_account_id_hex,
+                group_id_hex,
+                mention_classifier,
+            )
+        })
+    }
+
+    /// Persist an exact account-projection delta and materialize one chat-list
+    /// row in the same SQLCipher transaction, returning the committed row.
+    ///
+    /// Group creation uses this boundary so the host-visible row is durable
+    /// when the response is handed off, without a second projection commit or
+    /// a follow-up storage read merely to assemble that response.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_account_projection_delta_and_refresh_chat_list_row(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[cgka_traits::MessageId],
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<Option<ChatListRow>> {
+        self.connection.with_transaction(|| {
+            // `with_transaction` is intentionally nestable on the owning
+            // thread, so the projection helper participates in this outer
+            // transaction and cannot commit before the chat-list row exists.
+            self.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                state,
+                max_seen_events,
+                max_future_skew_secs,
+                frontiers_to_clear,
+                application_event_ids_to_ack,
+            )?;
             let conn = self.lock()?;
             refresh_chat_list_row_tx(
                 &conn,
