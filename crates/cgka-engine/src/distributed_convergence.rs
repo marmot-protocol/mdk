@@ -613,30 +613,6 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Re-arm the queued-outbound drain edge when a pass closes.
-    ///
-    /// The schedule edge is a one-shot signal: a drain that ran while the
-    /// pass was still open consumed it without releasing the durable queue.
-    /// Closing the pass is the transition that opens the outbound gate, so
-    /// the engine owes edge-driven hosts a fresh edge whenever intents are
-    /// still queued (mdk#1472). Level-driven hosts re-arm from
-    /// `has_queued_outbound_intents` on their own; the extra edge only costs
-    /// them one no-op drain.
-    fn rearm_queued_outbound_drain_after_pass_close(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<(), OpenMlsProjectionError> {
-        if !self
-            .storage
-            .list_queued_outbound_intents(group_id)
-            .map_err(storage_projection_error)?
-            .is_empty()
-        {
-            self.schedule_pending_convergence_group(group_id);
-        }
-        Ok(())
-    }
-
     /// Discard a pass whose base epoch disagrees with the current tip, so the
     /// caller reopens one at the tip.
     ///
@@ -1406,7 +1382,7 @@ impl<S: StorageProvider> Engine<S> {
             self.storage
                 .put_convergence_pass(&pass)
                 .map_err(storage_projection_error)?;
-            self.rearm_queued_outbound_drain_after_pass_close(group_id)?;
+            self.schedule_drain_for_retained_outbound_intents(group_id);
             return Ok(result);
         }
 
@@ -1453,7 +1429,7 @@ impl<S: StorageProvider> Engine<S> {
         // one-shot schedule edge without releasing them, so completion must
         // re-arm it — otherwise an edge-driven host never comes back for the
         // durable queue.
-        self.rearm_queued_outbound_drain_after_pass_close(group_id)?;
+        self.schedule_drain_for_retained_outbound_intents(group_id);
         for (disposition, previous_state, epoch) in disposition_transitions {
             if previous_state == disposition.state {
                 continue;

@@ -104,8 +104,9 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 /// Capacity is reclaimed on confirmation, not on drain. A drained row is
 /// deleted only by `confirm_queued_outbound_intent` — or, for a group-state
 /// intent, inside `confirm_published` — so a payload that was prepared and
-/// published but never acknowledged still holds its slot and is re-prepared on
-/// the next drain. A group whose transport keeps failing therefore sits at the
+/// published but never acknowledged still holds its slot and stays in flight.
+/// A definite retry clears that in-flight association so the next drain
+/// re-prepares it. A group whose transport keeps failing therefore sits at the
 /// cap: its rows keep being re-attempted, but nothing frees a slot until a
 /// publish is accepted by at least one endpoint.
 pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
