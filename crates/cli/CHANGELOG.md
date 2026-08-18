@@ -9,7 +9,28 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-08-18
+
 ### Added
+
+- MarmotKit adds bounded, local-first APIs for common host reads: keyed
+  `chatListRow`, badge-ready account unread summaries, administrator ids on
+  membership pages, bulk cached identity projections, and peer-keyed existing
+  direct-conversation lookup. These replace repeated full chat-list, roster,
+  and profile scans while preserving typed missing, malformed, and not-ready
+  outcomes.
+  ([#1464](https://github.com/marmot-protocol/mdk/pull/1464),
+  [#1466](https://github.com/marmot-protocol/mdk/pull/1466),
+  [#1468](https://github.com/marmot-protocol/mdk/pull/1468),
+  [#1469](https://github.com/marmot-protocol/mdk/pull/1469),
+  [#1471](https://github.com/marmot-protocol/mdk/pull/1471))
+
+- MarmotKit release and exact-SHA snapshot workflows now package native macOS
+  artifacts and Android Kotlin/JNI bindings alongside the existing Apple
+  outputs, with immutable source identities, checksums, and provenance
+  manifests for downstream staging.
+  ([#1402](https://github.com/marmot-protocol/mdk/pull/1402),
+  [#1473](https://github.com/marmot-protocol/mdk/pull/1473))
 
 - MarmotKit exposes `appPerformanceSnapshot()`, a read-only fetch of the
   process-wide app-performance snapshot — per-phase attempt/success/failure
@@ -40,7 +61,65 @@ versioning through the workspace version in the root `Cargo.toml`.
   repair.
   ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
 
+### Changed
+
+- Account databases upgrade through storage migrations 47–50. Migration 47
+  normalizes message metadata and introduces versioned `MDKMP` message-payload
+  and `MDKS` snapshot/checkpoint codecs; existing format-1 rows remain readable
+  and promote in bounded background batches after account readiness. Later
+  migrations persist deferred-peel generations and add targeted pending-invite
+  and direct-conversation indexes. Downgrade across migration 47 is unsupported:
+  older binaries refuse the database before reading account tables, so make a
+  backup before upgrading and restore that backup if downgrade is required.
+  Migration 47 can temporarily require substantial disk space; allow at least
+  3.25 times the existing account database size as additional free space.
+  ([#1421](https://github.com/marmot-protocol/mdk/pull/1421),
+  [#1433](https://github.com/marmot-protocol/mdk/pull/1433),
+  [#1440](https://github.com/marmot-protocol/mdk/pull/1440),
+  [#1454](https://github.com/marmot-protocol/mdk/pull/1454),
+  [#1471](https://github.com/marmot-protocol/mdk/pull/1471))
+
+- Group creation and invitation return after the durable MLS mutation instead
+  of waiting for Welcome fanout; bounded background delivery retains retryable
+  recovery. Invite-with-admin now applies membership and initial administrator
+  policy in one commit instead of a follow-up promotion per administrator.
+  ([#1457](https://github.com/marmot-protocol/mdk/pull/1457))
+
+- Account setup publishes its initial replaceable records as one recoverable
+  batch, connects directory relays concurrently, avoids redundant relay-list
+  and SQLCipher work, and preserves partially exposed accounts for idempotent
+  retry. One unavailable relay no longer serializes or rolls back otherwise
+  acknowledged setup.
+  ([#1446](https://github.com/marmot-protocol/mdk/pull/1446))
+
+- WN Agent reconciliation is event-driven with adaptive quiet-period safety
+  nets instead of two fixed five-second full-state scans. Remaining passes use
+  targeted changed-state reads, reducing idle CPU and SQLite read amplification
+  while retaining prompt activity and retry wakeups.
+  ([#1454](https://github.com/marmot-protocol/mdk/pull/1454))
+
 ### Fixed
+
+- Outbound operations bound foreground deferred-peel work and durably queue
+  application, proposal, and commit intents when convergence cannot yet finish.
+  Queued messages re-arm their drain when a convergence pass closes, and an
+  in-flight regenerated intent is not published twice. This prevents accepted
+  messages from remaining stranded or later failing confirmation after a
+  duplicate publication.
+  ([#1440](https://github.com/marmot-protocol/mdk/pull/1440),
+  [#1475](https://github.com/marmot-protocol/mdk/pull/1475))
+
+- App runtime work that can block on SQLCipher, subscription recovery, wake
+  catch-up, directory reads, notifications, or media HTTP no longer stalls the
+  async runtime or exclusive account worker. Lagged subscriptions rebuild from
+  authoritative state, buffered wake events survive catch-up timeouts, and
+  projection updates from account mutations flush promptly.
+  ([#1435](https://github.com/marmot-protocol/mdk/pull/1435),
+  [#1447](https://github.com/marmot-protocol/mdk/pull/1447))
+
+- Steady-state account opens skip a duplicate SQLCipher KDF migration probe
+  without weakening marker, salt, key, or recovery checks.
+  ([#1442](https://github.com/marmot-protocol/mdk/pull/1442))
 
 - Welcome joins now become durable and publish `GroupJoined` before ordinary
   relay subscriptions rebuild, with failed rebuilds retried in the background.
@@ -1569,7 +1648,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.12...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.13...HEAD
+[0.9.13]: https://github.com/marmot-protocol/mdk/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/marmot-protocol/mdk/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/marmot-protocol/mdk/compare/v0.9.9...v0.9.10
