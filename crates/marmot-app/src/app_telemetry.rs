@@ -47,6 +47,7 @@ pub(crate) enum AppPerformanceOperation {
     GroupMemberKeyPackagePrewarm,
     GroupCreateKeyPackageCacheReuse,
     GroupCreateKeyPackageNetworkResolution,
+    GroupCreateImagePreprocess,
     GroupCreateImageUpload,
     GroupCreateMlsPreparePersist,
     GroupCreatePendingWelcomeIndex,
@@ -257,6 +258,8 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub group_create_key_package_network_resolution: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub group_create_image_preprocess: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub group_create_image_upload: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_mls_prepare_persist: AppPerformanceOperationSnapshot,
@@ -347,6 +350,7 @@ struct AppPerformanceTelemetryInner {
     group_member_key_package_prewarm: AppPerformanceOperationTelemetry,
     group_create_key_package_cache_reuse: AppPerformanceOperationTelemetry,
     group_create_key_package_network_resolution: AppPerformanceOperationTelemetry,
+    group_create_image_preprocess: AppPerformanceOperationTelemetry,
     group_create_image_upload: AppPerformanceOperationTelemetry,
     group_create_mls_prepare_persist: AppPerformanceOperationTelemetry,
     group_create_pending_welcome_index: AppPerformanceOperationTelemetry,
@@ -574,6 +578,11 @@ impl AppPerformanceTelemetry {
                     .group_create_key_package_network_resolution
                     .record(duration, success);
             }
+            AppPerformanceOperation::GroupCreateImagePreprocess => {
+                inner
+                    .group_create_image_preprocess
+                    .record(duration, success);
+            }
             AppPerformanceOperation::GroupCreateImageUpload => {
                 inner.group_create_image_upload.record(duration, success);
             }
@@ -776,6 +785,7 @@ impl AppPerformanceTelemetry {
             group_create_key_package_network_resolution: inner
                 .group_create_key_package_network_resolution
                 .snapshot(),
+            group_create_image_preprocess: inner.group_create_image_preprocess.snapshot(),
             group_create_image_upload: inner.group_create_image_upload.snapshot(),
             group_create_mls_prepare_persist: inner.group_create_mls_prepare_persist.snapshot(),
             group_create_pending_welcome_index: inner.group_create_pending_welcome_index.snapshot(),
@@ -1115,6 +1125,7 @@ mod tests {
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
             AppPerformanceOperation::GroupCreateKeyPackageCacheReuse,
             AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
+            AppPerformanceOperation::GroupCreateImagePreprocess,
             AppPerformanceOperation::GroupCreateImageUpload,
             AppPerformanceOperation::GroupCreateMlsPreparePersist,
             AppPerformanceOperation::GroupCreatePendingWelcomeIndex,
@@ -1136,6 +1147,7 @@ mod tests {
             snapshot.group_member_key_package_prewarm,
             snapshot.group_create_key_package_cache_reuse,
             snapshot.group_create_key_package_network_resolution,
+            snapshot.group_create_image_preprocess,
             snapshot.group_create_image_upload,
             snapshot.group_create_mls_prepare_persist,
             snapshot.group_create_pending_welcome_index,

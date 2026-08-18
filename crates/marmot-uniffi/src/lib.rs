@@ -44,7 +44,7 @@ uniffi::setup_scaffolding!();
 
 pub use commands::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
-    parse_media_imeta_tag,
+    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
 };
 pub use conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,

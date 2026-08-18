@@ -92,6 +92,64 @@ impl From<CreateGroupOptionsFfi> for marmot_app::AppCreateGroupOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum PreparedGroupImageUploadStateFfi {
+    Staged,
+    Uploading,
+    Uploaded,
+    Failed,
+    Consumed,
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PreparedGroupImageUploadFfi {
+    pub upload_id: String,
+    pub state: PreparedGroupImageUploadStateFfi,
+    pub attempt_count: u32,
+    pub last_error_kind: Option<String>,
+    pub group_id_hex: Option<String>,
+}
+
+impl std::fmt::Debug for PreparedGroupImageUploadFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedGroupImageUploadFfi")
+            .field("upload_id", &self.upload_id)
+            .field("state", &self.state)
+            .field("attempt_count", &self.attempt_count)
+            .field("last_error_kind", &self.last_error_kind)
+            .field("has_group_id", &self.group_id_hex.is_some())
+            .finish()
+    }
+}
+
+impl From<marmot_app::AppPreparedGroupImageUpload> for PreparedGroupImageUploadFfi {
+    fn from(value: marmot_app::AppPreparedGroupImageUpload) -> Self {
+        Self {
+            upload_id: value.upload_id,
+            state: match value.state {
+                marmot_app::AppPreparedGroupImageUploadState::Staged => {
+                    PreparedGroupImageUploadStateFfi::Staged
+                }
+                marmot_app::AppPreparedGroupImageUploadState::Uploading => {
+                    PreparedGroupImageUploadStateFfi::Uploading
+                }
+                marmot_app::AppPreparedGroupImageUploadState::Uploaded => {
+                    PreparedGroupImageUploadStateFfi::Uploaded
+                }
+                marmot_app::AppPreparedGroupImageUploadState::Failed => {
+                    PreparedGroupImageUploadStateFfi::Failed
+                }
+                marmot_app::AppPreparedGroupImageUploadState::Consumed => {
+                    PreparedGroupImageUploadStateFfi::Consumed
+                }
+            },
+            attempt_count: value.attempt_count,
+            last_error_kind: value.last_error_kind,
+            group_id_hex: value.group_id_hex,
+        }
+    }
+}
+
 pub(crate) async fn group_details_for(
     kit: &Marmot,
     account_ref: &str,
@@ -405,6 +463,88 @@ impl Marmot {
         Ok(hex::encode(group_id.as_slice()))
     }
 
+    /// Validate and durably encrypt a founding image without performing any
+    /// network transfer. The opaque id survives process restart; keys,
+    /// ciphertext, and the content hash stay inside MDK's SQLCipher database.
+    pub async fn stage_prepared_group_image(
+        &self,
+        account_ref: String,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<PreparedGroupImageUploadFfi, MarmotKitError> {
+        validate_group_image_plaintext(&plaintext)?;
+        Ok(self
+            .runtime
+            .stage_prepared_group_image(&account_ref, plaintext, media_type)
+            .await?
+            .into())
+    }
+
+    /// Upload a staged founding image. A failed status is durable and can be
+    /// retried with the same id; an already uploaded id performs no duplicate
+    /// HTTP transfer.
+    pub async fn upload_prepared_group_image(
+        &self,
+        account_ref: String,
+        upload_id: String,
+    ) -> Result<PreparedGroupImageUploadFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .upload_prepared_group_image(&account_ref, upload_id)
+            .await?
+            .into())
+    }
+
+    pub async fn prepared_group_image_status(
+        &self,
+        account_ref: String,
+        upload_id: String,
+    ) -> Result<PreparedGroupImageUploadFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .prepared_group_image_status(&account_ref, upload_id)
+            .await?
+            .into())
+    }
+
+    pub async fn prepared_group_images(
+        &self,
+        account_ref: String,
+    ) -> Result<Vec<PreparedGroupImageUploadFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .prepared_group_images(&account_ref)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Fast founding-image create path. `upload_id` must already be uploaded;
+    /// the image component is present in epoch-zero metadata and no Blossom
+    /// request occurs on this call. Reusing a consumed id returns its original
+    /// canonical group rather than creating a duplicate.
+    pub async fn create_group_with_prepared_initial_image(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+        upload_id: String,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = self
+            .runtime
+            .create_group_with_prepared_initial_image(
+                &account_ref,
+                &name,
+                &member_refs,
+                description,
+                upload_id,
+            )
+            .await?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
     pub async fn create_group_with_initial_image_detailed(
         &self,
         account_ref: String,
@@ -413,13 +553,7 @@ impl Marmot {
         description: Option<String>,
         initial_image: Option<InitialGroupImageFfi>,
     ) -> Result<CreatedGroupFfi, MarmotKitError> {
-        let initial_image = initial_image.map(|image| marmot_app::AppInitialGroupImage {
-            plaintext: image.plaintext,
-            media_type: image.media_type,
-            source_url: image.source_url,
-            dim: image.dim,
-            thumbhash: image.thumbhash,
-        });
+        let initial_image = initial_image.map(Into::into);
         Ok(self
             .runtime
             .create_group_with_initial_image_detailed(

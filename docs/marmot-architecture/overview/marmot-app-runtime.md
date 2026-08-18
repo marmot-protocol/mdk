@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-08-11
+updated: 2026-08-18
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -138,6 +138,46 @@ observation time, which is a display/retention value and never the canonical gro
 
 The convergence branch-selection model is unchanged; see [`../distributed-convergence.md`](../distributed-convergence.md)
 and [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md).
+
+## Founding Group Images
+
+The original `create_group_with_initial_image` API retains its founding-image
+contract: it validates, encrypts, and uploads the image before canonical group
+creation, so success means the blob was already accepted by Blossom and the
+image component is present in epoch-zero metadata.
+
+Latency-sensitive hosts should use the explicit prepared-artifact sequence:
+
+1. `stage_prepared_group_image` validates the encoded image before encryption
+   (10 MiB, 4096 px per side, and 16,777,216 pixels), encrypts it once, and
+   stores the exact ciphertext plus upload authorization in the account's
+   SQLCipher database. No network request occurs.
+2. `upload_prepared_group_image` uploads that durable ciphertext. Failure is a
+   durable `failed` state with a privacy-safe error kind; cancellation leaves
+   the prior state intact. Retrying the opaque id reuses the same ciphertext,
+   content hash, and upload authorization. An already uploaded id is a no-op.
+3. `create_group_with_prepared_initial_image` accepts only `uploaded` state,
+   places the image component in founding MLS metadata, and performs no
+   Blossom transfer. A consumed id is idempotent and returns its original
+   canonical group, including recovery after a crash before the consumed
+   marker was written.
+
+The states `staged`, `uploading`, `uploaded`, `failed`, and `consumed` are
+returned through Rust and UniFFI. `uploading` is worker-local; after a restart,
+the durable `staged` or `failed` record is exposed again for retry. Concurrent
+retries of one id are rejected instead of issuing duplicate uploads. This
+design has no follow-up image commit: the blob transfer is completed during
+composition and the image component is founding metadata.
+The telemetry phases are preprocessing, upload, MLS prepare/persist, local
+projection save, and total caller latency. Prepared-artifact create therefore
+records no create-image-upload sample.
+
+Run `just bench-group-image-create` for the repeatable no-image, typical-image,
+exact byte-limit, and stalled-server matrix. Stable `MDK_BENCH` rows report the
+prior serialized-path model (`preprocess + upload + canonical create`) next to
+the new canonical-create response boundary. The stalled row keeps a Blossom
+response pending while a founding-image create completes from an already
+uploaded artifact.
 
 ## Daemon Boundary
 

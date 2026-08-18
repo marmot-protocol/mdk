@@ -61,6 +61,43 @@ pub struct AppInitialGroupImage {
     pub thumbhash: Option<String>,
 }
 
+/// Host-visible lifecycle for an opaque, SQLCipher-backed founding-image
+/// artifact. Upload retries reuse the same encrypted bytes and content hash.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppPreparedGroupImageUploadState {
+    Staged,
+    /// An ephemeral worker state. A restart exposes the durable staged or
+    /// failed state again so the exact same upload can be retried.
+    Uploading,
+    Uploaded,
+    Failed,
+    Consumed,
+}
+
+/// Sanitized status for a prepared founding-image artifact. The component,
+/// ciphertext, image keys, upload key, and content hash never cross this API.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppPreparedGroupImageUpload {
+    pub upload_id: String,
+    pub state: AppPreparedGroupImageUploadState,
+    pub attempt_count: u32,
+    pub last_error_kind: Option<String>,
+    pub group_id_hex: Option<String>,
+}
+
+impl std::fmt::Debug for AppPreparedGroupImageUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppPreparedGroupImageUpload")
+            .field("upload_id", &self.upload_id)
+            .field("state", &self.state)
+            .field("attempt_count", &self.attempt_count)
+            .field("last_error_kind", &self.last_error_kind)
+            .field("has_group_id", &self.group_id_hex.is_some())
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for AppInitialGroupImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppInitialGroupImage")

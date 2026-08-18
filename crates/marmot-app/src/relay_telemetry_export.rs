@@ -288,6 +288,15 @@ pub mod metric_names {
         "app_group_create_key_package_network_resolution_successes";
     pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_FAILURES: &str =
         "app_group_create_key_package_network_resolution_failures";
+    /// Group-create image validation/encryption/staging metrics.
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_DURATION: &str =
+        "app_group_create_image_preprocess_duration_ms";
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_ATTEMPTS: &str =
+        "app_group_create_image_preprocess_attempts";
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_SUCCESSES: &str =
+        "app_group_create_image_preprocess_successes";
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_FAILURES: &str =
+        "app_group_create_image_preprocess_failures";
     /// Group-create image upload metrics.
     pub const APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION: &str =
         "app_group_create_image_upload_duration_ms";
@@ -1041,6 +1050,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_ATTEMPTS,
         metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_SUCCESSES,
         metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_image_preprocess,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_DURATION,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_FAILURES,
     );
     append_app_operation_points(
         points,

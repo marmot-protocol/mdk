@@ -1337,6 +1337,72 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Validate and durably stage a founding image without network I/O.
+    pub async fn stage_prepared_group_image(
+        &self,
+        account_ref: &str,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<crate::AppPreparedGroupImageUpload, AppError> {
+        self.accounts
+            .stage_prepared_group_image(account_ref, plaintext, media_type)
+            .await
+    }
+
+    /// Upload a staged founding image. Retrying the same opaque id reuses the
+    /// exact encrypted bytes and content hash; an already uploaded artifact is
+    /// returned without another HTTP request.
+    pub async fn upload_prepared_group_image(
+        &self,
+        account_ref: &str,
+        upload_id: String,
+    ) -> Result<crate::AppPreparedGroupImageUpload, AppError> {
+        self.accounts
+            .upload_prepared_group_image(account_ref, upload_id)
+            .await
+    }
+
+    pub async fn prepared_group_image_status(
+        &self,
+        account_ref: &str,
+        upload_id: String,
+    ) -> Result<crate::AppPreparedGroupImageUpload, AppError> {
+        self.accounts
+            .prepared_group_image_status(account_ref, upload_id)
+            .await
+    }
+
+    /// Enumerate the bounded SQLCipher-backed artifact set so a restarted host
+    /// can resume uploads without maintaining its own durable operation cache.
+    pub async fn prepared_group_images(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::AppPreparedGroupImageUpload>, AppError> {
+        self.accounts.prepared_group_images(account_ref).await
+    }
+
+    /// Create with an already-uploaded founding-image artifact. The image
+    /// component is part of epoch-zero metadata; this method performs no
+    /// Blossom transfer and is idempotent for a consumed `upload_id`.
+    pub async fn create_group_with_prepared_initial_image(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        upload_id: String,
+    ) -> Result<GroupId, AppError> {
+        self.accounts
+            .create_group_with_prepared_initial_image(
+                account_ref,
+                name,
+                members,
+                description,
+                upload_id,
+            )
+            .await
+    }
+
     pub async fn create_group_with_initial_image_detailed(
         &self,
         account_ref: &str,

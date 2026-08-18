@@ -30,7 +30,10 @@ use host_safety::validate_locator;
 
 pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
 pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
-pub(crate) use group_image::{fetch_group_image, upload_group_image};
+pub use group_image::{MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS};
+pub(crate) use group_image::{
+    fetch_group_image, prepare_group_image_upload, upload_group_image, upload_prepared_group_image,
+};
 pub(crate) use host_safety::is_loopback_http_endpoint;
 
 /// Validate and compact the latest-message encrypted-media metadata for the

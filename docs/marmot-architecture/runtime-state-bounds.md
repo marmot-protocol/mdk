@@ -63,6 +63,7 @@ Tracking issue: marmot-protocol/mdk#381.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
+| `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 

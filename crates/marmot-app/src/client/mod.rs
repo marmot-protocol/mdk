@@ -27,6 +27,10 @@ use marmot_account::{
 };
 use marmot_forensics::AuditEventContext;
 use nostr::NostrSigner;
+use rand::RngCore;
+use rand::rngs::OsRng;
+use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
+use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
@@ -36,8 +40,9 @@ use crate::groups::{
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
-    download_encrypted_media, fetch_group_image, is_loopback_http_endpoint, upload_encrypted_media,
-    upload_group_image,
+    download_encrypted_media, fetch_group_image, is_loopback_http_endpoint,
+    prepare_group_image_upload, upload_encrypted_media, upload_group_image,
+    upload_prepared_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::notifications;
@@ -47,10 +52,11 @@ use crate::{
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
     AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
     AppGroupRecord, AppInitialGroupImage, AppPerformanceTelemetry, AppQuarantinedGroup,
-    AppRoutingState, AppRuntime, AppTransportRouting, CanonicalCreatedGroup,
-    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    PendingWelcomeDelivery, SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState, AppRoutingState, AppRuntime,
+    AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -178,6 +184,45 @@ pub(crate) struct GroupImageDownloadHttp {
     media_type: String,
 }
 
+pub(crate) struct PreparedGroupImageUploadHttp {
+    upload_id: String,
+    encrypted_blob: Vec<u8>,
+    image_hash_hex: String,
+    upload_secret: Zeroizing<Vec<u8>>,
+    server: Option<String>,
+    allow_loopback_http: bool,
+}
+
+impl PreparedGroupImageUploadHttp {
+    pub(crate) fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    pub(crate) async fn run(self) -> Result<(), AppError> {
+        upload_prepared_group_image(
+            self.encrypted_blob,
+            &self.image_hash_hex,
+            self.upload_secret,
+            self.server.as_deref(),
+            self.allow_loopback_http,
+        )
+        .await
+    }
+}
+
+pub(crate) enum PreparedGroupImageUploadStart {
+    Complete(AppPreparedGroupImageUpload),
+    Http(PreparedGroupImageUploadHttp),
+}
+
+enum InitialGroupImageSource {
+    Inline(AppInitialGroupImage),
+    Prepared {
+        upload_id: String,
+        component_data: Vec<u8>,
+    },
+}
+
 impl GroupImageDownloadHttp {
     pub(crate) async fn run(self) -> Result<Vec<u8>, AppError> {
         fetch_group_image(
@@ -207,6 +252,23 @@ where
         .await;
     results.sort_unstable_by_key(|(index, _)| *index);
     results.into_iter().map(|(_, result)| result).collect()
+}
+
+fn prepared_group_image_status(
+    record: &PreparedGroupImageUploadRecord,
+) -> AppPreparedGroupImageUpload {
+    AppPreparedGroupImageUpload {
+        upload_id: record.upload_id.clone(),
+        state: match record.state {
+            PreparedGroupImageUploadState::Staged => AppPreparedGroupImageUploadState::Staged,
+            PreparedGroupImageUploadState::Uploaded => AppPreparedGroupImageUploadState::Uploaded,
+            PreparedGroupImageUploadState::Failed => AppPreparedGroupImageUploadState::Failed,
+            PreparedGroupImageUploadState::Consumed => AppPreparedGroupImageUploadState::Consumed,
+        },
+        attempt_count: record.attempt_count,
+        last_error_kind: record.last_error_kind.clone(),
+        group_id_hex: record.group_id_hex.clone(),
+    }
 }
 
 /// Outcome of one [`AppClient::refresh_group_routes`] pass, separating the
@@ -826,6 +888,131 @@ impl AppClient {
             .await
     }
 
+    /// Validate and encrypt a founding image, then durably stage its exact
+    /// ciphertext and upload authorization in the account SQLCipher database.
+    /// This performs no network I/O. The returned opaque id can be resumed
+    /// after cancellation or process restart.
+    pub(crate) fn stage_prepared_initial_group_image(
+        &self,
+        plaintext: &[u8],
+        media_type: &str,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        let prepared = prepare_group_image_upload(plaintext, media_type)?;
+        let component_data = hex::decode(AppGroupImageComponent::new(prepared.input).data_hex)?;
+        let mut id_bytes = [0_u8; 16];
+        OsRng.fill_bytes(&mut id_bytes);
+        let upload_id = hex::encode(id_bytes);
+        let now = unix_now_seconds();
+        let record = PreparedGroupImageUploadRecord {
+            upload_id: upload_id.clone(),
+            state: PreparedGroupImageUploadState::Staged,
+            component_data,
+            encrypted_blob: Some(prepared.encrypted_blob),
+            upload_secret: Some(prepared.upload_secret.to_vec()),
+            group_id_hex: None,
+            attempt_count: 0,
+            last_error_kind: None,
+            recorded_at: now,
+            updated_at: now,
+        };
+        self.app
+            .account_storage(&self.state.label)?
+            .stage_prepared_group_image_upload(&record)?;
+        Ok(prepared_group_image_status(&record))
+    }
+
+    pub(crate) fn prepared_initial_group_image_status(
+        &self,
+        upload_id: &str,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        let record = self
+            .app
+            .account_storage(&self.state.label)?
+            .prepared_group_image_upload(upload_id)?
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
+            })?;
+        Ok(prepared_group_image_status(&record))
+    }
+
+    pub(crate) fn prepared_initial_group_images(
+        &self,
+    ) -> Result<Vec<AppPreparedGroupImageUpload>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .list_prepared_group_image_uploads()?
+            .iter()
+            .map(prepared_group_image_status)
+            .collect())
+    }
+
+    pub(crate) fn prepare_initial_group_image_upload(
+        &self,
+        upload_id: &str,
+        server: Option<String>,
+        allow_loopback_http: bool,
+    ) -> Result<PreparedGroupImageUploadStart, AppError> {
+        let record = self
+            .app
+            .account_storage(&self.state.label)?
+            .prepared_group_image_upload(upload_id)?
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
+            })?;
+        if matches!(
+            record.state,
+            PreparedGroupImageUploadState::Uploaded | PreparedGroupImageUploadState::Consumed
+        ) {
+            return Ok(PreparedGroupImageUploadStart::Complete(
+                prepared_group_image_status(&record),
+            ));
+        }
+        let input =
+            AppGroupImageInput::from_component_bytes(&record.component_data).ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("prepared group image component is invalid".into())
+            })?;
+        let encrypted_blob = record.encrypted_blob.ok_or_else(|| {
+            AppError::InvalidEncryptedMedia("prepared group image ciphertext is missing".into())
+        })?;
+        let upload_secret = record.upload_secret.ok_or_else(|| {
+            AppError::InvalidEncryptedMedia("prepared group image upload key is missing".into())
+        })?;
+        Ok(PreparedGroupImageUploadStart::Http(
+            PreparedGroupImageUploadHttp {
+                upload_id: record.upload_id,
+                encrypted_blob,
+                image_hash_hex: input.image_hash_hex,
+                upload_secret: Zeroizing::new(upload_secret),
+                server,
+                allow_loopback_http,
+            },
+        ))
+    }
+
+    pub(crate) fn finish_initial_group_image_upload(
+        &self,
+        upload_id: &str,
+        result: &Result<(), AppError>,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let now = unix_now_seconds();
+        match result {
+            Ok(()) => storage.mark_prepared_group_image_upload_uploaded(upload_id, now)?,
+            Err(error) => storage.mark_prepared_group_image_upload_failed(
+                upload_id,
+                error.privacy_safe_kind(),
+                now,
+            )?,
+        }
+        let record = storage
+            .prepared_group_image_upload(upload_id)?
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
+            })?;
+        Ok(prepared_group_image_status(&record))
+    }
+
     /// Create a locally canonical group and attempt each founding Welcome.
     ///
     /// `Ok(group_id)` reports group creation, not blanket invitation success.
@@ -900,6 +1087,83 @@ impl AppClient {
         .await
     }
 
+    pub(crate) async fn create_group_with_prepared_initial_image_and_telemetry(
+        &mut self,
+        name: &str,
+        member_refs: &[&str],
+        options: AppCreateGroupOptions,
+        upload_id: &str,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<CanonicalCreatedGroup, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let record = storage
+            .prepared_group_image_upload(upload_id)?
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
+            })?;
+        if record.state == PreparedGroupImageUploadState::Consumed {
+            let group_id_hex = record.group_id_hex.ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("consumed group image artifact has no group".into())
+            })?;
+            return Ok(CanonicalCreatedGroup {
+                group_id: GroupId::new(hex::decode(group_id_hex)?),
+                chat_list_row: None,
+            });
+        }
+        if record.state != PreparedGroupImageUploadState::Uploaded {
+            return Err(AppError::InvalidEncryptedMedia(
+                "prepared group image must be uploaded before group creation".into(),
+            ));
+        }
+
+        // Recover a crash after canonical creation but before the artifact's
+        // consumed marker. The exact randomized component bytes uniquely bind
+        // the artifact to the already-created group, so retry returns that
+        // group rather than creating a duplicate.
+        let component_data_hex = hex::encode(&record.component_data);
+        if let Some(group) = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.image.data_hex == component_data_hex)
+        {
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            storage.consume_prepared_group_image_upload(
+                upload_id,
+                &group.group_id_hex,
+                unix_now_seconds(),
+            )?;
+            return Ok(CanonicalCreatedGroup {
+                group_id,
+                chat_list_row: None,
+            });
+        }
+
+        let AppCreateGroupOptions {
+            description,
+            initial_image,
+            disappearing_message_secs,
+        } = options;
+        if initial_image.is_some() {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group creation accepts either inline or prepared image input".into(),
+            ));
+        }
+
+        self.create_group_with_initial_source_and_optional_telemetry(
+            name,
+            description,
+            member_refs,
+            Some(InitialGroupImageSource::Prepared {
+                upload_id: upload_id.to_owned(),
+                component_data: record.component_data,
+            }),
+            disappearing_message_secs,
+            Some(telemetry),
+        )
+        .await
+    }
+
     async fn create_group_with_options_and_optional_telemetry(
         &mut self,
         name: &str,
@@ -912,6 +1176,26 @@ impl AppClient {
             initial_image,
             disappearing_message_secs,
         } = options;
+        self.create_group_with_initial_source_and_optional_telemetry(
+            name,
+            description,
+            member_refs,
+            initial_image.map(InitialGroupImageSource::Inline),
+            disappearing_message_secs,
+            telemetry,
+        )
+        .await
+    }
+
+    async fn create_group_with_initial_source_and_optional_telemetry(
+        &mut self,
+        name: &str,
+        description: String,
+        member_refs: &[&str],
+        initial_image: Option<InitialGroupImageSource>,
+        disappearing_message_secs: u64,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<CanonicalCreatedGroup, AppError> {
         validate_group_profile(name, &description)?;
         let key_package_started_at = Instant::now();
         let key_packages = self
@@ -965,39 +1249,73 @@ impl AppClient {
         }
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &app_components)?;
-        let has_initial_image = initial_image.is_some();
+        let uploads_inline_image =
+            matches!(&initial_image, Some(InitialGroupImageSource::Inline(_)));
+        let prepared_upload_id = match &initial_image {
+            Some(InitialGroupImageSource::Prepared { upload_id, .. }) => Some(upload_id.clone()),
+            _ => None,
+        };
         let image_started_at = Instant::now();
         let optional_app_components = async {
             let mut optional_app_components = Vec::new();
             if let Some(image) = initial_image {
                 match preferred_initial_group_image_component(
                     &constructable,
-                    image.source_url.is_some(),
+                    matches!(
+                        &image,
+                        InitialGroupImageSource::Inline(image) if image.source_url.is_some()
+                    ),
                 ) {
                     Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
-                        let upload =
-                            upload_group_image(&image.plaintext, &image.media_type, None).await?;
-                        let input = AppGroupImageInput::from(upload);
+                        let data = match image {
+                            InitialGroupImageSource::Inline(image) => {
+                                let upload =
+                                    upload_group_image(&image.plaintext, &image.media_type, None)
+                                        .await?;
+                                let input = AppGroupImageInput::from(upload);
+                                hex::decode(AppGroupImageComponent::new(input).data_hex)?
+                            }
+                            InitialGroupImageSource::Prepared { component_data, .. } => {
+                                component_data
+                            }
+                        };
                         optional_app_components.push(AppComponentData {
                             component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-                            data: hex::decode(AppGroupImageComponent::new(input).data_hex)?,
+                            data,
                         });
                     }
-                    Some(GROUP_AVATAR_URL_COMPONENT_ID) => {
-                        if let Some(url) = image.source_url {
-                            optional_app_components.push(
-                                AppGroupAvatarUrlComponent::new(url, image.dim, image.thumbhash)?
+                    Some(GROUP_AVATAR_URL_COMPONENT_ID) => match image {
+                        InitialGroupImageSource::Inline(image) => {
+                            if let Some(url) = image.source_url {
+                                optional_app_components.push(
+                                    AppGroupAvatarUrlComponent::new(
+                                        url,
+                                        image.dim,
+                                        image.thumbhash,
+                                    )?
                                     .to_app_component_data()?,
-                            );
+                                );
+                            }
+                        }
+                        InitialGroupImageSource::Prepared { .. } => {
+                            return Err(AppError::InvalidEncryptedMedia(
+                                "prepared group images require encrypted Blossom support".into(),
+                            ));
+                        }
+                    },
+                    _ => {
+                        if matches!(image, InitialGroupImageSource::Prepared { .. }) {
+                            return Err(AppError::InvalidEncryptedMedia(
+                                "founding members do not support prepared group images".into(),
+                            ));
                         }
                     }
-                    _ => {}
                 }
             }
             Ok::<_, AppError>(optional_app_components)
         }
         .await;
-        if has_initial_image {
+        if uploads_inline_image {
             record_app_performance(
                 telemetry,
                 AppPerformanceOperation::GroupCreateImageUpload,
@@ -1106,6 +1424,27 @@ impl AppClient {
             local_projection_started_at.elapsed(),
             local_projection.is_ok(),
         );
+        if let Some(upload_id) = prepared_upload_id
+            && let Err(error) = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    storage
+                        .consume_prepared_group_image_upload(
+                            &upload_id,
+                            &hex::encode(group_id.as_slice()),
+                            unix_now_seconds(),
+                        )
+                        .map_err(AppError::from)
+                })
+        {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "create_group",
+                error_kind = error.privacy_safe_kind(),
+                "confirmed group creation outpaced prepared-image consumption; retry will reconcile the component"
+            );
+        }
         if let Err(error) = &local_projection {
             tracing::warn!(
                 target: "marmot_app::client",

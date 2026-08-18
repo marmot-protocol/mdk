@@ -22,10 +22,10 @@ use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
     AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppQuarantinedGroup,
-    CanonicalCreatedGroup, CreatedGroup, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MaintenanceRunSummary, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
-    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    AppPreparedGroupImageUpload, CanonicalCreatedGroup, CreatedGroup, GroupInviteDeclineResult,
+    GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, NotificationSettings, PendingWelcomeDelivery,
+    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
 
@@ -252,10 +252,124 @@ impl AccountManager {
         options: AppCreateGroupOptions,
     ) -> Result<GroupId, AppError> {
         let started_at = Instant::now();
-        let result = self
-            .create_group_with_options_outcome(account_ref, name, members, options)
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::CreateGroup {
+                    queued_at: Instant::now(),
+                    name: name.to_owned(),
+                    members: members.to_vec(),
+                    options,
+                    prepared_image_upload_id: None,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            long_account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupCreateTotalCallerLatency,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        let group_id = result?.group_id;
+        self.schedule_create_group_post_mutation_catch_up().await;
+        self.schedule_audit_log_tracker_update("create_group");
+        Ok(group_id)
+    }
+
+    pub async fn stage_prepared_group_image(
+        &self,
+        account_ref: &str,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::StagePreparedGroupImage {
+                plaintext,
+                media_type,
+                respond,
+            })
             .await
-            .map(|created| created.group_id);
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn upload_prepared_group_image(
+        &self,
+        account_ref: &str,
+        upload_id: String,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UploadPreparedGroupImage { upload_id, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        long_account_worker_response(response).await
+    }
+
+    pub async fn prepared_group_image_status(
+        &self,
+        account_ref: &str,
+        upload_id: String,
+    ) -> Result<AppPreparedGroupImageUpload, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn prepared_group_images(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AppPreparedGroupImageUpload>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PreparedGroupImages { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn create_group_with_prepared_initial_image(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        upload_id: String,
+    ) -> Result<GroupId, AppError> {
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::CreateGroup {
+                    queued_at: Instant::now(),
+                    name: name.to_owned(),
+                    members: members.to_vec(),
+                    options: AppCreateGroupOptions {
+                        description: description.unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    prepared_image_upload_id: Some(upload_id),
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            long_account_worker_response(response).await
+        }
+        .await;
+        let result = result.map(|created| created.group_id);
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
@@ -320,6 +434,7 @@ impl AccountManager {
                 name: name.to_owned(),
                 members: members.to_vec(),
                 options,
+                prepared_image_upload_id: None,
                 respond,
             })
             .await

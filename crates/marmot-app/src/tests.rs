@@ -42,6 +42,316 @@ use crate::key_package_records::{
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
+fn one_pixel_png() -> Vec<u8> {
+    use image::ImageEncoder;
+
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    bytes
+}
+
+async fn read_blossom_benchmark_upload(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let header_end = loop {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "upload closed before its headers completed");
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap();
+    let hash = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-sha-256")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap();
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "upload closed before its body completed");
+        request.extend_from_slice(&buffer[..read]);
+    }
+    hash
+}
+
+async fn blossom_benchmark_success_server() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server_url = url.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let hash = read_blossom_benchmark_upload(&mut stream).await;
+        let body = serde_json::json!({
+            "url": format!("{server_url}/{hash}.bin"),
+            "sha256": hash,
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    (url, server)
+}
+
+async fn measure_prepared_group_image_case(case: &str, image: &[u8]) {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+
+    let preprocess_started = std::time::Instant::now();
+    let staged = client
+        .stage_prepared_initial_group_image(image, "image/png")
+        .unwrap();
+    let preprocess = preprocess_started.elapsed();
+    let (server_url, server) = blossom_benchmark_success_server().await;
+    let upload = match client
+        .prepare_initial_group_image_upload(&staged.upload_id, Some(server_url), true)
+        .unwrap()
+    {
+        crate::client::PreparedGroupImageUploadStart::Http(upload) => upload,
+        crate::client::PreparedGroupImageUploadStart::Complete(_) => {
+            panic!("new staged artifact unexpectedly skipped upload")
+        }
+    };
+    let upload_started = std::time::Instant::now();
+    let upload_result = upload.run().await;
+    let upload_elapsed = upload_started.elapsed();
+    client
+        .finish_initial_group_image_upload(&staged.upload_id, &upload_result)
+        .unwrap();
+    upload_result.unwrap();
+    server.await.unwrap();
+
+    let telemetry = AppPerformanceTelemetry::default();
+    let create_started = std::time::Instant::now();
+    client
+        .create_group_with_prepared_initial_image_and_telemetry(
+            case,
+            "",
+            &[],
+            &staged.upload_id,
+            &telemetry,
+        )
+        .await
+        .unwrap();
+    let create = create_started.elapsed();
+    let baseline_serialized = preprocess + upload_elapsed + create;
+    println!(
+        "MDK_BENCH group_image_create case={case} source_bytes={} baseline_serialized_ms={} \
+         preprocess_ms={} upload_ms={} canonical_create_ms={} upload_in_create=false",
+        image.len(),
+        baseline_serialized.as_millis(),
+        preprocess.as_millis(),
+        upload_elapsed.as_millis(),
+        create.as_millis(),
+    );
+}
+
+/// Repeatable issue-1485 measurement matrix. `baseline_serialized_ms` models
+/// the prior critical path by summing the same serial preprocess, upload, and
+/// canonical-create phases. The new response boundary is
+/// `canonical_create_ms`; no network transfer runs inside it.
+#[test]
+#[ignore = "group-image create benchmark; run via `just bench-group-image-create`"]
+fn prepared_group_image_create_measurement_matrix() {
+    run_composed_app_runtime_test("group-image-create-bench", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        let create_started = std::time::Instant::now();
+        client
+            .create_group_with_initial_profile_and_telemetry("no image", "", &[], None, &telemetry)
+            .await
+            .unwrap();
+        let no_image = create_started.elapsed();
+        println!(
+            "MDK_BENCH group_image_create case=no_image source_bytes=0 \
+             baseline_serialized_ms={} preprocess_ms=0 upload_ms=0 canonical_create_ms={} \
+             upload_in_create=false",
+            no_image.as_millis(),
+            no_image.as_millis(),
+        );
+
+        measure_prepared_group_image_case("typical", &one_pixel_png()).await;
+        let mut maximum = one_pixel_png();
+        maximum.resize(crate::MAX_GROUP_IMAGE_BYTES, 0);
+        measure_prepared_group_image_case("maximum_accepted_bytes", &maximum).await;
+
+        let ready = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        client
+            .finish_initial_group_image_upload(&ready.upload_id, &Ok(()))
+            .unwrap();
+        let stalled = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let server_accepted = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_blossom_benchmark_upload(&mut stream).await;
+            server_accepted.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let upload = match client
+            .prepare_initial_group_image_upload(&stalled.upload_id, Some(server_url), true)
+            .unwrap()
+        {
+            crate::client::PreparedGroupImageUploadStart::Http(upload) => upload,
+            crate::client::PreparedGroupImageUploadStart::Complete(_) => unreachable!(),
+        };
+        let upload = tokio::spawn(upload.run());
+        accepted.notified().await;
+        let create_started = std::time::Instant::now();
+        client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "stalled server independence",
+                "",
+                &[],
+                &ready.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        let create = create_started.elapsed();
+        println!(
+            "MDK_BENCH group_image_create case=stalled_server source_bytes={} \
+             baseline_serialized_ms=stalled preprocess_ms=measured_separately upload_ms=stalled \
+             canonical_create_ms={} upload_in_create=false",
+            one_pixel_png().len(),
+            create.as_millis(),
+        );
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        server.abort();
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
+    run_composed_app_runtime_test("prepared-group-image-create", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        assert_eq!(staged.state, AppPreparedGroupImageUploadState::Staged);
+
+        let prepared_http = client
+            .prepare_initial_group_image_upload(&staged.upload_id, None, false)
+            .unwrap();
+        assert!(matches!(
+            prepared_http,
+            crate::client::PreparedGroupImageUploadStart::Http(_)
+        ));
+        drop(prepared_http);
+        let after_cancellation = client
+            .prepared_initial_group_image_status(&staged.upload_id)
+            .unwrap();
+        assert_eq!(
+            after_cancellation.state,
+            AppPreparedGroupImageUploadState::Staged
+        );
+        assert_eq!(after_cancellation.attempt_count, 0);
+
+        let failed = client
+            .finish_initial_group_image_upload(
+                &staged.upload_id,
+                &Err(AppError::BlobStore("test failure".into())),
+            )
+            .unwrap();
+        assert_eq!(failed.state, AppPreparedGroupImageUploadState::Failed);
+        assert_eq!(failed.attempt_count, 1);
+        assert_eq!(failed.last_error_kind.as_deref(), Some("blob_store"));
+        let uploaded = client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        assert_eq!(uploaded.state, AppPreparedGroupImageUploadState::Uploaded);
+        assert_eq!(uploaded.attempt_count, 2);
+        assert!(matches!(
+            client
+                .prepare_initial_group_image_upload(&staged.upload_id, None, false)
+                .unwrap(),
+            crate::client::PreparedGroupImageUploadStart::Complete(_)
+        ));
+
+        let telemetry = AppPerformanceTelemetry::default();
+        let group_id = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "prepared image",
+                "",
+                &[],
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        let group_id_again = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "ignored on idempotent retry",
+                "",
+                &[],
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(group_id_again, group_id);
+        assert_eq!(client.state.groups.len(), 1);
+        assert!(client.state.groups[0].image.present);
+
+        let status = client
+            .prepared_initial_group_image_status(&staged.upload_id)
+            .unwrap();
+        assert_eq!(status.state, AppPreparedGroupImageUploadState::Consumed);
+        let group_id_hex = hex::encode(group_id.as_slice());
+        assert_eq!(status.group_id_hex.as_deref(), Some(group_id_hex.as_str()));
+        assert!(!format!("{status:?}").contains(&group_id_hex));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_create_image_upload.attempts, 0);
+        assert_eq!(snapshot.group_create_mls_prepare_persist.attempts, 1);
+    });
+}
+
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,

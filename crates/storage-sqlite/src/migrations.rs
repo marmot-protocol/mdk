@@ -98,6 +98,8 @@ mod migration_0048_deferred_peel_generations;
 mod migration_0049_pending_invite_index;
 #[path = "migrations/0050_direct_conversation_members.rs"]
 mod migration_0050_direct_conversation_members;
+#[path = "migrations/0051_prepared_group_image_uploads.rs"]
+mod migration_0051_prepared_group_image_uploads;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -362,6 +364,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 50,
         name: "0050_direct_conversation_members",
         apply: migration_0050_direct_conversation_members::apply,
+    },
+    Migration {
+        version: 51,
+        name: "0051_prepared_group_image_uploads",
+        apply: migration_0051_prepared_group_image_uploads::apply,
     },
 ];
 
@@ -890,7 +897,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 50,
+                found: 51,
                 latest_supported: 46,
             }
         ));
@@ -946,7 +953,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 50,
+                found: 51,
                 latest_supported: 46,
             }
         ));
@@ -1250,7 +1257,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 50,
+                found: 51,
                 latest_supported: 46,
             }
         ));
