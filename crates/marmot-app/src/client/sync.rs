@@ -17,8 +17,8 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
-    AppPerformanceTelemetry, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure,
-    SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
+    AppPerformanceTelemetry, ClassifiedSyncFailure, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT,
+    SelfMembership, SyncFailure, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillDeferredReason,
@@ -329,6 +329,14 @@ impl AppClient {
 
     /// Synchronize while retaining the durably applied prefix on failure.
     pub async fn sync_with_partial_progress(&mut self) -> Result<SyncSummary, SyncFailure> {
+        self.sync_with_classified_partial_progress()
+            .await
+            .map_err(SyncFailure::from)
+    }
+
+    pub(crate) async fn sync_with_classified_partial_progress(
+        &mut self,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(None).await {
             Ok(summary) => Ok(summary),
             Err(mut failure) => {
@@ -341,7 +349,7 @@ impl AppClient {
     pub(crate) async fn sync_with_startup_stage_telemetry(
         &mut self,
         telemetry: &AppPerformanceTelemetry,
-    ) -> Result<SyncSummary, SyncFailure> {
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(Some(telemetry)).await {
             Ok(summary) => Ok(summary),
             Err(mut failure) => {
@@ -354,12 +362,12 @@ impl AppClient {
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<SyncSummary, SyncFailure> {
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
         let refresh = self.refresh_group_routes().map_err(|error| {
-            SyncFailure::at_stage(
+            ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
                 error,
                 SyncFailureStage::StatePersist,
@@ -371,7 +379,7 @@ impl AppClient {
         if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(|error| {
-                    SyncFailure::at_stage(
+                    ClassifiedSyncFailure::at_stage(
                         SyncSummary::default(),
                         error,
                         SyncFailureStage::StatePersist,
@@ -385,7 +393,7 @@ impl AppClient {
         self.prepare_transport_for_sync(telemetry)
             .await
             .map_err(|(stage, error)| {
-                SyncFailure::at_stage(SyncSummary::default(), error, stage)
+                ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
             })?;
         // A complete startup/catch-up rebuild satisfies any older deferred
         // refresh intent before this pass starts ingesting new deliveries.
@@ -408,7 +416,7 @@ impl AppClient {
                 // This composite drain spans engine drain, app-state reads,
                 // publish checks, and projection. Its AppError does not retain
                 // the inner boundary, so do not infer a stage from the cause.
-                return Err(SyncFailure::at_stage(
+                return Err(ClassifiedSyncFailure::at_stage(
                     summary,
                     error,
                     SyncFailureStage::Unknown,
@@ -789,18 +797,41 @@ impl AppClient {
         Ok(summary)
     }
 
-    async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, SyncFailure> {
+    fn checkpoint_error_stage_and_cursor(
+        &self,
+        error: &SyncCheckpointError,
+        cursor_before_secs: Option<u64>,
+    ) -> (SyncFailureStage, Option<u64>) {
+        match error {
+            SyncCheckpointError::BeforePersistence(_) => {
+                (SyncFailureStage::StatePersist, cursor_before_secs)
+            }
+            SyncCheckpointError::AfterPersistence(_) => (
+                SyncFailureStage::GroupSubscriptionSync,
+                self.state.last_transport_timestamp,
+            ),
+        }
+    }
+
+    async fn sync_sdk_relay(
+        &mut self,
+        deliveries: &mut u64,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         // These are local app-state reads before the relay receive loop. They
         // are not failures of the account-worker command boundary.
         let display_names = self.app.display_names_by_id().map_err(|error| {
-            SyncFailure::at_stage(SyncSummary::default(), error, SyncFailureStage::Unknown)
+            ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::Unknown,
+            )
         })?;
         let local_account_id_hex = self
             .app
             .account_home()
             .account(&self.state.label)
             .map_err(|source| {
-                SyncFailure::at_stage(
+                ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
                     AppError::from(source),
                     SyncFailureStage::Unknown,
@@ -899,14 +930,8 @@ impl AppClient {
             .checkpoint_sync_prefix(&mut summary, routes_dirty, *deliveries)
             .await
         {
-            let stage = match &error {
-                SyncCheckpointError::BeforePersistence(_) => SyncFailureStage::StatePersist,
-                SyncCheckpointError::AfterPersistence(_) => SyncFailureStage::GroupSubscriptionSync,
-            };
-            let cursor_after_secs = match &error {
-                SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
-                SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
-            };
+            let (stage, cursor_after_secs) =
+                self.checkpoint_error_stage_and_cursor(&error, cursor_before_secs);
             let (summary, source) = self.checkpoint_failure_summary(summary, error);
             self.record_sync_drain(
                 drain_started.elapsed().as_millis() as u64,
@@ -914,7 +939,7 @@ impl AppClient {
                 cursor_before_secs,
                 cursor_after_secs,
             );
-            return Err(SyncFailure::at_stage(summary, source, stage));
+            return Err(ClassifiedSyncFailure::at_stage(summary, source, stage));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -933,7 +958,7 @@ impl AppClient {
         original: StagedSyncError,
         drain_started: std::time::Instant,
         cursor_before_secs: Option<u64>,
-    ) -> SyncFailure {
+    ) -> ClassifiedSyncFailure {
         let (source, stage, cursor_after_secs) = match self
             .checkpoint_sync_prefix(&mut summary, routes_dirty, deliveries)
             .await
@@ -944,16 +969,8 @@ impl AppClient {
                 self.state.last_transport_timestamp,
             ),
             Err(error) => {
-                let stage = match &error {
-                    SyncCheckpointError::BeforePersistence(_) => SyncFailureStage::StatePersist,
-                    SyncCheckpointError::AfterPersistence(_) => {
-                        SyncFailureStage::GroupSubscriptionSync
-                    }
-                };
-                let cursor_after_secs = match &error {
-                    SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
-                    SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
-                };
+                let (stage, cursor_after_secs) =
+                    self.checkpoint_error_stage_and_cursor(&error, cursor_before_secs);
                 let (retained_summary, checkpoint_error) =
                     self.checkpoint_failure_summary(summary, error);
                 summary = retained_summary;
@@ -966,7 +983,7 @@ impl AppClient {
             cursor_before_secs,
             cursor_after_secs,
         );
-        SyncFailure::at_stage(summary, source, stage)
+        ClassifiedSyncFailure::at_stage(summary, source, stage)
     }
 
     async fn checkpoint_sync_prefix(
@@ -1580,9 +1597,11 @@ impl AppClient {
     /// participant that has no new traffic capable of arming epoch-stall
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
-    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
+    pub(crate) async fn repair_full_history(
+        &mut self,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let refresh = self.refresh_group_routes().map_err(|error| {
-            SyncFailure::at_stage(
+            ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
                 error,
                 SyncFailureStage::StatePersist,
@@ -1593,7 +1612,7 @@ impl AppClient {
         if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
                 .map_err(|error| {
-                    SyncFailure::at_stage(
+                    ClassifiedSyncFailure::at_stage(
                         SyncSummary::default(),
                         error,
                         SyncFailureStage::StatePersist,
@@ -1622,7 +1641,7 @@ impl AppClient {
                         // its activation, subscription, drain, or projection
                         // boundaries failed. Keep the cause, but do not invent
                         // a stage from it.
-                        SyncFailure::at_stage(
+                        ClassifiedSyncFailure::at_stage(
                             SyncSummary::default(),
                             error,
                             SyncFailureStage::Unknown,
@@ -1638,14 +1657,14 @@ impl AppClient {
             .activate_transport(None)
             .await
             .map_err(|source| {
-                SyncFailure::at_stage(
+                ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
                     AppError::from(source),
                     SyncFailureStage::TransportActivation,
                 )
             })?;
         self.sync_runtime_groups().await.map_err(|error| {
-            SyncFailure::at_stage(
+            ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
                 error,
                 SyncFailureStage::GroupSubscriptionSync,
@@ -1659,7 +1678,7 @@ impl AppClient {
             Ok(drained) => drained,
             Err(error) => {
                 // As above, this composite drain has lost its inner boundary.
-                return Err(SyncFailure::at_stage(
+                return Err(ClassifiedSyncFailure::at_stage(
                     summary,
                     error,
                     SyncFailureStage::Unknown,

@@ -725,18 +725,35 @@ pub struct SyncFailure {
     pub partial_summary: SyncSummary,
     #[source]
     pub source: AppError,
-    classification: app_telemetry::SyncFailureClassification,
 }
 
 impl SyncFailure {
     pub fn new(partial_summary: SyncSummary, source: AppError) -> Self {
-        Self::at_stage(
+        Self {
             partial_summary,
             source,
-            app_telemetry::SyncFailureStage::Unknown,
-        )
+        }
     }
+}
 
+impl From<AppError> for SyncFailure {
+    fn from(source: AppError) -> Self {
+        Self::new(SyncSummary::default(), source)
+    }
+}
+
+/// Internal sync failure that retains the bounded telemetry classification.
+///
+/// The sidecar is deliberately separate from [`SyncFailure`] so the public
+/// two-field struct remains constructible by downstream callers.
+#[derive(Debug)]
+pub(crate) struct ClassifiedSyncFailure {
+    pub(crate) partial_summary: SyncSummary,
+    pub(crate) source: AppError,
+    classification: app_telemetry::SyncFailureClassification,
+}
+
+impl ClassifiedSyncFailure {
     pub(crate) fn at_stage(
         partial_summary: SyncSummary,
         source: AppError,
@@ -758,9 +775,12 @@ impl SyncFailure {
     }
 }
 
-impl From<AppError> for SyncFailure {
-    fn from(source: AppError) -> Self {
-        Self::new(SyncSummary::default(), source)
+impl From<ClassifiedSyncFailure> for SyncFailure {
+    fn from(failure: ClassifiedSyncFailure) -> Self {
+        Self {
+            partial_summary: failure.partial_summary,
+            source: failure.source,
+        }
     }
 }
 

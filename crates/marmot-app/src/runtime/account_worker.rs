@@ -31,12 +31,12 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
-    AppProjectionUpdate, AppQuarantinedGroup, ConvergenceScheduleState, EpochBackfillRunOutcome,
-    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncFailure, SyncSummary,
+    AppProjectionUpdate, AppQuarantinedGroup, ClassifiedSyncFailure, ConvergenceScheduleState,
+    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
+    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -615,7 +615,7 @@ async fn run_app_runtime_account_worker(
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
-            Ok::<_, SyncFailure>(summary)
+            Ok::<_, ClassifiedSyncFailure>(summary)
         });
         loop {
             tokio::select! {
@@ -710,7 +710,7 @@ async fn run_app_runtime_account_worker(
         startup_sync_result
             .as_ref()
             .err()
-            .map(SyncFailure::classification),
+            .map(ClassifiedSyncFailure::classification),
     );
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
@@ -1520,7 +1520,7 @@ async fn handle_account_worker_catch_up(
     let mut commands_open = true;
     let sync_started_at = Instant::now();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync_with_partial_progress());
+        let mut sync = std::pin::pin!(client.sync_with_classified_partial_progress());
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
@@ -2349,7 +2349,7 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();
-            let result = match client.sync_with_partial_progress().await {
+            let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
                     let backfill_result = run_pending_epoch_backfill_reporting_arm(

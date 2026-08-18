@@ -1143,9 +1143,7 @@ fn append_app_operation_points(
             value: ExportMetricValue::Counter(value),
         });
     }
-    let classified_metric = failures_name == metric_names::APP_ACCOUNT_SYNC_FAILURES
-        || failures_name == metric_names::APP_ACCOUNT_CATCH_UP_FAILURES;
-    if !classified_metric {
+    if operation.failure_classifications.is_empty() {
         points.push(ExportMetricPoint {
             name: failures_name,
             relay: None,
@@ -1167,9 +1165,8 @@ fn append_app_operation_points(
             value: ExportMetricValue::Counter(entry.count),
         });
     }
-    // Backward-compatible snapshots, and any legacy internal recorder call,
-    // cannot supply a typed classification. Preserve their count explicitly
-    // as the bounded fallback instead of dropping it.
+    // Preserve any count not represented by the supplied classification
+    // entries as the bounded fallback instead of dropping it.
     if classified_failures < operation.failures {
         points.push(ExportMetricPoint {
             name: failures_name,

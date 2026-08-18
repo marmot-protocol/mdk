@@ -385,7 +385,13 @@ impl DurationHistogram {
 
 impl AppPerformanceOperationTelemetry {
     fn record(&mut self, duration: Duration, success: bool) {
-        self.record_with_failure(duration, success, None);
+        self.attempts += 1;
+        if success {
+            self.successes += 1;
+        } else {
+            self.failures += 1;
+        }
+        self.duration_ms.record(duration);
     }
 
     fn record_with_failure(
@@ -394,18 +400,14 @@ impl AppPerformanceOperationTelemetry {
         success: bool,
         failure: Option<SyncFailureClassification>,
     ) {
-        self.attempts += 1;
-        if success {
-            self.successes += 1;
-        } else {
-            self.failures += 1;
+        self.record(duration, success);
+        if !success {
             let classification = failure.unwrap_or(SyncFailureClassification::UNKNOWN);
             *self
                 .failure_classifications
                 .entry(classification)
                 .or_default() += 1;
         }
-        self.duration_ms.record(duration);
     }
 
     fn snapshot(&self) -> AppPerformanceOperationSnapshot {
@@ -740,13 +742,13 @@ pub(crate) async fn bounded_advisory_step<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AccountCatchUpFailure, AppError, SyncFailure, SyncSummary};
+    use crate::{AccountCatchUpFailure, AppError, ClassifiedSyncFailure, SyncSummary};
     use cgka_traits::TransportAdapterError;
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;
 
     fn classified(stage: SyncFailureStage, error: AppError) -> SyncFailureClassification {
-        SyncFailure::at_stage(SyncSummary::default(), error, stage).classification()
+        ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage).classification()
     }
 
     #[test]
@@ -1014,6 +1016,13 @@ mod tests {
         assert_eq!(snapshot.group_accept_invite.attempts, 2);
         assert_eq!(snapshot.group_accept_invite.successes, 1);
         assert_eq!(snapshot.group_accept_invite.failures, 1);
+        assert!(
+            snapshot
+                .group_accept_invite
+                .failure_classifications
+                .is_empty(),
+            "generic operation failures must not populate sync classifications"
+        );
         assert_eq!(snapshot.group_accept_invite.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
     }
