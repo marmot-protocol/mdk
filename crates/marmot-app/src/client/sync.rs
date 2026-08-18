@@ -8,7 +8,7 @@ use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::app_telemetry::AppPerformanceOperation;
+use crate::app_telemetry::{AppPerformanceOperation, SyncErrorClass, SyncFailureStage};
 use crate::groups::{
     EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
     observe_event,
@@ -93,6 +93,17 @@ pub(crate) enum ConvergenceScheduleState {
 enum SyncCheckpointError {
     BeforePersistence(AppError),
     AfterPersistence(AppError),
+}
+
+struct StagedSyncError {
+    source: AppError,
+    stage: SyncFailureStage,
+}
+
+impl StagedSyncError {
+    fn new(source: AppError, stage: SyncFailureStage) -> Self {
+        Self { source, stage }
+    }
 }
 
 impl AppClient {
@@ -255,6 +266,15 @@ impl AppClient {
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<(), AppError> {
+        self.prepare_transport_for_sync(telemetry)
+            .await
+            .map_err(|(_, error)| error)
+    }
+
+    async fn prepare_transport_for_sync(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<(), (SyncFailureStage, AppError)> {
         // Before any subscription goes out: auth-gated relays (NIP-42)
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
@@ -272,7 +292,8 @@ impl AppClient {
                 activation.is_ok(),
             );
         }
-        activation?;
+        activation
+            .map_err(|error| (SyncFailureStage::TransportActivation, AppError::from(error)))?;
 
         let registration_started = Instant::now();
         let registration = self.sync_runtime_groups().await;
@@ -283,7 +304,7 @@ impl AppClient {
                 registration.is_ok(),
             );
         }
-        registration
+        registration.map_err(|error| (SyncFailureStage::GroupSubscriptionSync, error))
     }
 
     /// Transport-first startup sync. All authenticated, newly-applied effects
@@ -337,21 +358,35 @@ impl AppClient {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
-        let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
+        let refresh = self.refresh_group_routes().map_err(|error| {
+            SyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::StatePersist,
+            )
+        })?;
         // A routing-table delta lives in memory and obligates the subscription
         // refresh below, not a state write; only route retirement mutates
         // persisted group state.
         if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
-                .map_err(SyncFailure::from)?;
+                .map_err(|error| {
+                    SyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
         }
         let rebuild_since_secs = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp)
             .map(|timestamp| timestamp.0);
-        self.prepare_transport_with_telemetry(telemetry)
+        self.prepare_transport_for_sync(telemetry)
             .await
-            .map_err(SyncFailure::from)?;
+            .map_err(|(stage, error)| {
+                SyncFailure::at_stage(SyncSummary::default(), error, stage)
+            })?;
         // A complete startup/catch-up rebuild satisfies any older deferred
         // refresh intent before this pass starts ingesting new deliveries.
         self.pending_runtime_group_subscription_refresh = false;
@@ -370,7 +405,12 @@ impl AppClient {
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
             Err(error) => {
-                return Err(SyncFailure::new(summary, error));
+                let stage = if error.sync_error_class() == SyncErrorClass::Storage {
+                    SyncFailureStage::StatePersist
+                } else {
+                    SyncFailureStage::CgkaIngest
+                };
+                return Err(SyncFailure::at_stage(summary, error, stage));
             }
         };
         summary.merge(drained);
@@ -748,12 +788,24 @@ impl AppClient {
     }
 
     async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, SyncFailure> {
-        let display_names = self.app.display_names_by_id().map_err(SyncFailure::from)?;
+        let display_names = self.app.display_names_by_id().map_err(|error| {
+            SyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::AccountWorker,
+            )
+        })?;
         let local_account_id_hex = self
             .app
             .account_home()
             .account(&self.state.label)
-            .map_err(|source| SyncFailure::from(AppError::from(source)))?
+            .map_err(|source| {
+                SyncFailure::at_stage(
+                    SyncSummary::default(),
+                    AppError::from(source),
+                    SyncFailureStage::AccountWorker,
+                )
+            })?
             .account_id_hex;
         let mut summary = SyncSummary::default();
         let mut first_wait = true;
@@ -782,7 +834,7 @@ impl AppClient {
                             summary,
                             routes_dirty,
                             *deliveries,
-                            error.into(),
+                            StagedSyncError::new(error.into(), SyncFailureStage::RelayReceive),
                             drain_started,
                             cursor_before_secs,
                         )
@@ -809,7 +861,10 @@ impl AppClient {
                         summary,
                         routes_dirty,
                         *deliveries,
-                        AppError::BlockingTask("injected catch-up delivery failure".to_owned()),
+                        StagedSyncError::new(
+                            AppError::BlockingTask("injected catch-up delivery failure".to_owned()),
+                            SyncFailureStage::Unknown,
+                        ),
                         drain_started,
                         cursor_before_secs,
                     )
@@ -827,7 +882,7 @@ impl AppClient {
                             summary,
                             routes_dirty,
                             *deliveries,
-                            error,
+                            StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
                             drain_started,
                             cursor_before_secs,
                         )
@@ -844,6 +899,10 @@ impl AppClient {
             .checkpoint_sync_prefix(&mut summary, routes_dirty, *deliveries)
             .await
         {
+            let stage = match &error {
+                SyncCheckpointError::BeforePersistence(_) => SyncFailureStage::StatePersist,
+                SyncCheckpointError::AfterPersistence(_) => SyncFailureStage::GroupSubscriptionSync,
+            };
             let cursor_after_secs = match &error {
                 SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
                 SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
@@ -855,7 +914,7 @@ impl AppClient {
                 cursor_before_secs,
                 cursor_after_secs,
             );
-            return Err(SyncFailure::new(summary, source));
+            return Err(SyncFailure::at_stage(summary, source, stage));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -871,16 +930,26 @@ impl AppClient {
         mut summary: SyncSummary,
         routes_dirty: bool,
         deliveries: u64,
-        original_error: AppError,
+        original: StagedSyncError,
         drain_started: std::time::Instant,
         cursor_before_secs: Option<u64>,
     ) -> SyncFailure {
-        let (source, cursor_after_secs) = match self
+        let (source, stage, cursor_after_secs) = match self
             .checkpoint_sync_prefix(&mut summary, routes_dirty, deliveries)
             .await
         {
-            Ok(()) => (original_error, self.state.last_transport_timestamp),
+            Ok(()) => (
+                original.source,
+                original.stage,
+                self.state.last_transport_timestamp,
+            ),
             Err(error) => {
+                let stage = match &error {
+                    SyncCheckpointError::BeforePersistence(_) => SyncFailureStage::StatePersist,
+                    SyncCheckpointError::AfterPersistence(_) => {
+                        SyncFailureStage::GroupSubscriptionSync
+                    }
+                };
                 let cursor_after_secs = match &error {
                     SyncCheckpointError::BeforePersistence(_) => cursor_before_secs,
                     SyncCheckpointError::AfterPersistence(_) => self.state.last_transport_timestamp,
@@ -888,7 +957,7 @@ impl AppClient {
                 let (retained_summary, checkpoint_error) =
                     self.checkpoint_failure_summary(summary, error);
                 summary = retained_summary;
-                (checkpoint_error, cursor_after_secs)
+                (checkpoint_error, stage, cursor_after_secs)
             }
         };
         self.record_sync_drain(
@@ -897,7 +966,7 @@ impl AppClient {
             cursor_before_secs,
             cursor_after_secs,
         );
-        SyncFailure::new(summary, source)
+        SyncFailure::at_stage(summary, source, stage)
     }
 
     async fn checkpoint_sync_prefix(
@@ -1512,12 +1581,24 @@ impl AppClient {
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
     pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, SyncFailure> {
-        let refresh = self.refresh_group_routes().map_err(SyncFailure::from)?;
+        let refresh = self.refresh_group_routes().map_err(|error| {
+            SyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::StatePersist,
+            )
+        })?;
         // As in `sync_inner`: save only for persisted-state pruning, not for
         // in-memory routing-table deltas.
         if refresh.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
-                .map_err(SyncFailure::from)?;
+                .map_err(|error| {
+                    SyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
         }
         // Caller-directed repair is a fresh transport preparation, not an
         // assumption that startup ordering already installed the signer and
@@ -1536,8 +1617,14 @@ impl AppClient {
                 match self
                     .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
                     .await
-                    .map_err(SyncFailure::from)?
-                {
+                    .map_err(|error| {
+                        let stage = if error.sync_error_class() == SyncErrorClass::Storage {
+                            SyncFailureStage::StatePersist
+                        } else {
+                            SyncFailureStage::CgkaIngest
+                        };
+                        SyncFailure::at_stage(SyncSummary::default(), error, stage)
+                    })? {
                     EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
                     EpochBackfillRunOutcome::Deferred => continue,
                     EpochBackfillRunOutcome::NotPending => break,
@@ -1547,17 +1634,34 @@ impl AppClient {
         self.runtime
             .activate_transport(None)
             .await
-            .map_err(|source| SyncFailure::from(AppError::from(source)))?;
-        self.sync_runtime_groups()
-            .await
-            .map_err(SyncFailure::from)?;
+            .map_err(|source| {
+                SyncFailure::at_stage(
+                    SyncSummary::default(),
+                    AppError::from(source),
+                    SyncFailureStage::TransportActivation,
+                )
+            })?;
+        self.sync_runtime_groups().await.map_err(|error| {
+            SyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::GroupSubscriptionSync,
+            )
+        })?;
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut deliveries = 0;
         let mut summary = self.sync_sdk_relay(&mut deliveries).await?;
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
-            Err(error) => return Err(SyncFailure::new(summary, error)),
+            Err(error) => {
+                let stage = if error.sync_error_class() == SyncErrorClass::Storage {
+                    SyncFailureStage::StatePersist
+                } else {
+                    SyncFailureStage::CgkaIngest
+                };
+                return Err(SyncFailure::at_stage(summary, error, stage));
+            }
         };
         summary.merge(drained);
         Ok(summary)

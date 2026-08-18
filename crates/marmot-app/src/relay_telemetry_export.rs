@@ -13,9 +13,10 @@
 //!   is the single construction gate: it returns `None` unless export is
 //!   enabled and a full metrics URL, bearer token, and resource metadata are
 //!   configured. No exporter, no resolution, no push.
-//! - **Relay identity is the only label (req. 3).** The export batch is a flat
-//!   list of [`ExportMetricPoint`]s, each of which can carry at most a single
-//!   `relay` label and nothing else — there is deliberately no field for an
+//! - **Labels are structurally bounded.** The export batch is a flat list of
+//!   [`ExportMetricPoint`]s. Relay points can carry only `relay`; account
+//!   sync/catch-up failure points can carry only the closed `failure_stage`
+//!   and `error_class` enums. There is deliberately no field for an
 //!   account, member, device, group, subscription, pubkey, message, event, or
 //!   IP value, so a forbidden label cannot be attached.
 //! - **Aggregate only (req. 4).** Point values are monotonic counters, gauges,
@@ -29,7 +30,9 @@
 
 use transport_nostr_adapter::{DurationHistogramSnapshot, RelayIndex, RelayLabelResolution};
 
-use crate::app_telemetry::{AppPerformanceOperationSnapshot, AppPerformanceSnapshot};
+use crate::app_telemetry::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncFailureClassification,
+};
 use crate::config::RelayTelemetryExportConfig;
 use crate::relay_plane::{EngineReorgMetrics, MarmotRelayPlane, RelayTelemetryRollup};
 
@@ -531,9 +534,12 @@ pub enum ExportMetricValue {
 pub struct ExportMetricPoint {
     /// Metric name from [`metric_names`].
     pub name: &'static str,
-    /// Relay-identity label (a relay URL), or `None` for population-level
-    /// metrics. The sole label permitted to leave the device.
+    /// Relay-identity label (a relay URL), or `None` for population-level and
+    /// classified app failure metrics.
     pub relay: Option<String>,
+    /// Closed sync/catch-up failure attributes, or `None` for every other
+    /// metric point.
+    pub failure: Option<SyncFailureClassification>,
     /// The aggregate value.
     pub value: ExportMetricValue,
 }
@@ -618,6 +624,7 @@ pub fn build_export_batch(
         points.push(ExportMetricPoint {
             name: metric_names::FIRST_EVENT_LATENCY,
             relay: Some(relay.clone()),
+            failure: None,
             value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
                 &entry.first_event_latency,
             )),
@@ -625,6 +632,7 @@ pub fn build_export_batch(
         points.push(ExportMetricPoint {
             name: metric_names::EOSE_LATENCY,
             relay: Some(relay.clone()),
+            failure: None,
             value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
                 &entry.eose_latency,
             )),
@@ -632,17 +640,20 @@ pub fn build_export_batch(
         points.push(ExportMetricPoint {
             name: metric_names::DELIVERY_COUNT,
             relay: Some(relay.clone()),
+            failure: None,
             value: ExportMetricValue::Counter(entry.delivery_count()),
         });
         points.push(ExportMetricPoint {
             name: metric_names::REDUNDANT_COUNT,
             relay: Some(relay.clone()),
+            failure: None,
             value: ExportMetricValue::Counter(entry.redundant_count()),
         });
         if let Some(rate) = entry.first_deliverer_rate() {
             points.push(ExportMetricPoint {
                 name: metric_names::FIRST_DELIVERER_RATE,
                 relay: Some(relay),
+                failure: None,
                 value: ExportMetricValue::Gauge(rate),
             });
         }
@@ -652,6 +663,7 @@ pub fn build_export_batch(
     points.push(ExportMetricPoint {
         name: metric_names::CROSS_RELAY_SPREAD,
         relay: None,
+        failure: None,
         value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
             &rollup.cross_relay_spread,
         )),
@@ -681,6 +693,7 @@ pub fn build_export_batch(
         points.push(ExportMetricPoint {
             name,
             relay: None,
+            failure: None,
             value: ExportMetricValue::Counter(value),
         });
     }
@@ -689,23 +702,27 @@ pub fn build_export_batch(
         points.push(ExportMetricPoint {
             name: metric_names::SETTLES,
             relay: None,
+            failure: None,
             value: ExportMetricValue::Counter(engine.settles),
         });
         points.push(ExportMetricPoint {
             name: metric_names::POST_SETTLE_REORGS,
             relay: None,
+            failure: None,
             value: ExportMetricValue::Counter(engine.post_settle_reorgs),
         });
         if let Some(rate) = rollup.observed_reorg_rate() {
             points.push(ExportMetricPoint {
                 name: metric_names::OBSERVED_REORG_RATE,
                 relay: None,
+                failure: None,
                 value: ExportMetricValue::Gauge(rate),
             });
         }
         points.push(ExportMetricPoint {
             name: metric_names::REORG_LATENESS,
             relay: None,
+            failure: None,
             value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
                 &engine.reorg_lateness_ms,
             )),
@@ -1095,6 +1112,7 @@ fn append_app_performance_points(
         points.push(ExportMetricPoint {
             name,
             relay: None,
+            failure: None,
             value: ExportMetricValue::Counter(value),
         });
     }
@@ -1111,17 +1129,53 @@ fn append_app_operation_points(
     points.push(ExportMetricPoint {
         name: duration_name,
         relay: None,
+        failure: None,
         value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(&operation.duration_ms)),
     });
     for (name, value) in [
         (attempts_name, operation.attempts),
         (successes_name, operation.successes),
-        (failures_name, operation.failures),
     ] {
         points.push(ExportMetricPoint {
             name,
             relay: None,
+            failure: None,
             value: ExportMetricValue::Counter(value),
+        });
+    }
+    let classified_metric = failures_name == metric_names::APP_ACCOUNT_SYNC_FAILURES
+        || failures_name == metric_names::APP_ACCOUNT_CATCH_UP_FAILURES;
+    if !classified_metric {
+        points.push(ExportMetricPoint {
+            name: failures_name,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(operation.failures),
+        });
+        return;
+    }
+    let classified_failures = operation
+        .failure_classifications
+        .iter()
+        .map(|entry| entry.count)
+        .sum::<u64>();
+    for entry in &operation.failure_classifications {
+        points.push(ExportMetricPoint {
+            name: failures_name,
+            relay: None,
+            failure: Some(entry.classification),
+            value: ExportMetricValue::Counter(entry.count),
+        });
+    }
+    // Backward-compatible snapshots, and any legacy internal recorder call,
+    // cannot supply a typed classification. Preserve their count explicitly
+    // as the bounded fallback instead of dropping it.
+    if classified_failures < operation.failures {
+        points.push(ExportMetricPoint {
+            name: failures_name,
+            relay: None,
+            failure: Some(SyncFailureClassification::UNKNOWN),
+            value: ExportMetricValue::Counter(operation.failures - classified_failures),
         });
     }
 }
@@ -1263,17 +1317,22 @@ mod otlp {
             .unwrap_or_default()
     }
 
-    fn relay_attributes(relay: &Option<String>) -> Vec<KeyValue> {
-        match relay {
-            Some(relay) => vec![KeyValue {
+    fn point_attributes(point: &super::ExportMetricPoint) -> Vec<KeyValue> {
+        if let Some(relay) = &point.relay {
+            return vec![KeyValue {
                 key: "relay".to_owned(),
                 value: Some(AnyValue {
                     value: Some(any_value::Value::StringValue(relay.clone())),
                 }),
                 ..Default::default()
-            }],
-            None => Vec::new(),
+            }];
         }
+        point.failure.map_or_else(Vec::new, |failure| {
+            vec![
+                string_key_value("failure_stage", failure.failure_stage.as_str()),
+                string_key_value("error_class", failure.error_class.as_str()),
+            ]
+        })
     }
 
     fn string_key_value(key: &str, value: impl Into<String>) -> KeyValue {
@@ -1328,7 +1387,7 @@ mod otlp {
             .points
             .iter()
             .map(|point| {
-                let attributes = relay_attributes(&point.relay);
+                let attributes = point_attributes(point);
                 let data = match &point.value {
                     ExportMetricValue::Counter(value) => metric::Data::Sum(Sum {
                         data_points: vec![NumberDataPoint {
@@ -1443,6 +1502,7 @@ mod otlp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification, SyncFailureStage};
         use crate::config::RelayTelemetryResource;
         use crate::relay_telemetry_export::{
             ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayTelemetryExportBatch,
@@ -1456,22 +1516,34 @@ mod otlp {
                     ExportMetricPoint {
                         name: metric_names::DELIVERY_COUNT,
                         relay: Some("wss://a.example".into()),
+                        failure: None,
                         value: ExportMetricValue::Counter(7),
                     },
                     ExportMetricPoint {
                         name: metric_names::FIRST_DELIVERER_RATE,
                         relay: Some("wss://a.example".into()),
+                        failure: None,
                         value: ExportMetricValue::Gauge(0.5),
                     },
                     ExportMetricPoint {
                         name: metric_names::CROSS_RELAY_SPREAD,
                         relay: None,
+                        failure: None,
                         value: ExportMetricValue::Histogram(ExportHistogram {
                             bounds_ms: vec![10, 50],
                             bucket_counts: vec![1, 2],
                             overflow_count: 3,
                             sum_ms: 123,
                         }),
+                    },
+                    ExportMetricPoint {
+                        name: metric_names::APP_ACCOUNT_SYNC_FAILURES,
+                        relay: None,
+                        failure: Some(SyncFailureClassification::new(
+                            SyncFailureStage::CgkaIngest,
+                            SyncErrorClass::Protocol,
+                        )),
+                        value: ExportMetricValue::Counter(2),
                     },
                 ],
             };
@@ -1522,11 +1594,30 @@ mod otlp {
 
             let scope_metrics = &request.resource_metrics[0].scope_metrics[0];
             assert_eq!(scope_metrics.scope.as_ref().unwrap().name, SCOPE_NAME);
-            assert_eq!(scope_metrics.metrics.len(), 3);
+            assert_eq!(scope_metrics.metrics.len(), 4);
             assert_eq!(scope_metrics.metrics[0].unit, "1");
             assert_eq!(scope_metrics.metrics[1].unit, "1");
             assert_eq!(scope_metrics.metrics[2].name, "cross_relay_spread_ms");
             assert_eq!(scope_metrics.metrics[2].unit, "ms");
+            let classified = match &scope_metrics.metrics[3].data {
+                Some(metric::Data::Sum(sum)) => &sum.data_points[0],
+                other => panic!("expected classified failure sum, got {other:?}"),
+            };
+            let attribute = |key: &str| {
+                classified
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.key == key)
+                    .and_then(|attribute| attribute.value.as_ref())
+                    .and_then(|value| value.value.as_ref())
+                    .map(|value| match value {
+                        any_value::Value::StringValue(value) => value.as_str(),
+                        other => panic!("expected string failure attr, got {other:?}"),
+                    })
+            };
+            assert_eq!(attribute("failure_stage"), Some("cgka_ingest"));
+            assert_eq!(attribute("error_class"), Some("protocol"));
+            assert_eq!(classified.attributes.len(), 2);
 
             // Counter -> monotonic cumulative Sum, carrying the relay label.
             let sum = match &scope_metrics.metrics[0].data {

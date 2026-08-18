@@ -24,7 +24,8 @@ use tokio::time::timeout;
 
 use crate::agent_streams::AgentStreamWatchManager;
 use crate::app_telemetry::{
-    AppPerformanceOperation, AppPerformanceTelemetry, bounded_advisory_step,
+    AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
+    SyncFailureStage, bounded_advisory_step,
 };
 use crate::directory::DirectorySyncHandle;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
@@ -33,24 +34,25 @@ use crate::notifications;
 use crate::{
     ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
-    APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountKeyPackageRecord,
-    AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
-    AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
-    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
-    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
-    KeyPackageDeletionResult, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp,
-    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, MessageDraft, MessageDraftAttachment,
-    MessageDraftSummary, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
-    TimelineMessageRecord, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
+    AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread,
+    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
+    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
+    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
+    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
+    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
+    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
+    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
+    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
+    unix_now_seconds,
 };
 
 mod account_worker;
@@ -4125,10 +4127,13 @@ impl AccountManager {
             })
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.app_performance_telemetry().record_sync_result(
             AppPerformanceOperation::AccountCatchUp,
             started_at.elapsed(),
-            result.is_ok(),
+            result
+                .as_ref()
+                .err()
+                .map(account_catch_up_metric_classification),
         );
         result
     }
@@ -4159,12 +4164,16 @@ impl AccountManager {
         for response in responses {
             match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
                 Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(message))) => return Err(AppError::AccountCatchUp(message)),
+                Ok(Ok(Err(failure))) => return Err(AppError::AccountCatchUp(failure)),
                 Ok(Err(_)) => return Err(AppError::TransportClosed),
                 Err(_) => {
-                    return Err(AppError::AccountCatchUp(
+                    return Err(AppError::AccountCatchUp(AccountCatchUpFailure::new(
                         "account worker catch-up timed out".into(),
-                    ));
+                        SyncFailureClassification::new(
+                            SyncFailureStage::AccountWorker,
+                            SyncErrorClass::Timeout,
+                        ),
+                    )));
                 }
             }
         }
@@ -5438,12 +5447,22 @@ pub(crate) async fn long_account_worker_response<T>(
 }
 
 pub(crate) async fn long_account_worker_catch_up_response(
-    response: oneshot::Receiver<Result<(), String>>,
+    response: oneshot::Receiver<Result<(), AccountCatchUpFailure>>,
 ) -> Result<(), AppError> {
     match timeout(APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT, response).await {
         Ok(Ok(result)) => result.map_err(AppError::AccountCatchUp),
         Ok(Err(_)) => Err(AppError::TransportClosed),
         Err(_) => Err(AppError::AccountWorkerResponseTimedOut),
+    }
+}
+
+fn account_catch_up_metric_classification(error: &AppError) -> SyncFailureClassification {
+    match error {
+        AppError::AccountCatchUp(failure) => failure.classification(),
+        _ => SyncFailureClassification::new(
+            SyncFailureStage::AccountWorker,
+            error.sync_error_class(),
+        ),
     }
 }
 

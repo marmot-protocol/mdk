@@ -117,11 +117,17 @@ impl AccountManager {
             }
             let started_at = Instant::now();
             let result = manager.catch_up_account_commands(commands).await;
-            manager.shared.app_performance_telemetry().record(
-                AppPerformanceOperation::AccountCatchUp,
-                started_at.elapsed(),
-                result.is_ok(),
-            );
+            manager
+                .shared
+                .app_performance_telemetry()
+                .record_sync_result(
+                    AppPerformanceOperation::AccountCatchUp,
+                    started_at.elapsed(),
+                    result
+                        .as_ref()
+                        .err()
+                        .map(super::account_catch_up_metric_classification),
+                );
             manager.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::GroupCreatePostMutationCatchUp,
                 started_at.elapsed(),

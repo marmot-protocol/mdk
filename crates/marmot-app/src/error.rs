@@ -2,6 +2,35 @@ use cgka_traits::{TransportAdapterError, storage::StorageError};
 use marmot_account::{AccountError, AccountHomeError};
 
 use crate::MissingRelayListKind;
+use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
+
+/// Worker-safe account catch-up failure. The human-facing message remains for
+/// compatibility, while telemetry propagation uses only the closed
+/// classification value.
+#[derive(Clone, Debug)]
+pub struct AccountCatchUpFailure {
+    message: String,
+    classification: SyncFailureClassification,
+}
+
+impl AccountCatchUpFailure {
+    pub fn new(message: String, classification: SyncFailureClassification) -> Self {
+        Self {
+            message,
+            classification,
+        }
+    }
+
+    pub(crate) const fn classification(&self) -> SyncFailureClassification {
+        self.classification
+    }
+}
+
+impl std::fmt::Display for AccountCatchUpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -71,7 +100,7 @@ pub enum AppError {
     /// failures were once wrapped as relay-directory errors, which sent an
     /// earlier investigation chasing the wrong subsystem.
     #[error("account catch-up failed: {0}")]
-    AccountCatchUp(String),
+    AccountCatchUp(AccountCatchUpFailure),
     #[error("invalid Nostr public key")]
     InvalidPublicKey,
     #[error("this operation does not accept a private key")]
@@ -258,6 +287,27 @@ impl AppError {
         }
     }
 
+    /// Broad, bounded cause derived only from typed variants.
+    pub(crate) fn sync_error_class(&self) -> SyncErrorClass {
+        match self {
+            Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) => SyncErrorClass::Storage,
+            Self::Session(error) => session_error_class(error),
+            Self::Account(error) => account_sync_error_class(error),
+            Self::Transport(error) => transport_error_class(error),
+            Self::RelayDirectory(_) => SyncErrorClass::RelayDirectory,
+            Self::AccountCatchUp(error) => error.classification().error_class,
+            Self::AccountWorkerResponseTimedOut => SyncErrorClass::Timeout,
+            Self::TransportClosed => SyncErrorClass::TransportClosed,
+            Self::RuntimeStopping | Self::ExternalSignerRejected => SyncErrorClass::Cancelled,
+            Self::Json(_)
+            | Self::Hex(_)
+            | Self::InvalidAppMessagePayload(_)
+            | Self::InvalidNostrRouting(_)
+            | Self::InvalidKeyPackageEvent(_) => SyncErrorClass::Protocol,
+            _ => SyncErrorClass::Unknown,
+        }
+    }
+
     pub fn as_engine_error(&self) -> Option<&cgka_traits::error::EngineError> {
         match self {
             Self::Account(marmot_account::AccountError::Engine(err))
@@ -267,6 +317,59 @@ impl AppError {
             | Self::Session(cgka_session::SessionError::Engine(err)) => Some(err),
             _ => None,
         }
+    }
+}
+
+fn transport_error_class(error: &TransportAdapterError) -> SyncErrorClass {
+    match error {
+        TransportAdapterError::Timeout => SyncErrorClass::Timeout,
+        TransportAdapterError::Closed => SyncErrorClass::TransportClosed,
+        TransportAdapterError::InvalidInboundEncoding
+        | TransportAdapterError::InvalidInboundSignature
+        | TransportAdapterError::PublishTargetMismatch { .. } => SyncErrorClass::Protocol,
+        _ => SyncErrorClass::Unknown,
+    }
+}
+
+fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
+    match error {
+        AccountError::Session(error) => session_error_class(error),
+        AccountError::Engine(error) => engine_error_class(error),
+        AccountError::Transport(error) => transport_error_class(error),
+        AccountError::TransportRouting(_) | AccountError::WrongAccountDelivery => {
+            SyncErrorClass::Protocol
+        }
+        _ => SyncErrorClass::Unknown,
+    }
+}
+
+fn session_error_class(error: &cgka_session::SessionError) -> SyncErrorClass {
+    match error {
+        cgka_session::SessionError::Storage(_) => SyncErrorClass::Storage,
+        cgka_session::SessionError::Engine(error) => engine_error_class(error),
+    }
+}
+
+fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass {
+    use cgka_traits::error::{EngineError, PeelerError};
+
+    match error {
+        EngineError::Storage(_) => SyncErrorClass::Storage,
+        EngineError::Peeler(
+            PeelerError::DecryptFailed
+            | PeelerError::MissingContext { .. }
+            | PeelerError::InvalidSignature,
+        ) => SyncErrorClass::Crypto,
+        EngineError::Peeler(_)
+        | EngineError::InvalidCredentialIdentity(_)
+        | EngineError::InvalidAppMessagePayload(_)
+        | EngineError::InvalidAccountIdentityProof(_)
+        | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::InvalidWelcome
+        | EngineError::Serialize(_)
+        | EngineError::ForkedEpoch { .. }
+        | EngineError::InvalidTransition(_) => SyncErrorClass::Protocol,
+        _ => SyncErrorClass::Unknown,
     }
 }
 
@@ -326,7 +429,8 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::AppError;
+    use super::{AccountCatchUpFailure, AppError};
+    use crate::SyncFailureClassification;
 
     // Kind strings leave the runtime: `account_error_message` interpolates
     // them into messages the CLI daemon persists and host apps log. Pin the
@@ -334,7 +438,10 @@ mod tests {
     // the label operators will grep for after the RelayDirectory mislabel.
     #[test]
     fn account_catch_up_kind_is_stable() {
-        let err = AppError::AccountCatchUp("runtime catch-up failed: account_session".into());
+        let err = AppError::AccountCatchUp(AccountCatchUpFailure::new(
+            "runtime catch-up failed: account_session".into(),
+            SyncFailureClassification::UNKNOWN,
+        ));
         assert_eq!(err.privacy_safe_kind(), "account_catch_up");
         assert_eq!(
             err.to_string(),
