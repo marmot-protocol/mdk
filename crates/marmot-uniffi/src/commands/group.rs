@@ -11,12 +11,13 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
-    AppGroupRecordFfi, AppQuarantinedGroupFfi, DisbandRequestFfi, GroupDetailsFfi,
-    GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
+    AppGroupRecordFfi, AppQuarantinedGroupFfi, DisbandRequestFfi, GroupConversationSnapshotFfi,
+    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi,
+    GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
     KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
-    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
-    group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
+    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
+    group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
+    group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -45,45 +46,14 @@ pub(crate) async fn group_details_for(
     kit: &Marmot,
     account_ref: &str,
     group_id: &GroupId,
-    group_id_hex: &str,
 ) -> Result<GroupDetailsFfi, MarmotKitError> {
     let started_at = Instant::now();
     let result = async {
-        let account = kit.runtime.accounts().resolve(account_ref)?;
-        let group = kit
-            .app
-            .group(&account.label, group_id_hex)?
-            .ok_or_else(|| MarmotKitError::UnknownGroup {
-                group_id_hex: group_id_hex.to_string(),
-            })?;
-        let group = AppGroupRecordFfi::from(group);
-        let members = kit
+        let snapshot = kit
             .runtime
-            .group_members(account_ref, group_id)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<AppGroupMemberRecordFfi>>();
-        let member_ids = members
-            .iter()
-            .map(|member| member.member_id_hex.clone())
-            .collect::<Vec<_>>();
-        let display_names = kit
-            .runtime
-            .display_names_for_account_ids(&member_ids)
-            .unwrap_or_default();
-        let mls_state = kit
-            .runtime
-            .group_mls_state(account_ref, group_id)
-            .await?
-            .into();
-        group_details_ffi(
-            group,
-            members,
-            mls_state,
-            &account.account_id_hex,
-            display_names,
-        )
+            .group_conversation_snapshot(account_ref, group_id)
+            .await?;
+        group_details_from_conversation_snapshot_ffi(snapshot)
     }
     .await;
     kit.runtime
@@ -91,14 +61,35 @@ pub(crate) async fn group_details_for(
     result
 }
 
+pub(crate) async fn group_conversation_snapshot_for(
+    kit: &Marmot,
+    account_ref: &str,
+    group_id: &GroupId,
+) -> Result<GroupConversationSnapshotFfi, MarmotKitError> {
+    let started_at = Instant::now();
+    let result = async {
+        let snapshot = kit
+            .runtime
+            .group_conversation_snapshot(account_ref, group_id)
+            .await?;
+        let my_account_id_hex = snapshot.my_account_id_hex.clone();
+        let details = group_details_from_conversation_snapshot_ffi(snapshot)?;
+        Ok(group_conversation_snapshot_ffi(&my_account_id_hex, details))
+    }
+    .await;
+    kit.runtime
+        .record_group_conversation_snapshot_read(started_at.elapsed(), result.is_ok());
+    result
+}
+
 pub(crate) async fn group_management_state_for(
     kit: &Marmot,
     account_ref: &str,
     group_id: &GroupId,
-    group_id_hex: &str,
+    _group_id_hex: &str,
 ) -> Result<GroupManagementStateFfi, MarmotKitError> {
     let account = kit.runtime.accounts().resolve(account_ref)?;
-    let details = group_details_for(kit, account_ref, group_id, group_id_hex).await?;
+    let details = group_details_for(kit, account_ref, group_id).await?;
     Ok(group_management_state_ffi(
         &account.account_id_hex,
         &details,
@@ -109,11 +100,11 @@ pub(crate) async fn group_mutation_result_for(
     kit: &Marmot,
     account_ref: &str,
     group_id: &GroupId,
-    group_id_hex: &str,
+    _group_id_hex: &str,
     summary: SendSummaryFfi,
 ) -> Result<GroupMutationResultFfi, MarmotKitError> {
     let account = kit.runtime.accounts().resolve(account_ref)?;
-    let details = group_details_for(kit, account_ref, group_id, group_id_hex).await?;
+    let details = group_details_for(kit, account_ref, group_id).await?;
     let management_state = group_management_state_ffi(&account.account_id_hex, &details);
     Ok(GroupMutationResultFfi {
         summary,
@@ -360,8 +351,20 @@ impl Marmot {
         group_id_hex: String,
     ) -> Result<GroupDetailsFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
-        let group_id_hex = hex::encode(group_id.as_slice());
-        group_details_for(self, &account_ref, &group_id, &group_id_hex).await
+        group_details_for(self, &account_ref, &group_id).await
+    }
+
+    /// Group details and management state captured for conversation loading in
+    /// one worker command. The authoritative group record, roster, and MLS
+    /// state share one session/snapshot frontier; management state is derived
+    /// from those exact returned details without another await.
+    pub async fn group_conversation_snapshot(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupConversationSnapshotFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        group_conversation_snapshot_for(self, &account_ref, &group_id).await
     }
 
     /// Lightweight membership roster projection for membership screens.
@@ -1019,7 +1022,120 @@ impl Marmot {
 
 #[cfg(test)]
 mod tests {
+    use cgka_traits::TransportEndpoint;
+    use marmot_app::{AccountSetupRequest, MarmotApp};
+    use nostr_relay_builder::MockRelay;
+
     use super::*;
+
+    #[test]
+    fn group_conversation_snapshot_round_trips_shape_and_errors() {
+        let test_thread = std::thread::Builder::new()
+            .name("ffi-group-conversation-snapshot".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(group_conversation_snapshot_round_trip_body());
+            })
+            .unwrap();
+        test_thread.join().unwrap();
+    }
+
+    async fn group_conversation_snapshot_round_trip_body() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url);
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+        let account_ref = account.account.account_id_hex;
+        let group_id_hex = kit
+            .create_group(
+                account_ref.clone(),
+                "Snapshot test".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("create group");
+
+        let details = kit
+            .group_details(account_ref.clone(), group_id_hex.clone())
+            .await
+            .expect("individual details");
+        let management = kit
+            .group_management_state(account_ref.clone(), group_id_hex.clone())
+            .await
+            .expect("individual management state");
+        let before = kit.app_performance_snapshot();
+        let snapshot = kit
+            .group_conversation_snapshot(account_ref.clone(), group_id_hex.clone())
+            .await
+            .expect("combined conversation snapshot");
+
+        assert_eq!(
+            snapshot.details.group.group_id_hex,
+            details.group.group_id_hex
+        );
+        assert_eq!(snapshot.details.group.name, details.group.name);
+        assert_eq!(snapshot.details.group.admins, details.group.admins);
+        assert_eq!(snapshot.details.mls_state.epoch, details.mls_state.epoch);
+        assert_eq!(snapshot.details.members.len(), details.members.len());
+        assert_eq!(
+            snapshot.management_state.my_account_id_hex,
+            management.my_account_id_hex
+        );
+        assert_eq!(
+            snapshot.management_state.is_self_admin,
+            management.is_self_admin
+        );
+        assert_eq!(
+            snapshot.management_state.member_actions.len(),
+            snapshot.details.members.len()
+        );
+
+        let unknown = kit
+            .group_conversation_snapshot(account_ref.clone(), "00".to_owned())
+            .await
+            .expect_err("unknown group must retain typed error mapping");
+        assert!(matches!(unknown, MarmotKitError::UnknownGroup { .. }));
+
+        let after = kit.app_performance_snapshot();
+        assert_eq!(
+            after.group_conversation_snapshot_read.attempts,
+            before.group_conversation_snapshot_read.attempts + 2
+        );
+        assert_eq!(
+            after.group_conversation_snapshot_read.successes,
+            before.group_conversation_snapshot_read.successes + 1
+        );
+        assert_eq!(
+            after.group_conversation_snapshot_read.failures,
+            before.group_conversation_snapshot_read.failures + 1
+        );
+
+        kit.runtime.shutdown().await;
+        let stopped = kit
+            .group_conversation_snapshot(account_ref, group_id_hex)
+            .await
+            .expect_err("stopped account must retain typed error mapping");
+        assert!(matches!(stopped, MarmotKitError::RuntimeStopping));
+    }
 
     fn state(self_admin: bool, last_admin: bool) -> GroupManagementStateFfi {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";

@@ -73,6 +73,30 @@ import MarmotKit
 // Referencing the generated public object proves the source and binary headers
 // are the matching UniFFI surface. The dynamic product forces a final link.
 public func acceptMarmotForLinkValidation(_ marmot: Marmot) {}
+
+// Compile the combined conversation-loading API, both result projections, and
+// the typed MarmotKit error path so generated Swift cannot silently drift from
+// the Rust record or async method shape (mdk#1490).
+public func loadConversationSnapshot(
+    _ marmot: Marmot,
+    accountRef: String,
+    groupIdHex: String
+) async throws -> GroupConversationSnapshotFfi {
+    do {
+        let snapshot = try await marmot.groupConversationSnapshot(
+            accountRef: accountRef,
+            groupIdHex: groupIdHex
+        )
+        _ = snapshot.details.group.groupIdHex
+        _ = snapshot.details.members
+        _ = snapshot.details.mlsState.epoch
+        _ = snapshot.managementState.myAccountIdHex
+        _ = snapshot.managementState.memberActions
+        return snapshot
+    } catch let error as MarmotKitError {
+        throw error
+    }
+}
 EOF
 
 (

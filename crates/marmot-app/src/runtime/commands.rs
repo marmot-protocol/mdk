@@ -20,12 +20,12 @@ use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
-    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
-    AppQuarantinedGroup, GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary,
+    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppGroupRoster, AppQuarantinedGroup, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MaintenanceRunSummary, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
@@ -306,6 +306,28 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<AppGroupRoster, AppError> {
+        let snapshot = self
+            .group_conversation_snapshot(account_ref, group_id)
+            .await?;
+        Ok(crate::groups::app_group_roster_from_session(
+            crate::groups::AppGroupRosterSession {
+                group_record: snapshot.group,
+                members: snapshot.members,
+                mls_state: snapshot.mls_state,
+            },
+            &snapshot.my_account_id_hex,
+            snapshot.display_names,
+        ))
+    }
+
+    /// Capture the group record, member projection, and MLS state in one
+    /// account-worker command, then enrich member display names without an
+    /// await or worker queue re-entry.
+    pub async fn group_conversation_snapshot(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupConversationSnapshot, AppError> {
         let account = self.resolve(account_ref)?;
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -328,11 +350,13 @@ impl AccountManager {
             .app
             .display_names_for_account_ids(&member_ids)
             .unwrap_or_default();
-        Ok(crate::groups::app_group_roster_from_session(
-            session,
-            &account.account_id_hex,
+        Ok(AppGroupConversationSnapshot {
+            my_account_id_hex: account.account_id_hex,
+            group: session.group_record,
+            members: session.members,
+            mls_state: session.mls_state,
             display_names,
-        ))
+        })
     }
 
     pub async fn enable_group_disbanding(
