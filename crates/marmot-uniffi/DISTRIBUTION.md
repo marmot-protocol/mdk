@@ -143,7 +143,9 @@ The archive has a `marmotkit-android-<identifier>` root containing:
 
 Verify the archive against its sibling `.sha256` before extracting it. Update the generated Kotlin helpers and all
 JNI ABI libraries together; mixing identifiers can cross an incompatible UniFFI ABI. The manifest records both the
-exact packaged source SHA and the workflow builder SHA.
+exact packaged source SHA and the workflow builder SHA. Its ordered `contents` contract lists the generated UniFFI
+Kotlin source and JNI libraries; the two required hand-written initialization helpers remain validated archive
+payloads but do not change that existing consumer-facing API contract.
 
 ## Publishing
 

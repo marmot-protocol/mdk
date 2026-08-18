@@ -381,6 +381,13 @@ jobs:
             "jniLibs/x86/libmarmot_uniffi.so"
             "jniLibs/x86_64/libmarmot_uniffi.so"
           )
+          manifest_contents=(
+            "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt"
+            "jniLibs/arm64-v8a/libmarmot_uniffi.so"
+            "jniLibs/armeabi-v7a/libmarmot_uniffi.so"
+            "jniLibs/x86/libmarmot_uniffi.so"
+            "jniLibs/x86_64/libmarmot_uniffi.so"
+          )
 
           rm -rf "$stage_parent" "$asset" "$asset.sha256"
           mkdir -p "$bundle_dir"
@@ -409,8 +416,6 @@ jobs:
             "android_api": "${ANDROID_API:-26}",
             "contents": [
               "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
-              "kotlin/dev/ipf/marmotkit/MarmotAndroid.kt",
-              "kotlin/io/crates/keyring/Keyring.kt",
               "jniLibs/arm64-v8a/libmarmot_uniffi.so",
               "jniLibs/armeabi-v7a/libmarmot_uniffi.so",
               "jniLibs/x86/libmarmot_uniffi.so",
@@ -435,6 +440,17 @@ jobs:
           fi
           mapfile -t declared_contents < <(jq -r '.contents[]' <<< "$manifest")
 
+          if (( ${#declared_contents[@]} != ${#manifest_contents[@]} )); then
+            echo "error: Android manifest contents do not match the consumer contract" >&2
+            exit 1
+          fi
+          for index in "${!manifest_contents[@]}"; do
+            if [[ "${declared_contents[$index]}" != "${manifest_contents[$index]}" ]]; then
+              echo "error: Android manifest contents do not match the consumer contract" >&2
+              exit 1
+            fi
+          done
+
           for entry in "${declared_contents[@]}"; do
             if [[ "$entry" == /* || "$entry" == ".." || "$entry" == ../* || "$entry" == */../* || "$entry" == */.. ]]; then
               echo "error: Android manifest contains unsafe path: $entry" >&2
@@ -442,13 +458,6 @@ jobs:
             fi
             if ! grep -Fqx "$bundle_root/$entry" <<< "$archive_entries"; then
               echo "error: Android manifest declares missing archive entry: $entry" >&2
-              exit 1
-            fi
-          done
-
-          for entry in "${required_contents[@]}"; do
-            if ! printf '%s\n' "${declared_contents[@]}" | grep -Fqx "$entry"; then
-              echo "error: Android manifest omits required archive entry: $entry" >&2
               exit 1
             fi
           done
