@@ -128,6 +128,35 @@ fn scheduled_workflows_collect_and_enforce_lane_observations() {
 }
 
 #[test]
+fn process_orchestrator_coverage_runs_outside_the_parallel_simulator_suites() {
+    let justfile = include_str!("../../../Justfile");
+    let dedicated_filter = justfile
+        .lines()
+        .find(|line| line.starts_with("simulator-dedicated-filter :="))
+        .expect("simulator dedicated filter");
+    assert!(
+        dedicated_filter.contains("not binary(process_orchestrator)"),
+        "the subprocess-heavy process suite must not compete with parallel simulator tests"
+    );
+
+    let smoke = recipe_body(justfile, "simulator-smoke");
+    assert!(
+        smoke.contains(
+            "cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci"
+        ),
+        "PR smoke coverage must retain a dedicated process-orchestrator pass"
+    );
+
+    let nightly = recipe_body(justfile, "convergence-nightly-lane");
+    assert!(
+        nightly.contains(
+            "cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked"
+        ),
+        "nightly coverage must retain a dedicated process-orchestrator pass"
+    );
+}
+
+#[test]
 fn release_workflow_builds_exact_ancestor_image_and_verifies_one_bundle() {
     let hardening = include_str!("../../../.github/workflows/convergence-hardening.yml");
     for contract in [
@@ -163,6 +192,16 @@ fn assert_artifact_retention(workflow: &str, artifact_name: &str, expected: &str
         artifact_step.contains(&format!("retention-days: {expected}")),
         "artifact {artifact_name} retention does not match lane policy {expected}"
     );
+}
+
+fn recipe_body<'a>(justfile: &'a str, recipe: &str) -> &'a str {
+    justfile
+        .split_once(&format!("\n{recipe}:"))
+        .unwrap_or_else(|| panic!("Justfile is missing recipe {recipe}"))
+        .1
+        .split("\n\n")
+        .next()
+        .expect("recipe has a body")
 }
 
 #[test]

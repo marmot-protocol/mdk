@@ -1390,9 +1390,20 @@ fn process_cli_failure_report_keeps_capsules_after_exit() {
         .arg(&report_path)
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "controlled failure unexpectedly succeeded; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report_bytes = std::fs::read(&report_path).unwrap_or_else(|error| {
+        panic!(
+            "process CLI did not write its failure report: status={} read_error={error}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
     let report: cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1 =
-        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        serde_json::from_slice(&report_bytes).unwrap();
     assert!(!report.completed, "{report:#?}");
     let failed = report
         .actions
