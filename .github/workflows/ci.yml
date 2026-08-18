@@ -465,10 +465,29 @@ jobs:
           persist-credentials: false
 
       - name: Install system dependencies
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3 python3-venv git
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=15s 180s apt-get \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              update; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              echo "apt-get update failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "apt-get update attempt $attempt failed; retrying" >&2
+          done
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 \
+            install -y --no-install-recommends python3 python3-venv git
 
       - name: Install uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
