@@ -316,11 +316,7 @@ impl TuiApp {
                 }
             }
             Screen::MessageSearch => {
-                if let Some(view) = self.message_search.as_mut()
-                    && view.focus == MessageSearchFocus::Query
-                {
-                    view.query.insert_str(&text);
-                }
+                self.edit_message_search_query(|query| query.insert_str(&text))
             }
             _ => {}
         }
@@ -1766,25 +1762,43 @@ impl TuiApp {
                     view.focus = MessageSearchFocus::Results;
                 }
             }
-            KeyCode::Left => self.with_message_search_query(Input::left),
-            KeyCode::Right => self.with_message_search_query(Input::right),
-            KeyCode::Home => self.with_message_search_query(Input::home),
-            KeyCode::End => self.with_message_search_query(Input::end),
-            KeyCode::Delete => self.with_message_search_query(Input::delete),
-            KeyCode::Backspace => self.with_message_search_query(Input::backspace),
+            KeyCode::Left => self.edit_message_search_query(Input::left),
+            KeyCode::Right => self.edit_message_search_query(Input::right),
+            KeyCode::Home => self.edit_message_search_query(Input::home),
+            KeyCode::End => self.edit_message_search_query(Input::end),
+            KeyCode::Delete => self.edit_message_search_query(Input::delete),
+            KeyCode::Backspace => self.edit_message_search_query(Input::backspace),
             KeyCode::Char(character) => {
-                if let Some(view) = self.message_search.as_mut() {
-                    view.query.insert(character);
-                }
+                self.edit_message_search_query(|query| query.insert(character));
             }
             _ => {}
         }
     }
 
-    fn with_message_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
-        if let Some(view) = self.message_search.as_mut() {
-            edit(&mut view.query);
+    /// The single seam every message-search query edit goes through, so no edit can
+    /// leave hits, a count, or an in-flight page answering a query the screen no
+    /// longer shows. Cursor moves come through here too and change nothing:
+    /// [`MessageSearchView::edit_query`] invalidates on the text, not on the key.
+    ///
+    /// Edits apply only while the query has focus, because the hit list's keys are
+    /// navigation. Holding that here rather than at each call site makes this safe
+    /// to call from anywhere a character can arrive, including a paste.
+    fn edit_message_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
+        let Some(view) = self
+            .message_search
+            .as_mut()
+            .filter(|view| view.focus == MessageSearchFocus::Query)
+        else {
+            return;
+        };
+        if !view.edit_query(edit) {
+            return;
         }
+        // Same reasoning as `leave_screen`: clearing the anchor drops the outstanding
+        // page at fold time, and the status it stranded ("searching...", "N
+        // match(es)") described the query that just went away.
+        self.searching_messages = None;
+        self.status = String::new();
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the

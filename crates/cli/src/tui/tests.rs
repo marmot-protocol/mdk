@@ -10315,17 +10315,135 @@ fn a_short_message_search_page_reports_an_exact_count() {
     );
 }
 
+/// A message search for `deploy` with its one-hit page still outstanding. A test
+/// that wants the settled screen adds a `settle_effects(1)`; one that types
+/// during the flight does not.
+fn message_search_in_flight() -> (tempfile::TempDir, TuiApp) {
+    let (dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}]}}}}"#,
+        timeline_hit_json("m1", "bob", "the deploy is green", 1_700_000_000)
+    ));
+    let mut app = app_with_open_chat(client, &[("m1", "the deploy is green")]);
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    (dir, app)
+}
+
+#[test]
+fn editing_a_settled_message_search_query_drops_the_hits_it_answered() {
+    let (_dir, mut app) = message_search_in_flight();
+    app.settle_effects(1);
+    app.handle_key(char_key('i')).expect("back to the query");
+
+    for character in "ment".chars() {
+        app.handle_key(char_key(character)).expect("append");
+    }
+
+    let view = app.message_search.as_ref().expect("view");
+    assert_eq!(view.query.value(), "deployment");
+    assert!(
+        view.results.is_empty(),
+        "hits for `deploy` do not sit under the query `deployment`"
+    );
+    assert_eq!(view.selected, 0, "nor does a selection into them");
+    assert!(!view.truncated, "nor the old page's truncation");
+    assert!(
+        app.status.is_empty(),
+        "nor a count describing the old query; got: {:?}",
+        app.status
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .expect("down");
+    assert_eq!(
+        app.message_search.as_ref().expect("view").focus,
+        MessageSearchFocus::Query,
+        "there is no list to step into"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(
+        app.searching_messages.as_deref(),
+        Some("deployment"),
+        "and Enter runs the query the screen shows"
+    );
+}
+
+#[test]
+fn moving_the_message_search_cursor_keeps_a_settled_hit_list() {
+    let (_dir, mut app) = message_search_in_flight();
+    app.settle_effects(1);
+    let count = app.status.clone();
+    app.handle_key(char_key('i')).expect("back to the query");
+
+    // `Home` then `Backspace`, and `End` then `Delete`, are the keys that mutate on
+    // any other cursor position and change nothing here. Invalidating on the key
+    // rather than on the text would throw the hits away on both.
+    for code in [
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Home,
+        KeyCode::Backspace,
+        KeyCode::End,
+        KeyCode::Delete,
+    ] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            .expect("cursor key");
+    }
+
+    let view = app.message_search.as_ref().expect("view");
+    assert_eq!(view.query.value(), "deploy", "the text is untouched");
+    assert_eq!(view.results.len(), 1, "so the hits stay");
+    assert_eq!(app.status, count, "and so does the count");
+}
+
+#[test]
+fn editing_the_query_drops_an_in_flight_message_search_page() {
+    let (_dir, mut app) = message_search_in_flight();
+    assert_eq!(app.searching_messages.as_deref(), Some("deploy"));
+
+    for character in "ment".chars() {
+        app.handle_key(char_key(character)).expect("append");
+    }
+    app.settle_effects(1);
+
+    let view = app.message_search.as_ref().expect("view");
+    assert!(
+        view.results.is_empty(),
+        "the page for `deploy` does not land under `deployment`"
+    );
+    assert_eq!(
+        view.focus,
+        MessageSearchFocus::Query,
+        "and a landing page cannot yank focus out of the query mid-word"
+    );
+}
+
+#[test]
+fn pasting_into_the_message_search_query_invalidates_like_typing() {
+    let (_dir, mut app) = message_search_in_flight();
+    app.settle_effects(1);
+    app.handle_key(char_key('i')).expect("back to the query");
+
+    app.handle_paste("ment".to_owned());
+
+    let view = app.message_search.as_ref().expect("view");
+    assert_eq!(view.query.value(), "deployment");
+    assert!(view.results.is_empty(), "a paste is an edit like any other");
+}
+
 #[test]
 fn a_stale_message_search_result_for_a_superseded_query_is_dropped() {
-    let (_dir, client) = test_json_client(&format!(
-        r#"{{"ok":true,"result":{{"messages":[{}]}}}}"#,
-        timeline_hit_json("m1", "bob", "stale hit", 1_700_000_000)
-    ));
-    let mut app = app_with_open_chat(client, &[("m1", "stale hit")]);
-    app.open_message_search(Some("first".to_owned()))
-        .expect("open search");
-    // A second query supersedes the first before its page lands.
-    app.searching_messages = Some("second".to_owned());
+    let (_dir, mut app) = message_search_in_flight();
+    // Supersede the first query the way a user does — by editing and re-running it
+    // — rather than by assigning the anchor. The anchor comparison in the fold is
+    // only worth anything if an edit actually moves the anchor.
+    for character in "ment".chars() {
+        app.handle_key(char_key(character)).expect("append");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("run the new query");
+    // Effects run in order, so this is the first search's page landing second.
     app.settle_effects(1);
 
     assert!(
@@ -10338,7 +10456,7 @@ fn a_stale_message_search_result_for_a_superseded_query_is_dropped() {
     );
     assert_eq!(
         app.searching_messages.as_deref(),
-        Some("second"),
+        Some("deployment"),
         "and the outstanding query is left alone"
     );
 }

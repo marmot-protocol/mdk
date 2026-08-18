@@ -1403,6 +1403,28 @@ pub(crate) struct MessageSearchView {
 }
 
 impl MessageSearchView {
+    /// Apply an edit to the query, dropping the hits when the text changes.
+    ///
+    /// `results`, `truncated`, and `selected` all describe the query they were
+    /// fetched for, so carrying them past an edit would leave a hit list under a
+    /// query it does not answer — and `Down`/`Enter` would still jump into it.
+    /// Dropping them holds one invariant: the list on screen answers the query on
+    /// screen, or there is no list. Keying off the text rather than off the keys
+    /// that usually mutate is what leaves a settled list alone through a cursor
+    /// move, a `Backspace` at the start, and a `Delete` at the end.
+    ///
+    /// Returns whether the text changed, so the caller can drop the app-side state
+    /// describing the same superseded query.
+    pub(crate) fn edit_query(&mut self, edit: impl FnOnce(&mut Input)) -> bool {
+        if !self.query.edit(edit) {
+            return false;
+        }
+        self.results.clear();
+        self.truncated = false;
+        self.selected = 0;
+        true
+    }
+
     /// The match count as shown: `12` when the page is complete, `100+` when hits
     /// remain beyond the page. One place, so the status line and the list header
     /// cannot disagree about how many matches there are.
@@ -2002,6 +2024,16 @@ impl Input {
     /// The cursor position as a char index in `0..=char_count`.
     pub(crate) fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// Apply `edit` and report whether the text changed. Cursor moves report
+    /// `false`, and so do no-op edits (`Backspace` at the start, `Delete` at the
+    /// end, an empty paste), so a caller can hang invalidation off the text instead
+    /// of off the key that produced it.
+    pub(crate) fn edit(&mut self, edit: impl FnOnce(&mut Self)) -> bool {
+        let before = self.value.clone();
+        edit(self);
+        self.value != before
     }
 
     pub(crate) fn set_masked(&mut self, masked: bool) {
