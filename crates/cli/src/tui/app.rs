@@ -306,15 +306,9 @@ impl TuiApp {
         match self.screen {
             Screen::Login(LoginMode::NsecEntry) => self.input.insert_str(&text),
             Screen::Main if self.focus == Focus::Composer => self.input.insert_str(&text),
-            // Paste into a search query only while it has focus, mirroring where
-            // typed characters are accepted on those screens.
-            Screen::UserSearch => {
-                if let Some(view) = self.user_search.as_mut()
-                    && view.focus == UserSearchFocus::Query
-                {
-                    view.query.insert_str(&text);
-                }
-            }
+            // Both funnels accept an edit only while the query has focus, mirroring
+            // where typed characters are accepted on those screens.
+            Screen::UserSearch => self.edit_user_search_query(|query| query.insert_str(&text)),
             Screen::MessageSearch => {
                 self.edit_message_search_query(|query| query.insert_str(&text))
             }
@@ -1917,25 +1911,33 @@ impl TuiApp {
                     view.focus = UserSearchFocus::Results;
                 }
             }
-            KeyCode::Left => self.with_search_query(Input::left),
-            KeyCode::Right => self.with_search_query(Input::right),
-            KeyCode::Home => self.with_search_query(Input::home),
-            KeyCode::End => self.with_search_query(Input::end),
-            KeyCode::Delete => self.with_search_query(Input::delete),
-            KeyCode::Backspace => self.with_search_query(Input::backspace),
+            KeyCode::Left => self.edit_user_search_query(Input::left),
+            KeyCode::Right => self.edit_user_search_query(Input::right),
+            KeyCode::Home => self.edit_user_search_query(Input::home),
+            KeyCode::End => self.edit_user_search_query(Input::end),
+            KeyCode::Delete => self.edit_user_search_query(Input::delete),
+            KeyCode::Backspace => self.edit_user_search_query(Input::backspace),
             KeyCode::Char(character) => {
-                if let Some(view) = self.user_search.as_mut() {
-                    view.query.insert(character);
-                }
+                self.edit_user_search_query(|query| query.insert(character));
             }
             _ => {}
         }
     }
 
-    fn with_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
-        if let Some(view) = self.user_search.as_mut() {
-            edit(&mut view.query);
+    /// The user-search mirror of [`Self::edit_message_search_query`].
+    fn edit_user_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
+        let Some(view) = self
+            .user_search
+            .as_mut()
+            .filter(|view| view.focus == UserSearchFocus::Query)
+        else {
+            return;
+        };
+        if !view.edit_query(edit) {
+            return;
         }
+        self.searching_users = None;
+        self.status = String::new();
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the

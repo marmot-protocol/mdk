@@ -11389,6 +11389,113 @@ fn a_re_search_after_following_badges_the_row_from_the_follows_snapshot() {
     );
 }
 
+/// A user search for `bob` with its one-result page still outstanding, the
+/// user-search mirror of [`message_search_in_flight`].
+fn user_search_in_flight() -> (tempfile::TempDir, TuiApp) {
+    let (dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"users":[{"account_id_hex":"bb","npub":"npubbb","radius":1,"matched_field":"name","match_quality":"prefix","profile":{"display_name":"Bob"}}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.open_user_search(Some("bob".to_owned()));
+    (dir, app)
+}
+
+#[test]
+fn editing_a_settled_user_search_query_drops_the_results_it_answered() {
+    // It matters more here than on message search: the results-focus keys publish
+    // follows (`f`/`x`) and open chat popups (`c`/`a`), so a row left under a query
+    // it does not answer is not just misread, it is acted on.
+    let (_dir, mut app) = user_search_in_flight();
+    app.settle_effects(1);
+    assert_eq!(app.user_search.as_ref().expect("view").results.len(), 1);
+    app.handle_key(char_key('i')).expect("back to the query");
+
+    for character in "by".chars() {
+        app.handle_key(char_key(character)).expect("append");
+    }
+
+    let view = app.user_search.as_ref().expect("view");
+    assert_eq!(view.query.value(), "bobby");
+    assert!(
+        view.results.is_empty(),
+        "results for `bob` do not sit under the query `bobby`"
+    );
+    assert_eq!(view.selected, 0, "nor does a selection into them");
+    assert!(
+        app.status.is_empty(),
+        "nor a count describing the old query; got: {:?}",
+        app.status
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(
+        app.searching_users.as_deref(),
+        Some("bobby"),
+        "and Enter runs the query the screen shows"
+    );
+}
+
+#[test]
+fn moving_the_user_search_cursor_keeps_a_settled_result_list() {
+    let (_dir, mut app) = user_search_in_flight();
+    app.settle_effects(1);
+    let count = app.status.clone();
+    app.handle_key(char_key('i')).expect("back to the query");
+
+    for code in [
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Home,
+        KeyCode::Backspace,
+        KeyCode::End,
+        KeyCode::Delete,
+    ] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            .expect("cursor key");
+    }
+
+    let view = app.user_search.as_ref().expect("view");
+    assert_eq!(view.query.value(), "bob", "the text is untouched");
+    assert_eq!(view.results.len(), 1, "so the results stay");
+    assert_eq!(app.status, count, "and so does the count");
+}
+
+#[test]
+fn editing_the_query_drops_an_in_flight_user_search_page() {
+    let (_dir, mut app) = user_search_in_flight();
+    assert_eq!(app.searching_users.as_deref(), Some("bob"));
+
+    for character in "by".chars() {
+        app.handle_key(char_key(character)).expect("append");
+    }
+    app.settle_effects(1);
+
+    let view = app.user_search.as_ref().expect("view");
+    assert!(
+        view.results.is_empty(),
+        "the page for `bob` does not land under `bobby`"
+    );
+    assert_eq!(
+        view.focus,
+        UserSearchFocus::Query,
+        "and a landing page cannot yank focus out of the query mid-word"
+    );
+}
+
+#[test]
+fn pasting_into_the_user_search_query_invalidates_like_typing() {
+    let (_dir, mut app) = user_search_in_flight();
+    app.settle_effects(1);
+    app.handle_key(char_key('i')).expect("back to the query");
+
+    app.handle_paste("by".to_owned());
+
+    let view = app.user_search.as_ref().expect("view");
+    assert_eq!(view.query.value(), "bobby");
+    assert!(view.results.is_empty(), "a paste is an edit like any other");
+}
+
 #[test]
 fn a_stale_user_search_result_for_a_superseded_query_is_dropped() {
     let account_id = "aa".repeat(32);

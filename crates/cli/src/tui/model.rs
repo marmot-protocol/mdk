@@ -1477,6 +1477,19 @@ impl Default for UserSearchView {
 }
 
 impl UserSearchView {
+    /// Mirrors [`MessageSearchView::edit_query`]: the results, and the selection
+    /// into them, answer the query they were fetched for, so a text change drops
+    /// them. The stakes are higher here — the results-focus keys publish follows and
+    /// open chat popups, so a row under the wrong query is acted on, not just read.
+    pub(crate) fn edit_query(&mut self, edit: impl FnOnce(&mut Input)) -> bool {
+        if !self.query.edit(edit) {
+            return false;
+        }
+        self.results.clear();
+        self.selected = 0;
+        true
+    }
+
     pub(crate) fn select_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }

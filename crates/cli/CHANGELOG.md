@@ -156,6 +156,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   event woke them.
   ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
 
+- `wn tui` user search no longer leaves results under a query they do not answer.
+  Editing the query after results landed used to keep the old rows, their count,
+  and the highlight on screen, so `f`/`x` published a follow for whoever the
+  previous query had found and `c`/`a` opened a chat with them. An edit now clears
+  the results, and a page still in flight for the abandoned query is dropped
+  instead of landing — and taking focus mid-word with it. Moving the cursor, and
+  editing that changes nothing, still keep the results.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
+
 - `wn tui` group detail can now reach its relay hints. They sit below the member
   list, so a group with more members than the pane is tall left them permanently
   off-screen; moving the selection to the last member now scrolls to the end of
