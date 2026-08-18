@@ -221,6 +221,9 @@ pub mod metric_names {
         "app_account_initial_key_package_publish_successes";
     pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_FAILURES: &str =
         "app_account_initial_key_package_publish_failures";
+    /// Overlap between initial KeyPackage publication and initial sync. The
+    /// setup-priority path emits a successful zero-duration sample to state
+    /// that publication completed before sync began.
     pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_DURATION: &str =
         "app_account_initial_sync_overlap_duration_ms";
     pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_ATTEMPTS: &str =

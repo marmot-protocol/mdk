@@ -36,6 +36,10 @@ pub(crate) enum AppPerformanceOperation {
     AccountBootstrapRelayAndFollowPublish,
     AccountDefaultProfilePublish,
     AccountInitialKeyPackagePublish,
+    /// Time during which the initial KeyPackage publication and initial sync
+    /// overlap. The setup-priority path deliberately serializes them, so its
+    /// successful sample is zero; a non-zero sample would mean a future path
+    /// allowed both network phases to run concurrently.
     AccountInitialSyncOverlap,
     OutboundMessageSend,
     GroupCreateQueueWait,
@@ -219,6 +223,9 @@ pub struct AppPerformanceSnapshot {
     pub account_default_profile_publish: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub account_initial_key_package_publish: AppPerformanceOperationSnapshot,
+    /// Overlap between initial KeyPackage publication and initial sync. A
+    /// successful zero-duration sample is the intentional setup-priority
+    /// sentinel: KeyPackage publication completed before sync began.
     #[serde(default)]
     pub account_initial_sync_overlap: AppPerformanceOperationSnapshot,
     /// Interrupted-migration recovery probes executed since process start. Each

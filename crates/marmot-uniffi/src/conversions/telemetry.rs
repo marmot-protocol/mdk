@@ -91,6 +91,9 @@ pub struct AppPerformanceSnapshotFfi {
     pub account_bootstrap_relay_and_follow_publish: AppPerformanceOperationSnapshotFfi,
     pub account_default_profile_publish: AppPerformanceOperationSnapshotFfi,
     pub account_initial_key_package_publish: AppPerformanceOperationSnapshotFfi,
+    /// Overlap between initial KeyPackage publication and initial sync. A
+    /// successful zero-duration sample means publication completed before
+    /// sync began; it is not a missing duration sample.
     pub account_initial_sync_overlap: AppPerformanceOperationSnapshotFfi,
     /// Interrupted-migration recovery probes executed since process start.
     /// Process-wide aggregate: no account, path, or key information.

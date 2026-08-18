@@ -570,6 +570,10 @@ async fn run_app_runtime_account_worker(
                 started_at.elapsed(),
                 result.is_ok(),
             );
+            // The durable setup lane serializes these phases by design. Record
+            // an explicit zero rather than omitting the sample so hosts can
+            // distinguish "publication finished before sync" from "overlap
+            // was not observed".
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::AccountInitialSyncOverlap,
                 Duration::ZERO,
