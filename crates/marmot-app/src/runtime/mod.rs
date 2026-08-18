@@ -36,23 +36,23 @@ use crate::{
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
     AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread,
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
-    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
-    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
-    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
+    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
+    AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
+    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
+    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
+    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
+    KeyPackageDeletionResult, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp,
+    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, MessageDraft, MessageDraftAttachment,
+    MessageDraftSummary, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1308,6 +1308,18 @@ impl MarmotAppRuntime {
     ) -> Result<GroupId, AppError> {
         self.accounts
             .create_group_with_initial_image(account_ref, name, members, description, initial_image)
+            .await
+    }
+
+    pub async fn create_group_with_options(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<GroupId, AppError> {
+        self.accounts
+            .create_group_with_options(account_ref, name, members, options)
             .await
     }
 

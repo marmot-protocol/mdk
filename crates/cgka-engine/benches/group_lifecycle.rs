@@ -21,6 +21,9 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
+};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -254,6 +257,21 @@ fn build_client_with_storage(
         .expect("build bench engine")
 }
 
+fn build_retention_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .supported_app_components(
+            default_group_components()
+                .into_iter()
+                .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID]),
+        )
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(BenchPeeler))
+        .build()
+        .expect("build retention bench engine")
+}
+
 fn build_deferred_bench_client(
     identity: &[u8],
     storage: SqliteAccountStorage,
@@ -328,13 +346,42 @@ fn invitee_key_packages(count: usize) -> Vec<KeyPackage> {
     out
 }
 
+fn retention_invitee_key_packages(count: usize) -> Vec<KeyPackage> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("helper runtime");
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let identity = format!("bench-retention-invitee-{index}");
+        let mut engine = build_retention_client(identity.as_bytes());
+        out.push(
+            rt.block_on(engine.fresh_key_package())
+                .expect("mint retention-aware invitee key package"),
+        );
+    }
+    out
+}
+
 fn create_request(members: Vec<KeyPackage>) -> CreateGroupRequest {
+    create_request_with_retention(members, None)
+}
+
+fn create_request_with_retention(
+    members: Vec<KeyPackage>,
+    disappearing_message_secs: Option<u64>,
+) -> CreateGroupRequest {
     CreateGroupRequest {
         name: "bench".into(),
         description: "bench".into(),
         members,
         required_features: vec![],
-        app_components: vec![],
+        app_components: disappearing_message_secs
+            .map(|seconds| AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: seconds.to_be_bytes().to_vec(),
+            })
+            .into_iter()
+            .collect(),
         initial_admins: vec![],
     }
 }
@@ -415,31 +462,39 @@ fn bench_create_group(c: &mut Criterion) {
         .expect("bench runtime");
     let mut group = c.benchmark_group("create_group");
     for invitees in [1_usize, 8, 32] {
-        let key_packages = invitee_key_packages(invitees);
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{invitees} invitees")),
-            &key_packages,
-            |b, key_packages| {
-                let alice = std::sync::Arc::new(tokio::sync::Mutex::new(build_client(
-                    b"bench-alice-create",
-                )));
-                b.to_async(&rt).iter(|| {
-                    let alice = alice.clone();
-                    async move {
-                        let request = create_request(key_packages.clone());
-                        let (group_id, result) = alice
-                            .lock()
-                            .await
-                            .create_group(request)
-                            .await
-                            .expect("create_group succeeds");
-                        // Sanity: founding creation returns one Welcome per invitee.
-                        debug_assert!(matches!(result, SendResult::FoundingGroupCreated { .. }));
-                        group_id
-                    }
-                });
-            },
-        );
+        for (retention, disappearing_message_secs) in [("disabled", None), ("enabled", Some(300))] {
+            let key_packages = retention_invitee_key_packages(invitees);
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{invitees} invitees, retention {retention}")),
+                &key_packages,
+                |b, key_packages| {
+                    let alice = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        build_retention_client(b"bench-alice-create"),
+                    ));
+                    b.to_async(&rt).iter(|| {
+                        let alice = alice.clone();
+                        async move {
+                            let request = create_request_with_retention(
+                                key_packages.clone(),
+                                disappearing_message_secs,
+                            );
+                            let (group_id, result) = alice
+                                .lock()
+                                .await
+                                .create_group(request)
+                                .await
+                                .expect("create_group succeeds");
+                            // Sanity: founding creation returns one Welcome per invitee.
+                            debug_assert!(matches!(
+                                result,
+                                SendResult::FoundingGroupCreated { .. }
+                            ));
+                            group_id
+                        }
+                    });
+                },
+            );
+        }
     }
     group.finish();
 }

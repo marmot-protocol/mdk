@@ -19,13 +19,13 @@ use super::{
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
-    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppGroupRoster, AppQuarantinedGroup, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MaintenanceRunSummary, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
-    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
+    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppQuarantinedGroup,
+    GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
@@ -166,8 +166,16 @@ impl AccountManager {
         members: &[String],
         description: Option<String>,
     ) -> Result<GroupId, AppError> {
-        self.create_group_with_initial_image(account_ref, name, members, description, None)
-            .await
+        self.create_group_with_options(
+            account_ref,
+            name,
+            members,
+            AppCreateGroupOptions {
+                description: description.unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// Prewarm the current group-composition roster outside the account-worker
@@ -203,6 +211,26 @@ impl AccountManager {
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
     ) -> Result<GroupId, AppError> {
+        self.create_group_with_options(
+            account_ref,
+            name,
+            members,
+            AppCreateGroupOptions {
+                description: description.unwrap_or_default(),
+                initial_image,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn create_group_with_options(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<GroupId, AppError> {
         let started_at = Instant::now();
         let result = async {
             let command = self.worker_commands(account_ref).await?;
@@ -212,8 +240,7 @@ impl AccountManager {
                     queued_at: Instant::now(),
                     name: name.to_owned(),
                     members: members.to_vec(),
-                    description,
-                    initial_image,
+                    options,
                     respond,
                 })
                 .await

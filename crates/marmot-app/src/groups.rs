@@ -73,6 +73,18 @@ impl std::fmt::Debug for AppInitialGroupImage {
     }
 }
 
+/// Forward-compatible options for creating a group.
+///
+/// A zero retention value preserves the historical disabled-retention
+/// behavior and does not make message retention a founding capability
+/// requirement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppCreateGroupOptions {
+    pub description: String,
+    pub initial_image: Option<AppInitialGroupImage>,
+    pub disappearing_message_secs: u64,
+}
+
 /// A group invite still pending the local device's confirmation decision
 /// (`pending_confirmation && !archived` in the account projection). Carries
 /// only what an invite policy needs to accept or decline; returned by

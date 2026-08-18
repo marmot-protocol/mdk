@@ -7,8 +7,8 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BLOSSOM_LOCATOR_KIND_V1,
-    BlobStoreEndpointV1, BlobStoreEndpointV2, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
+    AppComponentData, AppComponentSet, BLOSSOM_LOCATOR_KIND_V1, BlobStoreEndpointV1,
+    BlobStoreEndpointV2, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
     EncryptedMediaPolicyV1, EncryptedMediaPolicyV2, GROUP_ADMIN_POLICY_COMPONENT_ID,
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
@@ -19,11 +19,11 @@ use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
-use cgka_traits::{GroupId, MessageId, SecretBytes};
+use cgka_traits::{EngineError, GroupId, MessageId, SecretBytes};
 #[cfg(test)]
 use futures::StreamExt;
 use marmot_account::{
-    CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
+    AccountError, CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
 };
 use marmot_forensics::AuditEventContext;
 use nostr::NostrSigner;
@@ -43,14 +43,14 @@ use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
-    AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
-    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppInitialGroupImage, AppPerformanceTelemetry, AppQuarantinedGroup, AppRoutingState,
-    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
-    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
-    remember_seen_event, unix_now_seconds,
+    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupAdminPolicyComponent,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
+    AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupRecord, AppInitialGroupImage, AppPerformanceTelemetry, AppQuarantinedGroup,
+    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -837,7 +837,7 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
     ) -> Result<GroupId, AppError> {
-        self.create_group_with_initial_image(name, member_refs, None)
+        self.create_group_with_options(name, member_refs, AppCreateGroupOptions::default())
             .await
     }
 
@@ -847,14 +847,25 @@ impl AppClient {
         member_refs: &[&str],
         initial_image: Option<AppInitialGroupImage>,
     ) -> Result<GroupId, AppError> {
-        let group_id = self
-            .create_group_with_initial_profile_and_optional_telemetry(
-                name,
-                "",
-                member_refs,
+        self.create_group_with_options(
+            name,
+            member_refs,
+            AppCreateGroupOptions {
                 initial_image,
-                None,
-            )
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn create_group_with_options(
+        &mut self,
+        name: &str,
+        member_refs: &[&str],
+        options: AppCreateGroupOptions,
+    ) -> Result<GroupId, AppError> {
+        let group_id = self
+            .create_group_with_options_and_optional_telemetry(name, member_refs, options, None)
             .await?;
         self.drive_unpublished_welcome_delivery(None).await;
         // Direct `AppClient` callers do not have the managed account worker to
@@ -873,33 +884,35 @@ impl AppClient {
         Ok(group_id)
     }
 
-    pub(crate) async fn create_group_with_initial_profile_and_telemetry(
+    pub(crate) async fn create_group_with_options_and_telemetry(
         &mut self,
         name: &str,
-        description: &str,
         member_refs: &[&str],
-        initial_image: Option<AppInitialGroupImage>,
+        options: AppCreateGroupOptions,
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<GroupId, AppError> {
-        self.create_group_with_initial_profile_and_optional_telemetry(
+        self.create_group_with_options_and_optional_telemetry(
             name,
-            description,
             member_refs,
-            initial_image,
+            options,
             Some(telemetry),
         )
         .await
     }
 
-    async fn create_group_with_initial_profile_and_optional_telemetry(
+    async fn create_group_with_options_and_optional_telemetry(
         &mut self,
         name: &str,
-        description: &str,
         member_refs: &[&str],
-        initial_image: Option<AppInitialGroupImage>,
+        options: AppCreateGroupOptions,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<GroupId, AppError> {
-        validate_group_profile(name, description)?;
+        let AppCreateGroupOptions {
+            description,
+            initial_image,
+            disappearing_message_secs,
+        } = options;
+        validate_group_profile(name, &description)?;
         let key_package_started_at = Instant::now();
         let key_packages = self
             .app
@@ -943,9 +956,15 @@ impl AppClient {
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
         let encrypted_media = self.encrypted_media_component_for_new_group()?;
-        let encrypted_media_component_id = encrypted_media.component_id;
         app_components.push(encrypted_media);
+        if disappearing_message_secs != 0 {
+            app_components.push(
+                AppGroupMessageRetentionComponent::new(disappearing_message_secs)
+                    .to_app_component_data()?,
+            );
+        }
         let constructable = self.runtime.constructable_capabilities(&members)?;
+        require_initial_group_component_support(&constructable, &app_components)?;
         let has_initial_image = initial_image.is_some();
         let image_started_at = Instant::now();
         let optional_app_components = async {
@@ -987,11 +1006,10 @@ impl AppClient {
             );
         }
         let optional_app_components = optional_app_components?;
-        let mut touched_components = vec![
-            NOSTR_ROUTING_COMPONENT_ID,
-            AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-            encrypted_media_component_id,
-        ];
+        let mut touched_components = app_components
+            .iter()
+            .map(|component| component.component_id)
+            .collect::<Vec<_>>();
         touched_components.extend(
             optional_app_components
                 .iter()
@@ -1000,6 +1018,9 @@ impl AppClient {
         let mut changed_fields = vec!["name", "members"];
         if !description.is_empty() {
             changed_fields.push("description");
+        }
+        if disappearing_message_secs != 0 {
+            changed_fields.push("message_retention");
         }
         if !optional_app_components.is_empty() {
             changed_fields.push("image");
@@ -1017,7 +1038,7 @@ impl AppClient {
             .prepare_create_group_with_optional_app_components_and_audit_context(
                 CreateGroupRequest {
                     name: name.to_owned(),
-                    description: description.to_owned(),
+                    description,
                     members,
                     required_features: Vec::new(),
                     app_components,
@@ -4308,6 +4329,32 @@ fn preferred_initial_group_image_component(
     }
 }
 
+fn require_initial_group_component_support(
+    constructable: &GroupCapabilities,
+    app_components: &[AppComponentData],
+) -> Result<(), AppError> {
+    let required = AppComponentSet::new(
+        app_components
+            .iter()
+            .map(|component| component.component_id),
+    );
+    if required
+        .missing_from(&constructable.app_components)
+        .is_empty()
+    {
+        return Ok(());
+    }
+    Err(AppError::Account(AccountError::Engine(
+        EngineError::MissingRequiredCapabilities {
+            required: Box::new(GroupCapabilities {
+                app_components: required,
+                ..GroupCapabilities::default()
+            }),
+            had: Box::new(constructable.clone()),
+        },
+    )))
+}
+
 /// Whether the local account (`local_account_id_hex`) is absent from a group's
 /// engine roster — the backfill's suppression decision. MLS member ids in this
 /// design are the Nostr account pubkey hex, so an account is "still a member"
@@ -4329,10 +4376,12 @@ mod post_canonical_create_tests {
     use super::{
         CREATE_GROUP_LOOKUP_CONCURRENCY, INVITE_LOOKUP_CONCURRENCY, collect_bounded_ordered,
         preferred_initial_group_image_component, recover_post_canonical_result,
+        require_initial_group_component_support,
     };
     use crate::AppError;
     use cgka_traits::app_components::{
-        GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        AppComponentData, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     };
     use cgka_traits::capabilities::GroupCapabilities;
 
@@ -4362,6 +4411,33 @@ mod post_canonical_create_tests {
             preferred_initial_group_image_component(&capabilities, false),
             None
         );
+    }
+
+    #[test]
+    fn founding_required_components_are_preflighted_against_every_member() {
+        let retention = AppComponentData {
+            component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            data: 300u64.to_be_bytes().to_vec(),
+        };
+        let mut capabilities = GroupCapabilities::default();
+        let error = require_initial_group_component_support(
+            &capabilities,
+            std::slice::from_ref(&retention),
+        )
+        .expect_err("unsupported retention must fail before founding side effects");
+        assert!(matches!(
+            error,
+            AppError::Account(marmot_account::AccountError::Engine(
+                cgka_traits::EngineError::MissingRequiredCapabilities { ref required, .. }
+            )) if required
+                .app_components
+                .contains(GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+        ));
+
+        capabilities
+            .app_components
+            .insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+        require_initial_group_component_support(&capabilities, &[retention]).unwrap();
     }
 
     #[test]

@@ -30,8 +30,8 @@ use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppCreateGroupOptions,
+    AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppProjectionUpdate, AppQuarantinedGroup, ClassifiedSyncFailure, ConvergenceScheduleState,
     EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
     MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
@@ -111,8 +111,7 @@ pub(crate) enum AccountWorkerCommand {
         queued_at: Instant,
         name: String,
         members: Vec<String>,
-        description: Option<String>,
-        initial_image: Option<AppInitialGroupImage>,
+        options: AppCreateGroupOptions,
         respond: oneshot::Sender<Result<GroupId, AppError>>,
     },
     Members {
@@ -2523,8 +2522,7 @@ async fn handle_account_worker_command(
             queued_at,
             name,
             members,
-            description,
-            initial_image,
+            options,
             respond,
         } => {
             let telemetry = shared.app_performance_telemetry();
@@ -2535,13 +2533,7 @@ async fn handle_account_worker_command(
             );
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let result = client
-                .create_group_with_initial_profile_and_telemetry(
-                    &name,
-                    description.as_deref().unwrap_or_default(),
-                    &member_refs,
-                    initial_image,
-                    &telemetry,
-                )
+                .create_group_with_options_and_telemetry(&name, &member_refs, options, &telemetry)
                 .await;
             if let Ok(group_id) = &result {
                 publish_app_runtime_group_state_updated(
