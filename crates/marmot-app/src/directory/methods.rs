@@ -485,11 +485,26 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(label)?;
-        let signer = self.account_signer_for_summary(&account)?;
         let endpoints = self.outbox_endpoints(
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
+        self.publish_user_profile_to_endpoints(&account.label, profile, endpoints)
+            .await
+    }
+
+    /// Publish kind-0 metadata to an already-selected, account-scoped route.
+    ///
+    /// This is the action boundary used when the runtime has captured one
+    /// coherent relay-list snapshot and must not re-read it before publishing.
+    pub(crate) async fn publish_user_profile_to_endpoints(
+        &self,
+        label: &str,
+        profile: UserProfileMetadata,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
         let content = serde_json::to_string(&profile_content_json(&profile))?;
         let event = NostrTransportEvent::new_unsigned(
             account.account_id_hex.clone(),
@@ -501,6 +516,49 @@ impl MarmotApp {
             .publish_event(&endpoints, &event, 1)
             .await?;
         Ok(())
+    }
+
+    /// Select profile publication endpoints from one account relay-list
+    /// snapshot. Prefer the account's published NIP-65 write relays, then its
+    /// remembered bootstrap relays. A missing bootstrap list falls back to the
+    /// snapshot's compatibility default/publish list.
+    ///
+    /// Every tier is filtered through the discovered-endpoint safety policy.
+    /// If a tier contains only invalid, unsafe, or retired endpoints, selection
+    /// continues to the next tier; no unusable endpoint reaches the dialer.
+    pub(crate) fn account_profile_publish_endpoints(
+        &self,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let published = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "account-owned profile publish relays",
+        );
+        if !published.is_empty() {
+            return Ok(published);
+        }
+
+        let bootstrap = if relay_lists.bootstrap_relays.is_empty() {
+            &relay_lists.default_relays
+        } else {
+            &relay_lists.bootstrap_relays
+        };
+        let bootstrap = self.retain_safe_discovered_endpoints(
+            bootstrap.iter().cloned().map(TransportEndpoint).collect(),
+            "account-owned profile bootstrap relays",
+        );
+        if bootstrap.is_empty() {
+            return Err(AppError::RelayDirectory(
+                "account relay configuration has no usable profile publication endpoints".into(),
+            ));
+        }
+        Ok(bootstrap)
     }
 
     pub async fn publish_account_follow_list(
