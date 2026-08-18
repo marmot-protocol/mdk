@@ -468,6 +468,14 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
+          venv_check_dir="${RUNNER_TEMP}/hermes-venv-check"
+          if command -v python3 >/dev/null \
+            && command -v git >/dev/null \
+            && python3 -m venv "$venv_check_dir"; then
+            rm -rf "$venv_check_dir"
+            exit 0
+          fi
+          rm -rf "$venv_check_dir"
           for attempt in 1 2 3; do
             if sudo timeout --kill-after=15s 180s apt-get \
               -o Acquire::Retries=3 \
