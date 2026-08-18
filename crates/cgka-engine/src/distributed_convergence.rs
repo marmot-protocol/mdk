@@ -1382,6 +1382,7 @@ impl<S: StorageProvider> Engine<S> {
             self.storage
                 .put_convergence_pass(&pass)
                 .map_err(storage_projection_error)?;
+            self.schedule_drain_for_retained_outbound_intents(group_id);
             return Ok(result);
         }
 
@@ -1423,6 +1424,12 @@ impl<S: StorageProvider> Engine<S> {
             }
             Ok::<_, OpenMlsProjectionError>((observations, application_events))
         })?;
+        // mdk#1472: completing the pass opens the gate that held queued
+        // outbound intents. A drain that ran before the settle consumed the
+        // one-shot schedule edge without releasing them, so completion must
+        // re-arm it — otherwise an edge-driven host never comes back for the
+        // durable queue.
+        self.schedule_drain_for_retained_outbound_intents(group_id);
         for (disposition, previous_state, epoch) in disposition_transitions {
             if previous_state == disposition.state {
                 continue;

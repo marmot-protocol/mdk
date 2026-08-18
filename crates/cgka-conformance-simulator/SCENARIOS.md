@@ -706,7 +706,9 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   retained join commit itself is tracked as a harness coverage gap.
 ### `bounded-convergence-pressure/v1`
 
-- Generator: `generate_bounded_convergence_pressure_family` (generator version `1`).
+- Generator: `generate_bounded_convergence_pressure_family` (generator version `2`). Version 2 adds the confirmed
+  pending-resolution expectations the strict oracle requires for the labelled publication acknowledgements; scenario
+  steps are unchanged.
 - Setup: four clients, Alice and Bob admins. Both admins race same-epoch `update_group_data` commits and both confirm
   publication; each rival commit is withheld, then released in a seed-derived order so every member ingests the fork.
 - Pressure: **finite** and deliberately so. One application send per client is issued after the rival branch is ingested
@@ -724,10 +726,9 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Scope fence: the campaign claims eventual quiescence for **bounded** input only. It makes no progress claim under an
   unbounded self-update stream (reliability plan PDR-2/L3), which is a deliberate non-guarantee.
 - Status: `bounded_convergence_pressure_family_generates_the_declared_campaign_shape` gates the generator in CI. The
-  runnable gate `bounded_convergence_pressure_family_settles_every_seeded_permutation` is `#[ignore]`d because it fails
-  on engine behavior, not on the campaign: an application message accepted while the group is resolving a same-epoch
-  fork is queued durably and then stranded, because nothing re-arms the retained-intent drain once the pass completes.
-  Do not weaken the assertions to make it pass.
+  runnable gate `bounded_convergence_pressure_family_settles_every_seeded_permutation` passes since mdk#1472 (the
+  engine re-arms the queued-intent drain when a pass closes and no longer re-prepares an in-flight regenerated
+  intent). It runs in the nightly lane; the PR smoke lane excludes it as one of the multi-minute generated batches.
 
 ### `convergence-chaos/v1`
 

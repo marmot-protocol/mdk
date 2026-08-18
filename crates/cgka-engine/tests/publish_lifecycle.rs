@@ -2010,6 +2010,86 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
 }
 
 #[tokio::test]
+async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let queued_intent_list_fault = ProcessedFault::default();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: ProcessedFault::default(),
+        lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: queued_intent_list_fault.clone(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"alice-pass-close"))
+    .account_identity_proof_signer(proof_signer(b"alice-pass-close"))
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .convergence_clock(Arc::new(clock.clone()))
+    .build()
+    .unwrap();
+    let mut bob = build(b"bob-pass-close");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+    bob.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        alice.ingest(commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    let queued = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, "retained across a locked pass-close read"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }));
+    assert!(
+        alice.drain_pending_convergence_groups().contains(&group_id),
+        "queueing the retained intent must arm the first drain"
+    );
+
+    clock.advance_ms(1_500);
+    queued_intent_list_fault.arm(1);
+    assert!(
+        alice
+            .advance_convergence_inputs_until_settled(&group_id, 2_500)
+            .await
+            .expect("a failed post-close queue read must not fail a durable convergence apply"),
+        "the pass must settle despite the injected queue-read failure"
+    );
+    assert!(
+        alice.drain_pending_convergence_groups().contains(&group_id),
+        "an unreadable queue at pass close must conservatively re-arm the drain"
+    );
+
+    let drained = alice
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_500)
+        .await
+        .expect("the successful retry must release the retained intent");
+    assert_eq!(
+        drained.len(),
+        1,
+        "the re-armed retry must publish the retained intent"
+    );
+}
+
+#[tokio::test]
 async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unresolved() {
     // Retention has no deadline, and that is deliberate: a publication whose
     // exposure is ambiguous must never be rolled back. So the state that holds
@@ -2115,9 +2195,15 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
         // reports that the regenerated message reached the transport. Until
         // then the row is still owed a delivery, so it still occupies the cap.
         let (_, intent_id) = alice
-            .take_regenerated_queued_intent_for_message(&msg.id)
+            .regenerated_queued_intent_for_message(&msg.id)
             .expect("a drained retained intent must be attributable to its durable row");
         alice.confirm_queued_outbound_intent(&intent_id).unwrap();
+        assert!(
+            alice
+                .regenerated_queued_intent_for_message(&msg.id)
+                .is_none(),
+            "confirmation must clear the regenerated-intent association"
+        );
     }
     assert!(
         storage

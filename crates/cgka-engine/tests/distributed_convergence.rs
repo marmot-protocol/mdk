@@ -5183,6 +5183,216 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
     );
 }
 
+/// mdk#1472: a drain that runs before the pass settles consumes the
+/// schedule edge without releasing the queued intent. When the pass later
+/// completes, the engine must re-arm the edge — the completion of the gate
+/// that held the intent is exactly the moment an edge-driven host can make
+/// progress. Level-driven hosts (marmot-app's `schedule_after_pass`) recover
+/// on their own; hosts that only drain `pending_convergence_groups` (the
+/// conformance harness `drive_due_convergence`) spin on `runnable_work`
+/// forever without this re-arm.
+#[tokio::test]
+async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "drain-rearm".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    // Alice and Bob race privileged same-epoch commits; Carol ingests both
+    // and opens one collecting pass over the fork.
+    let (alice_commit, alice_pending) = evolution(
+        alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("alice-branch".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    let (bob_commit, bob_pending) = evolution(
+        bob.send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("bob-branch".into()),
+            description: None,
+        })
+        .await
+        .unwrap(),
+    );
+    bob.confirm_published(bob_pending).await.unwrap();
+    for commit in [&alice_commit, &bob_commit] {
+        assert!(matches!(
+            carol
+                .ingest(route(commit.clone(), &group_id))
+                .await
+                .unwrap(),
+            IngestOutcome::Buffered { .. }
+        ));
+    }
+    assert_eq!(
+        carol_storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .expect("the raced commits open a pass")
+            .cutoff_monotonic_ms(),
+        2_000
+    );
+
+    // Consume the edges the ingests armed, mirroring a host that has taken
+    // everything the ingest produced before the send arrives.
+    carol.drain_events();
+    carol.drain_pending_convergence_groups();
+
+    let queued = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"typed inside the fork window"),
+        })
+        .await
+        .unwrap();
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("an unsettled pass retains the send, got {other:?}"),
+    };
+    assert!(
+        carol.drain_pending_convergence_groups().contains(&group_id),
+        "queueing the intent arms the drain edge"
+    );
+
+    // The host drains immediately — before the cutoff — so the drain refuses
+    // to release and the one-shot edge is spent. This is the harness
+    // `drive_due_convergence` order: edge-driven, not level-driven.
+    let early = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_500)
+        .await
+        .unwrap();
+    assert!(
+        early.is_empty(),
+        "a pre-cutoff drain must not release the intent: {early:?}"
+    );
+    assert!(
+        carol.drain_pending_convergence_groups().is_empty(),
+        "the premature drain consumes the edge"
+    );
+
+    // The pass settles at the cutoff (the harness tick's settle prepass).
+    clock.advance_ms(1_500);
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group_id, 2_500)
+            .await
+            .unwrap(),
+        "the cutoff has passed, so the pass settles"
+    );
+
+    // The completion of the gate that held the intent must re-arm the drain
+    // edge; without it an edge-driven host never comes back.
+    assert!(
+        carol.drain_pending_convergence_groups().contains(&group_id),
+        "settling the pass must re-arm the drain for the retained intent"
+    );
+
+    // The committers resolve the same fork: each ingests the rival root and
+    // settles its own pass, so every client lands on carol's selected branch
+    // before the decrypt check below.
+    alice
+        .ingest(route(bob_commit.clone(), &group_id))
+        .await
+        .unwrap();
+    bob.ingest(route(alice_commit.clone(), &group_id))
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .advance_convergence_inputs_until_settled(&group_id, 10_000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        bob.advance_convergence_inputs_until_settled(&group_id, 10_000)
+            .await
+            .unwrap()
+    );
+
+    // And the re-armed drain really publishes the message.
+    let mut drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_500)
+        .await
+        .expect("the re-armed drain releases the retained intent");
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected the retained message: {drained:?}"
+    );
+
+    // A second drain before the host's confirm must not regenerate the
+    // in-flight intent: re-preparing would publish the same logical message
+    // twice (mdk#1472).
+    let duplicate = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_500)
+        .await
+        .expect("an in-flight intent stays the host's obligation");
+    assert!(
+        duplicate.is_empty(),
+        "an unconfirmed intent must not regenerate a duplicate: {duplicate:?}"
+    );
+    let SendResult::ApplicationMessage { msg, .. } = drained.remove(0) else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert!(matches!(
+        alice.ingest(route(msg, &group_id)).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            GroupEvent::MessageReceived { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .expect("alice observes the retained message");
+    assert_eq!(app_content(&received), b"typed inside the fork window");
+
+    carol
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("the drained intent is the one the pass window retained");
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
     let (mut alice, _alice_storage) = build_client(b"alice");

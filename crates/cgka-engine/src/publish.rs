@@ -546,12 +546,12 @@ impl<S: StorageProvider> Engine<S> {
     /// instead: a publish outcome and a verified repair Welcome through this
     /// helper, quarantine recovery (`retry_hydrate_quarantined_group`)
     /// unconditionally because it has already read the group. `Stable` with an
-    /// unsettled convergence pass holds it too and has no such seam: it is
-    /// carried by the level signal, staying visible as runnable work until it
-    /// releases (`has_queued_outbound_intents`), which is what a scheduler
-    /// re-reads once it has consumed the edge. (Across a restart, session-open
-    /// hydration re-arms the drain from the same durable queue whatever state
-    /// the group landed in.)
+    /// unsettled convergence pass holds it too: the pass-close seam calls this
+    /// helper to re-arm (mdk#1472), and the level signal keeps the group visible
+    /// as runnable work until it releases (`has_queued_outbound_intents`), which
+    /// is what a scheduler re-reads once it has consumed the edge. (Across a
+    /// restart, session-open hydration re-arms the drain from the same durable
+    /// queue whatever state the group landed in.)
     ///
     /// Best-effort by construction: this runs after the outcome is durable, so
     /// a transient backend lock here must not fail already-committed work.

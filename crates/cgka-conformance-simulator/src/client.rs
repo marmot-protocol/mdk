@@ -785,8 +785,13 @@ impl HarnessClient {
         self.engine_mut().confirm_queued_outbound_intent(intent_id)
     }
 
-    pub(crate) fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId) {
-        self.engine_mut().retry_queued_outbound_intent(group_id);
+    pub(crate) fn retry_regenerated_queued_intent(
+        &mut self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) {
+        self.engine_mut()
+            .retry_queued_outbound_intent(group_id, intent_id);
     }
 
     pub(crate) fn forget_regenerated_queued_intent(&mut self, message_id: &MessageId) {
@@ -1706,7 +1711,7 @@ impl HarnessClient {
             } => {
                 let queued_intent = self
                     .engine_mut()
-                    .take_regenerated_queued_intent_for_message(&msg.id);
+                    .regenerated_queued_intent_for_message(&msg.id);
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {
@@ -1731,7 +1736,7 @@ impl HarnessClient {
             SendResult::Proposal { msg } => {
                 let queued_intent = self
                     .engine_mut()
-                    .take_regenerated_queued_intent_for_message(&msg.id);
+                    .regenerated_queued_intent_for_message(&msg.id);
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {
@@ -1821,7 +1826,7 @@ impl HarnessClient {
         for msg in proposals {
             let queued_intent = self
                 .engine_mut()
-                .take_regenerated_queued_intent_for_message(&msg.id);
+                .regenerated_queued_intent_for_message(&msg.id);
             let routed = if let Some(gid) = &gid {
                 route(msg, gid)
             } else {

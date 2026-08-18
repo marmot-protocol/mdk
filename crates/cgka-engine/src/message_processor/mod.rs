@@ -104,8 +104,9 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 /// Capacity is reclaimed on confirmation, not on drain. A drained row is
 /// deleted only by `confirm_queued_outbound_intent` — or, for a group-state
 /// intent, inside `confirm_published` — so a payload that was prepared and
-/// published but never acknowledged still holds its slot and is re-prepared on
-/// the next drain. A group whose transport keeps failing therefore sits at the
+/// published but never acknowledged still holds its slot and stays in flight.
+/// A definite retry clears that in-flight association so the next drain
+/// re-prepares it. A group whose transport keeps failing therefore sits at the
 /// cap: its rows keep being re-attempted, but nothing frees a slot until a
 /// publish is accepted by at least one endpoint.
 pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
@@ -691,6 +692,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
         for record in queued {
+            // A regenerated intent the host has not yet confirmed or retired
+            // is still the host's obligation: re-preparing it would publish
+            // the same logical message twice (mdk#1472).
+            if self.queued_outbound_intent_in_flight(group_id, &record.id) {
+                continue;
+            }
             if !reservation.permits(&record.intent) {
                 continue;
             }
@@ -888,15 +895,32 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    /// Whether a durable queued intent was already regenerated into an
+    /// artifact the host has not yet confirmed or retired. The association
+    /// lives from regeneration until `confirm_regenerated_queued_intent`,
+    /// `retry_regenerated_queued_intent`, or a publish rollback clears it.
+    fn queued_outbound_intent_in_flight(&self, group_id: &GroupId, intent_id: &MessageId) -> bool {
+        self.queued_intent_by_message
+            .values()
+            .chain(self.queued_intent_by_pending.values())
+            .any(|(queued_group_id, queued_intent_id)| {
+                queued_group_id == group_id && queued_intent_id == intent_id
+            })
+    }
+
     pub(crate) fn schedule_pending_convergence_group(&mut self, group_id: &GroupId) {
         self.pending_convergence_groups.insert(group_id.clone());
     }
 
-    pub fn take_regenerated_queued_intent_for_message(
-        &mut self,
+    /// Read the durable queued intent a regenerated artifact carries. The
+    /// association is non-destructive: it stays readable until the host
+    /// confirms or retries the intent, so a later drain can see the intent
+    /// is still in flight and must not regenerate it again (mdk#1472).
+    pub fn regenerated_queued_intent_for_message(
+        &self,
         message_id: &MessageId,
     ) -> Option<(GroupId, MessageId)> {
-        self.queued_intent_by_message.remove(message_id)
+        self.queued_intent_by_message.get(message_id).cloned()
     }
 
     pub fn confirm_regenerated_queued_intent(
@@ -904,10 +928,21 @@ impl<S: StorageProvider> Engine<S> {
         intent_id: &MessageId,
     ) -> Result<(), EngineError> {
         self.storage.delete_queued_outbound_intent(intent_id)?;
+        self.queued_intent_by_message
+            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
+        self.queued_intent_by_pending
+            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
         Ok(())
     }
 
-    pub fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId) {
+    /// Re-arm a regenerated intent whose publication reached no endpoint.
+    /// Clearing the in-flight association lets the next drain regenerate a
+    /// fresh artifact; the durable intent row is untouched.
+    pub fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId, intent_id: &MessageId) {
+        self.queued_intent_by_message
+            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
+        self.queued_intent_by_pending
+            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
         self.schedule_pending_convergence_group(group_id);
     }
 

@@ -1697,7 +1697,7 @@ fn bounded_convergence_pressure_family_generates_the_declared_campaign_shape() {
     assert_eq!(cases.len(), 6);
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "bounded-convergence-pressure/v1");
-        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.generator_version, "2");
         assert_eq!(case.seed, 2026);
         assert_eq!(case.case_index, case_index as u64);
         compile_scenario(&case.scenario)
@@ -1802,16 +1802,14 @@ fn bounded_convergence_pressure_family_generates_the_declared_campaign_shape() {
 /// It deliberately claims nothing about progress under an unbounded
 /// self-update stream.
 ///
-/// IGNORED — this currently fails on engine behavior, not on the campaign. An
-/// application message accepted while the group is resolving a same-epoch fork
-/// is queued durably and then stranded: once the pass completes, nothing
-/// re-arms the retained-intent drain, and the engine's own conformance
-/// structural progress reports `runnable_work = 0` with no next wake while
-/// `pending_work.queued_outbound_intents > 0`. The quiescence driver therefore
-/// reports `Blocked { subsystems: ["scenario_inputs"] }` and the payload is
-/// never published. Un-ignore once the retained-intent drain is re-armed after
-/// a completed pass; do not weaken the assertions below to make it pass.
-#[ignore = "engine strands application sends accepted inside the convergence quiescence window"]
+/// This gate was ignored while the engine stranded application sends accepted
+/// inside the convergence quiescence window (mdk#1472): a drain that ran
+/// before the pass settled consumed the one-shot schedule edge, pass
+/// completion never re-armed it, and once the re-arm existed the repeated
+/// drain re-prepared the still-unconfirmed intent and double-published it.
+/// The engine now re-arms the drain when a pass closes with queued intents
+/// outstanding and skips intents that are already regenerated and awaiting
+/// the host's confirm or retry.
 #[tokio::test(flavor = "multi_thread")]
 async fn bounded_convergence_pressure_family_settles_every_seeded_permutation() {
     for case in &generate_bounded_convergence_pressure_family(2026, 6) {
