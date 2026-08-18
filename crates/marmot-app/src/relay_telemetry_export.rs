@@ -220,6 +220,33 @@ pub mod metric_names {
         "app_group_create_key_package_lookup_successes";
     pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES: &str =
         "app_group_create_key_package_lookup_failures";
+    /// Composition-time member KeyPackage prewarm metrics.
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_DURATION: &str =
+        "app_group_member_key_package_prewarm_duration_ms";
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_ATTEMPTS: &str =
+        "app_group_member_key_package_prewarm_attempts";
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_SUCCESSES: &str =
+        "app_group_member_key_package_prewarm_successes";
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_FAILURES: &str =
+        "app_group_member_key_package_prewarm_failures";
+    /// Cache-only create-time KeyPackage validation/reuse metrics.
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_DURATION: &str =
+        "app_group_create_key_package_cache_reuse_duration_ms";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_ATTEMPTS: &str =
+        "app_group_create_key_package_cache_reuse_attempts";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_SUCCESSES: &str =
+        "app_group_create_key_package_cache_reuse_successes";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_FAILURES: &str =
+        "app_group_create_key_package_cache_reuse_failures";
+    /// Create-time KeyPackage resolution that required relay work.
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_DURATION: &str =
+        "app_group_create_key_package_network_resolution_duration_ms";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_ATTEMPTS: &str =
+        "app_group_create_key_package_network_resolution_attempts";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_SUCCESSES: &str =
+        "app_group_create_key_package_network_resolution_successes";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_FAILURES: &str =
+        "app_group_create_key_package_network_resolution_failures";
     /// Group-create image upload metrics.
     pub const APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION: &str =
         "app_group_create_image_upload_duration_ms";
@@ -879,6 +906,30 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_ATTEMPTS,
         metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_SUCCESSES,
         metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_member_key_package_prewarm,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_DURATION,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_ATTEMPTS,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_SUCCESSES,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_key_package_cache_reuse,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_key_package_network_resolution,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_FAILURES,
     );
     append_app_operation_points(
         points,

@@ -71,6 +71,54 @@ pub(crate) struct ScriptedPushRelayClient {
     unsubscribe_release: tokio::sync::Notify,
 }
 
+#[derive(Default)]
+struct MemberResolutionDirectoryFetcher {
+    requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
+    events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    reject_multi_author: std::sync::atomic::AtomicBool,
+    stalled_endpoint: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
+    async fn fetch_directory_events(
+        &self,
+        request: crate::relay_plane::DirectoryFetchRequest,
+    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        self.requests.lock().unwrap().push(request.clone());
+        if self
+            .reject_multi_author
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request.queries.iter().any(|query| query.authors.len() > 1)
+        {
+            return Err("multi-author queries unsupported".to_owned());
+        }
+        let stalled_endpoint = self.stalled_endpoint.lock().unwrap().clone();
+        if stalled_endpoint.is_some_and(|stalled| {
+            request
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.0 == stalled)
+        }) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let events = self.events.lock().unwrap().clone();
+        Ok(events
+            .into_iter()
+            .filter(|event| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
+            })
+            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: request.endpoints.clone(),
+                event,
+            })
+            .collect())
+    }
+}
+
 impl ScriptedPushRelayClient {
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
@@ -3721,6 +3769,425 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
         selected_metadata.key_package_ref_hex,
         metadata.key_package_ref_hex
     );
+}
+
+#[tokio::test]
+async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let bob = home.create_account("bob").unwrap();
+    let carol = home.create_account("carol").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    for account in [&bob, &carol] {
+        let current = fresh_key_package_for_account(&app, account, false).await;
+        let metadata = cgka_engine::key_package::key_package_metadata(&current).unwrap();
+        app.save_directory_entry(&UserDirectoryRecord {
+            account_id_hex: account.account_id_hex.clone(),
+            npub: npub_for_account_id_lossy(&account.account_id_hex),
+            local_account: Some(UserDirectoryLocalAccount {
+                label: account.label.clone(),
+                local_signing: true,
+            }),
+            profile: None,
+            follows: Vec::new(),
+            follow_source_relays: Vec::new(),
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: Some(DirectoryKeyPackage {
+                key_package_id: format!("{}-slot", account.label),
+                key_package_ref_hex: metadata.key_package_ref_hex,
+                key_package_event_id: String::new(),
+                key_package_hex: hex::encode(current.bytes()),
+                created_at: 1,
+                source_relays: Vec::new(),
+            }),
+        })
+        .unwrap();
+    }
+
+    let bob_npub = npub_for_account_id_lossy(&bob.account_id_hex);
+    let resolved = app
+        .resolve_member_key_packages(&[
+            bob.label.as_str(),
+            bob_npub.as_str(),
+            carol.account_id_hex.as_str(),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.len(), 2, "duplicate account ids must resolve once");
+    let identities = resolved
+        .iter()
+        .map(|key_package| {
+            cgka_engine::key_package::key_package_metadata(key_package)
+                .unwrap()
+                .credential_identity_hex
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(identities, vec![bob.account_id_hex, carol.account_id_hex]);
+}
+
+fn member_resolution_key_package_event(
+    account: &AccountSummary,
+    key_package: KeyPackage,
+) -> NostrTransportEvent {
+    let metadata = cgka_engine::key_package::key_package_metadata(&key_package).unwrap();
+    transport_nostr_adapter::NostrKeyPackagePublication {
+        account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        key_package,
+        key_package_slot_id: format!("{}-slot", account.label),
+        key_package_ref: metadata.key_package_ref_hex,
+        mls_ciphersuite: format!("0x{:04x}", metadata.ciphersuite),
+        mls_extensions: metadata
+            .mls_extensions
+            .iter()
+            .map(|id| format!("0x{id:04x}"))
+            .collect(),
+        mls_proposals: metadata
+            .mls_proposals
+            .iter()
+            .map(|id| format!("0x{id:04x}"))
+            .collect(),
+        app_components: metadata
+            .app_components
+            .iter()
+            .filter(|id| **id >= cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START)
+            .map(|id| format!("0x{id:04x}"))
+            .collect(),
+        publish_endpoints: vec![TransportEndpoint("wss://shared.example".into())],
+    }
+    .to_event()
+    .unwrap()
+}
+
+async fn member_resolution_fixture(
+    count: usize,
+    split_relays: bool,
+) -> (
+    tempfile::TempDir,
+    MarmotApp,
+    Vec<AccountSummary>,
+    Arc<MemberResolutionDirectoryFetcher>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let accounts = (0..count)
+        .map(|index| home.create_account(&format!("member-{index}")).unwrap())
+        .collect::<Vec<_>>();
+    let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut app = MarmotApp::with_relay(directory.path(), "wss://directory.example")
+        .with_test_relay_client(relay.clone());
+    for (index, account) in accounts.iter().enumerate() {
+        let key_package = fresh_key_package_for_account(&app, account, false).await;
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .push(member_resolution_key_package_event(account, key_package));
+        let relay = if split_relays && index % 2 == 1 {
+            "wss://split-b.example"
+        } else if split_relays {
+            "wss://split-a.example"
+        } else {
+            "wss://shared.example"
+        };
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .push(NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_NIP65_RELAY_LIST,
+                vec![vec!["r".into(), relay.into()]],
+                String::new(),
+            ));
+    }
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(relay, fetcher.clone());
+    (directory, app, accounts, fetcher)
+}
+
+#[tokio::test]
+async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
+    let members = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+
+    let summary = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .unwrap();
+    assert_eq!(summary.requested_members, 8);
+    assert_eq!(summary.unique_members, 8);
+    assert_eq!(summary.reused_members, 0);
+    assert_eq!(summary.network_resolved_members, 8);
+
+    let requests = fetcher.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "cold shared relays must use one relay-list batch and one KeyPackage batch"
+    );
+    assert_eq!(requests[0].queries.len(), 2);
+    assert!(
+        requests[0]
+            .queries
+            .iter()
+            .all(|query| query.authors.len() == 8)
+    );
+    assert_eq!(requests[1].queries.len(), 1);
+    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    assert_eq!(requests[1].queries[0].authors.len(), 8);
+    assert_eq!(requests[1].queries[0].limit, 8 * 12);
+    drop(requests);
+
+    for account in &accounts {
+        assert!(
+            app.directory_entry_for_account_id(&account.account_id_hex)
+                .unwrap()
+                .and_then(|entry| entry.key_package)
+                .is_none(),
+            "composition prewarm must not durably admit a KeyPackage"
+        );
+    }
+
+    let resolved = app.resolve_member_key_packages(&members).await.unwrap();
+    assert_eq!(resolved.len(), 8);
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        2,
+        "fresh prewarm entries must eliminate create-time relay requests"
+    );
+}
+
+#[tokio::test]
+async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejected() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    fetcher
+        .reject_multi_author
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let members = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+
+    let summary = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.network_resolved_members, 2);
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.queries.iter().any(|query| query.authors.len() == 2))
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
+            .count(),
+        4,
+        "relay-list and KeyPackage batches must each fall back per member"
+    );
+}
+
+#[tokio::test]
+async fn member_key_package_set_reports_missing_packages_in_input_order() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let members = [
+        accounts[1].account_id_hex.as_str(),
+        accounts[0].account_id_hex.as_str(),
+    ];
+
+    let error = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .expect_err("both packages are absent");
+
+    assert!(
+        matches!(error, AppError::MissingKeyPackage(account_id) if account_id == accounts[1].account_id_hex),
+        "the first canonical input error must win regardless of batch completion order"
+    );
+}
+
+#[tokio::test]
+async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    let malformed_account = accounts[1].account_id_hex.clone();
+    let valid_account = accounts[0].account_id_hex.clone();
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        let malformed = events
+            .iter_mut()
+            .find(|event| {
+                event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == malformed_account
+            })
+            .expect("malformed account KeyPackage event");
+        malformed.content = "not-base64".to_owned();
+    }
+
+    let error = app
+        .prewarm_group_member_key_packages(&[malformed_account.as_str(), valid_account.as_str()])
+        .await
+        .expect_err("the malformed member must fail");
+    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
+    let requests_after_partial = fetcher.requests.lock().unwrap().len();
+
+    let summary = app
+        .prewarm_group_member_key_packages(&[valid_account.as_str()])
+        .await
+        .expect("the valid member from the partial batch remains safely reusable");
+    assert_eq!(summary.reused_members, 1);
+    assert_eq!(summary.network_resolved_members, 0);
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        requests_after_partial,
+        "reusing the valid partial result must not issue another relay request"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    *fetcher.stalled_endpoint.lock().unwrap() = Some("wss://directory.example".to_owned());
+    let member = accounts[0].account_id_hex.clone();
+    let task_app = app.clone();
+    let task_member = member.clone();
+    let task = tokio::spawn(async move {
+        task_app
+            .prewarm_group_member_key_packages(&[task_member.as_str()])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fetcher.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("prewarm should start its directory request");
+    task.abort();
+    let _ = task.await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert!(
+        app.directory_entry_for_account_id(&member)
+            .unwrap()
+            .and_then(|entry| entry.key_package)
+            .is_none(),
+        "cancelled composition work must not durably admit a package"
+    );
+    *fetcher.stalled_endpoint.lock().unwrap() = None;
+    let requests_before_retry = fetcher.requests.lock().unwrap().len();
+    let summary = app
+        .prewarm_group_member_key_packages(&[member.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(summary.network_resolved_members, 1);
+    assert!(fetcher.requests.lock().unwrap().len() > requests_before_retry);
+}
+
+#[tokio::test]
+#[ignore = "member-resolution scaling benchmark; reports request count and wall clock"]
+async fn member_key_package_resolution_scaling_report() {
+    eprintln!("invitees,scenario,requests,wall_ms,outcome");
+    for count in [1, 8, 32] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        app.prewarm_group_member_key_packages(&members)
+            .await
+            .unwrap();
+        fetcher.requests.lock().unwrap().clear();
+        let started = Instant::now();
+        let outcome = app.resolve_member_key_packages(&members).await;
+        eprintln!(
+            "{count},warm_cache,{}, {},{}",
+            fetcher.requests.lock().unwrap().len(),
+            started.elapsed().as_millis(),
+            if outcome.is_ok() { "ok" } else { "error" }
+        );
+
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        eprintln!(
+            "{count},shared_relays,{}, {},{}",
+            fetcher.requests.lock().unwrap().len(),
+            started.elapsed().as_millis(),
+            if outcome.is_ok() { "ok" } else { "error" }
+        );
+
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, true).await;
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        eprintln!(
+            "{count},split_relays,{}, {},{}",
+            fetcher.requests.lock().unwrap().len(),
+            started.elapsed().as_millis(),
+            if outcome.is_ok() { "ok" } else { "error" }
+        );
+
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, true).await;
+        *fetcher.stalled_endpoint.lock().unwrap() = Some(
+            if count == 1 {
+                "wss://split-a.example"
+            } else {
+                "wss://split-b.example"
+            }
+            .to_owned(),
+        );
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        eprintln!(
+            "{count},one_stalled_relay,{}, {},{}",
+            fetcher.requests.lock().unwrap().len(),
+            started.elapsed().as_millis(),
+            if outcome.is_ok() { "ok" } else { "error" }
+        );
+
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
+        let missing = accounts.last().unwrap().account_id_hex.clone();
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != missing);
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        eprintln!(
+            "{count},missing_package,{}, {},{}",
+            fetcher.requests.lock().unwrap().len(),
+            started.elapsed().as_millis(),
+            if outcome.is_ok() { "ok" } else { "error" }
+        );
+    }
 }
 
 #[test]

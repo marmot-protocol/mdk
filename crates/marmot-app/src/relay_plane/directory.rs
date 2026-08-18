@@ -65,8 +65,8 @@ impl DirectorySubscriptionFilter {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DirectoryFetchRequest {
-    endpoints: Vec<TransportEndpoint>,
-    queries: Vec<DirectoryEventQuery>,
+    pub(crate) endpoints: Vec<TransportEndpoint>,
+    pub(crate) queries: Vec<DirectoryEventQuery>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

@@ -45,9 +45,11 @@ ranked by social distance. Live traversal is bounded by construction -- capped r
 under a per-radius timeout, and a per-search lifecycle that ends when its consumer drops the subscription -- and
 strangers it discovers are never promoted into the directory. It is not a crawler for the whole Nostr social graph.
 
-Group creation and invites still take pubkeys at the action boundary. If a member's KeyPackage is not already cached but
-the directory knows where their KeyPackages are published, the app fetches the latest package before building the MLS
-add. New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the component bytes in
+Group creation and invites still take pubkeys at the action boundary. The app canonicalizes and deduplicates the
+requested roster, reuses current cached KeyPackages, and resolves cold members in bounded multi-author relay batches
+before building the MLS add. Hosts may prewarm that same bounded composition lookup without reserving packages or
+durably admitting strangers; the final mutation revalidates every package. New Nostr-routed groups generate
+`marmot.transport.nostr.routing.v1` at creation, store the component bytes in
 signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
 

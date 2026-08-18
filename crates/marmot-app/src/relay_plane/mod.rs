@@ -208,6 +208,21 @@ impl MarmotRelayPlane {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_directory_fetcher_for_test(
+        relay_client: Arc<dyn NostrRelayClient>,
+        directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
+    ) -> Self {
+        Self::from_adapter(
+            Some(Duration::from_secs(120)),
+            NostrTransportAdapter::new(relay_client),
+            None,
+            None,
+            directory_fetcher,
+            false,
+        )
+    }
+
     fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
         let client = NostrSdkClient::builder().build();
         let relay_client = NostrSdkRelayClient::new(client.clone());

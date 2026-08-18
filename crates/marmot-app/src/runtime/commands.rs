@@ -170,6 +170,30 @@ impl AccountManager {
             .await
     }
 
+    /// Prewarm the current group-composition roster outside the account-worker
+    /// mutation queue. Dropping the returned future cancels the caller's wait;
+    /// relay-plane coalescing may still safely satisfy a later identical create
+    /// request, and no KeyPackage is reserved or consumed here.
+    pub async fn prewarm_group_member_key_packages(
+        &self,
+        account_ref: &str,
+        members: &[String],
+    ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
+        let started_at = Instant::now();
+        self.resolve(account_ref)?;
+        let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = self
+            .app
+            .prewarm_group_member_key_packages(&member_refs)
+            .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
+    }
+
     pub async fn create_group_with_initial_image(
         &self,
         account_ref: &str,

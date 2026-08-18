@@ -35,6 +35,9 @@ pub(crate) enum AppPerformanceOperation {
     OutboundMessageSend,
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
+    GroupMemberKeyPackagePrewarm,
+    GroupCreateKeyPackageCacheReuse,
+    GroupCreateKeyPackageNetworkResolution,
     GroupCreateImageUpload,
     GroupCreateMlsPreparePersist,
     GroupCreateWelcomePublish,
@@ -223,6 +226,12 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub group_create_key_package_lookup: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub group_member_key_package_prewarm: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_key_package_cache_reuse: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_key_package_network_resolution: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub group_create_image_upload: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_mls_prepare_persist: AppPerformanceOperationSnapshot,
@@ -299,6 +308,9 @@ struct AppPerformanceTelemetryInner {
     outbound_message_send: AppPerformanceOperationTelemetry,
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
+    group_member_key_package_prewarm: AppPerformanceOperationTelemetry,
+    group_create_key_package_cache_reuse: AppPerformanceOperationTelemetry,
+    group_create_key_package_network_resolution: AppPerformanceOperationTelemetry,
     group_create_image_upload: AppPerformanceOperationTelemetry,
     group_create_mls_prepare_persist: AppPerformanceOperationTelemetry,
     group_create_welcome_publish: AppPerformanceOperationTelemetry,
@@ -493,6 +505,21 @@ impl AppPerformanceTelemetry {
                     .group_create_key_package_lookup
                     .record(duration, success);
             }
+            AppPerformanceOperation::GroupMemberKeyPackagePrewarm => {
+                inner
+                    .group_member_key_package_prewarm
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateKeyPackageCacheReuse => {
+                inner
+                    .group_create_key_package_cache_reuse
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution => {
+                inner
+                    .group_create_key_package_network_resolution
+                    .record(duration, success);
+            }
             AppPerformanceOperation::GroupCreateImageUpload => {
                 inner.group_create_image_upload.record(duration, success);
             }
@@ -664,6 +691,13 @@ impl AppPerformanceTelemetry {
             outbound_message_send: inner.outbound_message_send.snapshot(),
             group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
             group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
+            group_member_key_package_prewarm: inner.group_member_key_package_prewarm.snapshot(),
+            group_create_key_package_cache_reuse: inner
+                .group_create_key_package_cache_reuse
+                .snapshot(),
+            group_create_key_package_network_resolution: inner
+                .group_create_key_package_network_resolution
+                .snapshot(),
             group_create_image_upload: inner.group_create_image_upload.snapshot(),
             group_create_mls_prepare_persist: inner.group_create_mls_prepare_persist.snapshot(),
             group_create_welcome_publish: inner.group_create_welcome_publish.snapshot(),
@@ -968,6 +1002,9 @@ mod tests {
         let operations = [
             AppPerformanceOperation::GroupCreateQueueWait,
             AppPerformanceOperation::GroupCreateKeyPackageLookup,
+            AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
+            AppPerformanceOperation::GroupCreateKeyPackageCacheReuse,
+            AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
             AppPerformanceOperation::GroupCreateImageUpload,
             AppPerformanceOperation::GroupCreateMlsPreparePersist,
             AppPerformanceOperation::GroupCreateWelcomePublish,
@@ -984,6 +1021,9 @@ mod tests {
         for stage in [
             snapshot.group_create_queue_wait,
             snapshot.group_create_key_package_lookup,
+            snapshot.group_member_key_package_prewarm,
+            snapshot.group_create_key_package_cache_reuse,
+            snapshot.group_create_key_package_network_resolution,
             snapshot.group_create_image_upload,
             snapshot.group_create_mls_prepare_persist,
             snapshot.group_create_welcome_publish,

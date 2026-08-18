@@ -366,6 +366,23 @@ async fn create_group_rejects_malformed_member_as_invalid_identity() {
 }
 
 #[tokio::test]
+async fn member_key_package_prewarm_binding_is_public_and_requires_a_known_account() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let error = kit
+        .prewarm_group_member_key_packages("alice".into(), Vec::new())
+        .await
+        .expect_err("a missing account cannot prewarm group composition");
+    assert!(matches!(error, MarmotKitError::UnknownAccount { .. }));
+}
+
+#[tokio::test]
 async fn delete_group_local_binding_is_public_and_validates_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

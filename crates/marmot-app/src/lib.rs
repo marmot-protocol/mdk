@@ -144,10 +144,10 @@ pub use config::{
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
-    MatchedField, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserDirectoryLocalAccount,
-    UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
-    UserProfileMetadata, UserSearchParams, UserSearchSubscription, UserSearchUpdate,
-    sort_user_search_results,
+    MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
+    UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
+    UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
+    UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
     MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
@@ -238,10 +238,14 @@ use directory::records::display_name_for_profile;
 use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
 use key_package_records::{
-    account_key_package_record_from_fetched, fresh_or_cached_key_package,
-    key_package_from_hex_with_optional_source, key_package_from_record,
-    latest_fresh_key_package_from_records, merge_key_package_records,
-    parse_key_package_event_id_hex, publish_endpoints_from_bootstrap, validated_cached_key_package,
+    account_key_package_record_from_fetched, key_package_from_hex_with_optional_source,
+    key_package_from_record, merge_key_package_records, parse_key_package_event_id_hex,
+    publish_endpoints_from_bootstrap,
+};
+#[cfg(test)]
+use key_package_records::{
+    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
+    validated_cached_key_package,
 };
 use projection::LegacyAccountProjectionDb;
 use relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
@@ -488,6 +492,9 @@ pub struct MarmotApp {
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
+    /// Bounded, process-local composition prewarm. Entries are never durable
+    /// directory admission and never reserve or consume a KeyPackage.
+    member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -1309,6 +1316,9 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            member_key_package_prewarm_cache: Arc::new(Mutex::new(
+                directory::MemberKeyPackagePrewarmCache::default(),
+            )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1379,6 +1389,9 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            member_key_package_prewarm_cache: Arc::new(Mutex::new(
+                directory::MemberKeyPackagePrewarmCache::default(),
+            )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4207,7 +4220,11 @@ impl MarmotApp {
             && storage.stored_key_package_bundles()?.is_empty())
     }
 
-    async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
+    #[cfg(test)]
+    pub(crate) async fn member_key_package(
+        &self,
+        member_ref: &str,
+    ) -> Result<KeyPackage, AppError> {
         // Local accounts: cache files are keyed by the account's canonical
         // label, so resolve the ref (which may be an npub or hex pubkey)
         // before looking up the cached key package. Using the raw ref here
