@@ -549,6 +549,40 @@ jobs:
             exit 0
           fi
 
+          latest_release_file="$RUNNER_TEMP/latest-installer-release.json"
+          if ! latest_status="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$latest_release_file" \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$latest_tag")"; then
+            if [ "$latest_status" != "404" ]; then
+              echo "failed to inspect $latest_tag; refusing to mutate the legacy installer alias" >&2
+              exit 1
+            fi
+          fi
+
+          if [ "$latest_status" = "200" ]; then
+            if ! latest_immutable="$(jq -er \
+              'if (.immutable | type) == "boolean" then .immutable else error("missing boolean immutable field") end' \
+              "$latest_release_file")"; then
+              echo "invalid release metadata for $latest_tag; refusing to mutate the legacy installer alias" >&2
+              exit 1
+            fi
+          elif [ "$latest_status" = "404" ]; then
+            latest_immutable="false"
+          else
+            echo "unexpected HTTP status $latest_status while inspecting $latest_tag; refusing to mutate the legacy installer alias" >&2
+            exit 1
+          fi
+
+          if [ "$latest_immutable" = "true" ]; then
+            echo "warning: $latest_tag is immutable; leaving the legacy installer alias unchanged"
+            echo "use the installer assets from the immutable $tag release instead"
+            exit 0
+          fi
+
           cat > "$latest_notes" <<EOF
           Latest WN Agent installers. These scripts install WN Agent \`$version\` from immutable release \`$tag\`.
 
