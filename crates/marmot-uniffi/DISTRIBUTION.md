@@ -1,8 +1,8 @@
-# MarmotKit Apple Binary Distribution
+# MarmotKit Binary Distribution
 
-MarmotKit releases publish the generated Swift API and its matching XCFrameworks as immutable GitHub Release
-assets. Consumers keep `MarmotKit.swift` in a Swift source target and declare the XCFramework as a remote binary
-target; neither the expanded XCFramework nor its static libraries need to be committed to the app repository.
+MarmotKit releases publish the generated Swift and Kotlin APIs with their matching native libraries as immutable
+GitHub Release assets. Apple consumers keep `MarmotKit.swift` in a Swift source target and declare the XCFramework as
+a remote binary target; Android consumers unpack the Kotlin and JNI bundle into their app build.
 
 Each release carries a separate iOS and macOS XCFramework under distinct asset names, and a single shared
 `MarmotKit-<identifier>.swift`. The generated Swift is platform-independent, so both platforms consume the same file:
@@ -112,16 +112,52 @@ toolchain versions, enabled features, macOS targets and deployment target, effec
 of the binary and shared generated Swift artifacts. The complete `marmotkit-macos-<identifier>.zip` retains the
 XCFramework, matching Swift source, and the same manifest for consumers that prefer a single provenance bundle.
 
+## Android
+
+Android bundles contain generated Kotlin, the required Android initialization helpers, and JNI libraries for
+`arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`.
+
+### Exact URLs
+
+Formal release `marmotkit-v<version>`:
+
+```text
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/marmotkit-android-<version>.zip
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/marmotkit-android-<version>.zip.sha256
+```
+
+Snapshot for a full 40-character commit SHA `<sha>` reachable from `master`:
+
+```text
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/marmotkit-android-snapshot-<sha>.zip
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/marmotkit-android-snapshot-<sha>.zip.sha256
+```
+
+The archive has a `marmotkit-android-<identifier>` root containing:
+
+- `kotlin/dev/ipf/marmotkit/marmot_uniffi.kt`
+- `kotlin/dev/ipf/marmotkit/MarmotAndroid.kt`
+- `kotlin/io/crates/keyring/Keyring.kt`
+- `jniLibs/<abi>/libmarmot_uniffi.so` for each supported ABI
+- `manifest.json`
+
+Verify the archive against its sibling `.sha256` before extracting it. Update the generated Kotlin helpers and all
+JNI ABI libraries together; mixing identifiers can cross an incompatible UniFFI ABI. The manifest records both the
+exact packaged source SHA and the workflow builder SHA.
+
 ## Publishing
 
 Pushing a formal `marmotkit-v*` tag publishes iOS, macOS, and Android bindings. To publish an untagged snapshot, run
 the `MarmotKit Bindings` workflow with a full SHA on `master`. Its immutable release tag is derived from that SHA.
-Snapshots publish the iOS and macOS bindings; Android bindings are published only for formal tags.
+Snapshots publish the iOS, macOS, and Android bindings from the same source SHA.
 
 Publishing first uploads and verifies every asset on a draft, then publishes it under repository-enforced immutable
 releases. A retry discards only an incomplete draft. Publishing fails if a public release already exists, and snapshot
 publishing also fails if its derived tag already exists. Assets and snapshot tags are never replaced or moved; a
 changed build requires a new formal version or a new source SHA.
 
-The iOS and macOS manifests each record both the packaged source SHA and the workflow builder SHA. Snapshot dispatches
-must use the workflow from `master`, so an older reachable source commit cannot substitute its own packaging logic.
+Each platform manifest records both the packaged source SHA and the workflow builder SHA. Snapshot dispatches must use
+the workflow from `master`, so an older reachable source commit cannot substitute its own packaging logic. The
+builder SHA also owns the canonical Rust release profile and compiled-in public endpoint defaults. Source-coupled
+inputs—including the Cargo workspace, UniFFI configuration, and Kotlin support files—come from the packaged source
+SHA so the generated API and JNI libraries remain a matched set.
