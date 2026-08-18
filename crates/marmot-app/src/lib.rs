@@ -128,7 +128,8 @@ pub use agent_streams::{
 };
 pub use app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    HostPerformanceOperation, HostPerformanceOutcome,
+    HostPerformanceOperation, HostPerformanceOutcome, SyncErrorClass, SyncFailureClassification,
+    SyncFailureCount, SyncFailureStage,
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
@@ -151,7 +152,7 @@ pub use directory::{
 pub use drafts::{
     MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
 };
-pub use error::AppError;
+pub use error::{AccountCatchUpFailure, AppError};
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest,
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
@@ -738,6 +739,48 @@ impl SyncFailure {
 impl From<AppError> for SyncFailure {
     fn from(source: AppError) -> Self {
         Self::new(SyncSummary::default(), source)
+    }
+}
+
+/// Internal sync failure that retains the bounded telemetry classification.
+///
+/// The sidecar is deliberately separate from [`SyncFailure`] so the public
+/// two-field struct remains constructible by downstream callers.
+#[derive(Debug)]
+pub(crate) struct ClassifiedSyncFailure {
+    pub(crate) partial_summary: SyncSummary,
+    pub(crate) source: AppError,
+    classification: app_telemetry::SyncFailureClassification,
+}
+
+impl ClassifiedSyncFailure {
+    pub(crate) fn at_stage(
+        partial_summary: SyncSummary,
+        source: AppError,
+        failure_stage: app_telemetry::SyncFailureStage,
+    ) -> Self {
+        let error_class = source.sync_error_class();
+        Self {
+            partial_summary,
+            source,
+            classification: app_telemetry::SyncFailureClassification::new(
+                failure_stage,
+                error_class,
+            ),
+        }
+    }
+
+    pub(crate) const fn classification(&self) -> app_telemetry::SyncFailureClassification {
+        self.classification
+    }
+}
+
+impl From<ClassifiedSyncFailure> for SyncFailure {
+    fn from(failure: ClassifiedSyncFailure) -> Self {
+        Self {
+            partial_summary: failure.partial_summary,
+            source: failure.source,
+        }
     }
 }
 

@@ -23,20 +23,20 @@ use super::{
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     wait_for_runtime_shutdown,
 };
-use crate::app_telemetry::AppPerformanceOperation;
+use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::{CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish};
 use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
-    ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+    ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
-    AppProjectionUpdate, AppQuarantinedGroup, ConvergenceScheduleState, EpochBackfillRunOutcome,
-    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncFailure, SyncSummary,
+    AppProjectionUpdate, AppQuarantinedGroup, ClassifiedSyncFailure, ConvergenceScheduleState,
+    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
+    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -95,16 +95,16 @@ pub(crate) struct AccountWorkerRuntime {
 
 pub(crate) enum AccountWorkerCommand {
     CatchUp {
-        respond: oneshot::Sender<Result<(), String>>,
+        respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
     },
     /// Startup-coalesced catch-up response held in the same FIFO as deferred
     /// mutations so later live reads cannot bypass those mutations.
     StartupCatchUpResult {
-        result: Result<(), String>,
-        respond: oneshot::Sender<Result<(), String>>,
+        result: Result<(), AccountCatchUpFailure>,
+        respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
     },
     RepairFullHistory {
-        respond: oneshot::Sender<Result<(), String>>,
+        respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
     },
     CreateGroup {
         queued_at: Instant,
@@ -413,7 +413,7 @@ enum DeferredStartupCommand {
     Command(Box<AccountWorkerCommand>),
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
-    CatchUp(oneshot::Sender<Result<(), String>>),
+    CatchUp(oneshot::Sender<Result<(), AccountCatchUpFailure>>),
 }
 
 /// Relay-only startup Welcome work. Dropping the worker aborts the task so no
@@ -615,7 +615,7 @@ async fn run_app_runtime_account_worker(
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
-            Ok::<_, SyncFailure>(summary)
+            Ok::<_, ClassifiedSyncFailure>(summary)
         });
         loop {
             tokio::select! {
@@ -704,10 +704,13 @@ async fn run_app_runtime_account_worker(
             }
         }
     };
-    shared.app_performance_telemetry().record(
+    shared.app_performance_telemetry().record_sync_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
-        startup_sync_result.is_ok(),
+        startup_sync_result
+            .as_ref()
+            .err()
+            .map(ClassifiedSyncFailure::classification),
     );
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
@@ -791,7 +794,10 @@ async fn run_app_runtime_account_worker(
                     );
                 }
             }
-            Err(message)
+            Err(AccountCatchUpFailure::new(
+                message,
+                failure.classification(),
+            ))
         }
     };
     // Replay commands deferred during the initial catch-up in arrival order, now
@@ -1487,7 +1493,7 @@ struct AccountWorkerCatchUpContext<'a> {
 
 async fn handle_account_worker_catch_up(
     client: &mut AppClient,
-    respond: oneshot::Sender<Result<(), String>>,
+    respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
     commands: &mut mpsc::Receiver<AccountWorkerCommand>,
     pending: &mut VecDeque<AccountWorkerCommand>,
     context: AccountWorkerCatchUpContext<'_>,
@@ -1514,7 +1520,7 @@ async fn handle_account_worker_catch_up(
     let mut commands_open = true;
     let sync_started_at = Instant::now();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync_with_partial_progress());
+        let mut sync = std::pin::pin!(client.sync_with_classified_partial_progress());
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
@@ -1651,14 +1657,23 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
                 message.clone(),
             );
-            Err(message)
+            Err(AccountCatchUpFailure::new(
+                message,
+                failure.classification(),
+            ))
         }
     };
-    context.shared.app_performance_telemetry().record(
-        AppPerformanceOperation::AccountSync,
-        sync_started_at.elapsed(),
-        result.is_ok(),
-    );
+    context
+        .shared
+        .app_performance_telemetry()
+        .record_sync_result(
+            AppPerformanceOperation::AccountSync,
+            sync_started_at.elapsed(),
+            result
+                .as_ref()
+                .err()
+                .map(AccountCatchUpFailure::classification),
+        );
     let retry_after_response = result.is_ok();
     for respond in catch_up_responders {
         let _ = respond.send(result.clone());
@@ -2334,7 +2349,7 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();
-            let result = match client.sync_with_partial_progress().await {
+            let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
                     let backfill_result = run_pending_epoch_backfill_reporting_arm(
@@ -2367,13 +2382,19 @@ async fn handle_account_worker_command(
                         account_label,
                         message.clone(),
                     );
-                    Err(message)
+                    Err(AccountCatchUpFailure::new(
+                        message,
+                        failure.classification(),
+                    ))
                 }
             };
-            shared.app_performance_telemetry().record(
+            shared.app_performance_telemetry().record_sync_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
-                result.is_ok(),
+                result
+                    .as_ref()
+                    .err()
+                    .map(AccountCatchUpFailure::classification),
             );
             let retry_after_response = result.is_ok();
             let _ = respond.send(result);
@@ -2410,13 +2431,19 @@ async fn handle_account_worker_command(
                         account_label,
                         message.clone(),
                     );
-                    Err(message)
+                    Err(AccountCatchUpFailure::new(
+                        message,
+                        failure.classification(),
+                    ))
                 }
             };
-            shared.app_performance_telemetry().record(
+            shared.app_performance_telemetry().record_sync_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
-                result.is_ok(),
+                result
+                    .as_ref()
+                    .err()
+                    .map(AccountCatchUpFailure::classification),
             );
             let _ = respond.send(result);
         }
@@ -3993,7 +4020,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     account_label: &str,
     shared: &RuntimeSharedServices,
     seam: EpochBackfillExecutionSeam,
-) -> Result<(), String> {
+) -> Result<(), AccountCatchUpFailure> {
     let backfill_armed = client.has_pending_epoch_backfill();
     let result = match client.run_pending_epoch_backfill(seam).await {
         Ok(EpochBackfillRunOutcome::Completed(summary)) => {
@@ -4009,7 +4036,13 @@ async fn run_pending_epoch_backfill_reporting_arm(
                 account_label,
                 message.clone(),
             );
-            Err(message)
+            // run_pending_epoch_backfill returns only AppError, after several
+            // distinct sync boundaries. Preserve its typed broad cause but do
+            // not derive a stage from that cause.
+            Err(AccountCatchUpFailure::new(
+                message,
+                SyncFailureClassification::new(SyncFailureStage::Unknown, error.sync_error_class()),
+            ))
         }
     };
     if backfill_armed {
@@ -4495,7 +4528,10 @@ mod tests {
         .await
         .expect_err("failed replay activation must be returned");
 
-        assert_eq!(error, "epoch-gap backfill failed: account_transport");
+        assert_eq!(
+            error.to_string(),
+            "epoch-gap backfill failed: account_transport"
+        );
         assert!(client.has_pending_epoch_backfill());
         let failed_rows: Vec<serde_json::Value> = app
             .audit_log_files()

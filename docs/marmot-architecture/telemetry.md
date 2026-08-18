@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-08-15
+updated: 2026-08-18
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -22,7 +22,7 @@ runtime. It complements the policy docs:
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
 | Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read/accept operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. Exposed locally via `MarmotAppRuntime::app_performance_snapshot()` and the MarmotKit `appPerformanceSnapshot()` binding. | No by itself. Local getters return the aggregate snapshot to the host process only. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
-| Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
+| Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay metrics may carry only `relay`; account sync/catch-up failure counters carry only the closed `failure_stage` and `error_class` attributes. Other app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Agent connector reconciliation telemetry | Always collected while `wn-agent` runs: process-local cumulative counters for the shared inbound catch-up driver and the invite-policy worker (passes, outcomes, accounts/candidate rows considered), plus one privacy-safe `tracing` event per scheduled pass carrying a `source` label, duration, result, and aggregate counts (mdk#1380). | No. Counters are process-local; tracing events follow the no-ids/no-urls/no-content rules. | [`reconcile_telemetry.rs`](../../crates/agent-connector/src/reconcile_telemetry.rs), [`event_projection.rs`](../../crates/agent-connector/src/event_projection.rs), [`invite_policy.rs`](../../crates/agent-connector/src/invite_policy.rs) |
 | Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
@@ -252,6 +252,24 @@ ids, relay URLs, media URLs, payload sizes, content types, upload endpoints, dow
 Host applications can only select the closed `HostPerformanceOperation` enum; callers cannot supply metric names,
 label names, or label values. Adding a new cross-platform operation requires an MDK API change and review.
 
+The `app_account_sync_failures` and `app_account_catch_up_failures` counters are the only app-performance metrics with
+metric attributes. Every failed attempt emits exactly one point in a bounded classification bucket:
+
+| Attribute | Allowed values |
+| --- | --- |
+| `failure_stage` | `transport_activation`, `group_subscription_sync`, `relay_receive`, `cgka_ingest`, `state_persist`, `account_worker`, `unknown` |
+| `error_class` | `timeout`, `transport_closed`, `relay_directory`, `protocol`, `crypto`, `storage`, `cancelled`, `unknown` |
+
+`failure_stage` is the explicit sync boundary that stopped; `error_class` is derived from typed error variants. A
+catch-up failure propagated to its parent account sync retains the same pair. The implementation never parses
+`Display` or debug text. If a typed cause is unavailable, it uses `unknown`; it does not infer a class from backend
+strings. Raw errors, relay URLs, account/group/event ids, pubkeys, file paths, and caller-generated strings cannot enter
+these fields because the snapshot and export types store closed enums rather than strings.
+
+Transport `Backend`, `Subscription`, and `Publish` errors intentionally use `error_class=unknown`: their current typed
+variants carry backend text but do not expose a safe, more specific cause. Their explicit `failure_stage` remains the
+useful diagnostic dimension until those lower layers preserve additional typed source information.
+
 ### Agent connector reconciliation telemetry
 
 `ReconcileTelemetry` (in `crates/agent-connector/src/reconcile_telemetry.rs`) holds process-local cumulative
@@ -373,7 +391,8 @@ the batch now carries both relay metrics and app-performance metrics. Each point
 | Field | Meaning |
 | --- | --- |
 | `name` | Static metric name from `metric_names`. |
-| `relay` | Optional relay URL label. This is the only metric label the batch type permits. Population metrics use `None`. |
+| `relay` | Optional relay URL label, used only by relay metrics. |
+| `failure` | Optional closed sync/catch-up classification, encoded as `failure_stage` and `error_class`; used only by the two account failure counters. |
 | `value` | `Counter(u64)`, `Gauge(f64)`, or `Histogram(ExportHistogram)`. |
 
 `ExportHistogram` carries:
@@ -453,11 +472,11 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_account_catch_up_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_catch_up.duration_ms` |
 | `app_account_catch_up_attempts` | none | Counter | `AppPerformanceSnapshot.account_catch_up.attempts` |
 | `app_account_catch_up_successes` | none | Counter | `AppPerformanceSnapshot.account_catch_up.successes` |
-| `app_account_catch_up_failures` | none | Counter | `AppPerformanceSnapshot.account_catch_up.failures` |
+| `app_account_catch_up_failures` | `failure_stage`, `error_class` | Counter | `AppPerformanceSnapshot.account_catch_up.failure_classifications` (sums to `.failures`) |
 | `app_account_sync_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_sync.duration_ms` |
 | `app_account_sync_attempts` | none | Counter | `AppPerformanceSnapshot.account_sync.attempts` |
 | `app_account_sync_successes` | none | Counter | `AppPerformanceSnapshot.account_sync.successes` |
-| `app_account_sync_failures` | none | Counter | `AppPerformanceSnapshot.account_sync.failures` |
+| `app_account_sync_failures` | `failure_stage`, `error_class` | Counter | `AppPerformanceSnapshot.account_sync.failure_classifications` (sums to `.failures`) |
 | `app_outbound_message_send_duration_ms` | none | Histogram | `AppPerformanceSnapshot.outbound_message_send.duration_ms` |
 | `app_outbound_message_send_attempts` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.attempts` |
 | `app_outbound_message_send_successes` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.successes` |
@@ -515,6 +534,14 @@ Resource attributes on every OTLP request:
 | `os.type` | `RelayTelemetryResource.os_type`. |
 | `os.version` | `RelayTelemetryResource.os_version`. |
 | `device.model.identifier` | Optional `RelayTelemetryResource.device_model_identifier`. |
+
+Example PromQL (for collectors that expose OTLP monotonic sums with the conventional `_total` suffix):
+
+```promql
+sum by (failure_stage, error_class, service_version) (
+  increase(app_account_catch_up_failures_total[24h])
+)
+```
 
 Exporter timing:
 

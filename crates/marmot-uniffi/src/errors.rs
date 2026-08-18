@@ -307,7 +307,9 @@ impl From<AppError> for MarmotKitError {
                 Self::AccountSetupKeyPackageRecoveryAvailable
             }
             AppError::RuntimeStopping => Self::RuntimeStopping,
-            AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
+            AppError::AccountCatchUp(details) => Self::AccountCatchUp {
+                details: details.to_string(),
+            },
             // #484: a transient storage busy error can also surface directly at
             // the app layer (not only wrapped in an EngineError). Classify it
             // as the typed transient variant here too, so Android never sees
@@ -445,7 +447,10 @@ mod tests {
     // earlier investigation chasing the wrong subsystem).
     #[test]
     fn account_catch_up_crosses_ffi_as_typed_variant() {
-        let app_err = AppError::AccountCatchUp("runtime catch-up failed: account_session".into());
+        let app_err = AppError::AccountCatchUp(marmot_app::AccountCatchUpFailure::new(
+            "runtime catch-up failed: account_session".into(),
+            marmot_app::SyncFailureClassification::UNKNOWN,
+        ));
         let ffi: MarmotKitError = app_err.into();
         match ffi {
             MarmotKitError::AccountCatchUp { details } => {

@@ -1,7 +1,10 @@
 use cgka_traits::TransportEndpoint;
 use transport_nostr_adapter::HistogramBucket;
 
-use crate::app_telemetry::{AppPerformanceOperationSnapshot, AppPerformanceSnapshot};
+use crate::app_telemetry::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncErrorClass,
+    SyncFailureClassification, SyncFailureCount, SyncFailureStage,
+};
 use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
 use crate::relay_plane::{EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup};
 
@@ -216,55 +219,77 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             attempts: 3,
             successes: 2,
             failures: 1,
+            failure_classifications: Vec::new(),
             duration_ms: hist(2),
         },
         group_invite_engine_publish: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
             failures: 0,
+            failure_classifications: Vec::new(),
             duration_ms: hist(4),
         },
         group_details_read: AppPerformanceOperationSnapshot {
             attempts: 2,
             successes: 2,
             failures: 0,
+            failure_classifications: Vec::new(),
             duration_ms: hist(1),
         },
         chat_list_row_read: AppPerformanceOperationSnapshot {
             attempts: 3,
             successes: 3,
             failures: 0,
+            failure_classifications: Vec::new(),
             duration_ms: hist(1),
         },
         group_roster_read: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
             failures: 0,
+            failure_classifications: Vec::new(),
             duration_ms: hist(1),
         },
         group_accept_invite: AppPerformanceOperationSnapshot {
             attempts: 2,
             successes: 1,
             failures: 1,
+            failure_classifications: Vec::new(),
             duration_ms: hist(3),
         },
         host_splash_ready: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
             failures: 0,
+            failure_classifications: Vec::new(),
             duration_ms: hist(5),
         },
         account_transport_activation: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
             failures: 0,
+            failure_classifications: Vec::new(),
             duration_ms: hist(2),
         },
         account_subscription_registration: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 0,
             failures: 1,
+            failure_classifications: Vec::new(),
             duration_ms: hist(3),
+        },
+        account_sync: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 0,
+            failures: 1,
+            failure_classifications: vec![SyncFailureCount {
+                classification: SyncFailureClassification::new(
+                    SyncFailureStage::CgkaIngest,
+                    SyncErrorClass::Protocol,
+                ),
+                count: 1,
+            }],
+            duration_ms: hist(1),
         },
         sqlcipher_migration_probe_runs: 7,
         sqlcipher_migration_probe_skips: 42,
@@ -277,6 +302,19 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     );
 
     assert!(batch.points.iter().all(|point| point.relay.is_none()));
+    let sync_failure = batch
+        .points
+        .iter()
+        .find(|point| point.name == metric_names::APP_ACCOUNT_SYNC_FAILURES)
+        .expect("classified sync failure point");
+    assert_eq!(
+        sync_failure.failure,
+        Some(SyncFailureClassification::new(
+            SyncFailureStage::CgkaIngest,
+            SyncErrorClass::Protocol,
+        ))
+    );
+    assert_eq!(sync_failure.value, ExportMetricValue::Counter(1));
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_START_ATTEMPTS
             && point.value == ExportMetricValue::Counter(3)

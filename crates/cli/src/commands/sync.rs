@@ -32,6 +32,7 @@ fn sync_failure_error(
     let SyncFailure {
         partial_summary,
         source,
+        ..
     } = failure;
     let partial_plain = partial_sync_plain(&partial_summary);
     // Rendering the applied prefix is secondary to the sync failure. Account
@@ -170,8 +171,8 @@ mod tests {
         let home = AccountHome::open(dir.path());
         let account = home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        let failure = SyncFailure {
-            partial_summary: SyncSummary {
+        let failure = SyncFailure::new(
+            SyncSummary {
                 messages: vec![ReceivedMessage {
                     message_id_hex: "11".repeat(32),
                     source_message_id_hex: "22".repeat(32),
@@ -193,8 +194,8 @@ mod tests {
                 }],
                 ..Default::default()
             },
-            source: AppError::BlockingTask("injected sync failure".to_owned()),
-        };
+            AppError::BlockingTask("injected sync failure".to_owned()),
+        );
 
         let error = sync_failure_error(&app, account, failure);
         let rendered = wn_error_json(&error);
@@ -229,10 +230,10 @@ mod tests {
             external_signing: false,
             signed_out: false,
         };
-        let failure = SyncFailure {
-            partial_summary: SyncSummary::default(),
-            source: AppError::BlockingTask("original sync failure".to_owned()),
-        };
+        let failure = SyncFailure::new(
+            SyncSummary::default(),
+            AppError::BlockingTask("original sync failure".to_owned()),
+        );
 
         let error = sync_failure_error(&app, account, failure);
         let rendered = wn_error_json(&error);

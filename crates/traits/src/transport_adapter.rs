@@ -697,6 +697,10 @@ pub enum TransportAdapterError {
     #[error("account not active")]
     AccountNotActive(MemberId),
 
+    /// The transport delivery stream or its backing task has closed.
+    #[error("transport closed")]
+    Closed,
+
     /// An inbound transport object failed its transport-specific syntax or
     /// exact-shape validation. Carries no attacker-controlled detail so it is
     /// safe to classify in runtime telemetry.

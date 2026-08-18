@@ -617,7 +617,7 @@ impl NostrTransportAdapter {
                     },
                 })
                 .await
-                .map_err(|_| TransportAdapterError::Backend("delivery queue closed".into()))?;
+                .map_err(|_| TransportAdapterError::Closed)?;
             delivered += 1;
         }
 
@@ -1010,7 +1010,7 @@ impl NostrTransportAdapter {
                         },
                     })
                     .await
-                    .map_err(|_| TransportAdapterError::Backend("delivery queue closed".into()))?;
+                    .map_err(|_| TransportAdapterError::Closed)?;
                 delivered += 1;
             }
         }

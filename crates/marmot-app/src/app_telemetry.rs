@@ -5,6 +5,7 @@
 //! are no fields for account, group, message, relay, URL, pubkey, payload, or
 //! key material.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,94 @@ pub enum HostPerformanceOutcome {
     Failure,
 }
 
+/// Fixed sync/catch-up boundary at which an attempt stopped.
+///
+/// These values are exported verbatim as the `failure_stage` attribute. Keep
+/// this enum closed: accepting caller-provided strings would make metric
+/// cardinality and privacy impossible to review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncFailureStage {
+    TransportActivation,
+    GroupSubscriptionSync,
+    RelayReceive,
+    CgkaIngest,
+    StatePersist,
+    AccountWorker,
+    Unknown,
+}
+
+impl SyncFailureStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportActivation => "transport_activation",
+            Self::GroupSubscriptionSync => "group_subscription_sync",
+            Self::RelayReceive => "relay_receive",
+            Self::CgkaIngest => "cgka_ingest",
+            Self::StatePersist => "state_persist",
+            Self::AccountWorker => "account_worker",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Fixed broad cause for a sync/catch-up failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncErrorClass {
+    Timeout,
+    TransportClosed,
+    RelayDirectory,
+    Protocol,
+    Crypto,
+    Storage,
+    Cancelled,
+    Unknown,
+}
+
+impl SyncErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::TransportClosed => "transport_closed",
+            Self::RelayDirectory => "relay_directory",
+            Self::Protocol => "protocol",
+            Self::Crypto => "crypto",
+            Self::Storage => "storage",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Privacy-safe, bounded classification attached only to failed account sync
+/// and catch-up counter samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SyncFailureClassification {
+    pub failure_stage: SyncFailureStage,
+    pub error_class: SyncErrorClass,
+}
+
+impl SyncFailureClassification {
+    pub const UNKNOWN: Self = Self {
+        failure_stage: SyncFailureStage::Unknown,
+        error_class: SyncErrorClass::Unknown,
+    };
+
+    pub const fn new(failure_stage: SyncFailureStage, error_class: SyncErrorClass) -> Self {
+        Self {
+            failure_stage,
+            error_class,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncFailureCount {
+    pub classification: SyncFailureClassification,
+    pub count: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPerformanceOperationSnapshot {
     /// Operation attempts since process start.
@@ -88,6 +177,10 @@ pub struct AppPerformanceOperationSnapshot {
     pub successes: u64,
     /// Failed operations since process start.
     pub failures: u64,
+    /// Bounded failure breakdown. Empty for operations other than account sync
+    /// and catch-up and for snapshots written by older MDK versions.
+    #[serde(default)]
+    pub failure_classifications: Vec<SyncFailureCount>,
     /// Operation duration histogram in local monotonic milliseconds.
     pub duration_ms: DurationHistogramSnapshot,
 }
@@ -240,6 +333,7 @@ struct AppPerformanceOperationTelemetry {
     attempts: u64,
     successes: u64,
     failures: u64,
+    failure_classifications: BTreeMap<SyncFailureClassification, u64>,
     duration_ms: DurationHistogram,
 }
 
@@ -300,11 +394,35 @@ impl AppPerformanceOperationTelemetry {
         self.duration_ms.record(duration);
     }
 
+    fn record_with_failure(
+        &mut self,
+        duration: Duration,
+        success: bool,
+        failure: Option<SyncFailureClassification>,
+    ) {
+        self.record(duration, success);
+        if !success {
+            let classification = failure.unwrap_or(SyncFailureClassification::UNKNOWN);
+            *self
+                .failure_classifications
+                .entry(classification)
+                .or_default() += 1;
+        }
+    }
+
     fn snapshot(&self) -> AppPerformanceOperationSnapshot {
         AppPerformanceOperationSnapshot {
             attempts: self.attempts,
             successes: self.successes,
             failures: self.failures,
+            failure_classifications: self
+                .failure_classifications
+                .iter()
+                .map(|(classification, count)| SyncFailureCount {
+                    classification: *classification,
+                    count: *count,
+                })
+                .collect(),
             duration_ms: self.duration_ms.snapshot(),
         }
     }
@@ -317,6 +435,16 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         success: bool,
     ) {
+        if matches!(
+            operation,
+            AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp
+        ) {
+            debug_assert!(
+                false,
+                "account sync/catch-up must use record_sync_result with a bounded failure classification"
+            );
+            return;
+        }
         let mut inner = self
             .inner
             .lock()
@@ -350,10 +478,7 @@ impl AppPerformanceTelemetry {
                     .account_subscription_registration
                     .record(duration, success);
             }
-            AppPerformanceOperation::AccountCatchUp => {
-                inner.account_catch_up.record(duration, success);
-            }
-            AppPerformanceOperation::AccountSync => inner.account_sync.record(duration, success),
+            AppPerformanceOperation::AccountCatchUp | AppPerformanceOperation::AccountSync => {}
             AppPerformanceOperation::AccountSetupAdvisoryStep => {
                 inner.account_setup_advisory_step.record(duration, success)
             }
@@ -466,6 +591,30 @@ impl AppPerformanceTelemetry {
                 inner.host_foreground_local_ready.record(duration, success);
             }
         }
+    }
+
+    /// Record a terminal account sync/catch-up result with its bounded failure
+    /// classification. Successful samples carry no failure attributes.
+    pub(crate) fn record_sync_result(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        failure: Option<SyncFailureClassification>,
+    ) {
+        debug_assert!(matches!(
+            operation,
+            AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp
+        ));
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = match operation {
+            AppPerformanceOperation::AccountSync => &mut inner.account_sync,
+            AppPerformanceOperation::AccountCatchUp => &mut inner.account_catch_up,
+            _ => return,
+        };
+        target.record_with_failure(duration, failure.is_none(), failure);
     }
 
     /// Record one approved host-app milestone without accepting arbitrary
@@ -593,6 +742,137 @@ pub(crate) async fn bounded_advisory_step<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AccountCatchUpFailure, AppError, ClassifiedSyncFailure, SyncSummary};
+    use cgka_traits::TransportAdapterError;
+    use cgka_traits::error::EngineError;
+    use cgka_traits::storage::StorageError;
+
+    fn classified(stage: SyncFailureStage, error: AppError) -> SyncFailureClassification {
+        ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage).classification()
+    }
+
+    #[test]
+    fn sync_failure_classification_is_typed_bounded_and_propagates() {
+        let cases = [
+            (
+                classified(
+                    SyncFailureStage::AccountWorker,
+                    AppError::AccountWorkerResponseTimedOut,
+                ),
+                SyncFailureClassification::new(
+                    SyncFailureStage::AccountWorker,
+                    SyncErrorClass::Timeout,
+                ),
+            ),
+            (
+                classified(
+                    SyncFailureStage::RelayReceive,
+                    AppError::Transport(TransportAdapterError::Closed),
+                ),
+                SyncFailureClassification::new(
+                    SyncFailureStage::RelayReceive,
+                    SyncErrorClass::TransportClosed,
+                ),
+            ),
+            (
+                classified(
+                    SyncFailureStage::GroupSubscriptionSync,
+                    AppError::Transport(TransportAdapterError::Subscription(
+                        "raw relay detail must not become an attribute".into(),
+                    )),
+                ),
+                SyncFailureClassification::new(
+                    SyncFailureStage::GroupSubscriptionSync,
+                    SyncErrorClass::Unknown,
+                ),
+            ),
+            (
+                classified(
+                    SyncFailureStage::CgkaIngest,
+                    AppError::Account(marmot_account::AccountError::Engine(
+                        EngineError::InvalidWelcome,
+                    )),
+                ),
+                SyncFailureClassification::new(
+                    SyncFailureStage::CgkaIngest,
+                    SyncErrorClass::Protocol,
+                ),
+            ),
+            (
+                classified(
+                    SyncFailureStage::StatePersist,
+                    AppError::Storage(StorageError::Backend(
+                        "/private/account.sqlite secret detail".into(),
+                    )),
+                ),
+                SyncFailureClassification::new(
+                    SyncFailureStage::StatePersist,
+                    SyncErrorClass::Storage,
+                ),
+            ),
+            (
+                classified(
+                    SyncFailureStage::Unknown,
+                    AppError::BlockingTask("untyped raw failure".into()),
+                ),
+                SyncFailureClassification::UNKNOWN,
+            ),
+        ];
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+
+        let child = cases[3].0;
+        let propagated = AppError::AccountCatchUp(AccountCatchUpFailure::new(
+            "runtime catch-up failed: attacker-controlled detail".into(),
+            child,
+        ));
+        assert_eq!(propagated.sync_error_class(), child.error_class);
+
+        let telemetry = AppPerformanceTelemetry::default();
+        telemetry.record_sync_result(
+            AppPerformanceOperation::AccountSync,
+            Duration::from_millis(1),
+            Some(child),
+        );
+        telemetry.record_sync_result(
+            AppPerformanceOperation::AccountCatchUp,
+            Duration::from_millis(2),
+            Some(child),
+        );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_sync.attempts, 1);
+        assert_eq!(snapshot.account_sync.successes, 0);
+        assert_eq!(snapshot.account_sync.failures, 1);
+        assert_eq!(snapshot.account_catch_up.attempts, 1);
+        assert_eq!(snapshot.account_catch_up.successes, 0);
+        assert_eq!(snapshot.account_catch_up.failures, 1);
+        assert_eq!(
+            snapshot.account_sync.failure_classifications[0].classification,
+            child
+        );
+        assert_eq!(
+            snapshot.account_catch_up.failure_classifications[0].classification,
+            child
+        );
+
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("attacker-controlled"));
+        assert!(!serialized.contains("account.sqlite"));
+        assert!(!serialized.contains("raw relay detail"));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "account sync/catch-up must use record_sync_result with a bounded failure classification"
+    )]
+    fn generic_record_rejects_classified_sync_operations() {
+        AppPerformanceTelemetry::default().record(
+            AppPerformanceOperation::AccountSync,
+            Duration::from_millis(1),
+            false,
+        );
+    }
 
     #[test]
     fn records_success_failure_counts_and_duration_buckets() {
@@ -736,6 +1016,13 @@ mod tests {
         assert_eq!(snapshot.group_accept_invite.attempts, 2);
         assert_eq!(snapshot.group_accept_invite.successes, 1);
         assert_eq!(snapshot.group_accept_invite.failures, 1);
+        assert!(
+            snapshot
+                .group_accept_invite
+                .failure_classifications
+                .is_empty(),
+            "generic operation failures must not populate sync classifications"
+        );
         assert_eq!(snapshot.group_accept_invite.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
     }
