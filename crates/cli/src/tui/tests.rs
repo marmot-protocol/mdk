@@ -10183,12 +10183,10 @@ fn message_search_navigates_hits_and_returns_to_the_query() {
     );
 }
 
-#[test]
-fn a_message_search_that_fills_its_limit_reports_the_count_as_partial() {
-    // A full page means hits were almost certainly dropped, and the screen is a
-    // scan-and-pick list with no paging. Reporting the cap as an exact count would
-    // read as "these are all of them" and hide the need to refine the query.
-    let hits = (0..TUI_MESSAGE_SEARCH_LIMIT)
+/// `TUI_MESSAGE_SEARCH_LIMIT` hits, so a fixture can pair a page of exactly the
+/// limit with either answer to "were hits dropped".
+fn limit_sized_hit_page() -> String {
+    (0..TUI_MESSAGE_SEARCH_LIMIT)
         .map(|index| {
             timeline_hit_json(
                 &format!("m{index}"),
@@ -10198,21 +10196,35 @@ fn a_message_search_that_fills_its_limit_reports_the_count_as_partial() {
             )
         })
         .collect::<Vec<_>>()
-        .join(",");
-    let (_dir, client) = test_json_client(&format!(
-        r#"{{"ok":true,"result":{{"messages":[{hits}]}}}}"#
-    ));
+        .join(",")
+}
+
+/// Open the message-search screen over a canned page and settle its one effect.
+fn settled_message_search(response: &str) -> (tempfile::TempDir, TuiApp) {
+    let (dir, client) = test_json_client(response);
     let mut app = app_with_open_chat(client, &[("m0", "deploy")]);
     app.open_message_search(Some("deploy".to_owned()))
         .expect("open search");
     app.settle_effects(1);
+    (dir, app)
+}
+
+#[test]
+fn a_message_search_with_hits_beyond_the_page_reports_a_partial_count() {
+    // Hits remain past the page, and the screen is a scan-and-pick list with no
+    // paging. Reporting the page size as an exact count would read as "these are
+    // all of them" and hide the need to refine the query.
+    let hits = limit_sized_hit_page();
+    let (_dir, app) = settled_message_search(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{hits}],"has_more_before":true}}}}"#
+    ));
 
     let view = app.message_search.as_ref().expect("view");
     assert_eq!(view.results.len(), TUI_MESSAGE_SEARCH_LIMIT);
     assert_eq!(
         view.match_count_label(),
         format!("{TUI_MESSAGE_SEARCH_LIMIT}+"),
-        "a filled page is labelled as a lower bound, not an exact count"
+        "a page with more behind it is labelled as a lower bound, not an exact count"
     );
     assert!(
         app.status.contains(&format!("{TUI_MESSAGE_SEARCH_LIMIT}+")),
@@ -10223,6 +10235,57 @@ fn a_message_search_that_fills_its_limit_reports_the_count_as_partial() {
         app.status.contains("refine"),
         "the status points at the action that fixes it; got: {:?}",
         app.status
+    );
+}
+
+#[test]
+fn a_message_search_page_of_exactly_the_limit_with_nothing_behind_it_is_exact() {
+    // The count alone cannot tell this page from the one above it, which is why
+    // the answer comes from the response rather than from `hits.len()`.
+    let hits = limit_sized_hit_page();
+    let (_dir, app) = settled_message_search(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{hits}],"has_more_before":false}}}}"#
+    ));
+
+    let view = app.message_search.as_ref().expect("view");
+    assert_eq!(
+        view.match_count_label(),
+        TUI_MESSAGE_SEARCH_LIMIT.to_string(),
+        "a page that happens to be limit-sized is still an exact count"
+    );
+    assert!(
+        !app.status.contains('+') && !app.status.contains("refine"),
+        "so nothing asks the reader to refine a complete answer; got: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn a_short_message_search_page_with_hits_behind_it_reports_a_partial_count() {
+    // The mirror image: fewer hits than the limit, but the backend says more
+    // remain, so the count is a lower bound. Only the response can say this.
+    let hits = (0..3)
+        .map(|index| {
+            timeline_hit_json(
+                &format!("m{index}"),
+                "bob",
+                "deploy",
+                1_700_000_000 + index as u64,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let (_dir, app) = settled_message_search(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{hits}],"has_more_before":true}}}}"#
+    ));
+
+    assert_eq!(
+        app.message_search
+            .as_ref()
+            .expect("view")
+            .match_count_label(),
+        "3+",
+        "truncation follows the response, not the hit count"
     );
 }
 

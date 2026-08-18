@@ -1394,17 +1394,18 @@ pub(crate) struct MessageSearchView {
     pub(crate) results: Vec<TimelineRow>,
     pub(crate) selected: usize,
     pub(crate) focus: MessageSearchFocus,
-    /// Whether the answer filled `TUI_MESSAGE_SEARCH_LIMIT`, so matches were very
-    /// likely dropped. Recorded at fold time because the count alone cannot say it,
-    /// and the screen has no paging: an exact-looking count would read as "these
-    /// are all of them" and hide the one action that helps, refining the query.
+    /// Whether matches remain beyond this page, per the response's
+    /// `has_more_before`. Recorded at fold time because the count alone cannot say
+    /// it, and the screen has no paging: an exact-looking count would read as
+    /// "these are all of them" and hide the one action that helps, refining the
+    /// query.
     pub(crate) truncated: bool,
 }
 
 impl MessageSearchView {
-    /// The match count as shown: `12` when the page is complete, `100+` when the
-    /// limit was filled. One place, so the status line and the list header cannot
-    /// disagree about how many matches there are.
+    /// The match count as shown: `12` when the page is complete, `100+` when hits
+    /// remain beyond the page. One place, so the status line and the list header
+    /// cannot disagree about how many matches there are.
     pub(crate) fn match_count_label(&self) -> String {
         if self.truncated {
             format!("{}+", self.results.len())

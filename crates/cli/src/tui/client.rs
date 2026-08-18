@@ -1450,8 +1450,12 @@ impl TuiApp {
         // wanted one. The timeline parser sorts oldest-first for the pane.
         let mut hits = parse_timeline_page(&page);
         hits.reverse();
+        // The backend fetches one row past the limit, so this is an exact answer to
+        // "were hits dropped"; the hit count is only a proxy, and it gets a page of
+        // exactly the limit wrong. A cursorless search takes the newest rows, so
+        // anything beyond the page is older — which is what `has_more_before` names.
+        view.truncated = timeline_page_has_more_before(&page);
         let count = hits.len();
-        view.truncated = count >= TUI_MESSAGE_SEARCH_LIMIT;
         view.results = hits;
         view.selected = 0;
         if count > 0 {
