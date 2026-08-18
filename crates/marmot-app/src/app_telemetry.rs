@@ -433,6 +433,16 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         success: bool,
     ) {
+        if matches!(
+            operation,
+            AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp
+        ) {
+            debug_assert!(
+                false,
+                "account sync/catch-up must use record_sync_result with a bounded failure classification"
+            );
+            return;
+        }
         let mut inner = self
             .inner
             .lock()
@@ -466,10 +476,7 @@ impl AppPerformanceTelemetry {
                     .account_subscription_registration
                     .record(duration, success);
             }
-            AppPerformanceOperation::AccountCatchUp => {
-                inner.account_catch_up.record(duration, success);
-            }
-            AppPerformanceOperation::AccountSync => inner.account_sync.record(duration, success),
+            AppPerformanceOperation::AccountCatchUp | AppPerformanceOperation::AccountSync => {}
             AppPerformanceOperation::AccountSetupAdvisoryStep => {
                 inner.account_setup_advisory_step.record(duration, success)
             }
@@ -747,11 +754,11 @@ mod tests {
         let cases = [
             (
                 classified(
-                    SyncFailureStage::TransportActivation,
-                    AppError::Transport(TransportAdapterError::Timeout),
+                    SyncFailureStage::AccountWorker,
+                    AppError::AccountWorkerResponseTimedOut,
                 ),
                 SyncFailureClassification::new(
-                    SyncFailureStage::TransportActivation,
+                    SyncFailureStage::AccountWorker,
                     SyncErrorClass::Timeout,
                 ),
             ),
@@ -851,6 +858,18 @@ mod tests {
         assert!(!serialized.contains("attacker-controlled"));
         assert!(!serialized.contains("account.sqlite"));
         assert!(!serialized.contains("raw relay detail"));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "account sync/catch-up must use record_sync_result with a bounded failure classification"
+    )]
+    fn generic_record_rejects_classified_sync_operations() {
+        AppPerformanceTelemetry::default().record(
+            AppPerformanceOperation::AccountSync,
+            Duration::from_millis(1),
+            false,
+        );
     }
 
     #[test]

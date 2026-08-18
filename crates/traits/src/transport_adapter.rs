@@ -697,10 +697,6 @@ pub enum TransportAdapterError {
     #[error("account not active")]
     AccountNotActive(MemberId),
 
-    /// A bounded transport operation exceeded its explicit deadline.
-    #[error("transport operation timed out")]
-    Timeout,
-
     /// The transport delivery stream or its backing task has closed.
     #[error("transport closed")]
     Closed,

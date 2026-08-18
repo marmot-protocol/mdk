@@ -322,7 +322,6 @@ impl AppError {
 
 fn transport_error_class(error: &TransportAdapterError) -> SyncErrorClass {
     match error {
-        TransportAdapterError::Timeout => SyncErrorClass::Timeout,
         TransportAdapterError::Closed => SyncErrorClass::TransportClosed,
         TransportAdapterError::InvalidInboundEncoding
         | TransportAdapterError::InvalidInboundSignature

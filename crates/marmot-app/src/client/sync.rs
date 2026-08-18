@@ -8,7 +8,7 @@ use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::app_telemetry::{AppPerformanceOperation, SyncErrorClass, SyncFailureStage};
+use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
 use crate::groups::{
     EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
     observe_event,
@@ -405,12 +405,14 @@ impl AppClient {
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
             Err(error) => {
-                let stage = if error.sync_error_class() == SyncErrorClass::Storage {
-                    SyncFailureStage::StatePersist
-                } else {
-                    SyncFailureStage::CgkaIngest
-                };
-                return Err(SyncFailure::at_stage(summary, error, stage));
+                // This composite drain spans engine drain, app-state reads,
+                // publish checks, and projection. Its AppError does not retain
+                // the inner boundary, so do not infer a stage from the cause.
+                return Err(SyncFailure::at_stage(
+                    summary,
+                    error,
+                    SyncFailureStage::Unknown,
+                ));
             }
         };
         summary.merge(drained);
@@ -788,12 +790,10 @@ impl AppClient {
     }
 
     async fn sync_sdk_relay(&mut self, deliveries: &mut u64) -> Result<SyncSummary, SyncFailure> {
+        // These are local app-state reads before the relay receive loop. They
+        // are not failures of the account-worker command boundary.
         let display_names = self.app.display_names_by_id().map_err(|error| {
-            SyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::AccountWorker,
-            )
+            SyncFailure::at_stage(SyncSummary::default(), error, SyncFailureStage::Unknown)
         })?;
         let local_account_id_hex = self
             .app
@@ -803,7 +803,7 @@ impl AppClient {
                 SyncFailure::at_stage(
                     SyncSummary::default(),
                     AppError::from(source),
-                    SyncFailureStage::AccountWorker,
+                    SyncFailureStage::Unknown,
                 )
             })?
             .account_id_hex;
@@ -1618,12 +1618,15 @@ impl AppClient {
                     .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
                     .await
                     .map_err(|error| {
-                        let stage = if error.sync_error_class() == SyncErrorClass::Storage {
-                            SyncFailureStage::StatePersist
-                        } else {
-                            SyncFailureStage::CgkaIngest
-                        };
-                        SyncFailure::at_stage(SyncSummary::default(), error, stage)
+                        // The backfill's AppError no longer carries which of
+                        // its activation, subscription, drain, or projection
+                        // boundaries failed. Keep the cause, but do not invent
+                        // a stage from it.
+                        SyncFailure::at_stage(
+                            SyncSummary::default(),
+                            error,
+                            SyncFailureStage::Unknown,
+                        )
                     })? {
                     EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
                     EpochBackfillRunOutcome::Deferred => continue,
@@ -1655,12 +1658,12 @@ impl AppClient {
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
             Err(error) => {
-                let stage = if error.sync_error_class() == SyncErrorClass::Storage {
-                    SyncFailureStage::StatePersist
-                } else {
-                    SyncFailureStage::CgkaIngest
-                };
-                return Err(SyncFailure::at_stage(summary, error, stage));
+                // As above, this composite drain has lost its inner boundary.
+                return Err(SyncFailure::at_stage(
+                    summary,
+                    error,
+                    SyncFailureStage::Unknown,
+                ));
             }
         };
         summary.merge(drained);

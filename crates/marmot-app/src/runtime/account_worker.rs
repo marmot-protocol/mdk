@@ -23,9 +23,7 @@ use super::{
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     wait_for_runtime_shutdown,
 };
-use crate::app_telemetry::{
-    AppPerformanceOperation, SyncErrorClass, SyncFailureClassification, SyncFailureStage,
-};
+use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::{CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish};
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -4038,14 +4036,12 @@ async fn run_pending_epoch_backfill_reporting_arm(
                 account_label,
                 message.clone(),
             );
-            let failure_stage = if error.sync_error_class() == SyncErrorClass::Storage {
-                SyncFailureStage::StatePersist
-            } else {
-                SyncFailureStage::CgkaIngest
-            };
+            // run_pending_epoch_backfill returns only AppError, after several
+            // distinct sync boundaries. Preserve its typed broad cause but do
+            // not derive a stage from that cause.
             Err(AccountCatchUpFailure::new(
                 message,
-                SyncFailureClassification::new(failure_stage, error.sync_error_class()),
+                SyncFailureClassification::new(SyncFailureStage::Unknown, error.sync_error_class()),
             ))
         }
     };

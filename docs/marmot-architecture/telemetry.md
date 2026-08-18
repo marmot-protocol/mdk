@@ -261,10 +261,14 @@ metric attributes. Every failed attempt emits exactly one point in a bounded cla
 | `error_class` | `timeout`, `transport_closed`, `relay_directory`, `protocol`, `crypto`, `storage`, `cancelled`, `unknown` |
 
 `failure_stage` is the explicit sync boundary that stopped; `error_class` is derived from typed error variants. A
-catch-up failure propagated to its parent account catch-up retains the same pair. The implementation never parses
+catch-up failure propagated to its parent account sync retains the same pair. The implementation never parses
 `Display` or debug text. If a typed cause is unavailable, it uses `unknown`; it does not infer a class from backend
 strings. Raw errors, relay URLs, account/group/event ids, pubkeys, file paths, and caller-generated strings cannot enter
 these fields because the snapshot and export types store closed enums rather than strings.
+
+Transport `Backend`, `Subscription`, and `Publish` errors intentionally use `error_class=unknown`: their current typed
+variants carry backend text but do not expose a safe, more specific cause. Their explicit `failure_stage` remains the
+useful diagnostic dimension until those lower layers preserve additional typed source information.
 
 ### Agent connector reconciliation telemetry
 
