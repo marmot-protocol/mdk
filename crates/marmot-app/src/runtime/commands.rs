@@ -180,6 +180,7 @@ impl AccountManager {
         members: &[String],
     ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
         let started_at = Instant::now();
+        self.shared.lifecycle().ensure_running()?;
         self.resolve(account_ref)?;
         let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
         let result = self

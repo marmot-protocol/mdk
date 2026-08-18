@@ -76,6 +76,7 @@ struct MemberResolutionDirectoryFetcher {
     requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
+    failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
 }
 
@@ -92,6 +93,13 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             && request.queries.iter().any(|query| query.authors.len() > 1)
         {
             return Err("multi-author queries unsupported".to_owned());
+        }
+        if let Some(failing_author) = self.failing_single_author.lock().unwrap().as_ref()
+            && request.queries.iter().any(|query| {
+                query.authors.len() == 1 && query.authors.first() == Some(failing_author)
+            })
+        {
+            return Err(format!("single-author query failed for {failing_author}"));
         }
         let stalled_endpoint = self.stalled_endpoint.lock().unwrap().clone();
         if stalled_endpoint.is_some_and(|stalled| {
@@ -3996,6 +4004,45 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
 }
 
 #[tokio::test]
+async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(3, false).await;
+    fetcher
+        .reject_multi_author
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *fetcher.failing_single_author.lock().unwrap() = Some(accounts[2].account_id_hex.clone());
+    fetcher.events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != accounts[0].account_id_hex
+    });
+    let members = [
+        accounts[0].account_id_hex.as_str(),
+        accounts[1].account_id_hex.as_str(),
+        accounts[2].account_id_hex.as_str(),
+    ];
+
+    let error = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .expect_err("the first member is missing and the third relay-list fallback fails");
+    assert!(
+        matches!(error, AppError::MissingKeyPackage(account_id) if account_id == accounts[0].account_id_hex),
+        "the first canonical member error must win over a later relay-list failure"
+    );
+    let requests_after_partial = fetcher.requests.lock().unwrap().len();
+
+    let summary = app
+        .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
+        .await
+        .expect("the valid sibling should remain reusable after the partial failure");
+    assert_eq!(summary.reused_members, 1);
+    assert_eq!(summary.network_resolved_members, 0);
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        requests_after_partial,
+        "reusing the valid sibling must not issue another relay request"
+    );
+}
+
+#[tokio::test]
 async fn member_key_package_set_reports_missing_packages_in_input_order() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
@@ -4098,7 +4145,7 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
 #[tokio::test]
 #[ignore = "member-resolution scaling benchmark; reports request count and wall clock"]
 async fn member_key_package_resolution_scaling_report() {
-    eprintln!("invitees,scenario,requests,wall_ms,outcome");
+    let mut report = vec!["invitees,scenario,requests,wall_ms,outcome".to_owned()];
     for count in [1, 8, 32] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
         let members = accounts
@@ -4111,12 +4158,12 @@ async fn member_key_package_resolution_scaling_report() {
         fetcher.requests.lock().unwrap().clear();
         let started = Instant::now();
         let outcome = app.resolve_member_key_packages(&members).await;
-        eprintln!(
-            "{count},warm_cache,{}, {},{}",
+        report.push(format!(
+            "{count},warm_cache,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
             started.elapsed().as_millis(),
             if outcome.is_ok() { "ok" } else { "error" }
-        );
+        ));
 
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
         let members = accounts
@@ -4125,12 +4172,12 @@ async fn member_key_package_resolution_scaling_report() {
             .collect::<Vec<_>>();
         let started = Instant::now();
         let outcome = app.prewarm_group_member_key_packages(&members).await;
-        eprintln!(
-            "{count},shared_relays,{}, {},{}",
+        report.push(format!(
+            "{count},shared_relays,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
             started.elapsed().as_millis(),
             if outcome.is_ok() { "ok" } else { "error" }
-        );
+        ));
 
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, true).await;
         let members = accounts
@@ -4139,12 +4186,12 @@ async fn member_key_package_resolution_scaling_report() {
             .collect::<Vec<_>>();
         let started = Instant::now();
         let outcome = app.prewarm_group_member_key_packages(&members).await;
-        eprintln!(
-            "{count},split_relays,{}, {},{}",
+        report.push(format!(
+            "{count},split_relays,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
             started.elapsed().as_millis(),
             if outcome.is_ok() { "ok" } else { "error" }
-        );
+        ));
 
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, true).await;
         *fetcher.stalled_endpoint.lock().unwrap() = Some(
@@ -4161,12 +4208,12 @@ async fn member_key_package_resolution_scaling_report() {
             .collect::<Vec<_>>();
         let started = Instant::now();
         let outcome = app.prewarm_group_member_key_packages(&members).await;
-        eprintln!(
-            "{count},one_stalled_relay,{}, {},{}",
+        report.push(format!(
+            "{count},one_stalled_relay,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
             started.elapsed().as_millis(),
             if outcome.is_ok() { "ok" } else { "error" }
-        );
+        ));
 
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
         let missing = accounts.last().unwrap().account_id_hex.clone();
@@ -4181,13 +4228,19 @@ async fn member_key_package_resolution_scaling_report() {
             .collect::<Vec<_>>();
         let started = Instant::now();
         let outcome = app.prewarm_group_member_key_packages(&members).await;
-        eprintln!(
-            "{count},missing_package,{}, {},{}",
+        report.push(format!(
+            "{count},missing_package,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
             started.elapsed().as_millis(),
             if outcome.is_ok() { "ok" } else { "error" }
-        );
+        ));
     }
+    tracing::info!(
+        target: "marmot_app::member_key_packages",
+        method = "member_key_package_resolution_scaling_report",
+        report = %report.join("\n"),
+        "member KeyPackage resolution scaling report"
+    );
 }
 
 #[test]

@@ -136,7 +136,8 @@ pub struct MemberKeyPackagePrewarmSummary {
     pub requested_members: u64,
     /// Canonical account ids after aliases and duplicates are collapsed.
     pub unique_members: u64,
-    /// Packages satisfied by validated local or directory state.
+    /// Packages satisfied by validated local state, durable directory state,
+    /// or the process-local prewarm cache.
     pub reused_members: u64,
     /// Packages that required relay resolution during this call.
     pub network_resolved_members: u64,
@@ -314,10 +315,24 @@ impl MarmotApp {
         }
 
         if !unresolved.is_empty() {
-            self.resolve_missing_relay_lists(&mut targets, &unresolved)
-                .await?;
-            self.resolve_missing_key_packages(&targets, &unresolved, &mut outcomes, purpose)
-                .await;
+            for (index, error) in self
+                .resolve_missing_relay_lists(&mut targets, &unresolved)
+                .await
+            {
+                outcomes[index] = Some(Err(error));
+            }
+            let key_package_unresolved = unresolved
+                .iter()
+                .copied()
+                .filter(|index| outcomes[*index].is_none())
+                .collect::<Vec<_>>();
+            self.resolve_missing_key_packages(
+                &targets,
+                &key_package_unresolved,
+                &mut outcomes,
+                purpose,
+            )
+            .await;
         }
 
         let mut key_packages = Vec::with_capacity(targets.len());
@@ -427,18 +442,18 @@ impl MarmotApp {
         &self,
         targets: &mut [MemberTarget],
         unresolved: &[usize],
-    ) -> Result<(), AppError> {
+    ) -> Vec<(usize, AppError)> {
         let needs_discovery = unresolved
             .iter()
             .copied()
             .filter(|index| targets[*index].relay_lists.nip65.relays.is_empty())
             .collect::<Vec<_>>();
         if needs_discovery.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
         let endpoints = self.directory_source_relays(&[]);
         if endpoints.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
 
         let request_specs = needs_discovery
@@ -483,6 +498,7 @@ impl MarmotApp {
             .collect::<Vec<_>>()
             .await;
 
+        let mut failures = Vec::new();
         for (indices, endpoints, result) in batches {
             match result {
                 Ok(records) => {
@@ -538,13 +554,21 @@ impl MarmotApp {
                         .collect::<Vec<_>>()
                         .await;
                     for (index, endpoints, records) in results {
-                        targets[index].relay_lists =
-                            self.relay_lists_from_records(&targets[index], records?, &endpoints);
+                        match records {
+                            Ok(records) => {
+                                targets[index].relay_lists = self.relay_lists_from_records(
+                                    &targets[index],
+                                    records,
+                                    &endpoints,
+                                );
+                            }
+                            Err(error) => failures.push((index, error)),
+                        }
                     }
                 }
             }
         }
-        Ok(())
+        failures
     }
 
     async fn resolve_missing_key_packages(
