@@ -549,6 +549,13 @@ jobs:
             exit 0
           fi
 
+          latest_release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$latest_tag" 2>/dev/null || true)"
+          if [ -n "$latest_release" ] && [ "$(jq -r '.immutable' <<< "$latest_release")" = "true" ]; then
+            echo "warning: $latest_tag is immutable; leaving the legacy installer alias unchanged"
+            echo "use the installer assets from the immutable $tag release instead"
+            exit 0
+          fi
+
           cat > "$latest_notes" <<EOF
           Latest WN Agent installers. These scripts install WN Agent \`$version\` from immutable release \`$tag\`.
 

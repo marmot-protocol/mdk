@@ -359,7 +359,12 @@ if [ "$push" -eq 1 ] && [ "$wait" -eq 1 ]; then
     verify_release "$mdk_tag" "v$version - MDK" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 0
     verify_release "$wn_tag" "v$version - wn-agent" "$([ "$draft" -eq 1 ] && echo true || echo false)" true 14
     if [ "$draft" -eq 0 ]; then
-        verify_release "wn-agent-latest" "Latest WN Agent installers" false true 3
+        latest_immutable="$(gh api "repos/$repo/releases/tags/wn-agent-latest" --jq '.immutable' 2>/dev/null || true)"
+        if [ "$latest_immutable" = "true" ]; then
+            echo "warning: wn-agent-latest is immutable; verified the versioned WN Agent release only"
+        else
+            verify_release "wn-agent-latest" "Latest WN Agent installers" false true 3
+        fi
     fi
     verify_release "$marmotkit_tag" "v$version - MarmotKit" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 4
 elif [ "$push" -eq 1 ]; then

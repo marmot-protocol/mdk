@@ -9,6 +9,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-08-18
+
+### Fixed
+
+- MarmotKit Android release artifacts now strip target JNI libraries while
+  preserving the host library metadata UniFFI needs, reject residual debug or
+  static-symbol sections during packaging, and retain the established ordered
+  manifest contract expected by White Noise Android.
+  ([#1480](https://github.com/marmot-protocol/mdk/pull/1480))
+
+- WN Agent publication no longer fails after publishing the immutable
+  versioned release when the legacy `wn-agent-latest` installer release is
+  itself immutable. In that configuration the workflow leaves the stale alias
+  unchanged and directs consumers to the pinned versioned installer assets.
+
 ## [0.9.13] - 2026-08-18
 
 ### Added
@@ -1648,7 +1663,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.13...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.14...HEAD
+[0.9.14]: https://github.com/marmot-protocol/mdk/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/marmot-protocol/mdk/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/marmot-protocol/mdk/compare/v0.9.10...v0.9.11
