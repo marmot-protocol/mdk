@@ -70,6 +70,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   than the loaded history say so instead of moving the view, because the pane
   holds one contiguous run of messages and cannot represent a gap — page back with
   `g` and search again to reach them.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
 
 ### Changed
 
@@ -159,6 +160,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   list, so a group with more members than the pane is tall left them permanently
   off-screen; moving the selection to the last member now scrolls to the end of
   the pane and brings them into view with it.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
 
 ## [0.9.12] - 2026-08-13
 
