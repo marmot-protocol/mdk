@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-connector"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "agent-control",
  "agent-stream-compose",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agent-control"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "agent-stream-compose"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -864,7 +864,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cgka-conformance-simulator"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-engine"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-session"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-traits"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "criterion",
@@ -1192,7 +1192,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "convergence-campaign-runner"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "cgka-conformance-simulator",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "fs-private"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "libc",
  "tempfile",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "incident-replay"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "cgka-conformance-simulator",
  "fs-private",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-account"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-app"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-forensics"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "fs-private",
  "serde",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-markdown"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-terminal-harness"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "agent-control",
  "async-trait",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-uniffi"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "cgka-engine",
  "cgka-traits",
@@ -5652,7 +5652,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage-sqlite"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "cgka-traits",
  "fs-private",
@@ -6268,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-adapter"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -6288,7 +6288,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-peeler"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -6305,7 +6305,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-broker"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "cgka-traits",
  "clap",
@@ -6324,7 +6324,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-stream"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "cgka-traits",
  "chacha20poly1305",
@@ -7391,7 +7391,7 @@ dependencies = [
 
 [[package]]
 name = "wn-cli"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "agent-stream-compose",
  "cgka-session",
@@ -7425,7 +7425,7 @@ dependencies = [
 
 [[package]]
 name = "wn-opencode"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "clap",
@@ -7440,7 +7440,7 @@ dependencies = [
 
 [[package]]
 name = "wn-pi"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-trait",
  "clap",
