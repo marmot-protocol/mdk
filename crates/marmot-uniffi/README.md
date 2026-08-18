@@ -73,6 +73,9 @@ Build all Android ABIs:
 ./crates/marmot-uniffi/kotlin-bindings.sh
 ```
 
+The script keeps the host library's UniFFI metadata intact while stripping
+debug and static symbol sections from each packaged Android JNI library.
+
 To build a subset:
 
 ```sh

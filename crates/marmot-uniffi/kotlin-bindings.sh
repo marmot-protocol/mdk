@@ -184,6 +184,23 @@ configure_android_toolchain() {
   export "RANLIB_${cc_env}=$toolchain_bin/llvm-ranlib"
 }
 
+validate_stripped_android_library() {
+  local library="$1"
+  local readelf="$NDK_DIR/toolchains/llvm/prebuilt/$HOST_TAG/bin/llvm-readelf"
+  local sections
+
+  if [[ ! -x "$readelf" ]]; then
+    echo "error: Android llvm-readelf not found or not executable: $readelf" >&2
+    return 1
+  fi
+
+  sections="$("$readelf" --sections "$library")"
+  if grep -Eq '[.]debug_|[.]symtab' <<< "$sections"; then
+    echo "error: Android JNI library contains debug or static symbol sections: $library" >&2
+    return 1
+  fi
+}
+
 cd "$WORKSPACE_DIR"
 
 NDK_DIR="$(find_android_ndk)"
@@ -196,9 +213,8 @@ mkdir -p "$KOTLIN_OUT_DIR" "$JNI_OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"
 # The host dylib must keep its symbol table: uniffi-bindgen's library mode
-# reads the uniffi metadata through it, and with RUSTFLAGS="-C strip=symbols"
-# (release.sh sets it for the Android .so's) bindgen exits 0 while emitting
-# NOTHING. Strip only the Android target builds below, never this one.
+# reads the uniffi metadata through it. Strip only the Android target builds
+# below, never this host build.
 RUSTFLAGS="" cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Generating Kotlin bindings"
@@ -225,9 +241,11 @@ for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
   configure_android_toolchain "$NDK_DIR" "$HOST_TAG" "$target"
-  cargo build --release -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  CARGO_PROFILE_RELEASE_STRIP=symbols \
+    cargo build --release -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
   mkdir -p "$JNI_OUT_DIR/$abi"
   cp "$TARGET_DIR/$target/release/lib${LIB_BASENAME}.so" "$JNI_OUT_DIR/$abi/"
+  validate_stripped_android_library "$JNI_OUT_DIR/$abi/lib${LIB_BASENAME}.so"
 done
 
 echo ""
