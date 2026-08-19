@@ -247,6 +247,18 @@ impl MarmotRelayPlane {
         )
     }
 
+    /// Whether both handles are the same plane, rather than two planes that look alike.
+    #[cfg(test)]
+    pub(crate) fn is_same_plane(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Whether [`MarmotRelayPlane::shutdown`] has been entered on this plane.
+    #[cfg(test)]
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.inner.transport.shutting_down.load(Ordering::SeqCst)
+    }
+
     fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
         let client = NostrSdkClient::builder().build();
         let relay_client = NostrSdkRelayClient::new(client.clone());
