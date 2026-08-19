@@ -558,7 +558,7 @@ test-convergence-policy-pin:
     cargo test -p cgka-engine --test convergence_policy_pin --locked
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
-# GitHub CI runs the full `just ci` suite (including the workspace test matrix).
+# GitHub CI invokes the static gates directly and runs the full test matrix.
 fast-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate check clippy test-convergence-policy-pin test

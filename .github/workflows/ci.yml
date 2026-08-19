@@ -50,6 +50,9 @@ jobs:
       - name: Campaign image toolchain gate
         run: ./scripts/check_campaign_toolchain.sh
 
+      - name: Agent install documentation gate
+        run: ./scripts/check_agent_install_docs.sh
+
   terminal-harness-installers:
     name: Terminal harness installer tests
     runs-on: ubuntu-latest

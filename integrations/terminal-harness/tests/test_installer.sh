@@ -93,6 +93,7 @@ run_linux_service_case() {
     : >"$log_file"
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
+    TEST_LEGACY_BOOTSTRAP="${TEST_LEGACY_BOOTSTRAP:-0}" \
     TEST_HARNESS_BINARY="$harness_binary" \
     HOME="$fixture_root/home" \
     MARMOT_HOME="$fixture_root/marmot-home" \
@@ -205,8 +206,12 @@ cat >/dev/null
 case "$code" in
     *account_id_hex*) printf '%s\n' aa ;;
     *welcomer_account_ids_hex*) printf '%s\n' bb ;;
-    *'json.load(sys.stdin)["npub"]'*) printf '%s\n' npub-test ;;
-    *'json.load(sys.stdin)["nprofile"]'*) printf '%s\n' nprofile-test ;;
+    *'json.load(sys.stdin).get("npub", "")'*)
+        [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' npub-test
+        ;;
+    *'json.load(sys.stdin).get("nprofile", "")'*)
+        [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' nprofile-test
+        ;;
     *) exit 1 ;;
 esac
 EOF
@@ -222,6 +227,12 @@ if grep -Fq "To run it manually:" "$installer_output"; then
     echo "$kind installer printed manual-start steps after starting services" >&2
     exit 1
 fi
+
+legacy_log="$fixture_root/systemctl-legacy.log"
+TEST_LEGACY_BOOTSTRAP=1 run_linux_service_case "$fixture_root" 1 "$legacy_log" --no-service
+legacy_output="$fixture_root/installer-output.log"
+grep -F "White Noise agent identity was not returned by this wn-agent release." "$legacy_output" >/dev/null
+grep -F "Inspect the bootstrap response at: $fixture_root/marmot-home/bootstrap.json" "$legacy_output" >/dev/null
 assert_log_contains "$fresh_log" "--user enable --now $agent_service"
 assert_log_contains "$fresh_log" "--user enable --now $harness_service"
 assert_log_excludes "$fresh_log" "--user restart $agent_service"

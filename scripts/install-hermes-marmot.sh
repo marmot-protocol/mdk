@@ -1165,11 +1165,11 @@ bootstrap_agent() {
     )"
     BOOTSTRAP_NPUB="$(
         printf '%s\n' "$bootstrap_json" |
-            python3 -c 'import json, sys; print(json.load(sys.stdin)["npub"])'
+            python3 -c 'import json, sys; print(json.load(sys.stdin).get("npub", ""))'
     )"
     BOOTSTRAP_NPROFILE="$(
         printf '%s\n' "$bootstrap_json" |
-            python3 -c 'import json, sys; print(json.load(sys.stdin)["nprofile"])'
+            python3 -c 'import json, sys; print(json.load(sys.stdin).get("nprofile", ""))'
     )"
     log "bootstrap details -> $BOOTSTRAP_JSON_PATH"
 }
@@ -1232,14 +1232,22 @@ configure_hermes_gateway() {
 }
 
 print_phone_invite() {
-    cat <<EOF
+    if [ -n "$BOOTSTRAP_NPUB" ] && [ -n "$BOOTSTRAP_NPROFILE" ]; then
+        cat <<EOF
 
 White Noise agent identity:
   npub: $BOOTSTRAP_NPUB
   nprofile: $BOOTSTRAP_NPROFILE
 EOF
-    if [ "$DRY_RUN" -eq 0 ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
-        printf '%s' "$BOOTSTRAP_NPROFILE" | qrencode -t ANSIUTF8
+        if [ "$DRY_RUN" -eq 0 ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
+            printf '%s' "$BOOTSTRAP_NPROFILE" | qrencode -t ANSIUTF8
+        fi
+    else
+        cat <<EOF
+
+White Noise agent identity was not returned by this wn-agent release.
+Inspect the bootstrap response at: $BOOTSTRAP_JSON_PATH
+EOF
     fi
 }
 

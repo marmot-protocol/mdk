@@ -21,13 +21,26 @@ active_paths=(
     .github/workflows/wn-agent-binaries.yml
 )
 
-for connector in hermes openclaw codex opencode pi; do
-    expected="releases/download/wn-agent-v${workspace_version}/install-${connector}-marmot.sh"
-    if ! rg -F -q "$expected" integrations/README.md; then
-        echo "error: integrations/README.md is missing the current $connector installer URL ($expected)" >&2
-        exit 1
-    fi
-done
+python3 - "$workspace_version" <<'PY'
+from pathlib import Path
+import sys
+
+version = sys.argv[1]
+quickstart = Path("integrations/README.md").read_text(encoding="utf-8")
+for connector in ("hermes", "openclaw", "codex", "opencode", "pi"):
+    url = (
+        "https://github.com/marmot-protocol/mdk/releases/download/"
+        f"wn-agent-v{version}/install-{connector}-marmot.sh"
+    )
+    block = f"```sh\ncurl -fsSL {url} | bash\n```"
+    if quickstart.count(block) != 1:
+        print(
+            "error: integrations/README.md must contain exactly one copy-pasteable "
+            f"one-line sh block for the current {connector} installer ({url})",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
 
 if rg -n 'releases/download/wn-agent-latest/install-' "${active_paths[@]}"; then
     echo "error: active agent install guidance must use an immutable versioned release" >&2
