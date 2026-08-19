@@ -21,6 +21,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 extensions-draft = ["openmls_traits/extensions-draft"]

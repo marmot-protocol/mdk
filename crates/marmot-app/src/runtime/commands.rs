@@ -22,10 +22,11 @@ use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
     AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppQuarantinedGroup,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    CanonicalCreatedGroup, CreatedGroup, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MaintenanceRunSummary, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
@@ -203,6 +204,25 @@ impl AccountManager {
         result
     }
 
+    pub async fn create_group_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+    ) -> Result<CreatedGroup, AppError> {
+        self.create_group_with_options_detailed(
+            account_ref,
+            name,
+            members,
+            AppCreateGroupOptions {
+                description: description.unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     pub async fn create_group_with_initial_image(
         &self,
         account_ref: &str,
@@ -232,31 +252,84 @@ impl AccountManager {
         options: AppCreateGroupOptions,
     ) -> Result<GroupId, AppError> {
         let started_at = Instant::now();
-        let result = async {
-            let command = self.worker_commands(account_ref).await?;
-            let (respond, response) = oneshot::channel();
-            command
-                .send(AccountWorkerCommand::CreateGroup {
-                    queued_at: Instant::now(),
-                    name: name.to_owned(),
-                    members: members.to_vec(),
-                    options,
-                    respond,
-                })
-                .await
-                .map_err(|_| AppError::TransportClosed)?;
-            long_account_worker_response(response).await
-        }
-        .await;
+        let result = self
+            .create_group_with_options_outcome(account_ref, name, members, options)
+            .await
+            .map(|created| created.group_id);
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
         );
-        let group_id = result?;
-        self.schedule_create_group_post_mutation_catch_up().await;
-        self.schedule_audit_log_tracker_update("create_group");
-        Ok(group_id)
+        result
+    }
+
+    pub async fn create_group_with_initial_image_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        initial_image: Option<crate::AppInitialGroupImage>,
+    ) -> Result<CreatedGroup, AppError> {
+        self.create_group_with_options_detailed(
+            account_ref,
+            name,
+            members,
+            AppCreateGroupOptions {
+                description: description.unwrap_or_default(),
+                initial_image,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn create_group_with_options_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<CreatedGroup, AppError> {
+        let started_at = Instant::now();
+        let result = self
+            .create_group_with_options_outcome(account_ref, name, members, options)
+            .await
+            .and_then(CanonicalCreatedGroup::into_detailed);
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupCreateTotalCallerLatency,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
+    }
+
+    async fn create_group_with_options_outcome(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<CanonicalCreatedGroup, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CreateGroup {
+                queued_at: Instant::now(),
+                name: name.to_owned(),
+                members: members.to_vec(),
+                options,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let result = long_account_worker_response(response).await;
+        if result.is_ok() {
+            self.schedule_create_group_post_mutation_catch_up().await;
+            self.schedule_audit_log_tracker_update("create_group");
+        }
+        result
     }
 
     /// Accounts the local account currently shares a group with, deduplicated

@@ -8821,6 +8821,167 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     runtime.shutdown().await;
 }
 
+/// mdk#1487: the detailed create response carries the exact durable chat-list
+/// row that subscribers and ordinary queries observe at the response boundary.
+#[tokio::test]
+async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGiftWraps::new();
+    let (_relay, app, url) = gift_wrap_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let mut events = runtime.subscribe();
+
+    gate.arm(1);
+    let created = timeout(
+        Duration::from_secs(5),
+        runtime.create_group_detailed(
+            &alice.account.account_id_hex,
+            "durable detailed create",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        ),
+    )
+    .await
+    .expect("detailed create must return before Welcome fanout")
+    .unwrap();
+
+    assert_eq!(
+        created.chat_list_row.group_id_hex,
+        hex::encode(created.group_id.as_slice())
+    );
+    let queried = app
+        .chat_list_row(&alice.account.label, &created.chat_list_row.group_id_hex)
+        .unwrap()
+        .expect("created chat-list row is queryable immediately");
+    assert_eq!(created.chat_list_row, queried);
+
+    let emitted = wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::ProjectionUpdated(update)
+                if update.update.chat_list_trigger == marmot_app::ChatListUpdateTrigger::NewGroup
+                    && update.update.chat_list_row.as_ref() == Some(&created.chat_list_row)
+        )
+    })
+    .await;
+    let MarmotAppEvent::ProjectionUpdated(emitted) = emitted else {
+        unreachable!("wait predicate only accepts projection updates")
+    };
+    assert_eq!(
+        emitted.update.chat_list_row.as_ref(),
+        Some(&created.chat_list_row)
+    );
+
+    gate.release();
+    runtime.shutdown().await;
+}
+
+/// mdk#1487: a process cut after the engine commit but before the sole app
+/// projection transaction is repaired from engine-authoritative group and
+/// Welcome state on restart.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn create_group_post_canonical_projection_crash_recovers_visibility_and_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default()
+        .with_allow_loopback_relay_endpoints(true)
+        .with_dev_fail_create_local_projection(true);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+
+    rejecting.store(true, Ordering::Relaxed);
+    let error = runtime
+        .create_group_detailed(
+            &alice.account.account_id_hex,
+            "projection crash recovery",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .expect_err("fault injection cuts the app write after canonical MLS persistence");
+    let detailed_group_id_hex = match error {
+        marmot_app::AppError::CreatedGroupProjectionUnavailable(group_id_hex) => group_id_hex,
+        other => panic!("expected typed post-canonical projection result, got {other:?}"),
+    };
+    let legacy_group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "legacy projection crash recovery",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .expect("the compatibility API must preserve post-canonical success");
+    assert!(
+        app.groups(&alice.account.label)
+            .unwrap()
+            .iter()
+            .all(|group| group.profile.name != "projection crash recovery")
+    );
+    runtime.shutdown().await;
+
+    let restarted = MarmotAppRuntime::new(app.clone());
+    restarted.reconcile_accounts().await.unwrap();
+    let recovered = timeout(Duration::from_secs(5), async {
+        loop {
+            let groups = app.groups(&alice.account.label).unwrap();
+            let pending = restarted
+                .pending_welcome_deliveries(&alice.account.account_id_hex)
+                .await;
+            let recovered_names = groups
+                .iter()
+                .map(|group| group.profile.name.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            if let Ok(pending) = pending
+                && pending.len() == 2
+                && recovered_names.contains("projection crash recovery")
+                && recovered_names.contains("legacy projection crash recovery")
+            {
+                return pending;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("restart must reconcile the projection and retained Welcome");
+    let recovered_group_ids = recovered
+        .iter()
+        .map(|delivery| delivery.group_id_hex.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let legacy_group_id_hex = hex::encode(legacy_group_id.as_slice());
+    assert!(recovered_group_ids.contains(detailed_group_id_hex.as_str()));
+    assert!(recovered_group_ids.contains(legacy_group_id_hex.as_str()));
+    restarted.shutdown().await;
+}
+
 /// mdk#1451: existing-group invite returns after the confirmed commit while a
 /// delayed Welcome remains durably pending.
 #[tokio::test]

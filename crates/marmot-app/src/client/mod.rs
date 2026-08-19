@@ -47,10 +47,10 @@ use crate::{
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
     AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
     AppGroupRecord, AppInitialGroupImage, AppPerformanceTelemetry, AppQuarantinedGroup,
-    AppRoutingState, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    AppRoutingState, AppRuntime, AppTransportRouting, CanonicalCreatedGroup,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    PendingWelcomeDelivery, SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -864,7 +864,7 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
     ) -> Result<GroupId, AppError> {
-        let group_id = self
+        let created = self
             .create_group_with_options_and_optional_telemetry(name, member_refs, options, None)
             .await?;
         self.drive_unpublished_welcome_delivery(None).await;
@@ -881,7 +881,7 @@ impl AppClient {
                 "confirmed group creation could not refresh subscriptions immediately"
             );
         }
-        Ok(group_id)
+        Ok(created.group_id)
     }
 
     pub(crate) async fn create_group_with_options_and_telemetry(
@@ -890,7 +890,7 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         telemetry: &AppPerformanceTelemetry,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<CanonicalCreatedGroup, AppError> {
         self.create_group_with_options_and_optional_telemetry(
             name,
             member_refs,
@@ -906,7 +906,7 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<CanonicalCreatedGroup, AppError> {
         let AppCreateGroupOptions {
             description,
             initial_image,
@@ -1057,12 +1057,23 @@ impl AppClient {
         let prepared = prepared?;
         let group_id = prepared.group_id;
         // Current-profile founding creation is already canonical before
-        // transport delivery. Persist every exact Welcome obligation before
-        // the first external side effect, so a crash between recipients
-        // cannot lose the still-undelivered work or induce a second group.
+        // transport delivery: the engine transaction retained the exact
+        // Welcome bytes and destinations. Derive only the in-memory ids used
+        // by the post-response fanout driver here. The app convenience index
+        // is populated later by delivery failure or reconciliation.
+        let welcome_index_started_at = Instant::now();
+        let founding_welcome_intents =
+            Self::founding_welcome_delivery_intent_ids(&prepared.effects);
+        let welcome_index_prepared = founding_welcome_intents.is_ok();
         let founding_welcome_intents = recover_post_canonical_result(
-            "record_founding_welcome_delivery_intents",
-            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
+            "prepare_founding_welcome_delivery_index",
+            founding_welcome_intents,
+        );
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreatePendingWelcomeIndex,
+            welcome_index_started_at.elapsed(),
+            welcome_index_prepared,
         );
         self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
             group_id: group_id.clone(),
@@ -1072,42 +1083,41 @@ impl AppClient {
                 welcome_intents: founding_welcome_intents,
             },
         });
-        // The engine group is already canonical. Projection and state
-        // persistence are downstream repairable work; none can roll the group
-        // back, so none may turn this operation into a false failure that
-        // invites the caller to create a duplicate. Welcome fanout is driven
-        // after the caller-visible return.
+        // The engine group is already canonical. If this sole remaining app
+        // transaction fails, account-open reconciliation recovers the derived
+        // projection. Preserve that post-canonical outcome internally so the
+        // compatibility API can still return the group id and the worker can
+        // drive the engine-retained Welcome. The detailed API converts the
+        // missing row into a typed, non-retryable creation result.
         let local_projection_started_at = Instant::now();
-        let local_projection_saved = match self.add_group(&group_id) {
-            Ok(()) => match self.save_state_with_pending_local_group_deletion_frontier_clears() {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "marmot_app::client",
-                        method = "create_group",
-                        error_kind = error.privacy_safe_kind(),
-                        "confirmed group creation outpaced projection persistence; account open will reconcile it"
-                    );
-                    false
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "create_group",
-                    error_kind = error.privacy_safe_kind(),
-                    "confirmed group creation could not be projected immediately; account open will reconcile it"
-                );
-                false
-            }
+        let local_projection = if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_fail_create_local_projection
+        {
+            Err(AppError::Publish(
+                "injected create local projection failure".into(),
+            ))
+        } else {
+            self.add_group(&group_id)
+                .and_then(|()| self.save_state_with_created_chat_list_row(&group_id))
         };
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupCreateLocalProjectionSave,
             local_projection_started_at.elapsed(),
-            local_projection_saved,
+            local_projection.is_ok(),
         );
-        Ok(group_id)
+        if let Err(error) = &local_projection {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "create_group",
+                error_kind = error.privacy_safe_kind(),
+                "canonical group creation needs local projection reconciliation"
+            );
+        }
+        Ok(CanonicalCreatedGroup {
+            group_id,
+            chat_list_row: local_projection.ok(),
+        })
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<AppGroupMemberRecord>, AppError> {
@@ -3919,22 +3929,28 @@ impl AppClient {
         Ok(())
     }
 
-    /// Record current-profile founding Welcome delivery intent before any
-    /// transport publish. Returns the message ids so successful deliveries can
-    /// be cleared after the account runtime reports their acknowledgements.
-    fn record_founding_welcome_delivery_intents(
-        &mut self,
-        group_id: &GroupId,
+    /// Derive the current-profile founding Welcome message ids needed by the
+    /// in-process fanout driver. The engine's retained outbound Welcome rows
+    /// are authoritative; the app repair table is convenience-only and is
+    /// rebuilt on demand or populated only for actual delivery failures.
+    fn founding_welcome_delivery_intent_ids(
         effects: &cgka_session::SessionEffects,
     ) -> Result<Vec<String>, AppError> {
-        let mut welcomes = Vec::new();
+        let mut message_ids = Vec::new();
         for work in &effects.publish {
             let PublishWork::FoundingGroupCreated { welcomes: items } = work else {
                 continue;
             };
-            welcomes.extend(items.iter().cloned());
+            for welcome in items {
+                if !matches!(welcome.envelope, TransportEnvelope::Welcome { .. }) {
+                    return Err(AppError::Publish(
+                        "delivery artifact was not a Welcome".into(),
+                    ));
+                }
+                message_ids.push(hex::encode(welcome.id.as_slice()));
+            }
         }
-        self.record_welcome_delivery_intents(group_id, &welcomes)
+        Ok(message_ids)
     }
 
     fn record_welcome_delivery_intents(

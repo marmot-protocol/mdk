@@ -1298,6 +1298,20 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Create a locally canonical group and return the exact durable
+    /// chat-list row available at the response boundary.
+    pub async fn create_group_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+    ) -> Result<crate::CreatedGroup, AppError> {
+        self.accounts
+            .create_group_detailed(account_ref, name, members, description)
+            .await
+    }
+
     pub async fn create_group_with_initial_image(
         &self,
         account_ref: &str,
@@ -1320,6 +1334,37 @@ impl MarmotAppRuntime {
     ) -> Result<GroupId, AppError> {
         self.accounts
             .create_group_with_options(account_ref, name, members, options)
+            .await
+    }
+
+    pub async fn create_group_with_initial_image_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        initial_image: Option<crate::AppInitialGroupImage>,
+    ) -> Result<crate::CreatedGroup, AppError> {
+        self.accounts
+            .create_group_with_initial_image_detailed(
+                account_ref,
+                name,
+                members,
+                description,
+                initial_image,
+            )
+            .await
+    }
+
+    pub async fn create_group_with_options_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<crate::CreatedGroup, AppError> {
+        self.accounts
+            .create_group_with_options_detailed(account_ref, name, members, options)
             .await
     }
 

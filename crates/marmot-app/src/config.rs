@@ -101,6 +101,11 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
     pub dev_fail_invite_welcome_intent: bool,
+    /// Dev/test-only override that fails the app projection transaction after
+    /// a founding group is already canonical. Honored only with
+    /// `test-policy-overrides`; restart tests use it to exercise the sole
+    /// remaining post-canonical write boundary.
+    pub dev_fail_create_local_projection: bool,
     /// Dev/test-only override that fails invite local projection refresh.
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
@@ -174,6 +179,7 @@ impl Default for MarmotAppConfig {
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
             dev_fail_invite_welcome_intent: false,
+            dev_fail_create_local_projection: false,
             dev_fail_invite_local_refresh: false,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
@@ -276,6 +282,11 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_fail_invite_welcome_intent(mut self, enabled: bool) -> Self {
         self.dev_fail_invite_welcome_intent = enabled;
+        self
+    }
+
+    pub fn with_dev_fail_create_local_projection(mut self, enabled: bool) -> Self {
+        self.dev_fail_create_local_projection = enabled;
         self
     }
 

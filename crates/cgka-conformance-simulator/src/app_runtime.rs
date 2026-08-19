@@ -1487,6 +1487,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::Transport(_)
         | AppError::Io(_)
         | AppError::Sqlite(_)
+        | AppError::CreatedGroupProjectionUnavailable(_)
         | AppError::SqlcipherKeyDerivation(_) => SubjectFailureCategory::Environment,
     };
     SubjectError::classified(
