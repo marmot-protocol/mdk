@@ -203,6 +203,8 @@ printf '%s\n' '{"type":"text","text":"completed"}'
 
 #[tokio::test]
 async fn stdout_reads_reset_the_idle_deadline() {
+    const IDLE_TIMEOUT: Duration = Duration::from_millis(600);
+
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();
     let script = executable_script(
@@ -210,17 +212,21 @@ async fn stdout_reads_reset_the_idle_deadline() {
         "progress-backend",
         r#"#!/bin/sh
 printf '%s\n' '{"type":"session","id":"progress"}'
-sleep 0.1
+sleep 0.25
 printf '%s\n' '{"type":"progress"}'
-sleep 0.1
+sleep 0.25
+printf '%s\n' '{"type":"progress"}'
+sleep 0.25
 printf '%s\n' '{"type":"text","text":"done"}'
 "#,
     );
     let (tx, mut rx) = mpsc::channel(2);
     let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
-    spec.idle_timeout = Duration::from_millis(500);
+    spec.idle_timeout = IDLE_TIMEOUT;
+    let started = std::time::Instant::now();
     let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
 
+    assert!(started.elapsed() > IDLE_TIMEOUT);
     assert_eq!(outcome.observed_session.as_deref(), Some("progress"));
     assert_eq!(rx.recv().await, Some(RunnerEvent::Text("done".to_owned())));
 }
