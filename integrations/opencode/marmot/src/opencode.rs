@@ -99,8 +99,8 @@ async fn run_with_bin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Some((name, value)) = permission_overlay(execution_profile) {
-        command.env(name, value);
+    if let Some((remove, name, value)) = config_overlay(execution_profile) {
+        command.env_remove(remove).env(name, value);
     }
 
     let mut child = command.spawn().map_err(|_| RunFailure {
@@ -269,8 +269,12 @@ pub(crate) fn build_run_args(
     args
 }
 
-fn permission_overlay(profile: ExecutionProfile) -> Option<(&'static str, &'static str)> {
-    (profile == ExecutionProfile::Unrestricted).then_some(("OPENCODE_PERMISSION", r#""allow""#))
+fn config_overlay(profile: ExecutionProfile) -> Option<(&'static str, &'static str, &'static str)> {
+    (profile == ExecutionProfile::Unrestricted).then_some((
+        "OPENCODE_PERMISSION",
+        "OPENCODE_CONFIG_CONTENT",
+        r#"{"permission":"allow"}"#,
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -584,12 +588,16 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_uses_a_process_local_permission_overlay_only() {
-        assert_eq!(permission_overlay(ExecutionProfile::Inherit), None);
-        assert_eq!(permission_overlay(ExecutionProfile::Autonomous), None);
+    fn unrestricted_uses_a_process_local_config_overlay_only() {
+        assert_eq!(config_overlay(ExecutionProfile::Inherit), None);
+        assert_eq!(config_overlay(ExecutionProfile::Autonomous), None);
         assert_eq!(
-            permission_overlay(ExecutionProfile::Unrestricted),
-            Some(("OPENCODE_PERMISSION", r#""allow""#))
+            config_overlay(ExecutionProfile::Unrestricted),
+            Some((
+                "OPENCODE_PERMISSION",
+                "OPENCODE_CONFIG_CONTENT",
+                r#"{"permission":"allow"}"#
+            ))
         );
     }
 }

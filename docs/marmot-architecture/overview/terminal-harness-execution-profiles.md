@@ -45,7 +45,8 @@ file and same-user service definition. It requires
 `--acknowledge-unrestricted` before writing `unrestricted`; `--yes`, dry-run,
 or an environment-provided profile do not substitute for that acknowledgement.
 
-Startup tracing contains only the profile and fixed capability state names.
+Startup tracing contains the profile and fixed capability state names alongside
+coarse fields such as the harness name, sender count, and reply-size limit.
 Unsupported or malformed profiles fail configuration loading.
 
 ## Security Boundary

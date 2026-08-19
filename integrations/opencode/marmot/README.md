@@ -108,7 +108,10 @@ home, socket, token, and account for a separate trust boundary.
 `autonomous` passes OpenCode's `--auto`, which auto-approves asks while
 preserving explicit denies. `unrestricted` also supplies a connector-owned,
 process-local allow-all permission overlay; it does not rewrite OpenCode's
-global or project configuration. See the shared
+global or project configuration, and it clears an inherited
+`OPENCODE_PERMISSION` in the child. Managed organization policy may still
+override the process-local setting. OpenCode provides no built-in OS isolation;
+use external OS isolation for unrestricted deployments. See the shared
 [execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
 
 The reply limit is byte-based, not character-based. The default is 30KB, well
