@@ -223,6 +223,30 @@ impl MarmotRelayPlane {
         )
     }
 
+    /// Builds a relay plane over a caller-supplied `nostr-sdk` client.
+    ///
+    /// The client owns the transport, so an embedder can reach relays over something other
+    /// than the default TCP/TLS WebSocket stack without forking this crate. Everything above
+    /// the transport, including the directory fetcher used to look up KeyPackages, is built
+    /// from the same client, so there is no second path that silently falls back to the
+    /// default transport.
+    pub fn from_sdk_client(
+        client: NostrSdkClient,
+        subscription_rebuild_lookback: Option<Duration>,
+        allow_loopback: bool,
+    ) -> Self {
+        let relay_client = NostrSdkRelayClient::new(client.clone());
+        let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
+        Self::from_adapter(
+            subscription_rebuild_lookback,
+            adapter,
+            Some(relay_client),
+            None,
+            Arc::new(NostrSdkDirectoryRelayFetcher::new(client)),
+            allow_loopback,
+        )
+    }
+
     fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
         let client = NostrSdkClient::builder().build();
         let relay_client = NostrSdkRelayClient::new(client.clone());

@@ -499,6 +499,12 @@ type AppRuntime = AccountDeviceRuntime<
 #[cfg(test)]
 type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 
+/// Builds the `nostr-sdk` client an account publishes through, given its signer.
+///
+/// Supplied by an embedder that runs the runtime over a transport of its own.
+pub type AccountClientFactory =
+    Arc<dyn Fn(Arc<dyn nostr::NostrSigner>) -> NostrSdkClient + Send + Sync>;
+
 #[derive(Clone)]
 pub struct MarmotApp {
     root: PathBuf,
@@ -551,6 +557,7 @@ pub struct MarmotApp {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
+    account_client_factory: Option<AccountClientFactory>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1326,6 +1333,15 @@ impl MarmotApp {
         )
     }
 
+    /// Replaces the relay plane this app will use.
+    ///
+    /// Call it before any account work. Pairs with [`MarmotRelayPlane::from_sdk_client`] to
+    /// run the runtime over an embedder-supplied transport.
+    pub fn with_relay_plane(mut self, relay_plane: MarmotRelayPlane) -> Self {
+        self.relay_plane = relay_plane;
+        self
+    }
+
     pub fn with_relays_and_config(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
@@ -1378,6 +1394,7 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            account_client_factory: None,
         }
     }
 
@@ -1451,6 +1468,7 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            account_client_factory: None,
         }
     }
 
@@ -5417,6 +5435,16 @@ impl MarmotApp {
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 
+    /// Sets the factory used to build each account's publishing client.
+    ///
+    /// Without it an app that supplied its own relay plane still has every account publish
+    /// go out over the default transport, because the per-account publishing client is built
+    /// here rather than taken from the plane.
+    pub fn with_account_client_factory(mut self, factory: AccountClientFactory) -> Self {
+        self.account_client_factory = Some(factory);
+        self
+    }
+
     fn relay_client_for_account_id(
         &self,
         account_id_hex: &str,
@@ -5436,7 +5464,10 @@ impl MarmotApp {
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {
-                let client = NostrSdkClient::builder().signer(signer).build();
+                let client = match &self.account_client_factory {
+                    Some(build) => build(signer),
+                    None => NostrSdkClient::builder().signer(signer).build(),
+                };
                 Arc::new(NostrSdkRelayClient::new(client))
             })
             .clone()
