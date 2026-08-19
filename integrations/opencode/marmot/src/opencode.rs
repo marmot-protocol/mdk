@@ -4,7 +4,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use marmot_terminal_harness::{
     Backend, HarnessError, Invocation, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
-    process::{capture_stderr, cleanup_failed_run, kill_and_reap, next_stdout_line, strip_ansi},
+    process::{
+        capture_stderr, cleanup_failed_run, kill_and_reap, next_stdout_line, strip_ansi,
+        write_stdin,
+    },
 };
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -73,12 +76,9 @@ async fn run_with_bin(
 ) -> std::result::Result<Outcome, RunFailure> {
     let mut command = Command::new(bin);
     command
-        .args(build_run_args(
-            invocation.session_id.as_deref(),
-            &invocation.prompt,
-        ))
+        .args(build_run_args(invocation.session_id.as_deref()))
         .current_dir(&invocation.cwd)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -88,6 +88,16 @@ async fn run_with_bin(
         observed_session: None,
     })?;
     let total_deadline = tokio::time::Instant::now() + invocation.timeout;
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            kill_and_reap(&mut child).await;
+            return Err(RunFailure {
+                error: HarnessError::BackendSpawn,
+                observed_session: None,
+            });
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -110,6 +120,7 @@ async fn run_with_bin(
     };
     let mut lines = BufReader::new(stdout).lines();
     let mut stderr_task = tokio::spawn(capture_stderr(stderr));
+    let mut writer_task = write_stdin(stdin, invocation.prompt);
     let start = Instant::now();
     let mut observed_session: Option<String> = None;
     let mut error_summary: Option<String> = None;
@@ -168,8 +179,20 @@ async fn run_with_bin(
         }
 
         let (status, stderr) = match timeout_at(idle_deadline, async {
-            let status = child.wait().await.map_err(HarnessError::from)?;
-            let stderr = (&mut stderr_task).await.map_err(HarnessError::from)?;
+            let (writer, status, stderr) =
+                tokio::join!(&mut writer_task, child.wait(), &mut stderr_task);
+            let status = status.map_err(HarnessError::from)?;
+            let stderr = stderr.map_err(HarnessError::from)?;
+            match writer.map_err(HarnessError::from)? {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => debug!(
+                    target: TRACE_TARGET,
+                    method = "opencode_run",
+                    error_kind = "stdin_closed",
+                    "backend closed stdin before draining the prompt"
+                ),
+                Err(_) => return Err(HarnessError::BackendStream),
+            }
             Ok::<_, HarnessError>((status, stderr))
         })
         .await
@@ -190,14 +213,14 @@ async fn run_with_bin(
     match lifecycle_result {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, None).await;
+            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
             Err(RunFailure {
                 error,
                 observed_session,
             })
         }
         Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, None).await;
+            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
@@ -206,7 +229,7 @@ async fn run_with_bin(
     }
 }
 
-pub(crate) fn build_run_args(session_id: Option<&str>, prompt: &str) -> Vec<String> {
+pub(crate) fn build_run_args(session_id: Option<&str>) -> Vec<String> {
     let mut args = vec!["run".to_owned(), "--format".to_owned(), "json".to_owned()];
     if let Some(session_id) = session_id
         && !session_id.is_empty()
@@ -214,8 +237,6 @@ pub(crate) fn build_run_args(session_id: Option<&str>, prompt: &str) -> Vec<Stri
         args.push("--session".to_owned());
         args.push(session_id.to_owned());
     }
-    args.push("--".to_owned());
-    args.push(prompt.to_owned());
     args
 }
 
@@ -287,18 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn build_run_args_separates_prompt_from_flags() {
+    fn build_run_args_keeps_prompt_out_of_process_arguments() {
         assert_eq!(
-            build_run_args(Some("ses_123"), "--auto"),
-            vec![
-                "run",
-                "--format",
-                "json",
-                "--session",
-                "ses_123",
-                "--",
-                "--auto"
-            ]
+            build_run_args(Some("ses_123")),
+            vec!["run", "--format", "json", "--session", "ses_123"]
         );
     }
 

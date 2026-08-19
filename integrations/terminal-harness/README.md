@@ -28,9 +28,8 @@ Connector crates are responsible for:
 - exposing only completed assistant output, never thinking or tool output;
 - preserving or reporting the backend session id needed for the next prompt.
 
-OpenCode keeps prompt text after its command's `--` delimiter. Codex and Pi
-write prompt text to stdin. Backend-specific behavior belongs in those connector crates, not
-in this shared runtime.
+Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
+belongs in those connector crates, not in this shared runtime.
 
 ## Shared Behavior
 
@@ -43,10 +42,18 @@ All connectors:
 - use `/<path>` on the first group message to select a canonical working
   directory beneath `$HOME`;
 - persist private per-group working-directory and session mappings;
+- intercept an exact `/reset-session` message before backend invocation, clear
+  only that group's backend session id, and retain its selected workdir;
 - split durable replies on UTF-8 boundaries with a 30,000-byte default and a
   60,000-byte hard ceiling;
 - enforce bounded per-group queues plus idle and total backend timeouts;
 - keep diagnostics free of identifiers, paths, prompts, and backend output.
+
+`/reset-session` is reserved as a harness control message. Send
+`//reset-session` to forward the literal `/reset-session` text to the backend.
+Reset never deletes backend-owned transcripts and never retries a failed resumed
+prompt automatically; the next distinct prompt starts a new logical backend
+session in the retained workdir.
 
 The connector READMEs document their environment variables, installer topology,
 and backend contracts:

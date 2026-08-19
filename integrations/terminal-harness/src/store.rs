@@ -72,6 +72,27 @@ impl SessionStore {
         *map = next;
         Ok(())
     }
+
+    pub(crate) async fn reset_session(&self, group_key: &str) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        let Some(record) = map.get(group_key) else {
+            return Ok(false);
+        };
+        if record.session_id.is_empty() {
+            return Ok(false);
+        }
+
+        let mut next = map.clone();
+        next.get_mut(group_key)
+            .expect("record exists in cloned session map")
+            .session_id
+            .clear();
+        let path = self.path.clone();
+        let snapshot = next.clone();
+        tokio::task::spawn_blocking(move || write_snapshot(&path, &snapshot)).await??;
+        *map = next;
+        Ok(true)
+    }
 }
 
 fn write_snapshot(path: &Path, snapshot: &HashMap<String, SessionRecord>) -> Result<()> {
@@ -112,6 +133,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_store_resets_only_one_session_and_preserves_its_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let first_cwd = home.join("first");
+        let second_cwd = home.join("second");
+
+        {
+            let store = SessionStore::load(path.clone(), &home).unwrap();
+            store
+                .set(
+                    "group1",
+                    SessionRecord {
+                        session_id: "ses_first".to_owned(),
+                        cwd: first_cwd.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .set(
+                    "group2",
+                    SessionRecord {
+                        session_id: "ses_second".to_owned(),
+                        cwd: second_cwd.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert!(store.reset_session("group1").await.unwrap());
+        }
+
+        let store = SessionStore::load(path, &home).unwrap();
+        let first = store.get("group1").await.expect("first group retained");
+        assert_eq!(first.session_id, "");
+        assert_eq!(first.cwd, first_cwd);
+        let second = store.get("group2").await.expect("second group retained");
+        assert_eq!(second.session_id, "ses_second");
+        assert_eq!(second.cwd, second_cwd);
+    }
+
+    #[tokio::test]
+    async fn failed_reset_keeps_the_memory_and_durable_snapshots_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let cwd = home.join("proj");
+        let store = SessionStore::load(path.clone(), &home).unwrap();
+        store
+            .set(
+                "group1",
+                SessionRecord {
+                    session_id: "ses_original".to_owned(),
+                    cwd: cwd.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        assert!(store.reset_session("group1").await.is_err());
+        let current = store.get("group1").await.unwrap();
+        assert_eq!(current.session_id, "ses_original");
+        assert_eq!(current.cwd, cwd);
+        drop(store);
+
+        let reloaded = SessionStore::load(path, &home).unwrap();
+        let current = reloaded.get("group1").await.unwrap();
+        assert_eq!(current.session_id, "ses_original");
+        assert_eq!(current.cwd, cwd);
+    }
+
+    #[tokio::test]
     async fn session_store_accepts_bare_string_legacy_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
@@ -144,6 +239,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(store.reset_session("group1").await.unwrap());
 
         let parent_mode = path
             .parent()

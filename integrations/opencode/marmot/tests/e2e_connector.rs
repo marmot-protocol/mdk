@@ -44,21 +44,12 @@ if [ "${1:-}" != "run" ] || [ "${2:-}" != "--format" ] || [ "${3:-}" != "json" ]
   echo "unexpected opencode args: $*" >&2
   exit 64
 fi
-found_delimiter=0
-prompt=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    found_delimiter=1
-    shift
-    prompt="${1:-}"
-    break
-  fi
-  shift
-done
-if [ "$found_delimiter" -ne 1 ]; then
-  echo "missing prompt delimiter" >&2
+shift 3
+if [ "$#" -ne 0 ]; then
+  echo "prompt or unexpected option exposed in opencode args: $*" >&2
   exit 64
 fi
+prompt="$(cat)"
 tail=""
 for _ in $(seq 1 40); do
   tail="${tail}chunk "

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-scenario="${!#}"
+scenario="$(cat)"
 case "$scenario" in
     stream-text)
         printf '%s\n' '{"type":"step_start","sessionID":"ses_mock"}'
