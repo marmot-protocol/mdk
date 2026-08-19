@@ -422,6 +422,8 @@ pub struct GeneratedScenarioMetadata {
     pub generator_version: String,
     pub seed: u64,
     pub case_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_profile: Option<crate::GeneratedWorkloadProfileV1>,
     pub minimized_case: Option<ScenarioSpec>,
 }
 

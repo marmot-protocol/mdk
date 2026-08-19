@@ -1058,6 +1058,7 @@ async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
         generator_version: "4".into(),
         seed: 17,
         case_index: 2,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario: spec.clone(),
         expected_outcomes: vec![TraceExpectation::GroupProfile {

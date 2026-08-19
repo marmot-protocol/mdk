@@ -31,6 +31,8 @@ pub struct GeneratedScenarioProvenanceV1 {
     pub generator_version: String,
     pub seed: u64,
     pub case_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_profile: Option<crate::GeneratedWorkloadProfileV1>,
     pub recorded_subject: GeneratedSubjectKind,
 }
 
@@ -134,6 +136,7 @@ pub(crate) fn generated_scenario_input_provenance(
             generator_version: case.generator_version.clone(),
             seed: case.seed,
             case_index: case.case_index,
+            workload_profile: case.workload_profile.clone(),
             recorded_subject: case.subject,
         }),
     })
@@ -170,6 +173,7 @@ mod tests {
             generator_version: "3".into(),
             seed: 42,
             case_index: 7,
+            workload_profile: None,
             subject: GeneratedSubjectKind::RetainedRelay,
             scenario: scenario.clone(),
             expected_outcomes: Vec::new(),
@@ -205,6 +209,7 @@ mod tests {
                 generator_version: "3".into(),
                 seed: 42,
                 case_index: 7,
+                workload_profile: None,
                 subject: GeneratedSubjectKind::Engine,
                 scenario: scenario(),
                 expected_outcomes: Vec::new(),

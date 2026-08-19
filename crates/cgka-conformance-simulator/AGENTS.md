@@ -102,6 +102,12 @@ Git commit; require a clean build and retain the exact source revision plus comm
     observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
     observation passed. Positive `PayloadCount` asserts are strict-oracle `AppMessage` coverage.
 
+- **Module:** `src/large_group_family.rs`
+  - **Role:** Replay-stable 10–200 member pressure catalog. Keeps group size, administrator population, active
+    committer width, traffic balance, formation, and disruption explicit in versioned workload metadata. Size blocks
+    are ordered by execution cost because campaign selection is prefix-only; race arms must retain at least two active
+    committers, and bounded decryptability probes must preserve late-join/re-add and roster-tail representatives.
+
 - **Module:** `src/stateful_generator.rs`
   - **Role:** Legality-aware product journey generation into canonical Scenario IR v3. Tracks membership, admins,
     connectivity, profile, epoch, and application delivery; alternates late-membership engine cases with founding-member

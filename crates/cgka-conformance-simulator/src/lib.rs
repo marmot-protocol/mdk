@@ -29,6 +29,7 @@ mod cross_route_scenario;
 mod decryptability;
 mod failure_capsule;
 pub mod family;
+mod large_group_family;
 pub mod lifecycle_model;
 pub mod mutation_adequacy;
 pub mod node_protocol;
@@ -100,8 +101,8 @@ pub use failure_capsule::{
 };
 pub use family::{
     GENERATED_SCENARIO_INPUT_SCHEMA_VERSION, GeneratedScenarioCase, GeneratedScenarioInputV1,
-    GeneratedSubjectKind, UnsupportedGeneratedFamily, generate_admin_churn_case,
-    generate_admin_churn_family, generate_adversarial_reliability_case,
+    GeneratedSubjectKind, GeneratedWorkloadProfileV1, UnsupportedGeneratedFamily,
+    generate_admin_churn_case, generate_admin_churn_family, generate_adversarial_reliability_case,
     generate_adversarial_reliability_family, generate_adversarial_reliability_offline_regression,
     generate_adversarial_reliability_self_update_regression,
     generate_adversarial_reliability_sustained_regression,
@@ -115,6 +116,11 @@ pub use family::{
     run_generated_case_report, run_generated_case_report_with_capture,
     run_generated_case_report_with_capture_on_subject, run_generated_case_report_with_storage_mode,
     semantic_reduction_units,
+};
+pub use large_group_family::{
+    LARGE_GROUP_PRESSURE_FAMILY, LARGE_GROUP_PRESSURE_GENERATOR_VERSION,
+    LARGE_GROUP_PRESSURE_PROFILE_VERSION, generate_large_group_pressure_case,
+    generate_large_group_pressure_family,
 };
 pub use oracle::{
     BehaviorEvidenceSummary, CoverageMatrixEntry, OracleBehavior, OracleCoverageWarning,
