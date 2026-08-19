@@ -305,9 +305,10 @@ Use the narrow checks first:
 cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
-bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --codex-bin /bin/echo
-bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
-bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
+sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
+bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
 integrations/hermes/marmot/tests/test_dev_scripts.sh
 just codex-installer-test
 just opencode-installer-test

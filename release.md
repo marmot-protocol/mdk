@@ -254,9 +254,10 @@ cargo test -p wn-opencode
 cargo test -p wn-pi
 bash scripts/install-hermes-marmot.sh --dry-run --yes
 bash scripts/install-openclaw-marmot.sh --dry-run --yes
-bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --codex-bin /bin/echo
-bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
-bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
+sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
+bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
 ```
 
 Bridge and control logs for all terminal harnesses use the
@@ -326,10 +327,15 @@ The release job creates these assets:
 - `openclaw-marmot-plugin-<version>.tgz`
 - `openclaw-marmot-plugin-<version>.tgz.sha256`
 - `install-hermes-marmot.sh`
+- `install-hermes-marmot.sh.sha256`
 - `install-openclaw-marmot.sh`
+- `install-openclaw-marmot.sh.sha256`
 - `install-codex-marmot.sh`
+- `install-codex-marmot.sh.sha256`
 - `install-opencode-marmot.sh`
+- `install-opencode-marmot.sh.sha256`
 - `install-pi-marmot.sh`
+- `install-pi-marmot.sh.sha256`
 
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).

@@ -420,10 +420,37 @@ exit 64
 
         assert!(outcome.observed_session.is_some());
         assert_eq!(outcome.exit_code, Some(0));
+        let session_id = outcome.observed_session.unwrap();
         let mut reply = String::new();
         while let Some(RunnerEvent::Text(text)) = rx.recv().await {
             reply.push_str(&text);
         }
         assert_eq!(reply.trim(), "CODEX_CONNECTOR_OK");
+
+        let (resume_tx, mut resume_rx) = mpsc::channel(8);
+        let resumed = run_with_bin(
+            "codex",
+            Invocation {
+                timeout: Duration::from_secs(120),
+                idle_timeout: Duration::from_secs(30),
+                cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                session_id: Some(session_id.clone()),
+                prompt: "Reply with exactly CODEX_RESUME_OK and nothing else.".to_owned(),
+            },
+            resume_tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resumed.observed_session.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(resumed.exit_code, Some(0));
+        let mut resumed_reply = String::new();
+        while let Some(RunnerEvent::Text(text)) = resume_rx.recv().await {
+            resumed_reply.push_str(&text);
+        }
+        assert_eq!(resumed_reply.trim(), "CODEX_RESUME_OK");
     }
 }

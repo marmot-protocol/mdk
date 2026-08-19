@@ -460,6 +460,11 @@ jobs:
                 > "dist/install/install-$harness-marmot.sh"
             chmod 0755 "dist/install/install-$harness-marmot.sh"
           done
+          for installer in dist/install/install-*.sh; do
+            shasum -a 256 "$installer" | \
+              awk -v name="$(basename "$installer")" '{print $1 "  " name}' \
+              > "$installer.sha256"
+          done
 
       - name: Create or update wn-agent release
         shell: bash
@@ -547,10 +552,15 @@ jobs:
             dist/plugin/openclaw-marmot-plugin-"$version".tgz
             dist/plugin/openclaw-marmot-plugin-"$version".tgz.sha256
             dist/install/install-hermes-marmot.sh
+            dist/install/install-hermes-marmot.sh.sha256
             dist/install/install-openclaw-marmot.sh
+            dist/install/install-openclaw-marmot.sh.sha256
             dist/install/install-codex-marmot.sh
+            dist/install/install-codex-marmot.sh.sha256
             dist/install/install-opencode-marmot.sh
+            dist/install/install-opencode-marmot.sh.sha256
             dist/install/install-pi-marmot.sh
+            dist/install/install-pi-marmot.sh.sha256
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -641,10 +651,15 @@ jobs:
 
           assets=(
             dist/install/install-hermes-marmot.sh
+            dist/install/install-hermes-marmot.sh.sha256
             dist/install/install-openclaw-marmot.sh
+            dist/install/install-openclaw-marmot.sh.sha256
             dist/install/install-codex-marmot.sh
+            dist/install/install-codex-marmot.sh.sha256
             dist/install/install-opencode-marmot.sh
+            dist/install/install-opencode-marmot.sh.sha256
             dist/install/install-pi-marmot.sh
+            dist/install/install-pi-marmot.sh.sha256
           )
 
           if gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

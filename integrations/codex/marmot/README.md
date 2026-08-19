@@ -23,14 +23,39 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh" | bash
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+curl -fsSL "$base_url/install-codex-marmot.sh" -o "$tmpdir/install-codex-marmot.sh"
+curl -fsSL "$base_url/install-codex-marmot.sh.sha256" -o "$tmpdir/install-codex-marmot.sh.sha256"
+if command -v shasum >/dev/null 2>&1; then
+  (cd "$tmpdir" && shasum -a 256 -c install-codex-marmot.sh.sha256)
+elif command -v sha256sum >/dev/null 2>&1; then
+  (cd "$tmpdir" && sha256sum -c install-codex-marmot.sh.sha256)
+else
+  echo "error: need shasum or sha256sum to verify the installer" >&2
+  exit 1
+fi
+bash "$tmpdir/install-codex-marmot.sh"
 ```
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+curl -fsSL "$base_url/install-codex-marmot.sh" -o "$tmpdir/install-codex-marmot.sh"
+curl -fsSL "$base_url/install-codex-marmot.sh.sha256" -o "$tmpdir/install-codex-marmot.sh.sha256"
+if command -v shasum >/dev/null 2>&1; then
+  (cd "$tmpdir" && shasum -a 256 -c install-codex-marmot.sh.sha256)
+elif command -v sha256sum >/dev/null 2>&1; then
+  (cd "$tmpdir" && sha256sum -c install-codex-marmot.sh.sha256)
+else
+  echo "error: need shasum or sha256sum to verify the installer" >&2
+  exit 1
+fi
+bash "$tmpdir/install-codex-marmot.sh" --yes --allow-welcomer npub1...
 ```
 
 The default install uses its own `~/.marmot-agents/codex` identity and services,
@@ -72,7 +97,9 @@ wn-codex
 
 On the first message in a group, use `/<path>` to select a Git working
 directory under `$HOME`. A picker-only message stores the workdir without
-starting Codex. Subsequent prompts resume that group's Codex thread.
+starting Codex. Subsequent prompts resume that group's Codex thread. Without a
+picker, the shared harness uses `$HOME`; Codex rejects a non-Git working
+directory by default, so select a repository before sending the first prompt.
 
 ## Configuration
 
@@ -124,7 +151,7 @@ cargo test -p wn-codex
 just codex-dev-e2e-connector
 just codex-installer-test
 cargo run -p wn-codex
-bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --codex-bin /bin/echo
+bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')" --codex-bin /bin/echo
 ```
 
 The real Codex contract test is ignored by default because it requires an

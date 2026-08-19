@@ -17,7 +17,8 @@ Rust Codex harness for Marmot through the local `wn-agent` control socket. Read
 - The CLI contract is `codex exec --json -` for a new thread and
   `codex exec resume --json <thread-id> -` for a resumed thread. Re-verify the
   official non-interactive-mode contract before changing invocation flags or
-  JSON event parsing.
+  JSON event parsing. The new-thread and resume paths were verified end-to-end
+  against `codex-cli 0.146.0`.
 
 ## Key Files
 
