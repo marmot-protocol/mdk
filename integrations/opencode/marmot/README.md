@@ -18,8 +18,8 @@ GitHub pre-releases.
 
 Prerequisites:
 
-- OpenCode installed locally and runnable on `PATH`, or an executable path set
-  with `WN_OPENCODE_BIN` / `--opencode-bin`
+- OpenCode 1.18.18 or newer installed locally and runnable on `PATH`, or an
+  executable path set with `WN_OPENCODE_BIN` / `--opencode-bin`
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
@@ -128,6 +128,40 @@ for the next prompt. Symlinks that resolve outside `$HOME` are rejected after
 canonicalization. Picker-looking messages with invalid segments are rejected
 and are not forwarded to OpenCode as prompts.
 
+## Session Reset
+
+Send exactly `/reset-session` to clear the current Marmot group's OpenCode
+session id. The harness intercepts the command, preserves the group's validated
+workdir, does not delete OpenCode-owned transcripts, and confirms the result.
+The next normal prompt creates and records a new OpenCode session in that
+workdir. A failed resumed prompt is never retried automatically because the
+original invocation may already have produced side effects.
+
+The command name is reserved. Send `//reset-session` when the literal
+`/reset-session` text should reach OpenCode; messages such as
+`/reset-session please` are ordinary prompts.
+
+## OpenCode Transport Contract
+
+The minimum supported OpenCode version is 1.18.18. The harness retains the
+process-per-message [`opencode run --format json`](https://opencode.ai/docs/cli/)
+integration, including `--session` resume and the existing completed-text event
+filter. It supplies the prompt only through the child's stdin. OpenCode 1.18.18
+explicitly reads piped stdin when no message argument is present in its
+[tagged `run` implementation](https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/cli/cmd/run.ts#L416-L422).
+
+The bounded transport comparison was:
+
+| Candidate | Contract fit | Decision |
+| --- | --- | --- |
+| `opencode run --format json` with stdin | Preserves durable session ids, process isolation, completed-event filtering, timeouts, cancellation, cleanup, and future `run` permission flags while removing prompt argv exposure. | Selected. |
+| [`opencode acp`](https://opencode.ai/docs/acp/) | Moves prompts to stdio, but adds a stateful JSON-RPC connection, initialize/load/prompt/cancel framing, and permission-request replies. | Not selected; no benefit over `run` stdin for this harness. |
+| [`opencode serve`](https://opencode.ai/docs/server/) | Provides a local OpenAPI HTTP interface, but adds server startup/readiness, authentication, port ownership, event-stream, and crash-recovery obligations. | Not selected; it weakens the current process-per-message boundary. |
+
+This ACP decision concerns only the OpenCode backend below the shared `Backend`
+trait. It does not change `marmot.agent-control.v2` and does not imply an ACP
+migration for other terminal harnesses.
+
 ## Security Notes
 
 - The control socket is local Unix-domain only. Use the normal `wn-agent`
@@ -143,9 +177,8 @@ and are not forwarded to OpenCode as prompts.
 - Logs are structured and privacy-safe: no account ids, group ids, message ids,
   local paths, prompt text, OpenCode output, relay URLs, pubkeys, ciphertext, or
   key material.
-- Prompt text is passed to `opencode run` as a process argument. Run this
-  harness only on trusted single-user hosts or hosts with equivalent local
-  process isolation.
+- Prompt text is written to `opencode run` over stdin and is absent from spawned
+  process arguments and privacy-safe logs.
 - The session map is written through `fs-private` with owner-only file and
   directory modes.
 

@@ -31,7 +31,9 @@ Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` firs
 - Keep shared control, queueing, chunking, workdir, session-map, and process lifecycle behavior in
   `integrations/terminal-harness`; keep only OpenCode command/event behavior here.
 - Keep state files restrictive-by-construction through `fs-private` or an equivalent mode-tested path.
-- Keep opencode prompts after a `--` delimiter so prompt text cannot be parsed as `opencode run` flags.
+- Keep opencode prompts on stdin and out of process arguments. The supported
+  minimum OpenCode version is 1.18.18, whose non-interactive `run` path consumes
+  piped stdin when no message argument is present.
 
 ## Verification
 

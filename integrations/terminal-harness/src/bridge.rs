@@ -311,34 +311,75 @@ struct InboundPrompt {
     text: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PromptDisposition {
+    ResetSession,
+    Forward {
+        prompt: String,
+        allow_workdir_picker: bool,
+    },
+}
+
+fn classify_prompt(text: &str) -> PromptDisposition {
+    match text.trim() {
+        "/reset-session" => PromptDisposition::ResetSession,
+        "//reset-session" => PromptDisposition::Forward {
+            prompt: "/reset-session".to_owned(),
+            allow_workdir_picker: false,
+        },
+        _ => PromptDisposition::Forward {
+            prompt: text.to_owned(),
+            allow_workdir_picker: true,
+        },
+    }
+}
+
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit: GroupPermit) {
     let _serial = permit.serial.lock().await;
-    let known_session = ctx.sessions.get(&inbound.group_ref).await;
-    let (cwd, prompt) = match resolve_cwd_and_prompt(&ctx, &inbound, known_session.as_ref()).await {
-        Ok(Some(value)) => value,
-        Ok(None) => return,
-        Err(err) => {
-            warn!(
-                target: TRACE_TARGET,
-                method = "handle_message",
-                error_kind = err.privacy_safe_kind(),
-                "failed to prepare inbound prompt"
-            );
-            let _ = send_reply(
-                &ctx,
-                &inbound.account_ref,
-                &inbound.group_ref,
-                &inbound.message_ref,
-                &format!(
-                    "[{}] failed to prepare this prompt.",
-                    ctx.cfg.spec.reply_prefix
-                ),
-                0,
-            )
-            .await;
+    let mut inbound = inbound;
+    let allow_workdir_picker = match classify_prompt(&inbound.text) {
+        PromptDisposition::ResetSession => {
+            handle_session_reset(&ctx, &inbound).await;
             return;
         }
+        PromptDisposition::Forward {
+            prompt,
+            allow_workdir_picker,
+        } => {
+            inbound.text = prompt;
+            allow_workdir_picker
+        }
     };
+
+    let known_session = ctx.sessions.get(&inbound.group_ref).await;
+    let (cwd, prompt) =
+        match resolve_cwd_and_prompt(&ctx, &inbound, known_session.as_ref(), allow_workdir_picker)
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "handle_message",
+                    error_kind = err.privacy_safe_kind(),
+                    "failed to prepare inbound prompt"
+                );
+                let _ = send_reply(
+                    &ctx,
+                    &inbound.account_ref,
+                    &inbound.group_ref,
+                    &inbound.message_ref,
+                    &format!(
+                        "[{}] failed to prepare this prompt.",
+                        ctx.cfg.spec.reply_prefix
+                    ),
+                    0,
+                )
+                .await;
+                return;
+            }
+        };
 
     info!(
         target: TRACE_TARGET,
@@ -464,6 +505,48 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             )
             .await;
         }
+    }
+}
+
+async fn handle_session_reset(ctx: &BridgeContext, inbound: &InboundPrompt) {
+    let message = match ctx.sessions.reset_session(&inbound.group_ref).await {
+        Ok(true) => format!(
+            "[{}] Session reset. The next prompt will start a new {} session in the preserved workdir.",
+            ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+        ),
+        Ok(false) => format!(
+            "[{}] No {} session is recorded for this group.",
+            ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+        ),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "session_reset",
+                error_kind = err.privacy_safe_kind(),
+                "failed to reset backend session"
+            );
+            format!(
+                "[{}] Failed to reset the {} session.",
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+            )
+        }
+    };
+    if let Err(err) = send_reply(
+        ctx,
+        &inbound.account_ref,
+        &inbound.group_ref,
+        &inbound.message_ref,
+        &message,
+        0,
+    )
+    .await
+    {
+        warn!(
+            target: TRACE_TARGET,
+            method = "session_reset_reply",
+            error_kind = err.privacy_safe_kind(),
+            "failed to send session-reset reply"
+        );
     }
 }
 
@@ -632,10 +715,14 @@ async fn resolve_cwd_and_prompt(
     ctx: &BridgeContext,
     inbound: &InboundPrompt,
     known_session: Option<&SessionRecord>,
+    allow_workdir_picker: bool,
 ) -> Result<Option<(PathBuf, String)>> {
     if let Some(record) = known_session {
         let cwd = validate_session_cwd(&record.cwd, &ctx.home).await?;
         return Ok(Some((cwd, inbound.text.clone())));
+    }
+    if !allow_workdir_picker {
+        return Ok(Some((ctx.home.clone(), inbound.text.clone())));
     }
 
     let (name, rest) = match parse_repo_picker(&inbound.text) {
@@ -920,6 +1007,32 @@ mod tests {
     }
 
     #[test]
+    fn reset_command_is_exact_and_has_a_literal_escape() {
+        assert_eq!(
+            classify_prompt("/reset-session"),
+            PromptDisposition::ResetSession
+        );
+        assert_eq!(
+            classify_prompt("  /reset-session\n"),
+            PromptDisposition::ResetSession
+        );
+        assert_eq!(
+            classify_prompt("//reset-session"),
+            PromptDisposition::Forward {
+                prompt: "/reset-session".to_owned(),
+                allow_workdir_picker: false,
+            }
+        );
+        assert_eq!(
+            classify_prompt("/reset-session please"),
+            PromptDisposition::Forward {
+                prompt: "/reset-session please".to_owned(),
+                allow_workdir_picker: true,
+            }
+        );
+    }
+
+    #[test]
     fn find_account_ref_matches_case_insensitively() {
         let account = AgentControlAccount {
             account_id_hex: "AA".repeat(32),
@@ -964,6 +1077,41 @@ mod tests {
         .unwrap();
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_new");
+    }
+
+    #[tokio::test]
+    async fn post_reset_observation_records_a_new_session_in_the_preserved_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let cwd = home.join("proj");
+        let store = SessionStore::load(path, &home).unwrap();
+        store
+            .set(
+                "group1",
+                SessionRecord {
+                    session_id: "ses_old".to_owned(),
+                    cwd: cwd.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.reset_session("group1").await.unwrap());
+
+        let reset_record = store.get("group1").await.unwrap();
+        persist_observed_session_if_unset(
+            &store,
+            "group1",
+            Some(&reset_record),
+            reset_record.cwd.clone(),
+            Some("ses_new".to_owned()),
+        )
+        .await
+        .unwrap();
+
+        let current = store.get("group1").await.unwrap();
+        assert_eq!(current.session_id, "ses_new");
+        assert_eq!(current.cwd, cwd);
     }
 
     #[tokio::test]

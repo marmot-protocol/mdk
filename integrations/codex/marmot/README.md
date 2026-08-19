@@ -101,6 +101,12 @@ starting Codex. Subsequent prompts resume that group's Codex thread. Without a
 picker, the shared harness uses `$HOME`; Codex rejects a non-Git working
 directory by default, so select a repository before sending the first prompt.
 
+Send exactly `/reset-session` to clear the current group's Codex thread id while
+preserving its selected workdir and Codex-owned transcript files. The next
+normal prompt starts and records a new Codex thread; a failed resumed prompt is
+never retried automatically. Send `//reset-session` to pass the literal
+`/reset-session` text to Codex instead of invoking the harness command.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |
