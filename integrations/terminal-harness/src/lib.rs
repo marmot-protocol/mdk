@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
+pub use process::{ParsedEvent, PromptTransport};
 
 /// Default maximum byte length for one Marmot reply chunk.
 pub const DEFAULT_MAX_REPLY_BYTES: usize = 30_000;

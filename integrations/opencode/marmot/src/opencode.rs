@@ -1,21 +1,11 @@
-use std::process::Stdio;
-use std::time::Instant;
-
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
-    IsolationSupport, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
-    process::{
-        capture_stderr, cleanup_failed_run, kill_and_reap, next_stdout_line, strip_ansi,
-        write_stdin,
-    },
+    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, Invocation, IsolationSupport,
+    Outcome, ParsedEvent, PromptTransport, Result, RunFailure, RunnerEvent,
+    process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
 };
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::timeout_at;
-use tracing::debug;
 
 #[derive(Clone)]
 pub(crate) struct OpencodeBackend {
@@ -88,165 +78,40 @@ async fn run_with_bin(
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
-    let mut command = Command::new(bin);
-    command
-        .args(build_run_args(
-            invocation.session_id.as_deref(),
-            execution_profile,
-        ))
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if let Some((remove, name, value)) = config_overlay(execution_profile) {
-        command.env_remove(remove).env(name, value);
-    }
-
-    let mut child = command.spawn().map_err(|_| RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let total_deadline = tokio::time::Instant::now() + invocation.timeout;
-    let stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            kill_and_reap(&mut child).await;
-            return Err(RunFailure {
-                error: HarnessError::BackendSpawn,
-                observed_session: None,
-            });
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            kill_and_reap(&mut child).await;
-            return Err(RunFailure {
-                error: HarnessError::BackendSpawn,
-                observed_session: None,
-            });
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            kill_and_reap(&mut child).await;
-            return Err(RunFailure {
-                error: HarnessError::BackendSpawn,
-                observed_session: None,
-            });
-        }
-    };
-    let mut lines = BufReader::new(stdout).lines();
-    let mut stderr_task = tokio::spawn(capture_stderr(stderr));
-    let mut writer_task = write_stdin(stdin, invocation.prompt);
-    let start = Instant::now();
-    let mut observed_session: Option<String> = None;
-    let mut error_summary: Option<String> = None;
-    let mut idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-
-    let lifecycle_result = timeout_at(total_deadline, async {
-        loop {
-            let Some(line) = next_stdout_line(&mut lines, idle_deadline).await? else {
-                break;
-            };
-
-            if line.is_empty() {
-                idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-                continue;
-            }
-            match parse_event_line(&line) {
-                Ok(Some(ParsedEvent::Text(text))) => {
-                    if !text.trim().is_empty() {
-                        // The idle clock measures actual stdout reads, not time intentionally
-                        // spent applying bounded reply-channel backpressure. The total deadline
-                        // still caps both operations.
-                        tx.send(RunnerEvent::Text(text))
-                            .await
-                            .map_err(|_| HarnessError::BackendStream)?;
-                    }
-                }
-                Ok(Some(ParsedEvent::Session(session_id))) => {
-                    if observed_session.is_none() {
-                        observed_session = Some(session_id);
-                    }
-                }
-                Ok(Some(ParsedEvent::Error {
-                    session_id,
-                    summary,
-                })) => {
-                    if let Some(session_id) = session_id
-                        && observed_session.is_none()
-                    {
-                        observed_session = Some(session_id);
-                    }
-                    if error_summary.is_none() {
-                        error_summary = Some(summary);
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    debug!(
-                        target: TRACE_TARGET,
-                        method = "opencode_run",
-                        error_kind = "json",
-                        "dropping undecodable opencode event"
-                    );
-                }
-            }
-            idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-        }
-
-        let (status, stderr) = match timeout_at(idle_deadline, async {
-            let (writer, status, stderr) =
-                tokio::join!(&mut writer_task, child.wait(), &mut stderr_task);
-            let status = status.map_err(HarnessError::from)?;
-            let stderr = stderr.map_err(HarnessError::from)?;
-            match writer.map_err(HarnessError::from)? {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => debug!(
-                    target: TRACE_TARGET,
-                    method = "opencode_run",
-                    error_kind = "stdin_closed",
-                    "backend closed stdin before draining the prompt"
-                ),
-                Err(_) => return Err(HarnessError::BackendStream),
-            }
-            Ok::<_, HarnessError>((status, stderr))
+    let Invocation {
+        timeout,
+        idle_timeout,
+        cwd,
+        session_id,
+        prompt,
+    } = invocation;
+    let environment = config_overlay(execution_profile)
+        .map(|(remove, name, value)| {
+            vec![
+                EnvironmentChange::Remove(remove),
+                EnvironmentChange::Set {
+                    name,
+                    value: value.to_owned(),
+                },
+            ]
         })
-        .await
-        {
-            Err(_) => return Err(HarnessError::BackendIdle),
-            Ok(result) => result?,
-        };
-        Ok::<Outcome, HarnessError>(Outcome {
-            observed_session: observed_session.clone(),
-            exit_code: status.code(),
-            error_summary,
-            stderr: strip_ansi(stderr.trim()),
-            elapsed_ms: start.elapsed().as_millis(),
-        })
-    })
-    .await;
-
-    match lifecycle_result {
-        Ok(Ok(outcome)) => Ok(outcome),
-        Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
-            Err(RunFailure {
-                error,
-                observed_session,
-            })
-        }
-        Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
-            Err(RunFailure {
-                error: HarnessError::BackendTimedOut,
-                observed_session,
-            })
-        }
-    }
+        .unwrap_or_default();
+    run_jsonl_process(
+        ProcessSpec {
+            executable: bin.to_owned(),
+            args: build_run_args(session_id.as_deref(), execution_profile),
+            cwd,
+            environment,
+            prompt: PromptTransport::Stdin(prompt),
+            trace_method: "opencode_run",
+            backend_name: "opencode",
+            total_timeout: timeout,
+            idle_timeout,
+        },
+        tx,
+        parse_event_line,
+    )
+    .await
 }
 
 pub(crate) fn build_run_args(
@@ -277,30 +142,20 @@ fn config_overlay(profile: ExecutionProfile) -> Option<(&'static str, &'static s
     ))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ParsedEvent {
-    Text(String),
-    Session(String),
-    Error {
-        session_id: Option<String>,
-        summary: String,
-    },
-}
-
-fn parse_event_line(line: &str) -> Result<Option<ParsedEvent>> {
+fn parse_event_line(line: &str) -> Result<ParsedEvent> {
     let event = serde_json::from_str::<OpencodeEvent>(line)?;
     Ok(match event {
-        OpencodeEvent::Text { part } => Some(ParsedEvent::Text(part.text)),
-        OpencodeEvent::Error { session_id, error } => Some(ParsedEvent::Error {
+        OpencodeEvent::Text { part } => ParsedEvent::Text(part.text),
+        OpencodeEvent::Error { session_id, error } => ParsedEvent::Error {
             session_id,
             summary: error.summary(),
-        }),
+        },
         OpencodeEvent::StepStart {
             session_id: Some(session_id),
-        } => Some(ParsedEvent::Session(session_id)),
+        } => ParsedEvent::Session(session_id),
         OpencodeEvent::StepStart { session_id: None }
         | OpencodeEvent::StepFinish {}
-        | OpencodeEvent::Other => None,
+        | OpencodeEvent::Other => ParsedEvent::Ignored,
     })
 }
 
@@ -316,9 +171,9 @@ impl OpencodeError {
 
 #[cfg(test)]
 mod tests {
-    use marmot_terminal_harness::ExecutionProfile;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use marmot_terminal_harness::{ExecutionProfile, HarnessError};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -357,11 +212,11 @@ mod tests {
     fn parse_opencode_text_and_session_events() {
         assert_eq!(
             parse_event_line(r#"{"type":"step_start","sessionID":"ses_1"}"#).unwrap(),
-            Some(ParsedEvent::Session("ses_1".to_owned()))
+            ParsedEvent::Session("ses_1".to_owned())
         );
         assert_eq!(
             parse_event_line(r#"{"type":"text","part":{"text":"hello"}}"#).unwrap(),
-            Some(ParsedEvent::Text("hello".to_owned()))
+            ParsedEvent::Text("hello".to_owned())
         );
     }
 
@@ -372,10 +227,10 @@ mod tests {
                 r#"{"type":"error","sessionID":"ses_err","error":{"name":"APIError","data":{"statusCode":404}}}"#
             )
             .unwrap(),
-            Some(ParsedEvent::Error {
+            ParsedEvent::Error {
                 session_id: Some("ses_err".to_owned()),
                 summary: "APIError status=404".to_owned()
-            })
+            }
         );
     }
 
@@ -415,49 +270,6 @@ mod tests {
         .unwrap_err();
         assert!(matches!(failure.error, HarnessError::BackendIdle));
         assert_eq!(failure.observed_session.as_deref(), Some("ses_idle"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stdout_lines_reset_idle_past_old_wall_clock_deadline() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::time::sleep;
-
-        const IDLE: Duration = Duration::from_secs(120);
-        const GAP: Duration = Duration::from_secs(70);
-        const TOTAL: Duration = Duration::from_secs(3600);
-        const LINE_COUNT: usize = 6;
-
-        let (mut writer, reader) = tokio::io::duplex(1024);
-        let producer = tokio::spawn(async move {
-            for index in 0..LINE_COUNT {
-                if index != 0 {
-                    sleep(GAP).await;
-                }
-                writer.write_all(b"line\n").await.unwrap();
-            }
-        });
-        let mut lines = BufReader::new(reader).lines();
-        let started = tokio::time::Instant::now();
-        let received = tokio::time::timeout(TOTAL, async {
-            let mut count = 0;
-            let mut idle_deadline = tokio::time::Instant::now() + IDLE;
-            while next_stdout_line(&mut lines, idle_deadline)
-                .await
-                .unwrap()
-                .is_some()
-            {
-                count += 1;
-                idle_deadline = tokio::time::Instant::now() + IDLE;
-            }
-            count
-        })
-        .await
-        .unwrap();
-
-        producer.await.unwrap();
-        assert_eq!(received, LINE_COUNT);
-        assert!(started.elapsed() > Duration::from_secs(300));
-        assert!(started.elapsed() < TOTAL);
     }
 
     #[cfg(unix)]

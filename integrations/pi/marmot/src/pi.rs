@@ -1,19 +1,13 @@
 use std::path::Path;
-use std::process::Stdio;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
-    IsolationSupport, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
-    process::{capture_stderr, cleanup_failed_run, next_stdout_line, strip_ansi, write_stdin},
+    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, Invocation, IsolationSupport,
+    Outcome, ParsedEvent, PromptTransport, Result, RunFailure, RunnerEvent,
+    process::{ProcessSpec, run_jsonl_process},
 };
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::timeout_at;
-use tracing::debug;
 
 #[derive(Clone)]
 pub(crate) struct PiBackend {
@@ -69,131 +63,29 @@ async fn run_with_bin(
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
-    let mut command = Command::new(bin);
-    command
-        .args(build_run_args(
-            session_dir,
-            invocation.session_id.as_deref(),
-            execution_profile,
-        ))
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = command.spawn().map_err(|_| RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let total_deadline = tokio::time::Instant::now() + invocation.timeout;
-    let stdin = child.stdin.take().ok_or(RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let stdout = child.stdout.take().ok_or(RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let stderr = child.stderr.take().ok_or(RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let mut stderr_task = tokio::spawn(capture_stderr(stderr));
-    let mut writer_task = write_stdin(stdin, invocation.prompt);
-    let start = Instant::now();
-    let mut observed_session = None;
-    let mut error_summary = None;
-    let mut idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-
-    let lifecycle_result = timeout_at(total_deadline, async {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let Some(line) = next_stdout_line(&mut lines, idle_deadline).await? else {
-                break;
-            };
-            if line.is_empty() {
-                idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-                continue;
-            }
-            match parse_event_line(&line) {
-                Ok(Some(ParsedEvent::Session(session_id))) => {
-                    if observed_session.is_none() {
-                        observed_session = Some(session_id);
-                    }
-                }
-                Ok(Some(ParsedEvent::Text(text))) => {
-                    if !text.trim().is_empty() {
-                        tx.send(RunnerEvent::Text(text))
-                            .await
-                            .map_err(|_| HarnessError::BackendStream)?;
-                    }
-                }
-                Ok(Some(ParsedEvent::Error(summary))) => {
-                    if error_summary.is_none() {
-                        error_summary = Some(summary);
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => debug!(
-                    target: TRACE_TARGET,
-                    method = "pi_run",
-                    error_kind = "json",
-                    "dropping undecodable Pi event"
-                ),
-            }
-            idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-        }
-
-        let (status, stderr) = match timeout_at(idle_deadline, async {
-            let (writer, status, stderr) =
-                tokio::join!(&mut writer_task, child.wait(), &mut stderr_task,);
-            let status = status.map_err(HarnessError::from)?;
-            let stderr = stderr.map_err(HarnessError::from)?;
-            match writer.map_err(HarnessError::from)? {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => debug!(
-                    target: TRACE_TARGET,
-                    method = "pi_run",
-                    error_kind = "stdin_closed",
-                    "backend closed stdin before draining the prompt"
-                ),
-                Err(_) => return Err(HarnessError::BackendStream),
-            }
-            Ok::<_, HarnessError>((status, stderr))
-        })
-        .await
-        {
-            Err(_) => return Err(HarnessError::BackendIdle),
-            Ok(result) => result?,
-        };
-        Ok::<_, HarnessError>(Outcome {
-            observed_session: observed_session.clone(),
-            exit_code: status.code(),
-            error_summary,
-            stderr: strip_ansi(stderr.trim()),
-            elapsed_ms: start.elapsed().as_millis(),
-        })
-    })
-    .await;
-
-    match lifecycle_result {
-        Ok(Ok(outcome)) => Ok(outcome),
-        Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
-            Err(RunFailure {
-                error,
-                observed_session,
-            })
-        }
-        Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
-            Err(RunFailure {
-                error: HarnessError::BackendTimedOut,
-                observed_session,
-            })
-        }
-    }
+    let Invocation {
+        timeout,
+        idle_timeout,
+        cwd,
+        session_id,
+        prompt,
+    } = invocation;
+    run_jsonl_process(
+        ProcessSpec {
+            executable: bin.to_owned(),
+            args: build_run_args(session_dir, session_id.as_deref(), execution_profile),
+            cwd,
+            environment: Vec::new(),
+            prompt: PromptTransport::Stdin(prompt),
+            trace_method: "pi_run",
+            backend_name: "pi",
+            total_timeout: timeout,
+            idle_timeout,
+        },
+        tx,
+        parse_event_line,
+    )
+    .await
 }
 
 fn build_run_args(
@@ -214,45 +106,40 @@ fn build_run_args(
     args
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ParsedEvent {
-    Session(String),
-    Text(String),
-    Error(String),
-}
-
-fn parse_event_line(line: &str) -> serde_json::Result<Option<ParsedEvent>> {
+fn parse_event_line(line: &str) -> serde_json::Result<ParsedEvent> {
     let value: Value = serde_json::from_str(line)?;
     let Some(event_type) = value.get("type").and_then(Value::as_str) else {
-        return Ok(None);
+        return Ok(ParsedEvent::Ignored);
     };
     if event_type == "session" {
         return Ok(value
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .map(|id| ParsedEvent::Session(id.to_owned())));
+            .map(|id| ParsedEvent::Session(id.to_owned()))
+            .unwrap_or(ParsedEvent::Ignored));
     }
     if event_type != "message_end" {
-        return Ok(None);
+        return Ok(ParsedEvent::Ignored);
     }
     let Some(message) = value.get("message") else {
-        return Ok(None);
+        return Ok(ParsedEvent::Ignored);
     };
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return Ok(None);
+        return Ok(ParsedEvent::Ignored);
     }
     let text = assistant_text(message.get("content"));
     if !text.is_empty() {
-        return Ok(Some(ParsedEvent::Text(text)));
+        return Ok(ParsedEvent::Text(text));
     }
     let stop_reason = message.get("stopReason").and_then(Value::as_str);
     if matches!(stop_reason, Some("error" | "aborted")) {
-        return Ok(Some(ParsedEvent::Error(
-            stop_reason.unwrap_or("error").to_owned(),
-        )));
+        return Ok(ParsedEvent::Error {
+            session_id: None,
+            summary: stop_reason.unwrap_or("error").to_owned(),
+        });
     }
-    Ok(None)
+    Ok(ParsedEvent::Ignored)
 }
 
 fn assistant_text(content: Option<&Value>) -> String {
@@ -304,21 +191,21 @@ mod tests {
     fn parser_emits_session_and_completed_assistant_text_only() {
         assert_eq!(
             parse_event_line(r#"{"type":"session","version":3,"id":"pi-session"}"#).unwrap(),
-            Some(ParsedEvent::Session("pi-session".to_owned()))
+            ParsedEvent::Session("pi-session".to_owned())
         );
-        assert!(
+        assert_eq!(
             parse_event_line(r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"partial"}}"#)
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            ParsedEvent::Ignored
         );
         assert_eq!(
             parse_event_line(r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"hello "},{"type":"toolCall","name":"bash"},{"type":"text","text":"world"}],"stopReason":"stop"}}"#).unwrap(),
-            Some(ParsedEvent::Text("hello world".to_owned()))
+            ParsedEvent::Text("hello world".to_owned())
         );
-        assert!(
+        assert_eq!(
             parse_event_line(r#"{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"private output"}]}}"#)
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            ParsedEvent::Ignored
         );
     }
 
@@ -326,7 +213,10 @@ mod tests {
     fn parser_reports_textless_error_without_exposing_error_message() {
         assert_eq!(
             parse_event_line(r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"secret"}}"#).unwrap(),
-            Some(ParsedEvent::Error("error".to_owned()))
+            ParsedEvent::Error {
+                session_id: None,
+                summary: "error".to_owned()
+            }
         );
     }
 
