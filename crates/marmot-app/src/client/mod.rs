@@ -185,7 +185,6 @@ pub(crate) struct GroupImageDownloadHttp {
 }
 
 pub(crate) struct PreparedGroupImageUploadHttp {
-    upload_id: String,
     encrypted_blob: Vec<u8>,
     image_hash_hex: String,
     upload_secret: Zeroizing<Vec<u8>>,
@@ -194,10 +193,6 @@ pub(crate) struct PreparedGroupImageUploadHttp {
 }
 
 impl PreparedGroupImageUploadHttp {
-    pub(crate) fn upload_id(&self) -> &str {
-        &self.upload_id
-    }
-
     pub(crate) async fn run(self) -> Result<(), AppError> {
         upload_prepared_group_image(
             self.encrypted_blob,
@@ -989,7 +984,6 @@ impl AppClient {
         })?;
         Ok(PreparedGroupImageUploadStart::Http(
             PreparedGroupImageUploadHttp {
-                upload_id: record.upload_id,
                 encrypted_blob,
                 image_hash_hex: input.image_hash_hex,
                 upload_secret: Zeroizing::new(upload_secret),

@@ -3964,7 +3964,6 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
         schedule_background: bool,
     ) -> Result<AccountSetupResult, AppError> {
-        let started_at = Instant::now();
         self.shared.lifecycle().ensure_running()?;
         let _generated_setup_transaction =
             self.accounts.generated_setup_local_transaction.lock().await;
@@ -4125,10 +4124,11 @@ impl MarmotAppRuntime {
             .account_relay_list_status(&account.label)?;
         let readiness = self.account_setup_readiness(&account.label)?;
         if schedule_background {
+            let handoff_started_at = Instant::now();
             let handoff_result = self.accounts.reconcile().await;
             self.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::AccountSetupLocalReadyHandoff,
-                started_at.elapsed(),
+                handoff_started_at.elapsed(),
                 handoff_result.is_ok(),
             );
             handoff_result?;
@@ -4229,8 +4229,11 @@ impl MarmotAppRuntime {
                         if final_attempt {
                             break;
                         }
+                        let multiplier = 1_u32
+                            .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
+                            .unwrap_or(u32::MAX);
                         tokio::time::sleep(
-                            GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY * (1 << attempt),
+                            GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY.saturating_mul(multiplier),
                         )
                         .await;
                     }

@@ -2774,7 +2774,6 @@ async fn handle_account_worker_command(
                             return;
                         }
                     };
-                    let upload_id = http.upload_id().to_owned();
                     let started_at = Instant::now();
                     spawn_media_http(media_http, permit, http.run(), move |result| {
                         MediaHttpCompletion::PreparedGroupImageUpload {
