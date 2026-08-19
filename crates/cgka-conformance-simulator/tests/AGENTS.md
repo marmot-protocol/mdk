@@ -34,7 +34,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 - **File:** `large_group_family.rs`
   - **Owns:** Deterministic large-group size/admin/traffic profiles, replay metadata, strict whole-group terminal
-    oracles, sampled delivery/decryptability coverage, and the normal mid-size executable canary.
+    oracles, exact retained-join pending-work classification, sampled delivery/decryptability coverage, and the normal
+    mid-size application and incremental-join executable canaries.
 
 - **File:** `mutation_adequacy.rs`
   - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable

@@ -30,7 +30,7 @@ fn large_group_profiles_are_deterministic_prefix_stable_and_registered() {
 #[test]
 fn complete_catalog_covers_sizes_admin_regimes_traffic_and_disruptions() {
     let cases = generate_large_group_pressure_family(2026, COMPLETE_PROFILE_CASES);
-    let expected_sizes = [16, 32, 64, 128, 10, 20, 50, 100, 200];
+    let expected_sizes = [10, 16, 20, 32, 50, 64, 100, 128, 200];
 
     for (size_slot, expected_size) in expected_sizes.into_iter().enumerate() {
         let block = &cases[(size_slot * 6)..((size_slot + 1) * 6)];
@@ -52,6 +52,45 @@ fn complete_catalog_covers_sizes_admin_regimes_traffic_and_disruptions() {
                 .len(),
             5,
             "each size block must cover all five admin regimes"
+        );
+        assert!(
+            block[3]
+                .workload_profile
+                .as_ref()
+                .expect("competing-commit profile")
+                .active_committer_count
+                >= 2,
+            "the competing-commit arm must not degenerate to one committer"
+        );
+        assert!(
+            block[3]
+                .scenario
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::DuplicateMessage { .. }))
+        );
+        assert!(
+            block[3]
+                .scenario
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::ReorderMessages { .. }))
+        );
+        assert!(
+            block[4]
+                .workload_profile
+                .as_ref()
+                .expect("mixed-interleaved profile")
+                .active_committer_count
+                >= 2,
+            "the mixed-interleaved arm must not degenerate to one committer"
+        );
+        assert!(
+            block[4]
+                .scenario
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::ReorderMessages { .. }))
         );
     }
 
@@ -145,32 +184,85 @@ fn every_case_carries_whole_group_and_sampled_delivery_oracles() {
             TraceExpectation::ClientsExactlyEquivalent { clients }
                 if clients.iter().cloned().collect::<BTreeSet<_>>() == all_clients
         )));
-        assert!(case.expected_outcomes.iter().any(|expectation| matches!(
-            expectation,
-            TraceExpectation::ClientsBidirectionallyDecryptable { clients }
-                if (2..=6).contains(&clients.len())
-        )));
+        let probe_clients = case
+            .expected_outcomes
+            .iter()
+            .find_map(|expectation| match expectation {
+                TraceExpectation::ClientsBidirectionallyDecryptable { clients } => Some(clients),
+                _ => None,
+            })
+            .expect("every case has a decryptability probe");
+        assert!((2..=6).contains(&probe_clients.len()));
+        assert!(
+            probe_clients.contains(case.scenario.clients.last().expect("non-empty roster")),
+            "{} must retain the roster tail in the probe cohort",
+            case.scenario.name
+        );
         assert!(case.expected_outcomes.iter().any(|expectation| matches!(
             expectation,
             TraceExpectation::ApplicationPayloadMultiset { .. }
         )));
 
-        let mut pending_scope = BTreeSet::new();
+        let expected_retained = case
+            .scenario
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ScenarioStep::InviteMembers { invitees, .. } => Some(invitees.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_pending_free = all_clients
+            .difference(&expected_retained)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut actual_pending_free = BTreeSet::new();
+        let mut actual_retained = BTreeSet::new();
         for expectation in &case.expected_outcomes {
             match expectation {
                 TraceExpectation::NoPendingWork { clients } => {
-                    pending_scope.extend(clients.iter().cloned());
+                    actual_pending_free.extend(clients.iter().cloned());
                 }
                 TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { client } => {
-                    pending_scope.insert(client.clone());
+                    actual_retained.insert(client.clone());
                 }
                 _ => {}
             }
         }
         assert_eq!(
-            pending_scope, all_clients,
-            "every client's terminal work is pinned"
+            actual_retained, expected_retained,
+            "{} must pin every late join or re-add to the retained-join exception",
+            case.scenario.name
         );
+        assert_eq!(
+            actual_pending_free, expected_pending_free,
+            "{} must require strict no-pending-work for every other client",
+            case.scenario.name
+        );
+        if !actual_retained.is_empty() {
+            assert!(
+                actual_retained
+                    .iter()
+                    .any(|client| probe_clients.contains(client)),
+                "{} must retain a late-join representative in the probe cohort",
+                case.scenario.name
+            );
+        }
+        if case
+            .workload_profile
+            .as_ref()
+            .is_some_and(|profile| profile.disruption == "restart-remove-and-readd")
+        {
+            assert!(
+                actual_retained
+                    .iter()
+                    .all(|client| probe_clients.contains(client)),
+                "{} must probe every re-added churn member",
+                case.scenario.name
+            );
+        }
     }
 }
 
@@ -192,7 +284,7 @@ fn workload_profile_survives_generated_input_replay_provenance() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_size_application_heavy_canary_passes_strict_oracles() {
-    let case = generate_large_group_pressure_case(2026, 24);
+    let case = generate_large_group_pressure_case(2026, 0);
     assert_eq!(case.scenario.clients.len(), 10);
     let report =
         run_scenario_report_with_outcomes(&case.scenario, None, case.expected_outcomes.clone())
@@ -210,10 +302,34 @@ async fn mid_size_application_heavy_canary_passes_strict_oracles() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_size_incremental_join_canary_passes_strict_oracles() {
+    let case = generate_large_group_pressure_case(2026, 1);
+    assert_eq!(case.scenario.clients.len(), 10);
+    assert!(case.expected_outcomes.iter().any(|expectation| matches!(
+        expectation,
+        TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { .. }
+    )));
+    let report =
+        run_scenario_report_with_outcomes(&case.scenario, None, case.expected_outcomes.clone())
+            .await
+            .expect("mid-size incremental-join canary executes");
+    assert!(
+        report.expectation_failures.is_empty(),
+        "expectation failures: {:#?}",
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "invariant failures: {:#?}",
+        report.invariant_failures
+    );
+}
+
 #[ignore = "six real-engine arms; run explicitly or in a scheduled lane"]
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_size_complete_arm_catalog_passes_strict_oracles() {
-    for case_index in 24..30 {
+    for case_index in 0..6 {
         let case = generate_large_group_pressure_case(2026, case_index);
         let report =
             run_scenario_report_with_outcomes(&case.scenario, None, case.expected_outcomes.clone())

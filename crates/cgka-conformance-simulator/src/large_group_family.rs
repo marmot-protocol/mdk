@@ -28,34 +28,18 @@ struct SizeProfile {
     members: usize,
 }
 
-// The first four six-case blocks are the comparable anchor curve. The next
-// five blocks pin requested edges without forcing every routine campaign to
-// pay for a 200-member case.
+// Keep six-case size blocks ordered by execution cost because the campaign CLI
+// selects a prefix. Names retain the anchor-versus-boundary distinction.
 const SIZE_PROFILES: [SizeProfile; 9] = [
-    SizeProfile {
-        name: "mid-anchor-16",
-        tier: "mid",
-        members: 16,
-    },
-    SizeProfile {
-        name: "medium-anchor-32",
-        tier: "medium",
-        members: 32,
-    },
-    SizeProfile {
-        name: "large-anchor-64",
-        tier: "large",
-        members: 64,
-    },
-    SizeProfile {
-        name: "xlarge-anchor-128",
-        tier: "xlarge",
-        members: 128,
-    },
     SizeProfile {
         name: "mid-min-10",
         tier: "mid",
         members: 10,
+    },
+    SizeProfile {
+        name: "mid-anchor-16",
+        tier: "mid",
+        members: 16,
     },
     SizeProfile {
         name: "mid-max-20",
@@ -63,14 +47,29 @@ const SIZE_PROFILES: [SizeProfile; 9] = [
         members: 20,
     },
     SizeProfile {
+        name: "medium-anchor-32",
+        tier: "medium",
+        members: 32,
+    },
+    SizeProfile {
         name: "medium-max-50",
         tier: "medium",
         members: 50,
     },
     SizeProfile {
+        name: "large-anchor-64",
+        tier: "large",
+        members: 64,
+    },
+    SizeProfile {
         name: "large-max-100",
         tier: "large",
         members: 100,
+    },
+    SizeProfile {
+        name: "xlarge-anchor-128",
+        tier: "xlarge",
+        members: 128,
     },
     SizeProfile {
         name: "xlarge-max-200",
@@ -202,7 +201,8 @@ pub fn generate_large_group_pressure_case(seed: u64, case_index: u64) -> Generat
     let size_slot = usize::try_from(case_index / ARM_COUNT).expect("case index fits usize")
         % SIZE_PROFILES.len();
     let size = SIZE_PROFILES[size_slot];
-    let admin_regime = AdminRegime::from_index(size_slot + usize::try_from(case_index).unwrap());
+    let arm_slot = usize::try_from(case_index % ARM_COUNT).expect("arm index fits usize");
+    let admin_regime = admin_regime_for(size_slot, arm_slot);
     let requested_admin_count = admin_regime.count(size.members);
     let clients = large_clients(size.members);
     let initial_admins = choose_admins(&clients, requested_admin_count, &mut rng);
@@ -941,6 +941,18 @@ fn choose_admins(clients: &[String], count: usize, rng: &mut StdRng) -> Vec<Stri
         .collect()
 }
 
+fn admin_regime_for(size_slot: usize, arm_slot: usize) -> AdminRegime {
+    let mut regime_indices = std::array::from_fn::<_, 6, _>(|offset| size_slot + offset);
+    let founder_slot = regime_indices
+        .iter()
+        .position(|index| index % 5 == 0)
+        .expect("six consecutive slots contain the founder-only regime");
+    if matches!(founder_slot, 3 | 4) {
+        regime_indices.swap(founder_slot, 5);
+    }
+    AdminRegime::from_index(regime_indices[arm_slot])
+}
+
 fn choose_committers(admins: &[String], maximum: usize, rng: &mut StdRng) -> Vec<String> {
     let mut committers = admins.to_vec();
     committers.shuffle(rng);
@@ -982,14 +994,22 @@ fn choose_probe_clients(
     retained_joiners: &BTreeSet<String>,
     rng: &mut StdRng,
 ) -> Vec<String> {
-    let mut selected = BTreeSet::from(["alice".to_owned()]);
-    selected.extend(admins.iter().take(2).cloned());
-    selected.extend(committers.iter().take(2).cloned());
-    selected.extend(retained_joiners.iter().take(1).cloned());
+    let mut priority = vec!["alice".to_owned()];
+    priority.extend(retained_joiners.iter().take(1).cloned());
+    priority.push(clients.last().expect("large group is non-empty").clone());
     if let Some(non_admin) = clients.iter().find(|client| !admins.contains(client)) {
-        selected.insert(non_admin.clone());
+        priority.push(non_admin.clone());
     }
-    selected.insert(clients.last().expect("large group is non-empty").clone());
+    priority.extend(committers.iter().take(2).cloned());
+    priority.extend(admins.iter().take(2).cloned());
+
+    let mut selected = BTreeSet::new();
+    for client in priority {
+        if selected.len() == MAX_PROBE_CLIENTS {
+            break;
+        }
+        selected.insert(client);
+    }
 
     let mut remainder = clients
         .iter()
@@ -1005,7 +1025,6 @@ fn choose_probe_clients(
     clients
         .iter()
         .filter(|client| selected.contains(*client))
-        .take(MAX_PROBE_CLIENTS)
         .cloned()
         .collect()
 }

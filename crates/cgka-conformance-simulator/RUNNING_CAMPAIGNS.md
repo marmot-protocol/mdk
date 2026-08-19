@@ -136,10 +136,13 @@ one case cannot erase the remaining cases, and the summary contains real child-p
 increase coverage; they do not promise that later cases are larger. `--seed` changes the deterministic choices within
 each indexed case. A family defines the available operations, weights/motifs, subject, and expectations.
 
-For `large-group-pressure/v1`, six consecutive cases form one size block. Cases `0..23` cover the 16/32/64/128 anchor
-curve; cases `24..53` cover the 10/20/50/100/200 boundaries. Use `--cases 6` for the mid-size arm canary, `--cases 18`
-for the 16/32/64 curve, and `--cases 54` only as a deliberately budgeted complete catalog. Prefer the isolated
-file-backed campaign runner for execution; generator tests already compile all 54 shapes without running them.
+For `large-group-pressure/v1`, six consecutive cases form one size block, ordered by execution cost: 10, 16, 20, 32,
+50, 64, 100, 128, then 200 members. Cases `0..17` cover the 10/16/20-member blocks, `18..35` cover 32/50/64, and
+`36..53` cover 100/128/200. Use `--cases 6` for the 10-member six-arm smoke run, `--cases 24` through the 32-member
+anchor, `--cases 36` through the 64-member anchor, and `--cases 54` only as a deliberately budgeted complete catalog.
+Run `cargo test -p cgka-conformance-simulator --test large_group_family --locked` for the ordinary 10-member
+application and retained-join canaries. Prefer the isolated file-backed campaign runner for broader execution;
+generator tests already compile all 54 shapes without running the expensive large/xlarge blocks.
 
 ## Running vectors and adapter comparisons
 
