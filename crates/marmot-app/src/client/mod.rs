@@ -2087,8 +2087,13 @@ impl AppClient {
             Vec::new(),
             Some(member_refs.len() as u64),
         );
+        let target_hexes = members
+            .iter()
+            .map(|member| hex::encode(member.as_slice()))
+            .collect::<Vec<_>>();
 
         self.sync_runtime_groups().await?;
+        let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, &target_hexes);
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -2106,6 +2111,12 @@ impl AppClient {
         self.cleanup_stale_push_tokens_best_effort(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
+        self.publish_targeted_group_state_wake_best_effort(
+            group_id,
+            wake_snapshot,
+            &effects.events,
+        )
+        .await;
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -2553,17 +2564,17 @@ impl AppClient {
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        let member_id = self.app.member_id(member_ref)?;
         let mut admins = self.runtime.admin_pubkeys(group_id)?;
-        admins.push(admin_pubkey_from_member_id(
-            &self.app.member_id(member_ref)?,
-        )?);
+        admins.push(admin_pubkey_from_member_id(&member_id)?);
         let audit_context = Self::local_human_action_context(
             "promote_admin",
             vec!["admins"],
             vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
             Some(1),
         );
-        self.update_admin_policy(group_id, admins, audit_context)
+        let target_hex = hex::encode(member_id.as_slice());
+        self.update_admin_policy(group_id, admins, audit_context, &[target_hex])
             .await
     }
 
@@ -2573,7 +2584,8 @@ impl AppClient {
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        let target = admin_pubkey_from_member_id(&self.app.member_id(member_ref)?)?;
+        let member_id = self.app.member_id(member_ref)?;
+        let target = admin_pubkey_from_member_id(&member_id)?;
         let mut admins = self.runtime.admin_pubkeys(group_id)?;
         admins.retain(|admin| admin != &target);
         let audit_context = Self::local_human_action_context(
@@ -2582,7 +2594,8 @@ impl AppClient {
             vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
             Some(1),
         );
-        self.update_admin_policy(group_id, admins, audit_context)
+        let target_hex = hex::encode(member_id.as_slice());
+        self.update_admin_policy(group_id, admins, audit_context, &[target_hex])
             .await
     }
 
@@ -2598,8 +2611,13 @@ impl AppClient {
             vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
             Some(1),
         );
-        self.update_admin_policy(group_id, admins, audit_context)
-            .await
+        self.update_admin_policy(
+            group_id,
+            admins,
+            audit_context,
+            std::slice::from_ref(&account.account_id_hex),
+        )
+        .await
     }
 
     async fn update_admin_policy(
@@ -2607,10 +2625,12 @@ impl AppClient {
         group_id: &GroupId,
         admins: Vec<[u8; 32]>,
         audit_context: AuditEventContext,
+        wake_targets: &[String],
     ) -> Result<SendSummary, AppError> {
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups().await?;
+        let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, wake_targets);
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -2627,6 +2647,12 @@ impl AppClient {
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
+        self.publish_targeted_group_state_wake_best_effort(
+            group_id,
+            wake_snapshot,
+            &effects.events,
+        )
+        .await;
         Ok(send_summary_from_effects(&effects))
     }
 

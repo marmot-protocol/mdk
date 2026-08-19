@@ -422,6 +422,41 @@ impl AppClient {
         self.share_push_registration().await
     }
 
+    pub(crate) fn snapshot_group_push_tokens_for_members(
+        &self,
+        group_id: &GroupId,
+        member_id_hexes: &[String],
+    ) -> Vec<notifications::GroupPushTokenRecord> {
+        let Ok(account) = self.app.account_home().account(&self.state.label) else {
+            return Vec::new();
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let Ok(tokens) = self.app.group_push_tokens(&account.label, &group_id_hex) else {
+            return Vec::new();
+        };
+        notifications::tokens_for_member_ids(tokens, member_id_hexes.iter().map(String::as_str))
+    }
+
+    pub(crate) async fn publish_targeted_group_state_wake_best_effort(
+        &self,
+        _group_id: &GroupId,
+        snapshot: Vec<notifications::GroupPushTokenRecord>,
+        events: &[cgka_traits::engine::GroupEvent],
+    ) {
+        let Ok(account) = self.app.account_home().account(&self.state.label) else {
+            return;
+        };
+        let wake_ids =
+            notifications::wake_member_ids_from_group_events(&account.account_id_hex, events);
+        let tokens =
+            notifications::tokens_for_member_ids(snapshot, wake_ids.iter().map(String::as_str));
+        if tokens.is_empty() {
+            return;
+        }
+        self.publish_notification_trigger_tokens_best_effort(tokens)
+            .await;
+    }
+
     pub(crate) async fn publish_notification_trigger_best_effort(
         &self,
         group_id: &GroupId,
@@ -437,6 +472,20 @@ impl AppClient {
         }
     }
 
+    async fn publish_notification_trigger_tokens_best_effort(
+        &self,
+        tokens: Vec<notifications::GroupPushTokenRecord>,
+    ) {
+        if let Err(err) = self.publish_notification_trigger_tokens(tokens).await {
+            tracing::warn!(
+                target: "marmot_app::notifications",
+                method = "publish_notification_trigger_tokens_best_effort",
+                error_kind = err.privacy_safe_kind(),
+                "notification trigger publish failed",
+            );
+        }
+    }
+
     async fn publish_notification_trigger(
         &self,
         group_id: &GroupId,
@@ -445,6 +494,14 @@ impl AppClient {
         let account = self.app.account_home().account(&self.state.label)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let tokens = self.app.group_push_tokens(&account.label, &group_id_hex)?;
+        self.publish_notification_trigger_tokens(tokens).await
+    }
+
+    async fn publish_notification_trigger_tokens(
+        &self,
+        tokens: Vec<notifications::GroupPushTokenRecord>,
+    ) -> Result<(), AppError> {
+        let account = self.app.account_home().account(&self.state.label)?;
         let by_server = notifications::token_records_by_server(tokens, &account.account_id_hex);
         if by_server.is_empty() {
             return Ok(());

@@ -74,6 +74,9 @@ impl From<NotificationCollectionStatus> for NotificationCollectionStatusFfi {
 pub enum NotificationTriggerFfi {
     NewMessage,
     GroupInvite,
+    RemovedFromGroup,
+    MadeAdmin,
+    RemovedAsAdmin,
 }
 
 impl From<NotificationTrigger> for NotificationTriggerFfi {
@@ -81,6 +84,9 @@ impl From<NotificationTrigger> for NotificationTriggerFfi {
         match value {
             NotificationTrigger::NewMessage => Self::NewMessage,
             NotificationTrigger::GroupInvite => Self::GroupInvite,
+            NotificationTrigger::RemovedFromGroup => Self::RemovedFromGroup,
+            NotificationTrigger::MadeAdmin => Self::MadeAdmin,
+            NotificationTrigger::RemovedAsAdmin => Self::RemovedAsAdmin,
         }
     }
 }
@@ -209,6 +215,30 @@ mod tests {
         assert!(matches!(
             NotificationTrafficClassFfi::from(marmot_app::NotificationTrafficClass::AgentActivity,),
             NotificationTrafficClassFfi::AgentActivity,
+        ));
+    }
+
+    #[test]
+    fn notification_trigger_ffi_covers_every_core_variant() {
+        assert!(matches!(
+            NotificationTriggerFfi::from(marmot_app::NotificationTrigger::NewMessage),
+            NotificationTriggerFfi::NewMessage
+        ));
+        assert!(matches!(
+            NotificationTriggerFfi::from(marmot_app::NotificationTrigger::GroupInvite),
+            NotificationTriggerFfi::GroupInvite
+        ));
+        assert!(matches!(
+            NotificationTriggerFfi::from(marmot_app::NotificationTrigger::RemovedFromGroup),
+            NotificationTriggerFfi::RemovedFromGroup
+        ));
+        assert!(matches!(
+            NotificationTriggerFfi::from(marmot_app::NotificationTrigger::MadeAdmin),
+            NotificationTriggerFfi::MadeAdmin
+        ));
+        assert!(matches!(
+            NotificationTriggerFfi::from(marmot_app::NotificationTrigger::RemovedAsAdmin),
+            NotificationTriggerFfi::RemovedAsAdmin
         ));
     }
 }
