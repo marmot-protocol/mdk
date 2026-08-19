@@ -1,10 +1,10 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
@@ -25,19 +25,21 @@ use super::{
     wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
-use crate::client::{CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish};
+use crate::client::{
+    CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+};
 use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppCreateGroupOptions,
     AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup, ChatListUpdateTrigger,
-    ClassifiedSyncFailure, ConvergenceScheduleState, EpochBackfillRunOutcome,
-    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    AppPreparedGroupImageUpload, AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup,
+    ChatListUpdateTrigger, ClassifiedSyncFailure, ConvergenceScheduleState,
+    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
+    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -113,7 +115,25 @@ pub(crate) enum AccountWorkerCommand {
         name: String,
         members: Vec<String>,
         options: AppCreateGroupOptions,
+        prepared_image_upload_id: Option<String>,
         respond: oneshot::Sender<Result<CanonicalCreatedGroup, AppError>>,
+    },
+    StagePreparedGroupImage {
+        plaintext: Vec<u8>,
+        media_type: String,
+        respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
+    },
+    UploadPreparedGroupImage {
+        upload_id: String,
+        server: Option<String>,
+        respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
+    },
+    PreparedGroupImageStatus {
+        upload_id: String,
+        respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
+    },
+    PreparedGroupImages {
+        respond: oneshot::Sender<Result<Vec<AppPreparedGroupImageUpload>, AppError>>,
     },
     Members {
         group_id: GroupId,
@@ -868,6 +888,7 @@ async fn run_app_runtime_account_worker(
     let media_http = MediaHttpContext {
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+        prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
         worker_lifetime: media_http_worker_lifetime,
     };
     let mut pending = deferred
@@ -1187,7 +1208,7 @@ async fn run_app_runtime_account_worker(
             done = media_http_rx.recv() => {
                 match done {
                     Some(done) => {
-                        complete_media_http(&mut client, done, &shared).await;
+                        complete_media_http(&mut client, done, &shared, &media_http).await;
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2125,6 +2146,10 @@ const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 struct MediaHttpContext {
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
+    /// Prevent concurrent host retries from uploading the same durable blob
+    /// more than once. This state is deliberately ephemeral: after a worker
+    /// restart, the durable staged/failed record remains retryable.
+    prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
@@ -2153,6 +2178,12 @@ enum MediaHttpCompletion {
     GroupImage {
         result: Result<Vec<u8>, AppError>,
         respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
+    },
+    PreparedGroupImageUpload {
+        upload_id: String,
+        result: Result<(), AppError>,
+        respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
+        started_at: Instant,
     },
 }
 
@@ -2185,10 +2216,42 @@ fn reserve_media_http(media_http: &MediaHttpContext) -> Result<OwnedSemaphorePer
         .map_err(|_| AppError::AccountWorkerBusy)
 }
 
+fn reserve_prepared_group_image_upload(
+    media_http: &MediaHttpContext,
+    upload_id: &str,
+) -> Result<(), AppError> {
+    let mut uploads = media_http
+        .prepared_group_image_uploads
+        .lock()
+        .map_err(|_| AppError::AccountWorkerBusy)?;
+    if !uploads.insert(upload_id.to_owned()) {
+        return Err(AppError::AccountWorkerBusy);
+    }
+    Ok(())
+}
+
+fn release_prepared_group_image_upload(media_http: &MediaHttpContext, upload_id: &str) {
+    if let Ok(mut uploads) = media_http.prepared_group_image_uploads.lock() {
+        uploads.remove(upload_id);
+    }
+}
+
+fn prepared_group_image_upload_is_in_flight(
+    media_http: &MediaHttpContext,
+    upload_id: &str,
+) -> bool {
+    media_http
+        .prepared_group_image_uploads
+        .lock()
+        .map(|uploads| uploads.contains(upload_id))
+        .unwrap_or(false)
+}
+
 async fn complete_media_http(
     client: &mut AppClient,
     done: MediaHttpDone,
     shared: &RuntimeSharedServices,
+    media_http: &MediaHttpContext,
 ) {
     let MediaHttpDone { permit, completion } = done;
     match completion {
@@ -2223,6 +2286,29 @@ async fn complete_media_http(
         }
         MediaHttpCompletion::GroupImage { result, respond } => {
             let _ = respond.send(result);
+        }
+        MediaHttpCompletion::PreparedGroupImageUpload {
+            upload_id,
+            result,
+            respond,
+            started_at,
+        } => {
+            release_prepared_group_image_upload(media_http, &upload_id);
+            let succeeded = result.is_ok();
+            let status = client.finish_initial_group_image_upload(&upload_id, &result);
+            let response = match result {
+                Ok(()) => status,
+                Err(upload_error) => match status {
+                    Ok(_) => Err(upload_error),
+                    Err(persistence_error) => Err(persistence_error),
+                },
+            };
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupCreateImageUpload,
+                started_at.elapsed(),
+                succeeded,
+            );
+            let _ = respond.send(response);
         }
     }
     drop(permit);
@@ -2524,6 +2610,7 @@ async fn handle_account_worker_command(
             name,
             members,
             options,
+            prepared_image_upload_id,
             respond,
         } => {
             let telemetry = shared.app_performance_telemetry();
@@ -2533,9 +2620,29 @@ async fn handle_account_worker_command(
                 true,
             );
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-            let result = client
-                .create_group_with_options_and_telemetry(&name, &member_refs, options, &telemetry)
-                .await;
+            let result = match prepared_image_upload_id {
+                None => {
+                    client
+                        .create_group_with_options_and_telemetry(
+                            &name,
+                            &member_refs,
+                            options,
+                            &telemetry,
+                        )
+                        .await
+                }
+                Some(upload_id) => {
+                    client
+                        .create_group_with_prepared_initial_image_and_telemetry(
+                            &name,
+                            &member_refs,
+                            options,
+                            &upload_id,
+                            &telemetry,
+                        )
+                        .await
+                }
+            };
             let response_handoff_started_at = Instant::now();
             if let Ok(created_group) = &result {
                 publish_app_runtime_group_state_updated(
@@ -2612,6 +2719,85 @@ async fn handle_account_worker_command(
                 )
                 .await;
             }
+        }
+        AccountWorkerCommand::StagePreparedGroupImage {
+            plaintext,
+            media_type,
+            respond,
+        } => {
+            let started_at = Instant::now();
+            let result = client.stage_prepared_initial_group_image(&plaintext, &media_type);
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupCreateImagePreprocess,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UploadPreparedGroupImage {
+            upload_id,
+            server,
+            respond,
+        } => {
+            match client.prepare_initial_group_image_upload(
+                &upload_id,
+                server,
+                app.allow_loopback_blob_endpoints(),
+            ) {
+                Ok(PreparedGroupImageUploadStart::Complete(status)) => {
+                    let _ = respond.send(Ok(status));
+                }
+                Ok(PreparedGroupImageUploadStart::Http(http)) => {
+                    if let Err(err) = reserve_prepared_group_image_upload(media_http, &upload_id) {
+                        let _ = respond.send(Err(err));
+                        return;
+                    }
+                    let permit = match reserve_media_http(media_http) {
+                        Ok(permit) => permit,
+                        Err(err) => {
+                            release_prepared_group_image_upload(media_http, &upload_id);
+                            let _ = respond.send(Err(err));
+                            return;
+                        }
+                    };
+                    let upload_id = http.upload_id().to_owned();
+                    let started_at = Instant::now();
+                    spawn_media_http(media_http, permit, http.run(), move |result| {
+                        MediaHttpCompletion::PreparedGroupImageUpload {
+                            upload_id,
+                            result,
+                            respond,
+                            started_at,
+                        }
+                    });
+                }
+                Err(err) => {
+                    let _ = respond.send(Err(err));
+                }
+            }
+        }
+        AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond } => {
+            let result =
+                client
+                    .prepared_initial_group_image_status(&upload_id)
+                    .map(|mut status| {
+                        if prepared_group_image_upload_is_in_flight(media_http, &upload_id) {
+                            status.state = crate::AppPreparedGroupImageUploadState::Uploading;
+                        }
+                        status
+                    });
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PreparedGroupImages { respond } => {
+            let result = client.prepared_initial_group_images().map(|mut statuses| {
+                for status in &mut statuses {
+                    if prepared_group_image_upload_is_in_flight(media_http, &status.upload_id) {
+                        status.state = crate::AppPreparedGroupImageUploadState::Uploading;
+                    }
+                }
+                statuses
+            });
+            let _ = respond.send(result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
             // On-demand promotion (mdk#1161): normally a no-op (the startup
@@ -4355,10 +4541,32 @@ mod tests {
             MediaHttpContext {
                 tx,
                 permits: Arc::new(Semaphore::new(limit)),
+                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 worker_lifetime,
             },
             rx,
         )
+    }
+
+    #[test]
+    fn prepared_group_image_upload_reservation_rejects_duplicate_until_release() {
+        let (media_http, _completions) = media_http_context(1);
+        reserve_prepared_group_image_upload(&media_http, "upload-1").unwrap();
+        assert!(prepared_group_image_upload_is_in_flight(
+            &media_http,
+            "upload-1"
+        ));
+        assert!(matches!(
+            reserve_prepared_group_image_upload(&media_http, "upload-1"),
+            Err(AppError::AccountWorkerBusy)
+        ));
+
+        release_prepared_group_image_upload(&media_http, "upload-1");
+        assert!(!prepared_group_image_upload_is_in_flight(
+            &media_http,
+            "upload-1"
+        ));
+        reserve_prepared_group_image_upload(&media_http, "upload-1").unwrap();
     }
 
     #[tokio::test]
@@ -4387,6 +4595,63 @@ mod tests {
 
         drop(completion);
         assert!(reserve_media_http(&media_http).is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepared_group_image_upload_failure_is_durable_and_returned_as_error() {
+        use image::ImageEncoder as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&png, "image/png")
+            .unwrap();
+
+        let (media_http, _completions) = media_http_context(1);
+        reserve_prepared_group_image_upload(&media_http, &staged.upload_id).unwrap();
+        let permit = reserve_media_http(&media_http).unwrap();
+        let (respond, response) = oneshot::channel();
+        let done = MediaHttpDone {
+            permit,
+            completion: MediaHttpCompletion::PreparedGroupImageUpload {
+                upload_id: staged.upload_id.clone(),
+                result: Err(AppError::BlobStore("injected upload failure".into())),
+                respond,
+                started_at: Instant::now(),
+            },
+        };
+
+        complete_media_http(
+            &mut client,
+            done,
+            &RuntimeSharedServices::default(),
+            &media_http,
+        )
+        .await;
+
+        let error = response
+            .await
+            .unwrap()
+            .expect_err("a durable failed status must not turn upload failure into success");
+        assert_eq!(error.privacy_safe_kind(), "blob_store");
+        let status = client
+            .prepared_initial_group_image_status(&staged.upload_id)
+            .unwrap();
+        assert_eq!(
+            status.state,
+            crate::AppPreparedGroupImageUploadState::Failed
+        );
+        assert_eq!(status.attempt_count, 1);
+        assert_eq!(status.last_error_kind.as_deref(), Some("blob_store"));
     }
 
     #[tokio::test]
@@ -4834,6 +5099,7 @@ mod tests {
         let media_http = MediaHttpContext {
             tx: media_http_tx,
             permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+            prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
             worker_lifetime: media_http_worker_lifetime,
         };
         let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();

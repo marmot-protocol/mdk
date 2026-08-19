@@ -161,8 +161,9 @@ pub use groups::{
     AppGroupMemberIds, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
     AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
-    AppInitialGroupImage, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
-    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite, group_system_event_from_message,
+    AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
+    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
+    PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -172,7 +173,8 @@ pub use ids::{
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
-    EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MediaAttachmentReference,
+    EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
+    MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS, MediaAttachmentReference,
     MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
     MediaUploadRequest, MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
 };

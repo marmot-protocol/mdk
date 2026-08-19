@@ -63,6 +63,11 @@ This workspace is the Marmot Development Kit (MDK). Release `0.9.0` unifies ever
 cohort above the previous `0.8.0` MDK layout (`mdk-core`, `mdk-sqlite-storage`, and related crates). The current
 crate tree under `crates/` is the production-shaped replacement: OpenMLS-backed engine, SQLCipher storage, Nostr
 transports, multi-account app runtime, CLI/daemon/TUI, agent connector stack, UniFFI bindings, and conformance tooling.
+The app runtime exposes an explicit prepared founding-image path: image validation/encryption and durable staging,
+idempotent Blossom upload, and canonical group creation are separate host-visible operations. The final create uses
+uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
+uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
+before canonical creation.
 
 ### Marmot-TS (TypeScript)
 

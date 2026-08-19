@@ -42,6 +42,228 @@ use crate::key_package_records::{
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
+fn one_pixel_png() -> Vec<u8> {
+    use image::ImageEncoder;
+
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    bytes
+}
+
+#[test]
+fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
+    run_composed_app_runtime_test("prepared-group-image-create", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        assert_eq!(staged.state, AppPreparedGroupImageUploadState::Staged);
+
+        let prepared_http = client
+            .prepare_initial_group_image_upload(&staged.upload_id, None, false)
+            .unwrap();
+        assert!(matches!(
+            prepared_http,
+            crate::client::PreparedGroupImageUploadStart::Http(_)
+        ));
+        drop(prepared_http);
+        let after_cancellation = client
+            .prepared_initial_group_image_status(&staged.upload_id)
+            .unwrap();
+        assert_eq!(
+            after_cancellation.state,
+            AppPreparedGroupImageUploadState::Staged
+        );
+        assert_eq!(after_cancellation.attempt_count, 0);
+
+        let failed = client
+            .finish_initial_group_image_upload(
+                &staged.upload_id,
+                &Err(AppError::BlobStore("test failure".into())),
+            )
+            .unwrap();
+        assert_eq!(failed.state, AppPreparedGroupImageUploadState::Failed);
+        assert_eq!(failed.attempt_count, 1);
+        assert_eq!(failed.last_error_kind.as_deref(), Some("blob_store"));
+        let uploaded = client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        assert_eq!(uploaded.state, AppPreparedGroupImageUploadState::Uploaded);
+        assert_eq!(uploaded.attempt_count, 2);
+        assert!(matches!(
+            client
+                .prepare_initial_group_image_upload(&staged.upload_id, None, false)
+                .unwrap(),
+            crate::client::PreparedGroupImageUploadStart::Complete(_)
+        ));
+
+        let telemetry = AppPerformanceTelemetry::default();
+        let group_id = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "prepared image",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        let group_id_again = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "ignored on idempotent retry",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        assert_eq!(group_id_again, group_id);
+        assert_eq!(client.state.groups.len(), 1);
+        assert!(client.state.groups[0].image.present);
+
+        let status = client
+            .prepared_initial_group_image_status(&staged.upload_id)
+            .unwrap();
+        assert_eq!(status.state, AppPreparedGroupImageUploadState::Consumed);
+        let group_id_hex = hex::encode(group_id.as_slice());
+        assert_eq!(status.group_id_hex.as_deref(), Some(group_id_hex.as_str()));
+        assert!(!format!("{status:?}").contains(&group_id_hex));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_create_image_upload.attempts, 0);
+        assert_eq!(snapshot.group_create_mls_prepare_persist.attempts, 1);
+    });
+}
+
+#[test]
+fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection() {
+    run_composed_app_runtime_test("prepared-group-image-engine-recovery", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        let component_data = app
+            .account_storage("alice")
+            .unwrap()
+            .prepared_group_image_upload(&staged.upload_id)
+            .unwrap()
+            .unwrap()
+            .component_data;
+        let telemetry = AppPerformanceTelemetry::default();
+
+        // Simulate the narrow crash window: MLS creation is canonical, but
+        // consumption fails and the best-effort app projection is absent.
+        let group_id = client
+            .create_group_with_initial_source_and_optional_telemetry(
+                "crash-window group",
+                String::new(),
+                &[],
+                Some(crate::client::InitialGroupImageSource::Prepared {
+                    upload_id: "injected-missing-consume-row".to_owned(),
+                    component_data,
+                }),
+                0,
+                Some(&telemetry),
+            )
+            .await
+            .unwrap()
+            .group_id;
+        client.state.groups.clear();
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        assert!(client.state.groups.is_empty());
+        assert_eq!(
+            client
+                .prepared_initial_group_image_status(&staged.upload_id)
+                .unwrap()
+                .state,
+            AppPreparedGroupImageUploadState::Uploaded
+        );
+
+        let recovered = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "must not create a duplicate",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap()
+            .group_id;
+
+        assert_eq!(recovered, group_id);
+        assert_eq!(client.runtime.live_group_ids().unwrap(), vec![group_id]);
+        assert_eq!(
+            client
+                .prepared_initial_group_image_status(&staged.upload_id)
+                .unwrap()
+                .state,
+            AppPreparedGroupImageUploadState::Consumed
+        );
+        assert_eq!(
+            telemetry
+                .snapshot()
+                .group_create_mls_prepare_persist
+                .attempts,
+            1
+        );
+    });
+}
+
+#[test]
+fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_creation() {
+    run_composed_app_runtime_test("legacy-inline-group-image-budget", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+
+        let result = client
+            .create_group_with_initial_image(
+                "oversized legacy image",
+                &[],
+                Some(AppInitialGroupImage {
+                    plaintext: vec![0_u8; MAX_GROUP_IMAGE_BYTES + 1],
+                    media_type: "image/png".to_owned(),
+                    source_url: None,
+                    dim: None,
+                    thumbhash: None,
+                }),
+            )
+            .await;
+
+        let error = result.expect_err("legacy inline create must enforce the image byte budget");
+        assert!(matches!(error, AppError::InvalidEncryptedMedia(_)));
+        assert!(error.to_string().contains("size limit"));
+        assert!(client.runtime.live_group_ids().unwrap().is_empty());
+        assert!(client.state.groups.is_empty());
+    });
+}
+
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
