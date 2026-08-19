@@ -31,6 +31,53 @@ Connector crates are responsible for:
 Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.
 
+## Execution Profiles
+
+`MARMOT_HARNESS_EXECUTION_PROFILE` expresses operator intent without pretending
+the backends have equivalent permission or sandbox systems:
+
+- `inherit` (default) adds no connector-owned execution-policy overrides.
+- `autonomous` avoids interactive approvals while preserving configured hard
+  denies and isolation where the backend supports them.
+- `unrestricted` requests the backend's broadest non-interactive mode. It
+  requires external isolation.
+
+| Backend | `inherit` | `autonomous` | `unrestricted` | Built-in OS isolation |
+| --- | --- | --- | --- | --- |
+| Pi | Existing tool/config behavior | Same native approval-free invocation | Same native approval-free invocation | None |
+| OpenCode | Existing permission config | `--auto`; explicit denies remain | `--auto` plus process-local `OPENCODE_CONFIG_CONTENT={"permission":"allow"}` | None |
+| Codex | Existing approval, sandbox, and network config | `approval_policy="never"`; sandbox/network remain configured | `--dangerously-bypass-approvals-and-sandbox` | Configured for `inherit`/`autonomous`; bypassed for `unrestricted` |
+
+The OpenCode overlay is set only on the spawned process and never rewrites the
+operator's global or project configuration. The child does not inherit a
+separate `OPENCODE_PERMISSION` override in this profile. Managed organization
+policy is loaded later and may still override the process-local configuration.
+Older backend versions that do not understand a required flag or
+invocation-local config override fail the invocation; the harness does not fall
+back to a broader or interactive mode and does not send a successful reply. Pi
+needs no version-dependent permission flag because its normal non-interactive
+mode is already approval-free.
+
+Installers accept `--execution-profile inherit|autonomous|unrestricted` and
+write the shared environment variable into the private env file and same-user
+service configuration. Writing `unrestricted` requires the separate
+`--acknowledge-unrestricted` flag, including in non-interactive and dry-run
+installs.
+
+### Security Boundary
+
+An allowed Marmot sender combined with `unrestricted` execution is effectively
+remote code execution as the harness service user. The `/<path>` picker chooses
+a working directory; it is not an OS containment boundary. Run unrestricted
+deployments as a dedicated OS user or inside a container/VM, and give that
+boundary only narrowly scoped credentials. Backend logical permissions are not
+equivalent to an OS sandbox.
+
+Startup diagnostics report the selected profile and typed approval/isolation
+support state alongside coarse fields such as the harness name, sender count,
+and reply-size limit. They never include paths, identities, prompts,
+configuration contents, or backend output.
+
 ## Shared Behavior
 
 All connectors:

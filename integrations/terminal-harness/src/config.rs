@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::{Config, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING, Result};
@@ -11,6 +12,50 @@ const DEFAULT_BACKEND_IDLE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_PENDING_PER_GROUP: usize = 4;
 const MIN_REPLY_BYTES: usize = 4;
+
+/// Operator intent for backend approval and isolation behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionProfile {
+    /// Add no connector-owned execution-policy overrides.
+    #[default]
+    Inherit,
+    /// Avoid interactive approvals while preserving hard denies and isolation.
+    Autonomous,
+    /// Request the backend's broadest non-interactive execution mode.
+    Unrestricted,
+}
+
+impl ExecutionProfile {
+    /// Stable environment and diagnostic value for this profile.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Autonomous => "autonomous",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+}
+
+impl fmt::Display for ExecutionProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ExecutionProfile {
+    type Err = HarnessError;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "inherit" => Ok(Self::Inherit),
+            "autonomous" => Ok(Self::Autonomous),
+            "unrestricted" => Ok(Self::Unrestricted),
+            _ => Err(config_error(
+                "MARMOT_HARNESS_EXECUTION_PROFILE must be `inherit`, `autonomous`, or `unrestricted`",
+            )),
+        }
+    }
+}
 
 /// Connector-specific names and defaults used by the shared environment parser.
 #[derive(Clone, Copy, Debug)]
@@ -121,6 +166,10 @@ pub fn load_config_with(
             spec.bin_env_name
         )));
     }
+    let execution_profile = lookup("MARMOT_HARNESS_EXECUTION_PROFILE")
+        .as_deref()
+        .unwrap_or("inherit")
+        .parse()?;
 
     let backend_timeout = parse_positive_duration(
         lookup,
@@ -181,6 +230,7 @@ pub fn load_config_with(
             state_path,
             backend_timeout,
             backend_idle_timeout,
+            execution_profile,
             spec,
         },
         home,
@@ -279,6 +329,40 @@ mod tests {
         assert_eq!(loaded.home, PathBuf::from("/home/test/.marmot-agents/test"));
         assert_eq!(loaded.harness.backend_timeout, Duration::from_secs(3600));
         assert_eq!(loaded.harness.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
+        assert_eq!(loaded.harness.execution_profile, ExecutionProfile::Inherit);
+    }
+
+    #[test]
+    fn shared_config_parses_every_execution_profile() {
+        for (raw, expected) in [
+            ("inherit", ExecutionProfile::Inherit),
+            ("autonomous", ExecutionProfile::Autonomous),
+            ("unrestricted", ExecutionProfile::Unrestricted),
+        ] {
+            let loaded = load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("MARMOT_HARNESS_EXECUTION_PROFILE", raw),
+            ])
+            .unwrap();
+            assert_eq!(loaded.harness.execution_profile, expected);
+            assert_eq!(loaded.harness.execution_profile.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn shared_config_rejects_unknown_execution_profile() {
+        let error = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("MARMOT_HARNESS_EXECUTION_PROFILE", "yolo"),
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("MARMOT_HARNESS_EXECUTION_PROFILE")
+        );
     }
 
     #[test]
@@ -332,5 +416,6 @@ mod tests {
         }
         assert!(debug.contains("auth_token_present: true"));
         assert!(debug.contains("account_id_present: true"));
+        assert!(debug.contains("execution_profile: Inherit"));
     }
 }

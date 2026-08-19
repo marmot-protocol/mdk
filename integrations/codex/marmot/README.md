@@ -117,6 +117,7 @@ never retried automatically. Send `//reset-session` to pass the literal
 | `WN_CODEX_ALLOWED_SENDERS_HEX` | required | Comma-separated authorized sender ids |
 | `WN_CODEX_ACCOUNT_ID_HEX` | sole local account | Explicit account selection |
 | `WN_CODEX_BIN` | `codex` | Codex executable |
+| `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_CODEX_IDLE_TIMEOUT_SECS` | `120` | Maximum silence per invocation |
 | `WN_CODEX_TIMEOUT_SECS` | `3600` | Total invocation cap |
 | `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
@@ -125,11 +126,14 @@ never retried automatically. Send `//reset-session` to pass the literal
 | `WN_CODEX_STATE_PATH` | `$XDG_STATE_HOME/wn-codex/sessions.json` | Group thread/workdir map |
 | `WN_CODEX_ACTIVATION` | `always` | Only supported activation mode |
 
-Codex credentials, model, config, sandbox, approval policy, and project trust
-remain authoritative. This first connector version deliberately adds no
-permission-broadening flags; common permission/configuration controls will be
-designed across all terminal harnesses separately. Prompts are written to Codex
-over stdin, and only completed `agent_message` text is returned to Marmot.
+Codex credentials, model, config, and project trust remain authoritative.
+`autonomous` overrides only `approval_policy` to `never`, preserving configured
+sandbox and network policy. `unrestricted` passes
+`--dangerously-bypass-approvals-and-sandbox` for both new and resumed threads.
+See the shared
+[execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
+Prompts are written to Codex over stdin, and only completed `agent_message`
+text is returned to Marmot.
 
 The optional bearer token grants the complete `wn-agent` control API for every
 account in its home; the sender allowlist does not narrow that authority. Use a

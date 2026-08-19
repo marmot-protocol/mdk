@@ -26,12 +26,16 @@ const SEND_RETRY_ATTEMPTS: usize = 3;
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
+    let execution_support = backend.execution_support();
     info!(
         target: TRACE_TARGET,
         method = "startup",
         allowed_senders = config.allowed_senders.len(),
         max_reply_bytes = config.max_reply_bytes,
         harness = config.spec.display_name,
+        execution_profile = config.execution_profile.as_str(),
+        approval_support = execution_support.approvals.as_str(),
+        isolation_support = execution_support.isolation.as_str(),
         "terminal harness starting"
     );
 
@@ -975,6 +979,7 @@ mod tests {
             state_path: root.join("sessions.json"),
             backend_timeout: Duration::from_secs(60),
             backend_idle_timeout: Duration::from_secs(45),
+            execution_profile: crate::ExecutionProfile::Inherit,
             spec: crate::ConfigSpec {
                 env_prefix: "WN_OPENCODE",
                 default_home_name: "harnesses",

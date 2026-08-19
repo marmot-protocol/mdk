@@ -90,6 +90,7 @@ Configure with environment variables:
 | `WN_OPENCODE_ADMIN_HEX` | unset | Legacy alias for `WN_OPENCODE_ALLOWED_SENDERS_HEX` |
 | `WN_OPENCODE_ACCOUNT_ID_HEX` | first local account | Specific `wn-agent` account to use |
 | `WN_OPENCODE_BIN` | `opencode` | OpenCode binary or executable path |
+| `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_OPENCODE_IDLE_TIMEOUT_SECS` | `120` | Kill the invocation when OpenCode produces no stdout line for this long |
 | `WN_OPENCODE_TIMEOUT_SECS` | `3600` | Generous total safety cap for wedge recovery; ongoing output resets only the idle timer |
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
@@ -103,6 +104,15 @@ The optional bearer token grants the complete `wn-agent` control API for every
 account in its home; the harness sender allowlist does not narrow that token's
 authority. Do not give it to an untrusted harness. Use a separate connector
 home, socket, token, and account for a separate trust boundary.
+
+`autonomous` passes OpenCode's `--auto`, which auto-approves asks while
+preserving explicit denies. `unrestricted` also supplies a connector-owned,
+process-local allow-all permission overlay; it does not rewrite OpenCode's
+global or project configuration, and it clears an inherited
+`OPENCODE_PERMISSION` in the child. Managed organization policy may still
+override the process-local setting. OpenCode provides no built-in OS isolation;
+use external OS isolation for unrestricted deployments. See the shared
+[execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
 
 The reply limit is byte-based, not character-based. The default is 30KB, well
 below Marmot's roughly 60KB message ceiling. Splitting prefers paragraph,

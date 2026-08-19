@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-07-02
+updated: 2026-08-19
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -59,6 +59,12 @@ mdk#379).
 | Errors wrapping any of the above | n/a | Constructors keep `Display` free of URLs/ids/values | n/a | Log `error_kind = privacy_safe_kind()` (or `io::ErrorKind`, variant names) — never `{err}`/`error = %err` | `error_kind` strings only |
 
 ## Current enforcement
+
+Terminal harness startup tracing may include the selected execution profile and
+typed approval/isolation support states. These are fixed enum values only
+(`inherit`, `autonomous`, `unrestricted`, and capability states such as
+`preserve_denies` or `not_provided`); backend configuration values and paths
+remain prohibited.
 
 `crates/cgka-conformance-simulator/tests/tracing_audit.rs` scans production Rust source for qualified and imported
 tracing calls. It requires explicit `target` and `method` fields, rejects known-sensitive token names inside tracing

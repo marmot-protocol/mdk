@@ -47,7 +47,11 @@ impl Config {
     }
 
     pub(crate) fn into_harness(self) -> Result<(marmot_terminal_harness::Config, PiBackend)> {
-        let backend = PiBackend::new(self.shared.bin, self.pi_session_dir)?;
+        let backend = PiBackend::new(
+            self.shared.bin,
+            self.pi_session_dir,
+            self.shared.harness.execution_profile,
+        )?;
         Ok((self.shared.harness, backend))
     }
 }

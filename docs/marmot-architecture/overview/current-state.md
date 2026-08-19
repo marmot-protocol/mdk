@@ -69,6 +69,12 @@ uploaded founding metadata and performs no media transfer; the older all-in-one 
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
 
+The Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
+`autonomous`, and `unrestricted` execution intent while retaining
+backend-specific approval and sandbox semantics. Unrestricted installs require
+explicit acknowledgement and an external OS-user, container, or VM boundary;
+see [`terminal-harness-execution-profiles.md`](./terminal-harness-execution-profiles.md).
+
 ### Marmot-TS (TypeScript)
 
 Marmot-TS is an independent implementation. It is valuable because it catches spec ambiguity that a single reference

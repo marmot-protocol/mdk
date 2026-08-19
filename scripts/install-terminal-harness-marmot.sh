@@ -56,6 +56,7 @@ HARNESS_IDLE_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_IDLE_TIMEOUT_SECS"
 HARNESS_REQUEST_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_REQUEST_TIMEOUT_SECS"
 HARNESS_MAX_REPLY_ENV="${HARNESS_ENV_PREFIX}_MAX_REPLY_BYTES"
 HARNESS_MAX_PENDING_ENV="${HARNESS_ENV_PREFIX}_MAX_PENDING_PER_GROUP"
+HARNESS_EXECUTION_PROFILE_ENV="MARMOT_HARNESS_EXECUTION_PROFILE"
 
 env_or_default() {
     local name="$1" default_value="$2"
@@ -91,6 +92,7 @@ HARNESS_IDLE_TIMEOUT_SECS="$(env_or_default "$HARNESS_IDLE_TIMEOUT_ENV" 120)"
 HARNESS_REQUEST_TIMEOUT_SECS="$(env_or_default "$HARNESS_REQUEST_TIMEOUT_ENV" 30)"
 HARNESS_MAX_REPLY_BYTES="$(env_or_default "$HARNESS_MAX_REPLY_ENV" 30000)"
 HARNESS_MAX_PENDING_PER_GROUP="$(env_or_default "$HARNESS_MAX_PENDING_ENV" 4)"
+HARNESS_EXECUTION_PROFILE="$(env_or_default "$HARNESS_EXECUTION_PROFILE_ENV" inherit)"
 HARNESS_CONFIGURED_SENDERS_HEX="$(env_or_default "$HARNESS_ALLOWED_SENDERS_ENV" "")"
 
 ASSUME_YES=0
@@ -100,6 +102,7 @@ INTERACTIVE=0
 NO_START_WN_AGENT=0
 NO_START_HARNESS=0
 SYSTEM_INSTALL=0
+ACKNOWLEDGE_UNRESTRICTED=0
 WN_AGENT_TEMP_PID=""
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_ALLOWED_SENDERS_HEX=""
@@ -127,6 +130,8 @@ Options:
   --allow-sender VALUE     Alias for --allow-welcomer
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --$HARNESS_KIND-bin PATH      $HARNESS_DISPLAY_NAME binary or command name (default: $HARNESS_DEFAULT_BIN)
+  --execution-profile PROFILE  inherit, autonomous, or unrestricted (default: inherit)
+  --acknowledge-unrestricted   Confirm that unrestricted requires external isolation
   --no-service             Do not install/start LaunchAgents or systemd user units
   --no-start-wn-agent      Install services but do not start wn-agent or the harness
   --no-start-$HARNESS_BINARY   Install the service but do not activate it
@@ -151,6 +156,7 @@ Environment:
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
   $HARNESS_ALLOWED_SENDERS_ENV Comma-separated hex values for prompt senders
   $HARNESS_BIN_ENV          $HARNESS_DISPLAY_NAME binary or command name
+  MARMOT_HARNESS_EXECUTION_PROFILE Shared execution profile (default: inherit)
 
 Example:
   curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/$MARMOT_RELEASE_TAG/install-$HARNESS_KIND-marmot.sh | bash
@@ -261,6 +267,22 @@ validate_prompt_senders() {
             exit 1
         fi
     done < <(append_csv "$HARNESS_CONFIGURED_SENDERS_HEX")
+}
+
+validate_execution_profile() {
+    case "$HARNESS_EXECUTION_PROFILE" in
+        inherit | autonomous) ;;
+        unrestricted)
+            if [ "$ACKNOWLEDGE_UNRESTRICTED" -ne 1 ]; then
+                echo "error: --acknowledge-unrestricted is required before writing the unrestricted execution profile" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "error: --execution-profile must be inherit, autonomous, or unrestricted" >&2
+            exit 1
+            ;;
+    esac
 }
 
 detect_platform() {
@@ -518,7 +540,7 @@ install_macos_harness_service() {
         else
             log "would run: launchctl bootstrap gui/$UID $plist"
         fi
-        log "env: $HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS $HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS $HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS $HARNESS_MAX_REPLY_ENV=$HARNESS_MAX_REPLY_BYTES $HARNESS_MAX_PENDING_ENV=$HARNESS_MAX_PENDING_PER_GROUP"
+        log "env: $HARNESS_EXECUTION_PROFILE_ENV=$HARNESS_EXECUTION_PROFILE $HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS $HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS $HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS $HARNESS_MAX_REPLY_ENV=$HARNESS_MAX_REPLY_BYTES $HARNESS_MAX_PENDING_ENV=$HARNESS_MAX_PENDING_PER_GROUP"
         return 0
     fi
 
@@ -543,6 +565,7 @@ install_macos_harness_service() {
         plist_env_entry "$HARNESS_ACCOUNT_ID_ENV" "$BOOTSTRAP_ACCOUNT_ID_HEX"
         plist_env_entry "$HARNESS_ALLOWED_SENDERS_ENV" "$BOOTSTRAP_ALLOWED_SENDERS_HEX"
         plist_env_entry "$HARNESS_BIN_ENV" "$HARNESS_BIN"
+        plist_env_entry "$HARNESS_EXECUTION_PROFILE_ENV" "$HARNESS_EXECUTION_PROFILE"
         plist_env_entry "$HARNESS_TIMEOUT_ENV" "$HARNESS_TIMEOUT_SECS"
         plist_env_entry "$HARNESS_IDLE_TIMEOUT_ENV" "$HARNESS_IDLE_TIMEOUT_SECS"
         plist_env_entry "$HARNESS_REQUEST_TIMEOUT_ENV" "$HARNESS_REQUEST_TIMEOUT_SECS"
@@ -663,7 +686,7 @@ install_linux_harness_service() {
         else
             log "would restart $MARMOT_HARNESS_SERVICE_NAME.service when active; otherwise enable --now"
         fi
-        log "env: $HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS $HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS $HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS $HARNESS_MAX_REPLY_ENV=$HARNESS_MAX_REPLY_BYTES $HARNESS_MAX_PENDING_ENV=$HARNESS_MAX_PENDING_PER_GROUP"
+        log "env: $HARNESS_EXECUTION_PROFILE_ENV=$HARNESS_EXECUTION_PROFILE $HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS $HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS $HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS $HARNESS_MAX_REPLY_ENV=$HARNESS_MAX_REPLY_BYTES $HARNESS_MAX_PENDING_ENV=$HARNESS_MAX_PENDING_PER_GROUP"
         return 0
     fi
 
@@ -686,6 +709,7 @@ install_linux_harness_service() {
         printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_ACCOUNT_ID_ENV=$BOOTSTRAP_ACCOUNT_ID_HEX")"
         printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_ALLOWED_SENDERS_ENV=$BOOTSTRAP_ALLOWED_SENDERS_HEX")"
         printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_BIN_ENV=$HARNESS_BIN")"
+        printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_EXECUTION_PROFILE_ENV=$HARNESS_EXECUTION_PROFILE")"
         printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS")"
         printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS")"
         printf 'Environment=%s\n' "$(systemd_quote "$HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS")"
@@ -832,7 +856,7 @@ write_harness_env() {
     local env_file="$MARMOT_HOME/dev/$HARNESS_BINARY.env"
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would write private env file $env_file"
-        log "env: $HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS $HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS $HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS $HARNESS_MAX_REPLY_ENV=$HARNESS_MAX_REPLY_BYTES $HARNESS_MAX_PENDING_ENV=$HARNESS_MAX_PENDING_PER_GROUP"
+        log "env: $HARNESS_EXECUTION_PROFILE_ENV=$HARNESS_EXECUTION_PROFILE $HARNESS_TIMEOUT_ENV=$HARNESS_TIMEOUT_SECS $HARNESS_IDLE_TIMEOUT_ENV=$HARNESS_IDLE_TIMEOUT_SECS $HARNESS_REQUEST_TIMEOUT_ENV=$HARNESS_REQUEST_TIMEOUT_SECS $HARNESS_MAX_REPLY_ENV=$HARNESS_MAX_REPLY_BYTES $HARNESS_MAX_PENDING_ENV=$HARNESS_MAX_PENDING_PER_GROUP"
         return 0
     fi
     run mkdir -p "$MARMOT_HOME/dev"
@@ -844,6 +868,7 @@ write_harness_env() {
             printf '%s=%q\n' "$HARNESS_ACCOUNT_ID_ENV" "$BOOTSTRAP_ACCOUNT_ID_HEX"
             printf '%s=%q\n' "$HARNESS_ALLOWED_SENDERS_ENV" "$BOOTSTRAP_ALLOWED_SENDERS_HEX"
             printf '%s=%q\n' "$HARNESS_BIN_ENV" "$HARNESS_BIN"
+            printf '%s=%q\n' "$HARNESS_EXECUTION_PROFILE_ENV" "$HARNESS_EXECUTION_PROFILE"
             printf '%s=%q\n' "$HARNESS_TIMEOUT_ENV" "$HARNESS_TIMEOUT_SECS"
             printf '%s=%q\n' "$HARNESS_IDLE_TIMEOUT_ENV" "$HARNESS_IDLE_TIMEOUT_SECS"
             printf '%s=%q\n' "$HARNESS_REQUEST_TIMEOUT_ENV" "$HARNESS_REQUEST_TIMEOUT_SECS"
@@ -917,6 +942,14 @@ while [ "$#" -gt 0 ]; do
             HARNESS_BIN="${2:?missing value for --$HARNESS_KIND-bin}"
             shift 2
             ;;
+        --execution-profile)
+            HARNESS_EXECUTION_PROFILE="${2:?missing value for --execution-profile}"
+            shift 2
+            ;;
+        --acknowledge-unrestricted)
+            ACKNOWLEDGE_UNRESTRICTED=1
+            shift
+            ;;
         --no-service)
             INSTALL_SERVICE=0
             shift
@@ -980,6 +1013,7 @@ fi
 
 validate_welcomer_inputs
 validate_prompt_senders
+validate_execution_profile
 need_cmd curl
 need_cmd tar
 if [ "$DRY_RUN" -eq 0 ]; then

@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    Backend, HarnessError, Invocation, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
+    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
+    IsolationSupport, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
     process::{
         capture_stderr, cleanup_failed_run, kill_and_reap, next_stdout_line, strip_ansi,
         write_stdin,
@@ -19,16 +20,28 @@ use tracing::debug;
 #[derive(Clone)]
 pub(crate) struct OpencodeBackend {
     pub(crate) bin: String,
+    pub(crate) execution_profile: ExecutionProfile,
 }
 
 #[async_trait]
 impl Backend for OpencodeBackend {
+    fn execution_support(&self) -> ExecutionSupport {
+        ExecutionSupport {
+            approvals: match self.execution_profile {
+                ExecutionProfile::Inherit => ApprovalSupport::Inherited,
+                ExecutionProfile::Autonomous => ApprovalSupport::PreserveDenies,
+                ExecutionProfile::Unrestricted => ApprovalSupport::ForceAllow,
+            },
+            isolation: IsolationSupport::NotProvided,
+        }
+    }
+
     async fn run(
         &self,
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        run_with_bin(&self.bin, invocation, tx).await
+        run_with_bin(&self.bin, self.execution_profile, invocation, tx).await
     }
 }
 
@@ -71,17 +84,24 @@ struct OpencodeErrorData {
 
 async fn run_with_bin(
     bin: &str,
+    execution_profile: ExecutionProfile,
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
     let mut command = Command::new(bin);
     command
-        .args(build_run_args(invocation.session_id.as_deref()))
+        .args(build_run_args(
+            invocation.session_id.as_deref(),
+            execution_profile,
+        ))
         .current_dir(&invocation.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some((remove, name, value)) = config_overlay(execution_profile) {
+        command.env_remove(remove).env(name, value);
+    }
 
     let mut child = command.spawn().map_err(|_| RunFailure {
         error: HarnessError::BackendSpawn,
@@ -229,8 +249,17 @@ async fn run_with_bin(
     }
 }
 
-pub(crate) fn build_run_args(session_id: Option<&str>) -> Vec<String> {
+pub(crate) fn build_run_args(
+    session_id: Option<&str>,
+    execution_profile: ExecutionProfile,
+) -> Vec<String> {
     let mut args = vec!["run".to_owned(), "--format".to_owned(), "json".to_owned()];
+    if matches!(
+        execution_profile,
+        ExecutionProfile::Autonomous | ExecutionProfile::Unrestricted
+    ) {
+        args.push("--auto".to_owned());
+    }
     if let Some(session_id) = session_id
         && !session_id.is_empty()
     {
@@ -238,6 +267,14 @@ pub(crate) fn build_run_args(session_id: Option<&str>) -> Vec<String> {
         args.push(session_id.to_owned());
     }
     args
+}
+
+fn config_overlay(profile: ExecutionProfile) -> Option<(&'static str, &'static str, &'static str)> {
+    (profile == ExecutionProfile::Unrestricted).then_some((
+        "OPENCODE_PERMISSION",
+        "OPENCODE_CONFIG_CONTENT",
+        r#"{"permission":"allow"}"#,
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -279,6 +316,7 @@ impl OpencodeError {
 
 #[cfg(test)]
 mod tests {
+    use marmot_terminal_harness::ExecutionProfile;
     use std::time::Duration;
 
     use tokio::sync::mpsc;
@@ -294,7 +332,7 @@ mod tests {
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        run_with_bin(MOCK_BIN, invocation, tx).await
+        run_with_bin(MOCK_BIN, ExecutionProfile::Inherit, invocation, tx).await
     }
 
     fn mock_invocation(dir: &tempfile::TempDir, scenario: &str) -> Invocation {
@@ -310,7 +348,7 @@ mod tests {
     #[test]
     fn build_run_args_keeps_prompt_out_of_process_arguments() {
         assert_eq!(
-            build_run_args(Some("ses_123")),
+            build_run_args(Some("ses_123"), ExecutionProfile::Inherit),
             vec!["run", "--format", "json", "--session", "ses_123"]
         );
     }
@@ -528,6 +566,38 @@ mod tests {
         assert_eq!(
             failure.observed_session.as_deref(),
             Some("ses_backpressure")
+        );
+    }
+
+    #[test]
+    fn args_apply_typed_permission_profiles_without_putting_prompt_in_args() {
+        for (profile, permission_args) in [
+            (ExecutionProfile::Inherit, Vec::<&str>::new()),
+            (ExecutionProfile::Autonomous, vec!["--auto"]),
+            (ExecutionProfile::Unrestricted, vec!["--auto"]),
+        ] {
+            let mut expected = vec!["run", "--format", "json"];
+            expected.extend(permission_args.iter().copied());
+            assert_eq!(build_run_args(None, profile), expected);
+
+            let mut resumed = vec!["run", "--format", "json"];
+            resumed.extend(permission_args.iter().copied());
+            resumed.extend(["--session", "session-123"]);
+            assert_eq!(build_run_args(Some("session-123"), profile), resumed);
+        }
+    }
+
+    #[test]
+    fn unrestricted_uses_a_process_local_config_overlay_only() {
+        assert_eq!(config_overlay(ExecutionProfile::Inherit), None);
+        assert_eq!(config_overlay(ExecutionProfile::Autonomous), None);
+        assert_eq!(
+            config_overlay(ExecutionProfile::Unrestricted),
+            Some((
+                "OPENCODE_PERMISSION",
+                "OPENCODE_CONFIG_CONTENT",
+                r#"{"permission":"allow"}"#
+            ))
         );
     }
 }

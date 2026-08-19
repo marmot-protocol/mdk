@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-08-13
+updated: 2026-08-19
 tags: [marmot, architecture, index]
 ---
 
@@ -88,6 +88,10 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** Restrictive-by-construction creation of local files, sockets, and databases: the
     `fs-private` helpers, the one octal-mode parser, the DB sidecar/PRAGMA-at-open rules, and the close-before-host-
     suspension rules that release WAL and root-lease file locks.
+
+- **Doc:** [`overview/terminal-harness-execution-profiles.md`](./overview/terminal-harness-execution-profiles.md)
+  - **What it covers:** Typed execution intent across Pi, OpenCode, and Codex; backend mappings, installer
+    acknowledgement, and the remote-execution containment boundary.
 
 - **Doc:** [`overview/multi-step-state-changes.md`](./overview/multi-step-state-changes.md)
   - **What it covers:** The no-torn-writes convention for multi-step operations: validate-before-mutate, full

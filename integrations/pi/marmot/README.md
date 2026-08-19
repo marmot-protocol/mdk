@@ -79,6 +79,7 @@ resume that group's Pi session.
 | `WN_PI_ALLOWED_SENDERS_HEX` | required | Comma-separated authorized sender ids |
 | `WN_PI_ACCOUNT_ID_HEX` | sole local account | Explicit account selection |
 | `WN_PI_BIN` | `pi` | Pi executable |
+| `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_PI_SESSION_DIR` | `$MARMOT_HOME/dev/pi-sessions` | Private Pi session directory |
 | `WN_PI_IDLE_TIMEOUT_SECS` | `120` | Maximum silence per invocation |
 | `WN_PI_TIMEOUT_SECS` | `3600` | Total invocation cap |
@@ -91,6 +92,12 @@ resume that group's Pi session.
 Pi's global credentials, model, tools, extensions, settings, and normal
 noninteractive project-trust policy remain authoritative. Prompts are written
 to Pi over stdin; only completed assistant text is returned to Marmot.
+
+Pi has no built-in approval prompt or OS sandbox. Its normal non-interactive
+invocation is already approval-free, so all three profiles use the same Pi
+arguments; `autonomous` and `unrestricted` describe deployment intent rather
+than adding a containment mechanism. See the shared
+[execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
 
 The optional bearer token grants the complete `wn-agent` control API for every
 account in its home; the sender allowlist does not narrow that authority. Use a
