@@ -9,14 +9,80 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-08-19
+
 ### Added
 
-- Added the `wn-codex` terminal-harness connector with per-group Codex thread
-  resumption, stdin prompts, completed-assistant-only JSONL parsing, isolated
-  installer/service defaults, and WN Agent release bundles for supported Linux
-  and macOS targets.
+- The TUI adds `/search [query]` for the newest 100 matching messages, with
+  highlighted matches, keyboard navigation, jumps into loaded history, and
+  guidance when older history must be loaded first. Group details also scroll
+  far enough to reveal relay hints for the final selected member.
+  ([#1478](https://github.com/marmot-protocol/mdk/pull/1478))
 
-## [0.9.14] - 2026-08-18
+- MarmotKit adds coherent group-conversation snapshots, bounded member
+  KeyPackage prewarming, and account-owned profile publication. Hosts can now
+  load group details and management state from one worker snapshot, prewarm a
+  deduplicated invitee set without reserving packages, and publish a profile
+  using the account's validated publish/bootstrap relay projection without a
+  separate relay-list round trip.
+  ([#1494](https://github.com/marmot-protocol/mdk/pull/1494),
+  [#1495](https://github.com/marmot-protocol/mdk/pull/1495),
+  [#1496](https://github.com/marmot-protocol/mdk/pull/1496))
+
+- Group creation accepts forward-compatible options for founding message
+  retention and prepared group images. Retention is installed in epoch-zero
+  metadata, while bounded PNG/JPEG/GIF/WebP preprocessing and resumable image
+  upload can finish before the canonical MLS mutation. Detailed creation APIs
+  return the exact durable chat-list row without an extra read.
+  ([#1497](https://github.com/marmot-protocol/mdk/pull/1497),
+  [#1498](https://github.com/marmot-protocol/mdk/pull/1498),
+  [#1500](https://github.com/marmot-protocol/mdk/pull/1500))
+
+- Account creation exposes `Initializing`, `LocalReady`, `Publishing`,
+  `NetworkReady`, and `RecoveryRequired` readiness states. A generated account
+  can return once its identity, SQLCipher store, default profile, and signed
+  setup KeyPackage artifact are durable locally, while restart-resumable
+  network publication continues in the background.
+  ([#1499](https://github.com/marmot-protocol/mdk/pull/1499))
+
+- WN Agent adds the `wn-codex` terminal harness with per-group Codex thread
+  resumption and release installers for supported Linux and macOS targets.
+  Terminal harnesses also add an exact `/reset-session` command and shared
+  `inherit`, `autonomous`, and explicitly acknowledged `unrestricted`
+  execution profiles without mutating global backend configuration.
+  ([#1501](https://github.com/marmot-protocol/mdk/pull/1501),
+  [#1506](https://github.com/marmot-protocol/mdk/pull/1506),
+  [#1507](https://github.com/marmot-protocol/mdk/pull/1507))
+
+### Changed
+
+- Account setup prioritizes its exact journaled KeyPackage before initial sync,
+  publishes independent bootstrap records concurrently under one deadline, and
+  records privacy-safe stage timings. The local-ready account flow reuses that
+  same durable artifact instead of generating a second identity or KeyPackage.
+  ([#1493](https://github.com/marmot-protocol/mdk/pull/1493),
+  [#1499](https://github.com/marmot-protocol/mdk/pull/1499))
+
+- Group creation and invitation deduplicate member references, reuse warm
+  KeyPackages, batch cold relay resolution, and remove the eager app
+  pending-Welcome index write from the response tail. Prepared founding images
+  keep slow media upload outside the canonical create path.
+  ([#1494](https://github.com/marmot-protocol/mdk/pull/1494),
+  [#1498](https://github.com/marmot-protocol/mdk/pull/1498),
+  [#1500](https://github.com/marmot-protocol/mdk/pull/1500))
+
+- Sync and catch-up telemetry now exports bounded `failure_stage` and
+  `error_class` dimensions across transport, subscription, relay receive, CGKA,
+  persistence, and account-worker boundaries without raw errors or
+  high-cardinality identifiers.
+  ([#1488](https://github.com/marmot-protocol/mdk/pull/1488))
+
+- Pi, OpenCode, and Codex terminal connectors share one bounded JSONL
+  subprocess runner for deadlines, backpressure, stderr capture, session/error
+  handling, cancellation, and child cleanup. OpenCode prompts are sent over
+  stdin rather than appearing in spawned process arguments.
+  ([#1505](https://github.com/marmot-protocol/mdk/pull/1505),
+  [#1506](https://github.com/marmot-protocol/mdk/pull/1506))
 
 ### Fixed
 
