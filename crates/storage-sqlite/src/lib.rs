@@ -15,6 +15,7 @@ mod message_drafts;
 mod migrations;
 mod openmls_storage;
 mod pending_welcome_delivery;
+mod prepared_group_image_upload;
 mod shared;
 mod storage;
 mod timeline;
@@ -43,6 +44,12 @@ pub use message_drafts::{
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
 pub use pending_welcome_delivery::PendingWelcomeDeliveryRecord;
+pub use prepared_group_image_upload::{
+    ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,
+    CONSUMED_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS, MAX_ACTIVE_PREPARED_GROUP_IMAGE_UPLOADS,
+    MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS, PreparedGroupImageUploadRecord,
+    PreparedGroupImageUploadState,
+};
 pub use shared::{
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
     StoredRelayTelemetrySettings,

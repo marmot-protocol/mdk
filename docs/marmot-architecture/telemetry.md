@@ -234,6 +234,7 @@ Collected operations:
 | `group_create_key_package_cache_reuse` | Successful create-time lookup when every canonical member was satisfied by revalidated local/directory state. | Closed operation name, not a caller-supplied label. A prewarm should shift the later Create wait into this bucket. |
 | `group_create_key_package_network_resolution` | Successful create-time lookup that required relay-list or KeyPackage network work for at least one canonical member. | Closed operation name, not a member-count or relay label. |
 | `group_create_queue_wait` | Time from enqueueing `CreateGroup` until the account worker begins it. | Separates worker contention from create work. |
+| `group_create_image_preprocess` | Prepared founding-image validation, dimension inspection, encryption, and SQLCipher staging. | Contains no network time. Rejections occur before encryption and upload. |
 | `group_create_image_upload` | Optional initial image selection/upload. | Recorded only when an initial image was supplied. |
 | `group_create_mls_prepare_persist` | Engine create through the authoritative atomic MLS group plus retained founding-Welcome commit. | The canonical point of no return. |
 | `group_create_pending_welcome_index` | In-memory derivation of founding Welcome message ids needed by the post-response fanout driver. | The durable app repair index is convenience-only and is not committed on this path; failures and reconciliation populate it later. |
@@ -544,6 +545,10 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_group_create_key_package_network_resolution_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_network_resolution.attempts` |
 | `app_group_create_key_package_network_resolution_successes` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_network_resolution.successes` |
 | `app_group_create_key_package_network_resolution_failures` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_network_resolution.failures` |
+| `app_group_create_image_preprocess_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_image_preprocess.duration_ms` |
+| `app_group_create_image_preprocess_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_image_preprocess.attempts` |
+| `app_group_create_image_preprocess_successes` | none | Counter | `AppPerformanceSnapshot.group_create_image_preprocess.successes` |
+| `app_group_create_image_preprocess_failures` | none | Counter | `AppPerformanceSnapshot.group_create_image_preprocess.failures` |
 | `app_group_accept_invite_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_accept_invite.duration_ms` |
 | `app_group_accept_invite_attempts` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.attempts` |
 | `app_group_accept_invite_successes` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.successes` |

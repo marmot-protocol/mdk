@@ -55,6 +55,13 @@ test-otlp:
 bench-startup:
     cargo test --release -p marmot-app --test startup_scaling -- --ignored --nocapture --test-threads=1
 
+# Founding-image critical-path benchmark (mdk#1485): reports no-image,
+# typical-image, exact byte-limit, and stalled-Blossom rows. The successful
+# rows include the prior serialized-path model and the new canonical-create
+# response boundary as stable `MDK_BENCH ...` fields.
+bench-group-image-create:
+    cargo test --release -p marmot-app --test group_image_create -- --ignored --nocapture --test-threads=1
+
 # Storage-format v1 -> v2 operational benchmark (mdk#1414). Builds a
 # file-backed schema-v46 database with legacy Welcome-heavy rows, samples the
 # database/WAL/SHM high-water mark across migration, bounded promotion, reopen,

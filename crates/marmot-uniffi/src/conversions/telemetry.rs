@@ -113,6 +113,7 @@ pub struct AppPerformanceSnapshotFfi {
     pub group_member_key_package_prewarm: AppPerformanceOperationSnapshotFfi,
     pub group_create_key_package_cache_reuse: AppPerformanceOperationSnapshotFfi,
     pub group_create_key_package_network_resolution: AppPerformanceOperationSnapshotFfi,
+    pub group_create_image_preprocess: AppPerformanceOperationSnapshotFfi,
     pub group_create_image_upload: AppPerformanceOperationSnapshotFfi,
     pub group_create_mls_prepare_persist: AppPerformanceOperationSnapshotFfi,
     pub group_create_pending_welcome_index: AppPerformanceOperationSnapshotFfi,
@@ -184,6 +185,7 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             group_member_key_package_prewarm,
             group_create_key_package_cache_reuse,
             group_create_key_package_network_resolution,
+            group_create_image_preprocess,
             group_create_image_upload,
             group_create_mls_prepare_persist,
             group_create_pending_welcome_index,
@@ -250,6 +252,7 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             group_create_key_package_cache_reuse: group_create_key_package_cache_reuse.into(),
             group_create_key_package_network_resolution:
                 group_create_key_package_network_resolution.into(),
+            group_create_image_preprocess: group_create_image_preprocess.into(),
             group_create_image_upload: group_create_image_upload.into(),
             group_create_mls_prepare_persist: group_create_mls_prepare_persist.into(),
             group_create_pending_welcome_index: group_create_pending_welcome_index.into(),
