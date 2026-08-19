@@ -1,7 +1,125 @@
 # Marmot Integrations
 
-This directory contains host integrations that let external agent runtimes talk
-to Marmot through the local `wn-agent` connector.
+This directory contains the connectors that let White Noise users chat with
+existing agent runtimes through the local `wn-agent` service.
+
+## Get Started: White Noise + Agents
+
+You need:
+
+- White Noise on your phone, with your account `npub` available;
+- one supported agent runtime already installed, authenticated, and working on
+  the same Mac or Linux machine where you will run the connector;
+- Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel.
+
+Choose the runtime you already use:
+
+| Runtime | Connector style | Best fit |
+| --- | --- | --- |
+| Hermes | Gateway plugin | Rich chat history, reactions, media, and live previews |
+| OpenClaw | Channel plugin | Rich gateway routing, media, and live previews |
+| Codex | Terminal harness | Repository and coding tasks through Codex |
+| OpenCode | Terminal harness | Repository and coding tasks through OpenCode |
+| Pi | Terminal harness | Repository and coding tasks through Pi |
+
+The guided installers prompt on the terminal for the White Noise account that
+may invite and message the agent. They install release `wn-agent-v0.9.14`, create
+an isolated White Noise identity for the selected connector, and start same-user
+services where supported.
+
+### Hermes
+
+Hermes 0.19.0 or newer must already be installed and working.
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | bash
+```
+
+### OpenClaw
+
+OpenClaw 2026.7.1 or newer and Node 22.19 or newer must already be installed.
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh | bash
+```
+
+### Codex
+
+Codex must already be installed, authenticated, and runnable as `codex`.
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh | bash
+```
+
+### OpenCode
+
+OpenCode 1.18.18 or newer must already be installed and runnable as `opencode`.
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-opencode-marmot.sh | bash
+```
+
+### Pi
+
+Pi must already be installed, authenticated, and runnable as `pi`.
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-pi-marmot.sh | bash
+```
+
+### Finish In White Noise
+
+Release 0.9.14 records the new agent's `npub` and `nprofile` in the
+`bootstrap.json` path printed at completion. Display them with:
+
+```sh
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["npub"]); print(d["nprofile"])' \
+  "$HOME/.marmot-agents/codex/bootstrap.json"
+```
+
+Use `hermes`, `openclaw`, `codex`, `harnesses` (OpenCode), or `pi` in that path.
+The updated source installers also show these values directly and render a
+terminal QR when `qrencode` is installed; that improvement will apply to the
+next immutable release.
+
+1. Add the displayed agent identity in White Noise.
+2. Invite it to a direct message or group from the account you authorized.
+3. Send a test message.
+
+Hermes and OpenClaw print one final gateway restart command because the installer
+does not restart an existing gateway. Codex, OpenCode, and Pi services are
+started by the default install. Their first group message can be `/<path>` to
+select a working directory under your home directory.
+
+### Repeatable Agent Or CI Setup
+
+Use the immutable release URL and provide the authorized White Noise account
+explicitly. Terminal harnesses and OpenClaw use the welcomer entry for both
+invitation and prompt authorization.
+
+```sh
+OWNER_NPUB=npub1...
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh | \
+  bash -s -- --yes --allow-welcomer "$OWNER_NPUB"
+```
+
+Replace `codex` in the URL with `openclaw`, `opencode`, or `pi`. Hermes keeps
+invite acceptance and message-sender authorization explicit:
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | \
+  bash -s -- --yes --allow-welcomer "$OWNER_NPUB" --allow-user "$OWNER_NPUB"
+```
+
+Every installer verifies the downloaded binary and plugin assets against the
+checksums from the same immutable release. For independent
+verification of the installer itself, download its adjacent `.sha256` asset
+before running it.
+
+Use each connector's README for existing-identity imports, shared deployments,
+execution profiles, manual service control, and development workflows.
+
+## How The Connectors Fit Together
 
 Current integrations:
 

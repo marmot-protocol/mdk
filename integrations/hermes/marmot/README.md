@@ -48,27 +48,24 @@ Prerequisites:
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-One-line install:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
-```
+Use the canonical [White Noise + Agents quickstart](../../README.md#hermes) for
+the current guided install command and the steps to finish in White Noise.
 
 In guided setup, the allowed-message-sender prompt accepts one or more `npub` or
 raw hex public keys separated by commas. Leaving that prompt blank explicitly
 opens Marmot messaging to every sender by writing
 `MARMOT_ALLOW_ALL_USERS=true`.
 
-For repeatable noninteractive setup, pass the allowed inviter/welcomer and allowed
-message sender as either an `npub` or raw hex public key. `--allow-user` may be
-repeated or given a comma-separated list to authorize multiple senders:
+For repeatable noninteractive setup, configure the allowed inviter and message
+sender explicitly:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
-  bash -s -- --yes \
-    --allow-welcomer npub1... \
-    --allow-user npub1...,0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1... --allow-user npub1...
 ```
+
+Both options may be repeated. `--allow-user` may also contain a comma-separated
+list when the sender set differs from the inviter set.
 
 Generated-identity onboarding is the default (and can be selected explicitly
 with `--generate-identity`). To preserve an existing Nostr identity, place its
@@ -76,7 +73,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 `0600`, then use a pinned release URL:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.9/install-hermes-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh" | \
   bash -s -- \
     --yes \
     --existing-identity-file "$HOME/.config/example/hermes-agent.nsec" \
@@ -103,7 +100,7 @@ the installers never opt into shared home/socket state silently.
 To accept Marmot messages from any sender (explicit opt-in):
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh" | \
   bash -s -- --yes --allow-all-users
 ```
 

@@ -93,6 +93,7 @@ run_linux_service_case() {
     : >"$log_file"
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
+    TEST_LEGACY_BOOTSTRAP="${TEST_LEGACY_BOOTSTRAP:-0}" \
     TEST_HARNESS_BINARY="$harness_binary" \
     HOME="$fixture_root/home" \
     MARMOT_HOME="$fixture_root/marmot-home" \
@@ -170,7 +171,7 @@ mkdir -p "$destination/$binary-$platform"
 cat >"$destination/$binary-$platform/$binary" <<'SCRIPT'
 #!/usr/bin/env bash
 if [ "${1:-}" = bootstrap ]; then
-    printf '%s\n' '{"account_id_hex":"aa","welcomer_account_ids_hex":["bb"]}'
+    printf '%s\n' '{"account_id_hex":"aa","welcomer_account_ids_hex":["bb"],"npub":"npub-test","nprofile":"nprofile-test"}'
 fi
 SCRIPT
 chmod +x "$destination/$binary-$platform/$binary"
@@ -205,6 +206,12 @@ cat >/dev/null
 case "$code" in
     *account_id_hex*) printf '%s\n' aa ;;
     *welcomer_account_ids_hex*) printf '%s\n' bb ;;
+    *'json.load(sys.stdin).get("npub", "")'*)
+        [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' npub-test
+        ;;
+    *'json.load(sys.stdin).get("nprofile", "")'*)
+        [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' nprofile-test
+        ;;
     *) exit 1 ;;
 esac
 EOF
@@ -212,6 +219,20 @@ chmod +x "$mock_bin"/*
 
 fresh_log="$fixture_root/systemctl-fresh.log"
 run_linux_service_case "$fixture_root" 0 "$fresh_log"
+installer_output="$fixture_root/installer-output.log"
+grep -F "npub: npub-test" "$installer_output" >/dev/null
+grep -F "nprofile: nprofile-test" "$installer_output" >/dev/null
+grep -F "Services were installed and started for the current user." "$installer_output" >/dev/null
+if grep -Fq "To run it manually:" "$installer_output"; then
+    echo "$kind installer printed manual-start steps after starting services" >&2
+    exit 1
+fi
+
+legacy_log="$fixture_root/systemctl-legacy.log"
+TEST_LEGACY_BOOTSTRAP=1 run_linux_service_case "$fixture_root" 1 "$legacy_log" --no-service
+legacy_output="$fixture_root/installer-output.log"
+grep -F "White Noise agent identity was not returned by this wn-agent release." "$legacy_output" >/dev/null
+grep -F "Inspect the bootstrap response at: $fixture_root/marmot-home/bootstrap.json" "$legacy_output" >/dev/null
 assert_log_contains "$fresh_log" "--user enable --now $agent_service"
 assert_log_contains "$fresh_log" "--user enable --now $harness_service"
 assert_log_excludes "$fresh_log" "--user restart $agent_service"
@@ -428,6 +449,10 @@ esac
 case "$installer_dry_run" in
     *"Terminal harness agent:"*"home: $default_home"* ) ;;
     *) echo "$kind installer dry-run did not use terminal harness Marmot home" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Dry run complete. No services were installed or started."* ) ;;
+    *) echo "$kind installer dry-run claimed that services were started" >&2; exit 1;;
 esac
 case "$installer_dry_run" in
     *"--socket $default_home/dev/wn-agent.sock"* ) ;;

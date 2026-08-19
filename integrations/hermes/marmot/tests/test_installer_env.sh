@@ -69,7 +69,7 @@ case "$archive_name" in
         cat >"$output_dir/wn-agent" <<'SCRIPT'
 #!/usr/bin/env bash
 if [ "${1:-}" = bootstrap ]; then
-    printf '%s\n' '{"account_id_hex":"aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4","welcomer_account_ids_hex":["bb"]}'
+    printf '%s\n' '{"account_id_hex":"aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4","welcomer_account_ids_hex":["bb"],"npub":"npub-test","nprofile":"nprofile-test"}'
 fi
 SCRIPT
         chmod +x "$output_dir/wn-agent"

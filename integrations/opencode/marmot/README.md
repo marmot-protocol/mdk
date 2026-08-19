@@ -23,17 +23,14 @@ Prerequisites:
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-One-line install:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | bash
-```
+Use the canonical [White Noise + Agents quickstart](../../README.md#opencode)
+for the current guided install command and the steps to finish in White Noise.
 
 For repeatable noninteractive setup, pass the allowed inviter and prompt sender
 as either an `npub` or raw hex public key:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-opencode-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
 

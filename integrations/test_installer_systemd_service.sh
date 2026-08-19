@@ -89,7 +89,11 @@ case "${1:-}" in
         printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":"imported-agent","local_signing":true}'
         ;;
     bootstrap)
-        printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created":false,"welcomer_account_ids_hex":["bb"]}'
+        if [ "${WN_AGENT_LEGACY_BOOTSTRAP:-0}" = 1 ]; then
+            printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created":false,"welcomer_account_ids_hex":["bb"]}'
+        else
+            printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created":false,"welcomer_account_ids_hex":["bb"],"npub":"npub-test","nprofile":"nprofile-test"}'
+        fi
         ;;
 esac
 SCRIPT
@@ -137,6 +141,7 @@ run_case() {
     local log_file="$3"
     shift 3
     local case_root="$fixture_root/$name"
+    local output_file="$case_root/installer-output.log"
 
     mkdir -p "$case_root"
     : >"$log_file"
@@ -144,6 +149,7 @@ run_case() {
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
     WN_AGENT_LOG="$case_root/wn-agent.log" \
+    WN_AGENT_LEGACY_BOOTSTRAP="${WN_AGENT_LEGACY_BOOTSTRAP:-0}" \
     HOME="$case_root/home" \
     HERMES_HOME="$case_root/hermes-home" \
     OPENCLAW_HOME="$case_root/openclaw-home" \
@@ -152,7 +158,7 @@ run_case() {
     PATH="$mock_bin:/usr/bin:/bin" \
     WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-        "$installer" --yes "$configure_flag" --allow-welcomer "$allow_hex" "$@" >/dev/null 2>&1
+        "$installer" --yes "$configure_flag" --allow-welcomer "$allow_hex" "$@" >"$output_file" 2>&1
 }
 
 assert_log_equals() {
@@ -169,9 +175,18 @@ assert_log_equals() {
 
 fresh_log="$fixture_root/systemctl-fresh.log"
 run_case fresh 0 "$fresh_log"
+fresh_output="$fixture_root/fresh/installer-output.log"
+grep -F "npub: npub-test" "$fresh_output" >/dev/null
+grep -F "nprofile: nprofile-test" "$fresh_output" >/dev/null
 assert_log_equals "$fresh_log" "--user daemon-reload
 --user is-active --quiet $service
 --user enable --now $service"
+
+legacy_log="$fixture_root/systemctl-legacy.log"
+WN_AGENT_LEGACY_BOOTSTRAP=1 run_case legacy 0 "$legacy_log" --no-service
+legacy_output="$fixture_root/legacy/installer-output.log"
+grep -F "White Noise agent identity was not returned by this wn-agent release." "$legacy_output" >/dev/null
+grep -F "Inspect the bootstrap response at: $fixture_root/legacy/marmot-home/bootstrap.json" "$legacy_output" >/dev/null
 
 upgrade_log="$fixture_root/systemctl-upgrade.log"
 run_case upgrade 1 "$upgrade_log"
@@ -207,6 +222,7 @@ case "$(cat "$wn_agent_log")" in
     *) echo "$flavor installer did not import then bootstrap the exact existing identity" >&2; exit 1 ;;
 esac
 bootstrap_json="$fixture_root/existing/marmot-home/bootstrap.json"
+[ "$(stat -c %a "$bootstrap_json")" = 600 ]
 python3 - "$bootstrap_json" <<'PY'
 import json
 import sys
