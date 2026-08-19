@@ -220,6 +220,31 @@ fn generated_setup_context_is_private_and_removed_with_the_journal() {
 }
 
 #[test]
+fn generated_setup_context_is_absent_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+
+    assert!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn generated_setup_context_write_requires_a_setup_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+
+    assert!(matches!(
+        home.set_account_setup_context(&account.label, b"{}"),
+        Err(AccountHomeError::AccountSetupStateMissing)
+    ));
+}
+
+#[test]
 fn account_home_idempotent_import_reuses_existing_identity() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

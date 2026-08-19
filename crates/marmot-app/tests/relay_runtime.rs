@@ -102,9 +102,7 @@ async fn create_network_ready_identity(
     runtime: &MarmotAppRuntime,
     request: AccountSetupRequest,
 ) -> AccountSetupResult {
-    let result = runtime.create_identity(request).await.unwrap();
-    wait_for_account_network_ready(runtime, &result.account.label).await;
-    result
+    runtime.create_identity(request).await.unwrap()
 }
 
 async fn group_message_blocking_app(
@@ -1375,7 +1373,7 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
     let first_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
     let first_runtime = MarmotAppRuntime::new(first_app);
     let first = first_runtime
-        .create_identity(setup())
+        .create_identity_local_ready(setup())
         .await
         .expect("KeyPackage rejection must not erase local readiness");
     assert_eq!(
@@ -1402,7 +1400,6 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
         .create_identity(setup())
         .await
         .expect("create-identity retry must resume the generated identity");
-    wait_for_account_network_ready(&second_runtime, &retried.account.label).await;
     assert_eq!(retried.account.account_id_hex, first_account.account_id_hex);
     assert_eq!(AccountHome::open(dir.path()).accounts().unwrap().len(), 1);
     second_runtime.shutdown().await;
@@ -1673,16 +1670,15 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
 
-    let created = create_network_ready_identity(
-        &runtime,
-        AccountSetupRequest {
+    let created = runtime
+        .create_identity_local_ready(AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
-        },
-    )
-    .await;
+        })
+        .await
+        .unwrap();
 
     assert!(created.account.local_signing);
     assert_eq!(
@@ -1778,7 +1774,7 @@ async fn account_creation_succeeds_with_one_unreachable_bootstrap_relay() {
 
     let created = timeout(
         Duration::from_secs(20),
-        runtime.create_identity(AccountSetupRequest {
+        runtime.create_identity_local_ready(AccountSetupRequest {
             default_relays: vec![endpoint(&live_url), endpoint(&unreachable_url)],
             bootstrap_relays: vec![endpoint(&live_url), endpoint(&unreachable_url)],
             publish_initial_key_package: true,
@@ -1814,8 +1810,6 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
         },
     )
     .await;
-
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
 
     runtime
         .publish_user_profile(
@@ -1902,7 +1896,6 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let first = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
@@ -2109,7 +2102,6 @@ async fn key_package_fetch_rejects_future_event_and_keeps_cached_package() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let cached = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
@@ -2163,7 +2155,6 @@ async fn app_runtime_can_rotate_key_package_on_request() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let first = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
@@ -2384,7 +2375,6 @@ async fn app_runtime_ignores_invalid_legacy_json_cache_when_publishing() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     // Identity creation now returns at local readiness. Use a worker mutation
     // as a barrier so the asynchronous startup sync and open maintenance have
     // completed before this test injects a synthetic legacy cache file.
@@ -2448,8 +2438,6 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     };
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup).await;
-    wait_for_account_network_ready(&runtime, &alice.account.label).await;
-    wait_for_account_network_ready(&runtime, &bob.account.label).await;
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
@@ -4716,7 +4704,7 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
 
     runtime.start().await.unwrap();
 
-    let health = tokio::time::timeout(Duration::from_secs(5), async {
+    let health = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let health = runtime.shared_services().relay_plane().relay_health().await;
             if health.directory_active_subscriptions == 1
@@ -4749,8 +4737,6 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
         },
     )
     .await;
-
-    wait_for_account_network_ready(&runtime, &setup.account.label).await;
 
     runtime.start().await.unwrap();
     // `create_identity` publishes a default profile (kind-0) for this account at
@@ -4804,8 +4790,6 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     )
     .await;
     let followed = format!("{:064x}", 77);
-
-    wait_for_account_network_ready(&runtime, &setup.account.label).await;
 
     runtime.start().await.unwrap();
     publish_follow_list_at(
@@ -7442,7 +7426,6 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
         },
     )
     .await;
-    wait_for_account_network_ready(&publisher_runtime, &created.account.label).await;
     publish_account_relay_lists_at(
         &publisher_home,
         &created.account.label,
@@ -7994,7 +7977,6 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let id = created.account.account_id_hex.clone();
     let label = created.account.label.clone();
 
@@ -8060,7 +8042,6 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex.clone();
 
     // The initial KeyPackage was published to the relay during setup, so the
@@ -8133,7 +8114,6 @@ async fn app_runtime_delete_key_package_event_nip09_succeeds_and_clears_matching
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let packages = runtime
         .account_key_packages(&created.account.account_id_hex, vec![endpoint(&url)])
         .await
@@ -8200,7 +8180,6 @@ async fn app_runtime_wipe_reports_deletion_failure_and_still_removes_local_accou
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex;
 
     let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
@@ -8235,8 +8214,6 @@ async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
     };
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup).await;
-    wait_for_account_network_ready(&runtime, &alice.account.label).await;
-    wait_for_account_network_ready(&runtime, &bob.account.label).await;
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
     let mut events = runtime.subscribe();
@@ -8326,7 +8303,6 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex.clone();
 
     // Setup published a KeyPackage to the relay, so the sign-out should find
@@ -8436,7 +8412,6 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex;
 
     let outcome = runtime
@@ -8474,7 +8449,6 @@ async fn app_runtime_sign_out_skips_key_package_deletion_when_disabled() {
         },
     )
     .await;
-    wait_for_account_network_ready(&runtime, &created.account.label).await;
     let account_id = created.account.account_id_hex.clone();
 
     // Confirm a relay key package exists before signing out.

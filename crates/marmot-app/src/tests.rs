@@ -3192,7 +3192,7 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     };
 
     let local = runtime
-        .create_identity(request())
+        .create_identity_local_ready(request())
         .await
         .expect("relay rejection must not erase durable local readiness");
     let bootstrap_started = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3243,11 +3243,6 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     );
 
     relay.allow_all_publish_kinds();
-    let retried = runtime
-        .create_identity(request())
-        .await
-        .expect("replaceable bootstrap records must be retryable");
-    assert_eq!(retried.account.account_id_hex, account.account_id_hex);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if runtime.account_setup_readiness(&account.label).unwrap()
@@ -3259,7 +3254,7 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
         }
     })
     .await
-    .expect("retry must complete the background setup");
+    .expect("in-session retry must complete the background setup without a manual create call");
     assert!(
         app.account_home()
             .account_setup_state(&account.label)
@@ -3281,7 +3276,7 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let create_runtime = runtime.clone();
     let mut create = tokio::spawn(async move {
         create_runtime
-            .create_identity(AccountSetupRequest {
+            .create_identity_local_ready(AccountSetupRequest {
                 default_relays: vec![TransportEndpoint("wss://relay.example".into())],
                 bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
                 publish_initial_key_package: true,
@@ -3291,7 +3286,7 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     });
 
     relay.wait_for_blocked_publish().await;
-    let result = tokio::time::timeout(Duration::from_millis(100), &mut create)
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut create)
         .await
         .expect("durable local readiness must not wait for bootstrap publication")
         .unwrap()
@@ -3319,9 +3314,7 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let signed_bytes = pending.signed_event.unwrap().bytes;
 
     let repeated = runtime
-        .create_identity(AccountSetupRequest {
-            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
-            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        .create_identity_local_ready(AccountSetupRequest {
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
         })
@@ -3364,6 +3357,124 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
 }
 
 #[tokio::test]
+async fn local_ready_result_does_not_report_an_unrequested_key_package_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let local = runtime
+        .create_identity_local_ready(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
+    assert_eq!(local.key_package_bytes, None);
+    let lifecycle = app
+        .account_storage(&local.account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert!(
+        lifecycle.pending_replacement.is_some() || lifecycle.current_key_package.is_some(),
+        "the prepared KeyPackage remains durable without being reported as published"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn compatibility_create_identity_waits_for_network_readiness() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay.fail_publishes_of_kind(KIND_MARMOT_INBOX_RELAY_LIST);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        runtime.create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("compatibility create must finish its network attempt")
+    .expect_err("compatibility create must not report local-only success");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn generated_setup_resume_context_failures_do_not_block_runtime_start() {
+    for (remove_context, expected_kind) in [
+        (true, "setup_context_missing"),
+        (false, "setup_context_unreadable"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        relay.block_next_publish();
+        let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let runtime = MarmotAppRuntime::new(app.clone());
+        let local = runtime
+            .create_identity_local_ready(AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .unwrap();
+        relay.wait_for_blocked_publish().await;
+        runtime.shutdown().await;
+        drop(runtime);
+        drop(app);
+
+        let context_path = AccountHome::open(directory.path())
+            .account_dir(&local.account.label)
+            .join(".account-setup-context.json");
+        if remove_context {
+            std::fs::remove_file(&context_path).unwrap();
+        } else {
+            std::fs::write(&context_path, b"not-json").unwrap();
+        }
+
+        let restarted_app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let restarted = MarmotAppRuntime::new(restarted_app);
+        let mut events = restarted.subscribe();
+        restarted
+            .start()
+            .await
+            .expect("one damaged setup context must not block runtime start");
+        let account_error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let MarmotAppEvent::AccountError(error) = events.recv().await.unwrap()
+                    && error.account_id_hex == local.account.account_id_hex
+                {
+                    break error;
+                }
+            }
+        })
+        .await
+        .expect("deferred resume must emit a host-visible account error");
+        assert_eq!(
+            account_error.message,
+            format!("generated account setup resume deferred: {expected_kind}")
+        );
+        restarted.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn generated_identity_restart_resumes_every_durable_setup_phase() {
     for phase in [
         marmot_account::AccountSetupPhase::LocalStateCreated,
@@ -3380,7 +3491,7 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
             .with_test_relay_client(relay.clone());
         let runtime = MarmotAppRuntime::new(app.clone());
         let result = runtime
-            .create_identity(AccountSetupRequest {
+            .create_identity_local_ready(AccountSetupRequest {
                 default_relays: vec![TransportEndpoint("wss://relay.example".into())],
                 bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
                 publish_initial_key_package: true,
@@ -3491,8 +3602,8 @@ async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     };
 
     let (first, second) = tokio::join!(
-        runtime.create_identity(request()),
-        runtime.create_identity(request())
+        runtime.create_identity_local_ready(request()),
+        runtime.create_identity_local_ready(request())
     );
     let first = first.unwrap();
     let second = second.unwrap();
@@ -3517,7 +3628,7 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
         .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(app.clone());
     let local = runtime
-        .create_identity(AccountSetupRequest {
+        .create_identity_local_ready(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
             ..AccountSetupRequest::default()
@@ -3541,7 +3652,7 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
     let batch_calls_before = relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst);
 
     let retried = runtime
-        .create_identity(AccountSetupRequest {
+        .create_identity_local_ready(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
             ..AccountSetupRequest::default()

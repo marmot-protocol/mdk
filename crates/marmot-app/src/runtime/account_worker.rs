@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
-use marmot_account::{AccountSetupKind, AccountSetupPhase};
+use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -547,21 +547,16 @@ async fn run_app_runtime_account_worker(
     // still background work, and that task may advance the journal as soon as
     // the ready signal is observed. Capturing here preserves the narrow
     // priority lane for the exact locally prepared KeyPackage.
-    let setup_key_package_phase =
-        app.account_home()
-            .account_setup_state(&account_label)
-            .map(|state| {
-                state.filter(|state| {
-                    state.kind == AccountSetupKind::GeneratedIdentity
-                        && matches!(
-                            state.phase,
-                            AccountSetupPhase::LocalReady
-                                | AccountSetupPhase::BootstrapPublicationStarted
-                                | AccountSetupPhase::BootstrapPublicationConfirmed
-                                | AccountSetupPhase::KeyPackagePublicationStarted
-                        )
-                })
-            });
+    let setup_key_package_priority =
+        setup_key_package_priority(app.account_home().account_setup_state(&account_label));
+    if let Err(error) = &setup_key_package_priority {
+        publish_app_runtime_account_error(
+            &events,
+            &account_id_hex,
+            &account_label,
+            account_error_message("account setup state lookup failed", error),
+        );
+    }
     if let Some(ready) = ready.take() {
         shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountWorkerReadiness,
@@ -576,8 +571,8 @@ async fn run_app_runtime_account_worker(
     // publish (or retry) the lifecycle-owned exact KeyPackage before unrelated
     // hydration and initial catch-up. General mutations, including the public
     // PublishKeyPackage command, remain on the ordinary startup FIFO.
-    let mut setup_key_package_result = match setup_key_package_phase {
-        Ok(Some(_)) => {
+    let mut setup_key_package_result = match setup_key_package_priority {
+        Ok(SetupKeyPackagePriority::PublishExactDurableInitial) => {
             let started_at = Instant::now();
             let result = async {
                 let key_package = client.publish_setup_key_package().await?;
@@ -600,8 +595,8 @@ async fn run_app_runtime_account_worker(
             );
             Some(result)
         }
-        Ok(_) => None,
-        Err(error) => Some(Err(error.into())),
+        Ok(SetupKeyPackagePriority::Skip) => None,
+        Err(error) => Some(Err(error)),
     };
 
     // Background hydration pipeline (mdk#1161): the deferred open above only
@@ -4304,6 +4299,32 @@ fn agent_stream_runtime_event(
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupKeyPackagePriority {
+    PublishExactDurableInitial,
+    Skip,
+}
+
+fn setup_key_package_priority(
+    state: Result<Option<AccountSetupState>, AccountHomeError>,
+) -> Result<SetupKeyPackagePriority, AppError> {
+    let publish = state?.is_some_and(|state| {
+        state.kind == AccountSetupKind::GeneratedIdentity
+            && matches!(
+                state.phase,
+                AccountSetupPhase::LocalReady
+                    | AccountSetupPhase::BootstrapPublicationStarted
+                    | AccountSetupPhase::BootstrapPublicationConfirmed
+                    | AccountSetupPhase::KeyPackagePublicationStarted
+            )
+    });
+    Ok(if publish {
+        SetupKeyPackagePriority::PublishExactDurableInitial
+    } else {
+        SetupKeyPackagePriority::Skip
+    })
+}
+
 /// Build a [`RuntimeAccountError`] message from a static prefix and the
 /// error's privacy-safe kind. These messages leave the runtime: the CLI daemon
 /// persists them into `wn daemon status --json` and the TUI, and host apps may
@@ -4347,6 +4368,79 @@ mod tests {
     use crate::tests::ScriptedPushRelayClient;
     use crate::{AuditLogSettings, MarmotApp};
     use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
+
+    fn setup_state(kind: AccountSetupKind, phase: AccountSetupPhase) -> AccountSetupState {
+        AccountSetupState {
+            account_id_hex: "00".repeat(32),
+            reused_account_id_credential: false,
+            kind,
+            phase,
+        }
+    }
+
+    #[test]
+    fn generated_setup_priority_selects_the_exact_durable_initial_key_package() {
+        for phase in [
+            AccountSetupPhase::LocalReady,
+            AccountSetupPhase::BootstrapPublicationStarted,
+            AccountSetupPhase::BootstrapPublicationConfirmed,
+            AccountSetupPhase::KeyPackagePublicationStarted,
+        ] {
+            assert_eq!(
+                setup_key_package_priority(Ok(Some(setup_state(
+                    AccountSetupKind::GeneratedIdentity,
+                    phase,
+                ))))
+                .unwrap(),
+                SetupKeyPackagePriority::PublishExactDurableInitial,
+                "phase {phase:?} must select the lifecycle-owned initial KeyPackage"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_priority_rejects_imported_absent_and_terminal_states() {
+        for phase in [
+            AccountSetupPhase::LocalReady,
+            AccountSetupPhase::BootstrapPublicationStarted,
+            AccountSetupPhase::BootstrapPublicationConfirmed,
+            AccountSetupPhase::KeyPackagePublicationStarted,
+        ] {
+            assert_eq!(
+                setup_key_package_priority(Ok(Some(setup_state(
+                    AccountSetupKind::ImportedIdentity,
+                    phase,
+                ))))
+                .unwrap(),
+                SetupKeyPackagePriority::Skip
+            );
+        }
+        for phase in [
+            AccountSetupPhase::LocalStateCreated,
+            AccountSetupPhase::KeyPackagePublicationConfirmed,
+        ] {
+            assert_eq!(
+                setup_key_package_priority(Ok(Some(setup_state(
+                    AccountSetupKind::GeneratedIdentity,
+                    phase,
+                ))))
+                .unwrap(),
+                SetupKeyPackagePriority::Skip
+            );
+        }
+        assert_eq!(
+            setup_key_package_priority(Ok(None)).unwrap(),
+            SetupKeyPackagePriority::Skip
+        );
+    }
+
+    #[test]
+    fn setup_state_lookup_failure_never_enters_the_publication_lane() {
+        let error = setup_key_package_priority(Err(AccountHomeError::AccountSetupStateMissing))
+            .expect_err("lookup failure must be surfaced");
+
+        assert!(matches!(error, AppError::AccountHome(_)));
+    }
 
     fn test_group_id(byte: u8) -> GroupId {
         GroupId::new(vec![byte])

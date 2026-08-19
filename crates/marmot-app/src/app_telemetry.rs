@@ -1098,6 +1098,12 @@ mod tests {
             (AppPerformanceOperation::AccountDefaultProfilePublish, 35),
             (AppPerformanceOperation::AccountInitialKeyPackagePublish, 25),
             (AppPerformanceOperation::AccountInitialSyncOverlap, 0),
+            (AppPerformanceOperation::AccountSetupIdentityLocal, 1),
+            (AppPerformanceOperation::AccountSetupStorageLocal, 2),
+            (AppPerformanceOperation::AccountSetupProfileLocal, 3),
+            (AppPerformanceOperation::AccountSetupKeyPackageLocal, 4),
+            (AppPerformanceOperation::AccountSetupLocalReadyHandoff, 5),
+            (AppPerformanceOperation::AccountSetupNetworkReady, 6),
         ] {
             telemetry.record(operation, Duration::from_millis(duration_ms), true);
         }
@@ -1132,6 +1138,52 @@ mod tests {
         );
         assert_eq!(snapshot.account_initial_sync_overlap.successes, 1);
         assert_eq!(snapshot.account_initial_sync_overlap.duration_ms.sum_ms, 0);
+        assert_eq!(snapshot.account_setup_identity_local.duration_ms.sum_ms, 1);
+        assert_eq!(snapshot.account_setup_storage_local.duration_ms.sum_ms, 2);
+        assert_eq!(snapshot.account_setup_profile_local.duration_ms.sum_ms, 3);
+        assert_eq!(
+            snapshot.account_setup_key_package_local.duration_ms.sum_ms,
+            4
+        );
+        assert_eq!(
+            snapshot
+                .account_setup_local_ready_handoff
+                .duration_ms
+                .sum_ms,
+            5
+        );
+        assert_eq!(snapshot.account_setup_network_ready.duration_ms.sum_ms, 6);
+    }
+
+    #[test]
+    fn records_each_generated_account_setup_stage_and_outcome() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms) in [
+            (AppPerformanceOperation::AccountSetupIdentityLocal, 1),
+            (AppPerformanceOperation::AccountSetupStorageLocal, 2),
+            (AppPerformanceOperation::AccountSetupProfileLocal, 3),
+            (AppPerformanceOperation::AccountSetupKeyPackageLocal, 4),
+            (AppPerformanceOperation::AccountSetupLocalReadyHandoff, 5),
+            (AppPerformanceOperation::AccountSetupNetworkReady, 6),
+        ] {
+            telemetry.record(operation, Duration::from_millis(duration_ms), true);
+            telemetry.record(operation, Duration::from_millis(duration_ms), false);
+        }
+
+        let snapshot = telemetry.snapshot();
+        for (stage, expected_sum_ms) in [
+            (snapshot.account_setup_identity_local, 2),
+            (snapshot.account_setup_storage_local, 4),
+            (snapshot.account_setup_profile_local, 6),
+            (snapshot.account_setup_key_package_local, 8),
+            (snapshot.account_setup_local_ready_handoff, 10),
+            (snapshot.account_setup_network_ready, 12),
+        ] {
+            assert_eq!(stage.attempts, 2);
+            assert_eq!(stage.successes, 1);
+            assert_eq!(stage.failures, 1);
+            assert_eq!(stage.duration_ms.sum_ms, expected_sum_ms);
+        }
     }
 
     #[test]
@@ -1225,6 +1277,37 @@ mod tests {
         assert_eq!(snapshot.chat_list_row_read.failures, 1);
         assert_eq!(snapshot.chat_list_row_read.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.chat_list_row_read.duration_ms.sum_ms, 13);
+    }
+
+    #[test]
+    fn records_group_conversation_snapshot_read_operation() {
+        let telemetry = AppPerformanceTelemetry::default();
+        telemetry.record(
+            AppPerformanceOperation::GroupConversationSnapshotRead,
+            Duration::from_millis(6),
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::GroupConversationSnapshotRead,
+            Duration::from_millis(10),
+            false,
+        );
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_conversation_snapshot_read.attempts, 2);
+        assert_eq!(snapshot.group_conversation_snapshot_read.successes, 1);
+        assert_eq!(snapshot.group_conversation_snapshot_read.failures, 1);
+        assert_eq!(
+            snapshot
+                .group_conversation_snapshot_read
+                .duration_ms
+                .sample_count(),
+            2
+        );
+        assert_eq!(
+            snapshot.group_conversation_snapshot_read.duration_ms.sum_ms,
+            16
+        );
     }
 
     #[test]

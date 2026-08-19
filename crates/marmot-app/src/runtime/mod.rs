@@ -148,6 +148,9 @@ struct GeneratedSetupTasks {
     handles: Vec<JoinHandle<()>>,
 }
 
+const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
+const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     relay_plane: MarmotRelayPlane,
@@ -861,6 +864,8 @@ impl AccountSetupRequest {
 pub struct AccountSetupResult {
     pub account: AccountSummary,
     pub relay_lists: AccountRelayListStatus,
+    /// Size of the initial KeyPackage when its publication was requested.
+    /// `None` never represents a published package.
     pub key_package_bytes: Option<usize>,
     pub profile: Option<UserProfileMetadata>,
     pub readiness: AccountSetupReadiness,
@@ -3614,7 +3619,19 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_or_import_account(request).await
+        self.create_generated_account_network_ready(request).await
+    }
+
+    /// Create a generated identity and return once its local artifacts are
+    /// durable, while relay publication continues in the background.
+    pub async fn create_identity_local_ready(
+        &self,
+        mut request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
+        request.identity = None;
+        self.create_generated_account_local_ready(request, true)
+            .await
     }
 
     pub async fn login(
@@ -3663,7 +3680,7 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         if request.identity.is_none() && request.import_nsec.is_none() {
-            return self.create_generated_account_local_ready(request).await;
+            return self.create_generated_account_network_ready(request).await;
         }
         self.create_or_import_account_network_ready(request).await
     }
@@ -3715,26 +3732,79 @@ impl MarmotAppRuntime {
             .account_home()
             .account_setup_context(&account.label)?
         else {
+            self.report_generated_setup_resume_deferred(&account, "setup_context_missing");
             return Ok(());
         };
-        let context: GeneratedAccountSetupContext = serde_json::from_slice(&bytes)?;
-        self.create_generated_account_local_ready(context.request())
-            .await?;
+        let context = match serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
+            Ok(context) => context,
+            Err(_) => {
+                self.report_generated_setup_resume_deferred(&account, "setup_context_unreadable");
+                return Ok(());
+            }
+        };
+        if let Err(error) = self
+            .create_generated_account_local_ready(context.request(), true)
+            .await
+        {
+            self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
+        }
         Ok(())
+    }
+
+    fn report_generated_setup_resume_deferred(
+        &self,
+        account: &AccountSummary,
+        error_kind: &'static str,
+    ) {
+        tracing::warn!(
+            target: "marmot_app::runtime",
+            method = "resume_generated_account_setup",
+            error_kind,
+            "generated account setup resume deferred"
+        );
+        let _ = self
+            .events
+            .send(MarmotAppEvent::AccountError(RuntimeAccountError {
+                account_id_hex: account.account_id_hex.clone(),
+                account_label: account.label.clone(),
+                message: format!("generated account setup resume deferred: {error_kind}"),
+            }));
     }
 
     async fn create_generated_account_local_ready(
         &self,
         request: AccountSetupRequest,
+        schedule_background: bool,
     ) -> Result<AccountSetupResult, AppError> {
         let started_at = Instant::now();
         self.shared.lifecycle().ensure_running()?;
         let _generated_setup_transaction =
             self.accounts.generated_setup_local_transaction.lock().await;
         validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
+
+        let resumable = self
+            .accounts
+            .app
+            .account_home()
+            .resumable_generated_account_setup()?;
+        // Persisted relays win on resume so every retry retains the exact
+        // locally prepared initial KeyPackage and its publication targets.
+        let context = match resumable.as_ref() {
+            Some(account) => match self
+                .accounts
+                .app
+                .account_home()
+                .account_setup_context(&account.label)?
+            {
+                Some(bytes) => serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)?,
+                None => GeneratedAccountSetupContext::from_request(&request),
+            },
+            None => GeneratedAccountSetupContext::from_request(&request),
+        };
+        let effective_request = context.request();
         let bootstrap = AccountRelayListBootstrap::new(
-            request.default_relays.clone(),
-            request.bootstrap_relays.clone(),
+            effective_request.default_relays.clone(),
+            effective_request.bootstrap_relays.clone(),
         );
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
@@ -3744,35 +3814,35 @@ impl MarmotAppRuntime {
             .validate_account_relay_list_declarations(&bootstrap, None)?;
 
         let identity_started = Instant::now();
-        let (account, _) = self.accounts.create_nostr_account_from_setup(&request)?;
+        let identity_result = self
+            .accounts
+            .create_nostr_account_from_setup(&effective_request);
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupIdentityLocal,
             identity_started.elapsed(),
-            true,
+            identity_result.is_ok(),
         );
-        let context = match self
+        let (account, _) = identity_result?;
+        if self
             .accounts
             .app
             .account_home()
             .account_setup_context(&account.label)?
+            .is_none()
         {
-            Some(bytes) => serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)?,
-            None => {
-                let context = GeneratedAccountSetupContext::from_request(&request);
-                self.accounts
-                    .app
-                    .account_home()
-                    .set_account_setup_context(&account.label, &serde_json::to_vec(&context)?)?;
-                context
-            }
-        };
+            self.accounts
+                .app
+                .account_home()
+                .set_account_setup_context(&account.label, &serde_json::to_vec(&context)?)?;
+        }
         let storage_started = Instant::now();
-        self.accounts.app.account_storage(&account.label)?;
+        let storage_result = self.accounts.app.account_storage(&account.label);
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupStorageLocal,
             storage_started.elapsed(),
-            true,
+            storage_result.is_ok(),
         );
+        storage_result?;
         let phase = self
             .accounts
             .app
@@ -3782,103 +3852,141 @@ impl MarmotAppRuntime {
             .ok_or(AppError::AccountSetupRetryRequired)?;
 
         let profile_started = Instant::now();
-        let profile = if let Some(profile) = self
-            .accounts
-            .app
-            .directory_entry_for_account_id(&account.account_id_hex)?
-            .and_then(|entry| entry.profile)
-        {
-            profile
-        } else {
-            let pseudonym = default_profile_pseudonym(&account.account_id_hex);
-            let profile = UserProfileMetadata {
-                name: Some(pseudonym.clone()),
-                display_name: Some(pseudonym),
-                created_at: unix_now_seconds(),
-                ..UserProfileMetadata::default()
-            };
-            self.accounts
+        let profile_result = (|| {
+            if let Some(profile) = self
+                .accounts
                 .app
-                .remember_directory_profile(&account.account_id_hex, &profile)?;
-            profile
-        };
+                .directory_entry_for_account_id(&account.account_id_hex)?
+                .and_then(|entry| entry.profile)
+            {
+                Ok(profile)
+            } else {
+                let pseudonym = default_profile_pseudonym(&account.account_id_hex);
+                let profile = UserProfileMetadata {
+                    name: Some(pseudonym.clone()),
+                    display_name: Some(pseudonym),
+                    created_at: unix_now_seconds(),
+                    ..UserProfileMetadata::default()
+                };
+                self.accounts
+                    .app
+                    .remember_directory_profile(&account.account_id_hex, &profile)?;
+                Ok::<_, AppError>(profile)
+            }
+        })();
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupProfileLocal,
             profile_started.elapsed(),
-            true,
+            profile_result.is_ok(),
         );
+        let profile = profile_result?;
 
         let key_package_started = Instant::now();
-        let key_package_bytes = if phase == AccountSetupPhase::LocalStateCreated {
-            let mut client = self
-                .accounts
-                .app
-                .local_client_with_relay_plane(
-                    &account.label,
-                    self.shared.relay_plane(),
-                    Some(self.shared.lifecycle()),
-                )
-                .await?;
-            let key_package = client
-                .prepare_initial_key_package(
-                    context
-                        .default_relays
-                        .iter()
-                        .cloned()
-                        .map(TransportEndpoint)
-                        .collect(),
-                )
-                .await?;
-            let bytes = key_package.bytes().len();
-            drop(client);
-            self.accounts
-                .app
-                .account_home()
-                .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
-            bytes
-        } else {
-            let lifecycle = self
-                .accounts
-                .app
-                .account_storage(&account.label)?
-                .key_package_lifecycle()?
-                .ok_or(AppError::AccountSetupRetryRequired)?;
-            lifecycle
-                .pending_replacement
-                .as_ref()
-                .map(|pending| pending.key_package.bytes().len())
-                .or_else(|| {
-                    lifecycle
-                        .current_key_package
-                        .as_ref()
-                        .map(|key_package| key_package.bytes().len())
-                })
-                .ok_or(AppError::AccountSetupRetryRequired)?
-        };
+        let key_package_result = async {
+            if phase == AccountSetupPhase::LocalStateCreated {
+                let mut client = self
+                    .accounts
+                    .app
+                    .local_client_with_relay_plane(
+                        &account.label,
+                        self.shared.relay_plane(),
+                        Some(self.shared.lifecycle()),
+                    )
+                    .await?;
+                let key_package = client
+                    .prepare_initial_key_package(effective_request.default_relays.to_vec())
+                    .await?;
+                let bytes = key_package.bytes().len();
+                drop(client);
+                self.accounts
+                    .app
+                    .account_home()
+                    .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
+                Ok(bytes)
+            } else {
+                let lifecycle = self
+                    .accounts
+                    .app
+                    .account_storage(&account.label)?
+                    .key_package_lifecycle()?
+                    .ok_or(AppError::AccountSetupRetryRequired)?;
+                lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .map(|pending| pending.key_package.bytes().len())
+                    .or_else(|| {
+                        lifecycle
+                            .current_key_package
+                            .as_ref()
+                            .map(|key_package| key_package.bytes().len())
+                    })
+                    .ok_or(AppError::AccountSetupRetryRequired)
+            }
+        }
+        .await;
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupKeyPackageLocal,
             key_package_started.elapsed(),
-            true,
+            key_package_result.is_ok(),
         );
+        let key_package_bytes = key_package_result?;
 
-        self.accounts.reconcile().await?;
         let relay_lists = self
             .accounts
             .app
             .account_relay_list_status(&account.label)?;
-        self.schedule_generated_account_setup(account.clone(), context);
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::AccountSetupLocalReadyHandoff,
-            started_at.elapsed(),
-            true,
-        );
+        if schedule_background {
+            let handoff_result = self.accounts.reconcile().await;
+            self.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountSetupLocalReadyHandoff,
+                started_at.elapsed(),
+                handoff_result.is_ok(),
+            );
+            handoff_result?;
+            self.schedule_generated_account_setup(account.clone(), context);
+        }
         Ok(AccountSetupResult {
             account,
             relay_lists,
-            key_package_bytes: Some(key_package_bytes),
+            key_package_bytes: effective_request
+                .publish_initial_key_package
+                .then_some(key_package_bytes),
             profile: Some(profile),
             readiness: AccountSetupReadiness::LocalReady,
         })
+    }
+
+    async fn create_generated_account_network_ready(
+        &self,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        let local = self
+            .create_generated_account_local_ready(request, false)
+            .await?;
+        let context = self
+            .accounts
+            .app
+            .account_home()
+            .account_setup_context(&local.account.label)?
+            .ok_or(AppError::AccountSetupRetryRequired)
+            .and_then(|bytes| {
+                serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)
+                    .map_err(AppError::from)
+            })?;
+        let started_at = Instant::now();
+        let result = self
+            .create_or_import_account_network_ready(context.request())
+            .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AccountSetupNetworkReady,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        let mut result = result?;
+        if result.profile.is_none() {
+            result.profile = local.profile;
+        }
+        Ok(result)
     }
 
     fn schedule_generated_account_setup(
@@ -3900,26 +4008,44 @@ impl MarmotAppRuntime {
         let account_id_hex = account.account_id_hex.clone();
         let account_label = account.label.clone();
         let handle = tokio::spawn(async move {
-            let started_at = Instant::now();
-            let result = manager
-                .create_or_import_account_network_ready(context.request())
-                .await;
-            manager.shared.app_performance_telemetry().record(
-                AppPerformanceOperation::AccountSetupNetworkReady,
-                started_at.elapsed(),
-                result.is_ok(),
-            );
-            if let Err(error) = result {
-                let _ = manager
-                    .events
-                    .send(MarmotAppEvent::AccountError(RuntimeAccountError {
-                        account_id_hex: account_id_hex.clone(),
-                        account_label: account_label.clone(),
-                        message: format!(
-                            "generated account publication deferred: {}",
-                            error.privacy_safe_kind()
-                        ),
-                    }));
+            for attempt in 0..GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS {
+                let started_at = Instant::now();
+                let result = manager
+                    .create_or_import_account_network_ready(context.request())
+                    .await;
+                manager.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::AccountSetupNetworkReady,
+                    started_at.elapsed(),
+                    result.is_ok(),
+                );
+                match result {
+                    Ok(_) => break,
+                    Err(error) => {
+                        let final_attempt = attempt + 1 == GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS;
+                        let status = if final_attempt {
+                            "deferred"
+                        } else {
+                            "retry scheduled"
+                        };
+                        let _ = manager.events.send(MarmotAppEvent::AccountError(
+                            RuntimeAccountError {
+                                account_id_hex: account_id_hex.clone(),
+                                account_label: account_label.clone(),
+                                message: format!(
+                                    "generated account publication {status}: {}",
+                                    error.privacy_safe_kind()
+                                ),
+                            },
+                        ));
+                        if final_attempt {
+                            break;
+                        }
+                        tokio::time::sleep(
+                            GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY * (1 << attempt),
+                        )
+                        .await;
+                    }
+                }
             }
             active
                 .lock()

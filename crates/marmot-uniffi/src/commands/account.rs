@@ -103,10 +103,10 @@ impl Marmot {
     }
 
     /// Compatibility entry point for creating a brand-new Nostr identity.
-    /// The secret, default profile, and exact initial KeyPackage publication
-    /// are durable when this returns; relay publication continues in the
-    /// background. New callers should use `create_identity_with_profile` to
-    /// receive the profile and explicit readiness state.
+    /// This retains the historical terminal-success contract: relay lists and
+    /// the initial KeyPackage are published when it returns. New callers may
+    /// use `create_identity_with_profile` for the earlier local-ready boundary
+    /// and an explicit readiness state.
     pub async fn create_identity(
         &self,
         default_relays: Vec<String>,
@@ -150,7 +150,7 @@ impl Marmot {
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
-        let result = self.runtime.create_identity(request).await?;
+        let result = self.runtime.create_identity_local_ready(request).await?;
         let profile = result.profile.ok_or_else(|| MarmotKitError::Runtime {
             details: "generated profile is unavailable".into(),
         })?;
