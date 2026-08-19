@@ -1,0 +1,42 @@
+# Dependabot configuration for marmot-protocol/mdk.
+#
+# Scope: keep GitHub Actions, the workspace Cargo.lock, and the OpenClaw plugin
+# pnpm lockfile current. Dependabot PRs run through the same CI gates as any
+# other PR (see .github/workflows/ci.yml and wn-agent-binaries.yml).
+#
+# Related tracker: https://github.com/marmot-protocol/mdk/issues/1220 restores
+# enforced RustSec scanning; Dependabot complements that by proposing lockfile
+# updates before advisories accumulate.
+version: 2
+updates:
+  # GitHub Actions referenced under .github/workflows/.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Rust workspace (root Cargo.lock).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rust-workspace:
+        patterns: ["*"]
+
+  # OpenClaw Marmot channel plugin (pnpm-lock.yaml).
+  # Verify openclaw/plugin-sdk surface changes before merging bumps; see
+  # integrations/openclaw/marmot/AGENTS.md.
+  - package-ecosystem: npm
+    directory: /integrations/openclaw/marmot
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      openclaw-plugin:
+        patterns: ["*"]
