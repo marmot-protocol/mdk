@@ -17,8 +17,8 @@ use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
     EncryptedMediaPolicyV2, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_lifecycle_v1,
+    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GroupLifecycleV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_lifecycle_v1,
     default_group_components, encode_components_list, encode_encrypted_media_policy_v2,
     encode_nostr_routing_v1,
 };
@@ -50,7 +50,7 @@ use openmls::prelude::{
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
 use std::sync::Arc;
-use storage_sqlite::SqliteAccountStorage;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
@@ -520,6 +520,43 @@ impl TransportPeeler for MockPeeler {
                 recipient: recipient.clone(),
             },
         })
+    }
+}
+
+struct BlockingWelcomePeeler {
+    inner: MockPeeler,
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl TransportPeeler for BlockingWelcomePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        _payload: &EncryptedPayload,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.started.notify_one();
+        std::future::pending().await
     }
 }
 
@@ -1125,6 +1162,196 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     let (stored_group, stored_welcome) = reopened.stored_sent_welcome(&welcome_id).unwrap();
     assert_eq!(stored_group, group_id);
     assert_eq!(stored_welcome.id, welcome_id);
+}
+
+#[tokio::test]
+async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("founding-retention.sqlite");
+    let database_key = SqlCipherKey::new("founding retention restart key").unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
+    let supported = default_group_components()
+        .into_iter()
+        .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
+        .collect::<Vec<_>>();
+    let mut alice = EngineBuilder::new(storage)
+        .identity(pad32(b"alice-founding-retention"))
+        .account_identity_proof_signer(proof_signer(b"alice-founding-retention"))
+        .supported_app_components(supported.clone())
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"bob-founding-retention"))
+        .account_identity_proof_signer(proof_signer(b"bob-founding-retention"))
+        .supported_app_components(supported.clone())
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "founding retention".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 300u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created {
+        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        other => panic!("expected one canonical founding result, got {other:?}"),
+    };
+
+    assert_eq!(
+        alice
+            .app_component(&group_id, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .unwrap(),
+        Some(300u64.to_be_bytes().to_vec())
+    );
+    let joined = bob.join_welcome(welcome).await.unwrap();
+    assert_eq!(joined, group_id);
+    assert_eq!(
+        bob.app_component(&joined, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .unwrap(),
+        Some(300u64.to_be_bytes().to_vec()),
+        "the Welcome must carry the founding retention state"
+    );
+
+    drop(alice);
+    let reopened_storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
+    let mut reopened = EngineBuilder::new(reopened_storage)
+        .identity(pad32(b"alice-founding-retention"))
+        .account_identity_proof_signer(proof_signer(b"alice-founding-retention"))
+        .supported_app_components(supported)
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    reopened.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        reopened
+            .app_component(&group_id, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .unwrap(),
+        Some(300u64.to_be_bytes().to_vec())
+    );
+}
+
+#[tokio::test]
+async fn current_group_initial_retention_rejects_unsupported_invitee_before_state() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let supported = default_group_components()
+        .into_iter()
+        .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
+        .collect::<Vec<_>>();
+    let mut alice = EngineBuilder::new(storage)
+        .identity(pad32(b"alice-unsupported-retention"))
+        .account_identity_proof_signer(proof_signer(b"alice-unsupported-retention"))
+        .supported_app_components(supported)
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let mut bob = build_current_client(b"bob-unsupported-retention");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "unsupported retention".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 300u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("retention must be supported by every founding member");
+
+    assert!(matches!(
+        error,
+        EngineError::MissingRequiredCapabilities { ref required, .. }
+            if required
+                .app_components
+                .contains(GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+    ));
+    assert!(alice.live_group_ids().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_founding_retention_before_canonicalization_leaves_no_group() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let supported = default_group_components()
+        .into_iter()
+        .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
+        .collect::<Vec<_>>();
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"bob-cancel-founding-retention"))
+        .account_identity_proof_signer(proof_signer(b"bob-cancel-founding-retention"))
+        .supported_app_components(supported.clone())
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let task_storage = storage.clone();
+    let task_supported = supported.clone();
+    let task_started = started.clone();
+    let creation = tokio::spawn(async move {
+        let mut alice = EngineBuilder::new(task_storage)
+            .identity(pad32(b"alice-cancel-founding-retention"))
+            .account_identity_proof_signer(proof_signer(b"alice-cancel-founding-retention"))
+            .supported_app_components(task_supported)
+            .protocol_profile(ProtocolProfile::Current)
+            .peeler(Box::new(BlockingWelcomePeeler {
+                inner: MockPeeler::default(),
+                started: task_started,
+            }))
+            .build()
+            .unwrap();
+        alice
+            .create_group(CreateGroupRequest {
+                name: "cancel founding retention".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                    data: 300u64.to_be_bytes().to_vec(),
+                }],
+                initial_admins: vec![],
+            })
+            .await
+    });
+
+    started.notified().await;
+    creation.abort();
+    assert!(creation.await.unwrap_err().is_cancelled());
+
+    let mut reopened = EngineBuilder::new(storage)
+        .identity(pad32(b"alice-cancel-founding-retention"))
+        .account_identity_proof_signer(proof_signer(b"alice-cancel-founding-retention"))
+        .supported_app_components(supported)
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    reopened.hydrate_all_stored_groups().unwrap();
+    assert!(
+        reopened.live_group_ids().unwrap().is_empty(),
+        "cancellation before the canonical transaction must clean up the provisional MLS group"
+    );
 }
 
 #[tokio::test]

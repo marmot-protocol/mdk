@@ -1354,6 +1354,57 @@ where
 }
 
 #[test]
+fn create_group_options_apply_initial_retention_atomically() {
+    run_composed_app_runtime_test("initial-group-retention", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+
+        let retained = client
+            .create_group_with_options(
+                "retained from founding state",
+                &[],
+                AppCreateGroupOptions {
+                    disappearing_message_secs: 300,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let disabled = client
+            .create_group_with_options(
+                "disabled retention compatibility",
+                &[],
+                AppCreateGroupOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(client.group_mls_state(&retained).unwrap().epoch, 0);
+        assert_eq!(
+            app.group("alice", &hex::encode(retained.as_slice()))
+                .unwrap()
+                .unwrap()
+                .message_retention
+                .disappearing_message_secs,
+            300
+        );
+        assert_eq!(
+            app.group("alice", &hex::encode(disabled.as_slice()))
+                .unwrap()
+                .unwrap()
+                .message_retention
+                .disappearing_message_secs,
+            0
+        );
+    });
+}
+
+#[test]
 fn live_group_archive_checkpoints_seen_and_target_group_deltas() {
     run_composed_app_runtime_test("account-projection-delta", || async {
         let dir = tempfile::tempdir().unwrap();

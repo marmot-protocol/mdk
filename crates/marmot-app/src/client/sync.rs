@@ -2516,11 +2516,10 @@ mod runtime_group_subscription_refresh_tests {
         client.prepare_transport().await.unwrap();
         let telemetry = AppPerformanceTelemetry::default();
         client
-            .create_group_with_initial_profile_and_telemetry(
+            .create_group_with_options_and_telemetry(
                 "catch-up retry intent",
-                "",
                 &[],
-                None,
+                crate::AppCreateGroupOptions::default(),
                 &telemetry,
             )
             .await
