@@ -40,7 +40,7 @@ impl Config {
     }
 
     pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, CodexBackend) {
-        let backend = CodexBackend::new(self.shared.bin);
+        let backend = CodexBackend::new(self.shared.bin, self.shared.harness.execution_profile);
         (self.shared.harness, backend)
     }
 }

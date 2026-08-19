@@ -36,7 +36,10 @@ impl Config {
     }
 
     pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, OpencodeBackend) {
-        let backend = OpencodeBackend { bin: self.0.bin };
+        let backend = OpencodeBackend {
+            bin: self.0.bin,
+            execution_profile: self.0.harness.execution_profile,
+        };
         (self.0.harness, backend)
     }
 }

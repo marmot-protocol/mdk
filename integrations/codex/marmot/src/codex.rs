@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    Backend, HarnessError, Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET,
+    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
+    IsolationSupport, Outcome, RunFailure, RunnerEvent, TRACE_TARGET,
     process::{capture_stderr, cleanup_failed_run, next_stdout_line, strip_ansi, write_stdin},
 };
 use serde_json::Value;
@@ -16,33 +17,57 @@ use tracing::debug;
 #[derive(Clone)]
 pub(crate) struct CodexBackend {
     bin: String,
+    execution_profile: ExecutionProfile,
 }
 
 impl CodexBackend {
-    pub(crate) fn new(bin: String) -> Self {
-        Self { bin }
+    pub(crate) fn new(bin: String, execution_profile: ExecutionProfile) -> Self {
+        Self {
+            bin,
+            execution_profile,
+        }
     }
 }
 
 #[async_trait]
 impl Backend for CodexBackend {
+    fn execution_support(&self) -> ExecutionSupport {
+        ExecutionSupport {
+            approvals: match self.execution_profile {
+                ExecutionProfile::Inherit => ApprovalSupport::Inherited,
+                ExecutionProfile::Autonomous => ApprovalSupport::PreserveDenies,
+                ExecutionProfile::Unrestricted => ApprovalSupport::Bypassed,
+            },
+            isolation: match self.execution_profile {
+                ExecutionProfile::Unrestricted => IsolationSupport::Bypassed,
+                ExecutionProfile::Inherit | ExecutionProfile::Autonomous => {
+                    IsolationSupport::Inherited
+                }
+            },
+        }
+    }
+
     async fn run(
         &self,
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        run_with_bin(&self.bin, invocation, tx).await
+        run_with_bin(&self.bin, self.execution_profile, invocation, tx).await
     }
 }
 
 async fn run_with_bin(
     bin: &str,
+    execution_profile: ExecutionProfile,
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
     let mut command = Command::new(bin);
     command
-        .args(build_exec_args(invocation.session_id.as_deref()))
+        .args(build_exec_args(
+            invocation.session_id.as_deref(),
+            execution_profile,
+        ))
         .current_dir(&invocation.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -163,17 +188,31 @@ async fn run_with_bin(
     }
 }
 
-fn build_exec_args(session_id: Option<&str>) -> Vec<String> {
-    match session_id.filter(|value| !value.is_empty()) {
-        Some(session_id) => vec![
-            "exec".to_owned(),
-            "resume".to_owned(),
-            "--json".to_owned(),
-            session_id.to_owned(),
-            "-".to_owned(),
-        ],
-        None => vec!["exec".to_owned(), "--json".to_owned(), "-".to_owned()],
+fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<String> {
+    let session_id = session_id.filter(|value| !value.is_empty());
+    let mut args = vec!["exec".to_owned()];
+    if session_id.is_some() {
+        args.push("resume".to_owned());
     }
+    match profile {
+        ExecutionProfile::Inherit => {}
+        ExecutionProfile::Autonomous => {
+            args.extend([
+                "--strict-config".to_owned(),
+                "-c".to_owned(),
+                "approval_policy=\"never\"".to_owned(),
+            ]);
+        }
+        ExecutionProfile::Unrestricted => {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+        }
+    }
+    args.push("--json".to_owned());
+    if let Some(session_id) = session_id {
+        args.push(session_id.to_owned());
+    }
+    args.push("-".to_owned());
+    args
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -219,15 +258,74 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use marmot_terminal_harness::ExecutionProfile;
 
     #[test]
     fn args_select_json_stdin_and_optional_resume() {
-        assert_eq!(build_exec_args(None), vec!["exec", "--json", "-"]);
         assert_eq!(
-            build_exec_args(Some("thread-123")),
+            build_exec_args(None, ExecutionProfile::Inherit),
+            vec!["exec", "--json", "-"]
+        );
+        assert_eq!(
+            build_exec_args(Some("thread-123"), ExecutionProfile::Inherit),
             vec!["exec", "resume", "--json", "thread-123", "-"]
         );
-        assert_eq!(build_exec_args(Some("")), vec!["exec", "--json", "-"]);
+        assert_eq!(
+            build_exec_args(Some(""), ExecutionProfile::Inherit),
+            vec!["exec", "--json", "-"]
+        );
+    }
+
+    #[test]
+    fn autonomous_preserves_configured_sandbox_and_network_for_new_and_resumed_threads() {
+        assert_eq!(
+            build_exec_args(None, ExecutionProfile::Autonomous),
+            vec![
+                "exec",
+                "--strict-config",
+                "-c",
+                "approval_policy=\"never\"",
+                "--json",
+                "-",
+            ]
+        );
+        assert_eq!(
+            build_exec_args(Some("thread-123"), ExecutionProfile::Autonomous),
+            vec![
+                "exec",
+                "resume",
+                "--strict-config",
+                "-c",
+                "approval_policy=\"never\"",
+                "--json",
+                "thread-123",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn unrestricted_bypasses_approvals_and_sandbox_for_new_and_resumed_threads() {
+        assert_eq!(
+            build_exec_args(None, ExecutionProfile::Unrestricted),
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--json",
+                "-",
+            ]
+        );
+        assert_eq!(
+            build_exec_args(Some("thread-123"), ExecutionProfile::Unrestricted),
+            vec![
+                "exec",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--json",
+                "thread-123",
+                "-",
+            ]
+        );
     }
 
     #[test]
@@ -288,6 +386,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         let (tx, mut rx) = mpsc::channel(4);
         let outcome = run_with_bin(
             script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(5),
                 idle_timeout: Duration::from_secs(2),
@@ -336,6 +435,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"received
         let (tx, mut rx) = mpsc::channel(4);
         let outcome = run_with_bin(
             script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(5),
                 idle_timeout: Duration::from_secs(2),
@@ -374,6 +474,7 @@ exit 64
         let (tx, _rx) = mpsc::channel(1);
         let outcome = run_with_bin(
             script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(5),
                 idle_timeout: Duration::from_secs(2),
@@ -406,6 +507,7 @@ exit 64
         let (tx, mut rx) = mpsc::channel(8);
         let outcome = run_with_bin(
             "codex",
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(120),
                 idle_timeout: Duration::from_secs(30),
@@ -430,6 +532,7 @@ exit 64
         let (resume_tx, mut resume_rx) = mpsc::channel(8);
         let resumed = run_with_bin(
             "codex",
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(120),
                 idle_timeout: Duration::from_secs(30),

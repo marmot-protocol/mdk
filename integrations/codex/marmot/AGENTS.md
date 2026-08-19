@@ -32,9 +32,8 @@ Rust Codex harness for Marmot through the local `wn-agent` control socket. Read
 ## Rules
 
 - Keep prompts on stdin; do not move prompt text into process arguments.
-- Do not add `--full-auto`, `--dangerously-bypass-approvals-and-sandbox`, or
-  connector-specific sandbox/approval overrides until the shared connector
-  permission model is designed.
+- Keep permission argv derived from the shared typed execution profile. Do not
+  add free-form backend argument configuration or mutate global Codex config.
 - Split completed assistant text into byte-budgeted Marmot messages. Keep
   `WN_CODEX_MAX_REPLY_BYTES=30000` below the Marmot message cap.
 - Keep request/response and Codex event validation strict; malformed or

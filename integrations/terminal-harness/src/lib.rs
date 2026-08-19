@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 pub use bridge::run;
-pub use config::{ConfigSpec, LoadedConfig, load_config_with};
+pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
 
 /// Default maximum byte length for one Marmot reply chunk.
@@ -52,6 +52,8 @@ pub struct Config {
     pub backend_timeout: Duration,
     /// Maximum backend stdout silence.
     pub backend_idle_timeout: Duration,
+    /// Connector execution-permission policy selected by the operator.
+    pub execution_profile: ExecutionProfile,
     /// Connector identity and naming.
     pub spec: ConfigSpec,
 }
@@ -68,6 +70,7 @@ impl fmt::Debug for Config {
             .field("max_pending_per_group", &self.max_pending_per_group)
             .field("backend_timeout", &self.backend_timeout)
             .field("backend_idle_timeout", &self.backend_idle_timeout)
+            .field("execution_profile", &self.execution_profile)
             .field("spec", &self.spec)
             .finish_non_exhaustive()
     }
@@ -167,12 +170,84 @@ impl fmt::Debug for RunnerEvent {
 /// Backend-specific command construction and event parsing boundary.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// Privacy-safe capability state emitted when the harness starts.
+    fn execution_support(&self) -> ExecutionSupport {
+        ExecutionSupport::INHERITED
+    }
+
     /// Runs one prompt and streams completed assistant text to `tx`.
     async fn run(
         &self,
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure>;
+}
+
+/// Backend support state for the selected execution profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionSupport {
+    /// How approval requests are handled.
+    pub approvals: ApprovalSupport,
+    /// How process isolation is handled.
+    pub isolation: IsolationSupport,
+}
+
+impl ExecutionSupport {
+    /// Default state for backends that add no policy overrides.
+    pub const INHERITED: Self = Self {
+        approvals: ApprovalSupport::Inherited,
+        isolation: IsolationSupport::Inherited,
+    };
+}
+
+/// Typed, privacy-safe approval capability state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalSupport {
+    /// The connector leaves backend approval configuration unchanged.
+    Inherited,
+    /// The backend is natively approval-free.
+    NativeApprovalFree,
+    /// Interactive asks are auto-approved while explicit denies remain.
+    PreserveDenies,
+    /// The connector requests allowance of every logical permission.
+    ForceAllow,
+    /// Approval checks are bypassed.
+    Bypassed,
+}
+
+impl ApprovalSupport {
+    /// Stable tracing field value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherited => "inherited",
+            Self::NativeApprovalFree => "native_approval_free",
+            Self::PreserveDenies => "preserve_denies",
+            Self::ForceAllow => "force_allow",
+            Self::Bypassed => "bypassed",
+        }
+    }
+}
+
+/// Typed, privacy-safe isolation capability state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolationSupport {
+    /// The connector leaves backend isolation configuration unchanged.
+    Inherited,
+    /// The backend does not provide a built-in OS sandbox.
+    NotProvided,
+    /// Backend isolation is explicitly bypassed.
+    Bypassed,
+}
+
+impl IsolationSupport {
+    /// Stable tracing field value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherited => "inherited",
+            Self::NotProvided => "not_provided",
+            Self::Bypassed => "bypassed",
+        }
+    }
 }
 
 /// Returns the current user's home directory or fails closed when it is unset.

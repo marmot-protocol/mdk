@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    Backend, HarnessError, Invocation, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
+    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
+    IsolationSupport, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
     process::{capture_stderr, cleanup_failed_run, next_stdout_line, strip_ansi, write_stdin},
 };
 use serde_json::Value;
@@ -18,29 +19,53 @@ use tracing::debug;
 pub(crate) struct PiBackend {
     pub(crate) bin: String,
     pub(crate) session_dir: std::path::PathBuf,
+    pub(crate) execution_profile: ExecutionProfile,
 }
 
 impl PiBackend {
-    pub(crate) fn new(bin: String, session_dir: std::path::PathBuf) -> Result<Self> {
+    pub(crate) fn new(
+        bin: String,
+        session_dir: std::path::PathBuf,
+        execution_profile: ExecutionProfile,
+    ) -> Result<Self> {
         fs_private::create_dir_all_private(&session_dir)?;
-        Ok(Self { bin, session_dir })
+        Ok(Self {
+            bin,
+            session_dir,
+            execution_profile,
+        })
     }
 }
 
 #[async_trait]
 impl Backend for PiBackend {
+    fn execution_support(&self) -> ExecutionSupport {
+        ExecutionSupport {
+            approvals: ApprovalSupport::NativeApprovalFree,
+            isolation: IsolationSupport::NotProvided,
+        }
+    }
+
     async fn run(
         &self,
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        run_with_bin(&self.bin, &self.session_dir, invocation, tx).await
+        run_with_bin(
+            &self.bin,
+            &self.session_dir,
+            self.execution_profile,
+            invocation,
+            tx,
+        )
+        .await
     }
 }
 
 async fn run_with_bin(
     bin: &str,
     session_dir: &Path,
+    execution_profile: ExecutionProfile,
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
@@ -49,6 +74,7 @@ async fn run_with_bin(
         .args(build_run_args(
             session_dir,
             invocation.session_id.as_deref(),
+            execution_profile,
         ))
         .current_dir(&invocation.cwd)
         .stdin(Stdio::piped())
@@ -170,7 +196,11 @@ async fn run_with_bin(
     }
 }
 
-fn build_run_args(session_dir: &Path, session_id: Option<&str>) -> Vec<String> {
+fn build_run_args(
+    session_dir: &Path,
+    session_id: Option<&str>,
+    _execution_profile: ExecutionProfile,
+) -> Vec<String> {
     let mut args = vec![
         "--mode".to_owned(),
         "json".to_owned(),
@@ -243,6 +273,7 @@ fn assistant_text(content: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use marmot_terminal_harness::ExecutionProfile;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -253,7 +284,11 @@ mod tests {
     #[test]
     fn args_select_json_session_dir_and_optional_session() {
         assert_eq!(
-            build_run_args(Path::new("/private/sessions"), Some("abc-123")),
+            build_run_args(
+                Path::new("/private/sessions"),
+                Some("abc-123"),
+                ExecutionProfile::Inherit,
+            ),
             vec![
                 "--mode",
                 "json",
@@ -300,7 +335,12 @@ mod tests {
     fn backend_constructor_creates_private_session_dir_once() {
         let root = tempfile::tempdir().unwrap();
         let session_dir = root.path().join("sessions");
-        let backend = PiBackend::new("pi".to_owned(), session_dir.clone()).unwrap();
+        let backend = PiBackend::new(
+            "pi".to_owned(),
+            session_dir.clone(),
+            ExecutionProfile::Inherit,
+        )
+        .unwrap();
         assert_eq!(backend.session_dir, session_dir);
         assert_eq!(
             fs::metadata(&backend.session_dir)
@@ -340,6 +380,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
         let outcome = run_with_bin(
             script.to_str().unwrap(),
             &session_dir,
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(5),
                 idle_timeout: Duration::from_secs(2),
@@ -392,6 +433,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
         let outcome = run_with_bin(
             script.to_str().unwrap(),
             &session_dir,
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(5),
                 idle_timeout: Duration::from_secs(2),
@@ -433,6 +475,7 @@ exit 64
         let outcome = run_with_bin(
             script.to_str().unwrap(),
             &session_dir,
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(5),
                 idle_timeout: Duration::from_secs(2),
@@ -465,6 +508,7 @@ exit 64
         let outcome = run_with_bin(
             "pi",
             &session_dir,
+            ExecutionProfile::Inherit,
             Invocation {
                 timeout: Duration::from_secs(120),
                 idle_timeout: Duration::from_secs(30),
@@ -486,5 +530,31 @@ exit 64
             reply.push_str(&text);
         }
         assert_eq!(reply.trim(), "PI_CONNECTOR_OK");
+    }
+
+    #[test]
+    fn every_profile_uses_pis_native_approval_free_command_contract() {
+        let session_dir = Path::new("/private/pi-sessions");
+        for profile in [
+            ExecutionProfile::Inherit,
+            ExecutionProfile::Autonomous,
+            ExecutionProfile::Unrestricted,
+        ] {
+            assert_eq!(
+                build_run_args(session_dir, None, profile),
+                vec!["--mode", "json", "--session-dir", "/private/pi-sessions"]
+            );
+            assert_eq!(
+                build_run_args(session_dir, Some("session-123"), profile),
+                vec![
+                    "--mode",
+                    "json",
+                    "--session-dir",
+                    "/private/pi-sessions",
+                    "--session-id",
+                    "session-123",
+                ]
+            );
+        }
     }
 }

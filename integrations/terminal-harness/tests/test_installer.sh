@@ -41,6 +41,7 @@ idle_timeout_env="${env_prefix}_IDLE_TIMEOUT_SECS"
 request_timeout_env="${env_prefix}_REQUEST_TIMEOUT_SECS"
 max_reply_env="${env_prefix}_MAX_REPLY_BYTES"
 max_pending_env="${env_prefix}_MAX_PENDING_PER_GROUP"
+profile_env="MARMOT_HARNESS_EXECUTION_PROFILE"
 export "$bin_env=/bin/echo"
 allow_hex="$(printf '11%.0s' {1..32})"
 fixture_version="9.9.9"
@@ -223,6 +224,22 @@ unit_dir="$fixture_root/home/.config/systemd/user"
 [ "$(stat_mode "$fixture_root/marmot-home/dev/$harness_binary.env")" = 600 ]
 grep -F "Environment=\"$timeout_env=3600\"" "$unit_dir/$harness_service" >/dev/null
 grep -F "Environment=\"$request_timeout_env=30\"" "$unit_dir/$harness_service" >/dev/null
+grep -F "Environment=\"$profile_env=inherit\"" "$unit_dir/$harness_service" >/dev/null
+grep -F "$profile_env=inherit" \
+    "$fixture_root/marmot-home/dev/$harness_binary.env" >/dev/null
+
+for profile in autonomous unrestricted; do
+    profile_log="$fixture_root/systemctl-profile-$profile.log"
+    profile_args=(--execution-profile "$profile")
+    if [ "$profile" = unrestricted ]; then
+        profile_args+=(--acknowledge-unrestricted)
+    fi
+    run_linux_service_case "$fixture_root" 1 "$profile_log" "${profile_args[@]}"
+    grep -F "Environment=\"$profile_env=$profile\"" \
+        "$unit_dir/$harness_service" >/dev/null
+    grep -F "$profile_env=$profile" \
+        "$fixture_root/marmot-home/dev/$harness_binary.env" >/dev/null
+done
 
 upgrade_log="$fixture_root/systemctl-upgrade.log"
 run_linux_service_case "$fixture_root" 1 "$upgrade_log"
@@ -306,6 +323,35 @@ installer_stdin_dry_run="$(
     MARMOT_TERMINAL_HARNESS="$kind" \
     bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" < "$shared_installer"
 )"
+
+for profile in inherit autonomous unrestricted; do
+    profile_args=(--execution-profile "$profile")
+    if [ "$profile" = unrestricted ]; then
+        profile_args+=(--acknowledge-unrestricted)
+    fi
+    profile_dry_run="$(
+        env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+            WN_AGENT_SHA="$fixture_version" \
+            MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+        "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex" \
+            "${profile_args[@]}"
+    )"
+    case "$profile_dry_run" in
+        *"$profile_env=$profile"*) ;;
+        *) echo "$kind installer dry-run omitted execution profile $profile" >&2; exit 1 ;;
+    esac
+done
+
+unacknowledged_status=0
+unacknowledged_stderr="$fixture_root/unacknowledged-unrestricted.err"
+env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+    WN_AGENT_SHA="$fixture_version" \
+    MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+    "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex" \
+        --execution-profile unrestricted >/dev/null 2>"$unacknowledged_stderr" \
+    || unacknowledged_status=$?
+[ "$unacknowledged_status" -ne 0 ]
+grep -F -- "--acknowledge-unrestricted is required" "$unacknowledged_stderr" >/dev/null
 
 custom_root="$fixture_parent/custom"
 installer_custom_socket_dry_run="$(
