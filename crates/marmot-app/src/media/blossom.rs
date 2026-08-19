@@ -459,8 +459,11 @@ async fn media_http_client_for_url(
 ) -> Result<reqwest::Client, AppError> {
     validate_blossom_fetch_url(url, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+    // The resolved address is checked separately from the URL, so a permitted loopback origin
+    // has to be recognised here too: otherwise the scheme passes and the connection is refused
+    // a line later, which reads like a bug rather than a policy.
     let allow_loopback = url.scheme() == "http"
-        && allow_loopback_http
+        && (allow_loopback_http || crate::media::host_safety::is_permitted_loopback_url(url))
         && url.host().map(is_loopback_host).unwrap_or(false);
     let pin = resolve_media_host(url, allow_loopback).await?;
     build_pinned_media_http_client(pin)

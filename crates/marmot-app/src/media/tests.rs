@@ -11,7 +11,9 @@ use url::Url;
 use super::blossom::{
     MAX_BLOSSOM_DESCRIPTOR_BYTES, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body,
 };
-use super::host_safety::validate_blossom_fetch_url;
+use super::host_safety::{
+    is_permitted_loopback_endpoint, permit_loopback_blob_origin, validate_blossom_fetch_url,
+};
 
 #[test]
 fn encrypted_media_blob_limit_supports_large_application_artifacts() {
@@ -1687,4 +1689,64 @@ fn shared_golden_v1_fixtures_parse_validate_and_round_trip_exactly() {
 #[test]
 fn shared_golden_v2_fixtures_parse_validate_and_round_trip_exactly() {
     assert_shared_media_fixture_file("imeta-v2.json");
+}
+
+#[test]
+fn a_permitted_loopback_origin_is_accepted_and_no_other_loopback_address_is() {
+    // A blob endpoint is group state, so a group admin picks it. Permitting one origin must
+    // not permit the local host generally: the port next door is a different service, and
+    // it belongs to whoever is running this program, not to whoever administers the group.
+    permit_loopback_blob_origin("http://127.0.0.1:47821");
+
+    assert!(
+        validate_blossom_fetch_url(&Url::parse("http://127.0.0.1:47821/abc").unwrap(), false)
+            .is_ok()
+    );
+
+    for refused in [
+        "http://127.0.0.1:47822/abc",
+        "http://127.0.0.1/abc",
+        "http://localhost:47821/abc",
+        "http://[::1]:47821/abc",
+    ] {
+        assert!(
+            validate_blossom_fetch_url(&Url::parse(refused).unwrap(), false).is_err(),
+            "{refused} was accepted by an allowlist that never named it"
+        );
+    }
+
+    // And permitting a loopback origin says nothing about cleartext elsewhere.
+    assert!(
+        validate_blossom_fetch_url(&Url::parse("http://example.com/abc").unwrap(), false).is_err()
+    );
+}
+
+#[test]
+fn a_permitted_origin_is_recognised_from_a_raw_endpoint_string() {
+    permit_loopback_blob_origin("http://127.0.0.1:47823/");
+
+    assert!(is_permitted_loopback_endpoint(
+        "http://127.0.0.1:47823/blob"
+    ));
+    assert!(!is_permitted_loopback_endpoint(
+        "http://127.0.0.1:47824/blob"
+    ));
+    assert!(!is_permitted_loopback_endpoint(
+        "https://blossom.example/blob"
+    ));
+    assert!(!is_permitted_loopback_endpoint("not a url"));
+}
+
+#[test]
+fn permitting_an_origin_ignores_anything_that_is_not_a_loopback_http_url() {
+    // Silently ignored rather than accepted: a caller that names a public host has made a
+    // mistake, and the safest reading of that mistake is that nothing was permitted.
+    permit_loopback_blob_origin("https://blossom.example");
+    permit_loopback_blob_origin("http://192.168.1.10:47825");
+    permit_loopback_blob_origin("nonsense");
+
+    assert!(!is_permitted_loopback_endpoint("https://blossom.example/x"));
+    assert!(!is_permitted_loopback_endpoint(
+        "http://192.168.1.10:47825/x"
+    ));
 }
