@@ -8,8 +8,8 @@ backend command construction and event parsing in each connector crate.
 
 The crate owns the `wn-agent` control client, account and sender selection,
 inbound reconnect and resync, per-group bounded queues, deduplication, working
-directory selection, private group-to-session mappings, reply chunking, and
-backend process lifecycle helpers. It does not own MLS, Nostr transport,
+directory selection, private group-to-session mappings, reply chunking, and a
+shared JSONL child-process runner. It does not own MLS, Nostr transport,
 storage, QUIC previews, or backend-specific CLI semantics.
 
 ## Backend Boundary
@@ -27,6 +27,11 @@ Connector crates are responsible for:
 - parsing the backend's documented machine-readable event stream;
 - exposing only completed assistant output, never thinking or tool output;
 - preserving or reporting the backend session id needed for the next prompt.
+
+Each backend provides a typed `ProcessSpec`, selects its prompt transport, and
+maps its strict decoder into the shared `ParsedEvent` vocabulary. The shared
+runner owns spawning, bounded stderr, stdout and total deadlines, reply-channel
+backpressure, first-session capture, and child termination and reaping.
 
 Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.

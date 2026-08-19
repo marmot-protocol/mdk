@@ -1,18 +1,11 @@
-use std::process::Stdio;
-use std::time::Instant;
-
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
-    IsolationSupport, Outcome, RunFailure, RunnerEvent, TRACE_TARGET,
-    process::{capture_stderr, cleanup_failed_run, next_stdout_line, strip_ansi, write_stdin},
+    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, Invocation, IsolationSupport,
+    Outcome, ParsedEvent, PromptTransport, RunFailure, RunnerEvent,
+    process::{ProcessSpec, run_jsonl_process},
 };
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::timeout_at;
-use tracing::debug;
 
 #[derive(Clone)]
 pub(crate) struct CodexBackend {
@@ -62,130 +55,29 @@ async fn run_with_bin(
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
-    let mut command = Command::new(bin);
-    command
-        .args(build_exec_args(
-            invocation.session_id.as_deref(),
-            execution_profile,
-        ))
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = command.spawn().map_err(|_| RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let total_deadline = tokio::time::Instant::now() + invocation.timeout;
-    let stdin = child.stdin.take().ok_or(RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let stdout = child.stdout.take().ok_or(RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let stderr = child.stderr.take().ok_or(RunFailure {
-        error: HarnessError::BackendSpawn,
-        observed_session: None,
-    })?;
-    let mut stderr_task = tokio::spawn(capture_stderr(stderr));
-    let mut writer_task = write_stdin(stdin, invocation.prompt);
-    let start = Instant::now();
-    let mut observed_session = None;
-    let mut error_summary = None;
-    let mut idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-
-    let lifecycle_result = timeout_at(total_deadline, async {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let Some(line) = next_stdout_line(&mut lines, idle_deadline).await? else {
-                break;
-            };
-            if line.is_empty() {
-                idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-                continue;
-            }
-            match parse_event_line(&line) {
-                Ok(Some(ParsedEvent::Session(session_id))) => {
-                    if observed_session.is_none() {
-                        observed_session = Some(session_id);
-                    }
-                }
-                Ok(Some(ParsedEvent::Text(text))) => {
-                    if !text.trim().is_empty() {
-                        tx.send(RunnerEvent::Text(text))
-                            .await
-                            .map_err(|_| HarnessError::BackendStream)?;
-                    }
-                }
-                Ok(Some(ParsedEvent::Error(summary))) => {
-                    if error_summary.is_none() {
-                        error_summary = Some(summary);
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => debug!(
-                    target: TRACE_TARGET,
-                    method = "codex_exec",
-                    error_kind = "json",
-                    "dropping undecodable Codex event"
-                ),
-            }
-            idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
-        }
-
-        let (status, stderr) = match timeout_at(idle_deadline, async {
-            let (writer, status, stderr) =
-                tokio::join!(&mut writer_task, child.wait(), &mut stderr_task,);
-            let status = status.map_err(HarnessError::from)?;
-            let stderr = stderr.map_err(HarnessError::from)?;
-            match writer.map_err(HarnessError::from)? {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => debug!(
-                    target: TRACE_TARGET,
-                    method = "codex_exec",
-                    error_kind = "stdin_closed",
-                    "backend closed stdin before draining the prompt"
-                ),
-                Err(_) => return Err(HarnessError::BackendStream),
-            }
-            Ok::<_, HarnessError>((status, stderr))
-        })
-        .await
-        {
-            Err(_) => return Err(HarnessError::BackendIdle),
-            Ok(result) => result?,
-        };
-        Ok::<_, HarnessError>(Outcome {
-            observed_session: observed_session.clone(),
-            exit_code: status.code(),
-            error_summary,
-            stderr: strip_ansi(stderr.trim()),
-            elapsed_ms: start.elapsed().as_millis(),
-        })
-    })
-    .await;
-
-    match lifecycle_result {
-        Ok(Ok(outcome)) => Ok(outcome),
-        Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
-            Err(RunFailure {
-                error,
-                observed_session,
-            })
-        }
-        Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
-            Err(RunFailure {
-                error: HarnessError::BackendTimedOut,
-                observed_session,
-            })
-        }
-    }
+    let Invocation {
+        timeout,
+        idle_timeout,
+        cwd,
+        session_id,
+        prompt,
+    } = invocation;
+    run_jsonl_process(
+        ProcessSpec {
+            executable: bin.to_owned(),
+            args: build_exec_args(session_id.as_deref(), execution_profile),
+            cwd,
+            environment: Vec::new(),
+            prompt: PromptTransport::Stdin(prompt),
+            trace_method: "codex_exec",
+            backend_name: "codex",
+            total_timeout: timeout,
+            idle_timeout,
+        },
+        tx,
+        parse_event_line,
+    )
+    .await
 }
 
 fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<String> {
@@ -211,37 +103,38 @@ fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<S
     args
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ParsedEvent {
-    Session(String),
-    Text(String),
-    Error(String),
-}
-
-fn parse_event_line(line: &str) -> serde_json::Result<Option<ParsedEvent>> {
+fn parse_event_line(line: &str) -> serde_json::Result<ParsedEvent> {
     let value: Value = serde_json::from_str(line)?;
     match value.get("type").and_then(Value::as_str) {
         Some("thread.started") => Ok(value
             .get("thread_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .map(|id| ParsedEvent::Session(id.to_owned()))),
+            .map(|id| ParsedEvent::Session(id.to_owned()))
+            .unwrap_or(ParsedEvent::Ignored)),
         Some("item.completed") => {
             let Some(item) = value.get("item") else {
-                return Ok(None);
+                return Ok(ParsedEvent::Ignored);
             };
             if item.get("type").and_then(Value::as_str) != Some("agent_message") {
-                return Ok(None);
+                return Ok(ParsedEvent::Ignored);
             }
             Ok(item
                 .get("text")
                 .and_then(Value::as_str)
                 .filter(|text| !text.trim().is_empty())
-                .map(|text| ParsedEvent::Text(text.to_owned())))
+                .map(|text| ParsedEvent::Text(text.to_owned()))
+                .unwrap_or(ParsedEvent::Ignored))
         }
-        Some("turn.failed") => Ok(Some(ParsedEvent::Error("turn_failed".to_owned()))),
-        Some("error") => Ok(Some(ParsedEvent::Error("error".to_owned()))),
-        _ => Ok(None),
+        Some("turn.failed") => Ok(ParsedEvent::Error {
+            session_id: None,
+            summary: "turn_failed".to_owned(),
+        }),
+        Some("error") => Ok(ParsedEvent::Error {
+            session_id: None,
+            summary: "error".to_owned(),
+        }),
+        _ => Ok(ParsedEvent::Ignored),
     }
 }
 
@@ -320,11 +213,11 @@ mod tests {
     fn parser_emits_thread_and_completed_agent_messages_only() {
         assert_eq!(
             parse_event_line(r#"{"type":"thread.started","thread_id":"thread-123"}"#).unwrap(),
-            Some(ParsedEvent::Session("thread-123".to_owned()))
+            ParsedEvent::Session("thread-123".to_owned())
         );
         assert_eq!(
             parse_event_line(r#"{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"hello"}}"#).unwrap(),
-            Some(ParsedEvent::Text("hello".to_owned()))
+            ParsedEvent::Text("hello".to_owned())
         );
         for line in [
             r#"{"type":"item.started","item":{"type":"agent_message","text":"partial"}}"#,
@@ -332,7 +225,7 @@ mod tests {
             r#"{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"private"}}"#,
             r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
         ] {
-            assert!(parse_event_line(line).unwrap().is_none());
+            assert_eq!(parse_event_line(line).unwrap(), ParsedEvent::Ignored);
         }
     }
 
@@ -340,11 +233,17 @@ mod tests {
     fn parser_reports_failures_without_exposing_backend_messages() {
         assert_eq!(
             parse_event_line(r#"{"type":"turn.failed","error":{"message":"secret"}}"#).unwrap(),
-            Some(ParsedEvent::Error("turn_failed".to_owned()))
+            ParsedEvent::Error {
+                session_id: None,
+                summary: "turn_failed".to_owned()
+            }
         );
         assert_eq!(
             parse_event_line(r#"{"type":"error","message":"secret"}"#).unwrap(),
-            Some(ParsedEvent::Error("error".to_owned()))
+            ParsedEvent::Error {
+                session_id: None,
+                summary: "error".to_owned()
+            }
         );
     }
 
