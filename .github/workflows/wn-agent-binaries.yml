@@ -11,6 +11,8 @@ on:
       - integrations/hermes/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
+      - scripts/install-codex-marmot.sh
+      - integrations/codex/marmot/**
       - scripts/install-opencode-marmot.sh
       - integrations/opencode/marmot/**
       - scripts/install-pi-marmot.sh
@@ -100,6 +102,12 @@ jobs:
       - name: Smoke test wn-agent
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
 
+      - name: Build wn-codex
+        run: cargo build --locked --release -p wn-codex --bin wn-codex --target "${{ matrix.rust_target }}"
+
+      - name: Smoke test wn-codex
+        run: ./target/${{ matrix.rust_target }}/release/wn-codex --help
+
       - name: Build wn-opencode
         run: cargo build --locked --release -p wn-opencode --bin wn-opencode --target "${{ matrix.rust_target }}"
 
@@ -116,7 +124,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for binary in wn-agent wn-opencode wn-pi; do
+          for binary in wn-agent wn-codex wn-opencode wn-pi; do
             ./scripts/package-binary-bundle.sh \
               "$binary" \
               "${{ matrix.target }}" \
@@ -128,6 +136,13 @@ jobs:
         with:
           name: wn-agent-${{ matrix.target }}
           path: dist/wn-agent-${{ matrix.target }}/*
+          if-no-files-found: error
+
+      - name: Upload wn-codex bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wn-codex-${{ matrix.target }}
+          path: dist/wn-codex-${{ matrix.target }}/*
           if-no-files-found: error
 
       - name: Upload wn-opencode bundle
@@ -388,11 +403,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/codex-linux dist/codex-linux-arm dist/codex-darwin dist/codex-darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-aarch64 --dir dist/linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-aarch64 --dir dist/darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-x86_64 --dir dist/darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-linux-x86_64 --dir dist/codex-linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-linux-aarch64 --dir dist/codex-linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-darwin-aarch64 --dir dist/codex-darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-darwin-x86_64 --dir dist/codex-darwin-intel
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-linux-x86_64 --dir dist/opencode-linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-linux-aarch64 --dir dist/opencode-linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-darwin-aarch64 --dir dist/opencode-darwin
@@ -431,7 +450,7 @@ jobs:
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
           chmod 0755 dist/install/install-openclaw-marmot.sh
-          for harness in opencode pi; do
+          for harness in codex opencode pi; do
             awk -v harness="$harness" \
               'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=" harness; next } { print }' \
               scripts/install-terminal-harness-marmot.sh | \
@@ -459,6 +478,7 @@ jobs:
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-codex-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-pi-marmot.sh | bash
           \`\`\`
@@ -468,18 +488,21 @@ jobs:
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-openclaw-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-codex-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-pi-marmot.sh | bash
           \`\`\`
 
           Assets:
           - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
+          - \`wn-codex-<platform>-$version.tar.gz\`: Codex harness binary bundle.
           - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
           - \`wn-pi-<platform>-$version.tar.gz\`: Pi harness binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
           - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
+          - \`install-codex-marmot.sh\`: installer for testers with Codex already installed.
           - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
           - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
 
@@ -495,6 +518,14 @@ jobs:
             dist/darwin/wn-agent-darwin-aarch64-"$version".tar.gz.sha256
             dist/darwin-intel/wn-agent-darwin-x86_64-"$version".tar.gz
             dist/darwin-intel/wn-agent-darwin-x86_64-"$version".tar.gz.sha256
+            dist/codex-linux/wn-codex-linux-x86_64-"$version".tar.gz
+            dist/codex-linux/wn-codex-linux-x86_64-"$version".tar.gz.sha256
+            dist/codex-linux-arm/wn-codex-linux-aarch64-"$version".tar.gz
+            dist/codex-linux-arm/wn-codex-linux-aarch64-"$version".tar.gz.sha256
+            dist/codex-darwin/wn-codex-darwin-aarch64-"$version".tar.gz
+            dist/codex-darwin/wn-codex-darwin-aarch64-"$version".tar.gz.sha256
+            dist/codex-darwin-intel/wn-codex-darwin-x86_64-"$version".tar.gz
+            dist/codex-darwin-intel/wn-codex-darwin-x86_64-"$version".tar.gz.sha256
             dist/opencode-linux/wn-opencode-linux-x86_64-"$version".tar.gz
             dist/opencode-linux/wn-opencode-linux-x86_64-"$version".tar.gz.sha256
             dist/opencode-linux-arm/wn-opencode-linux-aarch64-"$version".tar.gz
@@ -517,6 +548,7 @@ jobs:
             dist/plugin/openclaw-marmot-plugin-"$version".tgz.sha256
             dist/install/install-hermes-marmot.sh
             dist/install/install-openclaw-marmot.sh
+            dist/install/install-codex-marmot.sh
             dist/install/install-opencode-marmot.sh
             dist/install/install-pi-marmot.sh
           )
@@ -589,6 +621,7 @@ jobs:
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-hermes-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-openclaw-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-codex-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-opencode-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-pi-marmot.sh | bash
           \`\`\`
@@ -609,6 +642,7 @@ jobs:
           assets=(
             dist/install/install-hermes-marmot.sh
             dist/install/install-openclaw-marmot.sh
+            dist/install/install-codex-marmot.sh
             dist/install/install-opencode-marmot.sh
             dist/install/install-pi-marmot.sh
           )

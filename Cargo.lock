@@ -7425,6 +7425,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wn-codex"
+version = "0.9.14"
+dependencies = [
+ "async-trait",
+ "clap",
+ "marmot-terminal-harness",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "wn-opencode"
 version = "0.9.14"
 dependencies = [

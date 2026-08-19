@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Shared installer implementation for Marmot terminal harnesses.
-# MARMOT_TERMINAL_HARNESS must be `pi` or `opencode`.
+# MARMOT_TERMINAL_HARNESS must be `codex`, `pi`, or `opencode`.
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
@@ -12,6 +12,16 @@ fi
 
 HARNESS_KIND="${MARMOT_TERMINAL_HARNESS:-}"
 case "$HARNESS_KIND" in
+    codex)
+        HARNESS_DISPLAY_NAME="Codex"
+        HARNESS_ENV_PREFIX="WN_CODEX"
+        HARNESS_DEFAULT_BIN="codex"
+        HARNESS_FALLBACK_BIN_DIR="$HOME/.local/bin"
+        HARNESS_DEFAULT_HOME="$HOME/.marmot-agents/codex"
+        HARNESS_DEFAULT_AGENT_LABEL="codex-harness-agent"
+        HARNESS_DEFAULT_AGENT_SERVICE="wn-agent-codex"
+        HARNESS_DEFAULT_AGENT_LAUNCHD="org.marmot.wn-agent.codex"
+        ;;
     pi)
         HARNESS_DISPLAY_NAME="Pi"
         HARNESS_ENV_PREFIX="WN_PI"
@@ -33,7 +43,7 @@ case "$HARNESS_KIND" in
         HARNESS_DEFAULT_AGENT_LAUNCHD="org.marmot.wn-agent.harnesses"
         ;;
     *)
-        echo "error: MARMOT_TERMINAL_HARNESS must be pi or opencode" >&2
+        echo "error: MARMOT_TERMINAL_HARNESS must be codex, pi, or opencode" >&2
         exit 64
         ;;
 esac

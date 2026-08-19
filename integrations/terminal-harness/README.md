@@ -1,7 +1,8 @@
 # Marmot Terminal Harness
 
 `marmot-terminal-harness` is the shared Rust runtime behind
-[`wn-opencode`](../opencode/marmot) and [`wn-pi`](../pi/marmot). It keeps the
+[`wn-codex`](../codex/marmot), [`wn-opencode`](../opencode/marmot), and
+[`wn-pi`](../pi/marmot). It keeps the
 Marmot-facing behavior of pure terminal connectors consistent while leaving
 backend command construction and event parsing in each connector crate.
 
@@ -27,13 +28,13 @@ Connector crates are responsible for:
 - exposing only completed assistant output, never thinking or tool output;
 - preserving or reporting the backend session id needed for the next prompt.
 
-OpenCode keeps prompt text after its command's `--` delimiter. Pi writes prompt
-text to stdin. Backend-specific behavior belongs in those connector crates, not
+OpenCode keeps prompt text after its command's `--` delimiter. Codex and Pi
+write prompt text to stdin. Backend-specific behavior belongs in those connector crates, not
 in this shared runtime.
 
 ## Shared Behavior
 
-Both connectors:
+All connectors:
 
 - speak `marmot.agent-control.v2` over a local Unix socket;
 - require an explicit sender allowlist and mirror it additively into the
@@ -50,25 +51,29 @@ Both connectors:
 The connector READMEs document their environment variables, installer topology,
 and backend contracts:
 
+- [`integrations/codex/marmot/README.md`](../codex/marmot/README.md)
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
 
 ## Development
 
-Run the shared suite and both connector suites after changing this crate:
+Run the shared suite and all connector suites after changing this crate:
 
 ```sh
 cargo test -p marmot-terminal-harness
+cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
 
+just codex-dev-e2e-connector
 just opencode-dev-e2e-connector
 just pi-dev-e2e-connector
 
+just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
 ```
 
 The process-level connector tests are ignored by default and use real
 `wn-agent` and connector binaries with fake backend executables. They do not
-install or authenticate the real OpenCode or Pi CLIs.
+install or authenticate the real Codex, OpenCode, or Pi CLIs.

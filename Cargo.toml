@@ -23,6 +23,7 @@ members = [
     "crates/marmot-uniffi",
     "crates/cli",
     "integrations/terminal-harness",
+    "integrations/codex/marmot",
     "integrations/opencode/marmot",
     "integrations/pi/marmot",
 ]

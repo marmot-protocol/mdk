@@ -208,6 +208,12 @@ openclaw-host-compat-test:
 openclaw-dev-script-test:
     integrations/openclaw/marmot/test/dev-scripts.sh
 
+codex-installer-test:
+    integrations/codex/marmot/tests/test_installer.sh
+
+codex-dev-e2e-connector:
+    cargo test -p wn-codex --test e2e_connector -- --ignored --nocapture
+
 opencode-installer-test:
     integrations/opencode/marmot/tests/test_installer.sh
 
