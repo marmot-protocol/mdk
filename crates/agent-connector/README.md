@@ -11,8 +11,9 @@ Hermes is the first supported adapter. OpenClaw is the second: a TypeScript chan
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
 connector. `wn-opencode` is a pure Rust harness at
 [`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
-OpenCode. `wn-pi` is the corresponding Pi harness at
-[`integrations/pi/marmot`](../../integrations/pi/marmot). Both use the shared hardened runtime in
+OpenCode. `wn-codex` and `wn-pi` are the corresponding Codex and Pi harnesses at
+[`integrations/codex/marmot`](../../integrations/codex/marmot) and
+[`integrations/pi/marmot`](../../integrations/pi/marmot). All three use the shared hardened runtime in
 [`integrations/terminal-harness`](../../integrations/terminal-harness).
 
 ## Names
@@ -146,6 +147,28 @@ The OpenClaw installer follows the same release flow, but uses its own default c
 `~/.marmot-agents/openclaw`, `wn-agent-openclaw.service` on Linux, or `org.marmot.wn-agent.openclaw` on macOS. It
 installs/enables the OpenClaw plugin and updates only `channels.marmot` in OpenClaw config so existing channels
 continue to work.
+
+## Codex Harness Install
+
+The same WN Agent release publishes the `wn-codex` harness binary and installer. Codex itself must already be installed
+and authenticated.
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh" | bash
+```
+
+For repeatable noninteractive setup:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The Codex installer creates or reuses the isolated agent home at `~/.marmot-agents/codex`, writes a private
+`wn-codex.env`, and starts same-user `wn-agent` and `wn-codex` services where supported. Its connector service is
+`wn-agent-codex.service` on Linux or `org.marmot.wn-agent.codex` on macOS. Codex-specific configuration and
+development commands live in
+[`integrations/codex/marmot/README.md`](../../integrations/codex/marmot/README.md).
 
 ## OpenCode Harness Install
 
@@ -282,9 +305,12 @@ Use the narrow checks first:
 cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
-bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
-bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
+sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
+bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
 integrations/hermes/marmot/tests/test_dev_scripts.sh
+just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
 ```

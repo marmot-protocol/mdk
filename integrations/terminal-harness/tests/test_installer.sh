@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-kind="${1:?usage: test_installer.sh pi|opencode}"
+kind="${1:?usage: test_installer.sh codex|pi|opencode}"
 case "$kind" in
+    codex)
+        env_prefix="WN_CODEX"
+        display_name="Codex"
+        default_home="$HOME/.marmot-agents/codex"
+        agent_service="wn-agent-codex.service"
+        agent_launchd="org.marmot.wn-agent.codex"
+        agent_label="codex-harness-agent"
+        ;;
     pi)
         env_prefix="WN_PI"
         display_name="Pi"

@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Added the `wn-codex` terminal-harness connector with per-group Codex thread
+  resumption, stdin prompts, completed-assistant-only JSONL parsing, isolated
+  installer/service defaults, and WN Agent release bundles for supported Linux
+  and macOS targets.
+
 ## [0.9.14] - 2026-08-18
 
 ### Fixed

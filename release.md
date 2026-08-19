@@ -230,7 +230,8 @@ GitHub-generated source archives are the downloadable artifacts.
 
 Use this for the White Noise agent connector entry point. The release publishes `wn-agent` binaries for supported
 platforms plus adapter/harness install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, the OpenClaw
-Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-opencode` harness +
+Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-codex` harness +
+`install-codex-marmot.sh`, the `wn-opencode` harness +
 `install-opencode-marmot.sh`, and the `wn-pi` harness + `install-pi-marmot.sh`.
 
 The workflow lives at:
@@ -248,15 +249,18 @@ Before a WN Agent release, run the normal preflight plus:
 ```sh
 cargo test -p agent-connector
 cargo test -p marmot-terminal-harness
+cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
 bash scripts/install-hermes-marmot.sh --dry-run --yes
 bash scripts/install-openclaw-marmot.sh --dry-run --yes
-bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
-bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
+sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
+bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
 ```
 
-Bridge and control logs for both terminal harnesses now use the
+Bridge and control logs for all terminal harnesses use the
 `marmot_terminal_harness` tracing target. Include
 `marmot_terminal_harness=debug` in `RUST_LOG`. The former `wn_opencode` target
 no longer emits events, so existing filters that reference it must be updated.
@@ -294,6 +298,14 @@ The release job creates these assets:
 - `wn-agent-darwin-aarch64-<version>.tar.gz.sha256`
 - `wn-agent-darwin-x86_64-<version>.tar.gz`
 - `wn-agent-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-codex-linux-x86_64-<version>.tar.gz`
+- `wn-codex-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-codex-linux-aarch64-<version>.tar.gz`
+- `wn-codex-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-codex-darwin-aarch64-<version>.tar.gz`
+- `wn-codex-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-codex-darwin-x86_64-<version>.tar.gz`
+- `wn-codex-darwin-x86_64-<version>.tar.gz.sha256`
 - `wn-opencode-linux-x86_64-<version>.tar.gz`
 - `wn-opencode-linux-x86_64-<version>.tar.gz.sha256`
 - `wn-opencode-linux-aarch64-<version>.tar.gz`
@@ -315,9 +327,15 @@ The release job creates these assets:
 - `openclaw-marmot-plugin-<version>.tgz`
 - `openclaw-marmot-plugin-<version>.tgz.sha256`
 - `install-hermes-marmot.sh`
+- `install-hermes-marmot.sh.sha256`
 - `install-openclaw-marmot.sh`
+- `install-openclaw-marmot.sh.sha256`
+- `install-codex-marmot.sh`
+- `install-codex-marmot.sh.sha256`
 - `install-opencode-marmot.sh`
+- `install-opencode-marmot.sh.sha256`
 - `install-pi-marmot.sh`
+- `install-pi-marmot.sh.sha256`
 
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
@@ -332,6 +350,8 @@ The installer assets are generated during the release and default to their own `
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
 # OpenClaw gateway
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
+# Codex terminal harness
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh | bash
 # OpenCode terminal harness
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
 # Pi terminal harness
@@ -345,7 +365,8 @@ These one-liners perform full setup by default: they install `wn-agent`, install
 harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific Marmot
 agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
 `--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
-partial/manual install.
+partial/manual install. Terminal-harness installers also accept the matching
+`--no-start-wn-codex` or `--no-start-wn-pi` option.
 
 ## MarmotKit Binding Release
 

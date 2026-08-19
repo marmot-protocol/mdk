@@ -10,6 +10,7 @@ systems to Marmot through `wn-agent`.
 
 - `hermes/marmot` - Hermes platform plugin.
 - `openclaw/marmot` - OpenClaw channel plugin.
+- `codex/marmot` - `wn-codex` Codex harness binary.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 - `pi/marmot` - `wn-pi` Pi harness binary.
 - `terminal-harness` - shared terminal-harness control/runtime library.
@@ -48,7 +49,7 @@ runtime to Marmot and may own activation policy, message-tool routing, live
 preview adaptation, media staging policy, profile onboarding, and gateway
 session behavior.
 
-`wn-opencode` and `wn-pi` are pure terminal harnesses. They subscribe to allowed
+`wn-codex`, `wn-opencode`, and `wn-pi` are pure terminal harnesses. They subscribe to allowed
 Marmot prompts and invoke their respective binaries; they should stay narrower than the
 gateway integrations unless there is a concrete product reason to broaden it.
 
@@ -120,10 +121,10 @@ Installer expectations:
 The default Hermes, OpenClaw, and terminal-harness service names are
 connector-specific
 (`wn-agent-hermes.service`, `wn-agent-openclaw.service`,
-`wn-agent-harnesses.service`, `wn-agent-pi.service`,
+`wn-agent-codex.service`, `wn-agent-harnesses.service`, `wn-agent-pi.service`,
 `org.marmot.wn-agent.hermes`, `org.marmot.wn-agent.openclaw`,
-`org.marmot.wn-agent.harnesses`, and `org.marmot.wn-agent.pi`). Harness services
-are also connector-specific (`wn-opencode` and `wn-pi`). If you add a new
+`org.marmot.wn-agent.codex`, `org.marmot.wn-agent.harnesses`, and `org.marmot.wn-agent.pi`). Harness services
+are also connector-specific (`wn-codex`, `wn-opencode`, and `wn-pi`). If you add a new
 production installer, choose names that can coexist with the existing
 integrations on the same login.
 
@@ -140,6 +141,10 @@ just hermes-dev-e2e-connector
 just openclaw-dev-test
 just openclaw-dev-script-test
 just openclaw-dev-e2e-connector
+
+cargo test -p wn-codex
+just codex-dev-e2e-connector
+just codex-installer-test
 
 cargo test -p wn-opencode
 just opencode-dev-e2e-connector
@@ -166,5 +171,5 @@ New integrations should follow the existing shape:
 - share installer/release conventions with the existing scripts;
 - document whether the integration is a gateway/channel plugin or a pure
   harness;
-- document coexistence with Hermes, OpenClaw, OpenCode, and Pi before landing
+- document coexistence with Hermes, OpenClaw, Codex, OpenCode, and Pi before landing
   production install support.
