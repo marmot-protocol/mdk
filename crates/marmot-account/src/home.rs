@@ -9,7 +9,9 @@ use std::fs;
 use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
-use crate::io::{read_json, validate_account_label, write_json, write_secret_json};
+use crate::io::{
+    read_json, validate_account_label, write_json, write_secret_bytes, write_secret_json,
+};
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
     scrub_and_remove_local_secret_file,
@@ -17,6 +19,7 @@ use crate::secret_store::{
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
 const ACCOUNT_SETUP_STATE_FILE: &str = ".account-setup.json";
+const ACCOUNT_SETUP_CONTEXT_FILE: &str = ".account-setup-context.json";
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
 /// byte, never key material, so it is written with public file permissions.
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
@@ -126,6 +129,11 @@ pub enum AccountSetupKind {
 pub enum AccountSetupPhase {
     #[default]
     LocalStateCreated,
+    /// The identity, app-visible profile, account database, stable KeyPackage
+    /// slot, private KeyPackage material, and exact signed publication bytes
+    /// are durable locally. Generated-account callers may return at this
+    /// boundary; network publication remains journaled and resumable.
+    LocalReady,
     /// Set before publishing the account's replaceable bootstrap records
     /// (relay lists and, for generated identities, the empty follow list and
     /// default profile). A retry may safely republish those records, but setup
@@ -578,9 +586,39 @@ impl AccountHome {
 
     pub fn complete_account_setup(&self, account_ref: &str) -> AccountHomeResult<()> {
         let account = self.account(account_ref)?;
-        match fs::remove_file(self.account_setup_state_path(&account.label)) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        for path in [
+            self.account_setup_state_path(&account.label),
+            self.account_setup_context_path(&account.label),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Store app-owned, opaque setup context alongside the account journal.
+    /// The account layer does not interpret these bytes; it only provides the
+    /// same private, atomic durability contract as the journal itself.
+    pub fn set_account_setup_context(
+        &self,
+        account_ref: &str,
+        bytes: &[u8],
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        if self.raw_account_setup_state(&account.label)?.is_none() {
+            return Err(AccountHomeError::AccountSetupStateMissing);
+        }
+        write_secret_bytes(self.account_setup_context_path(&account.label), bytes)
+    }
+
+    pub fn account_setup_context(&self, account_ref: &str) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(self.account_setup_context_path(&account.label)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
     }
@@ -1120,5 +1158,9 @@ impl AccountHome {
 
     fn account_setup_state_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(ACCOUNT_SETUP_STATE_FILE)
+    }
+
+    fn account_setup_context_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(ACCOUNT_SETUP_CONTEXT_FILE)
     }
 }

@@ -1233,6 +1233,21 @@ mod tests {
         updates
     }
 
+    async fn wait_for_network_ready(runtime: &crate::MarmotAppRuntime, account_ref: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if runtime.account_setup_readiness(account_ref).unwrap()
+                    == crate::AccountSetupReadiness::NetworkReady
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generated identity bootstrap must become network-ready");
+    }
+
     #[tokio::test]
     async fn rejects_a_radius_deeper_than_the_producer_answers() {
         let dir = tempfile::tempdir().unwrap();
@@ -1418,8 +1433,8 @@ mod tests {
         let endpoint = cgka_traits::TransportEndpoint(relay_url.clone());
         let stranger_dir = tempfile::tempdir().unwrap();
         let stranger_app = MarmotApp::with_relay(stranger_dir.path(), relay_url.clone());
-        let stranger = stranger_app
-            .runtime()
+        let stranger_runtime = stranger_app.runtime();
+        let stranger = stranger_runtime
             .create_identity(crate::AccountSetupRequest {
                 default_relays: vec![endpoint.clone()],
                 bootstrap_relays: vec![endpoint.clone()],
@@ -1429,6 +1444,7 @@ mod tests {
             .await
             .expect("create the stranger's identity")
             .account;
+        wait_for_network_ready(&stranger_runtime, &stranger.account_id_hex).await;
         stranger_app
             .publish_user_profile(
                 &stranger.account_id_hex,
@@ -1822,17 +1838,28 @@ mod tests {
         let searcher_endpoint = cgka_traits::TransportEndpoint(searcher_relay_url.clone());
         let stranger_dir = tempfile::tempdir().unwrap();
         let stranger_app = MarmotApp::with_relay(stranger_dir.path(), author_relay_url.clone());
-        let stranger = stranger_app
-            .runtime()
+        let stranger_runtime = stranger_app.runtime();
+        let stranger = stranger_runtime
             .create_identity(crate::AccountSetupRequest {
                 default_relays: vec![author_endpoint.clone()],
-                bootstrap_relays: vec![author_endpoint.clone(), searcher_endpoint],
+                bootstrap_relays: vec![author_endpoint.clone(), searcher_endpoint.clone()],
                 publish_missing_relay_lists: true,
                 ..crate::AccountSetupRequest::default()
             })
             .await
             .expect("create the stranger's identity")
             .account;
+        wait_for_network_ready(&stranger_runtime, &stranger.account_id_hex).await;
+        stranger_app
+            .publish_account_relay_lists(
+                &stranger.account_id_hex,
+                crate::AccountRelayListBootstrap::new(
+                    vec![author_endpoint.clone()],
+                    vec![author_endpoint.clone(), searcher_endpoint],
+                ),
+            )
+            .await
+            .expect("make the stranger's write relay discoverable");
         stranger_app
             .publish_user_profile(
                 &stranger.account_id_hex,
@@ -2082,17 +2109,28 @@ mod tests {
         let searcher_endpoint = cgka_traits::TransportEndpoint(relay_url.clone());
         let stranger_dir = tempfile::tempdir().unwrap();
         let stranger_app = MarmotApp::with_relay(stranger_dir.path(), author_relay_url.clone());
-        let stranger = stranger_app
-            .runtime()
+        let stranger_runtime = stranger_app.runtime();
+        let stranger = stranger_runtime
             .create_identity(crate::AccountSetupRequest {
                 default_relays: vec![author_endpoint.clone()],
-                bootstrap_relays: vec![author_endpoint.clone(), searcher_endpoint],
+                bootstrap_relays: vec![author_endpoint.clone(), searcher_endpoint.clone()],
                 publish_missing_relay_lists: true,
                 ..crate::AccountSetupRequest::default()
             })
             .await
             .expect("create the stranger's identity")
             .account;
+        wait_for_network_ready(&stranger_runtime, &stranger.account_id_hex).await;
+        stranger_app
+            .publish_account_relay_lists(
+                &stranger.account_id_hex,
+                crate::AccountRelayListBootstrap::new(
+                    vec![author_endpoint.clone()],
+                    vec![author_endpoint.clone(), searcher_endpoint],
+                ),
+            )
+            .await
+            .expect("make the stranger's write relay discoverable");
         stranger_app
             .publish_user_profile(
                 &stranger.account_id_hex,

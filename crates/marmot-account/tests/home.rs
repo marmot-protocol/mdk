@@ -186,6 +186,65 @@ fn setup_phase_update_fails_when_journal_is_missing() {
 }
 
 #[test]
+fn generated_setup_context_is_private_and_removed_with_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    let context = br#"{"default_relays":["wss://relay.example"]}"#;
+
+    home.set_account_setup_context(&account.label, context)
+        .unwrap();
+
+    assert_eq!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .as_deref(),
+        Some(context.as_slice())
+    );
+    let context_path = home
+        .account_dir(&account.label)
+        .join(".account-setup-context.json");
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&context_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    home.complete_account_setup(&account.label).unwrap();
+    assert!(!context_path.exists());
+    assert!(home.account_setup_state(&account.label).unwrap().is_none());
+}
+
+#[test]
+fn generated_setup_context_is_absent_until_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+
+    assert!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn generated_setup_context_write_requires_a_setup_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+
+    assert!(matches!(
+        home.set_account_setup_context(&account.label, b"{}"),
+        Err(AccountHomeError::AccountSetupStateMissing)
+    ));
+}
+
+#[test]
 fn account_home_idempotent_import_reuses_existing_identity() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

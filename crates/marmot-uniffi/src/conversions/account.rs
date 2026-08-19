@@ -1,8 +1,9 @@
 //! Account summary, send summary, key-package, and user-profile FFI conversions.
 
 use marmot_app::{
-    AccountKeyPackageRecord, AccountUnread, GroupLeaveFailure, LocalCleanupReport, RelayFailure,
-    SendSummary, SignOutOutcome, UserProfileMetadata, WipeOutcome,
+    AccountKeyPackageRecord, AccountSetupReadiness, AccountUnread, GroupLeaveFailure,
+    LocalCleanupReport, RelayFailure, SendSummary, SignOutOutcome, UserProfileMetadata,
+    WipeOutcome,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -13,6 +14,34 @@ pub struct AccountSummaryFfi {
     pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AccountSetupReadinessFfi {
+    Initializing,
+    LocalReady,
+    Publishing,
+    NetworkReady,
+    RecoveryRequired,
+}
+
+impl From<AccountSetupReadiness> for AccountSetupReadinessFfi {
+    fn from(value: AccountSetupReadiness) -> Self {
+        match value {
+            AccountSetupReadiness::Initializing => Self::Initializing,
+            AccountSetupReadiness::LocalReady => Self::LocalReady,
+            AccountSetupReadiness::Publishing => Self::Publishing,
+            AccountSetupReadiness::NetworkReady => Self::NetworkReady,
+            AccountSetupReadiness::RecoveryRequired => Self::RecoveryRequired,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IdentityCreationResultFfi {
+    pub account: AccountSummaryFfi,
+    pub profile: UserProfileMetadataFfi,
+    pub readiness: AccountSetupReadinessFfi,
 }
 
 /// Per-account unread aggregate for the account-switcher and application

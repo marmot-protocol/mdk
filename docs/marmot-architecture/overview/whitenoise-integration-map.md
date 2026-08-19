@@ -1,7 +1,7 @@
 ---
 title: "whitenoise-rs Integration Map"
 created: 2026-05-11
-updated: 2026-07-24
+updated: 2026-08-19
 tags: [marmot, overview, cgka, integration, whitenoise]
 status: working-note
 ---
@@ -75,6 +75,11 @@ A first whitenoise-rs shim would need to do the following.
 
 ### Account Bootstrap
 
+- for generated identities, render the account and exact returned default profile at `LocalReady` without an immediate
+  profile lookup;
+- keep invite-receivable UI disabled until `AccountSetupReadiness::NetworkReady`; `Initializing` has not reached local
+  durability, `Publishing` has bounded in-session retry plus restart-resumable progress, and `RecoveryRequired` is
+  terminal until the explicit recovery flow succeeds;
 - ensure NIP-65 relay list state exists (its relays are also the outbox for KeyPackage publication);
 - ensure inbox relay list state exists;
 - publish or repair missing account relay-list events before normal runtime publication depends on them.

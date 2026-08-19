@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-08-18
+updated: 2026-08-19
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -140,6 +140,15 @@ ack/fail resolution and delivery/invite-lifecycle chaos cases at that stack boun
 account runtime for activation, KeyPackage publication, and publish confirmation/rollback, converge stored OpenMLS
 messages, emit application-visible group events, model losing-branch invalidations, and test generated delivery
 variants.
+
+Generated-account creation now has an explicit durable local-ready entry point. The identity, default profile, setup
+journal, stable KeyPackage slot, private KeyPackage material, and exact signed initial publication are persisted before
+that entry point returns. Bootstrap/profile/KeyPackage publication then continues as restart-resumable background work;
+the compatibility `create_identity` entry point still waits for `NetworkReady`. Hosts using the local-ready entry point
+must honor `AccountSetupReadiness`: `LocalReady` is sufficient for local reads and profile rendering, while only
+`NetworkReady` means the account may be presented as invite-receivable. `Initializing` means local setup has not yet
+reached durable local readiness. `Publishing` includes bounded in-session retry and restart-resumable publication, and
+`RecoveryRequired` requires an explicit recovery flow.
 
 ## Known gaps
 

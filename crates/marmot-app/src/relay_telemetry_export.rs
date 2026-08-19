@@ -232,6 +232,54 @@ pub mod metric_names {
         "app_account_initial_sync_overlap_successes";
     pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_FAILURES: &str =
         "app_account_initial_sync_overlap_failures";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_DURATION: &str =
+        "app_account_setup_identity_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_identity_local_attempts";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_SUCCESSES: &str =
+        "app_account_setup_identity_local_successes";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_FAILURES: &str =
+        "app_account_setup_identity_local_failures";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_DURATION: &str =
+        "app_account_setup_storage_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_storage_local_attempts";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_SUCCESSES: &str =
+        "app_account_setup_storage_local_successes";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_FAILURES: &str =
+        "app_account_setup_storage_local_failures";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_DURATION: &str =
+        "app_account_setup_profile_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_profile_local_attempts";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_SUCCESSES: &str =
+        "app_account_setup_profile_local_successes";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_FAILURES: &str =
+        "app_account_setup_profile_local_failures";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_DURATION: &str =
+        "app_account_setup_key_package_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_key_package_local_attempts";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_SUCCESSES: &str =
+        "app_account_setup_key_package_local_successes";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_FAILURES: &str =
+        "app_account_setup_key_package_local_failures";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_DURATION: &str =
+        "app_account_setup_local_ready_handoff_duration_ms";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_ATTEMPTS: &str =
+        "app_account_setup_local_ready_handoff_attempts";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_SUCCESSES: &str =
+        "app_account_setup_local_ready_handoff_successes";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_FAILURES: &str =
+        "app_account_setup_local_ready_handoff_failures";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_DURATION: &str =
+        "app_account_setup_network_ready_duration_ms";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_ATTEMPTS: &str =
+        "app_account_setup_network_ready_attempts";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_SUCCESSES: &str =
+        "app_account_setup_network_ready_successes";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_FAILURES: &str =
+        "app_account_setup_network_ready_failures";
     /// Interrupted-migration recovery probes executed (each is one full keyed
     /// SQLCipher open paying the passphrase KDF, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_RUNS: &str = "app_sqlcipher_migration_probe_runs";
@@ -1002,6 +1050,54 @@ fn append_app_performance_points(
         metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_ATTEMPTS,
         metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_SUCCESSES,
         metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_identity_local,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_storage_local,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_profile_local,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_key_package_local,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_local_ready_handoff,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_network_ready,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_FAILURES,
     );
     append_app_operation_points(
         points,

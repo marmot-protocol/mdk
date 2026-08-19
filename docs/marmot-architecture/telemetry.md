@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-08-18
+updated: 2026-08-19
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -220,6 +220,14 @@ Collected operations:
 | `account_subscription_registration` | Initial registration of the hydrated account's group subscriptions. | Runs after transport activation and before relay catch-up; a slow registration cannot delay local readiness. |
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
 | `account_sync` | The initial asynchronous account network/bootstrap phase and each later account-worker `client.sync()` catch-up. | The startup sample includes transport preparation, relay data drain, processing, projection/state update, and relay-dependent open maintenance; later samples cover catch-up only. |
+| `account_setup_identity_local` | Generated identity/keychain creation plus durable local account record initialization. | Ends before relay work. |
+| `account_setup_storage_local` | SQLCipher account-storage creation/open for the generated identity. | Separates database initialization from KeyPackage generation and signing. |
+| `account_setup_profile_local` | Exact default-profile selection and durable local directory projection. | The returned binding profile is this local value. |
+| `account_bootstrap_relay_and_follow_publish` / `account_default_profile_publish` | Generated bootstrap relay/follow records and the default profile publication. | Background, retryable, independently timed, and excluded from local-ready caller latency. |
+| `account_setup_key_package_local` | Initial KeyPackage generation, private-material persistence, signing, and exact signed-event persistence. | Completes before local-ready handoff and before any setup publication. |
+| `account_initial_key_package_publish` | Initial KeyPackage relay publication and durable confirmation. | Background and retryable from the exact persisted artifact. |
+| `account_setup_local_ready_handoff` | Complete generated-account caller latency through local worker readiness. | The host may render local state but must not claim invite readiness. |
+| `account_setup_network_ready` | Background work from local-ready scheduling through bootstrap and KeyPackage confirmation plus journal completion. | Success is the invite-receivable boundary. |
 | `outbound_message_send` | Worker `SendMessage` and `SendAppEvent` commands until their send call returns a `SendSummary` or error. | One-sided local send/publish confirmation only. It is not end-to-end remote delivery or read latency. |
 | `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension; includes either cache-only reuse or create-time relay resolution below. |
 | `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Aggregate duration only. No member count label, account/relay identity, reservation, or package consumption. |
@@ -477,6 +485,30 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_account_group_read_snapshot_attempts` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.attempts` |
 | `app_account_group_read_snapshot_successes` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.successes` |
 | `app_account_group_read_snapshot_failures` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.failures` |
+| `app_account_setup_identity_local_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_identity_local.duration_ms` |
+| `app_account_setup_identity_local_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_identity_local.attempts` |
+| `app_account_setup_identity_local_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_identity_local.successes` |
+| `app_account_setup_identity_local_failures` | none | Counter | `AppPerformanceSnapshot.account_setup_identity_local.failures` |
+| `app_account_setup_storage_local_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_storage_local.duration_ms` |
+| `app_account_setup_storage_local_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_storage_local.attempts` |
+| `app_account_setup_storage_local_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_storage_local.successes` |
+| `app_account_setup_storage_local_failures` | none | Counter | `AppPerformanceSnapshot.account_setup_storage_local.failures` |
+| `app_account_setup_profile_local_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_profile_local.duration_ms` |
+| `app_account_setup_profile_local_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_profile_local.attempts` |
+| `app_account_setup_profile_local_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_profile_local.successes` |
+| `app_account_setup_profile_local_failures` | none | Counter | `AppPerformanceSnapshot.account_setup_profile_local.failures` |
+| `app_account_setup_key_package_local_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_key_package_local.duration_ms` |
+| `app_account_setup_key_package_local_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_key_package_local.attempts` |
+| `app_account_setup_key_package_local_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_key_package_local.successes` |
+| `app_account_setup_key_package_local_failures` | none | Counter | `AppPerformanceSnapshot.account_setup_key_package_local.failures` |
+| `app_account_setup_local_ready_handoff_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_local_ready_handoff.duration_ms` |
+| `app_account_setup_local_ready_handoff_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_local_ready_handoff.attempts` |
+| `app_account_setup_local_ready_handoff_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_local_ready_handoff.successes` |
+| `app_account_setup_local_ready_handoff_failures` | none | Counter | `AppPerformanceSnapshot.account_setup_local_ready_handoff.failures` |
+| `app_account_setup_network_ready_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_setup_network_ready.duration_ms` |
+| `app_account_setup_network_ready_attempts` | none | Counter | `AppPerformanceSnapshot.account_setup_network_ready.attempts` |
+| `app_account_setup_network_ready_successes` | none | Counter | `AppPerformanceSnapshot.account_setup_network_ready.successes` |
+| `app_account_setup_network_ready_failures` | none | Counter | `AppPerformanceSnapshot.account_setup_network_ready.failures` |
 | `app_account_transport_activation_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_transport_activation.duration_ms` |
 | `app_account_transport_activation_attempts` | none | Counter | `AppPerformanceSnapshot.account_transport_activation.attempts` |
 | `app_account_transport_activation_successes` | none | Counter | `AppPerformanceSnapshot.account_transport_activation.successes` |
@@ -501,10 +533,66 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_group_conversation_snapshot_read_attempts` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.attempts` |
 | `app_group_conversation_snapshot_read_successes` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.successes` |
 | `app_group_conversation_snapshot_read_failures` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.failures` |
+| `app_group_member_key_package_prewarm_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_member_key_package_prewarm.duration_ms` |
+| `app_group_member_key_package_prewarm_attempts` | none | Counter | `AppPerformanceSnapshot.group_member_key_package_prewarm.attempts` |
+| `app_group_member_key_package_prewarm_successes` | none | Counter | `AppPerformanceSnapshot.group_member_key_package_prewarm.successes` |
+| `app_group_member_key_package_prewarm_failures` | none | Counter | `AppPerformanceSnapshot.group_member_key_package_prewarm.failures` |
+| `app_group_create_key_package_cache_reuse_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_key_package_cache_reuse.duration_ms` |
+| `app_group_create_key_package_cache_reuse_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_cache_reuse.attempts` |
+| `app_group_create_key_package_cache_reuse_successes` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_cache_reuse.successes` |
+| `app_group_create_key_package_cache_reuse_failures` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_cache_reuse.failures` |
+| `app_group_create_key_package_network_resolution_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_key_package_network_resolution.duration_ms` |
+| `app_group_create_key_package_network_resolution_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_network_resolution.attempts` |
+| `app_group_create_key_package_network_resolution_successes` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_network_resolution.successes` |
+| `app_group_create_key_package_network_resolution_failures` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_network_resolution.failures` |
 | `app_group_create_image_preprocess_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_image_preprocess.duration_ms` |
 | `app_group_create_image_preprocess_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_image_preprocess.attempts` |
 | `app_group_create_image_preprocess_successes` | none | Counter | `AppPerformanceSnapshot.group_create_image_preprocess.successes` |
 | `app_group_create_image_preprocess_failures` | none | Counter | `AppPerformanceSnapshot.group_create_image_preprocess.failures` |
+| `app_group_create_queue_wait_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_queue_wait.duration_ms` |
+| `app_group_create_queue_wait_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_queue_wait.attempts` |
+| `app_group_create_queue_wait_successes` | none | Counter | `AppPerformanceSnapshot.group_create_queue_wait.successes` |
+| `app_group_create_queue_wait_failures` | none | Counter | `AppPerformanceSnapshot.group_create_queue_wait.failures` |
+| `app_group_create_key_package_lookup_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_key_package_lookup.duration_ms` |
+| `app_group_create_key_package_lookup_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_lookup.attempts` |
+| `app_group_create_key_package_lookup_successes` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_lookup.successes` |
+| `app_group_create_key_package_lookup_failures` | none | Counter | `AppPerformanceSnapshot.group_create_key_package_lookup.failures` |
+| `app_group_create_image_upload_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_image_upload.duration_ms` |
+| `app_group_create_image_upload_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_image_upload.attempts` |
+| `app_group_create_image_upload_successes` | none | Counter | `AppPerformanceSnapshot.group_create_image_upload.successes` |
+| `app_group_create_image_upload_failures` | none | Counter | `AppPerformanceSnapshot.group_create_image_upload.failures` |
+| `app_group_create_mls_prepare_persist_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_mls_prepare_persist.duration_ms` |
+| `app_group_create_mls_prepare_persist_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_mls_prepare_persist.attempts` |
+| `app_group_create_mls_prepare_persist_successes` | none | Counter | `AppPerformanceSnapshot.group_create_mls_prepare_persist.successes` |
+| `app_group_create_mls_prepare_persist_failures` | none | Counter | `AppPerformanceSnapshot.group_create_mls_prepare_persist.failures` |
+| `app_group_create_pending_welcome_index_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_pending_welcome_index.duration_ms` |
+| `app_group_create_pending_welcome_index_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_pending_welcome_index.attempts` |
+| `app_group_create_pending_welcome_index_successes` | none | Counter | `AppPerformanceSnapshot.group_create_pending_welcome_index.successes` |
+| `app_group_create_pending_welcome_index_failures` | none | Counter | `AppPerformanceSnapshot.group_create_pending_welcome_index.failures` |
+| `app_group_create_welcome_publish_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_welcome_publish.duration_ms` |
+| `app_group_create_welcome_publish_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_welcome_publish.attempts` |
+| `app_group_create_welcome_publish_successes` | none | Counter | `AppPerformanceSnapshot.group_create_welcome_publish.successes` |
+| `app_group_create_welcome_publish_failures` | none | Counter | `AppPerformanceSnapshot.group_create_welcome_publish.failures` |
+| `app_group_create_local_projection_save_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_local_projection_save.duration_ms` |
+| `app_group_create_local_projection_save_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_local_projection_save.attempts` |
+| `app_group_create_local_projection_save_successes` | none | Counter | `AppPerformanceSnapshot.group_create_local_projection_save.successes` |
+| `app_group_create_local_projection_save_failures` | none | Counter | `AppPerformanceSnapshot.group_create_local_projection_save.failures` |
+| `app_group_create_response_handoff_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_response_handoff.duration_ms` |
+| `app_group_create_response_handoff_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_response_handoff.attempts` |
+| `app_group_create_response_handoff_successes` | none | Counter | `AppPerformanceSnapshot.group_create_response_handoff.successes` |
+| `app_group_create_response_handoff_failures` | none | Counter | `AppPerformanceSnapshot.group_create_response_handoff.failures` |
+| `app_group_create_subscription_refresh_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_subscription_refresh.duration_ms` |
+| `app_group_create_subscription_refresh_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_subscription_refresh.attempts` |
+| `app_group_create_subscription_refresh_successes` | none | Counter | `AppPerformanceSnapshot.group_create_subscription_refresh.successes` |
+| `app_group_create_subscription_refresh_failures` | none | Counter | `AppPerformanceSnapshot.group_create_subscription_refresh.failures` |
+| `app_group_create_post_mutation_catch_up_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_post_mutation_catch_up.duration_ms` |
+| `app_group_create_post_mutation_catch_up_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_post_mutation_catch_up.attempts` |
+| `app_group_create_post_mutation_catch_up_successes` | none | Counter | `AppPerformanceSnapshot.group_create_post_mutation_catch_up.successes` |
+| `app_group_create_post_mutation_catch_up_failures` | none | Counter | `AppPerformanceSnapshot.group_create_post_mutation_catch_up.failures` |
+| `app_group_create_total_caller_latency_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_create_total_caller_latency.duration_ms` |
+| `app_group_create_total_caller_latency_attempts` | none | Counter | `AppPerformanceSnapshot.group_create_total_caller_latency.attempts` |
+| `app_group_create_total_caller_latency_successes` | none | Counter | `AppPerformanceSnapshot.group_create_total_caller_latency.successes` |
+| `app_group_create_total_caller_latency_failures` | none | Counter | `AppPerformanceSnapshot.group_create_total_caller_latency.failures` |
 | `app_group_accept_invite_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_accept_invite.duration_ms` |
 | `app_group_accept_invite_attempts` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.attempts` |
 | `app_group_accept_invite_successes` | none | Counter | `AppPerformanceSnapshot.group_accept_invite.successes` |

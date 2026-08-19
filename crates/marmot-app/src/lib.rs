@@ -105,12 +105,12 @@ pub(crate) use groups::AppGroupImageInput;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
-    AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
-    AgentTextStreamCryptoContext, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
-    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RelayFailure,
-    RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
-    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
-    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult,
+    AgentStreamWatchOptions, AgentTextStreamCryptoContext, CatchUpAccountsSummary,
+    ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport, ManagedAccount, MarmotAppEvent,
+    MarmotAppRuntime, RelayFailure, RuntimeAccountError, RuntimeAgentStreamMessage,
+    RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
+    RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
     RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
     RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
     RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,

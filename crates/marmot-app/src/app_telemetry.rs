@@ -41,6 +41,12 @@ pub(crate) enum AppPerformanceOperation {
     /// successful sample is zero; a non-zero sample would mean a future path
     /// allowed both network phases to run concurrently.
     AccountInitialSyncOverlap,
+    AccountSetupIdentityLocal,
+    AccountSetupStorageLocal,
+    AccountSetupProfileLocal,
+    AccountSetupKeyPackageLocal,
+    AccountSetupLocalReadyHandoff,
+    AccountSetupNetworkReady,
     OutboundMessageSend,
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
@@ -235,6 +241,18 @@ pub struct AppPerformanceSnapshot {
     /// sentinel: KeyPackage publication completed before sync began.
     #[serde(default)]
     pub account_initial_sync_overlap: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_identity_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_storage_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_profile_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_key_package_local: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_local_ready_handoff: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_setup_network_ready: AppPerformanceOperationSnapshot,
     /// Interrupted-migration recovery probes executed since process start. Each
     /// probe is a full keyed SQLCipher open paying the passphrase KDF; the
     /// healthy steady state skips it via the cached v2-open verdict (mdk#1439).
@@ -344,6 +362,12 @@ struct AppPerformanceTelemetryInner {
     account_default_profile_publish: AppPerformanceOperationTelemetry,
     account_initial_key_package_publish: AppPerformanceOperationTelemetry,
     account_initial_sync_overlap: AppPerformanceOperationTelemetry,
+    account_setup_identity_local: AppPerformanceOperationTelemetry,
+    account_setup_storage_local: AppPerformanceOperationTelemetry,
+    account_setup_profile_local: AppPerformanceOperationTelemetry,
+    account_setup_key_package_local: AppPerformanceOperationTelemetry,
+    account_setup_local_ready_handoff: AppPerformanceOperationTelemetry,
+    account_setup_network_ready: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
@@ -551,6 +575,24 @@ impl AppPerformanceTelemetry {
                 .record(duration, success),
             AppPerformanceOperation::AccountInitialSyncOverlap => {
                 inner.account_initial_sync_overlap.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupIdentityLocal => {
+                inner.account_setup_identity_local.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupStorageLocal => {
+                inner.account_setup_storage_local.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupProfileLocal => {
+                inner.account_setup_profile_local.record(duration, success)
+            }
+            AppPerformanceOperation::AccountSetupKeyPackageLocal => inner
+                .account_setup_key_package_local
+                .record(duration, success),
+            AppPerformanceOperation::AccountSetupLocalReadyHandoff => inner
+                .account_setup_local_ready_handoff
+                .record(duration, success),
+            AppPerformanceOperation::AccountSetupNetworkReady => {
+                inner.account_setup_network_ready.record(duration, success)
             }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
@@ -773,6 +815,12 @@ impl AppPerformanceTelemetry {
                 .account_initial_key_package_publish
                 .snapshot(),
             account_initial_sync_overlap: inner.account_initial_sync_overlap.snapshot(),
+            account_setup_identity_local: inner.account_setup_identity_local.snapshot(),
+            account_setup_storage_local: inner.account_setup_storage_local.snapshot(),
+            account_setup_profile_local: inner.account_setup_profile_local.snapshot(),
+            account_setup_key_package_local: inner.account_setup_key_package_local.snapshot(),
+            account_setup_local_ready_handoff: inner.account_setup_local_ready_handoff.snapshot(),
+            account_setup_network_ready: inner.account_setup_network_ready.snapshot(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
             outbound_message_send: inner.outbound_message_send.snapshot(),
@@ -1080,6 +1128,12 @@ mod tests {
             (AppPerformanceOperation::AccountDefaultProfilePublish, 35),
             (AppPerformanceOperation::AccountInitialKeyPackagePublish, 25),
             (AppPerformanceOperation::AccountInitialSyncOverlap, 0),
+            (AppPerformanceOperation::AccountSetupIdentityLocal, 1),
+            (AppPerformanceOperation::AccountSetupStorageLocal, 2),
+            (AppPerformanceOperation::AccountSetupProfileLocal, 3),
+            (AppPerformanceOperation::AccountSetupKeyPackageLocal, 4),
+            (AppPerformanceOperation::AccountSetupLocalReadyHandoff, 5),
+            (AppPerformanceOperation::AccountSetupNetworkReady, 6),
         ] {
             telemetry.record(operation, Duration::from_millis(duration_ms), true);
         }
@@ -1114,6 +1168,52 @@ mod tests {
         );
         assert_eq!(snapshot.account_initial_sync_overlap.successes, 1);
         assert_eq!(snapshot.account_initial_sync_overlap.duration_ms.sum_ms, 0);
+        assert_eq!(snapshot.account_setup_identity_local.duration_ms.sum_ms, 1);
+        assert_eq!(snapshot.account_setup_storage_local.duration_ms.sum_ms, 2);
+        assert_eq!(snapshot.account_setup_profile_local.duration_ms.sum_ms, 3);
+        assert_eq!(
+            snapshot.account_setup_key_package_local.duration_ms.sum_ms,
+            4
+        );
+        assert_eq!(
+            snapshot
+                .account_setup_local_ready_handoff
+                .duration_ms
+                .sum_ms,
+            5
+        );
+        assert_eq!(snapshot.account_setup_network_ready.duration_ms.sum_ms, 6);
+    }
+
+    #[test]
+    fn records_each_generated_account_setup_stage_and_outcome() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms) in [
+            (AppPerformanceOperation::AccountSetupIdentityLocal, 1),
+            (AppPerformanceOperation::AccountSetupStorageLocal, 2),
+            (AppPerformanceOperation::AccountSetupProfileLocal, 3),
+            (AppPerformanceOperation::AccountSetupKeyPackageLocal, 4),
+            (AppPerformanceOperation::AccountSetupLocalReadyHandoff, 5),
+            (AppPerformanceOperation::AccountSetupNetworkReady, 6),
+        ] {
+            telemetry.record(operation, Duration::from_millis(duration_ms), true);
+            telemetry.record(operation, Duration::from_millis(duration_ms), false);
+        }
+
+        let snapshot = telemetry.snapshot();
+        for (stage, expected_sum_ms) in [
+            (snapshot.account_setup_identity_local, 2),
+            (snapshot.account_setup_storage_local, 4),
+            (snapshot.account_setup_profile_local, 6),
+            (snapshot.account_setup_key_package_local, 8),
+            (snapshot.account_setup_local_ready_handoff, 10),
+            (snapshot.account_setup_network_ready, 12),
+        ] {
+            assert_eq!(stage.attempts, 2);
+            assert_eq!(stage.successes, 1);
+            assert_eq!(stage.failures, 1);
+            assert_eq!(stage.duration_ms.sum_ms, expected_sum_ms);
+        }
     }
 
     #[test]
@@ -1213,6 +1313,37 @@ mod tests {
         assert_eq!(snapshot.chat_list_row_read.failures, 1);
         assert_eq!(snapshot.chat_list_row_read.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.chat_list_row_read.duration_ms.sum_ms, 13);
+    }
+
+    #[test]
+    fn records_group_conversation_snapshot_read_operation() {
+        let telemetry = AppPerformanceTelemetry::default();
+        telemetry.record(
+            AppPerformanceOperation::GroupConversationSnapshotRead,
+            Duration::from_millis(6),
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::GroupConversationSnapshotRead,
+            Duration::from_millis(10),
+            false,
+        );
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_conversation_snapshot_read.attempts, 2);
+        assert_eq!(snapshot.group_conversation_snapshot_read.successes, 1);
+        assert_eq!(snapshot.group_conversation_snapshot_read.failures, 1);
+        assert_eq!(
+            snapshot
+                .group_conversation_snapshot_read
+                .duration_ms
+                .sample_count(),
+            2
+        );
+        assert_eq!(
+            snapshot.group_conversation_snapshot_read.duration_ms.sum_ms,
+            16
+        );
     }
 
     #[test]

@@ -40,6 +40,10 @@ pub(crate) fn write_secret_json<T: Serialize>(
     write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Private)
 }
 
+pub(crate) fn write_secret_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> AccountHomeResult<()> {
+    write_file_atomically(path.as_ref(), bytes, FileMode::Private)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMode {
     Public,

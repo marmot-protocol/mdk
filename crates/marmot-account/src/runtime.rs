@@ -598,15 +598,24 @@ where
         }
     }
 
-    pub async fn publish_fresh_key_package(&mut self) -> AccountResult<KeyPackage> {
+    /// Stage the exact next KeyPackage and authored publication bytes without
+    /// performing any network I/O.
+    ///
+    /// This is the durable local-readiness boundary for generated accounts:
+    /// callers may return the identity only after this succeeds, then resume
+    /// [`Self::publish_fresh_key_package`] later with the same persisted
+    /// private material and signed artifact.
+    pub async fn prepare_fresh_key_package(
+        &mut self,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> AccountResult<KeyPackage> {
         tracing::debug!(
             target: TRACE_TARGET,
-            method = "publish_fresh_key_package",
-            endpoint_count = self.routing.key_package_endpoints().len(),
-            "publishing fresh key package"
+            method = "prepare_fresh_key_package",
+            endpoint_count = endpoints.len(),
+            "preparing fresh key package for later publication"
         );
         let now = self.wall_clock.now();
-        let endpoints = self.routing.key_package_endpoints();
         let mut lifecycle = match self.session.key_package_lifecycle()? {
             Some(state) => state,
             None => {
@@ -667,8 +676,7 @@ where
                 created_at,
                 lead,
                 endpoints
-                    .iter()
-                    .cloned()
+                    .into_iter()
                     .map(|endpoint| TransportFanoutTarget {
                         endpoint,
                         state: TransportFanoutAttemptState::Unattempted,
@@ -709,6 +717,28 @@ where
             // Exact signed bytes are durable before the first network call.
             self.session.put_key_package_lifecycle(&lifecycle)?;
         }
+
+        Ok(lifecycle
+            .pending_replacement
+            .as_ref()
+            .expect("prepared replacement exists")
+            .key_package
+            .clone())
+    }
+
+    pub async fn publish_fresh_key_package(&mut self) -> AccountResult<KeyPackage> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "publish_fresh_key_package",
+            endpoint_count = self.routing.key_package_endpoints().len(),
+            "publishing fresh key package"
+        );
+        let endpoints = self.routing.key_package_endpoints().to_vec();
+        self.prepare_fresh_key_package(endpoints).await?;
+        let mut lifecycle = self
+            .session
+            .key_package_lifecycle()?
+            .expect("prepared lifecycle is durable");
 
         let pending = lifecycle
             .pending_replacement
