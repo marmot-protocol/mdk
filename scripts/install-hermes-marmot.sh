@@ -47,6 +47,8 @@ SYSTEM_INSTALL=0
 CLI_RELAYS=0
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_JSON_PATH=""
+BOOTSTRAP_NPUB=""
+BOOTSTRAP_NPROFILE=""
 EXISTING_IDENTITY_FILE=""
 EXISTING_IDENTITY_PROMPT=0
 GENERATE_IDENTITY_EXPLICIT=0
@@ -115,13 +117,10 @@ through wn-agent. Message-sender allowlist entries control which Marmot senders
 Hermes accepts after gateway restart via $HERMES_HOME/.env.
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | bash
 
   curl -fsSL .../install-hermes-marmot.sh | bash -s -- --yes \
-    --existing-identity-file "$HOME/.config/example/hermes-agent.nsec" \
-    --allow-welcomer npub1... \
-    --expected-npub npub1... \
-    --allow-user npub1...
+    --allow-welcomer npub1... --allow-user npub1...
 
   curl -fsSL .../install-hermes-marmot.sh | bash -s -- --yes \
     --allow-all-users
@@ -1147,6 +1146,8 @@ bootstrap_agent() {
         printf '\n'
         BOOTSTRAP_ACCOUNT_ID_HEX="<account-id-from-bootstrap>"
         BOOTSTRAP_JSON_PATH="$MARMOT_HOME/bootstrap.json"
+        BOOTSTRAP_NPUB="<agent-npub-from-bootstrap>"
+        BOOTSTRAP_NPROFILE="<agent-nprofile-from-bootstrap>"
         return 0
     fi
 
@@ -1154,10 +1155,21 @@ bootstrap_agent() {
     local bootstrap_json
     bootstrap_json="$(wn-agent "${args[@]}")"
     BOOTSTRAP_JSON_PATH="$MARMOT_HOME/bootstrap.json"
-    printf '%s\n' "$bootstrap_json" >"$BOOTSTRAP_JSON_PATH"
+    (
+        umask 077
+        printf '%s\n' "$bootstrap_json" >"$BOOTSTRAP_JSON_PATH"
+    )
     BOOTSTRAP_ACCOUNT_ID_HEX="$(
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
+    )"
+    BOOTSTRAP_NPUB="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["npub"])'
+    )"
+    BOOTSTRAP_NPROFILE="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["nprofile"])'
     )"
     log "bootstrap details -> $BOOTSTRAP_JSON_PATH"
 }
@@ -1219,9 +1231,22 @@ configure_hermes_gateway() {
     run python3 "${args[@]}"
 }
 
+print_phone_invite() {
+    cat <<EOF
+
+White Noise agent identity:
+  npub: $BOOTSTRAP_NPUB
+  nprofile: $BOOTSTRAP_NPROFILE
+EOF
+    if [ "$DRY_RUN" -eq 0 ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
+        printf '%s' "$BOOTSTRAP_NPROFILE" | qrencode -t ANSIUTF8
+    fi
+}
+
 print_next_steps() {
-    # Account ids stay in the bootstrap/config files but are intentionally
-    # omitted here to keep installer diagnostics privacy-safe.
+    # Public onboarding identifiers are printed only in this explicit success
+    # summary; normal diagnostics remain identifier-free.
+    print_phone_invite
     cat <<EOF
 
 Install complete.
@@ -1246,6 +1271,9 @@ Hermes:
 
 Restart your existing Hermes gateway when you are ready for it to load the Marmot plugin/config:
   hermes gateway restart
+
+Then add the agent identity above in White Noise, invite it from an authorized
+account, and send a test message.
 
 Hermes loads sender authorization from $HERMES_HOME/.env at gateway startup.
 After changing MARMOT_ALLOWED_USERS or MARMOT_ALLOW_ALL_USERS, restart Hermes

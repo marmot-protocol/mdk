@@ -226,6 +226,9 @@ pi-installer-test:
 pi-dev-e2e-connector:
     cargo test -p wn-pi --test e2e_connector -- --ignored --nocapture
 
+agent-install-docs-gate:
+    scripts/check_agent_install_docs.sh
+
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -556,6 +559,6 @@ test-convergence-policy-pin:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI runs the full `just ci` suite (including the workspace test matrix).
-fast-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate check clippy test-convergence-policy-pin
 
 ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate check clippy test-convergence-policy-pin test

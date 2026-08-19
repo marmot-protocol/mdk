@@ -49,6 +49,8 @@ CLI_RELAYS=0
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_JSON_PATH=""
 BOOTSTRAP_WELCOMER_ALLOWLIST_CSV=""
+BOOTSTRAP_NPUB=""
+BOOTSTRAP_NPROFILE=""
 EXISTING_IDENTITY_FILE=""
 EXISTING_IDENTITY_PROMPT=0
 GENERATE_IDENTITY_EXPLICIT=0
@@ -107,7 +109,7 @@ Environment:
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh | bash
 
   curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
 
@@ -627,6 +629,8 @@ bootstrap_agent() {
         BOOTSTRAP_ACCOUNT_ID_HEX="<account-id-from-bootstrap>"
         BOOTSTRAP_JSON_PATH="$MARMOT_HOME/bootstrap.json"
         BOOTSTRAP_WELCOMER_ALLOWLIST_CSV=""
+        BOOTSTRAP_NPUB="<agent-npub-from-bootstrap>"
+        BOOTSTRAP_NPROFILE="<agent-nprofile-from-bootstrap>"
         return 0
     fi
 
@@ -634,7 +638,10 @@ bootstrap_agent() {
     local bootstrap_json
     bootstrap_json="$(wn-agent "${args[@]}")"
     BOOTSTRAP_JSON_PATH="$MARMOT_HOME/bootstrap.json"
-    printf '%s\n' "$bootstrap_json" >"$BOOTSTRAP_JSON_PATH"
+    (
+        umask 077
+        printf '%s\n' "$bootstrap_json" >"$BOOTSTRAP_JSON_PATH"
+    )
     BOOTSTRAP_ACCOUNT_ID_HEX="$(
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
@@ -642,6 +649,14 @@ bootstrap_agent() {
     BOOTSTRAP_WELCOMER_ALLOWLIST_CSV="$(
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(",".join(json.load(sys.stdin).get("welcomer_account_ids_hex", [])))'
+    )"
+    BOOTSTRAP_NPUB="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["npub"])'
+    )"
+    BOOTSTRAP_NPROFILE="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["nprofile"])'
     )"
     log "bootstrap details -> $BOOTSTRAP_JSON_PATH"
 }
@@ -713,7 +728,20 @@ NODE
     log "patched OpenClaw Marmot channel config -> $config_path"
 }
 
+print_phone_invite() {
+    cat <<EOF
+
+White Noise agent identity:
+  npub: $BOOTSTRAP_NPUB
+  nprofile: $BOOTSTRAP_NPROFILE
+EOF
+    if [ "$DRY_RUN" -eq 0 ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
+        printf '%s' "$BOOTSTRAP_NPROFILE" | qrencode -t ANSIUTF8
+    fi
+}
+
 print_next_steps() {
+    print_phone_invite
     cat <<EOF
 
 Install complete.
@@ -739,6 +767,9 @@ OpenClaw:
 
 Restart your existing OpenClaw gateway when you are ready for it to load the Marmot plugin/config:
   openclaw gateway run
+
+Then add the agent identity above in White Noise, invite it from an authorized
+account, and send a test message.
 
 Existing OpenClaw channels were not removed or disabled. The installer only installed the Marmot plugin and updated channels.marmot.
 

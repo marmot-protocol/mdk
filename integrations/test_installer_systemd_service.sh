@@ -89,7 +89,7 @@ case "${1:-}" in
         printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":"imported-agent","local_signing":true}'
         ;;
     bootstrap)
-        printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created":false,"welcomer_account_ids_hex":["bb"]}'
+        printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created":false,"welcomer_account_ids_hex":["bb"],"npub":"npub-test","nprofile":"nprofile-test"}'
         ;;
 esac
 SCRIPT
@@ -207,6 +207,7 @@ case "$(cat "$wn_agent_log")" in
     *) echo "$flavor installer did not import then bootstrap the exact existing identity" >&2; exit 1 ;;
 esac
 bootstrap_json="$fixture_root/existing/marmot-home/bootstrap.json"
+[ "$(stat -c %a "$bootstrap_json")" = 600 ]
 python3 - "$bootstrap_json" <<'PY'
 import json
 import sys

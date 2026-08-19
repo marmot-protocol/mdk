@@ -17,14 +17,13 @@ Prerequisites:
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | bash
-```
+Use the canonical [White Noise + Agents quickstart](../../README.md#pi) for the
+current guided install command and the steps to finish in White Noise.
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-pi-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
