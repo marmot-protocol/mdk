@@ -3668,6 +3668,7 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     assert_eq!(repeated.account, result.account);
     assert_eq!(repeated.profile, result.profile);
     assert_eq!(repeated.key_package_bytes, result.key_package_bytes);
+    assert_eq!(repeated.readiness, AccountSetupReadiness::Publishing);
     assert_eq!(
         app.account_storage(&repeated.account.label)
             .unwrap()

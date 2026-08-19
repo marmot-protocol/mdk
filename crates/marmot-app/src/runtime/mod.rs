@@ -4123,6 +4123,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .account_relay_list_status(&account.label)?;
+        let readiness = self.account_setup_readiness(&account.label)?;
         if schedule_background {
             let handoff_result = self.accounts.reconcile().await;
             self.shared.app_performance_telemetry().record(
@@ -4140,7 +4141,7 @@ impl MarmotAppRuntime {
                 .publish_initial_key_package
                 .then_some(key_package_bytes),
             profile: Some(profile),
-            readiness: AccountSetupReadiness::LocalReady,
+            readiness,
         })
     }
 
