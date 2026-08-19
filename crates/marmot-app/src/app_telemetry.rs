@@ -55,8 +55,10 @@ pub(crate) enum AppPerformanceOperation {
     GroupCreateKeyPackageNetworkResolution,
     GroupCreateImageUpload,
     GroupCreateMlsPreparePersist,
+    GroupCreatePendingWelcomeIndex,
     GroupCreateWelcomePublish,
     GroupCreateLocalProjectionSave,
+    GroupCreateResponseHandoff,
     GroupCreateSubscriptionRefresh,
     GroupCreatePostMutationCatchUp,
     GroupCreateTotalCallerLatency,
@@ -277,9 +279,13 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub group_create_mls_prepare_persist: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub group_create_pending_welcome_index: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub group_create_welcome_publish: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_local_projection_save: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_response_handoff: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_subscription_refresh: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -367,8 +373,10 @@ struct AppPerformanceTelemetryInner {
     group_create_key_package_network_resolution: AppPerformanceOperationTelemetry,
     group_create_image_upload: AppPerformanceOperationTelemetry,
     group_create_mls_prepare_persist: AppPerformanceOperationTelemetry,
+    group_create_pending_welcome_index: AppPerformanceOperationTelemetry,
     group_create_welcome_publish: AppPerformanceOperationTelemetry,
     group_create_local_projection_save: AppPerformanceOperationTelemetry,
+    group_create_response_handoff: AppPerformanceOperationTelemetry,
     group_create_subscription_refresh: AppPerformanceOperationTelemetry,
     group_create_post_mutation_catch_up: AppPerformanceOperationTelemetry,
     group_create_total_caller_latency: AppPerformanceOperationTelemetry,
@@ -616,12 +624,22 @@ impl AppPerformanceTelemetry {
                     .group_create_mls_prepare_persist
                     .record(duration, success);
             }
+            AppPerformanceOperation::GroupCreatePendingWelcomeIndex => {
+                inner
+                    .group_create_pending_welcome_index
+                    .record(duration, success);
+            }
             AppPerformanceOperation::GroupCreateWelcomePublish => {
                 inner.group_create_welcome_publish.record(duration, success);
             }
             AppPerformanceOperation::GroupCreateLocalProjectionSave => {
                 inner
                     .group_create_local_projection_save
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateResponseHandoff => {
+                inner
+                    .group_create_response_handoff
                     .record(duration, success);
             }
             AppPerformanceOperation::GroupCreateSubscriptionRefresh => {
@@ -808,8 +826,10 @@ impl AppPerformanceTelemetry {
                 .snapshot(),
             group_create_image_upload: inner.group_create_image_upload.snapshot(),
             group_create_mls_prepare_persist: inner.group_create_mls_prepare_persist.snapshot(),
+            group_create_pending_welcome_index: inner.group_create_pending_welcome_index.snapshot(),
             group_create_welcome_publish: inner.group_create_welcome_publish.snapshot(),
             group_create_local_projection_save: inner.group_create_local_projection_save.snapshot(),
+            group_create_response_handoff: inner.group_create_response_handoff.snapshot(),
             group_create_subscription_refresh: inner.group_create_subscription_refresh.snapshot(),
             group_create_post_mutation_catch_up: inner
                 .group_create_post_mutation_catch_up
@@ -1197,8 +1217,10 @@ mod tests {
             AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
             AppPerformanceOperation::GroupCreateImageUpload,
             AppPerformanceOperation::GroupCreateMlsPreparePersist,
+            AppPerformanceOperation::GroupCreatePendingWelcomeIndex,
             AppPerformanceOperation::GroupCreateWelcomePublish,
             AppPerformanceOperation::GroupCreateLocalProjectionSave,
+            AppPerformanceOperation::GroupCreateResponseHandoff,
             AppPerformanceOperation::GroupCreateSubscriptionRefresh,
             AppPerformanceOperation::GroupCreatePostMutationCatchUp,
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
@@ -1216,8 +1238,10 @@ mod tests {
             snapshot.group_create_key_package_network_resolution,
             snapshot.group_create_image_upload,
             snapshot.group_create_mls_prepare_persist,
+            snapshot.group_create_pending_welcome_index,
             snapshot.group_create_welcome_publish,
             snapshot.group_create_local_projection_save,
+            snapshot.group_create_response_handoff,
             snapshot.group_create_subscription_refresh,
             snapshot.group_create_post_mutation_catch_up,
             snapshot.group_create_total_caller_latency,

@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::{GroupId, TransportAdapter};
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
@@ -1949,6 +1949,23 @@ impl AppClient {
     pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(
         &mut self,
     ) -> Result<(), AppError> {
+        self.save_state_with_optional_created_chat_list_row(None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn save_state_with_created_chat_list_row(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<crate::ChatListRow, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.save_state_with_optional_created_chat_list_row(Some(&group_id_hex))?
+            .ok_or(AppError::UnknownGroup(group_id_hex))
+    }
+
+    fn save_state_with_optional_created_chat_list_row(
+        &mut self,
+        created_group_id_hex: Option<&str>,
+    ) -> Result<Option<crate::ChatListRow>, AppError> {
         let frontiers_to_clear = self
             .pending_local_group_deletion_frontier_clears
             .iter()
@@ -1979,17 +1996,30 @@ impl AppClient {
                 .cloned()
                 .collect(),
         };
-        self.app
-            .save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
-                &delta,
-                &frontiers_to_clear,
-                &application_event_ids_to_ack,
-            )?;
+        let created_chat_list_row = if let Some(group_id_hex) = created_group_id_hex {
+            Some(
+                self.app
+                    .save_state_delta_and_refresh_created_chat_list_row(
+                        &delta,
+                        &frontiers_to_clear,
+                        &application_event_ids_to_ack,
+                        group_id_hex,
+                    )?,
+            )
+        } else {
+            self.app
+                .save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                    &delta,
+                    &frontiers_to_clear,
+                    &application_event_ids_to_ack,
+                )?;
+            None
+        };
         self.pending_seen_event_count = 0;
         self.pending_group_projection_updates.clear();
         self.pending_local_group_deletion_frontier_clears.clear();
         self.pending_application_event_acks.clear();
-        Ok(())
+        Ok(created_chat_list_row)
     }
 
     /// Terminal disposition for accepted-but-unpublished sends (#1177).
@@ -2516,11 +2546,10 @@ mod runtime_group_subscription_refresh_tests {
         client.prepare_transport().await.unwrap();
         let telemetry = AppPerformanceTelemetry::default();
         client
-            .create_group_with_initial_profile_and_telemetry(
+            .create_group_with_options_and_telemetry(
                 "catch-up retry intent",
-                "",
                 &[],
-                None,
+                crate::AppCreateGroupOptions::default(),
                 &telemetry,
             )
             .await

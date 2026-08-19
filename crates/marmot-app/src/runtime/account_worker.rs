@@ -30,13 +30,14 @@ use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
-    AppProjectionUpdate, AppQuarantinedGroup, ClassifiedSyncFailure, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
-    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
-    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppCreateGroupOptions,
+    AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup, ChatListUpdateTrigger,
+    ClassifiedSyncFailure, ConvergenceScheduleState, EpochBackfillRunOutcome,
+    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -111,9 +112,8 @@ pub(crate) enum AccountWorkerCommand {
         queued_at: Instant,
         name: String,
         members: Vec<String>,
-        description: Option<String>,
-        initial_image: Option<AppInitialGroupImage>,
-        respond: oneshot::Sender<Result<GroupId, AppError>>,
+        options: AppCreateGroupOptions,
+        respond: oneshot::Sender<Result<CanonicalCreatedGroup, AppError>>,
     },
     Members {
         group_id: GroupId,
@@ -2537,8 +2537,7 @@ async fn handle_account_worker_command(
             queued_at,
             name,
             members,
-            description,
-            initial_image,
+            options,
             respond,
         } => {
             let telemetry = shared.app_performance_telemetry();
@@ -2549,24 +2548,38 @@ async fn handle_account_worker_command(
             );
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let result = client
-                .create_group_with_initial_profile_and_telemetry(
-                    &name,
-                    description.as_deref().unwrap_or_default(),
-                    &member_refs,
-                    initial_image,
-                    &telemetry,
-                )
+                .create_group_with_options_and_telemetry(&name, &member_refs, options, &telemetry)
                 .await;
-            if let Ok(group_id) = &result {
+            let response_handoff_started_at = Instant::now();
+            if let Ok(created_group) = &result {
                 publish_app_runtime_group_state_updated(
                     events,
                     account_id_hex,
                     account_label,
-                    group_id,
+                    &created_group.group_id,
                 );
+                if let Some(chat_list_row) = &created_group.chat_list_row {
+                    let _ =
+                        events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+                            account_id_hex: account_id_hex.to_owned(),
+                            account_label: account_label.to_owned(),
+                            update: AppProjectionUpdate {
+                                group_id_hex: chat_list_row.group_id_hex.clone(),
+                                timeline_messages: Vec::new(),
+                                timeline_changes: Vec::new(),
+                                chat_list_row: Some(chat_list_row.clone()),
+                                chat_list_trigger: ChatListUpdateTrigger::NewGroup,
+                            },
+                        }));
+                }
             }
             let created = result.is_ok();
-            let _ = respond.send(result);
+            let response_sent = respond.send(result).is_ok();
+            telemetry.record(
+                AppPerformanceOperation::GroupCreateResponseHandoff,
+                response_handoff_started_at.elapsed(),
+                response_sent,
+            );
             if created {
                 let read_snapshot = capture_group_read_snapshot(
                     client,

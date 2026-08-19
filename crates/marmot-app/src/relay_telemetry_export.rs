@@ -354,6 +354,15 @@ pub mod metric_names {
         "app_group_create_mls_prepare_persist_successes";
     pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_FAILURES: &str =
         "app_group_create_mls_prepare_persist_failures";
+    /// Group-create derived pending-Welcome index preparation metrics.
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_DURATION: &str =
+        "app_group_create_pending_welcome_index_duration_ms";
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_ATTEMPTS: &str =
+        "app_group_create_pending_welcome_index_attempts";
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_SUCCESSES: &str =
+        "app_group_create_pending_welcome_index_successes";
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_FAILURES: &str =
+        "app_group_create_pending_welcome_index_failures";
     /// Group-create Welcome publish metrics.
     pub const APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION: &str =
         "app_group_create_welcome_publish_duration_ms";
@@ -372,6 +381,15 @@ pub mod metric_names {
         "app_group_create_local_projection_save_successes";
     pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES: &str =
         "app_group_create_local_projection_save_failures";
+    /// Group-create worker response conversion/event handoff metrics.
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_DURATION: &str =
+        "app_group_create_response_handoff_duration_ms";
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_ATTEMPTS: &str =
+        "app_group_create_response_handoff_attempts";
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_SUCCESSES: &str =
+        "app_group_create_response_handoff_successes";
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_FAILURES: &str =
+        "app_group_create_response_handoff_failures";
     /// Group-create subscription refresh metrics.
     pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION: &str =
         "app_group_create_subscription_refresh_duration_ms";
@@ -1138,6 +1156,14 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.group_create_pending_welcome_index,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_DURATION,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.group_create_welcome_publish,
         metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
         metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_ATTEMPTS,
@@ -1151,6 +1177,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_ATTEMPTS,
         metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_SUCCESSES,
         metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_response_handoff,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_DURATION,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_FAILURES,
     );
     append_app_operation_points(
         points,

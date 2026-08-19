@@ -1369,6 +1369,57 @@ where
 }
 
 #[test]
+fn create_group_options_apply_initial_retention_atomically() {
+    run_composed_app_runtime_test("initial-group-retention", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+
+        let retained = client
+            .create_group_with_options(
+                "retained from founding state",
+                &[],
+                AppCreateGroupOptions {
+                    disappearing_message_secs: 300,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let disabled = client
+            .create_group_with_options(
+                "disabled retention compatibility",
+                &[],
+                AppCreateGroupOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(client.group_mls_state(&retained).unwrap().epoch, 0);
+        assert_eq!(
+            app.group("alice", &hex::encode(retained.as_slice()))
+                .unwrap()
+                .unwrap()
+                .message_retention
+                .disappearing_message_secs,
+            300
+        );
+        assert_eq!(
+            app.group("alice", &hex::encode(disabled.as_slice()))
+                .unwrap()
+                .unwrap()
+                .message_retention
+                .disappearing_message_secs,
+            0
+        );
+    });
+}
+
+#[test]
 fn live_group_archive_checkpoints_seen_and_target_group_deltas() {
     run_composed_app_runtime_test("account-projection-delta", || async {
         let dir = tempfile::tempdir().unwrap();
@@ -1810,6 +1861,78 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     .await
     .expect("detached post-mutation catch-up should finish after the relay unblocks");
     runtime.shutdown().await;
+}
+
+#[test]
+fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
+    run_composed_app_runtime_test("create-derived-welcome-index", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        app.chat_list_projection_warmed
+            .lock()
+            .unwrap()
+            .remove("alice");
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .insert("alice".to_owned());
+
+        relay.block_next_publish();
+        let created = runtime
+            .create_group_detailed(
+                "alice",
+                "derived welcome index",
+                std::slice::from_ref(&bob.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
+            .await
+            .expect("post-response Welcome publish should be blocked");
+
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .list_pending_welcome_deliveries()
+                .unwrap()
+                .is_empty(),
+            "the engine-retained Welcome is authoritative; create must not pay a second convenience-index commit"
+        );
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .chat_list_row(&created.chat_list_row.group_id_hex)
+                .unwrap(),
+            Some(created.chat_list_row),
+            "the remaining post-canonical commit must already contain the durable host projection"
+        );
+        assert!(
+            app.chat_list_projection_stale
+                .lock()
+                .unwrap()
+                .contains("alice"),
+            "create refreshes only its returned row and must preserve a pre-existing full-list rebuild obligation"
+        );
+        assert!(
+            !app.chat_list_projection_warmed
+                .lock()
+                .unwrap()
+                .contains("alice"),
+            "refreshing one created row must not claim the full chat-list projection is warmed"
+        );
+
+        relay.release_publish();
+        runtime.shutdown().await;
+    });
 }
 
 #[test]

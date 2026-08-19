@@ -10,6 +10,10 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    /// Canonical creation succeeded, but its derived chat row was not durable.
+    /// Refresh account state; retrying creation would produce a duplicate.
+    #[error("group was created but its local chat projection is unavailable: {group_id_hex}")]
+    CreatedGroupProjectionUnavailable { group_id_hex: String },
     #[error("group membership page exceeds the maximum of {max_groups} groups")]
     InvalidGroupMembershipPage { max_groups: u64 },
     #[error("cached identity page exceeds the maximum of {max_accounts} accounts")]
@@ -264,6 +268,9 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::CreatedGroupProjectionUnavailable(group_id_hex) => {
+                Self::CreatedGroupProjectionUnavailable { group_id_hex }
+            }
             AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
                 max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
             },
@@ -434,6 +441,18 @@ mod tests {
         assert!(matches!(
             ffi,
             MarmotKitError::InvalidCachedIdentityPage { max_accounts: 100 }
+        ));
+    }
+
+    #[test]
+    fn created_group_projection_failure_crosses_ffi_as_typed_variant() {
+        let ffi = MarmotKitError::from(AppError::CreatedGroupProjectionUnavailable(
+            "010203".to_owned(),
+        ));
+        assert!(matches!(
+            ffi,
+            MarmotKitError::CreatedGroupProjectionUnavailable { group_id_hex }
+                if group_id_hex == "010203"
         ));
     }
 

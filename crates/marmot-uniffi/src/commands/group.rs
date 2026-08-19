@@ -11,13 +11,13 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
-    AppGroupRecordFfi, AppQuarantinedGroupFfi, DisbandRequestFfi, GroupConversationSnapshotFfi,
-    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi,
-    GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
-    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
-    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
-    group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
-    group_roster_ffi, normalize_member_ref_ffi,
+    AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandRequestFfi,
+    GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
+    GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
+    GroupMutationResultFfi, GroupRosterFfi, KeyPackageMaintenanceStatusFfi,
+    MaintenanceRunSummaryFfi, MemberRefFfi, PeriodicMaintenancePolicyFfi, SendSummaryFfi,
+    group_conversation_snapshot_ffi, group_details_from_conversation_snapshot_ffi,
+    group_id_from_hex, group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -58,6 +58,37 @@ impl std::fmt::Debug for InitialGroupImageFfi {
             .field("dim", &self.dim)
             .field("thumbhash", &self.thumbhash)
             .finish()
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct CreateGroupOptionsFfi {
+    pub description: Option<String>,
+    pub initial_image: Option<InitialGroupImageFfi>,
+    /// Zero preserves the compatibility behavior: disappearing messages are
+    /// disabled and retention is not a founding capability requirement.
+    pub disappearing_message_secs: u64,
+}
+
+impl From<InitialGroupImageFfi> for marmot_app::AppInitialGroupImage {
+    fn from(image: InitialGroupImageFfi) -> Self {
+        Self {
+            plaintext: image.plaintext,
+            media_type: image.media_type,
+            source_url: image.source_url,
+            dim: image.dim,
+            thumbhash: image.thumbhash,
+        }
+    }
+}
+
+impl From<CreateGroupOptionsFfi> for marmot_app::AppCreateGroupOptions {
+    fn from(options: CreateGroupOptionsFfi) -> Self {
+        Self {
+            description: options.description.unwrap_or_default(),
+            initial_image: options.initial_image.map(Into::into),
+            disappearing_message_secs: options.disappearing_message_secs,
+        }
     }
 }
 
@@ -300,6 +331,55 @@ impl Marmot {
         Ok(hex::encode(group_id.as_slice()))
     }
 
+    /// Create a group with forward-compatible founding options. A nonzero
+    /// retention value is written into the founding MLS state and Welcome;
+    /// it does not emit a follow-up retention commit or publication.
+    pub async fn create_group_with_options(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        options: CreateGroupOptionsFfi,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = self
+            .runtime
+            .create_group_with_options(&account_ref, &name, &member_refs, options.into())
+            .await?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Create a group and return the exact durable chat-list row available to
+    /// subscriptions and queries at the response boundary.
+    pub async fn create_group_detailed(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .create_group_detailed(&account_ref, &name, &member_refs, description)
+            .await?
+            .into())
+    }
+
+    /// Create a group with forward-compatible founding options and return the
+    /// exact durable chat-list row available at the response boundary.
+    pub async fn create_group_with_options_detailed(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        options: CreateGroupOptionsFfi,
+    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .create_group_with_options_detailed(&account_ref, &name, &member_refs, options.into())
+            .await?
+            .into())
+    }
+
     /// Create a group with an optional initial avatar. MDK prefers an
     /// encrypted Blossom image and uses `source_url` only when the founding
     /// members do not all support that component but do support URL avatars.
@@ -311,13 +391,7 @@ impl Marmot {
         description: Option<String>,
         initial_image: Option<InitialGroupImageFfi>,
     ) -> Result<String, MarmotKitError> {
-        let initial_image = initial_image.map(|image| marmot_app::AppInitialGroupImage {
-            plaintext: image.plaintext,
-            media_type: image.media_type,
-            source_url: image.source_url,
-            dim: image.dim,
-            thumbhash: image.thumbhash,
-        });
+        let initial_image = initial_image.map(Into::into);
         let group_id = self
             .runtime
             .create_group_with_initial_image(
@@ -329,6 +403,34 @@ impl Marmot {
             )
             .await?;
         Ok(hex::encode(group_id.as_slice()))
+    }
+
+    pub async fn create_group_with_initial_image_detailed(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+        initial_image: Option<InitialGroupImageFfi>,
+    ) -> Result<CreatedGroupFfi, MarmotKitError> {
+        let initial_image = initial_image.map(|image| marmot_app::AppInitialGroupImage {
+            plaintext: image.plaintext,
+            media_type: image.media_type,
+            source_url: image.source_url,
+            dim: image.dim,
+            thumbhash: image.thumbhash,
+        });
+        Ok(self
+            .runtime
+            .create_group_with_initial_image_detailed(
+                &account_ref,
+                &name,
+                &member_refs,
+                description,
+                initial_image,
+            )
+            .await?
+            .into())
     }
 
     /// Normalize a member reference for group-management UI. Accepts hex,
@@ -1169,6 +1271,26 @@ mod tests {
             .await
             .expect_err("stopped account must retain typed error mapping");
         assert!(matches!(stopped, MarmotKitError::RuntimeStopping));
+    }
+
+    #[test]
+    fn create_group_options_preserve_founding_retention_and_optional_fields() {
+        let options: marmot_app::AppCreateGroupOptions = CreateGroupOptionsFfi {
+            description: Some("founding description".into()),
+            initial_image: Some(InitialGroupImageFfi {
+                plaintext: vec![1, 2, 3],
+                media_type: "image/png".into(),
+                source_url: None,
+                dim: Some("1x1".into()),
+                thumbhash: None,
+            }),
+            disappearing_message_secs: 300,
+        }
+        .into();
+
+        assert_eq!(options.description, "founding description");
+        assert_eq!(options.disappearing_message_secs, 300);
+        assert_eq!(options.initial_image.unwrap().plaintext, vec![1, 2, 3]);
     }
 
     fn state(self_admin: bool, last_admin: bool) -> GroupManagementStateFfi {

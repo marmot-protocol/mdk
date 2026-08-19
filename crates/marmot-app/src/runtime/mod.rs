@@ -36,23 +36,23 @@ use crate::{
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
     AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread,
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
-    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
-    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
-    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
+    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
+    AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
+    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
+    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
+    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
+    KeyPackageDeletionResult, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp,
+    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, MessageDraft, MessageDraftAttachment,
+    MessageDraftSummary, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1385,6 +1385,20 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Create a locally canonical group and return the exact durable
+    /// chat-list row available at the response boundary.
+    pub async fn create_group_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+    ) -> Result<crate::CreatedGroup, AppError> {
+        self.accounts
+            .create_group_detailed(account_ref, name, members, description)
+            .await
+    }
+
     pub async fn create_group_with_initial_image(
         &self,
         account_ref: &str,
@@ -1395,6 +1409,49 @@ impl MarmotAppRuntime {
     ) -> Result<GroupId, AppError> {
         self.accounts
             .create_group_with_initial_image(account_ref, name, members, description, initial_image)
+            .await
+    }
+
+    pub async fn create_group_with_options(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<GroupId, AppError> {
+        self.accounts
+            .create_group_with_options(account_ref, name, members, options)
+            .await
+    }
+
+    pub async fn create_group_with_initial_image_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        initial_image: Option<crate::AppInitialGroupImage>,
+    ) -> Result<crate::CreatedGroup, AppError> {
+        self.accounts
+            .create_group_with_initial_image_detailed(
+                account_ref,
+                name,
+                members,
+                description,
+                initial_image,
+            )
+            .await
+    }
+
+    pub async fn create_group_with_options_detailed(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<crate::CreatedGroup, AppError> {
+        self.accounts
+            .create_group_with_options_detailed(account_ref, name, members, options)
             .await
     }
 
@@ -2869,12 +2926,64 @@ impl MarmotAppRuntime {
     pub async fn publish_user_profile(
         &self,
         account_ref: &str,
-        mut profile: UserProfileMetadata,
+        profile: UserProfileMetadata,
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<UserProfileMetadata, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        let merge_source_relays = bootstrap.bootstrap_relays.clone();
+        let publish_endpoints = self.accounts.app.outbox_endpoints(
+            &account.account_id_hex,
+            crate::key_package_records::publish_endpoints_from_bootstrap(&bootstrap),
+        );
+        self.publish_user_profile_to_selected_endpoints(
+            &account,
+            profile,
+            &merge_source_relays,
+            publish_endpoints,
+        )
+        .await
+    }
+
+    /// Publish kind-0 metadata using the selected account's own relay-list
+    /// projection. The projection is captured once at the operation boundary;
+    /// profile merge reads and publication use endpoints derived from that same
+    /// snapshot, so a concurrent directory refresh cannot mix configurations.
+    pub async fn publish_user_profile_using_account_relays(
+        &self,
+        account_ref: &str,
+        profile: UserProfileMetadata,
+    ) -> Result<UserProfileMetadata, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()));
+        }
+        let relay_lists = self
+            .accounts
+            .app
+            .account_relay_list_status_for_account_id(&account.account_id_hex)?;
+        let endpoints = self
+            .accounts
+            .app
+            .account_profile_publish_endpoints(&relay_lists)?;
+        self.publish_user_profile_to_selected_endpoints(
+            &account,
+            profile,
+            &endpoints,
+            endpoints.clone(),
+        )
+        .await
+    }
+
+    async fn publish_user_profile_to_selected_endpoints(
+        &self,
+        account: &AccountSummary,
+        mut profile: UserProfileMetadata,
+        merge_source_relays: &[TransportEndpoint],
+        publish_endpoints: Vec<TransportEndpoint>,
+    ) -> Result<UserProfileMetadata, AppError> {
         if let Some(current) = self
-            .latest_known_user_profile_for_publish(&account.account_id_hex, &bootstrap)
+            .latest_known_user_profile_for_publish(&account.account_id_hex, merge_source_relays)
             .await?
         {
             profile = merge_user_profile_update(current, profile);
@@ -2892,7 +3001,7 @@ impl MarmotAppRuntime {
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
         self.accounts
             .app
-            .publish_user_profile(&account.label, profile.clone(), bootstrap)
+            .publish_user_profile_to_endpoints(&account.label, profile.clone(), publish_endpoints)
             .await?;
         self.accounts
             .app
@@ -2929,7 +3038,7 @@ impl MarmotAppRuntime {
     async fn latest_known_user_profile_for_publish(
         &self,
         account_id_hex: &str,
-        bootstrap: &AccountRelayListBootstrap,
+        source_relays: &[TransportEndpoint],
     ) -> Result<Option<UserProfileMetadata>, AppError> {
         let cached = self
             .accounts
@@ -2939,10 +3048,7 @@ impl MarmotAppRuntime {
         match self
             .accounts
             .app
-            .fetch_current_user_profile_for_account_id(
-                account_id_hex,
-                bootstrap.bootstrap_relays.clone(),
-            )
+            .fetch_current_user_profile_for_account_id(account_id_hex, source_relays.to_vec())
             .await
         {
             Ok(fetched) => Ok(newest_user_profile(cached, fetched)),

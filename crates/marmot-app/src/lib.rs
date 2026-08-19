@@ -154,15 +154,15 @@ pub use drafts::{
 };
 pub use error::{AccountCatchUpFailure, AppError};
 pub use groups::{
-    AppAgentTextStreamComponent, AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest,
-    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupConversationSnapshot,
-    AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupImageComponent,
-    AppGroupLifecycleState, AppGroupMemberIds, AppGroupMemberRecord,
-    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupOpaqueComponent, AppGroupProfileComponent, AppGroupRecord, AppGroupRoster,
-    AppGroupRosterMember, AppGroupSystemEvent, AppInitialGroupImage, AppPriorNostrRoute,
-    AppProtocolProfile, AppQuarantinedGroup, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite,
-    group_system_event_from_message,
+    AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
+    AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
+    AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
+    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
+    AppInitialGroupImage, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
+    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -211,6 +211,38 @@ pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
     RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
 };
+
+/// Canonical group-create result at the host response boundary.
+///
+/// `chat_list_row` is the exact row committed with the app projection before
+/// this value is returned. Hosts can navigate immediately without issuing a
+/// read-after-create query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedGroup {
+    pub group_id: GroupId,
+    pub chat_list_row: ChatListRow,
+}
+
+/// Internal outcome used to preserve the legacy create API's post-canonical
+/// success contract while the detailed API requires its durable projection.
+#[derive(Clone, Debug)]
+pub(crate) struct CanonicalCreatedGroup {
+    pub group_id: GroupId,
+    pub chat_list_row: Option<ChatListRow>,
+}
+
+impl CanonicalCreatedGroup {
+    pub(crate) fn into_detailed(self) -> Result<CreatedGroup, AppError> {
+        let group_id_hex = hex::encode(self.group_id.as_slice());
+        let chat_list_row = self
+            .chat_list_row
+            .ok_or(AppError::CreatedGroupProjectionUnavailable(group_id_hex))?;
+        Ok(CreatedGroup {
+            group_id: self.group_id,
+            chat_list_row,
+        })
+    }
+}
 
 fn chat_pin_error_from_storage(error: storage_sqlite::ChatPinError) -> AppError {
     match error {
@@ -4512,6 +4544,47 @@ impl MarmotApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(delta.label.clone());
         Ok(())
+    }
+
+    fn save_state_delta_and_refresh_created_chat_list_row(
+        &self,
+        delta: &AccountState,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+        group_id_hex: &str,
+    ) -> Result<ChatListRow, AppError> {
+        let account = self.account_home().account(&delta.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let has_other_dirty_groups = delta
+            .groups
+            .iter()
+            .any(|group| group.group_id_hex != group_id_hex);
+        let mut row = self
+            .account_storage(&delta.label)?
+            .save_account_projection_delta_and_refresh_chat_list_row(
+                &stored_state_from_account_state(delta),
+                MAX_SEEN_EVENT_IDS,
+                TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+                frontiers_to_clear,
+                application_event_ids_to_ack,
+                &account.account_id_hex,
+                group_id_hex,
+                &classifier,
+            )?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        self.hydrate_chat_list_row(Some(&mut row))?;
+
+        // Only the created row belongs on the response tail. Preserve any
+        // pre-existing stale marker, and add one if this delta also persisted
+        // another dirty group; a later full-list query performs that rebuild.
+        // A single-row refresh does not prove the full projection is warmed.
+        if has_other_dirty_groups {
+            self.chat_list_projection_stale
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(delta.label.clone());
+        }
+        Ok(row)
     }
 
     pub(crate) fn delete_group_local_data(

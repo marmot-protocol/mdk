@@ -544,9 +544,14 @@ impl Marmot {
         )?)
     }
 
-    /// Publish the Nostr kind:0 metadata for `account_ref`. The returned
-    /// metadata is what marmot-app actually published (any server-applied
-    /// defaults are reflected here).
+    /// Publish Nostr kind:0 metadata with explicit caller-supplied relay
+    /// overrides. Most app clients should use
+    /// [`publish_user_profile_using_account_relays`](Self::publish_user_profile_using_account_relays)
+    /// so relay selection remains owned by MDK. This override remains for
+    /// diagnostics, tests, and specialized clients.
+    ///
+    /// The returned metadata is what marmot-app actually published (including
+    /// preserved unknown fields and any merge defaults).
     pub async fn publish_user_profile(
         &self,
         account_ref: String,
@@ -561,6 +566,30 @@ impl Marmot {
         let pushed = self
             .runtime
             .publish_user_profile(&account_ref, UserProfileMetadata::from(profile), bootstrap)
+            .await?;
+        Ok(pushed.into())
+    }
+
+    /// Publish Nostr kind:0 metadata using one coherent snapshot of the
+    /// selected account's MDK-owned relay configuration.
+    ///
+    /// Published NIP-65 write relays are preferred. When that list is empty,
+    /// remembered bootstrap relays are used; when bootstrap relays are absent,
+    /// the account's default/publish list is the fallback. Invalid, unsafe, and
+    /// retired endpoints are removed by the relay safety policy before any
+    /// network work starts. No preceding [`account_relay_lists`](Self::account_relay_lists)
+    /// call is needed.
+    pub async fn publish_user_profile_using_account_relays(
+        &self,
+        account_ref: String,
+        profile: UserProfileMetadataFfi,
+    ) -> Result<UserProfileMetadataFfi, MarmotKitError> {
+        let pushed = self
+            .runtime
+            .publish_user_profile_using_account_relays(
+                &account_ref,
+                UserProfileMetadata::from(profile),
+            )
             .await?;
         Ok(pushed.into())
     }
@@ -745,5 +774,40 @@ mod tests {
             .await
             .expect_err("missing current kind-3 must not be treated as empty");
         assert!(matches!(error, MarmotKitError::FollowListUnavailable));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_owned_profile_publish_binding_needs_no_relay_arguments() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url);
+        let account = kit
+            .runtime
+            .create_identity(marmot_app::AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..marmot_app::AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+
+        let published = kit
+            .publish_user_profile_using_account_relays(
+                account.account.account_id_hex,
+                UserProfileMetadataFfi {
+                    display_name: Some("Account Owned".to_owned()),
+                    ..UserProfileMetadataFfi::default()
+                },
+            )
+            .await
+            .expect("publish without a host relay-list read");
+
+        assert_eq!(published.display_name.as_deref(), Some("Account Owned"));
     }
 }

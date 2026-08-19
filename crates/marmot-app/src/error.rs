@@ -56,6 +56,11 @@ pub enum AppError {
     MissingKeyPackage(String),
     #[error("unknown local group")]
     UnknownGroup(String),
+    /// Canonical MLS creation completed, but the host-facing derived row could
+    /// not be committed. The group id lets detailed callers refresh instead of
+    /// retrying creation and producing a duplicate group.
+    #[error("group was created but its local chat projection is unavailable")]
+    CreatedGroupProjectionUnavailable(String),
     #[error("invalid group membership page: {0}")]
     InvalidGroupMembershipPage(String),
     /// The once-per-open peer-index backfill has not finished. Retry after
@@ -228,6 +233,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
+            Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
