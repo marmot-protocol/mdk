@@ -246,6 +246,18 @@ execution. `tests/stateful_generator.rs` independently replays the legal-action 
 action vocabulary across adjacent cases, runs both profiles through the report path, and verifies that the input
 fixture was saved privately before execution.
 
+### `generate_large_group_pressure_family(seed, cases)`
+
+Generates a replay-stable large-group catalog with a separately versioned workload profile. Six consecutive arms at
+each size cover application-heavy fanout, incremental growth, sparse-admin sequential commits, up to sixteen competing
+committers, interleaved application/commit traffic, and administrator handoff with remove/re-add plus restart. The
+anchor curve is 16/32/64/128 members and the boundary curve is 10/20/50/100/200.
+
+`tests/large_group_family.rs` pins same-seed determinism, different-seed variation, prefix stability, family
+registration, every size/admin regime, required action interactions, profile replay provenance, whole-group exact and
+pending-work oracle coverage, bounded decryptability cohorts, and the ordinary 10-member executable canary. The test
+suite compiles all 54 catalog shapes but does not execute large/xlarge cases in the normal PR path.
+
 ### `cross-route-restart-permutations/v1`
 
 This bounded current-build catalog adds one reviewed durable reopen to the shared four-party cross-route scenario.

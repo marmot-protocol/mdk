@@ -153,8 +153,10 @@ For broad defect discovery, prioritize:
 1. `chat-journey/v1` for legal product histories;
 2. `convergence-chaos/v1` for adversarial schedule and traffic breadth;
 3. `bounded-convergence-pressure/v1` for the self-update/admin/profile pressure boundary;
-4. `admin-churn/v1` for membership and administrator transitions; and
-5. the two twelve-case cross-route restart catalogs as fixed high-value regressions.
+4. `large-group-pressure/v1` for explicit 10–200 member, administrator-population, committer-width, and traffic
+   profiles;
+5. `admin-churn/v1` for membership and administrator transitions; and
+6. the two twelve-case cross-route restart catalogs as fixed high-value regressions.
 
 Cover all registered families with a small seed matrix before making one family enormous. Then allocate additional
 cases using measured coverage gaps, failures, slow tails, and recent production changes.

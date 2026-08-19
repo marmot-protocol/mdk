@@ -28,11 +28,33 @@ pub struct GeneratedScenarioCase {
     pub generator_version: String,
     pub seed: u64,
     pub case_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_profile: Option<GeneratedWorkloadProfileV1>,
     #[serde(default, skip_serializing_if = "GeneratedSubjectKind::is_engine")]
     pub subject: GeneratedSubjectKind,
     pub scenario: ScenarioSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
+}
+
+/// Replay-stable workload parameters for a generated family whose case shape
+/// varies along independently meaningful scale and traffic dimensions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedWorkloadProfileV1 {
+    pub name: String,
+    pub version: String,
+    pub size_tier: String,
+    pub member_count: usize,
+    pub admin_regime: String,
+    pub initial_admin_count: usize,
+    pub final_admin_count: usize,
+    pub committer_mode: String,
+    pub active_committer_count: usize,
+    pub traffic_profile: String,
+    pub application_message_count: usize,
+    pub workload_commit_count: usize,
+    pub formation: String,
+    pub disruption: String,
 }
 
 /// Versioned executable input for replaying one generated case with the same
@@ -147,6 +169,9 @@ pub fn generate_family_case(
         "bounded-convergence-pressure/v1" => {
             generate_bounded_convergence_pressure_case(seed, case_index)
         }
+        crate::LARGE_GROUP_PRESSURE_FAMILY => {
+            crate::generate_large_group_pressure_case(seed, case_index)
+        }
         "cross-route-restart-permutations/v1" => {
             generate_cross_route_restart_permutation_case(seed, case_index)
         }
@@ -181,6 +206,7 @@ pub fn generate_send_leave_case(seed: u64, case_index: u64) -> GeneratedScenario
         generator_version: "2".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario,
         expected_outcomes,
@@ -206,6 +232,7 @@ pub fn generate_convergence_e2e_delivery_case(seed: u64, case_index: u64) -> Gen
         generator_version: "2".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario,
         expected_outcomes,
@@ -228,6 +255,7 @@ pub fn generate_convergence_chaos_case(seed: u64, case_index: u64) -> GeneratedS
         generator_version: "6".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario,
         expected_outcomes,
@@ -272,6 +300,7 @@ pub fn generate_admin_churn_case(seed: u64, case_index: u64) -> GeneratedScenari
         generator_version: "1".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario,
         expected_outcomes,
@@ -314,6 +343,7 @@ pub fn generate_bounded_convergence_pressure_case(
         generator_version: "2".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario,
         expected_outcomes,
@@ -387,6 +417,7 @@ pub fn generate_cross_route_restart_permutation_case(
         generator_version: "1".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::AppRuntime,
         scenario,
         expected_outcomes,
@@ -467,6 +498,7 @@ pub fn generate_cross_route_exact_restart_permutation_case(
         generator_version: "1".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject: GeneratedSubjectKind::RetainedRelay,
         scenario,
         expected_outcomes,
@@ -498,6 +530,7 @@ pub fn generate_adversarial_reliability_case(seed: u64, case_index: u64) -> Gene
         generator_version: "4".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject,
         scenario,
         expected_outcomes,
@@ -519,6 +552,7 @@ pub fn generate_adversarial_reliability_sustained_regression(seed: u64) -> Gener
         generator_version: "3-regression".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject,
         scenario,
         expected_outcomes,
@@ -566,6 +600,7 @@ fn adversarial_reliability_regression_case(
         generator_version: "3-regression".into(),
         seed,
         case_index,
+        workload_profile: None,
         subject,
         scenario,
         expected_outcomes,
@@ -741,6 +776,7 @@ async fn add_generated_metadata(
         generator_version: case.generator_version.clone(),
         seed: case.seed,
         case_index: case.case_index,
+        workload_profile: case.workload_profile.clone(),
         minimized_case,
     });
 }

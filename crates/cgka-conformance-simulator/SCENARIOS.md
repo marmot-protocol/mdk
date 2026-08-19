@@ -730,6 +730,47 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   engine re-arms the queued-intent drain when a pass closes and no longer re-prepares an in-flight regenerated
   intent). It runs in the nightly lane; the PR smoke lane excludes it as one of the multi-minute generated batches.
 
+### `large-group-pressure/v1`
+
+- Generator: `generate_large_group_pressure_family` (generator version `1`, workload-profile version `1`).
+- Size curve: six consecutive cases share one size. The first four blocks are comparable anchors at 16, 32, 64, and
+  128 members. The next five blocks pin the requested boundaries at 10, 20, 50, 100, and 200 members. A complete
+  size/arm catalog is therefore 54 cases; larger case counts repeat the stable catalog under new seeded choices.
+- Administrator curve: every six-case size block covers founder-only, three-admin, approximately 10%, approximately
+  50%, and all-member administrator populations. Administrator population and active committer width are separate:
+  a dense administrator group can still run a two- or eight-committer workload.
+- Workload metadata: every generated input and report records size tier, member count, initial/final admin counts,
+  committer mode/count, authored application count, workload commit count, traffic profile, formation, and disruption.
+  Authored application count is distinct from recipient fanout: one 200-member send round creates 39,800 directed
+  recipient deliveries before the active probe.
+- Oracle: every case requires exact canonical equivalence across every live member and pins the final member count,
+  administrator policy, group profile, input closure, and active decryptability. Exact application payload multisets
+  are checked on a deterministic cohort of at most six clients containing representatives of the founder, admin,
+  committer, ordinary-member, and late-join roles. This bounds probe cost without weakening whole-group state and
+  pending-work checks.
+- Join boundary: incremental-growth and remove/re-add arms name the existing welcome-join harness condition directly.
+  Every late joiner must retain exactly its own transport-deferred join commit and no other pending work; all other
+  clients must have no pending work.
+
+The six arms are:
+
+1. **Bulk Application Fanout** — bulk create, one authored message per member, and two sequential profile commits.
+2. **Incremental Growth** — four founding members, bounded invite batches, final admin assignment, checkpoint traffic,
+   and a final profile commit.
+3. **Sparse-Admin Sequential** — sequential profile commits interspersed with traffic plus a non-admin authorization
+   rejection whenever the selected admin regime leaves a non-admin.
+4. **Competing Commits** — up to sixteen active admins race same-epoch profile commits under seeded reorder and one
+   duplicate, followed by commit-heavy application traffic and a canonical pinning commit.
+5. **Mixed Interleaved** — application traffic before and after a seeded multi-admin commit wave, followed by a
+   canonical pinning commit.
+6. **Admin Handoff / Churn / Restart** — the founder hands authority to a successor, the successor removes a member,
+   restarts before delivery settles, re-adds the member, and verifies the rejoined non-admin cannot mutate policy.
+
+`mid_size_application_heavy_canary_passes_strict_oracles` is the ordinary 10-member executable gate. Generator tests
+compile the complete 54-case catalog without executing the expensive large/xlarge cases. Run 32/64-member blocks in
+nightly isolated workers and keep 128/200-member execution scheduled or manual until measured budgets justify wider
+promotion.
+
 ### `convergence-chaos/v1`
 
 - Generator: `generate_convergence_chaos_family` (generator version `6`).

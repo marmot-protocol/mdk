@@ -182,6 +182,7 @@ async fn adapter_override_uses_distinct_artifacts_without_minting_a_fixture() {
         generator_version: "1".into(),
         seed: 5,
         case_index: 2,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario: ScenarioSpec {
             name: "selectable-report/v1/case-2".into(),

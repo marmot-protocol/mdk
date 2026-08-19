@@ -127,6 +127,7 @@ one case cannot erase the remaining cases, and the summary contains real child-p
 | `admin-churn/v1` | Sequential/competing administration, joins, restarts, and churn |
 | `adversarial-reliability/v1` | Named real-world and resource-pressure workload catalog |
 | `bounded-convergence-pressure/v1` | Finite self-update/profile/admin pressure under a bounded quiescence contract |
+| `large-group-pressure/v1` | Explicit 10–200 member, admin-population, committer-width, traffic, growth, and churn profiles |
 | `cross-route-restart-permutations/v1` | Twelve public app-runtime restart boundaries in the four-party route scenario |
 | `cross-route-exact-restart-permutations/v1` | Exact/private engine companion to the public restart catalog |
 | `chat-journey/v1` | Legality-aware product journeys: membership, profile, app traffic, offline/catch-up, and restart |
@@ -134,6 +135,11 @@ one case cannot erase the remaining cases, and the summary contains real child-p
 `--cases` is a count, not a complexity dial. Case index selects a deterministic arm or generated history. More cases
 increase coverage; they do not promise that later cases are larger. `--seed` changes the deterministic choices within
 each indexed case. A family defines the available operations, weights/motifs, subject, and expectations.
+
+For `large-group-pressure/v1`, six consecutive cases form one size block. Cases `0..23` cover the 16/32/64/128 anchor
+curve; cases `24..53` cover the 10/20/50/100/200 boundaries. Use `--cases 6` for the mid-size arm canary, `--cases 18`
+for the 16/32/64 curve, and `--cases 54` only as a deliberately budgeted complete catalog. Prefer the isolated
+file-backed campaign runner for execution; generator tests already compile all 54 shapes without running them.
 
 ## Running vectors and adapter comparisons
 

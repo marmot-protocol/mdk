@@ -155,6 +155,7 @@ async fn app_runtime_adapter_is_selectable_for_a_saved_generated_case() {
         generator_version: "2".into(),
         seed: 23,
         case_index: 5,
+        workload_profile: None,
         subject: GeneratedSubjectKind::Engine,
         scenario: two_client_scenario(),
         expected_outcomes: vec![TraceExpectation::ClientsConverged {

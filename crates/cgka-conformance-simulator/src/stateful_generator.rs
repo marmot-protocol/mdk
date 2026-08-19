@@ -498,6 +498,7 @@ impl JourneyModel {
             generator_version: STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION.into(),
             seed,
             case_index: self.case_index,
+            workload_profile: None,
             subject: match self.profile {
                 JourneyProfile::Membership => GeneratedSubjectKind::Engine,
                 JourneyProfile::OfflineRetainedHistory => GeneratedSubjectKind::RetainedRelay,
