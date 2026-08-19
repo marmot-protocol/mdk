@@ -45,16 +45,15 @@ the backends have equivalent permission or sandbox systems:
 | Backend | `inherit` | `autonomous` | `unrestricted` | Built-in OS isolation |
 | --- | --- | --- | --- | --- |
 | Pi | Existing tool/config behavior | Same native approval-free invocation | Same native approval-free invocation | None |
-| OpenCode | Existing permission config | `--auto`; explicit denies remain | `--auto` plus process-local `OPENCODE_PERMISSION={"*":"allow"}` | None |
+| OpenCode | Existing permission config | `--auto`; explicit denies remain | `--auto` plus process-local `OPENCODE_PERMISSION="allow"` | None |
 | Codex | Existing approval, sandbox, and network config | `approval_policy="never"`; sandbox/network remain configured | `--dangerously-bypass-approvals-and-sandbox` | Configured for `inherit`/`autonomous`; bypassed for `unrestricted` |
 
 The OpenCode overlay is set only on the spawned process and never rewrites the
-operator's global or project configuration. Codex uses `--strict-config` with
-the autonomous override. Older backend versions that do not understand a
-required flag or config key fail the invocation; the harness does not fall back
-to a broader or interactive mode and does not send a successful reply. Pi needs
-no version-dependent permission flag because its normal non-interactive mode is
-already approval-free.
+operator's global or project configuration. Older backend versions that do not
+understand a required flag or invocation-local config override fail the
+invocation; the harness does not fall back to a broader or interactive mode and
+does not send a successful reply. Pi needs no version-dependent permission flag
+because its normal non-interactive mode is already approval-free.
 
 Installers accept `--execution-profile inherit|autonomous|unrestricted` and
 write the shared environment variable into the private env file and same-user

@@ -32,7 +32,7 @@ permissions, process sandboxing, and network policy are different controls.
 | --- | --- | --- | --- |
 | Pi | Non-interactive execution is natively approval-free for every profile | No built-in OS sandbox | No profile-specific CLI feature is required |
 | OpenCode | `autonomous` uses `--auto`; `unrestricted` adds a process-local allow-all permission overlay | Logical permissions only; no OS sandbox | An unsupported `--auto` fails the invocation; no successful reply is sent |
-| Codex | `autonomous` sets `approval_policy="never"`; `unrestricted` bypasses approvals | Configured sandbox/network survive `autonomous`; `unrestricted` bypasses the sandbox | Strict config/unknown flags fail the invocation; no successful reply is sent |
+| Codex | `autonomous` sets `approval_policy="never"`; `unrestricted` bypasses approvals | Configured sandbox/network survive `autonomous`; `unrestricted` bypasses the sandbox | An unsupported invocation-local config override or flag fails the invocation; no successful reply is sent |
 
 The OpenCode overlay exists only in the child process environment. The Codex
 override exists only in that invocation. Connector setup never rewrites global

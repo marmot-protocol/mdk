@@ -197,11 +197,7 @@ fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<S
     match profile {
         ExecutionProfile::Inherit => {}
         ExecutionProfile::Autonomous => {
-            args.extend([
-                "--strict-config".to_owned(),
-                "-c".to_owned(),
-                "approval_policy=\"never\"".to_owned(),
-            ]);
+            args.extend(["-c".to_owned(), "approval_policy=\"never\"".to_owned()]);
         }
         ExecutionProfile::Unrestricted => {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
@@ -280,21 +276,13 @@ mod tests {
     fn autonomous_preserves_configured_sandbox_and_network_for_new_and_resumed_threads() {
         assert_eq!(
             build_exec_args(None, ExecutionProfile::Autonomous),
-            vec![
-                "exec",
-                "--strict-config",
-                "-c",
-                "approval_policy=\"never\"",
-                "--json",
-                "-",
-            ]
+            vec!["exec", "-c", "approval_policy=\"never\"", "--json", "-",]
         );
         assert_eq!(
             build_exec_args(Some("thread-123"), ExecutionProfile::Autonomous),
             vec![
                 "exec",
                 "resume",
-                "--strict-config",
                 "-c",
                 "approval_policy=\"never\"",
                 "--json",

@@ -270,8 +270,7 @@ pub(crate) fn build_run_args(
 }
 
 fn permission_overlay(profile: ExecutionProfile) -> Option<(&'static str, &'static str)> {
-    (profile == ExecutionProfile::Unrestricted)
-        .then_some(("OPENCODE_PERMISSION", r#"{"*":"allow"}"#))
+    (profile == ExecutionProfile::Unrestricted).then_some(("OPENCODE_PERMISSION", r#""allow""#))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -590,7 +589,7 @@ mod tests {
         assert_eq!(permission_overlay(ExecutionProfile::Autonomous), None);
         assert_eq!(
             permission_overlay(ExecutionProfile::Unrestricted),
-            Some(("OPENCODE_PERMISSION", r#"{"*":"allow"}"#))
+            Some(("OPENCODE_PERMISSION", r#""allow""#))
         );
     }
 }
