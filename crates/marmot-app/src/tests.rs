@@ -115,7 +115,8 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .group_id;
         let group_id_again = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "ignored on idempotent retry",
@@ -125,7 +126,8 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .group_id;
         assert_eq!(group_id_again, group_id);
         assert_eq!(client.state.groups.len(), 1);
         assert!(client.state.groups[0].image.present);
@@ -183,7 +185,8 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
                 Some(&telemetry),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .group_id;
         client.state.groups.clear();
         client
             .save_state_with_pending_local_group_deletion_frontier_clears()
@@ -206,7 +209,8 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .group_id;
 
         assert_eq!(recovered, group_id);
         assert_eq!(client.runtime.live_group_ids().unwrap(), vec![group_id]);
@@ -224,6 +228,39 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
                 .attempts,
             1
         );
+    });
+}
+
+#[test]
+fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_creation() {
+    run_composed_app_runtime_test("legacy-inline-group-image-budget", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+
+        let result = client
+            .create_group_with_initial_image(
+                "oversized legacy image",
+                &[],
+                Some(AppInitialGroupImage {
+                    plaintext: vec![0_u8; MAX_GROUP_IMAGE_BYTES + 1],
+                    media_type: "image/png".to_owned(),
+                    source_url: None,
+                    dim: None,
+                    thumbhash: None,
+                }),
+            )
+            .await;
+
+        let error = result.expect_err("legacy inline create must enforce the image byte budget");
+        assert!(matches!(error, AppError::InvalidEncryptedMedia(_)));
+        assert!(error.to_string().contains("size limit"));
+        assert!(client.runtime.live_group_ids().unwrap().is_empty());
+        assert!(client.state.groups.is_empty());
     });
 }
 

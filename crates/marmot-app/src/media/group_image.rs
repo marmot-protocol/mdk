@@ -46,9 +46,17 @@ fn validate_group_image_input(plaintext: &[u8], media_type: &str) -> Result<Stri
     let detected_format = reader.format().ok_or_else(|| {
         AppError::InvalidEncryptedMedia("group image format is not recognized".into())
     })?;
-    let declared_format = image::ImageFormat::from_mime_type(&media_type).ok_or_else(|| {
-        AppError::InvalidEncryptedMedia("group image media type is not supported".into())
-    })?;
+    let declared_format = match media_type.as_str() {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/gif" => image::ImageFormat::Gif,
+        "image/webp" => image::ImageFormat::WebP,
+        _ => {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group image media type is not supported".into(),
+            ));
+        }
+    };
     if detected_format != declared_format {
         return Err(AppError::InvalidEncryptedMedia(
             "group image media type does not match its bytes".into(),
@@ -361,6 +369,13 @@ mod tests {
         let error = validate_group_image_input(&png(1, 1), "image/jpeg")
             .expect_err("declared type must match encoded bytes");
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn group_image_rejects_media_types_outside_avatar_allowlist() {
+        let error = validate_group_image_input(&png(1, 1), "image/tiff")
+            .expect_err("non-avatar image media types must be rejected explicitly");
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]

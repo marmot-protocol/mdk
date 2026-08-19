@@ -146,6 +146,12 @@ contract: it validates, encrypts, and uploads the image before canonical group
 creation, so success means the blob was already accepted by Blossom and the
 image component is present in epoch-zero metadata.
 
+That legacy all-in-one path intentionally adopts the same 10 MiB, 4096 px per
+side, 16,777,216-pixel, and PNG/JPEG/GIF/WebP validation as prepared staging.
+Inputs that older releases attempted to upload outside those bounds now fail
+before canonical group creation; the uploaded-before-success ordering is
+otherwise unchanged.
+
 Latency-sensitive hosts should use the explicit prepared-artifact sequence:
 
 1. `stage_prepared_group_image` validates the encoded image before encryption

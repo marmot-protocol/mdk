@@ -66,7 +66,8 @@ transports, multi-account app runtime, CLI/daemon/TUI, agent connector stack, Un
 The app runtime exposes an explicit prepared founding-image path: image validation/encryption and durable staging,
 idempotent Blossom upload, and canonical group creation are separate host-visible operations. The final create uses
 uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
-uploaded-before-success semantics.
+uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
+before canonical creation.
 
 ### Marmot-TS (TypeScript)
 
