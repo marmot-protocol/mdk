@@ -8347,6 +8347,121 @@ async fn app_runtime_sign_out_and_wipe_rejects_unknown_account() {
 }
 
 #[tokio::test]
+async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
+    // mdk#1509: an external-signer account (Amber and friends) publishes
+    // KeyPackages and joins groups exactly like a local-signing one, so it has
+    // a real device footprint to wipe. The old `local_signing` gate rejected it
+    // outright, leaving field users unable to remove the account at all.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
+
+    let created = runtime
+        .login_external_signer(
+            account_id.clone(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(&url)],
+                bootstrap_relays: vec![endpoint(&url)],
+                discovery_relays: vec![endpoint(&url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(created.account.external_signing);
+    assert!(!created.account.local_signing);
+
+    let before = runtime
+        .account_key_packages(&account_id, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    assert!(
+        before.iter().any(|pkg| pkg.relay),
+        "external-signer setup should leave a relay-published key package to delete"
+    );
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    // No groups joined, so nothing to leave and no leave failures.
+    assert_eq!(outcome.groups_left, 0);
+    assert!(outcome.group_leave_failures.is_empty());
+    // Stage 2 signs the kind:5 deletions through the registered external
+    // signer, so the relay cleanup is as complete as it is for a local account.
+    assert!(
+        outcome.key_packages_deleted >= 1,
+        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted
+    );
+    assert!(
+        outcome.key_package_failures.is_empty(),
+        "unexpected key package failures: {:?}",
+        outcome.key_package_failures
+    );
+    // The local wipe has no nsec to delete; a missing secret must not surface
+    // as a cleanup failure.
+    assert!(outcome.local_cleanup.completed);
+    assert!(outcome.local_cleanup.reason.is_none());
+
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .into_iter()
+            .all(|account| account.account_id_hex != account_id),
+        "wiped external-signer account must not remain managed"
+    );
+    assert!(
+        home.accounts()
+            .unwrap()
+            .into_iter()
+            .all(|account| account.account_id_hex != account_id),
+        "wiped external-signer account directory must be removed"
+    );
+    assert!(runtime.accounts().resolve(&account_id).is_err());
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_and_wipe_rejects_tracked_only_account() {
+    // A tracked-only (npub) follow has no signing key of any kind, so it never
+    // joined a group or published a KeyPackage from this device. It must keep
+    // failing with exactly the `SecretNotFound` app clients already classify
+    // on, and the tracked record must survive the rejection.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let account_id = Keys::generate().public_key().to_hex();
+    home.add_public_account(&account_id).unwrap();
+
+    let error = runtime.sign_out_and_wipe(&account_id).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            AppError::AccountHome(AccountHomeError::SecretNotFound(id)) if *id == account_id
+        ),
+        "tracked-only wipe must keep returning SecretNotFound, got {error:?}"
+    );
+    assert!(
+        home.accounts()
+            .unwrap()
+            .into_iter()
+            .any(|account| account.account_id_hex == account_id),
+        "a rejected wipe must leave the tracked account record untouched"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     // mdk#477: a non-destructive sign-out must clean up the relay
     // KeyPackages (so strangers can't gift-wrap a Welcome while signed out)
@@ -8576,6 +8691,118 @@ async fn app_runtime_sign_out_rejects_unknown_account() {
             .sign_out(&missing, SignOutOptions::default())
             .await
             .is_err()
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_succeeds_for_external_signer_account() {
+    // mdk#1509: reversible sign-out must work for an external-signer account.
+    // Its KeyPackages are real relay publications, so they are cleaned up with
+    // the external signer, and every byte of local state survives for the
+    // sign-back-in.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
+
+    runtime
+        .login_external_signer(
+            account_id.clone(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(&url)],
+                bootstrap_relays: vec![endpoint(&url)],
+                discovery_relays: vec![endpoint(&url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let before = runtime
+        .account_key_packages(&account_id, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    assert!(
+        before.iter().any(|pkg| pkg.relay),
+        "external-signer setup should leave a relay-published key package to delete"
+    );
+
+    let outcome = runtime
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.key_packages_deleted >= 1,
+        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted
+    );
+    assert!(
+        outcome.key_package_failures.is_empty(),
+        "unexpected key package failures: {:?}",
+        outcome.key_package_failures
+    );
+    assert!(outcome.local_cleanup.completed);
+    assert!(outcome.local_cleanup.reason.is_none());
+
+    let signed_out_account = home.account(&account_id).unwrap();
+    assert!(signed_out_account.signed_out);
+    assert!(signed_out_account.external_signing);
+    let managed = runtime
+        .accounts()
+        .managed_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.account_id_hex == account_id)
+        .expect("signed-out external-signer account should remain listed");
+    assert!(managed.signed_out);
+    assert!(
+        !managed.running,
+        "sign-out should stop the worker immediately"
+    );
+
+    // Reversible means reversible: the account is still a live on-disk record
+    // and signs back in with its registered signer.
+    let signed_in = runtime.sign_in_account(&account_id).await.unwrap();
+    assert!(!signed_in.signed_out);
+    assert!(signed_in.running);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_rejects_tracked_only_account() {
+    // The gate's real purpose: a tracked-only (npub) follow has nothing to sign
+    // out. It must keep failing with exactly the `SecretNotFound` app clients
+    // already classify on.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let account_id = Keys::generate().public_key().to_hex();
+    home.add_public_account(&account_id).unwrap();
+
+    let error = runtime
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            AppError::AccountHome(AccountHomeError::SecretNotFound(id)) if *id == account_id
+        ),
+        "tracked-only sign-out must keep returning SecretNotFound, got {error:?}"
+    );
+    assert!(
+        !home.account(&account_id).unwrap().signed_out,
+        "a rejected sign-out must not persist a signed-out marker"
     );
 
     runtime.shutdown().await;
