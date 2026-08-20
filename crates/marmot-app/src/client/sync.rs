@@ -203,6 +203,33 @@ impl AppClient {
         }
     }
 
+    /// Apply the publish gate to `effects`, arming epoch-gap recovery from the
+    /// same batch first.
+    ///
+    /// Every publishing seam must reach the gate through this rather than
+    /// calling `fail_if_publish_failed` directly. A
+    /// `TransportObjectResourceRefused` is buffered only after its durable
+    /// retention row is already deleted, and an effects batch carries its
+    /// events to the app exactly once — so a refusal a pass does not arm on can
+    /// never be re-observed. Gating first returns early and drops it for good;
+    /// arming first survives the caller's `?` because it is a field mutation
+    /// plus a durable audit row, not summary state. The two conditions are
+    /// correlated rather than independent: these seams publish, so the failure
+    /// and the refusal ride the same effects.
+    ///
+    /// Arming only. `remember_pending_convergence_groups` is deliberately not
+    /// paired here the way it is at the convergence and inbound seams: the
+    /// callers of this gate do not remember pending convergence on their
+    /// success paths either, so recording it on the failure path alone would
+    /// invent a scheduling contract they do not otherwise hold.
+    pub(crate) fn arm_recovery_then_fail_if_publish_failed(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        self.arm_recovery_from_effects(effects);
+        fail_if_publish_failed(effects)
+    }
+
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
         let rebuild_since = self
             .relay_plane

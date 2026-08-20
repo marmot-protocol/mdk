@@ -1997,7 +1997,7 @@ impl AppClient {
             },
         });
 
-        let published = self
+        let published = match self
             .runtime
             .publish_prepared_session_effects_with_audit_context(
                 session_effects,
@@ -2005,10 +2005,15 @@ impl AppClient {
             )
             .await
             .map_err(AppError::from)
-            .and_then(|effects| {
-                fail_if_publish_failed(&effects)?;
-                Ok(effects)
-            });
+        {
+            // Matched rather than chained so the gate can arm first: it
+            // previously sat in a combinator closure that could not reach
+            // `&mut self`.
+            Ok(effects) => self
+                .arm_recovery_then_fail_if_publish_failed(&effects)
+                .map(|()| effects),
+            Err(error) => Err(error),
+        };
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteEnginePublish,
@@ -2099,7 +2104,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2145,7 +2150,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2345,7 +2350,7 @@ impl AppClient {
                     audit_context.clone(),
                 )
                 .await?;
-            fail_if_publish_failed(&effects)?;
+            self.arm_recovery_then_fail_if_publish_failed(&effects)?;
             Ok::<_, AppError>(effects)
         }
         .await
@@ -2621,7 +2626,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2656,7 +2661,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2727,7 +2732,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2771,7 +2776,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2925,23 +2930,7 @@ impl AppClient {
                 return Err(err);
             }
         };
-        if let Err(publish_err) = fail_if_publish_failed(&effects) {
-            // The send itself failed to reach anyone, but any peer commits it
-            // folded are durably applied — broadcast them before surfacing the
-            // publish failure, best-effort so a projection error cannot mask
-            // the primary error.
-            self.observe_send_applied_effects_best_effort(&effects)
-                .await;
-            if let Err(_save_err) =
-                self.save_state_with_pending_local_group_deletion_frontier_clears()
-            {
-                tracing::warn!(
-                    target: "marmot_app::messages",
-                    method = "send_app_event_with_local_projection",
-                    error_code = "send_applied_state_save_failed",
-                    "failed to persist state observed from a failed send"
-                );
-            }
+        if let Err(publish_err) = self.arm_recovery_then_gate_send_publish(&effects).await {
             self.retract_failed_local_projection(
                 should_project_locally,
                 &group_id_hex,
@@ -3016,6 +3005,39 @@ impl AppClient {
                 maintenance_disposition: effects.maintenance_disposition,
             },
         ))
+    }
+
+    /// Apply the publish gate to a completed send's effects — arming
+    /// epoch-gap recovery from the same batch first — and, when the gate
+    /// fails, broadcast the peer commits the send folded before the caller
+    /// surfaces the error.
+    ///
+    /// Split out of `send_app_event_with_local_projection` so the ordering is
+    /// exercisable against a given batch of effects. The caller keeps the
+    /// local-projection retraction, which needs that send's own locals.
+    pub(crate) async fn arm_recovery_then_gate_send_publish(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        let publish_err = match self.arm_recovery_then_fail_if_publish_failed(effects) {
+            Ok(()) => return Ok(()),
+            Err(publish_err) => publish_err,
+        };
+        // The send itself failed to reach anyone, but any peer commits it
+        // folded are durably applied — broadcast them before surfacing the
+        // publish failure, best-effort so a projection error cannot mask
+        // the primary error.
+        self.observe_send_applied_effects_best_effort(effects).await;
+        if let Err(_save_err) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            tracing::warn!(
+                target: "marmot_app::messages",
+                method = "send_app_event_with_local_projection",
+                error_code = "send_applied_state_save_failed",
+                "failed to persist state observed from a failed send"
+            );
+        }
+        Err(publish_err)
     }
 
     /// Retract the optimistic local timeline row for a send that failed. No
@@ -3475,7 +3497,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
@@ -3755,7 +3777,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects)?;
+        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let message_ids = effects
@@ -4470,9 +4492,12 @@ impl AppClient {
                     "clear_delivered_founding_welcome_intents",
                     self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects),
                 );
+                // Non-fatal here: this classification only logs, so no
+                // refusal is lost to an early return. It still arms through the
+                // same gate, so no publishing seam reaches the bare check.
                 recover_post_canonical_result(
                     "classify_founding_welcome_publish",
-                    fail_if_publish_failed(&effects),
+                    self.arm_recovery_then_fail_if_publish_failed(&effects),
                 );
                 recover_post_canonical_result(
                     "record_founding_welcome_delivery_failures",

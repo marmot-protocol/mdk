@@ -2210,6 +2210,11 @@ pub(crate) fn add_group(
 ///   independently retryable Welcome deliveries remain outstanding.
 /// - failures with no pending resolution at all (e.g. a plain application
 ///   message or proposal publish that never landed): hard error, as before.
+///
+/// Call this from `AppClient::arm_recovery_then_fail_if_publish_failed` rather
+/// than directly. Gating an effects batch without first arming epoch-gap
+/// recovery from it drops any one-shot `TransportObjectResourceRefused` the
+/// batch carries; the seams that already arm explicitly are the only exception.
 pub(crate) fn fail_if_publish_failed(
     effects: &marmot_account::AccountDeviceEffects,
 ) -> Result<(), AppError> {
