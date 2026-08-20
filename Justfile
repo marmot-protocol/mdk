@@ -91,9 +91,15 @@ relay-smoke:
 fips-native-e2e:
     bash ./scripts/test-fips-native-compose.sh
 
-# Read-only native-FIPS interoperability probe against the configured demo relay.
+# Read-only WebSocket and native-FIPS interoperability probes against the
+# configured dual-protocol demo relay.
 fips-native-remote:
     bash ./scripts/test-fips-native-remote.sh
+
+# Fast checks for the two-host application-level relay benchmark harness.
+fips-benchmark-check:
+    python3 -m unittest testing/fips-native/test_benchmark.py
+    python3 testing/fips-native/benchmark.py --help >/dev/null
 
 # Real two-account MDK CLI flow through the external native-FIPS demo relay.
 fips-native-mdk-e2e:

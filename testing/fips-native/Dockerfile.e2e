@@ -30,3 +30,4 @@ COPY --from=mdk-builder /build/target/release/examples/relay-smoke /usr/local/bi
 COPY --from=mdk-builder /build/target/release/wn /usr/local/bin/wn
 COPY --from=mdk-builder /build/target/release/wnd /usr/local/bin/wnd
 COPY testing/fips-native/mdk-cli-e2e.sh /usr/local/bin/mdk-fips-cli-e2e
+COPY testing/fips-native/benchmark.py /usr/local/bin/mdk-relay-benchmark

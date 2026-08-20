@@ -71,6 +71,8 @@ services:
       - /run/fips/api.sock
       - fips://npub1pq5w2qtanuqfu6xctrqvz6jz5adwa0qyr3wvkfw2xy6yv7fneytq49daxg
       - ${FIPS_REMOTE_SMOKE_MODE:---read-only}
+      - --websocket
+      - wss://relay.fips.whitenoise.chat
     depends_on:
       client-fips:
         condition: service_healthy

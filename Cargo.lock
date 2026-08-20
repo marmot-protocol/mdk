@@ -6866,6 +6866,7 @@ dependencies = [
  "hex",
  "libc",
  "nostr",
+ "nostr-sdk",
  "rand 0.8.6",
  "serde_json",
  "tokio",

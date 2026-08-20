@@ -45,7 +45,7 @@ RUN cargo build --release --locked --bin fips --bin fipsctl
 FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl jq libdbus-1-3 tini && \
+    apt-get install -y --no-install-recommends ca-certificates curl jq libdbus-1-3 python3 tini && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --system fips && \
     install -d -o root -g fips -m 0750 /run/fips /etc/fips /etc/wok /var/lib/wok
@@ -61,5 +61,6 @@ COPY testing/fips-native/client-fips.yaml /etc/fips/client-fips.yaml
 COPY testing/fips-native/remote-client-fips.yaml /etc/fips/remote-client-fips.yaml
 COPY testing/fips-native/wok.toml /etc/wok/wok.toml
 COPY testing/fips-native/discovery-wok.toml /etc/wok/discovery-wok.toml
+COPY testing/fips-native/benchmark.py /usr/local/bin/mdk-relay-benchmark
 
 ENTRYPOINT []

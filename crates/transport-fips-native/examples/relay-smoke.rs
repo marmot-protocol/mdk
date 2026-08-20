@@ -33,10 +33,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
         }
     };
+    let websocket_relay = match args.next().as_deref() {
+        None => None,
+        Some("--websocket") => Some(args.next().ok_or(
+            "usage: relay-smoke SOCKET fips://RELAY_NPUB \
+             [--read-only|--publish|--inbox] [--websocket wss://RELAY]",
+        )?),
+        Some(_) => {
+            return Err("usage: relay-smoke SOCKET fips://RELAY_NPUB \
+                 [--read-only|--publish|--inbox] [--websocket wss://RELAY]"
+                .into());
+        }
+    };
     if args.next().is_some() {
         return Err("usage: relay-smoke SOCKET fips://RELAY_NPUB \
-             [--read-only|--publish|--inbox]"
+             [--read-only|--publish|--inbox] [--websocket wss://RELAY]"
             .into());
+    }
+    if let Some(websocket_relay) = websocket_relay {
+        websocket_read_only_smoke(&websocket_relay).await?;
     }
 
     let api: Arc<dyn FipsRelayApi> =
@@ -123,6 +138,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SmokeMode::GroupPublish => println!("native FIPS relay smoke passed"),
         SmokeMode::GroupReadOnly => unreachable!(),
     }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+async fn websocket_read_only_smoke(relay: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    use nostr_sdk::prelude::{Client, Filter};
+
+    let client = Client::builder().build();
+    client
+        .add_read_relay(relay)
+        .await
+        .map_err(|_| "failed to configure WebSocket relay")?;
+    client
+        .try_connect_relay(relay, Duration::from_secs(10))
+        .await
+        .map_err(|_| "failed to connect WebSocket relay")?;
+    client
+        .fetch_events_from([relay], Filter::new().limit(1), Duration::from_secs(10))
+        .await
+        .map_err(|_| "WebSocket relay did not complete a Nostr query")?;
+    client.disconnect().await;
+    println!("WebSocket relay read-only smoke passed");
     Ok(())
 }
 

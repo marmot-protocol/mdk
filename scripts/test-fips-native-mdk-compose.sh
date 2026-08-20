@@ -19,8 +19,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if ! docker image inspect mdk-fips-e2e:local >/dev/null 2>&1; then
-  "${compose[@]}" build discovery client-fips
-fi
+"${compose[@]}" build discovery client-fips
 "${compose[@]}" build mdk-e2e
 "${compose[@]}" up --no-build --abort-on-container-exit --exit-code-from mdk-e2e mdk-e2e

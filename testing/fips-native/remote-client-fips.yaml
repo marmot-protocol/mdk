@@ -32,5 +32,8 @@ peers:
       - transport: udp
         addr: "62.238.50.254:2121"
         priority: 1
+      - transport: udp
+        addr: "[2a01:4f9:c015:b7a::1]:2121"
+        priority: 2
     connect_policy: auto_connect
     auto_reconnect: true

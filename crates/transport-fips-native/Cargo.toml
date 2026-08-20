@@ -25,4 +25,5 @@ rand.workspace = true
 
 [dev-dependencies]
 nostr.workspace = true
+nostr-sdk.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

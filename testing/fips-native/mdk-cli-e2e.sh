@@ -17,9 +17,10 @@ readonly bob_text="hello over FIPS from Bob"
 
 alice_pid=""
 bob_pid=""
+benchmark_pid=""
 
 cleanup() {
-  for pid in "$alice_pid" "$bob_pid"; do
+  for pid in "$benchmark_pid" "$alice_pid" "$bob_pid"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -30,7 +31,11 @@ trap cleanup EXIT INT TERM
 
 fail() {
   printf 'native FIPS MDK CLI test failed: %s\n' "$1" >&2
-  for log in /run/mdk/alice.log /run/mdk/bob.log; do
+  for log in \
+    /run/mdk/alice.log \
+    /run/mdk/bob.log \
+    /run/mdk/benchmark-initiator.log \
+    /run/mdk/benchmark-responder.log; do
     if [[ -f "$log" ]]; then
       printf '%s:\n' "$log" >&2
       tail -n 80 "$log" >&2
@@ -233,5 +238,48 @@ require_ok "$bob_send" "Bob send"
 jq -e '.result.published > 0' >/dev/null <<<"$bob_send" || fail "Bob send was not published"
 poll_for_message "$alice_home" "$alice_socket" "$alice_npub" "$group_id" "$bob_text" || \
   fail "Alice did not receive Bob's message"
+
+# Exercise the same two-host benchmark roles against the real daemons and
+# encrypted FIPS-routed group. This is a small harness smoke, not a performance
+# assertion: shared-container timings are intentionally not treated as results.
+readonly benchmark_run_id="fips-container-e2e"
+readonly benchmark_count=3
+mdk-relay-benchmark responder \
+  --home "$bob_home" \
+  --socket "$bob_socket" \
+  --account "$bob_npub" \
+  --group "$group_id" \
+  --run-id "$benchmark_run_id" \
+  --transport fips \
+  --client-label container-bob \
+  --relay-label local-wok \
+  --build-id container-e2e \
+  --output /run/mdk/benchmark-responder.jsonl \
+  --expected "$benchmark_count" \
+  --idle-timeout-seconds 30 \
+  >/run/mdk/benchmark-responder.log 2>&1 &
+benchmark_pid=$!
+
+mdk-relay-benchmark initiator \
+  --home "$alice_home" \
+  --socket "$alice_socket" \
+  --account "$alice_npub" \
+  --group "$group_id" \
+  --run-id "$benchmark_run_id" \
+  --transport fips \
+  --client-label container-alice \
+  --relay-label local-wok \
+  --build-id container-e2e \
+  --output /run/mdk/benchmark-initiator.jsonl \
+  --warmups 1 \
+  --samples 2 \
+  --payload-bytes 512 \
+  --timeout-seconds 15 \
+  >/run/mdk/benchmark-initiator.log 2>&1 || fail "benchmark initiator failed"
+wait "$benchmark_pid" || fail "benchmark responder failed"
+benchmark_pid=""
+jq -e \
+  'select(.event == "summary") | .failures == 0 and .samples_successful == 2' \
+  /run/mdk/benchmark-initiator.jsonl >/dev/null || fail "benchmark summary was incomplete"
 
 printf 'native FIPS MDK CLI end-to-end test passed\n'
