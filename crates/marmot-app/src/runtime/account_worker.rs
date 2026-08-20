@@ -196,6 +196,11 @@ pub(crate) enum AccountWorkerCommand {
         initial_admins: Vec<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    InviteKeyPackages {
+        group_id: GroupId,
+        key_packages: Vec<cgka_traits::engine::KeyPackage>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     RemoveMembers {
         group_id: GroupId,
         members: Vec<String>,
@@ -3006,6 +3011,28 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.exporter_secret(&group_id, &label, length);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::InviteKeyPackages {
+            group_id,
+            key_packages,
+            respond,
+        } => {
+            let result = client.invite_key_packages(&group_id, key_packages).await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::InviteMembers {

@@ -9999,3 +9999,103 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
 
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn invite_key_packages_admits_two_leaves_of_one_account() {
+    // Member resolution answers "the account's KeyPackage", singular: the most recently
+    // published one. An account with two devices therefore joins as whichever of them
+    // published last, and the other never hears about the group. Group setup already says
+    // what more than one leaf per account means — admin policy applies to each — so the gap
+    // is in how a caller expresses it, not in what the protocol allows.
+    let dir = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+
+    let (_relay, app, url) = mock_app(&dir).await;
+
+    // Bob's first device publishes a KeyPackage, and Alice reads it.
+    let mut bob_one = app.client("bob").await.unwrap();
+    bob_one.publish_key_package().await.unwrap();
+    let first = app
+        .fetch_latest_key_package_for_account_id(&bob_id, vec![endpoint(&url)])
+        .await
+        .unwrap()
+        .key_package;
+
+    // Bob's second device: the same account, a separate store, its own MLS key material —
+    // which is what a second device is. Its KeyPackage replaces the first as "the latest".
+    let secret = home
+        .load_signing_keys("bob")
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    let second_home = AccountHome::open(second.path());
+    second_home.import_account("bob", &secret).unwrap();
+    let second_app = MarmotApp::with_relay(second.path(), url.clone());
+    let mut bob_two = second_app.client("bob").await.unwrap();
+    bob_two.publish_key_package().await.unwrap();
+    let latest = app
+        .fetch_latest_key_package_for_account_id(&bob_id, vec![endpoint(&url)])
+        .await
+        .unwrap()
+        .key_package;
+    assert_ne!(
+        first.bytes, latest.bytes,
+        "the second device published nothing of its own"
+    );
+
+    // Alice invites both, which naming the account once cannot express.
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("both of bob", &[]).await.unwrap();
+    let summary = alice
+        .invite_key_packages(&group_id, vec![first, latest])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.published, 1,
+        "the invite did not publish its commit"
+    );
+    let members = alice.members(&group_id).unwrap();
+    assert_eq!(
+        members.len(),
+        3,
+        "membership is per leaf: alice, and bob twice"
+    );
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == bob_id)
+            .count(),
+        2,
+        "bob's two devices are not both in the group under his one identity"
+    );
+
+    // Both devices find the group, which is the whole point.
+    let joined_one = bob_one.sync().await.unwrap();
+    assert_eq!(
+        joined_one.joined_groups,
+        vec![group_id.clone()],
+        "bob's first device did not join"
+    );
+    let joined_two = bob_two.sync().await.unwrap();
+    assert_eq!(
+        joined_two.joined_groups,
+        vec![group_id.clone()],
+        "bob's second device did not join"
+    );
+
+    // And a message reaches both of them, rather than whichever published last.
+    alice.send(&group_id, b"for both of you").await.unwrap();
+    for (name, bob) in [("first", &mut bob_one), ("second", &mut bob_two)] {
+        let received = bob.sync().await.unwrap();
+        assert_eq!(
+            received.messages.len(),
+            1,
+            "bob's {name} device received nothing"
+        );
+        assert_eq!(received.messages[0].plaintext, "for both of you");
+    }
+}

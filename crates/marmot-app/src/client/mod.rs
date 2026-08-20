@@ -1824,7 +1824,7 @@ impl AppClient {
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
         let summary = self
-            .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
+            .invite_members_with_optional_telemetry(group_id, member_refs, &[], None, None)
             .await?;
         self.drive_unpublished_welcome_delivery(None).await;
         Ok(summary)
@@ -1842,8 +1842,27 @@ impl AppClient {
             member_refs,
             initial_admin_refs,
             Some(telemetry),
+            None,
         )
         .await
+    }
+
+    /// Invites members whose KeyPackages the caller already holds.
+    ///
+    /// Resolution maps one account to one KeyPackage, which is the right answer only while an
+    /// account has one device. A caller that knows an account's devices — and which of them
+    /// still count — supplies their KeyPackages here instead. Group setup already defines the
+    /// resulting shape: admin policy applies per leaf when an account has more than one.
+    pub async fn invite_key_packages(
+        &mut self,
+        group_id: &GroupId,
+        key_packages: Vec<KeyPackage>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .invite_members_with_optional_telemetry(group_id, &[], &[], None, Some(key_packages))
+            .await?;
+        self.drive_unpublished_welcome_delivery(None).await;
+        Ok(summary)
     }
 
     async fn invite_members_with_optional_telemetry(
@@ -1852,18 +1871,24 @@ impl AppClient {
         member_refs: &[&str],
         initial_admin_refs: &[&str],
         telemetry: Option<&AppPerformanceTelemetry>,
+        supplied_key_packages: Option<Vec<KeyPackage>>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
-        let key_package_started_at = Instant::now();
-        let key_packages = self.app.resolve_member_key_packages(member_refs).await;
-        record_app_performance(
-            telemetry,
-            AppPerformanceOperation::GroupInviteKeyPackageLookup,
-            key_package_started_at.elapsed(),
-            key_packages.is_ok(),
-        );
-        let key_packages = key_packages?;
+        let key_packages = match supplied_key_packages {
+            Some(key_packages) => key_packages,
+            None => {
+                let key_package_started_at = Instant::now();
+                let key_packages = self.app.resolve_member_key_packages(member_refs).await;
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteKeyPackageLookup,
+                    key_package_started_at.elapsed(),
+                    key_packages.is_ok(),
+                );
+                key_packages?
+            }
+        };
 
         let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
         for admin in initial_admin_refs {
