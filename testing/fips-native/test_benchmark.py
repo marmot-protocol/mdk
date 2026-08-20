@@ -57,6 +57,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(publish_acks, [2.0])
         self.assertEqual(failures, 1)
 
+    def test_response_timeout_name_is_distinct_from_publish_failure(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn('outcome = "response_timeout"', source)
+        self.assertIn('outcome = "publish_failed"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

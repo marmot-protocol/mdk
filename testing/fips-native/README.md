@@ -93,7 +93,9 @@ both directions, and an administrator member-removal commit. The runner
 archives the resulting local projections. It does not use SelfRemove because
 the demo group's negotiated required components do not include lifecycle
 component `0x800c`, and it does not treat a last-member leave as transport
-evidence.
+evidence. Individual measured probe failures are retained in the evidence and
+do not stop later directions or lanes; malformed output, incomplete sample
+accounting, setup failures, and lifecycle failures still abort the campaign.
 
 Run the fast benchmark-tool checks with:
 

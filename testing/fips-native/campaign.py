@@ -460,6 +460,18 @@ def parse_summary(output: str) -> dict[str, Any]:
     return summary
 
 
+def validate_benchmark_summary(summary: dict[str, Any], samples: int) -> None:
+    requested = summary.get("samples_requested")
+    successful = summary.get("samples_successful")
+    failures = summary.get("failures")
+    if requested != samples:
+        raise CampaignError("benchmark summary has the wrong requested sample count")
+    if not isinstance(successful, int) or not isinstance(failures, int):
+        raise CampaignError("benchmark summary has invalid outcome counts")
+    if successful < 0 or failures < 0 or successful + failures != samples:
+        raise CampaignError("benchmark summary does not account for every measured sample")
+
+
 def run_benchmark_direction(
     lane: str,
     direction: str,
@@ -539,14 +551,16 @@ def run_benchmark_direction(
         "--timeout-seconds",
         "30",
     ]
-    initiator_result = initiator.host.run(initiator_args, timeout=max(120, expected * 35))
+    initiator_result = initiator.host.run(
+        initiator_args, timeout=max(120, expected * 35), check=False
+    )
     try:
         responder_stdout, responder_stderr = responder_process.communicate(timeout=75)
     except subprocess.TimeoutExpired as error:
         responder_process.terminate()
         responder_process.wait(timeout=10)
         raise CampaignError("benchmark responder did not finish") from error
-    if responder_process.returncode != 0:
+    if responder_process.returncode not in {0, 2}:
         raise CampaignError(f"benchmark responder failed: {responder_stderr.strip()}")
 
     prefix = run_id
@@ -557,8 +571,12 @@ def run_benchmark_direction(
         responder_stdout, encoding="utf-8"
     )
     summary = parse_summary(initiator_result.stdout)
-    if summary.get("failures") != 0 or summary.get("samples_successful") != samples:
-        raise CampaignError(f"{lane} {direction} benchmark was incomplete")
+    if initiator_result.returncode not in {0, 2}:
+        detail = initiator_result.stderr.strip() or "unexpected initiator exit"
+        raise CampaignError(f"{lane} {direction} benchmark failed: {detail}")
+    validate_benchmark_summary(summary, samples)
+    if responder_process.returncode == 2 and summary["failures"] == 0:
+        raise CampaignError(f"{lane} {direction} responder was incomplete")
     return summary
 
 
@@ -670,6 +688,7 @@ def run_lane(
                     round_trip_p50_ms=summary["round_trip_p50_ms"],
                     round_trip_p95_ms=summary["round_trip_p95_ms"],
                     round_trip_p99_ms=summary["round_trip_p99_ms"],
+                    samples_requested=summary["samples_requested"],
                     samples_successful=summary["samples_successful"],
                 )
 

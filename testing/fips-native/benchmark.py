@@ -379,6 +379,8 @@ def run_initiator(args: argparse.Namespace) -> int:
                 sent_wall_ns,
             )
             round_trip_started = time.monotonic_ns()
+            publish_ms = None
+            published = 0
             try:
                 publish_ms, published = send_message(config, ping)
                 pong = wait_for_pong(subscription, sequence, args.timeout_seconds)
@@ -388,10 +390,8 @@ def run_initiator(args: argparse.Namespace) -> int:
                     measured_rtts.append(rtt_ms)
                     measured_publish.append(publish_ms)
             except queue.Empty:
-                publish_ms = None
-                published = 0
                 rtt_ms = None
-                outcome = "timeout"
+                outcome = "response_timeout"
                 if not warmup:
                     failures += 1
             except (RuntimeError, subprocess.TimeoutExpired):

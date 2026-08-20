@@ -42,6 +42,19 @@ class CampaignTests(unittest.TestCase):
         )
         self.assertEqual(campaign.parse_summary(output)["failures"], 0)
 
+    def test_summary_validation_accepts_measured_failures(self) -> None:
+        campaign.validate_benchmark_summary(
+            {"samples_requested": 50, "samples_successful": 48, "failures": 2},
+            50,
+        )
+
+    def test_summary_validation_rejects_unaccounted_samples(self) -> None:
+        with self.assertRaises(campaign.CampaignError):
+            campaign.validate_benchmark_summary(
+                {"samples_requested": 50, "samples_successful": 48, "failures": 1},
+                50,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
