@@ -168,7 +168,10 @@ impl AppClient {
             .extend(effects.pending_convergence.iter().cloned());
     }
 
-    fn arm_recovery_from_effects(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+    pub(crate) fn arm_recovery_from_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
@@ -1708,9 +1711,11 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
-        fail_if_publish_failed(effects)?;
         self.remember_pending_convergence_groups(effects);
+        // Arm before the publish gate, for the reason spelled out in
+        // `observe_drained_session_events`.
         self.arm_recovery_from_effects(effects);
+        fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         let publish_new_message_notification =

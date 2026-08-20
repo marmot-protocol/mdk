@@ -3695,6 +3695,9 @@ impl AppClient {
         group_id: &GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
+        // Arm before the publish gate, for the reason spelled out in
+        // `observe_drained_session_events`.
+        self.arm_recovery_from_effects(effects);
         fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
