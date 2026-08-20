@@ -1723,6 +1723,10 @@ pub(crate) struct RelayHealthData {
     pub(crate) disconnected: u64,
     pub(crate) connection_attempts: u64,
     pub(crate) connection_successes: u64,
+    pub(crate) fips_enabled: bool,
+    pub(crate) fips_active_endpoints: u64,
+    pub(crate) fips_connected_endpoints: u64,
+    pub(crate) fips_reconnecting_endpoints: u64,
     pub(crate) notification_forwarder_running: bool,
     pub(crate) notification_forwarder_restarts: u64,
     pub(crate) notification_forwarder_lag_incidents: u64,
@@ -1802,6 +1806,7 @@ pub(crate) fn parse_relay_health(result: &Value, daemon_running: bool) -> RelayH
         .unwrap_or(Value::Null);
     let sync = result.get("sync").cloned().unwrap_or(Value::Null);
     let health = result.get("health").cloned().unwrap_or(Value::Null);
+    let fips = result.get("fips").cloned().unwrap_or(Value::Null);
     let spread_hist = spread.get("spread").cloned().unwrap_or(Value::Null);
     let first_event = sync.get("first_event").cloned().unwrap_or(Value::Null);
     let eose = sync.get("eose").cloned().unwrap_or(Value::Null);
@@ -1840,6 +1845,13 @@ pub(crate) fn parse_relay_health(result: &Value, daemon_running: bool) -> RelayH
         disconnected: u64_at(&health, "disconnected"),
         connection_attempts: u64_at(&health, "connection_attempts"),
         connection_successes: u64_at(&health, "connection_successes"),
+        fips_enabled: fips
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        fips_active_endpoints: u64_at(&fips, "active_endpoints"),
+        fips_connected_endpoints: u64_at(&fips, "connected_endpoints"),
+        fips_reconnecting_endpoints: u64_at(&fips, "reconnecting_endpoints"),
         notification_forwarder_running: health
             .get("notification_forwarder_running")
             .and_then(Value::as_bool)

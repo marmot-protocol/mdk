@@ -887,6 +887,21 @@ pub(crate) enum RelaysCommand {
         )]
         relay_type: String,
     },
+    #[command(about = "Replace an account relay list with the supplied URLs")]
+    Set {
+        #[arg(
+            required = true,
+            num_args = 1..,
+            help = "Complete relay URL set to publish"
+        )]
+        urls: Vec<String>,
+        #[arg(
+            long = "type",
+            value_name = "TYPE",
+            help = "Relay list type: nip65 or inbox"
+        )]
+        relay_type: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]

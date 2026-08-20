@@ -13,6 +13,7 @@ This repo owns the Rust implementation workspace for Marmot:
 - app runtime bridge,
 - SQLCipher-backed storage backend,
 - Nostr transport adapter and peeler,
+- native FIPS transport for Nostr-shaped relay traffic,
 - raw QUIC agent text stream preview transport and memory-only broker,
 - agent control protocol, stream composition, and the `wn-agent` connector daemon,
 - app message Markdown display parser,
@@ -42,6 +43,7 @@ The canonical protocol specification lives in
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
+| Native FIPS relay transport | `crates/transport-fips-native/AGENTS.md` |
 | QUIC agent text stream previews | `crates/transport-quic-stream/AGENTS.md` |
 | QUIC preview broker | `crates/transport-quic-broker/AGENTS.md` |
 | Agent control protocol DTOs / framing | `crates/agent-control/AGENTS.md` |

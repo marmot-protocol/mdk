@@ -224,9 +224,10 @@ These are longer working documents. Go here when you need depth, not orientation
   - **Target:** **whitenoise-core** — thin facade, per-account sessions
 
 - **Layer:** Transport
-  - **Today:** Nostr relay control planes, embedded
-  - **Target:** `TransportAdapter` trait plus `transport-nostr-adapter` core, stale subscription cleanup, diagnostics,
-    redacted SDK relay health, and optional SDK client; relay auth/policy next
+  - **Today:** Nostr relay semantics with WebSocket SDK connections plus an experimental Linux/FreeBSD native FIPS
+    backend for exact `fips://<npub>` delivery endpoints
+  - **Target:** Stable `TransportAdapter` boundaries, scheme-dispatched relay clients, stale subscription cleanup,
+    diagnostics, redacted relay health, and production hardening for each connection backend
 
 - **Layer:** CGKA Engine
   - **Today:** `crates/cgka-engine` implements the current OpenMLS-backed engine candidate; `crates/cgka-session` wraps
@@ -248,7 +249,8 @@ These are longer working documents. Go here when you need depth, not orientation
 
 - **PCS is non-negotiable.** Both FS and PCS required. Sender Keys off the table.
 - **MLS stays.** BeeKEM and other CGKAs interesting but immature; `CgkaEngine` trait makes them swappable in future.
-- **Transport is pluggable.** FIPS mesh and others are first-class future targets.
+- **Transport is pluggable.** Native FIPS relay delivery is the first experimental non-WebSocket connection backend;
+  other transports remain first-class targets.
 - **Commit convergence is engine-owned.** Transport ordering is advisory; the engine canonicalizes commits before
   releasing app-visible output.
 - **whitenoise-ffi, not whitenoise-frb.** FFI bridge outputs Swift bindings too.

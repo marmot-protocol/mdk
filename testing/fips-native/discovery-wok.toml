@@ -1,0 +1,24 @@
+[database]
+path = "/var/lib/wok-discovery"
+map_size = 1073741824
+min_free_disk_bytes = 0
+
+[observability]
+log_format = "pretty"
+log_filter = "wok=info"
+history_enabled = false
+
+[events]
+max_event_size = 65536
+
+[relay]
+bind = "0.0.0.0"
+port = 7778
+nofiles = 4096
+max_websocket_payload_size = 131072
+
+[relay.auth]
+enabled = false
+
+[relay.fips]
+enabled = false

@@ -7,6 +7,7 @@ use cgka_traits::{
 };
 use nostr_sdk::prelude::RelayUrl;
 use serde::{Deserialize, Serialize};
+use transport_nostr_adapter::NostrRelayEndpoint;
 use url::{Host, Url};
 
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
@@ -81,17 +82,24 @@ impl RelaySafetyPolicy {
 
     fn classify_endpoint(&self, endpoint: String) -> RelayEndpointClassification {
         let raw = endpoint.trim();
-        let Ok(relay_url) = RelayUrl::parse(raw) else {
+        let Ok(relay_endpoint) = NostrRelayEndpoint::parse(raw) else {
             return RelayEndpointClassification {
                 endpoint,
                 normalized_endpoint: None,
                 policy: RelayEndpointPolicy::Invalid,
             };
         };
-        let normalized_endpoint = Some(relay_url.to_string());
-        let policy = match evaluate_relay_url(&relay_url, self.allow_loopback) {
-            Ok(()) => RelayEndpointPolicy::Allowed,
-            Err(rejection) => rejection.policy(),
+        let normalized_endpoint = Some(relay_endpoint.transport_endpoint().0);
+        let policy = match relay_endpoint {
+            NostrRelayEndpoint::WebSocket(relay_url) => {
+                match evaluate_relay_url(&relay_url, self.allow_loopback) {
+                    Ok(()) => RelayEndpointPolicy::Allowed,
+                    Err(rejection) => rejection.policy(),
+                }
+            }
+            // A FIPS npub names the remote node inside the FIPS overlay. It is
+            // not a DNS/IP dial target and cannot bypass WebSocket host safety.
+            NostrRelayEndpoint::Fips(_) => RelayEndpointPolicy::Allowed,
         };
         RelayEndpointClassification {
             endpoint,
@@ -159,13 +167,15 @@ impl RelaySafetyPolicy {
         let offered = endpoints.len();
         let mut kept: Vec<TransportEndpoint> = Vec::new();
         for endpoint in endpoints {
-            let Ok(relay_url) = RelayUrl::parse(endpoint.as_str().trim()) else {
+            let Ok(relay_endpoint) = NostrRelayEndpoint::parse(endpoint.as_str().trim()) else {
                 continue;
             };
-            if reject_unsafe_relay_host(&relay_url, self.allow_loopback).is_err() {
+            if let NostrRelayEndpoint::WebSocket(relay_url) = &relay_endpoint
+                && reject_unsafe_relay_host(relay_url, self.allow_loopback).is_err()
+            {
                 continue;
             }
-            let endpoint = TransportEndpoint(relay_url.to_string());
+            let endpoint = relay_endpoint.transport_endpoint();
             if !kept.contains(&endpoint) {
                 kept.push(endpoint);
             }
@@ -185,6 +195,62 @@ impl RelaySafetyPolicy {
         kept
     }
 
+    /// Safe WebSocket-only subset for Nostr directory and KeyPackage work.
+    /// Direct FIPS delivery is intentionally limited to the Marmot transport
+    /// plane in this spike.
+    pub(crate) fn retain_safe_websocket_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        let offered = endpoints.len();
+        let kept = self
+            .retain_safe_endpoints(endpoints, context)
+            .into_iter()
+            .filter(|endpoint| {
+                matches!(
+                    NostrRelayEndpoint::parse(endpoint.as_str()),
+                    Ok(NostrRelayEndpoint::WebSocket(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        if kept.len() != offered {
+            tracing::debug!(
+                target: "marmot_app::relay_plane",
+                method = "retain_safe_websocket_endpoints",
+                context = context,
+                offered = offered,
+                kept = kept.len(),
+                "narrowed endpoints to the WebSocket-only relay plane"
+            );
+        }
+        kept
+    }
+
+    pub(crate) fn sanitize_websocket_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Result<Vec<TransportEndpoint>, String> {
+        let offered = endpoints.len();
+        let endpoints = self.sanitize_endpoints(endpoints, context)?;
+        let kept = endpoints
+            .into_iter()
+            .filter(|endpoint| {
+                matches!(
+                    NostrRelayEndpoint::parse(endpoint.as_str()),
+                    Ok(NostrRelayEndpoint::WebSocket(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        if offered > 0 && kept.is_empty() {
+            return Err(format!(
+                "{context}: operation requires at least one WebSocket relay endpoint"
+            ));
+        }
+        Ok(kept)
+    }
+
     pub(crate) fn sanitize_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -196,11 +262,13 @@ impl RelaySafetyPolicy {
             if raw.is_empty() {
                 return Err(format!("{context}: invalid relay endpoint"));
             }
-            let relay_url = RelayUrl::parse(raw)
+            let relay_endpoint = NostrRelayEndpoint::parse(raw)
                 .map_err(|err| format!("{context}: invalid relay endpoint: {err}"))?;
-            reject_unsafe_relay_host(&relay_url, self.allow_loopback)
-                .map_err(|reason| format!("{context}: {reason}"))?;
-            let endpoint = TransportEndpoint(relay_url.to_string());
+            if let NostrRelayEndpoint::WebSocket(relay_url) = &relay_endpoint {
+                reject_unsafe_relay_host(relay_url, self.allow_loopback)
+                    .map_err(|reason| format!("{context}: {reason}"))?;
+            }
+            let endpoint = relay_endpoint.transport_endpoint();
             if !sanitized.contains(&endpoint) {
                 sanitized.push(endpoint);
             }
@@ -304,6 +372,17 @@ fn is_retired_relay_host(host: &Host<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fips_endpoint() -> String {
+        let public_key = nostr::PublicKey::from_hex(
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        format!(
+            "fips://{}",
+            nostr::ToBech32::to_bech32(&public_key).unwrap()
+        )
+    }
 
     fn endpoints(urls: &[&str]) -> Vec<TransportEndpoint> {
         urls.iter()
@@ -465,6 +544,59 @@ mod tests {
                 .expect("public relay accepted");
             assert_eq!(sanitized.len(), 1);
         }
+    }
+
+    #[test]
+    fn accepts_exact_fips_node_endpoints_without_treating_them_as_hosts() {
+        let endpoint = fips_endpoint();
+        for policy in [
+            RelaySafetyPolicy::default(),
+            RelaySafetyPolicy::with_allow_loopback(true),
+        ] {
+            assert_eq!(
+                policy
+                    .sanitize_endpoints(endpoints(&[&endpoint]), "test")
+                    .unwrap(),
+                endpoints(&[&endpoint])
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_extended_fips_node_endpoints() {
+        let endpoint = fips_endpoint();
+        let policy = RelaySafetyPolicy::default();
+        for candidate in [
+            format!("{endpoint}/"),
+            format!("{endpoint}:443"),
+            format!("{endpoint}?service=relay"),
+        ] {
+            assert!(
+                policy
+                    .sanitize_endpoints(endpoints(&[&candidate]), "test")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_only_operations_drop_fips_siblings() {
+        let fips = fips_endpoint();
+        let policy = RelaySafetyPolicy::default();
+
+        let sanitized = policy
+            .sanitize_websocket_endpoints(
+                endpoints(&["wss://relay.example", &fips]),
+                "directory fetch",
+            )
+            .unwrap();
+
+        assert_eq!(sanitized, endpoints(&["wss://relay.example"]));
+        assert!(
+            policy
+                .sanitize_websocket_endpoints(endpoints(&[&fips]), "directory fetch")
+                .is_err()
+        );
     }
 
     #[test]

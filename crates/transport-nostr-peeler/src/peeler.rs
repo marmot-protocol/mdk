@@ -17,7 +17,9 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr::{EventBuilder, Keys, Kind, NostrSigner, PublicKey, RelayUrl, Tag, UnsignedEvent};
+use nostr::{
+    EventBuilder, Keys, Kind, NostrSigner, PublicKey, RelayUrl, Tag, ToBech32, UnsignedEvent,
+};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -413,9 +415,9 @@ fn rumor_single_tag_values<'a>(
 }
 
 /// Content-validate welcome `relays` values on both wrap and peel (#392):
-/// bounded count, bounded per-entry length, and well-formed ws/wss relay URLs
-/// via [`RelayUrl::parse`]. The relay strings are attacker-controlled on
-/// ingest, so error messages carry only aggregate values, never the URL.
+/// bounded count, bounded per-entry length, and well-formed ws/wss or canonical
+/// `fips://<npub>` endpoints. The relay strings are attacker-controlled on ingest,
+/// so error messages carry only aggregate values, never the URL.
 fn validate_welcome_relays(relays: &[&str]) -> Result<(), String> {
     if relays.is_empty() {
         return Err("welcome relays tag must contain at least one relay".into());
@@ -433,11 +435,33 @@ fn validate_welcome_relays(relays: &[&str]) -> Result<(), String> {
                 relay.len()
             ));
         }
-        if RelayUrl::parse(relay).is_err() {
-            return Err("welcome relay is not a valid ws/wss relay URL".into());
+        if !valid_welcome_relay(relay) {
+            return Err("welcome relay is not a valid transport endpoint".into());
         }
     }
     Ok(())
+}
+
+fn valid_welcome_relay(relay: &str) -> bool {
+    if RelayUrl::parse(relay).is_ok() {
+        return true;
+    }
+    let Some(npub) = relay.strip_prefix("fips://") else {
+        return false;
+    };
+    if npub.is_empty()
+        || !npub.starts_with("npub1")
+        || npub.bytes().any(|byte| byte.is_ascii_uppercase())
+        || npub
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b':' | b'?' | b'#' | b'@'))
+    {
+        return false;
+    }
+    PublicKey::parse(npub)
+        .ok()
+        .and_then(|key| key.to_bech32().ok())
+        .is_some_and(|canonical| canonical == npub)
 }
 
 fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {
@@ -1305,6 +1329,20 @@ mod tests {
                 relays.first(),
                 relays.len()
             );
+        }
+    }
+
+    #[test]
+    fn welcome_relay_validation_accepts_canonical_fips_endpoint_only() {
+        let node_npub = "npub1pq5w2qtanuqfu6xctrqvz6jz5adwa0qyr3wvkfw2xy6yv7fneytq49daxg";
+        assert!(validate_welcome_relays(&[&format!("fips://{node_npub}")]).is_ok());
+        for relay in [
+            format!("fips://{node_npub}:7777"),
+            format!("fips://{node_npub}/"),
+            format!("fips://{node_npub}?service=relay"),
+            "fips://relay.example".to_owned(),
+        ] {
+            assert!(validate_welcome_relays(&[&relay]).is_err());
         }
     }
 

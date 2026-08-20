@@ -7,7 +7,10 @@ use cgka_traits::{
     TransportEndpointReceipt, TransportGroupSubscription,
 };
 use tokio::sync::Notify;
-use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
+use transport_nostr_adapter::{
+    FipsRelayApi, FipsRelayApiError, FipsRelayEndpoint, FipsRelayNotification,
+    FipsRelaySubscription, NostrRelayEvent, NostrSubscription,
+};
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE, NostrPeelerError};
 
 use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
@@ -102,6 +105,107 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
         sdk.client().signer().await.is_ok(),
         "the transport client must hold a signer to answer NIP-42 AUTH"
     );
+}
+
+struct RecordingFipsRelayApi {
+    notifications: broadcast::Sender<FipsRelayNotification>,
+}
+
+impl Default for RecordingFipsRelayApi {
+    fn default() -> Self {
+        Self {
+            notifications: broadcast::channel(16).0,
+        }
+    }
+}
+
+#[async_trait]
+impl FipsRelayApi for RecordingFipsRelayApi {
+    async fn subscribe(
+        &self,
+        _endpoint: &FipsRelayEndpoint,
+        _subscription: &FipsRelaySubscription,
+    ) -> Result<(), FipsRelayApiError> {
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _endpoint: &FipsRelayEndpoint,
+        _subscription_id: &str,
+    ) -> Result<(), FipsRelayApiError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        _endpoint: &FipsRelayEndpoint,
+        _event: &NostrTransportEvent,
+    ) -> Result<(), FipsRelayApiError> {
+        Ok(())
+    }
+
+    fn notifications(&self) -> broadcast::Receiver<FipsRelayNotification> {
+        self.notifications.subscribe()
+    }
+}
+
+fn test_fips_endpoint() -> FipsRelayEndpoint {
+    use nostr::ToBech32;
+
+    let npub = nostr::Keys::generate().public_key().to_bech32().unwrap();
+    FipsRelayEndpoint::parse(&format!("fips://{npub}")).unwrap()
+}
+
+#[tokio::test]
+async fn fips_notifications_enter_the_existing_nostr_delivery_path() {
+    let api = Arc::new(RecordingFipsRelayApi::default());
+    let plane = MarmotRelayPlane::runtime_default_with_fips_api(
+        Duration::from_secs(30),
+        false,
+        api.clone(),
+    );
+    let account = MemberId::new(vec![0xA1; 32]);
+    let group_id = GroupId::new(vec![0xB2; 16]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint = test_fips_endpoint();
+    let account_adapter =
+        plane.account_adapter(account.clone(), Arc::new(RecordingRelayClient::default()));
+    account_adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.transport_endpoint()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.transport_endpoint()],
+            }],
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    api.notifications
+        .send(FipsRelayNotification::Event {
+            endpoint: endpoint.clone(),
+            subscription_id: "fips-group".to_owned(),
+            event: group_event("fips", &transport_group_id),
+        })
+        .unwrap();
+
+    let delivery = timeout(Duration::from_secs(1), account_adapter.receive())
+        .await
+        .expect("FIPS notification should be forwarded")
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.account_id, account);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+    assert_eq!(
+        delivery.source.endpoint,
+        Some(endpoint.transport_endpoint())
+    );
+
+    plane.shutdown().await;
 }
 
 #[test]
@@ -608,6 +712,7 @@ fn relay_plane_with_directory_fetcher(
     MarmotRelayPlane::from_adapter(
         Some(Duration::from_secs(30)),
         NostrTransportAdapter::new(relay),
+        None,
         None,
         None,
         directory_fetcher,

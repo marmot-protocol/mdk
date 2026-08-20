@@ -343,6 +343,7 @@ wn --account <npub-or-hex> profile update --name <name> --about <text>
 wn --account <npub-or-hex> relays list --type nip65
 wn --account <npub-or-hex> relays add <relay-url> --type inbox
 wn --account <npub-or-hex> relays remove <relay-url> --type inbox
+wn --account <npub-or-hex> relays set <relay-url>... --type inbox
 wn settings show
 wn settings theme dark
 wn settings language en
@@ -441,6 +442,50 @@ wn daemon stop
 `wn daemon status --json` includes `last_runtime_activity` for the TUI plus a redacted `relay_health` object with
 aggregate relay counts and connection status buckets. It does not include relay URLs, account ids, group ids,
 subscription ids, or message ids.
+
+### Experimental native FIPS relay transport
+
+Linux and FreeBSD builds can use Nostr delivery relays addressed as
+`fips://<relay-npub>`. The endpoint has no path or explicit port; the
+experimental adapter currently uses FIPS service port `7777`. It exchanges
+normal Nostr client/relay JSON messages over WFP1 without a WebSocket or HTTP
+handshake.
+
+For the current demo, keep discovery and initial account publication on a
+WebSocket endpoint and publish a FIPS-only inbox list. The one-second delay
+ensures the replacement kind-10050 event is newer than the account-bootstrap
+record under Nostr's second-resolution timestamps:
+
+```sh
+export WN_FIPS_SOCKET=/run/fips/api.sock
+export DISCOVERY_RELAY=wss://relay.example
+export FIPS_RELAY=fips://<relay-npub>
+
+# Create or import the account through the normal WebSocket discovery plane.
+wn --relay "$DISCOVERY_RELAY" login
+sleep 1
+wn --relay "$DISCOVERY_RELAY" --account <account-npub> \
+  relays set "$FIPS_RELAY" --type inbox
+
+# Keep discovery/default publication on WebSocket and activate FIPS delivery.
+wn daemon start \
+  --relay "$FIPS_RELAY" \
+  --discovery-relays "$DISCOVERY_RELAY" \
+  --default-account-relays "$DISCOVERY_RELAY"
+
+# Ready for a demo when FIPS is enabled and at least one endpoint is connected.
+wn relay-stats
+wn tui   # press h for the same redacted relay-health view
+```
+
+The FIPS health row is aggregate and privacy-safe. `enabled=true` means the
+native backend was injected; `active_endpoints=0` means it is idle rather than
+connected. Once the account inbox subscription is active, a ready backend
+reports at least one connected endpoint and zero reconnecting endpoints.
+
+Leaving `WN_FIPS_SOCKET` unset preserves the normal WebSocket-only runtime.
+The current spike requires a native FIPS daemon and does not run on macOS or
+Windows.
 
 When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to that
 daemon. `wn daemon status`, `wn daemon stop`, and `wn tui` handle daemon access directly.

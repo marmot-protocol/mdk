@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Experimental Linux/FreeBSD support for `fips://<npub>` Nostr delivery relay
+  endpoints. Setting `WN_FIPS_SOCKET` injects the native FIPS backend while
+  ordinary `ws://` and `wss://` endpoints continue to use the Nostr SDK.
+- `wn relays set ... --type inbox|nip65` atomically replaces one published
+  relay list. `wn relay-stats` and the TUI relay-health screen now report
+  privacy-safe FIPS backend endpoint counts for demo preflight and diagnosis.
+
 ## [0.9.14] - 2026-08-19
 
 ### Added

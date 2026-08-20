@@ -129,9 +129,12 @@ fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
             "Nostr relay URL exceeds {NOSTR_RELAY_URL_MAX_LEN} bytes"
         ));
     }
+    if relay.starts_with("fips://") {
+        return validate_fips_relay_url(relay);
+    }
     let url = Url::parse(relay).map_err(|e| format!("Nostr relay URL is invalid: {e}"))?;
     if !matches!(url.scheme(), "wss" | "ws") {
-        return Err("Nostr relay URL scheme must be wss or ws".into());
+        return Err("Nostr relay URL scheme must be wss, ws, or fips".into());
     }
     if url.host().is_none() {
         return Err("Nostr relay URL must include a host".into());
@@ -141,6 +144,34 @@ fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
     }
     if url.fragment().is_some() {
         return Err("Nostr relay URL must not include a fragment".into());
+    }
+    Ok(())
+}
+
+fn validate_fips_relay_url(relay: &str) -> Result<(), String> {
+    let npub = relay
+        .strip_prefix("fips://")
+        .ok_or_else(|| "FIPS relay URL scheme must be lowercase fips".to_owned())?;
+    if npub.is_empty()
+        || !npub.starts_with("npub1")
+        || npub.bytes().any(|byte| byte.is_ascii_uppercase())
+        || npub
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b':' | b'?' | b'#' | b'@'))
+    {
+        return Err("FIPS relay URL must be exactly fips://<node-npub>".into());
+    }
+    let (hrp, bytes) =
+        bech32::decode(npub).map_err(|_| "FIPS relay URL contains an invalid npub".to_owned())?;
+    let npub_hrp = bech32::Hrp::parse("npub")
+        .map_err(|_| "FIPS relay URL contains an invalid npub".to_owned())?;
+    if hrp != npub_hrp || bytes.len() != 32 {
+        return Err("FIPS relay URL contains an invalid npub".into());
+    }
+    let canonical = bech32::encode::<bech32::Bech32>(hrp, &bytes)
+        .map_err(|_| "FIPS relay URL contains an invalid npub".to_owned())?;
+    if canonical != npub {
+        return Err("FIPS relay URL contains a non-canonical npub".into());
     }
     Ok(())
 }

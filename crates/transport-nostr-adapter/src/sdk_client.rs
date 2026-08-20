@@ -20,7 +20,7 @@ use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
 use crate::{
     NostrEventPublishRequest, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
-    NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
+    NostrRelayEndpoint, NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -1172,16 +1172,24 @@ fn parse_endpoints(
     endpoints: &[TransportEndpoint],
     context: &str,
 ) -> Result<Vec<RelayUrl>, TransportAdapterError> {
-    endpoints
-        .iter()
-        .map(|endpoint| {
+    let mut parsed = Vec::new();
+    for endpoint in endpoints {
+        match NostrRelayEndpoint::parse(endpoint.as_str()) {
+            Ok(NostrRelayEndpoint::WebSocket(endpoint)) => parsed.push(endpoint),
+            // The hybrid client gives both backends the original subscription
+            // so its deterministic id still covers the complete endpoint set.
+            // The SDK backend must therefore ignore endpoints owned by FIPS.
+            Ok(NostrRelayEndpoint::Fips(_)) => {}
             // Neither the endpoint nor the parse error (which echoes its
             // input) may appear here: this Display reaches upper-layer logs.
-            RelayUrl::parse(endpoint.as_str()).map_err(|_| {
-                TransportAdapterError::Subscription(format!("{context}: invalid relay endpoint"))
-            })
-        })
-        .collect()
+            Err(_) => {
+                return Err(TransportAdapterError::Subscription(format!(
+                    "{context}: invalid relay endpoint"
+                )));
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 fn member_id_to_pubkey(
@@ -1295,7 +1303,7 @@ mod tests {
     use cgka_traits::engine::KeyPackage;
     use futures::{SinkExt, StreamExt};
     use nostr_relay_builder::MockRelay;
-    use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, Keys, Kind, Tag};
+    use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, Keys, Kind, Tag, ToBech32};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, advance, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
@@ -1531,6 +1539,31 @@ mod tests {
             serde_json::json!([hex::encode(&transport_group_id)])
         );
         assert_eq!(json["since"], serde_json::json!(1_700_000_000));
+    }
+
+    #[test]
+    fn sdk_subscription_plan_ignores_fips_endpoints_but_keeps_the_full_route_id() {
+        let fips = format!(
+            "fips://{}",
+            Keys::generate().public_key().to_bech32().unwrap()
+        );
+        let subscription = NostrSubscription::Group {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            group_id: cgka_traits::GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0xC3; 32],
+            endpoints: vec![
+                TransportEndpoint("wss://group.example".into()),
+                TransportEndpoint(fips),
+            ],
+            since: None,
+        };
+        let expected_subscription_id = SubscriptionId::new(subscription.subscription_id());
+
+        let plan = NostrSdkRelayClient::plan_subscription(&subscription).unwrap();
+
+        assert_eq!(plan.subscription_id, expected_subscription_id);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].to_string(), "wss://group.example");
     }
 
     fn relay(url: &str) -> RelayUrl {

@@ -11741,6 +11741,12 @@ fn parse_relay_health_reads_counters_histograms_and_per_relay() {
             "notification_forwarder_lagged_notifications": 17,
             "notification_forwarder_panics": 1,
             "notification_forwarder_unexpected_exits": 1
+        },
+        "fips": {
+            "enabled": true,
+            "active_endpoints": 2,
+            "connected_endpoints": 1,
+            "reconnecting_endpoints": 1
         }
     });
     let data = parse_relay_health(&snapshot, true);
@@ -11753,6 +11759,10 @@ fn parse_relay_health_reads_counters_histograms_and_per_relay() {
     assert_eq!(data.notification_forwarder_lagged_notifications, 17);
     assert_eq!(data.notification_forwarder_panics, 1);
     assert_eq!(data.notification_forwarder_unexpected_exits, 1);
+    assert!(data.fips_enabled);
+    assert_eq!(data.fips_active_endpoints, 2);
+    assert_eq!(data.fips_connected_endpoints, 1);
+    assert_eq!(data.fips_reconnecting_endpoints, 1);
     assert_eq!(data.observed, 5);
     assert_eq!(data.spread_samples, 4);
     // p50 of 4 samples: ceil(0.5*4)=2 falls in the first (<=50ms) bucket.
@@ -11888,6 +11898,7 @@ fn relay_health_frame_shows_redacted_summary_without_urls() {
     let data = parse_relay_health(
         &serde_json::json!({
             "health": {"total_relays": 2, "connected": 2},
+            "fips": {"enabled": true, "active_endpoints": 1, "connected_endpoints": 1, "reconnecting_endpoints": 0},
             "delivery_spread": {"per_relay": [{"relay_index": 0, "delivered_first": 1, "delivered_later": 0}], "spread": {"buckets": [], "overflow_count": 0}}
         }),
         true,
@@ -11897,6 +11908,10 @@ fn relay_health_frame_shows_redacted_summary_without_urls() {
     let rendered = rendered_buffer(&mut app);
     assert!(rendered.contains("Relay Health"), "screen title present");
     assert!(rendered.contains("health:"), "health summary present");
+    assert!(
+        rendered.contains("FIPS: enabled=true active_endpoints=1 connected=1 reconnecting=0"),
+        "FIPS readiness summary present: {rendered}"
+    );
     assert!(
         rendered.contains("relay#0"),
         "per-relay opaque index present"

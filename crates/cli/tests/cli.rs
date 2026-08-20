@@ -2429,6 +2429,29 @@ fn relays_add_fetches_remote_list_before_publishing_replaceable_event() {
 }
 
 #[test]
+fn relays_set_replaces_the_complete_inbox_list_in_one_publication() {
+    let discovery_relay = TestRelay::new();
+    let home = tempfile::tempdir().expect("tempdir");
+    let account = create_account_on_relay(home.path(), discovery_relay.url());
+    let fips_relay = "fips://npub1pq5w2qtanuqfu6xctrqvz6jz5adwa0qyr3wvkfw2xy6yv7fneytq49daxg";
+
+    // Replaceable events have second-resolution timestamps. Make the explicit
+    // demo routing update strictly newer than account bootstrap.
+    std::thread::sleep(Duration::from_secs(1));
+    let updated = run_json_with_relay(
+        home.path(),
+        discovery_relay.url(),
+        &["relays", "set", fips_relay, "--type", "inbox"],
+    );
+    assert_relay_urls(&updated, &[fips_relay]);
+
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    let persisted =
+        fetch_remote_relay_status(verify_home.path(), &account, discovery_relay.url(), "inbox");
+    assert_string_list(persisted.inbox.relays, &[fips_relay]);
+}
+
+#[test]
 fn relays_add_refuses_when_selected_relay_has_no_current_list_event() {
     let seed_relay = TestRelay::new();
     let empty_relay = TestRelay::new();

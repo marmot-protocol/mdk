@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
@@ -19,6 +20,7 @@ use marmot_app::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use transport_fips_native::{NATIVE_FIPS_SUPPORTED, NativeFipsRelayApi, NativeFipsRelayConfig};
 
 mod args;
 pub(crate) mod commands;
@@ -1006,6 +1008,11 @@ pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, WnErr
     if relay.is_empty() {
         return Err(WnError::EmptyRelayUrl);
     }
+    if relay.starts_with("fips://") {
+        return transport_nostr_adapter::FipsRelayEndpoint::parse(relay)
+            .map(|endpoint| endpoint.as_str().to_owned())
+            .map_err(|_| WnError::InvalidRelayUrl(relay.to_owned()));
+    }
     let parsed = url::Url::parse(relay).map_err(|_| WnError::InvalidRelayUrl(relay.to_owned()))?;
     let Some(host) = parsed.host() else {
         return Err(WnError::InvalidRelayUrl(relay.to_owned()));
@@ -1127,12 +1134,46 @@ fn app_for(
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
-    Ok(MarmotApp::with_relays_and_account_home_and_config(
-        home,
-        relay.into_iter().collect(),
-        account_home,
-        config,
-    ))
+    let relay_urls = relay.into_iter().collect();
+    match wn_fips_socket()? {
+        Some(socket_path) => {
+            let fips_api = Arc::new(NativeFipsRelayApi::new(NativeFipsRelayConfig::new(
+                socket_path,
+            )));
+            Ok(
+                MarmotApp::with_relays_and_account_home_and_config_and_fips_api(
+                    home,
+                    relay_urls,
+                    account_home,
+                    config,
+                    fips_api,
+                ),
+            )
+        }
+        None => Ok(MarmotApp::with_relays_and_account_home_and_config(
+            home,
+            relay_urls,
+            account_home,
+            config,
+        )),
+    }
+}
+
+fn resolve_fips_socket(value: Option<OsString>) -> Result<Option<PathBuf>, WnError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(WnError::EmptyFipsSocket);
+    }
+    if !NATIVE_FIPS_SUPPORTED {
+        return Err(WnError::UnsupportedFipsPlatform);
+    }
+    Ok(Some(PathBuf::from(value)))
+}
+
+fn wn_fips_socket() -> Result<Option<PathBuf>, WnError> {
+    resolve_fips_socket(std::env::var_os("WN_FIPS_SOCKET"))
 }
 
 fn wn_allow_loopback_blob_endpoints() -> bool {
@@ -1322,7 +1363,7 @@ mod tests {
     use super::{
         Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
         default_home_from_env, insert_chat_projection, npub_for_account_id, relay_endpoints,
-        resolve_dev_settlement_quiescence_ms, resolve_relay, run_from,
+        resolve_dev_settlement_quiescence_ms, resolve_fips_socket, resolve_relay, run_from,
     };
 
     use serde_json::json;
@@ -1416,6 +1457,7 @@ mod tests {
         RelayDeliverySpread, RelayDeliveryStats, RelayLatencyStats, RelayPlaneHealth,
         RelaySyncSnapshot, RelayTelemetrySnapshot,
     };
+    use transport_nostr_adapter::FipsRelayApiDiagnostics;
 
     fn one_sample_histogram(upper_bound_ms: u64) -> DurationHistogramSnapshot {
         DurationHistogramSnapshot {
@@ -1470,6 +1512,12 @@ mod tests {
                 connection_successes: 1,
                 ..RelayPlaneHealth::default()
             },
+            fips: FipsRelayApiDiagnostics {
+                enabled: true,
+                active_endpoints: 1,
+                connected_endpoints: 1,
+                reconnecting_endpoints: 0,
+            },
         }
     }
 
@@ -1522,6 +1570,27 @@ mod tests {
             resolve_dev_settlement_quiescence_ms(None, true).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn fips_socket_configuration_is_explicit_and_platform_gated() {
+        assert_eq!(resolve_fips_socket(None).unwrap(), None);
+
+        let empty = resolve_fips_socket(Some(OsString::new())).expect_err("empty socket path");
+        assert!(matches!(empty, WnError::EmptyFipsSocket));
+
+        let configured = resolve_fips_socket(Some(OsString::from("/run/fips/api.sock")));
+        if transport_fips_native::NATIVE_FIPS_SUPPORTED {
+            assert_eq!(
+                configured.unwrap(),
+                Some(PathBuf::from("/run/fips/api.sock"))
+            );
+        } else {
+            assert!(matches!(
+                configured.expect_err("unsupported platform"),
+                WnError::UnsupportedFipsPlatform
+            ));
+        }
     }
 
     fn test_cli(command: Command) -> Cli {
@@ -1774,6 +1843,11 @@ mod tests {
         assert!(plain.contains("first_deliverer=75%"));
         assert!(plain.contains("eose_p50=100ms"));
         assert!(
+            plain.contains(
+                "FIPS backend: enabled=true active_endpoints=1 connected=1 reconnecting=0"
+            )
+        );
+        assert!(
             !plain.contains("wss://") && !plain.contains("ws://"),
             "local relay stats must not surface relay URLs: {plain}"
         );
@@ -1789,6 +1863,8 @@ mod tests {
         );
         assert_eq!(output.json["sync"]["synced_subscriptions"], 1);
         assert_eq!(output.json["health"]["connected"], 1);
+        assert_eq!(output.json["fips"]["enabled"], true);
+        assert_eq!(output.json["fips"]["connected_endpoints"], 1);
     }
 
     #[test]
@@ -1868,7 +1944,16 @@ mod tests {
     }
 
     #[test]
-    fn relay_url_helpers_reject_malformed_or_non_websocket_urls() {
+    fn relay_url_helpers_accept_fips_and_reject_malformed_or_unsupported_urls() {
+        let node_npub = "npub1pq5w2qtanuqfu6xctrqvz6jz5adwa0qyr3wvkfw2xy6yv7fneytq49daxg";
+        assert_eq!(
+            resolve_relay(Some(format!("fips://{node_npub}"))).unwrap(),
+            Some(format!("fips://{node_npub}"))
+        );
+        assert!(matches!(
+            resolve_relay(Some(format!("fips://{node_npub}:7777"))),
+            Err(WnError::InvalidRelayUrl(_))
+        ));
         assert!(matches!(
             resolve_relay(Some("not-a-relay-url".to_owned())),
             Err(WnError::InvalidRelayUrl(value)) if value == "not-a-relay-url"

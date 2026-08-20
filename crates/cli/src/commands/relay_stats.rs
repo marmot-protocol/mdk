@@ -110,6 +110,13 @@ pub(crate) fn relay_stats_plain(snapshot: &RelayTelemetrySnapshot) -> String {
         health.connection_successes,
     ));
     lines.push(format!(
+        "FIPS backend: enabled={} active_endpoints={} connected={} reconnecting={}",
+        snapshot.fips.enabled,
+        snapshot.fips.active_endpoints,
+        snapshot.fips.connected_endpoints,
+        snapshot.fips.reconnecting_endpoints,
+    ));
+    lines.push(format!(
         "notification forwarder: running={} restarts={} lag_incidents={} lagged_notifications={} panics={} unexpected_exits={}",
         health.notification_forwarder_running,
         health.notification_forwarder_restarts,

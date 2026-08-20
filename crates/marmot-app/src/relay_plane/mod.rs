@@ -21,9 +21,10 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
-    RelayRegistrationOutcome,
+    DisabledFipsRelayApi, FipsNostrRelayClient, FipsRelayApi, FipsRelayNotification,
+    HybridNostrRelayClient, NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient,
+    NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter, RelayExportConsent,
+    RelayLabelResolution, RelayRegistrationOutcome,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -83,10 +84,12 @@ struct MarmotRelayPlaneInner {
 struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
+    fips_relay_client: Option<FipsNostrRelayClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, mpsc::Sender<TransportDelivery>>>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
+    fips_notification_forwarder: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder_health: Arc<RelayNotificationForwarderHealth>,
     shutting_down: AtomicBool,
 }
@@ -170,6 +173,22 @@ impl MarmotRelayPlane {
         Self::from_sdk(Some(subscription_rebuild_lookback), allow_loopback)
     }
 
+    /// Production-shaped relay plane with an injected direct-FIPS API.
+    ///
+    /// The default constructors install a disabled implementation that makes
+    /// no socket or network attempts.
+    pub fn runtime_default_with_fips_api(
+        subscription_rebuild_lookback: Duration,
+        allow_loopback: bool,
+        fips_api: Arc<dyn FipsRelayApi>,
+    ) -> Self {
+        Self::from_sdk_with_fips_api(
+            Some(subscription_rebuild_lookback),
+            allow_loopback,
+            fips_api,
+        )
+    }
+
     pub fn full_history() -> Self {
         Self::from_sdk(None, false)
     }
@@ -179,6 +198,14 @@ impl MarmotRelayPlane {
     /// (`MarmotAppConfig::allow_loopback_relay_endpoints`, off by default).
     pub fn full_history_with_loopback(allow_loopback: bool) -> Self {
         Self::from_sdk(None, allow_loopback)
+    }
+
+    /// Full-history relay plane with an injected direct-FIPS API.
+    pub fn full_history_with_fips_api(
+        allow_loopback: bool,
+        fips_api: Arc<dyn FipsRelayApi>,
+    ) -> Self {
+        Self::from_sdk_with_fips_api(None, allow_loopback, fips_api)
     }
 
     pub fn with_subscription_rebuild_lookback(lookback: Duration) -> Self {
@@ -203,6 +230,7 @@ impl MarmotRelayPlane {
             adapter,
             None,
             None,
+            None,
             Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
             allow_loopback,
         )
@@ -218,19 +246,36 @@ impl MarmotRelayPlane {
             NostrTransportAdapter::new(relay_client),
             None,
             None,
+            None,
             directory_fetcher,
             false,
         )
     }
 
     fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
+        Self::from_sdk_with_fips_api(
+            subscription_rebuild_lookback,
+            allow_loopback,
+            Arc::new(DisabledFipsRelayApi::default()),
+        )
+    }
+
+    fn from_sdk_with_fips_api(
+        subscription_rebuild_lookback: Option<Duration>,
+        allow_loopback: bool,
+        fips_api: Arc<dyn FipsRelayApi>,
+    ) -> Self {
         let client = NostrSdkClient::builder().build();
         let relay_client = NostrSdkRelayClient::new(client.clone());
-        let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
+        let fips_relay_client = FipsNostrRelayClient::new(fips_api);
+        let hybrid_client =
+            HybridNostrRelayClient::new(Arc::new(relay_client.clone()), fips_relay_client.clone());
+        let adapter = NostrTransportAdapter::new(Arc::new(hybrid_client));
         Self::from_adapter(
             subscription_rebuild_lookback,
             adapter,
             Some(relay_client),
+            Some(fips_relay_client),
             None,
             Arc::new(NostrSdkDirectoryRelayFetcher::new(client)),
             allow_loopback,
@@ -241,6 +286,7 @@ impl MarmotRelayPlane {
         subscription_rebuild_lookback: Option<Duration>,
         adapter: NostrTransportAdapter,
         sdk_relay_client: Option<NostrSdkRelayClient>,
+        fips_relay_client: Option<FipsNostrRelayClient>,
         notification_forwarder: Option<JoinHandle<()>>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
         allow_loopback: bool,
@@ -248,10 +294,12 @@ impl MarmotRelayPlane {
         let transport = Arc::new(RelayPlaneTransport {
             adapter,
             sdk_relay_client,
+            fips_relay_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
             router: Mutex::new(None),
             notification_forwarder: Mutex::new(notification_forwarder),
+            fips_notification_forwarder: Mutex::new(None),
             notification_forwarder_health: Arc::new(RelayNotificationForwarderHealth::default()),
             shutting_down: AtomicBool::new(false),
         });
@@ -283,6 +331,23 @@ impl MarmotRelayPlane {
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
         }
+    }
+
+    pub(crate) fn with_fips_publish_backend(
+        &self,
+        websocket_client: Arc<dyn NostrRelayClient>,
+    ) -> Arc<dyn NostrRelayClient> {
+        self.inner
+            .transport
+            .fips_relay_client
+            .as_ref()
+            .map(|fips| {
+                Arc::new(HybridNostrRelayClient::new(
+                    websocket_client.clone(),
+                    fips.clone(),
+                )) as Arc<dyn NostrRelayClient>
+            })
+            .unwrap_or(websocket_client)
     }
 
     pub(crate) fn sanitize_relay_endpoints(
@@ -417,6 +482,13 @@ impl MarmotRelayPlane {
             delivery_spread: adapter.delivery_spread().await,
             sync: adapter.relay_sync().await,
             health: self.relay_health().await,
+            fips: self
+                .inner
+                .transport
+                .fips_relay_client
+                .as_ref()
+                .map(FipsNostrRelayClient::diagnostics)
+                .unwrap_or_default(),
         }
     }
 
@@ -477,7 +549,7 @@ impl MarmotRelayPlane {
         let endpoints = self
             .inner
             .relay_safety
-            .sanitize_endpoints(endpoints, "directory fetch")?;
+            .sanitize_websocket_endpoints(endpoints, "directory fetch")?;
         self.inner
             .directory
             .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
@@ -500,6 +572,16 @@ impl MarmotRelayPlane {
             .retain_safe_endpoints(endpoints, context)
     }
 
+    pub(crate) fn retain_safe_discovered_websocket_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        self.inner
+            .relay_safety
+            .retain_safe_websocket_endpoints(endpoints, context)
+    }
+
     pub(crate) fn subscribe_directory_events(
         &self,
     ) -> broadcast::Receiver<DirectoryRelayPlaneEvent> {
@@ -516,7 +598,7 @@ impl MarmotRelayPlane {
         let endpoints = self
             .inner
             .relay_safety
-            .sanitize_endpoints(plan.endpoints, "directory subscription")?;
+            .sanitize_websocket_endpoints(plan.endpoints, "directory subscription")?;
         if plan.batches.is_empty() || endpoints.is_empty() {
             return self
                 .inner
@@ -658,6 +740,18 @@ impl MarmotRelayPlane {
             handle.abort();
             let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
         }
+        if let Some(handle) = self
+            .inner
+            .transport
+            .fips_notification_forwarder
+            .lock()
+            .await
+            .take()
+        {
+            let mut handle = handle;
+            handle.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
+        }
         self.inner
             .transport
             .notification_forwarder_health
@@ -697,6 +791,21 @@ impl MarmotRelayPlane {
                         self.inner.directory.clone(),
                     ));
                 }
+            }
+        }
+        if let Ok(mut fips_notification_forwarder) =
+            self.inner.transport.fips_notification_forwarder.try_lock()
+        {
+            let needs_forwarder = fips_notification_forwarder
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished);
+            if needs_forwarder
+                && let Some(fips_relay_client) = &self.inner.transport.fips_relay_client
+            {
+                *fips_notification_forwarder = Some(spawn_fips_notification_forwarder(
+                    fips_relay_client.clone(),
+                    self.inner.transport.clone(),
+                ));
             }
         }
         let Ok(mut router) = self.inner.transport.router.try_lock() else {
@@ -896,6 +1005,52 @@ fn spawn_relay_notification_forwarder(
         client: sdk_relay_client.client().clone(),
     });
     spawn_relay_notification_supervisor(source, transport, directory)
+}
+
+fn spawn_fips_notification_forwarder(
+    fips_relay_client: FipsNostrRelayClient,
+    transport: Arc<RelayPlaneTransport>,
+) -> JoinHandle<()> {
+    let mut notifications = fips_relay_client.notifications();
+    tokio::spawn(async move {
+        loop {
+            match notifications.recv().await {
+                Ok(FipsRelayNotification::Event {
+                    endpoint,
+                    subscription_id,
+                    event,
+                }) => {
+                    let relay_event = transport_nostr_adapter::NostrRelayEvent {
+                        endpoint: endpoint.transport_endpoint(),
+                        subscription_id: Some(subscription_id),
+                        event,
+                    };
+                    transport
+                        .adapter
+                        .observe_relay_event(relay_event.clone())
+                        .await;
+                    let _ = transport.adapter.handle_relay_event(relay_event).await;
+                }
+                Ok(FipsRelayNotification::EndOfStoredEvents {
+                    endpoint,
+                    subscription_id,
+                }) => {
+                    transport
+                        .adapter
+                        .handle_relay_eose(endpoint.transport_endpoint(), subscription_id)
+                        .await;
+                }
+                Ok(FipsRelayNotification::Shutdown) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    recover_relay_notification_forwarder(
+                        &transport,
+                        RelayNotificationConsumerExit::Lagged(skipped),
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn spawn_relay_notification_supervisor(

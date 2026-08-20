@@ -1,0 +1,36 @@
+node:
+  identity:
+    # Deterministic test-only key: scalar 2.
+    nsec: "0000000000000000000000000000000000000000000000000000000000000002"
+    persistent: false
+  leaf_only: true
+  log_level: info
+  control:
+    enabled: true
+    socket_path: /run/fips/control.sock
+  native_api:
+    enabled: true
+    socket_path: /run/fips/api.sock
+    pending_per_flow: 64
+    debug_commands: false
+
+tun:
+  enabled: false
+
+dns:
+  enabled: false
+
+transports:
+  udp:
+    bind_addr: "0.0.0.0:2121"
+    mtu: 1280
+
+peers:
+  - npub: npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d
+    alias: relay
+    addresses:
+      - transport: udp
+        addr: "relay-fips:2121"
+        priority: 1
+    connect_policy: auto_connect
+    auto_reconnect: true

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use transport_nostr_adapter::{
-    DurationHistogramSnapshot, NostrAdapterMetrics, RelayDeliverySpread, RelaySyncSnapshot,
+    DurationHistogramSnapshot, FipsRelayApiDiagnostics, NostrAdapterMetrics, RelayDeliverySpread,
+    RelaySyncSnapshot,
 };
 
 use super::RelayPlaneHealth;
@@ -24,6 +25,8 @@ pub struct RelayTelemetrySnapshot {
     pub sync: RelaySyncSnapshot,
     /// Redacted relay-pool and directory health.
     pub health: RelayPlaneHealth,
+    /// Aggregate native-FIPS backend state. Endpoint identities stay private.
+    pub fips: FipsRelayApiDiagnostics,
 }
 
 /// Export-ready rollup of device-local relay telemetry.

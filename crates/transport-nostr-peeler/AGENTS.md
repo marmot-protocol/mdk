@@ -36,7 +36,8 @@ skips content validation is a contract violation, not a style choice.
   future routing-significant tag gets the same treatment.
 - **Content-validate at extraction.** Tag values are validated before they surface: ids are hex/length-checked
   (`decode_hex_exact`), and `relays` values are count-bounded (`MAX_WELCOME_RELAYS`), length-bounded
-  (`MAX_WELCOME_RELAY_URL_LEN`), and ws/wss-scheme-validated (`RelayUrl::parse`) on both wrap and peel.
+  (`MAX_WELCOME_RELAY_URL_LEN`), and validated as canonical `ws(s)://` or `fips://<npub>` transport endpoints on
+  both wrap and peel.
 - **No self-reported identifier is trusted before verification.** `to_transport_message` verifies the event `id`
   against the recomputed NIP-01 event hash before it becomes `TransportMessage.id` (which keys routing metrics,
   telemetry, and the forensic `wire_id`); a mismatch fails closed on every ingest path, including telemetry-only

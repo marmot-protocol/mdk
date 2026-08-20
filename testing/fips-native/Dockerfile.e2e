@@ -1,0 +1,32 @@
+FROM rust:1.97.1-slim-trixie AS mdk-builder
+
+ARG FIPS_GIT_REV=9a2b85cd4f511c978de1b028d6124115f64ad7a8
+ARG WOK_GIT_REV=957d22c296e8053c7d01c80f15a3ae9b2b5f2fca
+ENV RUSTUP_TOOLCHAIN=1.97.1
+ENV CARGO_TARGET_DIR=/build/target
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        git \
+        libclang-dev \
+        libdbus-1-dev \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/mdk
+COPY . .
+RUN grep -Fq "${FIPS_GIT_REV}" Cargo.lock && \
+    grep -Fq "${WOK_GIT_REV}" Cargo.lock && \
+    cargo build --release --locked \
+        -p transport-fips-native --example relay-smoke \
+        -p wn-cli --bins
+
+FROM mdk-fips-e2e:local
+
+COPY --from=mdk-builder /build/target/release/examples/relay-smoke /usr/local/bin/mdk-fips-relay-smoke
+COPY --from=mdk-builder /build/target/release/wn /usr/local/bin/wn
+COPY --from=mdk-builder /build/target/release/wnd /usr/local/bin/wnd
+COPY testing/fips-native/mdk-cli-e2e.sh /usr/local/bin/mdk-fips-cli-e2e

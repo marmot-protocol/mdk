@@ -114,7 +114,12 @@ This repository now has the main engine candidate:
 - `crates/transport-nostr-adapter` — Nostr transport adapter core for account activation, group subscription sync,
   relay-event routing, and endpoint-level publish reports behind an injectable relay-client boundary. It also has the
   first Marmot kind `30443` KeyPackage event builder/publisher boundary, with MIP-00 metadata supplied explicitly. Its
-  optional `sdk` feature provides the first `nostr-sdk` backed relay client.
+  optional `sdk` feature provides the first `nostr-sdk` backed relay client. Scheme-aware dispatch accepts exact
+  `fips://<npub>` delivery endpoints alongside WebSocket endpoints while keeping directory discovery, KeyPackage
+  publication, and NIP-65 metadata operations on WebSocket relays.
+- `crates/transport-fips-native` — experimental Linux/FreeBSD implementation of the FIPS relay API. It owns the local
+  Unix-socket connection, WFP1 handshake/framing, one supervised flow per remote node, subscription replay, and Nostr
+  `OK` receipt matching. A disposable Docker lab verifies it against the pinned Wok relay and FIPS daemon revisions.
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` / `1059` events, kind `445` group envelope
   peeling, and NIP-59 welcome wrap/peel with injected local signer/decrypter.
 - `crates/transport-quic-stream` — raw QUIC transport binding for transient agent text stream previews over reliable
@@ -170,9 +175,10 @@ reached durable local readiness. `Publishing` includes bounded in-session retry 
   `wn` focused on command presentation and stable JSON output. The current boundary is summarized in
   [`app-core-boundary.md`](./app-core-boundary.md).
 - **Production transport adapters** — `transport-nostr-adapter` now implements the Nostr adapter core over an injectable
-  relay-client boundary, with an optional `nostr-sdk` relay client, exact stale group subscription cleanup,
-  adapter-local metrics, privacy-safe tracing, and redacted SDK relay-health summaries. The SDK owns reconnect/backoff,
-  retry interval adjustment, jitter, and relay status mechanics. The session crate now has an in-memory relay
+  relay-client boundary, with an optional `nostr-sdk` relay client and experimental native FIPS scheme dispatch, exact
+  stale group subscription cleanup, adapter-local metrics, privacy-safe tracing, and redacted SDK relay-health
+  summaries. The SDK owns WebSocket reconnect/backoff, while `transport-fips-native` owns supervised WFP1 flow
+  reconnect and receipt matching. The session crate now has an in-memory relay
   integration harness that drives NIP-59 welcomes, `marmot.transport.nostr.routing.v1`-backed kind `445` group messages,
   invite group evolution, insufficient acks, publish errors, subscription gating, duplicate delivery, reordered delivery,
   invite commit/welcome order variants, and terminal stale-epoch invite commits through the real session, adapter, and

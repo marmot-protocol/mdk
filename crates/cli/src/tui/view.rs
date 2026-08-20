@@ -1763,6 +1763,13 @@ pub(crate) fn relay_health_lines(data: &RelayHealthData) -> Vec<Line<'static>> {
             data.connection_successes,
         )),
         Line::from(format!(
+            "FIPS: enabled={} active_endpoints={} connected={} reconnecting={}",
+            data.fips_enabled,
+            data.fips_active_endpoints,
+            data.fips_connected_endpoints,
+            data.fips_reconnecting_endpoints,
+        )),
+        Line::from(format!(
             "forwarder: running={} restarts={} lag_incidents={} lagged={} panics={} unexpected_exits={}",
             data.notification_forwarder_running,
             data.notification_forwarder_restarts,

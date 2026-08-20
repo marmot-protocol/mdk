@@ -56,6 +56,10 @@ pub(crate) enum WnError {
     EmptyRelayUrl,
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(String),
+    #[error("WN_FIPS_SOCKET cannot be empty")]
+    EmptyFipsSocket,
+    #[error("WN_FIPS_SOCKET is only supported on Linux and FreeBSD")]
+    UnsupportedFipsPlatform,
     #[error(
         "relay URL is required; start the daemon with --discovery-relays and --default-account-relays, or pass setup relays for account creation"
     )]
@@ -444,6 +448,22 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
                 "login": "printf '%s\\n' \"$NSEC\" | wn login --nsec-stdin --relay <ws-or-wss-url>",
                 "daemon": "wn daemon start --discovery-relays <url> --default-account-relays <url>",
                 "account_setup": "--default-relays <ws-or-wss-url> --bootstrap-relays <ws-or-wss-url>",
+            },
+        }),
+        WnError::EmptyFipsSocket => json!({
+            "code": "empty_fips_socket",
+            "message": err.to_string(),
+            "repair": {
+                "unset": "WN_FIPS_SOCKET",
+                "example": "/run/fips/api.sock",
+            },
+        }),
+        WnError::UnsupportedFipsPlatform => json!({
+            "code": "unsupported_fips_platform",
+            "message": err.to_string(),
+            "repair": {
+                "unset": "WN_FIPS_SOCKET",
+                "supported": ["linux", "freebsd"],
             },
         }),
         WnError::MissingRelay => json!({

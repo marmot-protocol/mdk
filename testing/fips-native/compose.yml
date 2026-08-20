@@ -1,0 +1,91 @@
+name: mdk-fips
+
+x-runtime-image: &runtime-image
+  build:
+    context: ../..
+    dockerfile: testing/fips-native/Dockerfile
+    args:
+      FIPS_GIT_REV: 9a2b85cd4f511c978de1b028d6124115f64ad7a8
+      WOK_GIT_REV: 957d22c296e8053c7d01c80f15a3ae9b2b5f2fca
+  image: mdk-fips-e2e:local
+
+services:
+  relay-fips:
+    <<: *runtime-image
+    command: ["fips", "--config", "/etc/fips/relay-fips.yaml"]
+    init: true
+    volumes:
+      - relay-fips-run:/run/fips
+    networks:
+      fips-mesh:
+        aliases: [relay-fips]
+    healthcheck:
+      test: ["CMD", "fipsctl", "--socket", "/run/fips/control.sock", "show", "status"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  wok:
+    <<: *runtime-image
+    command: ["wok", "--config", "/etc/wok/wok.toml", "relay"]
+    init: true
+    depends_on:
+      relay-fips:
+        condition: service_healthy
+    volumes:
+      - relay-fips-run:/run/fips
+      - wok-data:/var/lib/wok
+    networks: [fips-mesh]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:7777/"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  client-fips:
+    <<: *runtime-image
+    command: ["fips", "--config", "/etc/fips/client-fips.yaml"]
+    init: true
+    depends_on:
+      relay-fips:
+        condition: service_healthy
+    volumes:
+      - client-fips-run:/run/fips
+    networks: [fips-mesh]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          fipsctl --socket /run/fips/control.sock show peers |
+          grep -Fq npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  smoke:
+    <<: *runtime-image
+    profiles: [test]
+    entrypoint:
+      - /usr/local/bin/mdk-fips-relay-smoke
+      - /run/fips/api.sock
+      - fips://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d
+    depends_on:
+      wok:
+        condition: service_healthy
+      client-fips:
+        condition: service_healthy
+    volumes:
+      - client-fips-run:/run/fips
+    networks: [fips-mesh]
+
+networks:
+  fips-mesh:
+    driver: bridge
+
+volumes:
+  relay-fips-run:
+  client-fips-run:
+  wok-data:

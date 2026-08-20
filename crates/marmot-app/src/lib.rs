@@ -210,8 +210,9 @@ pub use storage_sqlite::{
     select_reusable_direct_conversation,
 };
 pub use transport_nostr_adapter::{
-    DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
-    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
+    DurationHistogramSnapshot, FipsRelayApi, HistogramBucket, NostrAdapterMetrics,
+    RelayDeliverySpread, RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats,
+    RelaySyncSnapshot,
 };
 
 /// Canonical group-create result at the host response boundary.
@@ -522,6 +523,7 @@ pub struct MarmotApp {
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
+    fips_relay_api: Option<Arc<dyn FipsRelayApi>>,
     config: MarmotAppConfig,
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
@@ -1352,6 +1354,7 @@ impl MarmotApp {
             storage_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             relay_plane,
+            fips_relay_api: None,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
@@ -1425,6 +1428,7 @@ impl MarmotApp {
             relay_urls,
             account_home,
             relay_plane,
+            fips_relay_api: None,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
@@ -1452,6 +1456,32 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Experimental embedding constructor that enables direct FIPS relay
+    /// endpoints through an injected backend.
+    ///
+    /// WebSocket endpoints continue to use the normal Nostr SDK client. The
+    /// injected backend is only selected for validated `fips://<npub>` relay
+    /// endpoints.
+    #[doc(hidden)]
+    pub fn with_relays_and_account_home_and_config_and_fips_api(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+        config: MarmotAppConfig,
+        fips_api: Arc<dyn FipsRelayApi>,
+    ) -> Self {
+        let relay_plane = MarmotRelayPlane::runtime_default_with_fips_api(
+            APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
+            config.allow_loopback_relay_endpoints,
+            fips_api.clone(),
+        );
+        let mut app =
+            Self::with_relays_and_account_home_and_config(root, relay_urls, account_home, config);
+        app.relay_plane = relay_plane;
+        app.fips_relay_api = Some(fips_api);
+        app
     }
 
     /// Constructor that exclusively owns the Marmot root across processes for
@@ -1513,17 +1543,23 @@ impl MarmotApp {
             .test_relay_client
             .as_ref()
             .map(|client| MarmotRelayPlane::new(None, client.clone()))
-            .unwrap_or_else(|| {
-                MarmotRelayPlane::full_history_with_loopback(
-                    self.config.allow_loopback_relay_endpoints,
-                )
-            });
+            .unwrap_or_else(|| self.full_history_relay_plane());
         #[cfg(not(test))]
-        let relay_plane = MarmotRelayPlane::full_history_with_loopback(
-            self.config.allow_loopback_relay_endpoints,
-        );
+        let relay_plane = self.full_history_relay_plane();
         self.client_with_relay_plane(label, &relay_plane, None)
             .await
+    }
+
+    fn full_history_relay_plane(&self) -> MarmotRelayPlane {
+        match &self.fips_relay_api {
+            Some(fips_api) => MarmotRelayPlane::full_history_with_fips_api(
+                self.config.allow_loopback_relay_endpoints,
+                fips_api.clone(),
+            ),
+            None => MarmotRelayPlane::full_history_with_loopback(
+                self.config.allow_loopback_relay_endpoints,
+            ),
+        }
     }
 
     async fn runtime_local_client(
@@ -2268,11 +2304,18 @@ impl MarmotApp {
             .account_relay_list_status_for_account_id(account_id_hex)
             .map(|status| status.nip65.relays)
             .unwrap_or_default();
-        let safe = self.retain_safe_discovered_endpoints(
+        let safe = self.relay_plane.retain_safe_discovered_websocket_endpoints(
             nip65.into_iter().map(TransportEndpoint).collect(),
             "local account outbox routing",
         );
-        if safe.is_empty() { fallback } else { safe }
+        if safe.is_empty() {
+            self.relay_plane.retain_safe_discovered_websocket_endpoints(
+                fallback,
+                "local account outbox fallback",
+            )
+        } else {
+            safe
+        }
     }
 
     /// Preserve the account's existing outbox route while ensuring every
@@ -2282,6 +2325,9 @@ impl MarmotApp {
         account_id_hex: &str,
         requested: Vec<TransportEndpoint>,
     ) -> Vec<TransportEndpoint> {
+        let requested = self
+            .relay_plane
+            .retain_safe_discovered_websocket_endpoints(requested, "account metadata publication");
         let mut endpoints = self.outbox_endpoints(account_id_hex, requested.clone());
         for endpoint in requested {
             if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
@@ -3416,7 +3462,10 @@ impl MarmotApp {
             AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
 
         let publish_client =
-            self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
+            relay_plane.with_fips_publish_backend(self.websocket_relay_client_for_account_id(
+                &account.account_id_hex,
+                nostr_signer.clone(),
+            ));
         let adapter = relay_plane.account_adapter(account_id.clone(), publish_client);
 
         let key_packages = AppKeyPackagePublisher {
@@ -4759,7 +4808,7 @@ impl MarmotApp {
         // no usable NIP-65 relay. This runtime fallback is not published as a
         // replacement for the account's relay list.
         let offered = relay_lists.nip65.relays.len();
-        let safe = self.retain_safe_discovered_endpoints(
+        let safe = self.relay_plane.retain_safe_discovered_websocket_endpoints(
             relay_lists
                 .nip65
                 .relays
@@ -4772,7 +4821,7 @@ impl MarmotApp {
         if !safe.is_empty() {
             return safe;
         }
-        let fallback = self.relay_endpoints();
+        let fallback = self.websocket_relay_endpoints();
         if offered > 0 {
             tracing::warn!(
                 target: "marmot_app::relay_plane",
@@ -5344,6 +5393,13 @@ impl MarmotApp {
             .collect()
     }
 
+    fn websocket_relay_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.relay_plane.retain_safe_discovered_websocket_endpoints(
+            self.relay_endpoints(),
+            "configured WebSocket relays",
+        )
+    }
+
     fn key_package_cache_dir(&self) -> PathBuf {
         self.root.clone()
     }
@@ -5418,6 +5474,16 @@ impl MarmotApp {
     }
 
     fn relay_client_for_account_id(
+        &self,
+        account_id_hex: &str,
+        signer: Arc<dyn nostr::NostrSigner>,
+    ) -> Arc<dyn NostrRelayClient> {
+        self.relay_plane.with_fips_publish_backend(
+            self.websocket_relay_client_for_account_id(account_id_hex, signer),
+        )
+    }
+
+    fn websocket_relay_client_for_account_id(
         &self,
         account_id_hex: &str,
         signer: Arc<dyn nostr::NostrSigner>,

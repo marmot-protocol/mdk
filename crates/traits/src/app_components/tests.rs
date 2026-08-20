@@ -732,6 +732,35 @@ fn nostr_routing_rejects_invalid_relay_urls() {
 }
 
 #[test]
+fn nostr_routing_accepts_exact_fips_node_endpoints() {
+    let npub =
+        bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("npub").unwrap(), &[0x42; 32]).unwrap();
+    let relay = format!("fips://{npub}");
+
+    let routing = NostrRoutingV1::new([0x42; 32], vec![relay.clone()]).unwrap();
+
+    assert_eq!(routing.relays, vec![relay]);
+}
+
+#[test]
+fn nostr_routing_rejects_extended_fips_node_endpoints() {
+    let npub =
+        bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("npub").unwrap(), &[0x42; 32]).unwrap();
+    for relay in [
+        format!("fips://{npub}/"),
+        format!("fips://{npub}:443"),
+        format!("fips://{npub}?service=relay"),
+        format!("fips://{npub}#relay"),
+        "fips://relay.example".to_owned(),
+    ] {
+        assert!(
+            NostrRoutingV1::new([0x42; 32], vec![relay]).is_err(),
+            "extended FIPS endpoint must fail closed"
+        );
+    }
+}
+
+#[test]
 fn group_avatar_url_validity_does_not_apply_contact_safety_policy() {
     for raw in [
         "https://localhost/avatar.png",

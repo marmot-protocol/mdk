@@ -66,12 +66,21 @@ fn inbound_wire_metadata(
     }
 }
 
+mod endpoint;
+mod fips_client;
+mod hybrid_client;
 mod key_package;
 mod relay_list;
 #[cfg(feature = "sdk")]
 mod sdk_client;
 mod telemetry;
 
+pub use endpoint::{FipsRelayEndpoint, NostrRelayEndpoint, NostrRelayEndpointError};
+pub use fips_client::{
+    DisabledFipsRelayApi, FipsNostrFilter, FipsNostrRelayClient, FipsRelayApi,
+    FipsRelayApiDiagnostics, FipsRelayApiError, FipsRelayNotification, FipsRelaySubscription,
+};
+pub use hybrid_client::HybridNostrRelayClient;
 pub use key_package::{
     KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,
 };

@@ -86,6 +86,19 @@ relay-up:
 relay-smoke:
     ./scripts/wait_for_relays.sh
 
+# Linux-native WFP1 interoperability: FIPS node pair, Wok relay, and MDK's
+# semantic relay adapter in one disposable Compose project.
+fips-native-e2e:
+    bash ./scripts/test-fips-native-compose.sh
+
+# Read-only native-FIPS interoperability probe against the configured demo relay.
+fips-native-remote:
+    bash ./scripts/test-fips-native-remote.sh
+
+# Real two-account MDK CLI flow through the external native-FIPS demo relay.
+fips-native-mdk-e2e:
+    bash ./scripts/test-fips-native-mdk-compose.sh
+
 relay-down:
     docker compose down -v
 

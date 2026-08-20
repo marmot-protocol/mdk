@@ -57,7 +57,71 @@ pub(crate) async fn relays_command_with_runtime(
         RelaysCommand::Remove { url, relay_type } => {
             update_relay_list(app, runtime, account, relay, relay_type, url, false).await
         }
+        RelaysCommand::Set { urls, relay_type } => {
+            replace_relay_list(app, runtime, account, relay, relay_type, urls).await
+        }
     }
+}
+
+async fn replace_relay_list(
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    account: marmot_account::AccountSummary,
+    relay: Option<String>,
+    relay_type: String,
+    urls: Vec<String>,
+) -> Result<CommandOutput, WnError> {
+    let relay_type = normalize_relay_type(&relay_type)?;
+    let mut relays = urls
+        .into_iter()
+        .map(validate_relay_url)
+        .collect::<Result<Vec<_>, _>>()?;
+    relays.sort();
+    relays.dedup();
+    if relays.is_empty() {
+        return Err(WnError::MissingRelay);
+    }
+
+    let cached_status = app.account_relay_list_status(&account.label)?;
+    let bootstrap = relay
+        .map(validate_relay_url)
+        .transpose()?
+        .or_else(|| cached_status.bootstrap_relays.first().cloned())
+        .or_else(|| cached_status.nip65.write_relays.first().cloned())
+        .or_else(|| cached_status.nip65.relays.first().cloned())
+        .ok_or(WnError::MissingRelay)?;
+    let bootstrap_relays = vec![TransportEndpoint(bootstrap)];
+    let status = if relay_type == "nip65" {
+        let endpoints = relay_endpoints(relays.clone())?;
+        runtime
+            .publish_account_nip65_relay_set(
+                &account.label,
+                endpoints.clone(),
+                endpoints,
+                bootstrap_relays,
+            )
+            .await?
+    } else {
+        runtime
+            .publish_account_relay_list_kind(
+                &account.label,
+                &relay_type,
+                relay_endpoints(relays.clone())?,
+                bootstrap_relays,
+            )
+            .await?
+    };
+
+    Ok(CommandOutput {
+        plain: relays.join("\n"),
+        json: json!({
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex)?,
+            "relay_type": relay_type,
+            "relays": relays,
+            "relay_lists": relay_lists_json(status),
+        }),
+    })
 }
 
 async fn update_relay_list(

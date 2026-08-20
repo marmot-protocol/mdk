@@ -1,6 +1,8 @@
 use cgka_traits::{MemberId, TransportAdapterError, TransportEndpoint};
 use transport_nostr_peeler::NostrTransportEvent;
 
+use crate::{NostrRelayEndpoint, NostrRelayEndpointError};
+
 pub const KIND_NIP65_RELAY_LIST: u64 = 10_002;
 pub const KIND_MARMOT_INBOX_RELAY_LIST: u64 = 10_050;
 
@@ -113,7 +115,15 @@ impl NostrAccountRelayListPublication {
                 "account relay-list author must be a 32-byte Nostr pubkey".into(),
             ));
         }
-        if self.relays.is_empty() {
+        let relays = self
+            .relays
+            .iter()
+            .filter(|endpoint| {
+                self.list_kind == NostrAccountRelayListKind::Inbox
+                    || is_websocket_relay(endpoint).unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if relays.is_empty() {
             return Err(TransportAdapterError::Publish(
                 "account relay-list relays must not be empty".into(),
             ));
@@ -125,8 +135,7 @@ impl NostrAccountRelayListPublication {
         }
 
         let relay_tag = self.list_kind.relay_tag();
-        let tags = self
-            .relays
+        let tags = relays
             .iter()
             .map(|endpoint| vec![relay_tag.into(), endpoint.0.clone()])
             .collect::<Vec<_>>();
@@ -154,7 +163,19 @@ impl NostrNip65RelayListPublication {
                 "account relay-list author must be a 32-byte Nostr pubkey".into(),
             ));
         }
-        if self.relays.read_relays.is_empty() && self.relays.write_relays.is_empty() {
+        let read_relays = self
+            .relays
+            .read_relays
+            .iter()
+            .filter(|endpoint| is_websocket_relay(endpoint).unwrap_or(false))
+            .collect::<Vec<_>>();
+        let write_relays = self
+            .relays
+            .write_relays
+            .iter()
+            .filter(|endpoint| is_websocket_relay(endpoint).unwrap_or(false))
+            .collect::<Vec<_>>();
+        if read_relays.is_empty() && write_relays.is_empty() {
             return Err(TransportAdapterError::Publish(
                 "account relay-list relays must not be empty".into(),
             ));
@@ -166,25 +187,16 @@ impl NostrNip65RelayListPublication {
         }
 
         let mut tags = Vec::new();
-        for endpoint in &self.relays.read_relays {
-            let write = self
-                .relays
-                .write_relays
-                .iter()
-                .any(|candidate| candidate == endpoint);
+        for endpoint in &read_relays {
+            let write = write_relays.iter().any(|candidate| candidate == endpoint);
             let mut tag = vec![NIP65_RELAY_TAG.into(), endpoint.0.clone()];
             if !write {
                 tag.push("read".into());
             }
             tags.push(tag);
         }
-        for endpoint in &self.relays.write_relays {
-            if self
-                .relays
-                .read_relays
-                .iter()
-                .any(|candidate| candidate == endpoint)
-            {
+        for endpoint in &write_relays {
+            if read_relays.iter().any(|candidate| candidate == endpoint) {
                 continue;
             }
             tags.push(vec![
@@ -202,9 +214,23 @@ impl NostrNip65RelayListPublication {
     }
 }
 
+fn is_websocket_relay(endpoint: &TransportEndpoint) -> Result<bool, NostrRelayEndpointError> {
+    NostrRelayEndpoint::parse(endpoint.as_str())
+        .map(|endpoint| matches!(endpoint, NostrRelayEndpoint::WebSocket(_)))
+}
+
 #[cfg(test)]
 mod tests {
+    use nostr::{Keys, ToBech32};
+
     use super::*;
+
+    fn fips_endpoint() -> TransportEndpoint {
+        TransportEndpoint(format!(
+            "fips://{}",
+            Keys::generate().public_key().to_bech32().unwrap()
+        ))
+    }
 
     #[test]
     fn nip65_relay_list_uses_kind_10002_and_r_tags() {
@@ -234,6 +260,28 @@ mod tests {
             event.tags[0],
             vec!["relay".to_string(), "wss://relay1.example".to_string()]
         );
+    }
+
+    #[test]
+    fn fips_endpoints_are_advertised_for_inbox_but_not_nip65_outbox() {
+        let fips = fips_endpoint();
+        let websocket = TransportEndpoint("wss://relay.example".into());
+        let publication = |list_kind| NostrAccountRelayListPublication {
+            account_id: MemberId::new(vec![0x11; 32]),
+            list_kind,
+            relays: vec![websocket.clone(), fips.clone()],
+            publish_endpoints: vec![websocket.clone()],
+        };
+
+        let inbox = publication(NostrAccountRelayListKind::Inbox)
+            .to_event()
+            .unwrap();
+        let nip65 = publication(NostrAccountRelayListKind::Nip65)
+            .to_event()
+            .unwrap();
+
+        assert!(inbox.tags.iter().any(|tag| tag.get(1) == Some(&fips.0)));
+        assert!(!nip65.tags.iter().any(|tag| tag.get(1) == Some(&fips.0)));
     }
 
     #[test]

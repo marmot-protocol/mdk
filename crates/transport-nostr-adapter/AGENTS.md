@@ -21,6 +21,9 @@ for reconnect/backoff and relay status mechanics.
 | Path | Owns |
 | --- | --- |
 | `src/lib.rs` | Adapter implementation, relay-client boundary, routing state, lifecycle metrics. |
+| `src/endpoint.rs` | Scheme-aware `ws(s)://` and exact `fips://<npub>` endpoint parsing. |
+| `src/fips_client.rs` | Semantic FIPS relay API and Nostr relay-client implementation. |
+| `src/hybrid_client.rs` | Scheme dispatch across WebSocket and FIPS relay backends. |
 | `src/key_package.rs` | Marmot kind `30443` KeyPackage event building/publishing (`NostrKeyPackagePublication`, `NostrKeyPackagePublisher`). |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
@@ -33,6 +36,8 @@ for reconnect/backoff and relay status mechanics.
 - Keep `TransportDeliverySource` metadata diagnostic only; do not feed it into consensus decisions.
 - Preserve account-scoped deliveries even when group subscriptions share relay endpoints.
 - Keep real relay clients behind `NostrRelayClient`.
+- Keep Unix-socket, WFP1 framing, and native FIPS lifecycle mechanics in
+  `transport-fips-native`; this crate owns only the semantic relay boundary.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
   (`crates/marmot-app/src/relay_plane/safety.rs`); relay hosts that are non-public IP literals are rejected, and literal

@@ -38,6 +38,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
+transport-fips-native.workspace = true
+transport-nostr-adapter.workspace = true
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
 unicode-properties.workspace = true
