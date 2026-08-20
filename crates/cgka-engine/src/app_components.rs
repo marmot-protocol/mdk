@@ -1504,6 +1504,15 @@ pub(crate) fn encode_admin_policy(admins: &[[u8; 32]]) -> Result<Vec<u8>, Engine
     Ok(out)
 }
 
+/// Whether an admin-policy payload names no admin at all.
+///
+/// Bytes this cannot parse are not empty, they are malformed, and that verdict
+/// belongs to [`decode_admin_policy`] — so an unparseable payload answers
+/// `false` here and is refused there.
+pub(crate) fn admin_policy_is_empty(bytes: &[u8]) -> bool {
+    decode_quic_varint(bytes).is_ok_and(|(len, prefix_len)| len == 0 && prefix_len == bytes.len())
+}
+
 pub(crate) fn decode_admin_policy(bytes: &[u8]) -> Result<Vec<[u8; 32]>, EngineError> {
     let (len, prefix_len) = decode_quic_varint(bytes)
         .map_err(|e| EngineError::Serialize(format!("admin policy length decode failed: {e}")))?;

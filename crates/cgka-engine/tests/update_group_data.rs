@@ -1208,15 +1208,20 @@ async fn non_admin_cannot_update_admin_policy_component() {
 #[tokio::test]
 async fn invalid_admin_policy_component_is_rejected() {
     let (mut alice, _bob, gid) = create_pair().await;
-    let mut empty_admin_policy = Vec::new();
-    cgka_traits::app_components::encode_quic_varint(0, &mut empty_admin_policy);
+    // A key one byte short of 32: this payload is malformed, so the encoding
+    // verdict is the right one. An *empty* admin policy is well-formed and
+    // refused as MIP-03 §150 admin depletion instead — see
+    // `mip03_guards.rs::sole_admin_emptying_the_admin_policy_is_refused_as_admin_depletion`.
+    let mut short_key_admin_policy = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(31, &mut short_key_admin_policy);
+    short_key_admin_policy.extend_from_slice(&[0u8; 31]);
 
     let err = alice
         .send(SendIntent::UpdateAppComponents {
             group_id: gid,
             updates: vec![AppComponentData {
                 component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
-                data: empty_admin_policy,
+                data: short_key_admin_policy,
             }],
         })
         .await

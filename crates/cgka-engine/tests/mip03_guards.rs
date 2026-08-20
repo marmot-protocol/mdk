@@ -13,7 +13,10 @@ use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
-use cgka_traits::app_components::{GROUP_PROFILE_COMPONENT_ID, encode_component_vectors};
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    encode_component_vectors, encode_quic_varint,
+};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -1492,6 +1495,54 @@ async fn admin_cannot_self_remove_when_only_admin() {
             assert_eq!(gid, group_id);
         }
         other => panic!("expected AdminCannotSelfRemove, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sole_admin_emptying_the_admin_policy_is_refused_as_admin_depletion() {
+    // Self-demotion travels as an admin-policy component update, so MIP-03
+    // §150 has to hold on that route too: the sole admin's demotion leaves
+    // the group with no admin at all. The refusal is a policy verdict and must
+    // name itself as one, not as a malformed payload.
+    let mut alice = build(b"alice");
+    let mut bob = build(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "sole-admin-self-demote".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    match create {
+        SendResult::GroupCreated { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    }
+
+    let mut empty_admin_policy = Vec::new();
+    encode_quic_varint(0, &mut empty_admin_policy);
+    let err = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: empty_admin_policy,
+            }],
+        })
+        .await
+        .err()
+        .unwrap();
+    match err {
+        cgka_traits::EngineError::AdminDepletion { group_id: gid } => {
+            assert_eq!(gid, group_id);
+        }
+        other => panic!("expected AdminDepletion, got {other:?}"),
     }
 }
 

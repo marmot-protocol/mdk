@@ -3236,6 +3236,32 @@ async fn failed_leave_push_compensation_body() {
 }
 
 #[test]
+fn sole_admin_self_demote_surfaces_the_admin_policy_refusal() {
+    run_composed_app_runtime_test("sole-admin-self-demote", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("sole admin", &[]).await.unwrap();
+
+        // Alice is the only admin, so demoting herself would leave the group
+        // with none. The host must receive that as the admin-policy refusal it
+        // is, not as a payload-encoding fault.
+        let err = client.self_demote_admin(&group_id).await.err().unwrap();
+        match err {
+            AppError::Account(marmot_account::AccountError::Session(
+                cgka_session::SessionError::Engine(cgka_traits::EngineError::AdminDepletion {
+                    ..
+                }),
+            )) => {}
+            other => panic!("expected AdminDepletion, got {other:?}"),
+        }
+    });
+}
+#[test]
 fn push_registration_removal_retry_survives_clear_and_restart() {
     run_composed_app_runtime_test(
         "push-registration-removal-retry",
