@@ -9445,6 +9445,167 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     );
 }
 
+/// One effects batch carrying a resource refusal for `group_id` alongside a
+/// confirmed-but-partial publish failure: the shape the gate passes as a soft
+/// warning (mdk#428).
+fn a_refusal_riding_a_confirmed_but_partial_publish(
+    group_id: &cgka_traits::GroupId,
+) -> marmot_account::AccountDeviceEffects {
+    let message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group_id.clone(),
+            message_id: message_id.clone(),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    effects.failures.push(marmot_account::PublishFailure {
+        message_id,
+        reason: "insufficient publish acknowledgements".to_owned(),
+    });
+    effects
+        .pending
+        .push(marmot_account::PendingResolution::Confirmed {
+            pending: cgka_traits::engine_state::PendingStateRef::new(7),
+        });
+    effects
+}
+
+/// A resource refusal carried by an ordinary send must arm epoch-gap recovery
+/// even when that send's publish gate fails it.
+///
+/// The engine releases deferred-peel rows in the foreground of `do_send` and of
+/// the queued-outbound drain, so a plain send's effects can carry a
+/// `TransportObjectResourceRefused` — buffered only after its durable retention
+/// row was deleted, and delivered to the app exactly once. A gate that returned
+/// before arming dropped it for good, and no send-path observer downstream of
+/// the gate arms.
+#[tokio::test]
+async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("send arm ordering", &[]).await.unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+    let result = client.arm_recovery_then_gate_send_publish(&effects).await;
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the send"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal rides this batch only once, so it must arm before the send can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing send"
+    );
+}
+
+/// Arming ahead of the send gate must not change what the gate accepts: a
+/// confirmed-but-partial publish still passes (mdk#428), and the refusal riding
+/// it is observed all the same.
+#[tokio::test]
+async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-soft-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("send soft arm ordering", &[])
+        .await
+        .unwrap();
+
+    let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
+    let result = client.arm_recovery_then_gate_send_publish(&effects).await;
+
+    assert!(
+        result.is_ok(),
+        "a confirmed-but-partial publish must stay a soft pass on the send path"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "a refusal riding a passing batch must arm too"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave exactly one durable forensic row"
+    );
+}
+
+/// The arming gate is observation plus the unchanged publish check: for every
+/// classification it must return exactly what the bare check returns, so no
+/// caller's error path is widened or narrowed by arming ahead of it.
+#[tokio::test]
+async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://gate-parity.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("gate parity", &[]).await.unwrap();
+
+    let clean = marmot_account::AccountDeviceEffects::default();
+    let mut failure_without_pending = marmot_account::AccountDeviceEffects::default();
+    failure_without_pending
+        .failures
+        .push(marmot_account::PublishFailure {
+            message_id: cgka_traits::MessageId::new(vec![0xef; 32]),
+            reason: "relay rejected".to_owned(),
+        });
+    let batches = [
+        ("no failures", clean),
+        (
+            "rolled back",
+            a_refusal_riding_a_rolled_back_publish(&group_id),
+        ),
+        (
+            "confirmed but partial",
+            a_refusal_riding_a_confirmed_but_partial_publish(&group_id),
+        ),
+        ("failure without pending", failure_without_pending),
+    ];
+
+    for (label, effects) in batches {
+        let bare = crate::groups::fail_if_publish_failed(&effects).map_err(|err| err.to_string());
+        let armed = client
+            .arm_recovery_then_fail_if_publish_failed(&effects)
+            .map_err(|err| err.to_string());
+        assert_eq!(
+            armed, bare,
+            "arming must not change how the gate classifies a {label} publish"
+        );
+    }
+}
+
 /// An escalation recorded while an inbound delivery is ingested must ride the
 /// summary that seam returns.
 ///
