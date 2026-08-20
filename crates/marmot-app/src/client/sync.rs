@@ -1696,11 +1696,23 @@ impl AppClient {
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
-        fail_if_publish_failed(&effects)?;
-        self.remember_pending_convergence_groups(&effects);
-        self.arm_recovery_from_effects(&effects);
-        self.remember_published_reports(&effects);
-        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        self.observe_scheduled_convergence_effects(group_id, &effects)
+            .await
+    }
+
+    /// Project one scheduled convergence batch's effects, split from the
+    /// advance itself so the projection is exercisable against a given batch of
+    /// effects.
+    pub(crate) async fn observe_scheduled_convergence_effects(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
+        fail_if_publish_failed(effects)?;
+        self.remember_pending_convergence_groups(effects);
+        self.arm_recovery_from_effects(effects);
+        self.remember_published_reports(effects);
+        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         let publish_new_message_notification =
             effects.published_app_messages.iter().any(|published| {
                 let group_id_hex = hex::encode(published.group_id.as_slice());
@@ -1723,7 +1735,7 @@ impl AppClient {
         let source_received_at = unix_now_seconds();
         let routes_dirty = self
             .observe_account_device_effects(
-                &effects,
+                effects,
                 &display_names,
                 &mut summary,
                 &source_message_id_hex,
