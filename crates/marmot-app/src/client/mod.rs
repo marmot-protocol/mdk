@@ -3685,8 +3685,21 @@ impl AppClient {
 
         self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
-        fail_if_publish_failed(&effects)?;
-        self.remember_published_reports(&effects);
+        self.observe_convergence_retry_effects(group_id, &effects)
+    }
+
+    /// Project one convergence retry's effects, split from the advance itself so
+    /// the projection is exercisable against a given batch of effects.
+    pub(crate) fn observe_convergence_retry_effects(
+        &mut self,
+        group_id: &GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SendSummary, AppError> {
+        // Arm before the publish gate, for the reason spelled out in
+        // `observe_drained_session_events`.
+        self.arm_recovery_from_effects(effects);
+        fail_if_publish_failed(effects)?;
+        self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
         // finalize updates carry the pending -> delivered flip for each of them.
         // Unlike the send path — which drops the same updates because it
@@ -3694,13 +3707,13 @@ impl AppClient {
         // there is nothing here to re-emit them, so buffer them for the account
         // worker to broadcast. Dropping them leaves storage delivered while
         // every timeline and chat-list subscriber still shows pending.
-        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         self.pending_projection_updates.extend(finalize_updates);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
-        Ok(send_summary_from_effects(&effects))
+        self.queue_own_group_system_projection_updates(effects);
+        Ok(send_summary_from_effects(effects))
     }
 
     pub async fn update_group_profile(

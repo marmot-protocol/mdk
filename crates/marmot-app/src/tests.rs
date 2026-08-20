@@ -9299,6 +9299,126 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     );
 }
 
+/// One effects batch carrying both a resource refusal for `group_id` and a hard
+/// publish failure whose pending commit rolled back — the shape in which a
+/// refusal the pass does not arm on becomes unrecoverable.
+fn a_refusal_riding_a_rolled_back_publish(
+    group_id: &cgka_traits::GroupId,
+) -> marmot_account::AccountDeviceEffects {
+    let message_id = cgka_traits::MessageId::new(vec![0xab; 32]);
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group_id.clone(),
+            message_id: message_id.clone(),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    effects.failures.push(marmot_account::PublishFailure {
+        message_id,
+        reason: "injected publish failure".to_owned(),
+    });
+    effects
+        .pending
+        .push(marmot_account::PendingResolution::RolledBack {
+            pending: cgka_traits::engine_state::PendingStateRef::new(7),
+        });
+    effects
+}
+
+/// A resource refusal carried by the scheduled convergence batch must arm
+/// epoch-gap recovery even when that same pass's publish check fails it.
+///
+/// Same one-shot loss as the drained seam: this batch's events reach the app
+/// once, and the refusal was buffered only after its durable retention row was
+/// deleted. The account worker calls this seam per group, so a failing advance
+/// that returned before arming would drop the refusal for good.
+#[tokio::test]
+async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://advance-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("advance arm ordering", &[])
+        .await
+        .unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+    let result = client
+        .observe_scheduled_convergence_effects(&group_id, &effects)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the scheduled convergence pass"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal rides this batch only once, so it must arm before the pass can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing pass"
+    );
+}
+
+/// A resource refusal carried by a host-requested convergence retry must arm
+/// epoch-gap recovery even when that same pass's publish check fails it.
+///
+/// The retry seam folds and publishes exactly like the scheduled one, so it
+/// carries the same refusals under the same one-shot loss — and a host that
+/// retries a stuck group is the case where the recovery evidence matters most.
+#[tokio::test]
+async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://retry-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("retry arm ordering", &[])
+        .await
+        .unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+    let result = client.observe_convergence_retry_effects(&group_id, &effects);
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the convergence retry"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal rides this batch only once, so it must arm before the pass can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing pass"
+    );
+}
+
 /// An escalation recorded while an inbound delivery is ingested must ride the
 /// summary that seam returns.
 ///
