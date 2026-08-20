@@ -63,5 +63,6 @@ COPY --from=fips-builder /build/target/release/fips /usr/local/bin/fips
 COPY --from=fips-builder /build/target/release/fipsctl /usr/local/bin/fipsctl
 COPY testing/fips-native/demo-client-fips.yaml /usr/share/mdk-fips/demo-client-fips.yaml
 COPY testing/fips-native/benchmark.py /usr/local/bin/mdk-relay-benchmark
+COPY --chmod=0755 testing/fips-native/tui-demo.sh /usr/local/bin/mdk-fips-tui-demo
 
 ENTRYPOINT []

@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-08-19
+updated: 2026-08-20
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -117,7 +117,7 @@ This repository now has the main engine candidate:
   optional `sdk` feature provides the first `nostr-sdk` backed relay client. Scheme-aware dispatch accepts exact
   `fips://<npub>` delivery endpoints alongside WebSocket endpoints while keeping directory discovery, KeyPackage
   publication, and NIP-65 metadata operations on WebSocket relays.
-- `crates/transport-fips-native` — experimental Linux/FreeBSD implementation of the FIPS relay API. It owns the local
+- `crates/transport-fips-native` — experimental Linux/FreeBSD/macOS implementation of the FIPS relay API. It owns the local
   Unix-socket connection, WFP1 handshake/framing, one supervised flow per remote node, subscription replay, and Nostr
   `OK` receipt matching. A disposable Docker lab verifies it against the pinned Wok relay and FIPS daemon revisions.
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` / `1059` events, kind `445` group envelope

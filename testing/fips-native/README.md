@@ -44,10 +44,13 @@ inbox lists, creates and accepts a group, exchanges messages in both directions,
 checks aggregate FIPS readiness, and exercises a small benchmark round trip.
 The small in-container timing is a harness check, not benchmark evidence.
 
-Build the client-only Linux demo image with:
+Build the client-only Linux demo image using the `:local` tag expected by the
+client Compose file:
 
 ```sh
-docker build -f testing/fips-native/Dockerfile.client -t mdk-fips-client .
+docker build \
+  -f testing/fips-native/Dockerfile.client \
+  -t mdk-fips-client:local .
 ```
 
 This image contains `wn`, `wnd`, the TUI, FIPS client daemon/tools, the
@@ -67,6 +70,61 @@ benchmark results, exposes no host ports, and starts no relay:
 MDK_BUILD_ID="$(git rev-parse --short=12 HEAD)" \
   docker compose -f testing/fips-native/compose.client.yml up -d --wait
 ```
+
+### Linux TUI demo handoff
+
+For the cross-platform demo, build the exact shared branch and retain its
+commit as the image build id:
+
+```sh
+git fetch origin
+git switch codex/fips-relay-transport-spike
+git pull --ff-only
+
+docker build \
+  -f testing/fips-native/Dockerfile.client \
+  -t mdk-fips-client:local .
+
+MDK_BUILD_ID="$(git rev-parse --short=12 HEAD)" \
+  docker compose -f testing/fips-native/compose.client.yml up -d --wait
+```
+
+Prepare the persistent Linux identity, publish its FIPS-only inbox list through
+the WebSocket discovery relay, start `wnd` with the hybrid relay split, and
+print the account npub to give the Mac operator:
+
+```sh
+docker compose -f testing/fips-native/compose.client.yml exec client \
+  mdk-fips-tui-demo prepare
+```
+
+The setup is idempotent. Once the inbox list is correct, reruns retain the
+long-lived daemon and native FIPS flow instead of restarting them. Start the
+interactive TUI with:
+
+```sh
+docker compose -f testing/fips-native/compose.client.yml exec client \
+  mdk-fips-tui-demo run
+```
+
+The Mac operator creates the group using the printed Linux npub. When the
+invite arrives, press `I` in the Linux TUI and then `Enter` to accept it. Use
+`h` to inspect the privacy-safe relay-health screen. A ready client reports
+native FIPS enabled, at least one connected endpoint, and no reconnecting
+endpoint.
+
+Useful non-interactive diagnosis:
+
+```sh
+docker compose -f testing/fips-native/compose.client.yml exec client \
+  mdk-fips-tui-demo status
+docker compose -f testing/fips-native/compose.client.yml logs --tail=100 fips
+```
+
+Do not repeatedly restart the FIPS daemon during the demo. The current macOS
+native API has shown stale cross-process flow retention after short-lived
+clients; one persistent daemon and one persistent MDK runtime avoid that test
+pattern.
 
 With client-only containers running on this machine and the remote VM, stage
 fresh transport-isolated account pairs without starting measurements:

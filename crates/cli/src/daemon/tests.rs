@@ -8,6 +8,40 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[test]
+fn daemon_spawn_preserves_a_distinct_operational_relay() {
+    let mut command = std::process::Command::new("wnd");
+    let operational = "fips://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd3c4d";
+    command.arg("--home").arg("/tmp/wn-demo");
+    command.arg("--socket").arg("/tmp/wn-demo.sock");
+    append_daemon_transport_args(
+        &mut command,
+        Some(operational),
+        &["wss://discovery.example".to_owned()],
+        &["wss://account.example".to_owned()],
+    );
+
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        [
+            "--home",
+            "/tmp/wn-demo",
+            "--socket",
+            "/tmp/wn-demo.sock",
+            "--relay",
+            operational,
+            "--discovery-relays",
+            "wss://discovery.example",
+            "--default-account-relays",
+            "wss://account.example",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn daemon_stream_response_write_times_out_when_flush_stalls() {
     struct FlushStallingWriter;

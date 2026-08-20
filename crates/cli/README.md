@@ -445,7 +445,7 @@ subscription ids, or message ids.
 
 ### Experimental native FIPS relay transport
 
-Linux and FreeBSD builds can use Nostr delivery relays addressed as
+Linux, FreeBSD, and macOS builds can use Nostr delivery relays addressed as
 `fips://<relay-npub>`. The endpoint has no path or explicit port; the
 experimental adapter currently uses FIPS service port `7777`. It exchanges
 normal Nostr client/relay JSON messages over WFP1 without a WebSocket or HTTP
@@ -484,8 +484,7 @@ connected. Once the account inbox subscription is active, a ready backend
 reports at least one connected endpoint and zero reconnecting endpoints.
 
 Leaving `WN_FIPS_SOCKET` unset preserves the normal WebSocket-only runtime.
-The current spike requires a native FIPS daemon and does not run on macOS or
-Windows.
+The current spike requires a native FIPS daemon and does not run on Windows.
 
 When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to that
 daemon. `wn daemon status`, `wn daemon stop`, and `wn tui` handle daemon access directly.

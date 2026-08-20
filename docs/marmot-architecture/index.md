@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-08-19
+updated: 2026-08-20
 tags: [marmot, architecture, index]
 ---
 
@@ -224,7 +224,7 @@ These are longer working documents. Go here when you need depth, not orientation
   - **Target:** **whitenoise-core** — thin facade, per-account sessions
 
 - **Layer:** Transport
-  - **Today:** Nostr relay semantics with WebSocket SDK connections plus an experimental Linux/FreeBSD native FIPS
+  - **Today:** Nostr relay semantics with WebSocket SDK connections plus an experimental Linux/FreeBSD/macOS native FIPS
     backend for exact `fips://<npub>` delivery endpoints
   - **Target:** Stable `TransportAdapter` boundaries, scheme-dispatched relay clients, stale subscription cleanup,
     diagnostics, redacted relay health, and production hardening for each connection backend

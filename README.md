@@ -44,7 +44,7 @@ Primary implementation areas:
 - `crates/storage-sqlite` - SQLCipher-backed persistence for session, engine integration, tests, and simulator runs.
 - `crates/transport-nostr-peeler` - Nostr event to engine-message boundary and MLS envelope peeling.
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
-- `crates/transport-fips-native` - experimental Linux/FreeBSD native FIPS backend for `fips://<npub>` Nostr relays.
+- `crates/transport-fips-native` - experimental Linux/FreeBSD/macOS native FIPS backend for `fips://<npub>` Nostr relays.
 - `crates/transport-quic-stream` - raw QUIC transport binding for transient agent text stream previews.
 - `crates/transport-quic-broker` - memory-only QUIC pub/sub broker for forwarding live preview records.
 - `crates/cgka-session` - account-device session wrapper over `Engine<SqliteAccountStorage>`.

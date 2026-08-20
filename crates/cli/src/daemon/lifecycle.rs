@@ -80,6 +80,31 @@ pub fn default_log_path(home: &Path) -> PathBuf {
     home.join("dev").join("wnd.log")
 }
 
+pub(crate) fn append_daemon_transport_args(
+    command: &mut Command,
+    operational_relay: Option<&str>,
+    discovery_relays: &[String],
+    default_account_relays: &[String],
+) {
+    // `--relay` is the daemon's operational relay anchor. Keep it distinct
+    // from the discovery/default-account planes when the caller supplied all
+    // three for a hybrid transport deployment (for example native FIPS
+    // delivery with WebSocket discovery).
+    if let Some(relay) = operational_relay {
+        command.arg("--relay").arg(relay);
+    }
+    if !discovery_relays.is_empty() {
+        command
+            .arg("--discovery-relays")
+            .arg(discovery_relays.join(","));
+    }
+    if !default_account_relays.is_empty() {
+        command
+            .arg("--default-account-relays")
+            .arg(default_account_relays.join(","));
+    }
+}
+
 pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliOutput {
     match command {
         DaemonCommand::Start {
@@ -281,16 +306,12 @@ pub(crate) async fn start_daemon(
     let mut command = Command::new(executable);
     command.arg("--home").arg(home);
     command.arg("--socket").arg(socket);
-    if !discovery_relays.is_empty() {
-        command
-            .arg("--discovery-relays")
-            .arg(discovery_relays.join(","));
-    }
-    if !default_account_relays.is_empty() {
-        command
-            .arg("--default-account-relays")
-            .arg(default_account_relays.join(","));
-    }
+    append_daemon_transport_args(
+        &mut command,
+        hidden_relay.as_deref(),
+        &discovery_relays,
+        &default_account_relays,
+    );
     if let Some(secret_store) = cli.secret_store {
         command.arg("--secret-store").arg(secret_store.as_str());
     }
