@@ -59,6 +59,42 @@ private directory and mount that directory at `/etc/fips`. On first start FIPS
 generates `fips.key` and `fips.pub` beside the configuration; do not use the
 deterministic identity in `remote-client-fips.yaml` outside disposable tests.
 
+For a long-lived client-only Docker deployment, use `compose.client.yml`. It
+creates persistent volumes for the FIPS identity, MDK accounts, sockets, and
+benchmark results, exposes no host ports, and starts no relay:
+
+```sh
+MDK_BUILD_ID="$(git rev-parse --short=12 HEAD)" \
+  docker compose -f testing/fips-native/compose.client.yml up -d --wait
+```
+
+With client-only containers running on this machine and the remote VM, stage
+fresh transport-isolated account pairs without starting measurements:
+
+```sh
+python3 testing/fips-native/campaign.py preflight
+python3 testing/fips-native/campaign.py stage
+```
+
+The private manifest defaults to `/tmp/mdk-fips-campaign/manifest.json` and is
+created with mode `0600`. Run one WebSocket campaign followed by one FIPS
+campaign with the same message counts, sizes, commit sequence, and teardown:
+
+```sh
+python3 testing/fips-native/campaign.py run \
+  --lane-order websocket,fips --repeats 1 \
+  --warmups 5 --samples 50 --payload-bytes 512
+```
+
+The redacted JSONL results are written beneath
+`/tmp/mdk-fips-campaign/results`. Each lane records group creation, Welcome
+arrival and acceptance, two profile commits, application-message summaries in
+both directions, and an administrator member-removal commit. The runner
+archives the resulting local projections. It does not use SelfRemove because
+the demo group's negotiated required components do not include lifecycle
+component `0x800c`, and it does not treat a last-member leave as transport
+evidence.
+
 Run the fast benchmark-tool checks with:
 
 ```sh

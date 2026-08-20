@@ -98,8 +98,18 @@ fips-native-remote:
 
 # Fast checks for the two-host application-level relay benchmark harness.
 fips-benchmark-check:
-    python3 -m unittest testing/fips-native/test_benchmark.py
+    cd testing/fips-native && python3 -m unittest test_benchmark.py test_campaign.py
     python3 testing/fips-native/benchmark.py --help >/dev/null
+    python3 -m py_compile testing/fips-native/campaign.py
+    python3 testing/fips-native/campaign.py --help >/dev/null
+
+# Start a persistent client-only FIPS + MDK Docker environment. The image must
+# already exist locally as mdk-fips-client:local (or MDK_FIPS_CLIENT_IMAGE).
+fips-client-up:
+    MDK_BUILD_ID="$(git rev-parse --short=12 HEAD)" docker compose --file testing/fips-native/compose.client.yml up -d --wait
+
+fips-client-down:
+    docker compose --file testing/fips-native/compose.client.yml down
 
 # Real two-account MDK CLI flow through the external native-FIPS demo relay.
 fips-native-mdk-e2e:

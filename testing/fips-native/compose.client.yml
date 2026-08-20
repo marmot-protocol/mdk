@@ -1,0 +1,72 @@
+name: mdk-fips-client
+
+services:
+  fips-config-init:
+    image: ${MDK_FIPS_CLIENT_IMAGE:-mdk-fips-client:local}
+    command:
+      - sh
+      - -eu
+      - -c
+      - |
+        if [ ! -f /etc/fips/fips.yaml ]; then
+          cp /usr/share/mdk-fips/demo-client-fips.yaml /etc/fips/fips.yaml
+          chmod 0600 /etc/fips/fips.yaml
+        fi
+    volumes:
+      - fips-config:/etc/fips
+    restart: "no"
+
+  fips:
+    image: ${MDK_FIPS_CLIENT_IMAGE:-mdk-fips-client:local}
+    container_name: wn-fips-client
+    command: ["fips", "--config", "/etc/fips/fips.yaml"]
+    init: true
+    depends_on:
+      fips-config-init:
+        condition: service_completed_successfully
+    volumes:
+      - fips-config:/etc/fips
+      - fips-run:/run/fips
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          fipsctl --socket /run/fips/control.sock show peers |
+          grep -Fq npub1pq5w2qtanuqfu6xctrqvz6jz5adwa0qyr3wvkfw2xy6yv7fneytq49daxg
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  client:
+    image: ${MDK_FIPS_CLIENT_IMAGE:-mdk-fips-client:local}
+    container_name: wn-client
+    command:
+      - sh
+      - -eu
+      - -c
+      - |
+        chmod 0700 /var/lib/mdk /run/mdk /results
+        exec sleep infinity
+    init: true
+    depends_on:
+      fips:
+        condition: service_healthy
+    environment:
+      MDK_BUILD_ID: ${MDK_BUILD_ID:-unknown}
+      WN_FIPS_SOCKET: /run/fips/api.sock
+      WN_SECRET_STORE: file
+    volumes:
+      - fips-run:/run/fips
+      - client-data:/var/lib/mdk
+      - mdk-run:/run/mdk
+      - results:/results
+    restart: unless-stopped
+
+volumes:
+  fips-config:
+  fips-run:
+  client-data:
+  mdk-run:
+  results:
