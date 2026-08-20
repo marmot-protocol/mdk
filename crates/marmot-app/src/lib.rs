@@ -1507,6 +1507,34 @@ impl MarmotApp {
         Ok(app)
     }
 
+    /// Exclusive-root counterpart to
+    /// [`Self::with_relays_and_account_home_and_config_and_fips_api`].
+    ///
+    /// Host bindings use this path so enabling a native FIPS backend never
+    /// bypasses the same cross-process root lease as the default constructor.
+    #[doc(hidden)]
+    pub fn try_with_relays_and_account_home_and_config_and_fips_api(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+        config: MarmotAppConfig,
+        fips_api: Arc<dyn FipsRelayApi>,
+    ) -> Result<Self, AppError> {
+        let root = root.as_ref().to_path_buf();
+        let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        let app = Self::with_relays_and_account_home_and_config_and_fips_api(
+            &root,
+            relay_urls,
+            account_home,
+            config,
+            fips_api,
+        );
+        *app.root_runtime_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lease);
+        Ok(app)
+    }
+
     pub fn runtime(&self) -> MarmotAppRuntime {
         MarmotAppRuntime::new(self.clone())
     }

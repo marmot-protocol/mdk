@@ -16,10 +16,10 @@ tracing.workspace = true
 transport-nostr-adapter.workspace = true
 transport-nostr-peeler.workspace = true
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies]
 # WFP1's shared codec is pinned to the exact Wok interoperability revision.
 fips-message = { git = "https://github.com/erskingardner/wok.git", rev = "957d22c296e8053c7d01c80f15a3ae9b2b5f2fca" }
-fips = { git = "https://github.com/jmcorgan/fips.git", rev = "9a2b85cd4f511c978de1b028d6124115f64ad7a8" }
+fips = { git = "https://github.com/jmcorgan/fips.git", rev = "3d5fec659c7f48791634076301c4fb5864d5a70a" }
 libc.workspace = true
 rand.workspace = true
 

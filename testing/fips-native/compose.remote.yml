@@ -6,7 +6,7 @@ x-runtime-image: &runtime-image
     dockerfile: testing/fips-native/Dockerfile
     network: host
     args:
-      FIPS_GIT_REV: 9a2b85cd4f511c978de1b028d6124115f64ad7a8
+      FIPS_GIT_REV: 3d5fec659c7f48791634076301c4fb5864d5a70a
       WOK_GIT_REV: 957d22c296e8053c7d01c80f15a3ae9b2b5f2fca
   image: mdk-fips-e2e:local
 

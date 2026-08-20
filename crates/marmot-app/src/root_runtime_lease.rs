@@ -77,9 +77,12 @@ impl MarmotRootRuntimeLease {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::{MarmotApp, MarmotAppConfig};
     use marmot_account::AccountHome;
     use std::os::unix::fs::PermissionsExt;
+    use transport_nostr_adapter::DisabledFipsRelayApi;
 
     #[test]
     fn root_lease_creates_a_private_root_and_lock_file() {
@@ -201,6 +204,26 @@ mod tests {
         ));
 
         drop(clone);
+        drop(MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
+    }
+
+    #[test]
+    fn exclusive_root_fips_app_uses_the_same_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::try_with_relays_and_account_home_and_config_and_fips_api(
+            root.path(),
+            Vec::new(),
+            AccountHome::open(root.path()),
+            MarmotAppConfig::default(),
+            Arc::new(DisabledFipsRelayApi::default()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            MarmotRootRuntimeLease::try_acquire(root.path()),
+            Err(AppError::RuntimeBusy)
+        ));
+        drop(app);
         drop(MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
     }
 }

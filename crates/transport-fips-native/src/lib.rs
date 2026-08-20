@@ -9,7 +9,16 @@ use std::path::{Path, PathBuf};
 
 /// Wok's FIPS application port for the experimental relay transport.
 pub const DEFAULT_FIPS_RELAY_PORT: u16 = 7777;
-pub const NATIVE_FIPS_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "freebsd"));
+pub const NATIVE_FIPS_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+));
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+pub const DEFAULT_NATIVE_FIPS_SOCKET: &str = fips::native::client::SOCKET;
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+pub const DEFAULT_NATIVE_FIPS_SOCKET: &str = "/run/fips/api.sock";
 
 /// Configuration for the local native FIPS API connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,21 +59,24 @@ impl NativeFipsRelayConfig {
 
 impl Default for NativeFipsRelayConfig {
     fn default() -> Self {
-        Self::new("/run/fips/api.sock")
+        Self::new(DEFAULT_NATIVE_FIPS_SOCKET)
     }
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")),
+    allow(dead_code)
+)]
 mod wire;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 mod native;
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 mod unsupported;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 pub use native::NativeFipsRelayApi;
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 pub use unsupported::NativeFipsRelayApi;
 
 #[cfg(test)]
@@ -74,7 +86,7 @@ mod tests {
     #[test]
     fn default_configuration_keeps_port_out_of_endpoint_identity() {
         let config = NativeFipsRelayConfig::default();
-        assert_eq!(config.socket_path(), Path::new("/run/fips/api.sock"));
+        assert_eq!(config.socket_path(), Path::new(DEFAULT_NATIVE_FIPS_SOCKET));
         assert_eq!(config.service_port(), DEFAULT_FIPS_RELAY_PORT);
         assert!(config.clone().with_service_port(1023).is_none());
         assert_eq!(config.with_service_port(4242).unwrap().service_port(), 4242);

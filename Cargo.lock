@@ -586,7 +586,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2115,7 +2115,7 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 [[package]]
 name = "fips"
 version = "0.5.0-dev"
-source = "git+https://github.com/jmcorgan/fips.git?rev=9a2b85cd4f511c978de1b028d6124115f64ad7a8#9a2b85cd4f511c978de1b028d6124115f64ad7a8"
+source = "git+https://github.com/jmcorgan/fips.git?rev=3d5fec659c7f48791634076301c4fb5864d5a70a#3d5fec659c7f48791634076301c4fb5864d5a70a"
 dependencies = [
  "arc-swap",
  "bech32",
@@ -3094,15 +3094,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -3738,6 +3729,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "transport-fips-native",
  "uniffi",
  "zeroize",
 ]
@@ -4923,7 +4915,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

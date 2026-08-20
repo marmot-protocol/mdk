@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 async fn websocket_read_only_smoke(relay: &str) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
 
@@ -165,7 +165,7 @@ async fn websocket_read_only_smoke(relay: &str) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmokeMode {
     GroupReadOnly,
@@ -173,8 +173,8 @@ enum SmokeMode {
     InboxPublish,
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 fn main() {
-    eprintln!("the native FIPS relay smoke test is supported only on Linux and FreeBSD");
+    eprintln!("the native FIPS relay smoke test is supported only on Linux, FreeBSD, and macOS");
     std::process::exit(2);
 }

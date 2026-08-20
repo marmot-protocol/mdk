@@ -60,6 +60,10 @@ pub enum MarmotKitError {
     FollowListUnavailable,
     #[error("transport closed")]
     TransportClosed,
+    #[error("native FIPS transport is not supported on this platform")]
+    NativeFipsUnsupportedPlatform,
+    #[error("native FIPS socket path must be a non-empty absolute path")]
+    InvalidNativeFipsSocketPath,
     /// Another process or runtime owns the shared Marmot root. This is a typed,
     /// retryable/fallback signal for the iOS foreground app and NSE; neither
     /// host should open an unleased runtime after receiving it.

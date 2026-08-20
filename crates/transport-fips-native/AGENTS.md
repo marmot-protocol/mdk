@@ -4,7 +4,7 @@ Native FIPS transport for Nostr-shaped Marmot relay traffic.
 
 ## Scope
 
-- Implement `transport_nostr_adapter::FipsRelayApi` on Linux and FreeBSD.
+- Implement `transport_nostr_adapter::FipsRelayApi` on Linux, FreeBSD, and macOS.
 - Own the local FIPS Unix-socket connection, WFP1 handshake/framing,
   per-endpoint flow supervision, reconnects, and Nostr `OK` receipt matching.
 - Keep endpoint parsing and semantic Nostr relay routing in

@@ -37,6 +37,12 @@ Calling `shutdown()` stops runtime work but intentionally does not release the
 lease while the `Marmot` object or one of its runtime handles is still alive.
 Release the final object reference before constructing a replacement.
 
+On Linux, FreeBSD, and macOS, hosts that run a local FIPS daemon can use
+`Marmot.newWithNativeFips` and pass its absolute native-API socket path. The
+packaged macOS default is `/var/run/fips/api.sock`. This only changes handling
+of validated `fips://` relay endpoints; WebSocket discovery and other Nostr
+relay operations keep their normal transport.
+
 ## Service Endpoint Defaults
 
 `marmotkit-endpoints.env` sets the public build-time defaults consumed by Marmot's compiled endpoint config:

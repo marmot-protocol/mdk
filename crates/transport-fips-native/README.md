@@ -1,7 +1,7 @@
 # Native FIPS relay transport
 
 `transport-fips-native` implements MDK's semantic `FipsRelayApi` boundary on
-Linux and FreeBSD. It connects to a local FIPS daemon over its Unix socket,
+Linux, FreeBSD, and macOS. It connects to a local FIPS daemon over its Unix socket,
 opens one supervised WFP1 flow per `fips://<npub>` relay endpoint, and carries
 normal Nostr client/relay JSON messages without HTTP or WebSocket framing.
 

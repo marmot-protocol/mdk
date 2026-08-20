@@ -17,12 +17,14 @@
 //!   split by domain under [`commands`]; this module keeps construction,
 //!   lifecycle, the shared free helpers, module wiring, and the re-exports.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cgka_traits::TransportEndpoint;
 use marmot_app::{
     MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination,
 };
+use transport_fips_native::{NATIVE_FIPS_SUPPORTED, NativeFipsRelayApi, NativeFipsRelayConfig};
 
 mod commands;
 mod conversions;
@@ -128,6 +130,21 @@ pub(crate) fn optional_message_id_hex(
     Ok(Some(hex::encode(bytes)))
 }
 
+fn native_fips_socket_path(value: String) -> Result<PathBuf, MarmotKitError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(MarmotKitError::InvalidNativeFipsSocketPath);
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(MarmotKitError::InvalidNativeFipsSocketPath);
+    }
+    if !NATIVE_FIPS_SUPPORTED {
+        return Err(MarmotKitError::NativeFipsUnsupportedPlatform);
+    }
+    Ok(path)
+}
+
 pub(crate) fn timeline_query_from_ffi(
     query: TimelineMessageQueryFfi,
 ) -> Result<TimelineMessageQuery, MarmotKitError> {
@@ -169,6 +186,34 @@ impl Marmot {
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
         Self::open(root_path, relay_urls, MarmotAppConfig::default())
+    }
+
+    /// Open Marmot with native FIPS handling for validated `fips://` relay
+    /// endpoints. WebSocket relays continue to use the normal Nostr SDK path.
+    ///
+    /// `fips_socket_path` names the local FIPS daemon API socket. On packaged
+    /// macOS installations this is normally `/var/run/fips/api.sock`.
+    #[uniffi::constructor]
+    pub fn new_with_native_fips(
+        root_path: String,
+        relay_urls: Vec<String>,
+        fips_socket_path: String,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        let socket_path = native_fips_socket_path(fips_socket_path)?;
+        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
+            .map_err(marmot_app::AppError::from)?;
+        let fips_api = Arc::new(NativeFipsRelayApi::new(NativeFipsRelayConfig::new(
+            socket_path,
+        )));
+        let app = MarmotApp::try_with_relays_and_account_home_and_config_and_fips_api(
+            &root_path,
+            relay_urls,
+            account_home,
+            MarmotAppConfig::default(),
+            fips_api,
+        )?;
+        let runtime = app.runtime();
+        Ok(Arc::new(Self { app, runtime }))
     }
 
     /// Open the Marmot app with an explicit durable transport-cursor policy.
@@ -313,6 +358,24 @@ mod tests {
             Some("ab".repeat(32))
         );
         assert!(optional_message_id_hex(Some("abcd".into())).is_err());
+    }
+
+    #[test]
+    fn native_fips_socket_requires_an_absolute_path() {
+        assert!(matches!(
+            native_fips_socket_path(String::new()),
+            Err(MarmotKitError::InvalidNativeFipsSocketPath)
+        ));
+        assert!(matches!(
+            native_fips_socket_path("relative/api.sock".to_owned()),
+            Err(MarmotKitError::InvalidNativeFipsSocketPath)
+        ));
+        if NATIVE_FIPS_SUPPORTED {
+            assert_eq!(
+                native_fips_socket_path(" /var/run/fips/api.sock ".to_owned()).unwrap(),
+                PathBuf::from("/var/run/fips/api.sock")
+            );
+        }
     }
 
     #[test]
