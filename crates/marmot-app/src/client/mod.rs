@@ -1865,6 +1865,24 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// The same, for the account worker: timed like every other invite, and leaving Welcome
+    /// delivery to the worker's own fanout rather than driving it inline.
+    pub(crate) async fn invite_key_packages_with_telemetry(
+        &mut self,
+        group_id: &GroupId,
+        key_packages: Vec<KeyPackage>,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<SendSummary, AppError> {
+        self.invite_members_with_optional_telemetry(
+            group_id,
+            &[],
+            &[],
+            Some(telemetry),
+            Some(key_packages),
+        )
+        .await
+    }
+
     async fn invite_members_with_optional_telemetry(
         &mut self,
         group_id: &GroupId,

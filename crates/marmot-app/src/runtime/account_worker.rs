@@ -3018,8 +3018,17 @@ async fn handle_account_worker_command(
             key_packages,
             respond,
         } => {
-            let result = client.invite_key_packages(&group_id, key_packages).await;
-            if result.is_ok() {
+            let telemetry = shared.app_performance_telemetry();
+            let result = client
+                .invite_key_packages_with_telemetry(&group_id, key_packages, &telemetry)
+                .await;
+            // A queued send returns `Ok` without having been published, and announcing group
+            // state for one would be announcing something that has not happened. The sibling
+            // arm below draws the line in the same place.
+            let canonical = result.as_ref().is_ok_and(|summary| {
+                summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+            });
+            if canonical {
                 publish_client_pending_projection_updates(
                     client,
                     events,

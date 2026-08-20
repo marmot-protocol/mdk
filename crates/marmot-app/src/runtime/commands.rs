@@ -1629,8 +1629,9 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_after_committed_mutation("invite_key_packages")
-            .await;
+        // Detached, like the other invite: the caller has its answer, and the account-wide
+        // catch-up that follows an invite is not something to hold them for.
+        self.spawn_invite_catch_up();
         self.schedule_audit_log_tracker_update("invite_key_packages");
         Ok(summary)
     }
