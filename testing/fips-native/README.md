@@ -44,6 +44,21 @@ inbox lists, creates and accepts a group, exchanges messages in both directions,
 checks aggregate FIPS readiness, and exercises a small benchmark round trip.
 The small in-container timing is a harness check, not benchmark evidence.
 
+Build the client-only Linux demo image with:
+
+```sh
+docker build -f testing/fips-native/Dockerfile.client -t mdk-fips-client .
+```
+
+This image contains `wn`, `wnd`, the TUI, FIPS client daemon/tools, the
+read-only relay smoke check, and the benchmark harness. It does not contain or
+run Wok; the relay remains on the remote relay host.
+
+For a persistent demo client, copy `demo-client-fips.yaml` into a writable,
+private directory and mount that directory at `/etc/fips`. On first start FIPS
+generates `fips.key` and `fips.pub` beside the configuration; do not use the
+deterministic identity in `remote-client-fips.yaml` outside disposable tests.
+
 Run the fast benchmark-tool checks with:
 
 ```sh
