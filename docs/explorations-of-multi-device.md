@@ -2,7 +2,7 @@
 
 Status: exploratory and non-normative.
 
-Last updated: 2026-07-30.
+Last updated: 2026-08-20.
 
 This document preserves the current design discussion around multi-device Marmot accounts. It is an architecture
 exploration, not an interoperability specification. If any of these ideas become protocol behavior, the normative
@@ -18,6 +18,110 @@ The main conclusion so far is that "multi-device" contains several separate prob
 These problems can share one user-facing workflow without sharing one protocol mechanism. In particular, content
 sync should not be implemented by copying live MLS state between devices.
 
+## Agreed working baseline
+
+The following decisions are the current working baseline for a possible first version. They remain non-normative
+until matching protocol text is adopted in `marmot-protocol/marmot`.
+
+### Same-account admission
+
+- A new, separately assigned `marmot.same-account-add.v1` capability gates the behavior. It does not reuse the
+  earlier draft's `marmot.multi-device.v1` identifier or semantics.
+- Every current member advertises support, and the GroupContext explicitly enables and requires the capability.
+  Creating a group may enable it only when all initial members support it; enabling it in an existing group requires
+  the ordinary administrator-authorized capability-upgrade flow.
+- A non-administrator may commit one to four inline `Add` proposals when every added KeyPackage has a valid
+  `marmot.member.account-identity-proof.v2` and every added credential identity exactly equals the committer's
+  MLS-authenticated account identity.
+- The Commit may contain no referenced proposals or other proposal types. Its normal MLS UpdatePath is required and
+  permitted. Standalone Add proposals remain administrator-only.
+- The resulting group may contain at most five current leaves for one account, including the sponsoring leaf. This
+  resulting-state limit applies regardless of whether an administrator or same-account member authored the Add.
+- The KeyPackages and leaf signature keys added by one Commit must be distinct and must not duplicate a current leaf.
+- A valid same-account Add has ordinary rather than administrator-privileged convergence priority.
+
+An account-identity proof establishes account-key authorization of a leaf signature key, not a human identity. The
+authorization chain is the combination of a current member's MLS-authenticated control of a leaf, the new leaf's
+account-key proof, exact equality of their account identities, and the current member's signature over the Commit.
+
+### Welcome validation
+
+The joining device recognizes two distinct authorization paths: the existing administrator invitation path and the
+negotiated same-account path. For the same-account path, it requires:
+
+- the exact KeyPackage created for the active pairing session;
+- the expected MLS group id and sponsor account from the authenticated pairing manifest;
+- `marmot.same-account-add.v1` enabled and required in the joined GroupContext;
+- a current, non-blank GroupInfo signer whose validated account identity equals the joining leaf's identity;
+- valid account-identity proofs on the sponsor and joining leaves; and
+- no more than five resulting leaves for that account.
+
+The receiver records which authorization path succeeded and does not silently fall back from a failed same-account
+check unless the GroupInfo signer independently qualifies as an active administrator. A Welcome receiver cannot
+reconstruct the candidate parent and revalidate the inline-Add-only Commit shape. Existing members validate that
+candidate-parent rule; the joining device validates the authenticated pairing intent and resulting group state.
+
+### Pairing and enrollment
+
+- One new device initiates a short-lived, single-use pairing session. Its QR descriptor contains a version, random
+  session id, ephemeral X25519 public key, account public key, expiry, rendezvous hints, and an account signature. It
+  contains no group graph, KeyPackages, or MLS secrets.
+- The QR lifetime defaults to two minutes and MUST NOT exceed five minutes. An expired descriptor is replaced rather
+  than extended.
+- The scanning device verifies the descriptor against its own account, asks for explicit approval, contributes a
+  signed ephemeral key, and derives a transcript-bound encrypted channel. A separate visual short-authentication
+  string is not required for the first version.
+- The existing device sends an encrypted eligibility catalog. The user selects a bounded set of groups, and the new
+  device creates one fresh, group-bound KeyPackage for each selection.
+- Enrollment is a durable per-group operation, not one cross-group transaction. The implementation records intent,
+  stages and publishes the Commit under publish-before-apply, delivers the Welcome redundantly, validates the join,
+  and records an authenticated acknowledgement.
+- Progress distinguishes pending, Commit published, Welcome delivered, joined, retryable failure, terminal failure,
+  and skipped. Lost acknowledgement retries the same Welcome rather than another Add. A Commit that loses
+  convergence restarts from canonical state with a fresh KeyPackage.
+- Pairing channel keys may remain memory-only. Durable progress survives restart, but continuing unfinished work
+  requires a newly authenticated pairing session that first reconciles already-completed membership.
+
+### Same-account removal
+
+- A separately negotiated `marmot.same-account-remove.v1` capability permits a non-administrator to commit one to
+  four inline `Remove` proposals targeting current sibling leaves with the committer's exact account identity.
+- The committer cannot target its own leaf; SelfRemove remains the self-departure path. The Commit contains no
+  referenced proposals or other proposal types, carries the normal UpdatePath, and has ordinary convergence priority.
+- Every current leaf has reciprocal authority to remove its own siblings. This deliberately accepts that compromise
+  of one current device can cause denial of service by removing other devices.
+- The protocol operation is scoped to one group. There is no first-version cross-group tombstone, atomic "remove this
+  device everywhere" operation, or claim of global completion.
+- Pairing may maintain a private device identifier and per-group leaf mapping for local presentation. That mapping is
+  not protocol authority and does not appear in public KeyPackages or MLS credentials. Any later bulk-removal UX is a
+  best-effort orchestrator over independently evidenced per-group results.
+
+### Initial invitation
+
+- When an account is not represented in a group, an administrator selects exactly one valid, compatible KeyPackage
+  using the existing deterministic candidate-ranking rules and admits one initial leaf.
+- Public KeyPackage publication-slot `d` tags remain opaque and are not physical device identifiers. Discovery never
+  fans out automatically across every apparently valid KeyPackage.
+- After admission, that account uses the negotiated same-account Add path to enroll siblings.
+- Ambiguous Welcome delivery retries the same Welcome. It does not trigger an automatic Add for another KeyPackage.
+  Replacing an unreachable initial leaf requires an explicit administrator removal followed by a new invitation with
+  a fresh KeyPackage.
+
+### Optional history bootstrap
+
+Content bootstrap is not required for multi-device v1 interoperability or for a pairing operation to succeed. It is
+an optional companion that may be omitted from the first implementation.
+
+If implemented, it is an explicitly selected, one-time direct transfer of accepted, locally retained application
+history over the authenticated pairing channel. It uses stable record ids, a typed versioned envelope, a per-group
+high-water mark, chunk hashes, and a final completion manifest. Imported records retain provenance and are represented
+as account-synchronized history, not as freshly MLS-verified traffic.
+
+The transfer never includes a SQLCipher database, OpenMLS state, current or historical epoch secrets, sender
+ratchets, KeyPackage private keys, pending operations, or unaccepted raw input. Continuous synchronization, CRDT
+conflict resolution, asynchronous journals, cloud or relay backup, sync-key rotation, and cross-device presentation
+state remain separate future work.
+
 ## Candidate direction
 
 The most promising near-term design is:
@@ -28,9 +132,9 @@ The most promising near-term design is:
   administrator;
 - a short-lived, encrypted pairing session coordinates additions across a selected set of groups;
 - an inviter from another account normally admits one device, after which that device can add its siblings;
-- accepted content and private application state use a separate typed synchronization journal;
-- initial history transfer happens directly during pairing, with asynchronous journals and encrypted checkpoints
-  added later;
+- accepted content and private application state, if synchronized, use a separate typed record format;
+- optional initial history transfer may happen directly during pairing, while continuous synchronization remains a
+  separate future design;
 - P2Panda remains a promising possible implementation of the journal and replication layer, rather than a
   replacement for MLS group membership.
 
@@ -428,14 +532,20 @@ is unlikely to be a good interoperable baseline or a complete live-sync system.
 
 ## 8. Suggested incremental path
 
-### Phase 1: pairing and direct bootstrap
+### Phase 1: pairing and enrollment
 
 - specify the same-account Add authorization rule and capability negotiation;
 - define the pairing descriptor and encrypted session;
 - implement per-group KeyPackage generation and durable batch enrollment;
-- define a typed account-sync journal and snapshot envelope;
-- transfer an encrypted snapshot and journal tail directly; and
-- preserve provenance while excluding all live MLS state.
+- specify same-account per-group removal; and
+- preserve exact per-group publication, Welcome, join, and failure evidence.
+
+### Optional companion: direct history bootstrap
+
+- define a typed snapshot envelope without making it a multi-device interoperability requirement;
+- transfer only accepted, locally retained history over the authenticated pairing channel;
+- preserve provenance while excluding all live MLS state; and
+- allow implementations to omit this companion without blocking enrollment or future messaging.
 
 ### Phase 2: asynchronous continuity
 
