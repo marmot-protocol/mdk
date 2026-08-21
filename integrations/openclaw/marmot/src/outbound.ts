@@ -28,6 +28,7 @@ import { readLocalFileFromRoots } from "openclaw/plugin-sdk/infra-runtime";
 import { getDefaultLocalRoots, LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 
 import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
+import { deriveDurableFinalIdempotency } from "./durable-final-idempotency.js";
 import { markMarmotOutboundSent } from "./runtime-state.js";
 
 /** Marmot send target resolved from OpenClaw config + the inbound chat id. */
@@ -338,11 +339,26 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
     send: {
       text: async (ctx: ChannelMessageSendTextContext) => {
         const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
+        const durableIntentId = ctx.deliveryQueueId;
+        if (!durableIntentId) {
+          throw new Error(
+            "marmot: durable final send requires OpenClaw deliveryQueueId for idempotency",
+          );
+        }
+        const { idempotencyKey } = deriveDurableFinalIdempotency({
+          sessionBinding: `openclaw:marmot:${marmotAccountIdHex.toLowerCase()}:${ctx.to.toLowerCase()}`,
+          turnBinding: durableIntentId,
+          accountIdHex: marmotAccountIdHex,
+          groupIdHex: ctx.to,
+          replyToMessageIdHex: ctx.replyToId ?? null,
+          text: ctx.text,
+        });
         const response = await client.sendFinal(
           marmotAccountIdHex,
           ctx.to,
           ctx.text,
           ctx.replyToId ?? null,
+          idempotencyKey,
         );
         sentTargets.recordAll(response.message_ids_hex, {
           marmotAccountIdHex,
