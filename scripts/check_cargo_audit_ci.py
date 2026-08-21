@@ -41,8 +41,10 @@ def validate(workflow_path: Path, audit_config_path: Path) -> None:
 
     if "uses: actions/checkout@" not in job:
         raise PolicyError("rust-audit job must check out the repository")
-    if "tool: cargo-audit@" not in job:
-        raise PolicyError("rust-audit job must install a pinned cargo-audit release")
+    if "rustup toolchain install" not in job or "cargo --version" not in job:
+        raise PolicyError("rust-audit job must install and activate the repository Rust toolchain")
+    if "tool: cargo-audit@0.22.1" not in job:
+        raise PolicyError("rust-audit job must install cargo-audit@0.22.1")
     if re.search(r"(?m)^\s*continue-on-error:\s*true\s*$", job):
         raise PolicyError("rust-audit job must not use continue-on-error")
     if re.search(r"(?m)^\s*working-directory:", job):

@@ -27,16 +27,25 @@ import sys
 
 version = sys.argv[1]
 quickstart = Path("integrations/README.md").read_text(encoding="utf-8")
-for connector in ("hermes", "openclaw", "codex", "opencode", "pi"):
-    url = (
-        "https://github.com/marmot-protocol/mdk/releases/download/"
-        f"wn-agent-v{version}/install-{connector}-marmot.sh"
+base_url = (
+    "https://github.com/marmot-protocol/mdk/releases/download/"
+    f"wn-agent-v{version}"
+)
+if quickstart.count(f'base_url="{base_url}"') != 1:
+    print(
+        "error: integrations/README.md must define exactly one immutable current-release base_url "
+        f"({base_url})",
+        file=sys.stderr,
     )
-    block = f"```sh\ncurl -fsSL {url} | bash\n```"
-    if quickstart.count(block) != 1:
+    raise SystemExit(1)
+for connector in ("hermes", "openclaw", "codex", "opencode", "pi"):
+    installer = f"install-{connector}-marmot.sh"
+    call = f'install_verified "$base_url/{installer}"'
+    checksum = f'"$base_url/{installer}.sha256"'
+    if quickstart.count(call) < 1 or quickstart.count(checksum) < 1:
         print(
-            "error: integrations/README.md must contain exactly one copy-pasteable "
-            f"one-line sh block for the current {connector} installer ({url})",
+            "error: integrations/README.md must verify the current "
+            f"{connector} installer against its companion checksum before execution",
             file=sys.stderr,
         )
         raise SystemExit(1)

@@ -28,6 +28,20 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(PolicyError, message):
                 validate(mutated, AUDIT_CONFIG)
 
+    def test_rejects_missing_rust_toolchain_setup(self) -> None:
+        self.assert_mutation_rejected(
+            '          rustup toolchain install "$toolchain" --profile minimal\n',
+            "",
+            "repository Rust toolchain",
+        )
+
+    def test_rejects_changed_cargo_audit_pin(self) -> None:
+        self.assert_mutation_rejected(
+            "tool: cargo-audit@0.22.1",
+            "tool: cargo-audit@latest",
+            "cargo-audit@0.22.1",
+        )
+
     def test_rejects_unlocked_or_bypassed_audit_command(self) -> None:
         self.assert_mutation_rejected(
             "run: cargo --locked audit",

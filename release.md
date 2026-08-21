@@ -341,28 +341,51 @@ Each binary/plugin tarball carries a `manifest.json` recording the release tag, 
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
 The installer assets are generated during the release and default to their own immutable `wn-agent-v<version>` release
-tag and `<version>` asset suffix. The historical `wn-agent-latest` release is immutable and is not an authoritative
-update channel. User-facing commands must name a versioned release. For the current release:
+tag and `<version>` asset suffix. A verified install for the current workspace release looks like:
 
 ```sh
+set -eu
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+
+install_verified() (
+  set -eu
+  installer_url="$1"
+  checksum_url="$2"
+  shift 2
+  installer_script="${installer_url##*/}"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
+  elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
+  else
+    echo "error: need shasum or sha256sum to verify the installer" >&2
+    exit 1
+  fi
+  bash "$tmpdir/$installer_script" "$@"
+)
+
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | bash
+install_verified "$base_url/install-hermes-marmot.sh" "$base_url/install-hermes-marmot.sh.sha256"
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh | bash
+install_verified "$base_url/install-openclaw-marmot.sh" "$base_url/install-openclaw-marmot.sh.sha256"
 # Codex terminal harness
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh | bash
+install_verified "$base_url/install-codex-marmot.sh" "$base_url/install-codex-marmot.sh.sha256"
 # OpenCode terminal harness
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-opencode-marmot.sh | bash
+install_verified "$base_url/install-opencode-marmot.sh" "$base_url/install-opencode-marmot.sh.sha256"
 # Pi terminal harness
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-pi-marmot.sh | bash
+install_verified "$base_url/install-pi-marmot.sh" "$base_url/install-pi-marmot.sh.sha256"
 ```
 
-Update this section as part of a deliberate release-version bump. Use the exact version from the installed connector
-when reporting bugs.
+Change the immutable `wn-agent-v<version>` release URL when you need to pin a different release for repeatable testing or
+bug reports. Keep each installer URL paired with its sibling `.sha256` URL and execute only the verified local copy.
 
-These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin or
-harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific Marmot
-agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
+These verified installers perform full setup by default: they install `wn-agent`, install/enable the matching gateway
+plugin or harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific
+Marmot agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
 `--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
 partial/manual install. Terminal-harness installers also accept the matching
 `--no-start-wn-codex` or `--no-start-wn-pi` option.
