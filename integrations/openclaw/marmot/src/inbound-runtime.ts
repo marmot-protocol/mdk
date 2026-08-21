@@ -476,6 +476,11 @@ export interface SyncAllowlistOptions {
  * Mirror the configured `dm.allowFrom` welcomers into wn-agent's allowlist for
  * the resolved account. No-op when no allow-from is configured, so a bare
  * deployment does not wipe an allowlist managed directly on wn-agent.
+ *
+ * Startup stays best-effort — a wn-agent that cannot be reconciled must not
+ * block inbound dispatch — so failures surface as warnings rather than a throw.
+ * A failed revocation gets its own warning: it is the one outcome that leaves
+ * the account more permissive than the operator asked for.
  */
 export async function syncMarmotAllowlist(
   api: InboundPluginApi,
@@ -489,8 +494,21 @@ export async function syncMarmotAllowlist(
     const client = (options.clientFactory ?? clientForAccount)(resolved);
     const accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
     const result = await syncAllowlist(client, accountIdHex, resolved.allowFrom);
-    api.logger.info(
-      `marmot: welcomer allowlist synced (added ${result.added.length}, removed ${result.removed.length})`,
+    if (result.failedRemovals.length > 0) {
+      // Fail-open risk: those welcomers stay authorized on the shared account
+      // until the next successful sync, so never let it read as a clean start.
+      api.logger.warn(
+        `marmot: welcomer allowlist revocation failed for ${result.failedRemovals.length} entries; they remain authorized on wn-agent`,
+      );
+    }
+    if (result.verified) {
+      api.logger.info(
+        `marmot: welcomer allowlist synced (added ${result.added.length}, removed ${result.removed.length})`,
+      );
+      return;
+    }
+    api.logger.warn(
+      `marmot: welcomer allowlist not reconciled (added ${result.added.length}, removed ${result.removed.length}, failed ${result.failedAdds.length + result.failedRemovals.length})`,
     );
   } catch {
     // Best-effort on startup: account/config resolution or the sync itself can
