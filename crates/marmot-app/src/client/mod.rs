@@ -678,8 +678,38 @@ impl AppClient {
             return Ok(maintenance_run_summary_from_account(summary));
         }
         let effects = self.runtime.run_due_maintenance().await?;
-        self.queue_own_group_system_projection_updates(&effects);
-        let summary = self.runtime.maintenance_run_summary(&effects)?;
+        self.observe_recovery_evidence_then_summarize_maintenance(&effects)
+    }
+
+    /// Observe one maintenance tick's recovery evidence, then summarize the
+    /// tick — split from the tick itself so the pair is exercisable against a
+    /// given batch of effects.
+    ///
+    /// A maintenance tick publishes: it drains a recovered staged evolution and
+    /// confirms it, so this batch can carry an `EpochChanged` for a group the
+    /// stall detector is tracking. That passage is one-shot in these effects and
+    /// reaches the detector nowhere else — a tick's own recovery is invisible to
+    /// every delivery-driven seam.
+    ///
+    /// Hence the order the name states, and the reason this is one function
+    /// rather than two calls at the seam: the summary build reads storage and so
+    /// can return early, and an `Err` reached before the observation would drop
+    /// that passage for good. It is the same hazard
+    /// [`Self::observe_recovery_evidence_then_fail_if_publish_failed`] exists
+    /// for, and it gets the same answer — a name that fixes the order.
+    ///
+    /// A tick can also *arm*, from a `TransportObjectResourceRefused` riding the
+    /// same batch. Nothing executes that arm here: the worker does not run the
+    /// pending backfill after a tick, so the intent waits for the next
+    /// delivery-driven seam to drain it. The arm and its audit row are durable
+    /// meanwhile, so the wait costs latency, not the recovery.
+    pub(crate) fn observe_recovery_evidence_then_summarize_maintenance(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
+        self.observe_recovery_evidence(effects);
+        self.queue_own_group_system_projection_updates(effects);
+        let summary = self.runtime.maintenance_run_summary(effects)?;
         Ok(maintenance_run_summary_from_account(summary))
     }
 
@@ -2010,7 +2040,7 @@ impl AppClient {
             // previously sat in a combinator closure that could not reach
             // `&mut self`.
             Ok(effects) => self
-                .arm_recovery_then_fail_if_publish_failed(&effects)
+                .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
                 .map(|()| effects),
             Err(error) => Err(error),
         };
@@ -2104,7 +2134,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2150,7 +2180,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2350,7 +2380,7 @@ impl AppClient {
                     audit_context.clone(),
                 )
                 .await?;
-            self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
             Ok::<_, AppError>(effects)
         }
         .await
@@ -2626,7 +2656,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2661,7 +2691,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2732,7 +2762,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2776,7 +2806,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2930,7 +2960,10 @@ impl AppClient {
                 return Err(err);
             }
         };
-        if let Err(publish_err) = self.arm_recovery_then_gate_send_publish(&effects).await {
+        if let Err(publish_err) = self
+            .observe_recovery_evidence_then_gate_send_publish(&effects)
+            .await
+        {
             self.retract_failed_local_projection(
                 should_project_locally,
                 &group_id_hex,
@@ -3007,19 +3040,20 @@ impl AppClient {
         ))
     }
 
-    /// Apply the publish gate to a completed send's effects — arming
-    /// epoch-gap recovery from the same batch first — and, when the gate
-    /// fails, broadcast the peer commits the send folded before the caller
-    /// surfaces the error.
+    /// Apply the publish gate to a completed send's effects — observing the same
+    /// batch's epoch-gap recovery evidence first — and, when the gate fails,
+    /// broadcast the peer commits the send folded before the caller surfaces the
+    /// error.
     ///
     /// Split out of `send_app_event_with_local_projection` so the ordering is
     /// exercisable against a given batch of effects. The caller keeps the
     /// local-projection retraction, which needs that send's own locals.
-    pub(crate) async fn arm_recovery_then_gate_send_publish(
+    pub(crate) async fn observe_recovery_evidence_then_gate_send_publish(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        let publish_err = match self.arm_recovery_then_fail_if_publish_failed(effects) {
+        let publish_err = match self.observe_recovery_evidence_then_fail_if_publish_failed(effects)
+        {
             Ok(()) => return Ok(()),
             Err(publish_err) => publish_err,
         };
@@ -3497,7 +3531,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
@@ -3717,9 +3751,9 @@ impl AppClient {
         group_id: &GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
-        // Arm before the publish gate, for the reason spelled out in
+        // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
-        self.arm_recovery_from_effects(effects);
+        self.observe_recovery_evidence(effects);
         fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
@@ -3777,7 +3811,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.arm_recovery_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let message_ids = effects
@@ -4497,7 +4531,7 @@ impl AppClient {
                 // same gate, so no publishing seam reaches the bare check.
                 recover_post_canonical_result(
                     "classify_founding_welcome_publish",
-                    self.arm_recovery_then_fail_if_publish_failed(&effects),
+                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects),
                 );
                 recover_post_canonical_result(
                     "record_founding_welcome_delivery_failures",

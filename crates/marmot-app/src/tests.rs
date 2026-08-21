@@ -9500,7 +9500,9 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
-    let result = client.arm_recovery_then_gate_send_publish(&effects).await;
+    let result = client
+        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .await;
 
     assert!(
         result.is_err(),
@@ -9541,7 +9543,9 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
         .unwrap();
 
     let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
-    let result = client.arm_recovery_then_gate_send_publish(&effects).await;
+    let result = client
+        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .await;
 
     assert!(
         result.is_ok(),
@@ -9597,13 +9601,152 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
     for (label, effects) in batches {
         let bare = crate::groups::fail_if_publish_failed(&effects).map_err(|err| err.to_string());
         let armed = client
-            .arm_recovery_then_fail_if_publish_failed(&effects)
+            .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
             .map_err(|err| err.to_string());
         assert_eq!(
             armed, bare,
             "arming must not change how the gate classifies a {label} publish"
         );
     }
+}
+
+fn an_epoch_passage(
+    group_id: &cgka_traits::GroupId,
+    from: u64,
+    to: u64,
+) -> marmot_account::AccountDeviceEffects {
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects
+        .events
+        .push(cgka_traits::engine::GroupEvent::EpochChanged {
+            group_id: group_id.clone(),
+            from: cgka_traits::EpochId(from),
+            to: cgka_traits::EpochId(to),
+        });
+    effects
+}
+
+/// A maintenance tick's own epoch advance must reach the stall detector.
+///
+/// A tick drains a recovered staged evolution and confirms it, which emits
+/// `EpochChanged` into the batch this seam projects — and nowhere else. Miss it
+/// and the detector keeps believing the device sits at the epoch it armed at, so
+/// the *next* passage a peer fold reports cannot end the run either: its
+/// `from + 1` lands on the armed epoch and decides nothing. Two unrelated stalls
+/// later, a recovered device is escalated.
+#[tokio::test]
+async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://maintenance-passage.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("maintenance passage", &[])
+        .await
+        .unwrap();
+
+    // The group is stuck and arms once, at epoch 10.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+
+    // Maintenance then confirms a recovered evolution, 10 -> 11.
+    client
+        .observe_recovery_evidence_then_summarize_maintenance(&an_epoch_passage(&group_id, 10, 11))
+        .expect("a maintenance batch carrying only an epoch passage summarizes cleanly");
+
+    // A peer fold carries the device on to 12. Only a detector that heard the
+    // maintenance passage is sitting at 11 to have this one leave it.
+    client.epoch_stall.observe_epoch_passage(
+        &group_id,
+        cgka_traits::EpochId(11),
+        cgka_traits::EpochId(12),
+    );
+
+    // So the stalls that follow are a new run: without the maintenance report
+    // the second of these is the run's escalating third arm.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        crate::client::epoch_stall::BackfillDecision::Arm,
+        "the maintenance passage must have ended the run, so this is only its second arm"
+    );
+}
+
+/// A confirmed local publish's epoch passage must reach the detector through the
+/// publish gate.
+///
+/// An own commit is the strongest recovery evidence this layer ever sees — MLS
+/// requires current-epoch state to commit, so the committer was at tip by
+/// construction — but the engine reports it as an ordinary adjacent passage,
+/// `from` synthesized as `new_epoch - 1`. So it takes two: the confirm moves the
+/// detector off the armed epoch, and the next movement is what leaves an epoch
+/// nothing armed at. This pins that both halves land, and that the publishing
+/// seams carry the first one — the delivery-driven seams never see an own
+/// confirm.
+#[tokio::test]
+async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://own-publish-passage.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("own publish passage", &[])
+        .await
+        .unwrap();
+
+    // The group is stuck and arms once, at epoch 10.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+
+    // The device then commits and the publish confirms, 10 -> 11.
+    client
+        .observe_recovery_evidence_then_fail_if_publish_failed(&an_epoch_passage(&group_id, 10, 11))
+        .expect("a batch carrying only an epoch passage clears the publish gate");
+
+    // One epoch per arm is a limp, so that confirm alone does not end the run —
+    // the movement after it does.
+    client.epoch_stall.observe_epoch_passage(
+        &group_id,
+        cgka_traits::EpochId(11),
+        cgka_traits::EpochId(12),
+    );
+
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        crate::client::epoch_stall::BackfillDecision::Arm,
+        "the confirm must have been observed, so this is only the new run's second arm"
+    );
 }
 
 /// An escalation recorded while an inbound delivery is ingested must ride the

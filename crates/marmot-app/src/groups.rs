@@ -2211,10 +2211,13 @@ pub(crate) fn add_group(
 /// - failures with no pending resolution at all (e.g. a plain application
 ///   message or proposal publish that never landed): hard error, as before.
 ///
-/// Call this from `AppClient::arm_recovery_then_fail_if_publish_failed` rather
-/// than directly. Gating an effects batch without first arming epoch-gap
-/// recovery from it drops any one-shot `TransportObjectResourceRefused` the
-/// batch carries; the seams that already arm explicitly are the only exception.
+/// Call this from
+/// `AppClient::observe_recovery_evidence_then_fail_if_publish_failed` rather
+/// than directly. Gating an effects batch without first observing its
+/// epoch-gap recovery evidence drops any one-shot
+/// `TransportObjectResourceRefused` the batch carries, and any `EpochChanged`
+/// passage that would have ended a stall run; the seams that already observe
+/// explicitly are the only exception.
 pub(crate) fn fail_if_publish_failed(
     effects: &marmot_account::AccountDeviceEffects,
 ) -> Result<(), AppError> {
