@@ -9687,6 +9687,68 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
     );
 }
 
+/// A confirmed local publish's epoch passage must reach the detector through the
+/// publish gate.
+///
+/// An own commit is the strongest recovery evidence this layer ever sees — MLS
+/// requires current-epoch state to commit, so the committer was at tip by
+/// construction — but the engine reports it as an ordinary adjacent passage,
+/// `from` synthesized as `new_epoch - 1`. So it takes two: the confirm moves the
+/// detector off the armed epoch, and the next movement is what leaves an epoch
+/// nothing armed at. This pins that both halves land, and that the publishing
+/// seams carry the first one — the delivery-driven seams never see an own
+/// confirm.
+#[tokio::test]
+async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://own-publish-passage.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("own publish passage", &[])
+        .await
+        .unwrap();
+
+    // The group is stuck and arms once, at epoch 10.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+
+    // The device then commits and the publish confirms, 10 -> 11.
+    client
+        .observe_recovery_evidence_then_fail_if_publish_failed(&an_epoch_passage(&group_id, 10, 11))
+        .expect("a batch carrying only an epoch passage clears the publish gate");
+
+    // One epoch per arm is a limp, so that confirm alone does not end the run —
+    // the movement after it does.
+    client.epoch_stall.observe_epoch_passage(
+        &group_id,
+        cgka_traits::EpochId(11),
+        cgka_traits::EpochId(12),
+    );
+
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        crate::client::epoch_stall::BackfillDecision::Arm,
+        "the confirm must have been observed, so this is only the new run's second arm"
+    );
+}
+
 /// An escalation recorded while an inbound delivery is ingested must ride the
 /// summary that seam returns.
 ///
