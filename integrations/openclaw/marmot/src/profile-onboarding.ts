@@ -12,6 +12,8 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { deriveDurableFinalIdempotency } from "./durable-final-idempotency.js";
+
 export const MAX_PROFILE_NAME_CHARS = 80;
 
 export const PROFILE_PROMPT_WITH_NAME =
@@ -330,6 +332,7 @@ export interface ProfileOnboardingClient {
     groupIdHex: string,
     text: string,
     replyToMessageIdHex?: string | null,
+    idempotencyKey?: string,
   ): Promise<unknown>;
   accountPublishProfile(
     accountIdHex: string,
@@ -341,6 +344,55 @@ export interface ProfileOnboardingClient {
 interface OnboardingLogger {
   info?: (message: string) => void;
   warn?: (message: string) => void;
+}
+
+type OnboardingResponseKind =
+  | "profile-published"
+  | "profile-publish-failed"
+  | "profile-skipped"
+  | "profile-name-required"
+  | "profile-invalid";
+
+function canonicalOnboardingHex(value: string): string {
+  return value.trim().replace(/^0x/i, "").toLowerCase();
+}
+
+function onboardingSessionBinding(accountIdHex: string, groupIdHex: string): string {
+  return `openclaw:marmot:onboarding:${canonicalOnboardingHex(accountIdHex)}:${canonicalOnboardingHex(groupIdHex)}`;
+}
+
+async function sendOnboardingFinal(
+  client: ProfileOnboardingClient,
+  input: {
+    accountIdHex: string;
+    groupIdHex: string;
+    text: string;
+    replyToMessageIdHex?: string | null;
+    responseKind?: OnboardingResponseKind;
+  },
+): Promise<void> {
+  const replyToMessageIdHex = input.replyToMessageIdHex ?? null;
+  const replyTurnBinding = replyToMessageIdHex == null
+    ? null
+    : canonicalOnboardingHex(replyToMessageIdHex);
+  const turnBinding = input.responseKind
+    ? `profile-response:v1:${replyTurnBinding}:${input.responseKind}`
+    : "profile-prompt:v1";
+  const { idempotencyKey } = deriveDurableFinalIdempotency({
+    sessionBinding: onboardingSessionBinding(input.accountIdHex, input.groupIdHex),
+    turnBinding,
+    accountIdHex: input.accountIdHex,
+    groupIdHex: input.groupIdHex,
+    replyToMessageIdHex,
+    text: input.text,
+  });
+  await client.sendFinal(
+    input.accountIdHex,
+    input.groupIdHex,
+    input.text,
+    replyToMessageIdHex,
+    idempotencyKey,
+  );
 }
 
 /**
@@ -380,7 +432,11 @@ async function sendProfilePrompt(deps: {
     return false;
   }
   try {
-    await deps.client.sendFinal(deps.accountIdHex, deps.groupIdHex, buildProfilePrompt(suggested));
+    await sendOnboardingFinal(deps.client, {
+      accountIdHex: deps.accountIdHex,
+      groupIdHex: deps.groupIdHex,
+      text: buildProfilePrompt(suggested),
+    });
     deps.logger?.info?.("marmot: profile onboarding prompt sent");
     return true;
   } catch {
@@ -421,20 +477,22 @@ async function publishAndConfirm(
   try {
     await client.accountPublishProfile(message.accountIdHex, name, name);
     await store.markPublished(message.accountIdHex, name);
-    await client.sendFinal(
-      message.accountIdHex,
-      message.groupIdHex,
-      PROFILE_NAME_PUBLISHED.replace("{name}", name),
-      message.messageIdHex,
-    );
+    await sendOnboardingFinal(client, {
+      accountIdHex: message.accountIdHex,
+      groupIdHex: message.groupIdHex,
+      text: PROFILE_NAME_PUBLISHED.replace("{name}", name),
+      replyToMessageIdHex: message.messageIdHex,
+      responseKind: "profile-published",
+    });
     logger?.info?.("marmot: profile name published");
   } catch {
-    await client.sendFinal(
-      message.accountIdHex,
-      message.groupIdHex,
-      PROFILE_NAME_PUBLISH_FAILED,
-      message.messageIdHex,
-    );
+    await sendOnboardingFinal(client, {
+      accountIdHex: message.accountIdHex,
+      groupIdHex: message.groupIdHex,
+      text: PROFILE_NAME_PUBLISH_FAILED,
+      replyToMessageIdHex: message.messageIdHex,
+      responseKind: "profile-publish-failed",
+    });
     logger?.warn?.("marmot: profile name publish failed");
   }
 }
@@ -471,7 +529,13 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
     const parsed = parseProfileNameReply(message.text);
     if (parsed.action === "skip") {
       await store.markSkipped(message.accountIdHex);
-      await client.sendFinal(message.accountIdHex, message.groupIdHex, parsed.response, message.messageIdHex);
+      await sendOnboardingFinal(client, {
+        accountIdHex: message.accountIdHex,
+        groupIdHex: message.groupIdHex,
+        text: parsed.response,
+        replyToMessageIdHex: message.messageIdHex,
+        responseKind: "profile-skipped",
+      });
       logger?.info?.("marmot: profile onboarding skipped");
       return true;
     }
@@ -480,12 +544,24 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
       if (suggested) {
         await publishAndConfirm(store, client, message, suggested, logger);
       } else {
-        await client.sendFinal(message.accountIdHex, message.groupIdHex, PROFILE_NAME_EMPTY, message.messageIdHex);
+        await sendOnboardingFinal(client, {
+          accountIdHex: message.accountIdHex,
+          groupIdHex: message.groupIdHex,
+          text: PROFILE_NAME_EMPTY,
+          replyToMessageIdHex: message.messageIdHex,
+          responseKind: "profile-name-required",
+        });
       }
       return true;
     }
     if (parsed.action === "invalid") {
-      await client.sendFinal(message.accountIdHex, message.groupIdHex, parsed.response, message.messageIdHex);
+      await sendOnboardingFinal(client, {
+        accountIdHex: message.accountIdHex,
+        groupIdHex: message.groupIdHex,
+        text: parsed.response,
+        replyToMessageIdHex: message.messageIdHex,
+        responseKind: "profile-invalid",
+      });
       return true; // stay prompted; the prompt is implicitly re-asked
     }
     await publishAndConfirm(store, client, message, parsed.name, logger);

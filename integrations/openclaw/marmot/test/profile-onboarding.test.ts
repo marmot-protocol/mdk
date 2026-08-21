@@ -31,11 +31,12 @@ const MSG = HEX("11");
 interface Calls {
   lookup: number;
   sendFinal: string[];
+  sendFinalKeys: (string | undefined)[];
   publish: { name: string; displayName: string | null }[];
 }
 
 function emptyCalls(): Calls {
-  return { lookup: 0, sendFinal: [], publish: [] };
+  return { lookup: 0, sendFinal: [], sendFinalKeys: [], publish: [] };
 }
 
 function stubClient(
@@ -55,11 +56,12 @@ function stubClient(
         retryable: opts.profileStatus === "indeterminate",
       };
     },
-    async sendFinal(_account, _group, text) {
+    async sendFinal(_account, _group, text, _replyTo, idempotencyKey) {
+      calls.sendFinal.push(text);
+      calls.sendFinalKeys.push(idempotencyKey);
       if (opts.failSend) {
         throw new Error("send failed");
       }
-      calls.sendFinal.push(text);
       return { type: "final_sent" };
     },
     async accountPublishProfile(_account, name, displayName) {
@@ -299,6 +301,29 @@ describe("maybeSendProfilePromptOnJoin", () => {
     });
     expect(store.rec).toEqual({}); // cleared so a later trigger retries
   });
+
+  it("reuses the proactive prompt key after a failed send is retried", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    const trigger = () =>
+      maybeSendProfilePromptOnJoin({
+        store,
+        client: stubClient(calls, { failSend: true }),
+        accountIdHex: ACCOUNT,
+        groupIdHex: GROUP,
+        configuredName: "Marmot Bot",
+      });
+
+    await trigger();
+    await trigger();
+
+    expect(calls.sendFinal).toEqual([
+      buildProfilePrompt("Marmot Bot"),
+      buildProfilePrompt("Marmot Bot"),
+    ]);
+    expect(calls.sendFinalKeys[0]).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
+  });
 });
 
 describe("maybeHandleProfileOnboardingInbound", () => {
@@ -369,6 +394,30 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(calls.publish).toEqual([]);
     expect(calls.sendFinal).toEqual([PROFILE_NAME_EMPTY]);
     expect(store.rec.status).toBe("prompted");
+  });
+
+  it("reuses the response key for an identical inbound replay and changes it for a new message", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = { status: "prompted", group_id_hex: GROUP };
+    const client = stubClient(calls);
+
+    await maybeHandleProfileOnboardingInbound({ store, client, message: msg("yes") });
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client,
+      message: { ...msg("yes"), messageIdHex: `0x${MSG.toUpperCase()}` },
+    });
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client,
+      message: { ...msg("yes"), messageIdHex: HEX("22") },
+    });
+
+    expect(calls.sendFinal).toEqual([PROFILE_NAME_EMPTY, PROFILE_NAME_EMPTY, PROFILE_NAME_EMPTY]);
+    expect(calls.sendFinalKeys[0]).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
+    expect(calls.sendFinalKeys[2]).not.toBe(calls.sendFinalKeys[0]);
   });
 
   it("skips on a skip reply", async () => {
