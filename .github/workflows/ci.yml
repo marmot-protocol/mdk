@@ -70,7 +70,9 @@ jobs:
           tool: cargo-audit@0.22.1
 
       - name: Audit Rust dependencies
-        run: cargo audit --locked
+        # Cargo consumes --locked before dispatching to cargo-audit; cargo-audit
+        # itself does not accept --locked after the subcommand.
+        run: cargo --locked audit
 
   terminal-harness-installers:
     name: Terminal harness installer tests
