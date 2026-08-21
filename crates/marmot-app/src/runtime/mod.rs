@@ -2786,6 +2786,8 @@ impl MarmotAppRuntime {
     ///   the account's live state; neither step depends on a running worker for
     ///   the publish itself.
     /// - The account ref stays valid after this returns (unlike a wipe).
+    /// - Every account that can sign — local or external-signer — can sign
+    ///   out. Only tracked-only (npub) accounts are rejected.
     ///
     /// [`sign_out_and_wipe`]: Self::sign_out_and_wipe
     pub async fn sign_out(
@@ -2795,12 +2797,13 @@ impl MarmotAppRuntime {
     ) -> Result<SignOutOutcome, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
-        if !account.local_signing {
-            // Publishing kind:5 KeyPackage deletions requires signing with this
-            // account's key, which a tracked-only (npub) account cannot do.
-            // Surface the same error the worker path uses. (A tracked account
-            // also never published KeyPackages from this device, so there is
-            // nothing remote to clean up.)
+        if !account.can_sign() {
+            // Only a tracked-only (npub) account is rejected: it has no signing
+            // key of any kind, never published a KeyPackage from this device,
+            // and never joined a group, so there is nothing to sign out.
+            // External-signer accounts do all three and sign out like local
+            // ones — the kind:5 publish resolves its signer the same way every
+            // other publish does. Surface the same error the worker path uses.
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
 
@@ -2892,13 +2895,23 @@ impl MarmotAppRuntime {
     /// - Stages 1 and 2 are network-bound; their per-target failures are
     ///   surfaced for the app's partial-failure sheet and never block local
     ///   cleanup.
+    /// - Every account that can sign — local or external-signer — can be
+    ///   wiped. Only tracked-only (npub) accounts are rejected. An external
+    ///   signer that is unavailable at wipe time degrades stages 1 and 2 to
+    ///   recorded failures; the local wipe still completes, so a device is
+    ///   never stuck holding an account it cannot remove.
     pub async fn sign_out_and_wipe(&self, account_ref: &str) -> Result<WipeOutcome, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
-        if !account.local_signing {
-            // A wipe must sign group-leave messages and KeyPackage deletions;
-            // a tracked-only (npub) account can do neither, so there is nothing
-            // remote to clean up. Surface the same error the worker path uses.
+        if !account.can_sign() {
+            // Only a tracked-only (npub) account is rejected: with no signing
+            // key of any kind it never joined a group or published a KeyPackage
+            // from this device, so there is nothing device-side to tear down.
+            // External-signer accounts have both and are wiped like local ones;
+            // stages 1 and 2 sign through the account's registered external
+            // signer, and an unavailable signer degrades to a recorded
+            // best-effort failure instead of blocking the local wipe. Surface
+            // the same error the worker path uses.
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
 
@@ -4505,6 +4518,12 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            // The account no longer exists on this device, so the host callback
+            // handle it registered must not outlive it. This runs only after
+            // the removal commit point: a removal that failed leaves the
+            // account live, and a live external-signer account still needs its
+            // signer to reconcile.
+            self.app.forget_external_signer(&account.account_id_hex);
             Ok(())
         }
         .await;
