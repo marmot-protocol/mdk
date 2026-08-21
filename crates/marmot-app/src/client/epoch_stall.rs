@@ -188,11 +188,17 @@ impl GroupStall {
     /// The app routes that passage from every effects batch whose events it
     /// gates or projects (`AppClient::observe_recovery_evidence`) — the
     /// convergence folds a trailing device usually catches up by, and the
-    /// maintenance tick's own confirmed evolution, included. One publishing seam
-    /// is a known exception: `AppClient::disband_group` neither gates nor
-    /// observes its batch, a pre-existing gap tracked separately rather than
-    /// widened here. Arming from an observed batch is conditional on it carrying
-    /// a `TransportObjectResourceRefused`; observing a passage is not.
+    /// maintenance tick's own confirmed evolution, included. Two publishing
+    /// seams stay outside that routing. `AppClient::redeliver_welcome` is an
+    /// empty exception: it re-publishes a stored envelope without re-committing
+    /// and never drains the engine, so its batch carries no events to observe.
+    /// `AppClient::disband_group` is a real one — the engine does emit an
+    /// `EpochChanged` when it confirms a disband — and it is accepted rather
+    /// than pre-existing: passage reporting is a new contract, and this is a new
+    /// hole in it, taken because a run whose group is being destroyed has
+    /// nothing left to recover. Arming from an observed batch is conditional on
+    /// it carrying a `TransportObjectResourceRefused`; observing a passage is
+    /// not.
     ///
     /// A batch that reports neither leaves the run exactly as it was: an advance
     /// nobody reports is invisible here, as
