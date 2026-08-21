@@ -495,6 +495,7 @@ async fn execute_inner(
             .clone()
             .or_else(|| cli.daemon_discovery_relays.first().cloned())
             .or_else(|| cli.daemon_default_account_relays.first().cloned()),
+        cli.daemon_discovery_relays.clone(),
         account_home.clone(),
     )?;
     match command {
@@ -1120,6 +1121,7 @@ pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
 fn app_for(
     home: PathBuf,
     relay: Option<String>,
+    directory_relays: Vec<String>,
     account_home: AccountHome,
 ) -> Result<MarmotApp, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
@@ -1128,7 +1130,8 @@ fn app_for(
     // installs leave it unset.
     let mut config = MarmotAppConfig::default()
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
-        .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays());
+        .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
+        .with_directory_relay_urls(directory_relays);
     // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
     // pinned convergence settlement window (e.g. `0` for integration tests).
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {

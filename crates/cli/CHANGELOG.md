@@ -17,7 +17,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Hybrid daemon startup now preserves a distinct operational `--relay` when
   WebSocket discovery and default-account relay lists are also supplied. The
   client-only FIPS image includes `mdk-fips-tui-demo` for repeatable Linux TUI
-  setup, readiness checks, and launch.
+  setup, readiness checks, and launch. Daemon-hosted remote-member invites now
+  use those WebSocket discovery relays for relay-list and KeyPackage reads
+  without adding them to FIPS Welcome or group-message delivery.
 - `wn relays set ... --type inbox|nip65` atomically replaces one published
   relay list. `wn relay-stats` and the TUI relay-health screen now report
   privacy-safe FIPS backend endpoint counts for demo preflight and diagnosis.

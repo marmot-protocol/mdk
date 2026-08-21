@@ -14,6 +14,7 @@ use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
 };
+use nostr::Keys;
 use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
@@ -5584,6 +5585,68 @@ fn daemon_executes_cli_commands_over_socket() {
     );
 
     stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn daemon_uses_websocket_discovery_with_fips_operational_relay() {
+    let relay = TestRelay::new();
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
+    let bob = create_account_with_real_relay(bob_home.path(), relay.url());
+    run_json_with_relay(
+        bob_home.path(),
+        relay.url(),
+        &["--account", &bob, "keys", "rotate"],
+    );
+
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let alice = create_account_with_real_relay(alice_home.path(), relay.url());
+    let socket = alice_home.path().join("dev").join("wnd.sock");
+    let fips_npub = Keys::generate()
+        .public_key()
+        .to_bech32()
+        .expect("FIPS npub");
+    let fips_relay = format!("fips://{fips_npub}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(alice_home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--relay")
+        .arg(&fips_relay)
+        .arg("--discovery-relays")
+        .arg(relay.url())
+        .arg("--default-account-relays")
+        .arg(relay.url())
+        .arg("--secret-store")
+        .arg("file")
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--account")
+        .arg(&alice)
+        .arg("--json")
+        .args(["keys", "fetch", &bob])
+        .output()
+        .expect("wn keys fetch should run through daemon");
+
+    stop_daemon(&socket, &mut child);
+    assert!(
+        output.status.success(),
+        "daemon-hosted discovery failed\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["result"]["account_id"], bob);
+    assert!(
+        value["result"]["source_relays"]
+            .as_array()
+            .is_some_and(|relays| !relays.is_empty())
+    );
 }
 
 #[test]
