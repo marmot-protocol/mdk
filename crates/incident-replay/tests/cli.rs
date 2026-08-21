@@ -35,6 +35,22 @@ fn run(fixture: &str) -> (String, String, i32) {
     )
 }
 
+/// Run the CLI against an export written to a temporary file, returning
+/// `(stdout, stderr, exit code)`.
+fn run_on(export: &[u8]) -> (String, String, i32) {
+    let mut input = NamedTempFile::new().expect("create export");
+    input.write_all(export).expect("write export");
+    let output = Command::new(env!("CARGO_BIN_EXE_incident-replay"))
+        .arg(input.path())
+        .output()
+        .expect("run incident-replay");
+    (
+        String::from_utf8(output.stdout).expect("stdout is utf-8"),
+        String::from_utf8(output.stderr).expect("stderr is utf-8"),
+        output.status.code().expect("the CLI exited normally"),
+    )
+}
+
 #[test]
 fn a_healthy_export_prints_the_healthy_line_and_nothing_else() {
     // A cleared halt leaves nothing to report, so this is the whole of stdout:
@@ -90,17 +106,23 @@ fn an_accepted_export_prints_its_fidelity_not_a_bare_scenario_name() {
 }
 
 #[test]
-fn a_manifest_less_error_remnant_never_classifies_as_healthy() {
-    let mut input = NamedTempFile::new().expect("create export");
-    input
-        .write_all(br#"{"t":"error","complete":false}"#)
-        .expect("write export");
-    let output = Command::new(env!("CARGO_BIN_EXE_incident-replay"))
-        .arg(input.path())
-        .output()
-        .expect("run incident-replay");
-    let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
+fn an_unrecognized_document_never_classifies_as_healthy() {
+    // A document that is not an export at all — here a `package.json` fragment —
+    // must reach the operator as a parse failure, not as a clean bill of health.
+    let (stdout, stderr, code) = run_on(br#"{"name":"mdk","version":"0.1.0","dependencies":{}}"#);
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(code, 2);
+    assert!(!stdout.contains("healthy:"), "got {stdout:?}");
+    assert!(
+        stderr.contains("not an agent-state document"),
+        "the operator needs to be told what the input was not, got {stderr:?}"
+    );
+}
+
+#[test]
+fn a_manifest_less_error_remnant_never_classifies_as_healthy() {
+    let (stdout, _stderr, code) = run_on(br#"{"t":"error","complete":false}"#);
+
+    assert_eq!(code, 2);
     assert!(!stdout.contains("healthy:"));
 }
