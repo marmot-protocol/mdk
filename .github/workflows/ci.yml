@@ -53,6 +53,9 @@ jobs:
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh
 
+      - name: Cargo audit workflow policy gate
+        run: python3 scripts/test_check_cargo_audit_ci.py
+
   rust-audit:
     name: Rust audit
     runs-on: ubuntu-latest
