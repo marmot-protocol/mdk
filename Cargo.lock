@@ -2115,7 +2115,7 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 [[package]]
 name = "fips"
 version = "0.5.0-dev"
-source = "git+https://github.com/jmcorgan/fips.git?rev=3d5fec659c7f48791634076301c4fb5864d5a70a#3d5fec659c7f48791634076301c4fb5864d5a70a"
+source = "git+https://github.com/jmcorgan/fips.git?rev=1ec62e51192a3ed49792e177c8c88d8176647133#1ec62e51192a3ed49792e177c8c88d8176647133"
 dependencies = [
  "arc-swap",
  "bech32",
@@ -4915,7 +4915,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
