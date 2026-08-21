@@ -3236,6 +3236,32 @@ async fn failed_leave_push_compensation_body() {
 }
 
 #[test]
+fn sole_admin_self_demote_surfaces_the_admin_policy_refusal() {
+    run_composed_app_runtime_test("sole-admin-self-demote", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("sole admin", &[]).await.unwrap();
+
+        // Alice is the only admin, so demoting herself would leave the group
+        // with none. The host must receive that as the admin-policy refusal it
+        // is, not as a payload-encoding fault.
+        let err = client.self_demote_admin(&group_id).await.err().unwrap();
+        match err {
+            AppError::Account(marmot_account::AccountError::Session(
+                cgka_session::SessionError::Engine(cgka_traits::EngineError::AdminDepletion {
+                    ..
+                }),
+            )) => {}
+            other => panic!("expected AdminDepletion, got {other:?}"),
+        }
+    });
+}
+#[test]
 fn push_registration_removal_retry_survives_clear_and_restart() {
     run_composed_app_runtime_test(
         "push-registration-removal-retry",
@@ -9296,6 +9322,430 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
         audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
         1,
         "the arm must leave its durable forensic row even on a failing pass"
+    );
+}
+
+/// One effects batch carrying both a resource refusal for `group_id` and a hard
+/// publish failure whose pending commit rolled back — the shape in which a
+/// refusal the pass does not arm on becomes unrecoverable.
+fn a_refusal_riding_a_rolled_back_publish(
+    group_id: &cgka_traits::GroupId,
+) -> marmot_account::AccountDeviceEffects {
+    let message_id = cgka_traits::MessageId::new(vec![0xab; 32]);
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group_id.clone(),
+            message_id: message_id.clone(),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    effects.failures.push(marmot_account::PublishFailure {
+        message_id,
+        reason: "injected publish failure".to_owned(),
+    });
+    effects
+        .pending
+        .push(marmot_account::PendingResolution::RolledBack {
+            pending: cgka_traits::engine_state::PendingStateRef::new(7),
+        });
+    effects
+}
+
+/// A resource refusal carried by the scheduled convergence batch must arm
+/// epoch-gap recovery even when that same pass's publish check fails it.
+///
+/// Same one-shot loss as the drained seam: this batch's events reach the app
+/// once, and the refusal was buffered only after its durable retention row was
+/// deleted. The account worker calls this seam per group, so a failing advance
+/// that returned before arming would drop the refusal for good.
+#[tokio::test]
+async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://advance-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("advance arm ordering", &[])
+        .await
+        .unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+    let result = client
+        .observe_scheduled_convergence_effects(&group_id, &effects)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the scheduled convergence pass"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal rides this batch only once, so it must arm before the pass can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing pass"
+    );
+}
+
+/// A resource refusal carried by a host-requested convergence retry must arm
+/// epoch-gap recovery even when that same pass's publish check fails it.
+///
+/// The retry seam folds and publishes exactly like the scheduled one, so it
+/// carries the same refusals under the same one-shot loss — and a host that
+/// retries a stuck group is the case where the recovery evidence matters most.
+#[tokio::test]
+async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://retry-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("retry arm ordering", &[])
+        .await
+        .unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+    let result = client.observe_convergence_retry_effects(&group_id, &effects);
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the convergence retry"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal rides this batch only once, so it must arm before the pass can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing pass"
+    );
+}
+
+/// One effects batch carrying a resource refusal for `group_id` alongside a
+/// confirmed-but-partial publish failure: the shape the gate passes as a soft
+/// warning (mdk#428).
+fn a_refusal_riding_a_confirmed_but_partial_publish(
+    group_id: &cgka_traits::GroupId,
+) -> marmot_account::AccountDeviceEffects {
+    let message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group_id.clone(),
+            message_id: message_id.clone(),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    effects.failures.push(marmot_account::PublishFailure {
+        message_id,
+        reason: "insufficient publish acknowledgements".to_owned(),
+    });
+    effects
+        .pending
+        .push(marmot_account::PendingResolution::Confirmed {
+            pending: cgka_traits::engine_state::PendingStateRef::new(7),
+        });
+    effects
+}
+
+/// A resource refusal carried by an ordinary send must arm epoch-gap recovery
+/// even when that send's publish gate fails it.
+///
+/// The engine releases deferred-peel rows in the foreground of `do_send` and of
+/// the queued-outbound drain, so a plain send's effects can carry a
+/// `TransportObjectResourceRefused` — buffered only after its durable retention
+/// row was deleted, and delivered to the app exactly once. A gate that returned
+/// before arming dropped it for good, and no send-path observer downstream of
+/// the gate arms.
+#[tokio::test]
+async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("send arm ordering", &[]).await.unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+    let result = client
+        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the send"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal rides this batch only once, so it must arm before the send can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing send"
+    );
+}
+
+/// Arming ahead of the send gate must not change what the gate accepts: a
+/// confirmed-but-partial publish still passes (mdk#428), and the refusal riding
+/// it is observed all the same.
+#[tokio::test]
+async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-soft-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("send soft arm ordering", &[])
+        .await
+        .unwrap();
+
+    let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
+    let result = client
+        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a confirmed-but-partial publish must stay a soft pass on the send path"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "a refusal riding a passing batch must arm too"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave exactly one durable forensic row"
+    );
+}
+
+/// The arming gate is observation plus the unchanged publish check: for every
+/// classification it must return exactly what the bare check returns, so no
+/// caller's error path is widened or narrowed by arming ahead of it.
+#[tokio::test]
+async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://gate-parity.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("gate parity", &[]).await.unwrap();
+
+    let clean = marmot_account::AccountDeviceEffects::default();
+    let mut failure_without_pending = marmot_account::AccountDeviceEffects::default();
+    failure_without_pending
+        .failures
+        .push(marmot_account::PublishFailure {
+            message_id: cgka_traits::MessageId::new(vec![0xef; 32]),
+            reason: "relay rejected".to_owned(),
+        });
+    let batches = [
+        ("no failures", clean),
+        (
+            "rolled back",
+            a_refusal_riding_a_rolled_back_publish(&group_id),
+        ),
+        (
+            "confirmed but partial",
+            a_refusal_riding_a_confirmed_but_partial_publish(&group_id),
+        ),
+        ("failure without pending", failure_without_pending),
+    ];
+
+    for (label, effects) in batches {
+        let bare = crate::groups::fail_if_publish_failed(&effects).map_err(|err| err.to_string());
+        let armed = client
+            .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .map_err(|err| err.to_string());
+        assert_eq!(
+            armed, bare,
+            "arming must not change how the gate classifies a {label} publish"
+        );
+    }
+}
+
+fn an_epoch_passage(
+    group_id: &cgka_traits::GroupId,
+    from: u64,
+    to: u64,
+) -> marmot_account::AccountDeviceEffects {
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects
+        .events
+        .push(cgka_traits::engine::GroupEvent::EpochChanged {
+            group_id: group_id.clone(),
+            from: cgka_traits::EpochId(from),
+            to: cgka_traits::EpochId(to),
+        });
+    effects
+}
+
+/// A maintenance tick's own epoch advance must reach the stall detector.
+///
+/// A tick drains a recovered staged evolution and confirms it, which emits
+/// `EpochChanged` into the batch this seam projects — and nowhere else. Miss it
+/// and the detector keeps believing the device sits at the epoch it armed at, so
+/// the *next* passage a peer fold reports cannot end the run either: its
+/// `from + 1` lands on the armed epoch and decides nothing. Two unrelated stalls
+/// later, a recovered device is escalated.
+#[tokio::test]
+async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://maintenance-passage.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("maintenance passage", &[])
+        .await
+        .unwrap();
+
+    // The group is stuck and arms once, at epoch 10.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+
+    // Maintenance then confirms a recovered evolution, 10 -> 11.
+    client
+        .observe_recovery_evidence_then_summarize_maintenance(&an_epoch_passage(&group_id, 10, 11))
+        .expect("a maintenance batch carrying only an epoch passage summarizes cleanly");
+
+    // A peer fold carries the device on to 12. Only a detector that heard the
+    // maintenance passage is sitting at 11 to have this one leave it.
+    client.epoch_stall.observe_epoch_passage(
+        &group_id,
+        cgka_traits::EpochId(11),
+        cgka_traits::EpochId(12),
+    );
+
+    // So the stalls that follow are a new run: without the maintenance report
+    // the second of these is the run's escalating third arm.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        crate::client::epoch_stall::BackfillDecision::Arm,
+        "the maintenance passage must have ended the run, so this is only its second arm"
+    );
+}
+
+/// A confirmed local publish's epoch passage must reach the detector through the
+/// publish gate.
+///
+/// An own commit is the strongest recovery evidence this layer ever sees — MLS
+/// requires current-epoch state to commit, so the committer was at tip by
+/// construction — but the engine reports it as an ordinary adjacent passage,
+/// `from` synthesized as `new_epoch - 1`. So it takes two: the confirm moves the
+/// detector off the armed epoch, and the next movement is what leaves an epoch
+/// nothing armed at. This pins that both halves land, and that the publishing
+/// seams carry the first one — the delivery-driven seams never see an own
+/// confirm.
+#[tokio::test]
+async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://own-publish-passage.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("own publish passage", &[])
+        .await
+        .unwrap();
+
+    // The group is stuck and arms once, at epoch 10.
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+
+    // The device then commits and the publish confirms, 10 -> 11.
+    client
+        .observe_recovery_evidence_then_fail_if_publish_failed(&an_epoch_passage(&group_id, 10, 11))
+        .expect("a batch carrying only an epoch passage clears the publish gate");
+
+    // One epoch per arm is a limp, so that confirm alone does not end the run —
+    // the movement after it does.
+    client.epoch_stall.observe_epoch_passage(
+        &group_id,
+        cgka_traits::EpochId(11),
+        cgka_traits::EpochId(12),
+    );
+
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+    assert_eq!(
+        client
+            .epoch_stall
+            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        crate::client::epoch_stall::BackfillDecision::Arm,
+        "the confirm must have been observed, so this is only the new run's second arm"
     );
 }
 

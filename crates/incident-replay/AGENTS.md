@@ -14,7 +14,12 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     the fields the pipeline needs and ignores everything else, so it tolerates
     the export growing new fields. Deliberately decoupled from `marmot-forensics`:
     it tracks the stable `marmot-forensics-audit/v2` wire shape Goggles
-    serialises, not the engine's internal `AuditEventKind` enum.
+    serialises, not the engine's internal `AuditEventKind` enum. The leniency is
+    bounded by one positive check: every modelled field defaults, so `parse`
+    requires the object to carry at least one modelled top-level field
+    (`events`, `derived_projections`, `normalized_scenario_history`) and rejects
+    a foreign document — or `{}` — rather than adopting it as an empty, healthy
+    export.
 - **Module:** `src/ndjson.rs`
   - **Role:** `parse_stream` — the second parser: the streaming NDJSON group
     export into the same `AgentStateExport`. Enforces the stream's completeness

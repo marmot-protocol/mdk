@@ -22,41 +22,18 @@ Prerequisites:
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest"
-tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-curl -fsSL "$base_url/install-codex-marmot.sh" -o "$tmpdir/install-codex-marmot.sh"
-curl -fsSL "$base_url/install-codex-marmot.sh.sha256" -o "$tmpdir/install-codex-marmot.sh.sha256"
-if command -v shasum >/dev/null 2>&1; then
-  (cd "$tmpdir" && shasum -a 256 -c install-codex-marmot.sh.sha256)
-elif command -v sha256sum >/dev/null 2>&1; then
-  (cd "$tmpdir" && sha256sum -c install-codex-marmot.sh.sha256)
-else
-  echo "error: need shasum or sha256sum to verify the installer" >&2
-  exit 1
-fi
-bash "$tmpdir/install-codex-marmot.sh"
-```
+Use the canonical [White Noise + Agents quickstart](../../README.md#codex) for
+the current guided install command and the steps to finish in White Noise.
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest"
-tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-curl -fsSL "$base_url/install-codex-marmot.sh" -o "$tmpdir/install-codex-marmot.sh"
-curl -fsSL "$base_url/install-codex-marmot.sh.sha256" -o "$tmpdir/install-codex-marmot.sh.sha256"
-if command -v shasum >/dev/null 2>&1; then
-  (cd "$tmpdir" && shasum -a 256 -c install-codex-marmot.sh.sha256)
-elif command -v sha256sum >/dev/null 2>&1; then
-  (cd "$tmpdir" && sha256sum -c install-codex-marmot.sh.sha256)
-else
-  echo "error: need shasum or sha256sum to verify the installer" >&2
-  exit 1
-fi
-bash "$tmpdir/install-codex-marmot.sh" --yes --allow-welcomer npub1...
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
 ```
+
+The immutable release also publishes `install-codex-marmot.sh.sha256` for
+independent verification of the installer before execution.
 
 The default install uses its own `~/.marmot-agents/codex` identity and services,
 so it does not share prompts or replies with installed OpenCode or Pi harnesses.

@@ -32,6 +32,11 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
   - **Owns:** Stateright lifecycle mirror, fair bounded progress, crash/resource recovery, stranded-joiner repair, and
     stable-action-id counterexample-to-Scenario-IR validation.
 
+- **File:** `large_group_family.rs`
+  - **Owns:** Deterministic large-group size/admin/traffic profiles, replay metadata, strict whole-group terminal
+    oracles, exact retained-join pending-work classification, sampled delivery/decryptability coverage, and the normal
+    mid-size application and incremental-join executable canaries.
+
 - **File:** `mutation_adequacy.rs`
   - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable
     verification-layer matrix.

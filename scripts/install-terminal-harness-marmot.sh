@@ -106,6 +106,8 @@ ACKNOWLEDGE_UNRESTRICTED=0
 WN_AGENT_TEMP_PID=""
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_ALLOWED_SENDERS_HEX=""
+BOOTSTRAP_NPUB=""
+BOOTSTRAP_NPROFILE=""
 MARMOT_AGENT_SOCKET_SET=0
 if [ -n "$MARMOT_AGENT_SOCKET_OVERRIDE" ]; then
     MARMOT_AGENT_SOCKET_SET=1
@@ -820,6 +822,8 @@ bootstrap_agent() {
         printf '\n'
         BOOTSTRAP_ACCOUNT_ID_HEX="<account-id-from-bootstrap>"
         BOOTSTRAP_ALLOWED_SENDERS_HEX="${HARNESS_CONFIGURED_SENDERS_HEX:-<allowlist-from-bootstrap>}"
+        BOOTSTRAP_NPUB="<agent-npub-from-bootstrap>"
+        BOOTSTRAP_NPROFILE="<agent-nprofile-from-bootstrap>"
         return 0
     fi
 
@@ -841,6 +845,14 @@ bootstrap_agent() {
             python3 -c 'import json, sys; print(",".join(json.load(sys.stdin).get("welcomer_account_ids_hex", [])))'
     )"
     BOOTSTRAP_ALLOWED_SENDERS_HEX="${HARNESS_CONFIGURED_SENDERS_HEX:-$bootstrap_welcomers_hex}"
+    BOOTSTRAP_NPUB="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin).get("npub", ""))'
+    )"
+    BOOTSTRAP_NPROFILE="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin).get("nprofile", ""))'
+    )"
     if [ -z "$BOOTSTRAP_ACCOUNT_ID_HEX" ]; then
         echo "error: bootstrap did not return an account id" >&2
         exit 1
@@ -850,6 +862,26 @@ bootstrap_agent() {
         exit 1
     fi
     log "bootstrap details -> $MARMOT_HOME/bootstrap.json"
+}
+
+print_phone_invite() {
+    if [ -n "$BOOTSTRAP_NPUB" ] && [ -n "$BOOTSTRAP_NPROFILE" ]; then
+        cat <<EOF
+
+White Noise agent identity:
+  npub: $BOOTSTRAP_NPUB
+  nprofile: $BOOTSTRAP_NPROFILE
+EOF
+        if [ "$DRY_RUN" -eq 0 ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
+            printf '%s' "$BOOTSTRAP_NPROFILE" | qrencode -t ANSIUTF8
+        fi
+    else
+        cat <<EOF
+
+White Noise agent identity was not returned by this wn-agent release.
+Inspect the bootstrap response at: $MARMOT_HOME/bootstrap.json
+EOF
+    fi
 }
 
 write_harness_env() {
@@ -880,6 +912,7 @@ write_harness_env() {
 }
 
 print_next_steps() {
+    print_phone_invite
     cat <<EOF
 
 Install complete.
@@ -890,14 +923,35 @@ Terminal harness agent:
   socket: $MARMOT_AGENT_SOCKET
   service: $MARMOT_AGENT_SERVICE_NAME.service (Linux) / $MARMOT_AGENT_LAUNCHD_LABEL (macOS)
 
+EOF
+    if [ "$DRY_RUN" -eq 1 ]; then
+        cat <<EOF
+Dry run complete. No services were installed or started.
+EOF
+    elif [ "$INSTALL_SERVICE" -eq 1 ] && [ "$NO_START_WN_AGENT" -eq 0 ] && [ "$NO_START_HARNESS" -eq 0 ]; then
+        cat <<EOF
+Services were installed and started for the current user.
+
 Next steps:
-  1. Ensure binaries are on your PATH ($(install_dir))
+  1. Add the agent identity above in White Noise.
+  2. Invite it from an authorized account.
+  3. Send a test message. Use /<path> first to select a working directory.
+EOF
+    else
+        cat <<EOF
+The connector or harness was left stopped by the selected install options.
+
+To run it manually:
+  1. Ensure binaries are on your PATH ($(install_dir)).
   2. Start wn-agent:
      wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET"
-  3. Load the harness env:
+  3. In another shell, load the harness environment and start $HARNESS_BINARY:
      . "$MARMOT_HOME/dev/$HARNESS_BINARY.env"
-  4. Start $HARNESS_BINARY:
      $HARNESS_BINARY
+  4. Add the agent identity above in White Noise, invite it, and send a test message.
+EOF
+    fi
+    cat <<EOF
 
 Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${WN_AGENT_VERSION})
 EOF

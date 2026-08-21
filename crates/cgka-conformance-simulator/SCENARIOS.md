@@ -83,7 +83,8 @@ These are the scenarios another implementation should be able to load from JSON 
 - Setup: Alice creates a group with Bob as a non-admin, rejects Bob's first admin-policy edit, promotes Bob, lets Bob
   make an admin-gated group-data update, and then Bob removes himself from the admin set.
 - Pressure: admin-policy app-component validation, admin authorization, role convergence, and post-demotion denial.
-- Expected: empty admin policies fail, non-admin updates fail, both clients observe Bob's promotion and later
+- Expected: an empty admin policy is refused as admin depletion, non-admin updates fail, both clients observe
+  Bob's promotion and later
   self-demotion, and both clients converge at epoch 4 with Alice as the sole admin.
 
 ### `group-data-fork-recovery/v1`
@@ -729,6 +730,50 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   runnable gate `bounded_convergence_pressure_family_settles_every_seeded_permutation` passes since mdk#1472 (the
   engine re-arms the queued-intent drain when a pass closes and no longer re-prepares an in-flight regenerated
   intent). It runs in the nightly lane; the PR smoke lane excludes it as one of the multi-minute generated batches.
+
+### `large-group-pressure/v1`
+
+- Generator: `generate_large_group_pressure_family` (generator version `1`, workload-profile version `1`).
+- Size curve: six consecutive cases share one size, ordered by execution cost at 10, 16, 20, 32, 50, 64, 100, 128,
+  and 200 members. Metadata distinguishes the 16/32/64/128 anchors from the 10/20/50/100/200 boundaries. A complete
+  size/arm catalog is therefore 54 cases; larger case counts repeat the stable catalog under new seeded choices.
+- Administrator curve: every six-case size block covers founder-only, three-admin, approximately 10%, approximately
+  50%, and all-member administrator populations. Administrator population and active committer width are separate:
+  a dense administrator group can still run a two- or eight-committer workload. Regimes rotate across arms by size,
+  while the competing and mixed arms never receive founder-only because their contract requires an actual race.
+- Workload metadata: every generated input and report records size tier, member count, initial/final admin counts,
+  committer mode/count, authored application count, workload commit count, traffic profile, formation, and disruption.
+  Authored application count is distinct from recipient fanout: one 200-member send round creates 39,800 directed
+  recipient deliveries before the active probe.
+- Oracle: every case requires exact canonical equivalence across every live member and pins the final member count,
+  administrator policy, group profile, input closure, and active decryptability. Exact application payload multisets
+  are checked on a deterministic cohort of at most six clients containing representatives of the founder, admin,
+  committer, ordinary-member, late-join/re-add, and roster-tail roles. Priority roles are selected before the cohort is
+  roster-ordered, so truncation cannot silently discard the re-added or tail representative. This bounds probe cost
+  without weakening whole-group state and pending-work checks.
+- Join boundary: incremental-growth and remove/re-add arms name the existing welcome-join harness condition directly.
+  Every late joiner must retain exactly its own transport-deferred join commit and no other pending work; all other
+  clients must have no pending work.
+
+The six arms are:
+
+1. **Bulk Application Fanout** — bulk create, one authored message per member, and two sequential profile commits.
+2. **Incremental Growth** — four founding members, bounded invite batches, final admin assignment, checkpoint traffic,
+   and a final profile commit.
+3. **Sparse-Admin Sequential** — sequential profile commits interspersed with traffic plus a non-admin authorization
+   rejection whenever the selected admin regime leaves a non-admin.
+4. **Competing Commits** — up to sixteen active admins race same-epoch profile commits under seeded reorder and one
+   duplicate, followed by commit-heavy application traffic and a canonical pinning commit.
+5. **Mixed Interleaved** — application traffic before and after a seeded multi-admin commit wave, followed by a
+   canonical pinning commit.
+6. **Admin Handoff / Churn / Restart** — the founder hands authority to a successor, the successor removes a member,
+   restarts before delivery settles, re-adds the member, and verifies the rejoined non-admin cannot mutate policy.
+
+`mid_size_application_heavy_canary_passes_strict_oracles` and
+`mid_size_incremental_join_canary_passes_strict_oracles` are the ordinary 10-member executable gates; the latter
+exercises the retained-join pending-work condition. Generator tests compile the complete 54-case catalog without
+executing the expensive large/xlarge cases. Run 32/64-member blocks in nightly isolated workers and keep
+128/200-member execution scheduled or manual until measured budgets justify wider promotion.
 
 ### `convergence-chaos/v1`
 

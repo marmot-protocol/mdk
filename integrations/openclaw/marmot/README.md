@@ -46,9 +46,8 @@ Prerequisites:
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | bash
-```
+Use the canonical [White Noise + Agents quickstart](../../README.md#openclaw)
+for the current guided install command and the steps to finish in White Noise.
 
 The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
 tarball, runs `openclaw plugins install`, enables the `marmot` channel, starts a
@@ -59,11 +58,11 @@ Set `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`, and `WN_AGENT_VERSION` (or the
 legacy `WN_AGENT_SHA` alias) to install a non-default release asset, matching
 the Hermes installer.
 
-For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
-an `npub` or raw hex public key:
+For repeatable noninteractive setup, pass the White Noise owner as either an
+`npub` or raw hex public key:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
@@ -73,7 +72,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 `0600`, then use a pinned release URL:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.9/install-openclaw-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh" | \
   bash -s -- \
     --yes \
     --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \

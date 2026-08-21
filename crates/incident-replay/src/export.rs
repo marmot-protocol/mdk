@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::error::Category;
 
 /// The epoch-machine state an engine enters when its group is blocked pending a
 /// verified repair. Goggles derives its error-severity `epoch_state_transition`
@@ -441,11 +442,44 @@ impl EventKind {
     }
 }
 
+/// The top-level fields of [`AgentStateExport`] — the document's recognized
+/// markers. Every modelled field defaults, and unknown fields are ignored, so
+/// without a marker any JSON object at all would deserialize into an empty
+/// export and classify `Healthy`. Requiring *one* keeps the leniency that
+/// matters (a sparse export, a future field, an export whose sections this
+/// adapter ignores) while refusing a document that shows no evidence of being an
+/// export. Keep in step with the struct.
+const EXPORT_MARKERS: [&str; 3] = [
+    "events",
+    "derived_projections",
+    "normalized_scenario_history",
+];
+
 /// Parse a Goggles `agent-state.json` export.
 pub fn parse(json: &str) -> Result<AgentStateExport, ParseError> {
-    let probe = serde_json::from_str::<BTreeMap<String, serde::de::IgnoredAny>>(json);
-    if probe.is_ok_and(|object| object.contains_key("t")) {
-        return Err(ParseError::StreamDiscriminator);
+    match serde_json::from_str::<BTreeMap<String, serde::de::IgnoredAny>>(json) {
+        Ok(object) => {
+            if object.contains_key("t") {
+                return Err(ParseError::StreamDiscriminator);
+            }
+            if !EXPORT_MARKERS
+                .into_iter()
+                .any(|marker| object.contains_key(marker))
+            {
+                return Err(ParseError::UnrecognizedDocument);
+            }
+        }
+        // Well-formed JSON that is not an object. The probe deserializes a map
+        // of ignored values, so this is the only data error it can produce, and
+        // it has to be rejected here: serde also accepts a struct in its
+        // *sequence* form, so a bare `[]` would otherwise deserialize into the
+        // same empty (healthy) export a bare `{}` does.
+        Err(error) if error.classify() == Category::Data => {
+            return Err(ParseError::UnrecognizedDocument);
+        }
+        // Malformed JSON — fall through so the reported error keeps the
+        // position of the syntax that broke.
+        Err(_) => {}
     }
     Ok(serde_json::from_str(json)?)
 }
@@ -457,4 +491,11 @@ pub enum ParseError {
     Json(#[from] serde_json::Error),
     #[error("input carries the streamed NDJSON `t` discriminator, not an agent-state document")]
     StreamDiscriminator,
+    /// Deliberately names only what was expected: the rejected document is
+    /// operator-supplied forensic input and none of it belongs in a log line.
+    #[error(
+        "input is not an agent-state document: expected a JSON object carrying at least one of {}",
+        EXPORT_MARKERS.join(", ")
+    )]
+    UnrecognizedDocument,
 }

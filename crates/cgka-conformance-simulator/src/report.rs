@@ -863,6 +863,7 @@ mod tests {
             generator_version: "1".into(),
             seed: 7,
             case_index: 0,
+            workload_profile: None,
             subject: GeneratedSubjectKind::Engine,
             scenario: original.clone(),
             expected_outcomes: Vec::new(),
@@ -880,6 +881,7 @@ mod tests {
             generator_version: case.generator_version.clone(),
             seed: case.seed,
             case_index: case.case_index,
+            workload_profile: case.workload_profile.clone(),
             minimized_case: Some(minimized.clone()),
         });
 

@@ -340,26 +340,25 @@ The release job creates these assets:
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
-The installer assets are generated during the release and default to their own `wn-agent-v<version>` release tag and
-`<version>` asset suffix. When a non-draft WN Agent release completes, the workflow also refreshes a
-`wn-agent-latest` prerelease containing only installer scripts; those scripts are baked to the newest immutable
-`wn-agent-v<version>` assets. A latest-by-default install looks like:
+The installer assets are generated during the release and default to their own immutable `wn-agent-v<version>` release
+tag and `<version>` asset suffix. The historical `wn-agent-latest` release is immutable and is not an authoritative
+update channel. User-facing commands must name a versioned release. For the current release:
 
 ```sh
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | bash
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh | bash
 # Codex terminal harness
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh | bash
 # OpenCode terminal harness
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-opencode-marmot.sh | bash
 # Pi terminal harness
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-pi-marmot.sh | bash
 ```
 
-Use the versioned `wn-agent-v<version>` release URLs instead when you need a pinned install for repeatable testing or
-bug reports.
+Update this section as part of a deliberate release-version bump. Use the exact version from the installed connector
+when reporting bugs.
 
 These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin or
 harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific Marmot

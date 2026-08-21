@@ -5510,6 +5510,19 @@ impl MarmotApp {
         Err(AccountHomeError::SecretNotFound(account.account_id_hex.clone()).into())
     }
 
+    /// Drop an account's registered external signer.
+    ///
+    /// Only account *removal* may call this. The registration is what makes an
+    /// external-signer account reconcilable (see `has_external_signer`), so a
+    /// reversible sign-out has to keep it or the account could never be signed
+    /// back in without the host re-attaching its signer.
+    pub(crate) fn forget_external_signer(&self, account_id_hex: &str) {
+        self.external_signers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id_hex);
+    }
+
     pub(crate) fn has_external_signer(&self, account_id_hex: &str) -> bool {
         self.external_signers
             .lock()

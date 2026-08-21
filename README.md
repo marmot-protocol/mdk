@@ -19,7 +19,11 @@ conformance, diagnostics, and release material.
 
 ## Start Here
 
-If you are landing in this repo for the first time, read these files in order:
+If you want to use White Noise with an existing agent runtime, start with the
+[White Noise + Agents quickstart](integrations/README.md#get-started-white-noise--agents). It covers Hermes,
+OpenClaw, Codex, OpenCode, and Pi from install through the first encrypted chat.
+
+If you are developing Marmot itself, read these files in order:
 
 1. [`crates/cgka-engine/README.md`](crates/cgka-engine/README.md) - what the engine owns and what it leaves out.
 2. [`crates/cgka-conformance-simulator/README.md`](crates/cgka-conformance-simulator/README.md) - how scenarios,

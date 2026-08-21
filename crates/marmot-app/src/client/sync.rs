@@ -168,36 +168,96 @@ impl AppClient {
             .extend(effects.pending_convergence.iter().cloned());
     }
 
-    fn arm_recovery_from_effects(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+    /// Feed one effects batch's epoch-gap recovery evidence to the stall
+    /// detector: a resource refusal arms a replay, and an epoch passage reports
+    /// the movement that can end an unrecovered run.
+    ///
+    /// Both directions matter, and only this seam carries the second one. A
+    /// delivery reports the epoch it was *read* at, which is where the device
+    /// already sits; the epochs a fold, a confirmed publish, or a maintenance
+    /// tick's own evolution carried it *through* are read at by nothing, so
+    /// without the engine's own `EpochChanged` the detector cannot tell a device
+    /// that recovered from one that is still stuck (see
+    /// [`EpochStallDetector::observe_epoch_passage`](super::epoch_stall::EpochStallDetector::observe_epoch_passage)).
+    /// Of the three emitting sites only a convergence reorg spans more than one
+    /// epoch; publish-confirm and peer-commit ingest are always adjacent, which
+    /// is the case the passage rule is tuned for.
+    ///
+    /// Events are consumed in engine order, so a passage later in the same batch
+    /// supersedes an arm an earlier refusal just made: the durable
+    /// `epoch_stall_backfill_armed` row still records that the replay was armed,
+    /// while the detector's run counter starts over. That split is intended — the
+    /// arm happened and stays on the forensic record, and the run is what the
+    /// later evidence contradicts.
+    pub(crate) fn observe_recovery_evidence(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
         for event in &effects.events {
-            let cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
-                group_id, ..
-            } = event
-            else {
-                continue;
-            };
-            let Ok(record) = self.runtime.group_record(group_id) else {
-                continue;
-            };
-            // Recording the recovery intent before the worker performs the
-            // external full-history replay, and recording an escalation this
-            // arm raises, are both the shared decision handler's job: a
-            // resource-refusal arm counts toward the same unrecovered run as a
-            // deferred-delivery arm, and the detector raises the run's
-            // escalation only once, at whichever path happens to arm third.
-            let decision = self
-                .epoch_stall
-                .observe_resource_refusal(group_id.clone(), record.epoch);
-            self.apply_backfill_decision(
-                group_id,
-                record.epoch.0,
-                decision,
-                EpochStallBackfillTrigger::ResourceRefusal,
-            );
+            match event {
+                cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
+                    self.epoch_stall.observe_epoch_passage(group_id, *from, *to);
+                }
+                cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                    group_id,
+                    ..
+                } => {
+                    let Ok(record) = self.runtime.group_record(group_id) else {
+                        continue;
+                    };
+                    // Recording the recovery intent before the worker performs
+                    // the external full-history replay, and recording an
+                    // escalation this arm raises, are both the shared decision
+                    // handler's job: a resource-refusal arm counts toward the
+                    // same unrecovered run as a deferred-delivery arm, and the
+                    // detector raises the run's escalation only once, at
+                    // whichever path happens to arm third.
+                    let decision = self
+                        .epoch_stall
+                        .observe_resource_refusal(group_id.clone(), record.epoch);
+                    self.apply_backfill_decision(
+                        group_id,
+                        record.epoch.0,
+                        decision,
+                        EpochStallBackfillTrigger::ResourceRefusal,
+                    );
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// Apply the publish gate to `effects`, observing the same batch's
+    /// epoch-gap recovery evidence first.
+    ///
+    /// Every publishing seam must reach the gate through this rather than
+    /// calling `fail_if_publish_failed` directly. A
+    /// `TransportObjectResourceRefused` is buffered only after its durable
+    /// retention row is already deleted, and an effects batch carries its
+    /// events to the app exactly once — so a refusal a pass does not arm on can
+    /// never be re-observed. Gating first returns early and drops it for good;
+    /// arming first survives the caller's `?` because it is a field mutation
+    /// plus a durable audit row, not summary state. The two conditions are
+    /// correlated rather than independent: these seams publish, so the failure
+    /// and the refusal ride the same effects. An `EpochChanged` passage is
+    /// one-shot in the same batch, and losing it costs the opposite mistake —
+    /// a device that recovered stays counted as stuck — so it is observed on the
+    /// same side of the gate.
+    ///
+    /// Recovery evidence only. `remember_pending_convergence_groups` is
+    /// deliberately not paired here the way it is at the convergence and inbound
+    /// seams: the callers of this gate do not remember pending convergence on
+    /// their success paths either, so recording it on the failure path alone
+    /// would invent a scheduling contract they do not otherwise hold.
+    pub(crate) fn observe_recovery_evidence_then_fail_if_publish_failed(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        self.observe_recovery_evidence(effects);
+        fail_if_publish_failed(effects)
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
@@ -455,15 +515,15 @@ impl AppClient {
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
         self.remember_pending_convergence_groups(effects);
-        // Arm before the publish gate, not after. `drain()` empties the engine's
-        // in-memory event buffer one-shot and is these events' only source, and
-        // a `TransportObjectResourceRefused` is buffered only after its durable
-        // retention row is already deleted — so a refusal this pass does not arm
-        // on can never be re-observed. The arm survives the `?` because it is a
-        // field mutation plus a durable audit row, not summary state. The two
-        // conditions are correlated rather than independent: this drain
-        // publishes, so the failure and the refusal ride the same effects.
-        self.arm_recovery_from_effects(effects);
+        // Observe before the publish gate, not after. `drain()` empties the
+        // engine's in-memory event buffer one-shot and is these events' only
+        // source, and a `TransportObjectResourceRefused` is buffered only after
+        // its durable retention row is already deleted — so a refusal this pass
+        // does not arm on can never be re-observed. The arm survives the `?`
+        // because it is a field mutation plus a durable audit row, not summary
+        // state. The two conditions are correlated rather than independent: this
+        // drain publishes, so the failure and the refusal ride the same effects.
+        self.observe_recovery_evidence(effects);
         fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
         if effects.events.is_empty() {
@@ -1076,7 +1136,7 @@ impl AppClient {
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_groups(&effects.effects);
-        self.arm_recovery_from_effects(&effects.effects);
+        self.observe_recovery_evidence(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         // A delivery can contain several application events. If projection
@@ -1173,9 +1233,15 @@ impl AppClient {
                 .epoch_stall
                 .observe_resource_refusal(group_id.clone(), record.epoch),
             // Any other outcome carries no stall evidence, but it does tell the
-            // detector where this device now sits: a tracked group that leaves an
-            // epoch without arming at it has stopped failing to catch up, which
-            // ends its escalation run.
+            // detector where this device now sits. This is a landing position
+            // only: the epochs a folded commit carried the device *through* reach
+            // the detector as an `EpochChanged` passage, from this same delivery's
+            // effects in `observe_recovery_evidence`. The landing report stays
+            // because it is the fallback for movement no passage covers — an
+            // engine seam that advances a group without emitting `EpochChanged`,
+            // or a batch this delivery never sees — and because two landings at
+            // different epochs can end a run on their own. Where both fire they
+            // agree, since observing an epoch already recorded is a no-op.
             _ => {
                 self.epoch_stall
                     .observe_group_epoch(&group_id, record.epoch);
@@ -1696,11 +1762,25 @@ impl AppClient {
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
-        fail_if_publish_failed(&effects)?;
-        self.remember_pending_convergence_groups(&effects);
-        self.arm_recovery_from_effects(&effects);
-        self.remember_published_reports(&effects);
-        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        self.observe_scheduled_convergence_effects(group_id, &effects)
+            .await
+    }
+
+    /// Project one scheduled convergence batch's effects, split from the
+    /// advance itself so the projection is exercisable against a given batch of
+    /// effects.
+    pub(crate) async fn observe_scheduled_convergence_effects(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
+        self.remember_pending_convergence_groups(effects);
+        // Observe before the publish gate, for the reason spelled out in
+        // `observe_drained_session_events`.
+        self.observe_recovery_evidence(effects);
+        fail_if_publish_failed(effects)?;
+        self.remember_published_reports(effects);
+        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         let publish_new_message_notification =
             effects.published_app_messages.iter().any(|published| {
                 let group_id_hex = hex::encode(published.group_id.as_slice());
@@ -1723,7 +1803,7 @@ impl AppClient {
         let source_received_at = unix_now_seconds();
         let routes_dirty = self
             .observe_account_device_effects(
-                &effects,
+                effects,
                 &display_names,
                 &mut summary,
                 &source_message_id_hex,

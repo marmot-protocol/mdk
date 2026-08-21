@@ -57,7 +57,7 @@
         "type": "expect_update_admin_policy_error",
         "client": "alice",
         "admins": [],
-        "error": "invalid_admin_policy"
+        "error": "admin_policy"
       },
       {
         "type": "update_admin_policy",
@@ -178,7 +178,7 @@
       "step_index": 6,
       "client": "alice",
       "operation": "update_admin_policy",
-      "error": "invalid_admin_policy"
+      "error": "admin_policy"
     },
     {
       "type": "pending_resolution",

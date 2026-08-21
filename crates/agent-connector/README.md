@@ -100,120 +100,14 @@ users, make the gateway the directory owner and give the connector's shared grou
 are created `0640`. In split-container deployments, mount the same directory read-write in the gateway and read-only
 in the connector. Omitting `--media-allowed-root` deliberately leaves media sends disabled.
 
-## Hermes Install
+## Release Installs
 
-Versioned WN Agent builds publish the `wn-agent` binary, the Hermes Marmot plugin, and an installer script on GitHub
-Releases under `wn-agent-v*` tags. The `wn-agent-latest` release contains installer scripts that are refreshed to the
-newest WN Agent release. Hermes itself must already be installed.
+The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
+current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw, Codex,
+OpenCode, and Pi. Keep install commands there instead of duplicating them in this crate-level implementation guide.
 
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
-```
-
-For repeatable noninteractive setup:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
-```
-
-Use a versioned `wn-agent-v<version>` release URL when you need a pinned install for reproducible testing.
-
-The installer puts `wn-agent` in `~/.local/bin`, extracts the Hermes plugin to `~/.hermes/plugins/marmot`, and enables
-the plugin when the `hermes` launcher is on `PATH`. It also starts a same-user connector service where supported,
-bootstraps or reuses `~/.marmot-agents/hermes`, and patches only Marmot-specific Hermes config entries so existing
-connectors continue to work. The default service identity is connector-specific:
-`wn-agent-hermes.service` on Linux or `org.marmot.wn-agent.hermes` on macOS.
-
-Hermes-specific setup, development helpers, and phone-test commands live in
-[`integrations/hermes/marmot/README.md`](../../integrations/hermes/marmot/README.md).
-
-## OpenClaw Install
-
-The same WN Agent release publishes the OpenClaw Marmot channel plugin and installer:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | bash
-```
-
-For repeatable noninteractive setup:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
-```
-
-The OpenClaw installer follows the same release flow, but uses its own default connector home and service identity:
-`~/.marmot-agents/openclaw`, `wn-agent-openclaw.service` on Linux, or `org.marmot.wn-agent.openclaw` on macOS. It
-installs/enables the OpenClaw plugin and updates only `channels.marmot` in OpenClaw config so existing channels
-continue to work.
-
-## Codex Harness Install
-
-The same WN Agent release publishes the `wn-codex` harness binary and installer. Codex itself must already be installed
-and authenticated.
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh" | bash
-```
-
-For repeatable noninteractive setup:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-codex-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
-```
-
-The Codex installer creates or reuses the isolated agent home at `~/.marmot-agents/codex`, writes a private
-`wn-codex.env`, and starts same-user `wn-agent` and `wn-codex` services where supported. Its connector service is
-`wn-agent-codex.service` on Linux or `org.marmot.wn-agent.codex` on macOS. Codex-specific configuration and
-development commands live in
-[`integrations/codex/marmot/README.md`](../../integrations/codex/marmot/README.md).
-
-## OpenCode Harness Install
-
-The same WN Agent release publishes the `wn-opencode` harness binary and installer. OpenCode itself must already be
-installed.
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | bash
-```
-
-For repeatable noninteractive setup:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
-```
-
-The OpenCode installer creates or reuses the terminal-harness agent home at `~/.marmot-agents/harnesses`, writes a
-private `wn-opencode.env`, and starts a same-user `wn-opencode` service where supported. The backing `wn-agent` service
-uses `wn-agent-harnesses.service` on Linux or `org.marmot.wn-agent.harnesses` on macOS. `WN_OPENCODE_MAX_REPLY_BYTES`
-defaults to 30000 bytes per Marmot reply chunk.
-
-## Pi Harness Install
-
-The same WN Agent release publishes the `wn-pi` harness binary and installer. Pi itself must already be installed and
-authenticated.
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | bash
-```
-
-For repeatable noninteractive setup:
-
-```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
-```
-
-The Pi installer creates or reuses the isolated agent home at `~/.marmot-agents/pi`, writes a private `wn-pi.env`,
-and starts same-user `wn-agent` and `wn-pi` services where supported. Its connector service is `wn-agent-pi.service`
-on Linux or `org.marmot.wn-agent.pi` on macOS. Pi sessions default to
-`~/.marmot-agents/pi/dev/pi-sessions`, and `WN_PI_MAX_REPLY_BYTES` defaults to 30000 bytes per Marmot reply chunk.
-
-Pi-specific configuration and development commands live in
-[`integrations/pi/marmot/README.md`](../../integrations/pi/marmot/README.md).
+Connector-specific configuration, manual setup, security notes, and development workflows remain in each integration
+README under [`integrations/`](../../integrations/README.md).
 
 ## Cutting A WN Agent Release
 

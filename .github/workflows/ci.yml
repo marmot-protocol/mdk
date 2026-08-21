@@ -50,6 +50,9 @@ jobs:
       - name: Campaign image toolchain gate
         run: ./scripts/check_campaign_toolchain.sh
 
+      - name: Agent install documentation gate
+        run: ./scripts/check_agent_install_docs.sh
+
   rust-audit:
     name: Rust audit
     runs-on: ubuntu-latest

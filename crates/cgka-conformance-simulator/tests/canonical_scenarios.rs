@@ -2388,6 +2388,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
         generator_version: "1".into(),
         seed: 99,
         case_index: 0,
+        workload_profile: None,
         subject: cgka_conformance_simulator::GeneratedSubjectKind::Engine,
         expected_outcomes: vec![TraceExpectation::ClientState {
             client: "alice".into(),
