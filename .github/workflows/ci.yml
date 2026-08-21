@@ -53,6 +53,25 @@ jobs:
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh
 
+  rust-audit:
+    name: Rust audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cargo-audit@0.22.1
+
+      - name: Audit Rust dependencies
+        run: cargo audit --locked
+
   terminal-harness-installers:
     name: Terminal harness installer tests
     runs-on: ubuntu-latest
