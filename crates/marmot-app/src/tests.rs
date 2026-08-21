@@ -9659,7 +9659,7 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // Maintenance then confirms a recovered evolution, 10 -> 11.
     client
-        .observe_maintenance_effects(&an_epoch_passage(&group_id, 10, 11))
+        .observe_recovery_evidence_then_summarize_maintenance(&an_epoch_passage(&group_id, 10, 11))
         .expect("a maintenance batch carrying only an epoch passage summarizes cleanly");
 
     // A peer fold carries the device on to 12. Only a detector that heard the

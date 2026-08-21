@@ -678,19 +678,32 @@ impl AppClient {
             return Ok(maintenance_run_summary_from_account(summary));
         }
         let effects = self.runtime.run_due_maintenance().await?;
-        self.observe_maintenance_effects(&effects)
+        self.observe_recovery_evidence_then_summarize_maintenance(&effects)
     }
 
-    /// Project one maintenance tick's effects, split from the tick itself so the
-    /// projection is exercisable against a given batch of effects.
+    /// Observe one maintenance tick's recovery evidence, then summarize the
+    /// tick — split from the tick itself so the pair is exercisable against a
+    /// given batch of effects.
     ///
     /// A maintenance tick publishes: it drains a recovered staged evolution and
     /// confirms it, so this batch can carry an `EpochChanged` for a group the
     /// stall detector is tracking. That passage is one-shot in these effects and
     /// reaches the detector nowhere else — a tick's own recovery is invisible to
-    /// every delivery-driven seam — so observe it here, ahead of the summary
-    /// build that can return early.
-    pub(crate) fn observe_maintenance_effects(
+    /// every delivery-driven seam.
+    ///
+    /// Hence the order the name states, and the reason this is one function
+    /// rather than two calls at the seam: the summary build reads storage and so
+    /// can return early, and an `Err` reached before the observation would drop
+    /// that passage for good. It is the same hazard
+    /// [`Self::observe_recovery_evidence_then_fail_if_publish_failed`] exists
+    /// for, and it gets the same answer — a name that fixes the order.
+    ///
+    /// A tick can also *arm*, from a `TransportObjectResourceRefused` riding the
+    /// same batch. Nothing executes that arm here: the worker does not run the
+    /// pending backfill after a tick, so the intent waits for the next
+    /// delivery-driven seam to drain it. The arm and its audit row are durable
+    /// meanwhile, so the wait costs latency, not the recovery.
+    pub(crate) fn observe_recovery_evidence_then_summarize_maintenance(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
