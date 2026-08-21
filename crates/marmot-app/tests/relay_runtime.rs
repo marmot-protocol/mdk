@@ -8462,6 +8462,100 @@ async fn app_runtime_sign_out_and_wipe_rejects_tracked_only_account() {
 }
 
 #[tokio::test]
+async fn app_runtime_wipe_drops_external_signer_registration() {
+    // A wipe removes the account's footprint from this device, and the host
+    // callback handle registered for its external signer is part of that
+    // footprint. If it outlived the wipe, a later record for the same npub
+    // would silently sign with the stale handle instead of reporting that no
+    // signer is attached.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
+
+    runtime
+        .login_external_signer(
+            account_id.clone(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(&url)],
+                bootstrap_relays: vec![endpoint(&url)],
+                discovery_relays: vec![endpoint(&url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    // Re-add the same npub as an external-signer record without re-attaching a
+    // signer. Work that needs a signature must now report the signer as
+    // unavailable rather than reuse the wiped account's handle.
+    home.add_external_signer_account(&account_id).unwrap();
+    let error = runtime
+        .delete_key_package(&account_id, &"11".repeat(32), vec![endpoint(&url)])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::ExternalSignerUnavailable(id) if *id == account_id),
+        "a wiped account's external signer registration must not survive, got {error:?}"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_keeps_external_signer_registration() {
+    // The other half of the wipe-side drop: a reversible sign-out keeps the
+    // registration. Reconcile only reactivates an external-signer account whose
+    // signer is still registered, so forgetting it here would strand the
+    // account signed out until the host re-attached its signer.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
+
+    runtime
+        .login_external_signer(
+            account_id.clone(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(&url)],
+                bootstrap_relays: vec![endpoint(&url)],
+                discovery_relays: vec![endpoint(&url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .sign_out(
+            &account_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let signed_in = runtime.sign_in_account(&account_id).await.unwrap();
+    assert!(!signed_in.signed_out);
+    assert!(
+        signed_in.running,
+        "sign-in must reactivate the worker with the signer registered by the original login"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     // mdk#477: a non-destructive sign-out must clean up the relay
     // KeyPackages (so strangers can't gift-wrap a Welcome while signed out)

@@ -4518,6 +4518,12 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            // The account no longer exists on this device, so the host callback
+            // handle it registered must not outlive it. This runs only after
+            // the removal commit point: a removal that failed leaves the
+            // account live, and a live external-signer account still needs its
+            // signer to reconcile.
+            self.app.forget_external_signer(&account.account_id_hex);
             Ok(())
         }
         .await;
