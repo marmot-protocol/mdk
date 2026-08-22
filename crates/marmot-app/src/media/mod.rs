@@ -18,6 +18,7 @@ mod blossom;
 mod crypto;
 mod group_image;
 mod host_safety;
+pub use host_safety::permit_loopback_blob_origin;
 
 use blossom::{
     blossom_content_hash_from_url, upload_blossom_blob, upload_blossom_blob_with_content_type,
@@ -770,7 +771,11 @@ async fn fetch_encrypted_media_blob(
         // production build: skip it rather than GETting the local host. The
         // candidate may come from a remote-admin policy endpoint or a
         // sender-chosen locator, so the gate applies to both.
-        candidates.retain(|candidate| !is_loopback_http_endpoint(candidate));
+        // …except an origin this same process serves, named explicitly by the application.
+        candidates.retain(|candidate| {
+            !is_loopback_http_endpoint(candidate)
+                || host_safety::is_permitted_loopback_endpoint(candidate)
+        });
     }
     if candidates.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(

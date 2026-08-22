@@ -104,6 +104,57 @@ pub(crate) fn parse_profile_image_redirect_url(
     Ok(url)
 }
 
+/// Loopback blob origins this process serves itself.
+///
+/// A blob endpoint is group state, so a group admin chooses it, and
+/// `allow_loopback_blob_endpoints` makes that choice reach the local host of every member.
+/// This is the narrow alternative for an application that runs its own blob service on
+/// loopback: it names that exact origin, and every other loopback address stays refused no
+/// matter who put it in group state.
+static PERMITTED_LOOPBACK_ORIGINS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn permitted_origins() -> &'static std::sync::Mutex<Vec<String>> {
+    PERMITTED_LOOPBACK_ORIGINS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Permits one loopback origin, given as `http://127.0.0.1:PORT`.
+///
+/// A property of the process rather than of an account or a group: it names a service this
+/// same program is running. Call it before opening an app.
+pub fn permit_loopback_blob_origin(origin: &str) {
+    if let Ok(url) = Url::parse(origin)
+        && let Some(origin) = loopback_origin(&url)
+        && let Ok(mut permitted) = permitted_origins().lock()
+        && !permitted.contains(&origin)
+    {
+        permitted.push(origin);
+    }
+}
+
+/// `scheme://host:port` for a loopback HTTP URL, or nothing if it is not one.
+fn loopback_origin(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_owned();
+    if url.scheme() != "http" || !is_loopback_host(url.host()?) {
+        return None;
+    }
+    Some(format!("http://{host}:{}", url.port_or_known_default()?))
+}
+
+pub(crate) fn is_permitted_loopback_url(url: &Url) -> bool {
+    let Some(origin) = loopback_origin(url) else {
+        return false;
+    };
+    permitted_origins()
+        .lock()
+        .map(|permitted| permitted.contains(&origin))
+        .unwrap_or(false)
+}
+
+pub(crate) fn is_permitted_loopback_endpoint(raw: &str) -> bool {
+    Url::parse(raw.trim()).is_ok_and(|url| is_permitted_loopback_url(&url))
+}
+
 pub(crate) fn validate_blossom_fetch_url(
     url: &Url,
     allow_loopback_http: bool,
@@ -122,7 +173,12 @@ pub(crate) fn validate_blossom_fetch_url(
     let host = url.host().ok_or("URL must include a host")?;
     match url.scheme() {
         "https" => validate_public_or_allowed_loopback_host(host, false),
-        "http" if allow_loopback_http && is_loopback_host(host) => Ok(()),
+        "http"
+            if is_loopback_host(host)
+                && (allow_loopback_http || is_permitted_loopback_url(url)) =>
+        {
+            Ok(())
+        }
         "http" => Err("URL scheme must be https".into()),
         _ => Err("URL scheme must be https".into()),
     }

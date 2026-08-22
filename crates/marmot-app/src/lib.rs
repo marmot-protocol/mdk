@@ -171,6 +171,7 @@ pub use ids::{
 /// Re-exported so FFI/CLI consumers can name the audit data mode without
 /// depending on `marmot-forensics` directly.
 pub use marmot_forensics::AuditDataMode;
+pub use media::permit_loopback_blob_origin;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
