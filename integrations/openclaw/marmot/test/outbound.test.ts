@@ -36,6 +36,7 @@ interface SendFinalCall {
   groupIdHex: string;
   text: string;
   replyToMessageIdHex?: string | null;
+  idempotencyKey?: string;
 }
 
 interface SendMediaCall {
@@ -69,8 +70,15 @@ function stubClient(calls: ClientCalls, messageIdsHex: string[] = [HEX32("ab")])
       groupIdHex: string,
       text: string,
       replyToMessageIdHex?: string | null,
+      idempotencyKey?: string,
     ) {
-      calls.sendFinal.push({ accountIdHex, groupIdHex, text, replyToMessageIdHex });
+      calls.sendFinal.push({
+        accountIdHex,
+        groupIdHex,
+        text,
+        replyToMessageIdHex,
+        idempotencyKey,
+      });
       return { type: "final_sent", message_ids_hex: messageIdsHex };
     },
     async sendMedia(
@@ -105,6 +113,7 @@ describe("createMarmotMessageAdapter", () => {
       to: HEX32("cc"),
       text: "done",
       replyToId: HEX32("dd"),
+      deliveryQueueId: "turn-123:0",
     } as unknown as ChannelMessageSendTextContext;
 
     const result = await adapter.send!.text!(ctx);
@@ -115,12 +124,43 @@ describe("createMarmotMessageAdapter", () => {
       groupIdHex: HEX32("cc"),
       text: "done",
       replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: expect.stringMatching(/^marmot-final-v1:[0-9a-f]{64}$/),
     });
     expect(result.receipt.primaryPlatformMessageId).toBe(HEX32("ab"));
     expect(result.receipt.platformMessageIds).toEqual([HEX32("ab")]);
     expect(result.receipt.parts[0]).toMatchObject({ kind: "text", index: 0 });
     expect(result.receipt.sentAt).toBe(1234);
     expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
+  });
+
+  it("reuses the key for the same durable intent and fails closed without one", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+    });
+    const durableCtx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "retry-safe",
+      replyToId: HEX32("dd"),
+      deliveryQueueId: "turn-retry:0",
+    } as unknown as ChannelMessageSendTextContext;
+
+    await adapter.send!.text!(durableCtx);
+    await adapter.send!.text!(durableCtx);
+
+    const firstKey = calls.sendFinal[0]?.idempotencyKey;
+    expect(firstKey).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinal.map((call) => call.idempotencyKey)).toEqual([firstKey, firstKey]);
+
+    await expect(
+      adapter.send!.text!({
+        cfg: {},
+        to: HEX32("cc"),
+        text: "missing durable identity",
+      } as unknown as ChannelMessageSendTextContext),
+    ).rejects.toThrow("requires OpenClaw deliveryQueueId");
+    expect(calls.sendFinal).toHaveLength(2);
   });
 
   it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
@@ -162,6 +202,7 @@ describe("createMarmotMessageAdapter", () => {
       accountId: "personal",
       to: HEX32("cc"),
       text: "cross-account send",
+      deliveryQueueId: "cross-account-turn:0",
     } as unknown as ChannelMessageSendTextContext);
 
     expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
@@ -454,6 +495,7 @@ describe("createMarmotMessageAdapter", () => {
       cfg: {},
       to: HEX32("cc"),
       text: "deletable",
+      deliveryQueueId: "delete-test-turn:0",
     } as unknown as ChannelMessageSendTextContext;
     await adapter.send!.text!(ctx);
 
