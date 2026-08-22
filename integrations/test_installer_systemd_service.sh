@@ -49,7 +49,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 if [[ "$url" == *.sha256 ]]; then
-    printf '%s\n' fixture-hash >"$destination"
+    printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >"$destination"
 else
     : >"$destination"
 fi
@@ -57,7 +57,7 @@ EOF
 
 cat >"$mock_bin/shasum" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' fixture-hash
+printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 EOF
 
 cat >"$mock_bin/tar" <<'EOF'

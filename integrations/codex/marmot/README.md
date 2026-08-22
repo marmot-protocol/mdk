@@ -6,6 +6,9 @@ messages to [Codex](https://learn.chatgpt.com/) through the local
 activation, media handling, profile onboarding, live previews, MLS, or relay
 logic.
 
+For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
+[White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
+
 It uses Codex's documented non-interactive JSONL interface: a new group starts
 with `codex exec --json -`, and later messages resume the group's Codex thread
 with `codex exec resume --json <thread-id> -`.
@@ -28,8 +31,31 @@ the current guided install command and the steps to finish in White Noise.
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
+install_verified() (
+  set -eu
+  installer_url="$1"
+  checksum_url="$2"
+  shift 2
+  installer_script="${installer_url##*/}"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
+  elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
+  else
+    echo "error: need shasum or sha256sum to verify the installer" >&2
+    exit 1
+  fi
+  bash "$tmpdir/$installer_script" "$@"
+)
+
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+install_verified "$base_url/install-codex-marmot.sh" \
+  "$base_url/install-codex-marmot.sh.sha256" \
+  --yes --allow-welcomer npub1...
 ```
 
 The immutable release also publishes `install-codex-marmot.sh.sha256` for

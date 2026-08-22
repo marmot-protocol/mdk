@@ -25,14 +25,41 @@ Choose the runtime you already use:
 The guided installers prompt on the terminal for the White Noise account that
 may invite and message the agent. They install release `wn-agent-v0.9.14`, create
 an isolated White Noise identity for the selected connector, and start same-user
-services where supported.
+services where supported. Download each installer with its adjacent checksum,
+verify it, and only then execute the local file:
+
+```sh
+install_verified() (
+  set -eu
+  installer_url="$1"
+  checksum_url="$2"
+  shift 2
+  installer_script="${installer_url##*/}"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
+  elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
+  else
+    echo "error: need shasum or sha256sum to verify the installer" >&2
+    exit 1
+  fi
+  bash "$tmpdir/$installer_script" "$@"
+)
+
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+```
 
 ### Hermes
 
 Hermes 0.19.0 or newer must already be installed and working.
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | bash
+install_verified "$base_url/install-hermes-marmot.sh" \
+  "$base_url/install-hermes-marmot.sh.sha256"
 ```
 
 ### OpenClaw
@@ -40,7 +67,8 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.
 OpenClaw 2026.7.1 or newer and Node 22.19 or newer must already be installed.
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh | bash
+install_verified "$base_url/install-openclaw-marmot.sh" \
+  "$base_url/install-openclaw-marmot.sh.sha256"
 ```
 
 ### Codex
@@ -48,7 +76,8 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.
 Codex must already be installed, authenticated, and runnable as `codex`.
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh | bash
+install_verified "$base_url/install-codex-marmot.sh" \
+  "$base_url/install-codex-marmot.sh.sha256"
 ```
 
 ### OpenCode
@@ -56,7 +85,8 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.
 OpenCode 1.18.18 or newer must already be installed and runnable as `opencode`.
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-opencode-marmot.sh | bash
+install_verified "$base_url/install-opencode-marmot.sh" \
+  "$base_url/install-opencode-marmot.sh.sha256"
 ```
 
 ### Pi
@@ -64,7 +94,8 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.
 Pi must already be installed, authenticated, and runnable as `pi`.
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-pi-marmot.sh | bash
+install_verified "$base_url/install-pi-marmot.sh" \
+  "$base_url/install-pi-marmot.sh.sha256"
 ```
 
 ### Finish In White Noise
@@ -99,16 +130,18 @@ invitation and prompt authorization.
 
 ```sh
 OWNER_NPUB=npub1...
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-codex-marmot.sh | \
-  bash -s -- --yes --allow-welcomer "$OWNER_NPUB"
+install_verified "$base_url/install-codex-marmot.sh" \
+  "$base_url/install-codex-marmot.sh.sha256" \
+  --yes --allow-welcomer "$OWNER_NPUB"
 ```
 
 Replace `codex` in the URL with `openclaw`, `opencode`, or `pi`. Hermes keeps
 invite acceptance and message-sender authorization explicit:
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-hermes-marmot.sh | \
-  bash -s -- --yes --allow-welcomer "$OWNER_NPUB" --allow-user "$OWNER_NPUB"
+install_verified "$base_url/install-hermes-marmot.sh" \
+  "$base_url/install-hermes-marmot.sh.sha256" \
+  --yes --allow-welcomer "$OWNER_NPUB" --allow-user "$OWNER_NPUB"
 ```
 
 Every installer verifies the downloaded binary and plugin assets against the

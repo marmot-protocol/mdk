@@ -478,14 +478,82 @@ jobs:
           cat > "$notes" <<EOF
           WN Agent \`$version\` from MDK commit \`$GITHUB_SHA\`.
 
+          Install the latest WN Agent release with:
+
+          \`\`\`sh
+          set -eu
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest"
+
+          install_verified() (
+            set -eu
+            installer_url="\$1"
+            checksum_url="\$2"
+            shift 2
+            installer_script="\${installer_url##*/}"
+            tmpdir="\$(mktemp -d)"
+            trap 'rm -rf "\$tmpdir"' 0 HUP INT TERM
+            curl -fsSL "\$installer_url" -o "\$tmpdir/\$installer_script"
+            curl -fsSL "\$checksum_url" -o "\$tmpdir/\$installer_script.sha256"
+            if command -v shasum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && shasum -a 256 -c "\$installer_script.sha256")
+            elif command -v sha256sum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && sha256sum -c "\$installer_script.sha256")
+            else
+              echo "error: need shasum or sha256sum to verify the installer" >&2
+              exit 1
+            fi
+            bash "\$tmpdir/\$installer_script" "\$@"
+          )
+
+          # Hermes gateway
+          install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
+          # OpenClaw gateway
+          install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Codex terminal harness
+          install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
+          # OpenCode terminal harness
+          install_verified "\$base_url/install-opencode-marmot.sh" "\$base_url/install-opencode-marmot.sh.sha256"
+          # Pi terminal harness
+          install_verified "\$base_url/install-pi-marmot.sh" "\$base_url/install-pi-marmot.sh.sha256"
+          \`\`\`
+
           Install this exact WN Agent release with:
 
           \`\`\`sh
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-openclaw-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-codex-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-pi-marmot.sh | bash
+          set -eu
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"
+
+          install_verified() (
+            set -eu
+            installer_url="\$1"
+            checksum_url="\$2"
+            shift 2
+            installer_script="\${installer_url##*/}"
+            tmpdir="\$(mktemp -d)"
+            trap 'rm -rf "\$tmpdir"' 0 HUP INT TERM
+            curl -fsSL "\$installer_url" -o "\$tmpdir/\$installer_script"
+            curl -fsSL "\$checksum_url" -o "\$tmpdir/\$installer_script.sha256"
+            if command -v shasum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && shasum -a 256 -c "\$installer_script.sha256")
+            elif command -v sha256sum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && sha256sum -c "\$installer_script.sha256")
+            else
+              echo "error: need shasum or sha256sum to verify the installer" >&2
+              exit 1
+            fi
+            bash "\$tmpdir/\$installer_script" "\$@"
+          )
+
+          # Hermes gateway
+          install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
+          # OpenClaw gateway
+          install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Codex terminal harness
+          install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
+          # OpenCode terminal harness
+          install_verified "\$base_url/install-opencode-marmot.sh" "\$base_url/install-opencode-marmot.sh.sha256"
+          # Pi terminal harness
+          install_verified "\$base_url/install-pi-marmot.sh" "\$base_url/install-pi-marmot.sh.sha256"
           \`\`\`
 
           Assets:
@@ -619,11 +687,40 @@ jobs:
           Latest WN Agent installers. These scripts install WN Agent \`$version\` from immutable release \`$tag\`.
 
           \`\`\`sh
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-openclaw-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-codex-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-pi-marmot.sh | bash
+          set -eu
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag"
+
+          install_verified() (
+            set -eu
+            installer_url="\$1"
+            checksum_url="\$2"
+            shift 2
+            installer_script="\${installer_url##*/}"
+            tmpdir="\$(mktemp -d)"
+            trap 'rm -rf "\$tmpdir"' 0 HUP INT TERM
+            curl -fsSL "\$installer_url" -o "\$tmpdir/\$installer_script"
+            curl -fsSL "\$checksum_url" -o "\$tmpdir/\$installer_script.sha256"
+            if command -v shasum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && shasum -a 256 -c "\$installer_script.sha256")
+            elif command -v sha256sum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && sha256sum -c "\$installer_script.sha256")
+            else
+              echo "error: need shasum or sha256sum to verify the installer" >&2
+              exit 1
+            fi
+            bash "\$tmpdir/\$installer_script" "\$@"
+          )
+
+          # Hermes gateway
+          install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
+          # OpenClaw gateway
+          install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Codex terminal harness
+          install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
+          # OpenCode terminal harness
+          install_verified "\$base_url/install-opencode-marmot.sh" "\$base_url/install-opencode-marmot.sh.sha256"
+          # Pi terminal harness
+          install_verified "\$base_url/install-pi-marmot.sh" "\$base_url/install-pi-marmot.sh.sha256"
           \`\`\`
 
           Use the versioned \`$tag\` release URLs when you need a pinned install.
