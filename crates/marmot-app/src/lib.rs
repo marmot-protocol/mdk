@@ -499,6 +499,12 @@ type AppRuntime = AccountDeviceRuntime<
 #[cfg(test)]
 type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 
+/// Builds the `nostr-sdk` client an account publishes through, given its signer.
+///
+/// Supplied by an embedder that runs the runtime over a transport of its own.
+pub type AccountClientFactory =
+    Arc<dyn Fn(Arc<dyn nostr::NostrSigner>) -> NostrSdkClient + Send + Sync>;
+
 #[derive(Clone)]
 pub struct MarmotApp {
     root: PathBuf,
@@ -551,6 +557,11 @@ pub struct MarmotApp {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
+    account_client_factory: Option<AccountClientFactory>,
+    /// Whether [`MarmotApp::relay_plane`] came from the embedder rather than from this crate.
+    ///
+    /// Decides both who the transport belongs to and who is responsible for winding it down.
+    embedder_relay_plane: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1326,6 +1337,27 @@ impl MarmotApp {
         )
     }
 
+    /// Replaces the relay plane this app will use, everywhere it uses one.
+    ///
+    /// Call it before any account work. Pairs with [`MarmotRelayPlane::from_sdk_client`] to
+    /// run the runtime over an embedder-supplied transport. From here on the supplied plane
+    /// also backs [`MarmotApp::client`], which would otherwise open over a default plane and
+    /// put shared relay traffic on a connection the embedder does not control.
+    pub fn with_relay_plane(mut self, relay_plane: MarmotRelayPlane) -> Self {
+        let replaced = std::mem::replace(&mut self.relay_plane, relay_plane);
+        let ours = !self.embedder_relay_plane;
+        self.embedder_relay_plane = true;
+        // Constructing the default plane inside a runtime already started its router and
+        // notification forwarder, and those keep the old transport alive after the plane
+        // itself is dropped. Wind down the one this crate built; never touch one the caller
+        // supplied, since the caller may still be holding it. Outside a runtime nothing was
+        // started and there is nothing to wind down.
+        if ours && let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { replaced.shutdown().await });
+        }
+        self
+    }
+
     pub fn with_relays_and_config(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
@@ -1378,6 +1410,8 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            account_client_factory: None,
+            embedder_relay_plane: false,
         }
     }
 
@@ -1451,6 +1485,8 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            account_client_factory: None,
+            embedder_relay_plane: false,
         }
     }
 
@@ -1509,16 +1545,20 @@ impl MarmotApp {
     /// retrying.
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
         #[cfg(test)]
-        let relay_plane = self
-            .test_relay_client
-            .as_ref()
-            .map(|client| MarmotRelayPlane::new(None, client.clone()))
-            .unwrap_or_else(|| {
-                MarmotRelayPlane::full_history_with_loopback(
-                    self.config.allow_loopback_relay_endpoints,
-                )
-            });
-        #[cfg(not(test))]
+        if let Some(client) = &self.test_relay_client {
+            let relay_plane = MarmotRelayPlane::new(None, client.clone());
+            return self
+                .client_with_relay_plane(label, &relay_plane, None)
+                .await;
+        }
+        // An embedder that supplied a plane supplied the only transport this app may use.
+        // Its own lookback stands: the full-history default below is this crate's choice for
+        // a plane this crate built, not a property the caller's plane has to inherit.
+        if self.embedder_relay_plane {
+            return self
+                .client_with_relay_plane(label, &self.relay_plane, None)
+                .await;
+        }
         let relay_plane = MarmotRelayPlane::full_history_with_loopback(
             self.config.allow_loopback_relay_endpoints,
         );
@@ -5417,6 +5457,16 @@ impl MarmotApp {
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 
+    /// Sets the factory used to build each account's publishing client.
+    ///
+    /// Without it an app that supplied its own relay plane still has every account publish
+    /// go out over the default transport, because the per-account publishing client is built
+    /// here rather than taken from the plane.
+    pub fn with_account_client_factory(mut self, factory: AccountClientFactory) -> Self {
+        self.account_client_factory = Some(factory);
+        self
+    }
+
     fn relay_client_for_account_id(
         &self,
         account_id_hex: &str,
@@ -5436,7 +5486,10 @@ impl MarmotApp {
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {
-                let client = NostrSdkClient::builder().signer(signer).build();
+                let client = match &self.account_client_factory {
+                    Some(build) => build(signer),
+                    None => NostrSdkClient::builder().signer(signer).build(),
+                };
                 Arc::new(NostrSdkRelayClient::new(client))
             })
             .clone()

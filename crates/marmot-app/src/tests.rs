@@ -10787,3 +10787,68 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
     );
     runtime.shutdown().await;
 }
+
+#[test]
+fn client_opens_over_an_embedder_supplied_relay_plane() {
+    run_composed_app_runtime_test("embedder-relay-plane-client", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let supplied =
+            MarmotRelayPlane::from_sdk_client(NostrSdkClient::builder().build(), None, true);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_relay_plane(supplied.clone());
+
+        let client = app.client("alice").await.unwrap();
+
+        assert!(
+            client.relay_plane.is_same_plane(&supplied),
+            "client() opened over a plane of its own, so shared relay traffic would leave \
+             over a transport the embedder never supplied"
+        );
+    });
+}
+
+#[test]
+fn the_default_relay_plane_is_wound_down_when_it_is_replaced() {
+    run_composed_app_runtime_test("embedder-relay-plane-replace", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        // Built by this crate, and already running its router and notification forwarder,
+        // because construction happened inside a runtime.
+        let default_plane = app.relay_plane.clone();
+        assert!(!default_plane.is_shutting_down());
+
+        let supplied =
+            MarmotRelayPlane::from_sdk_client(NostrSdkClient::builder().build(), None, true);
+        let app = app.with_relay_plane(supplied.clone());
+
+        // The wind-down is async, so it runs as its own task rather than in the builder.
+        let mut wound_down = false;
+        for _ in 0..200 {
+            if default_plane.is_shutting_down() {
+                wound_down = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            wound_down,
+            "the replaced plane was dropped without being shut down, leaving its tasks on the \
+             old transport"
+        );
+
+        // A plane the caller supplied belongs to the caller, so a second replacement leaves
+        // it alone.
+        let second =
+            MarmotRelayPlane::from_sdk_client(NostrSdkClient::builder().build(), None, true);
+        let _app = app.with_relay_plane(second);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !supplied.is_shutting_down(),
+            "a supplied plane was shut down by this crate, though the embedder may still be \
+             using it"
+        );
+    });
+}
