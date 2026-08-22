@@ -70,7 +70,7 @@ jobs:
           tool: cargo-audit@0.22.1
 
       - name: Audit Rust dependencies
-        run: cargo audit --locked
+        run: cargo audit
 
   terminal-harness-installers:
     name: Terminal harness installer tests
