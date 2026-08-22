@@ -1,0 +1,5 @@
+# Generated/derived build artifacts. c-bindings.sh writes into output/ and
+# c-smoke.sh writes into build/. The checked-in include/marmot.h header is the
+# source of truth for the C surface (CI diff-gates it); nothing else here is.
+/build/
+/output/

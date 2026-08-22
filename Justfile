@@ -543,6 +543,14 @@ naming-gate:
         exit 1
     fi
 
+# Regenerate the checked-in C header from crates/marmot-c (CI diff-gates it).
+c-header:
+    cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c --output crates/marmot-c/include/marmot.h crates/marmot-c
+
+# Build marmot-c and compile+run the C smoke test (valgrind when available).
+c-smoke:
+    ./crates/marmot-c/c-smoke.sh
+
 # Keep convergence policy, resource, scheduler, and history-recovery constants
 # attached to reviewed convergence-constant ledger entries.
 convergence-ledger-gate:
