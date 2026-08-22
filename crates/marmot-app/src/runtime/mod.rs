@@ -2508,6 +2508,22 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Invites devices whose KeyPackages the caller already holds.
+    ///
+    /// [`Self::invite_members`] resolves one account to one KeyPackage, so an account with a
+    /// laptop and a phone joins as whichever published last. A host that knows an account's
+    /// devices supplies their KeyPackages here and every one of them becomes a member.
+    pub async fn invite_key_packages(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        key_packages: Vec<cgka_traits::engine::KeyPackage>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .invite_key_packages(account_ref, group_id, key_packages)
+            .await
+    }
+
     pub async fn retry_group_convergence(
         &self,
         account_ref: &str,

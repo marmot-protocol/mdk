@@ -196,6 +196,11 @@ pub(crate) enum AccountWorkerCommand {
         initial_admins: Vec<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    InviteKeyPackages {
+        group_id: GroupId,
+        key_packages: Vec<cgka_traits::engine::KeyPackage>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     RemoveMembers {
         group_id: GroupId,
         members: Vec<String>,
@@ -3006,6 +3011,37 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.exporter_secret(&group_id, &label, length);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::InviteKeyPackages {
+            group_id,
+            key_packages,
+            respond,
+        } => {
+            let telemetry = shared.app_performance_telemetry();
+            let result = client
+                .invite_key_packages_with_telemetry(&group_id, key_packages, &telemetry)
+                .await;
+            // A queued send returns `Ok` without having been published, and announcing group
+            // state for one would be announcing something that has not happened. The sibling
+            // arm below draws the line in the same place.
+            let canonical = result.as_ref().is_ok_and(|summary| {
+                summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
+            });
+            if canonical {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::InviteMembers {

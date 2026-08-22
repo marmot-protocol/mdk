@@ -1612,6 +1612,30 @@ impl AccountManager {
         Ok(result)
     }
 
+    pub async fn invite_key_packages(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        key_packages: Vec<cgka_traits::engine::KeyPackage>,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::InviteKeyPackages {
+                group_id: group_id.clone(),
+                key_packages,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        // Detached, like the other invite: the caller has its answer, and the account-wide
+        // catch-up that follows an invite is not something to hold them for.
+        self.spawn_invite_catch_up();
+        self.schedule_audit_log_tracker_update("invite_key_packages");
+        Ok(summary)
+    }
+
     pub async fn retry_group_convergence(
         &self,
         account_ref: &str,
