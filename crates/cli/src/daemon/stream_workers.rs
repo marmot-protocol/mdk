@@ -117,6 +117,7 @@ pub(crate) async fn start_stream_watch(
     let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
+        defaults.discovery_relays.clone(),
         account_home.clone(),
     ) {
         Ok(app) => app,
