@@ -81,8 +81,29 @@ wn-agent --version
 
 ## Invite Policy
 
-Production connectors accept pending group invites only when the MLS-authenticated welcomer is on the configured
-`--allow-welcomer` list. An empty allowlist rejects every invite.
+Invite policy is account-scoped and defaults to `allowlist`, preserving the existing behavior: a pending group invite
+is accepted only when its authenticated welcomer is on the account's configured `--allow-welcomer` list. An empty
+allowlist rejects every invite.
+
+Set a production invite policy while bootstrapping or reusing an account:
+
+```sh
+wn-agent bootstrap \
+  --home ~/.marmot-agent \
+  --invite-policy any-authenticated-direct
+```
+
+The available policies are:
+
+- `deny` — decline every invite while retaining any stored allowlist entries;
+- `allowlist` — accept only authenticated welcomers on the account allowlist;
+- `any-authenticated-direct` — accept any authenticated welcomer only when the resulting MLS group has exactly two
+  members (the agent and one peer);
+- `any-authenticated` — accept any authenticated welcomer, including invites to multi-party groups.
+
+Every policy fails closed when the Welcome has no authenticated welcomer. Invite policy controls group admission only;
+the Hermes, OpenClaw, or terminal-harness integration independently controls which admitted senders may invoke the
+agent and whether multi-party messages require activation.
 
 Local development may use `--dev-allow-any-invites` together with `--debug-controls`. The connector warns when this
 mode is active and accepts any authenticated welcomer, but it still rejects a welcome whose authenticated author is

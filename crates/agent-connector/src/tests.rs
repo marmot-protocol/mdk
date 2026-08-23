@@ -2,8 +2,8 @@
 
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
-    AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
-    AgentControlSendMaintenanceDisposition, read_envelope, write_frame,
+    AgentControlInvitePolicy, AgentControlProfileLookupStatus, AgentControlRequest,
+    AgentControlResponse, AgentControlSendMaintenanceDisposition, read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -2080,6 +2080,7 @@ fn allowlist_store_atomic_write_replaces_stale_temp_file() {
     store
         .write_record(&AllowlistRecord {
             account_id_hex: account_id_hex.clone(),
+            invite_policy: AgentControlInvitePolicy::Allowlist,
             welcomer_account_ids_hex: vec![welcomer_account_id_hex.clone()],
         })
         .unwrap();
@@ -2117,6 +2118,7 @@ fn allowlist_store_ignores_record_whose_account_id_does_not_match_path() {
     // `account_id_hex` claims to belong to account #99 (tampered/relocated file).
     let forged = serde_json::to_vec(&AllowlistRecord {
         account_id_hex: other_account_id_hex.clone(),
+        invite_policy: AgentControlInvitePolicy::Allowlist,
         welcomer_account_ids_hex: vec![welcomer_account_id_hex.clone()],
     })
     .unwrap();
@@ -2150,6 +2152,41 @@ fn allowlist_store_ignores_record_whose_account_id_does_not_match_path() {
         vec![welcomer_account_id_hex]
     );
     assert!(!store.record_path(&other_account_id_hex).exists());
+}
+
+#[test]
+fn invite_policy_defaults_to_allowlist_for_legacy_records_and_preserves_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AllowlistStore::new(dir.path());
+    let account_id_hex = format!("{:064x}", 1);
+    let welcomer_account_id_hex = format!("{:064x}", 2);
+    std::fs::create_dir_all(&store.dir).unwrap();
+    std::fs::write(
+        store.record_path(&account_id_hex),
+        serde_json::to_vec(&serde_json::json!({
+            "account_id_hex": account_id_hex.clone(),
+            "welcomer_account_ids_hex": [welcomer_account_id_hex.clone()]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.policy(&account_id_hex).unwrap(),
+        AgentControlInvitePolicy::Allowlist
+    );
+    assert_eq!(
+        store
+            .set_policy(&account_id_hex, AgentControlInvitePolicy::Deny)
+            .unwrap(),
+        AgentControlInvitePolicy::Deny
+    );
+    let record = store.read_record(&account_id_hex).unwrap();
+    assert_eq!(record.invite_policy, AgentControlInvitePolicy::Deny);
+    assert_eq!(
+        record.welcomer_account_ids_hex,
+        vec![welcomer_account_id_hex]
+    );
 }
 
 #[tokio::test]
@@ -2482,7 +2519,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
 }
 
 #[tokio::test]
-async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer() {
+async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welcomer() {
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2509,20 +2546,30 @@ async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer(
         agent_dir.path(),
         socket.clone(),
         vec![relay_url],
-        true,
-        true,
+        false,
+        false,
     )));
+    let policy = send_control_request(
+        &socket,
+        "req-direct-policy",
+        AgentControlRequest::InvitePolicySet {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        },
+    )
+    .await;
     assert!(matches!(
-        send_control_request(&socket, "req-ready", AgentControlRequest::AccountList)
-            .await
-            .payload,
-        AgentControlResponse::AccountList { .. }
+        policy.payload,
+        AgentControlResponse::InvitePolicy {
+            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+            ..
+        }
     ));
 
     let group_id = human_runtime
         .create_group(
             &human.account.account_id_hex,
-            "allow any invite",
+            "allow authenticated direct invite",
             std::slice::from_ref(&agent.account.account_id_hex),
             None,
         )
@@ -2539,13 +2586,121 @@ async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer(
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let human_dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let agent_app = MarmotApp::with_relay(agent_dir.path(), relay_url.clone());
+    let human_app = MarmotApp::with_relay(human_dir.path(), relay_url.clone());
+    let agent_setup_runtime = MarmotAppRuntime::new(agent_app.clone());
+    let human_runtime = MarmotAppRuntime::new(human_app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let third_setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = agent_setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = human_runtime.create_identity(setup).await.unwrap();
+    let third = human_runtime.create_identity(third_setup).await.unwrap();
+    agent_setup_runtime.shutdown().await;
+
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        agent_dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let policy = send_control_request(
+        &socket,
+        "req-direct-policy",
+        AgentControlRequest::InvitePolicySet {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        },
+    )
+    .await;
+    assert!(matches!(
+        policy.payload,
+        AgentControlResponse::InvitePolicy {
+            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+            ..
+        }
+    ));
+
+    let group_id = human_runtime
+        .create_group(
+            &human.account.account_id_hex,
+            "reject authenticated multiparty invite",
+            &[
+                agent.account.account_id_hex.clone(),
+                third.account.account_id_hex.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
+        !group.pending_confirmation && group.archived
+    })
+    .await;
+
+    human_runtime.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
 #[test]
-fn dev_allow_any_invites_still_requires_an_authenticated_welcomer() {
+fn invite_policies_require_an_authenticated_welcomer_and_enforce_scope() {
     assert!(crate::invite_policy::invite_policy_allows(
-        true, true, false
+        AgentControlInvitePolicy::AnyAuthenticated,
+        true,
+        false,
+        false,
     ));
     assert!(!crate::invite_policy::invite_policy_allows(
-        true, false, false
+        AgentControlInvitePolicy::AnyAuthenticated,
+        false,
+        false,
+        false,
+    ));
+    assert!(crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        true,
+        false,
+        true,
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        true,
+        false,
+        false,
+    ));
+    assert!(crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::Allowlist,
+        true,
+        true,
+        false,
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::Deny,
+        true,
+        true,
+        true,
     ));
 }
 

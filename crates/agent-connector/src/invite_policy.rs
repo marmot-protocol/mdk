@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use agent_control::AgentControlInvitePolicy;
 use cgka_traits::{GroupId, MemberId, engine::GroupEvent};
 use marmot_app::MarmotAppEvent;
 
@@ -361,24 +362,31 @@ impl AgentConnector {
         welcomer: Option<MemberId>,
     ) -> Result<(), ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let (welcomer_present, welcomer_allowlisted) = match welcomer {
-            Some(welcomer) => {
-                let allowlisted = if self.dev_allow_any_invites {
-                    false
-                } else {
-                    let welcomer_account_id_hex = hex::encode(welcomer.as_slice());
-                    self.allowlists
-                        .contains(&account.account_id_hex, &welcomer_account_id_hex)?
-                };
-                (true, allowlisted)
-            }
-            None => (false, false),
+        let policy = if self.dev_allow_any_invites {
+            AgentControlInvitePolicy::AnyAuthenticated
+        } else {
+            self.allowlists.policy(&account.account_id_hex)?
         };
-        let allowed = invite_policy_allows(
-            self.dev_allow_any_invites,
-            welcomer_present,
-            welcomer_allowlisted,
-        );
+        let welcomer_allowlisted = match (policy, welcomer.as_ref()) {
+            (AgentControlInvitePolicy::Allowlist, Some(welcomer)) => {
+                let welcomer_account_id_hex = hex::encode(welcomer.as_slice());
+                self.allowlists
+                    .contains(&account.account_id_hex, &welcomer_account_id_hex)?
+            }
+            _ => false,
+        };
+        let is_direct =
+            if policy == AgentControlInvitePolicy::AnyAuthenticatedDirect && welcomer.is_some() {
+                self.runtime
+                    .group_mls_state(&account.label, group_id)
+                    .await?
+                    .member_count
+                    == 2
+            } else {
+                false
+            };
+        let allowed =
+            invite_policy_allows(policy, welcomer.is_some(), welcomer_allowlisted, is_direct);
         if allowed {
             // A catch-up-owned worker returns AccountWorkerBusy as a
             // definitely-not-started result. Propagating it here is
@@ -451,9 +459,16 @@ impl AgentConnector {
 }
 
 pub(crate) fn invite_policy_allows(
-    dev_allow_any_invites: bool,
+    policy: AgentControlInvitePolicy,
     welcomer_present: bool,
     welcomer_allowlisted: bool,
+    is_direct: bool,
 ) -> bool {
-    welcomer_present && (dev_allow_any_invites || welcomer_allowlisted)
+    welcomer_present
+        && match policy {
+            AgentControlInvitePolicy::Deny => false,
+            AgentControlInvitePolicy::Allowlist => welcomer_allowlisted,
+            AgentControlInvitePolicy::AnyAuthenticatedDirect => is_direct,
+            AgentControlInvitePolicy::AnyAuthenticated => true,
+        }
 }

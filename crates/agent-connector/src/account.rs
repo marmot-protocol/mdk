@@ -160,4 +160,29 @@ impl AgentConnector {
                 .remove(&account.account_id_hex, &welcomer_account_id_hex)?,
         })
     }
+
+    pub(crate) fn invite_policy_response(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        Ok(AgentControlResponse::InvitePolicy {
+            account_id_hex: account.account_id_hex.clone(),
+            policy: self.allowlists.policy(&account.account_id_hex)?,
+        })
+    }
+
+    pub(crate) fn invite_policy_set_response(
+        &self,
+        account_id_hex: &str,
+        policy: agent_control::AgentControlInvitePolicy,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        Ok(AgentControlResponse::InvitePolicy {
+            account_id_hex: account.account_id_hex.clone(),
+            policy: self
+                .allowlists
+                .set_policy(&account.account_id_hex, policy)?,
+        })
+    }
 }

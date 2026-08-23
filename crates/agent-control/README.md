@@ -22,7 +22,7 @@ begin inputs is an error, and trying to begin another active stream with an occu
 
 ## What this crate does
 
-- Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, stream compose,
+- Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, invite policy, stream compose,
   allowlists, etc.).
 - Provides newline-delimited JSON framing with a 1 MiB per-frame cap.
 - Stays dependency-light: `serde` and Tokio IO only.
