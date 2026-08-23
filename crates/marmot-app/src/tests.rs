@@ -4276,6 +4276,34 @@ async fn key_package_deletion_routes_endpoints_through_relay_safety_policy() {
     );
 }
 
+#[test]
+fn configured_directory_relays_stay_separate_from_operational_relays() {
+    let directory = tempfile::tempdir().unwrap();
+    let operational = "wss://operational.example";
+    let discovery = "wss://directory.example";
+    let explicit = TransportEndpoint("wss://explicit.example".into());
+    let app = MarmotApp::with_relays_and_config(
+        directory.path(),
+        vec![operational.into()],
+        MarmotAppConfig::default().with_directory_relay_urls(vec![discovery.into()]),
+    );
+
+    assert_eq!(
+        app.relay_endpoints(),
+        vec![TransportEndpoint(operational.into())],
+        "directory configuration must not widen operational publication fanout"
+    );
+    assert_eq!(
+        app.directory_source_relays(&[]),
+        vec![TransportEndpoint(discovery.into())]
+    );
+    assert_eq!(
+        app.directory_source_relays(std::slice::from_ref(&explicit)),
+        vec![explicit],
+        "per-operation discovery relays must retain precedence"
+    );
+}
+
 #[tokio::test]
 async fn key_package_cutover_retains_current_cache_without_scheduling_replacement() {
     let directory = tempfile::tempdir().unwrap();

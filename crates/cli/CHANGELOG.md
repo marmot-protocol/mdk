@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Daemon-hosted directory and KeyPackage reads now honor configured discovery
+  relays independently from the operational relay set used for message
+  delivery.
+
 ## [0.9.14] - 2026-08-19
 
 ### Added
