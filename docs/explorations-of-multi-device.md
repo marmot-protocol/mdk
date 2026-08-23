@@ -2,7 +2,7 @@
 
 Status: exploratory and non-normative.
 
-Last updated: 2026-08-20.
+Last updated: 2026-08-23.
 
 This document preserves the current design discussion around multi-device Marmot accounts. It is an architecture
 exploration, not an interoperability specification. If any of these ideas become protocol behavior, the normative
@@ -40,6 +40,12 @@ until matching protocol text is adopted in `marmot-protocol/marmot`.
 - The KeyPackages and leaf signature keys added by one Commit must be distinct and must not duplicate a current leaf.
 - A valid same-account Add has ordinary rather than administrator-privileged convergence priority.
 
+The one-to-four proposal bound keeps a single same-account Commit small and bounds how many leaves one compromised
+device can mint per Commit; four additions plus the sponsoring leaf exactly fill the five-leaf per-account limit. The
+five-leaf limit is evaluated against canonical resulting state, so concurrent sibling Adds that individually fit but
+jointly exceed it resolve through ordinary convergence: the winning epoch stands, and the losing joiner rejects at
+Welcome validation because the resulting leaf count exceeds the limit.
+
 An account-identity proof establishes account-key authorization of a leaf signature key, not a human identity. The
 authorization chain is the combination of a current member's MLS-authenticated control of a leaf, the new leaf's
 account-key proof, exact equality of their account identities, and the current member's signature over the Commit.
@@ -76,8 +82,14 @@ candidate-parent rule; the joining device validates the authenticated pairing in
 - Enrollment is a durable per-group operation, not one cross-group transaction. The implementation records intent,
   stages and publishes the Commit under publish-before-apply, delivers the Welcome redundantly, validates the join,
   and records an authenticated acknowledgement.
+- The authenticated acknowledgement is signed by the joining device's post-join leaf signing key—the only key that
+  proves both identity and completed MLS admission—and binds the joined group id, epoch, staged KeyPackage reference,
+  and pairing session id. It travels over the shared transport rather than the pairing channel, whose keys are
+  memory-only.
 - Progress distinguishes pending, Commit published, Welcome delivered, joined, retryable failure, terminal failure,
-  and skipped. Lost acknowledgement retries the same Welcome rather than another Add. A Commit that loses
+  and skipped. Lost acknowledgement retries the same Welcome rather than another Add. Retrying the same Welcome
+  remains valid only while the joining device still holds the staged KeyPackage secret; if that staging is lost, the
+  enrollment item terminates as a terminal failure and is reconciled by a fresh pairing session. A Commit that loses
   convergence restarts from canonical state with a fresh KeyPackage.
 - Pairing channel keys may remain memory-only. Durable progress survives restart, but continuing unfinished work
   requires a newly authenticated pairing session that first reconciles already-completed membership.
@@ -113,9 +125,17 @@ Content bootstrap is not required for multi-device v1 interoperability or for a 
 an optional companion that may be omitted from the first implementation.
 
 If implemented, it is an explicitly selected, one-time direct transfer of accepted, locally retained application
-history over the authenticated pairing channel. It uses stable record ids, a typed versioned envelope, a per-group
-high-water mark, chunk hashes, and a final completion manifest. Imported records retain provenance and are represented
-as account-synchronized history, not as freshly MLS-verified traffic.
+history over the authenticated pairing channel. A group's transfer segment begins only after that group's join has
+been validated; history is never transferred for a group whose enrollment has not completed. It uses stable record
+ids, a typed versioned envelope, a per-group high-water mark, chunk hashes, and a final completion manifest. Imported
+records retain provenance and are represented as account-synchronized history, not as freshly MLS-verified traffic.
+The v1 envelope should be shaped so the same typed records embed verbatim into later journal and checkpoint carriers
+rather than forcing a second format or a migration of stored history.
+
+A compromised exporting device can fabricate history that the receiving device cannot detect cryptographically: it
+lacks historical epoch secrets and the attestation is by the exporter. Imported content is therefore strictly weaker
+than normally verified traffic, and implementations are expected to label its source device and trust level in the
+user interface.
 
 The transfer never includes a SQLCipher database, OpenMLS state, current or historical epoch secrets, sender
 ratchets, KeyPackage private keys, pending operations, or unaccepted raw input. Continuous synchronization, CRDT
@@ -224,11 +244,13 @@ baseline.
 
 ### Removal is a companion design
 
-Admission should not silently define removal. A later proposal might permit a same-account leaf to issue a
-Remove-only Commit for one of its sibling leaves. Removing an entire account remains an administrator action.
+The working baseline includes bounded same-account removal: a current leaf may commit Remove-only inline proposals
+targeting its own sibling leaves under a separately negotiated capability. Admission does not silently define
+account-wide removal. Removing an entire account from every group simultaneously remains future work.
 
 An identity-wide removal operation is useful only if it adds semantics beyond several leaf removals—for example, an
-identity tombstone that prevents a concurrently added sibling from keeping the account represented.
+identity tombstone that prevents a concurrently added sibling from keeping the account represented. No such semantics
+are proposed for the first version.
 
 ## 2. Pairing and batch group enrollment
 
@@ -246,7 +268,7 @@ once. The UX can nevertheless make the work feel like one bounded operation.
 7. The new device creates a fresh KeyPackage for each selected group.
 8. The existing device creates and publishes the per-group Add Commits and transfers the corresponding Welcomes.
 9. The new device processes only the Welcomes expected by the pairing manifest.
-10. Content bootstrap proceeds independently of MLS enrollment and may overlap it.
+10. Optional content bootstrap transfers each selected group's history only after that group's join validates.
 
 The existing device must be online long enough to authenticate the new endpoint, transfer the group catalog and
 KeyPackages, and create the Commits. Once a Commit and its `Welcome` have been delivered to the shared transport, the
@@ -575,20 +597,43 @@ is unlikely to be a good interoperable baseline or a complete live-sync system.
 
 ## 10. Open questions
 
+Questions resolved by the working baseline above have been removed. The remaining items are what a normative
+proposal in `marmot-protocol/marmot` still needs to settle.
+
+Baseline gaps raised during design review:
+
+- Should `marmot.same-account-add.v1` and `marmot.same-account-remove.v1` be negotiated as a pair—or collapsed into
+  one capability—so no group can enable same-account admission without also enabling reciprocal sibling removal?
+  Enabling Add without Remove lets a compromised device mint persistent leaves that only administrators can clean up.
+- What are the exact mechanics of enabling a *required* capability in an existing group: must every current member
+  consent through its own Update, or are non-supporting members removed? The upgrade flow must not silently change
+  anyone's membership.
+- How is an orphaned same-account leaf handled when no surviving sibling shares its group—for example, after the
+  sponsoring device archived or left? Is administrator-side per-group leaf listing sufficient discovery, or does this
+  force some private device-directory visibility into v1?
+- What recovery exists when lost or unreachable devices consume the per-account leaf budget so that remaining live
+  devices cannot enroll replacements? Is documented administrator cleanup acceptable for v1?
+- What exactly does `marmot.member.account-identity-proof.v2` sign—does it commit to the KeyPackage hash, preventing
+  proof reuse across KeyPackages sharing one signing key—and how does validation behave across account-key rotation?
+- What is the pairing-batch size bound, and how many group Commits may be in flight concurrently during one session?
+- What must the pairing approval dialog display to avoid confused-deputy approval of an entire batch: per-group cap
+  headroom, group count, and leaf-count impact at minimum?
+
+Content synchronization questions carried forward:
+
 - What history scope is offered by default: all retained, active groups, selected groups, or from-now-on?
 - What exact proof binds an MLS credential and a device synchronization key to the same Nostr account?
-- How is the same-account Add feature negotiated and introduced into existing groups?
-- What limits apply to leaves per account, additions per Commit, and pairing batch size?
-- Can a sibling remove another leaf, and how is account-wide removal made race-safe?
-- What is the smallest useful private device directory?
-- Should third-party invitation ever add more than one discovered KeyPackage?
 - Which private presentation fields synchronize, and which remain device-local?
 - What are the deterministic merge rules for edits, tombstones, drafts, pins, and read state?
-- How is an exported archive attested, and what trust claims does the receiving device show?
+- How is an exported archive attested beyond the exporter's own signature, given that fabrication by a compromised
+  exporting device is undetectable, and what trust claims does the receiving device show?
 - Which historical sync keys does a newly authorized or recovered device receive?
 - How are media retention, cache eviction, and missing encrypted objects represented?
 - What is the availability promise when no existing device is online?
 - How are snapshots compacted, garbage-collected, and recovered after partial upload?
+
+Scope and process questions:
+
 - Does P2Panda remove enough custom machinery to justify its integration and maturity risk?
 - Which parts of this design belong in the Marmot protocol versus MDK-local account orchestration?
 
