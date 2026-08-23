@@ -26,7 +26,9 @@ pub enum AgentControlInvitePolicy {
     Deny,
     #[default]
     Allowlist,
+    #[serde(alias = "any-authenticated-direct")]
     AnyAuthenticatedDirect,
+    #[serde(alias = "any-authenticated")]
     AnyAuthenticated,
 }
 
@@ -905,12 +907,29 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlMediaUpload,
-        AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
-        AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlInvitePolicy,
+        AgentControlMediaUpload, AgentControlProfileLookupStatus, AgentControlRequest,
+        AgentControlResponse, AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
         MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
         write_frame,
     };
+
+    #[test]
+    fn invite_policy_accepts_cli_aliases_without_changing_canonical_wire_values() {
+        assert_eq!(
+            serde_json::from_str::<AgentControlInvitePolicy>("\"any-authenticated-direct\"")
+                .unwrap(),
+            AgentControlInvitePolicy::AnyAuthenticatedDirect
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentControlInvitePolicy>("\"any-authenticated\"").unwrap(),
+            AgentControlInvitePolicy::AnyAuthenticated
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentControlInvitePolicy::AnyAuthenticatedDirect).unwrap(),
+            "\"any_authenticated_direct\""
+        );
+    }
 
     #[test]
     fn rich_context_golden_events_decode_and_deleted_targets_are_redacted() {

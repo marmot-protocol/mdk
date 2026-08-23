@@ -377,6 +377,9 @@ impl AgentConnector {
         };
         let is_direct =
             if policy == AgentControlInvitePolicy::AnyAuthenticatedDirect && welcomer.is_some() {
+                // This worker evaluates invites serially. Directness is an
+                // admission-time snapshot; later membership changes remain
+                // possible after the invite is accepted.
                 self.runtime
                     .group_mls_state(&account.label, group_id)
                     .await?

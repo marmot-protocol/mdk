@@ -2549,7 +2549,7 @@ async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welco
         false,
         false,
     )));
-    let policy = send_control_request(
+    let policy_response = send_control_request(
         &socket,
         "req-direct-policy",
         AgentControlRequest::InvitePolicySet {
@@ -2559,7 +2559,7 @@ async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welco
     )
     .await;
     assert!(matches!(
-        policy.payload,
+        policy_response.payload,
         AgentControlResponse::InvitePolicy {
             policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
             ..
@@ -2586,8 +2586,7 @@ async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welco
     let _ = server.await;
 }
 
-#[tokio::test]
-async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() {
+async fn assert_multiparty_invite_policy(policy: AgentControlInvitePolicy, expect_archived: bool) {
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2624,27 +2623,27 @@ async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() 
         false,
         false,
     )));
-    let policy = send_control_request(
+    let policy_response = send_control_request(
         &socket,
-        "req-direct-policy",
+        "req-multiparty-policy",
         AgentControlRequest::InvitePolicySet {
             account_id_hex: agent.account.account_id_hex.clone(),
-            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+            policy,
         },
     )
     .await;
     assert!(matches!(
-        policy.payload,
+        policy_response.payload,
         AgentControlResponse::InvitePolicy {
-            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+            policy: applied_policy,
             ..
-        }
+        } if applied_policy == policy
     ));
 
     let group_id = human_runtime
         .create_group(
             &human.account.account_id_hex,
-            "reject authenticated multiparty invite",
+            "authenticated multiparty invite",
             &[
                 agent.account.account_id_hex.clone(),
                 third.account.account_id_hex.clone(),
@@ -2655,13 +2654,23 @@ async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() 
         .unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
-        !group.pending_confirmation && group.archived
+        !group.pending_confirmation && group.archived == expect_archived
     })
     .await;
 
     human_runtime.shutdown().await;
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() {
+    assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticatedDirect, true).await;
+}
+
+#[tokio::test]
+async fn connector_policy_any_authenticated_accepts_multiparty_invite() {
+    assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticated, false).await;
 }
 
 #[test]

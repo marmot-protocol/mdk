@@ -98,7 +98,8 @@ The available policies are:
 - `deny` — decline every invite while retaining any stored allowlist entries;
 - `allowlist` — accept only authenticated welcomers on the account allowlist;
 - `any-authenticated-direct` — accept any authenticated welcomer only when the resulting MLS group has exactly two
-  members (the agent and one peer);
+  members (the agent and one peer); the member count is checked once, when the invite is confirmed, and does not
+  prevent later membership changes;
 - `any-authenticated` — accept any authenticated welcomer, including invites to multi-party groups.
 
 Every policy fails closed when the Welcome has no authenticated welcomer. Invite policy controls group admission only;
