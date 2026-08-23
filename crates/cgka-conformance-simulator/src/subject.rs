@@ -2369,6 +2369,20 @@ mod tests {
     }
 
     #[test]
+    fn an_admin_key_without_a_member_leaf_names_the_orphaned_member() {
+        // admin-policy-v1.md "Validation" refusals used to arrive as
+        // `EngineError::Other`, which this classifier can only call `other`.
+        // The engine now names the orphaned admin key, so the refusal carries
+        // its own verdict instead of the unclassified bucket's.
+        let (category, code) = classify_engine_error(&EngineError::UnknownMember {
+            group_id: cgka_traits::GroupId::new(vec![0xA5; 32]),
+            member: cgka_traits::MemberId::new(vec![0x11; 32]),
+        });
+        assert_eq!(category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(code, "unknown_member");
+    }
+
+    #[test]
     fn implicit_topology_preserves_legacy_client_identity_seeds() {
         let labels = vec!["alice".to_owned(), "bob".to_owned()];
         let subject = EngineHarnessSubject::new_with_topology(
