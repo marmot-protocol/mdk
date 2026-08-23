@@ -179,13 +179,13 @@ export interface ResolvedOutboundMediaUpload {
 }
 
 /**
- * Resolve the allowlist of local roots an outbound local-path send is confined
- * to. OpenClaw hands the channel the approved roots on the send ctx
- * (`mediaLocalRoots`, or `mediaAccess.localRoots`); when neither is present we
- * fall back to OpenClaw's default media-store roots. We never honor a `"any"`
- * sentinel here: the gateway reads and stages the source, so an unrestricted
- * source root would reintroduce the arbitrary-file-read this guard exists to
- * close. An empty configured allowlist means "nothing is allowed".
+ * Resolve the fallback allowlist used when an outbound local-path send has no
+ * host-provided reader. OpenClaw hands the channel the approved roots on the
+ * send ctx (`mediaLocalRoots`, or `mediaAccess.localRoots`); when neither is
+ * present we fall back to OpenClaw's default media-store roots. We never honor
+ * a `"any"` sentinel here: the gateway reads and stages the source, so an
+ * unrestricted source root would reintroduce the arbitrary-file-read this guard
+ * exists to close. An empty configured allowlist means "nothing is allowed".
  */
 function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly string[] {
   const configured = ctx.mediaLocalRoots ?? ctx.mediaAccess?.localRoots;
@@ -196,32 +196,53 @@ function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly
  * Resolve `ctx.mediaUrl` to a local `AgentControlMediaUpload` the connector can
  * read by path. Handles two cases the ctx can express with the real SDK types:
  *
- * 1. A local filesystem path or `file://` URL — read only through the send's
- *    allowlisted media roots (`readLocalFileFromRoots`), then copied to the
- *    connector-shared staging root. Without the source guard
+ * 1. Any source with a host-provided `mediaReadFile` accessor — read through
+ *    that already-authorized host capability and copied to the connector-
+ *    shared staging root. This includes local paths: the running host owns the
+ *    active agent's media policy, which may differ from this connector's pinned
+ *    SDK defaults.
+ * 2. A local filesystem path or `file://` URL with no host accessor — read only
+ *    through the send's allowlisted media roots (`readLocalFileFromRoots`), then
+ *    copied to the connector-shared staging root. Without the source guard
  *    an agent-influenced `mediaUrl` (e.g. `~/.ssh/id_rsa`) would let a prompt-
  *    injected agent exfiltrate any connector-host file into a group. This
  *    mirrors the inbound trust model, where downloaded media is re-staged under
  *    an allowlisted root before the agent's image tool can read it.
- * 2. A non-local URL with a `mediaReadFile` host accessor — the bytes are read
- *    through that already-authorized host reader and staged the same way.
  *
  * Returns `null` when the ctx provides only a remote URL and no buffer accessor;
  * the connector reads a path it cannot be given in that case (see Seam 2 note).
  *
- * Throws `LocalMediaAccessError` (from the SDK) when a local path cannot be read
- * from the allowlisted roots; the caller surfaces that as a failed send. A path
- * outside the roots is never opened — the allowlist check and the read are the
- * same operation — but the error does not distinguish that from an in-root read
- * failure, so treat it as "refused", not specifically "escaped the allowlist".
+ * When the host reader is absent, throws `LocalMediaAccessError` (from the SDK)
+ * if a local path cannot be read from the allowlisted roots; the caller surfaces
+ * that as a failed send. A path outside the roots is never opened — the allowlist
+ * check and the read are the same operation — but the error does not distinguish
+ * that from an in-root read failure, so treat it as "refused", not specifically
+ * "escaped the allowlist". Errors from a host reader propagate unchanged.
  */
 async function resolveOutboundMediaUpload(
   ctx: ChannelMessageSendMediaContext,
   writeTempMedia: (fileName: string, bytes: Buffer) => Promise<string>,
 ): Promise<ResolvedOutboundMediaUpload | null> {
   const { mediaUrl } = ctx;
-  if (isLocalMediaUrl(mediaUrl)) {
-    const localPath = mediaUrl.startsWith("file://") ? fileURLToPath(mediaUrl) : mediaUrl;
+  const local = isLocalMediaUrl(mediaUrl);
+  const localPath = local
+    ? mediaUrl.startsWith("file://")
+      ? fileURLToPath(mediaUrl)
+      : mediaUrl
+    : undefined;
+  const mediaReadFile = ctx.mediaReadFile ?? ctx.mediaAccess?.readFile;
+  if (mediaReadFile) {
+    const bytes = await mediaReadFile(mediaUrl);
+    const fileName = localPath
+      ? basename(localPath) || "attachment"
+      : basename(new URL(mediaUrl).pathname) || "attachment";
+    const path = await writeTempMedia(fileName, bytes);
+    return {
+      upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
+      cleanup: () => rm(path, { force: true }),
+    };
+  }
+  if (localPath) {
     // Defense against exfiltration via a tool/prompt-influenced path: the read
     // itself is confined to the allowlisted roots, so a path outside them is
     // never opened. Keep OpenClaw's source policy as the first layer; wn-agent
@@ -244,16 +265,6 @@ async function resolveOutboundMediaUpload(
     }
     const fileName = basename(localPath) || "attachment";
     const path = await writeTempMedia(fileName, read.buffer);
-    return {
-      upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
-      cleanup: () => rm(path, { force: true }),
-    };
-  }
-  const mediaReadFile = ctx.mediaReadFile;
-  if (mediaReadFile) {
-    const bytes = await mediaReadFile(mediaUrl);
-    const fileName = basename(new URL(mediaUrl).pathname) || "attachment";
-    const path = await writeTempMedia(fileName, bytes);
     return {
       upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
       cleanup: () => rm(path, { force: true }),
