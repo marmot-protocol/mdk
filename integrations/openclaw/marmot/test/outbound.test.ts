@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -366,6 +366,35 @@ describe("createMarmotMessageAdapter", () => {
       const stagedPath = calls.sendMedia[0]!.attachments[0]!.path;
       expect(stagedPath).toContain(join(tmpRoot, "staging"));
       await expect(access(stagedPath)).rejects.toThrow();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("removes staged plaintext when the permission adjustment fails", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    const stagingDir = join(tmpRoot, "staging");
+    try {
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: stagingDir,
+        chmodTempMedia: async () => {
+          throw new Error("chmod failed");
+        },
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "generated image",
+        mediaUrl: "/workspace/generated/photo.png",
+        mediaReadFile: async () => Buffer.from("host-authorized-bytes"),
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await expect(adapter.send!.media!(ctx)).rejects.toThrow(/chmod failed/);
+
+      expect(calls.sendMedia).toHaveLength(0);
+      expect(await readdir(stagingDir)).toEqual([]);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

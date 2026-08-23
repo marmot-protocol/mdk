@@ -31,6 +31,7 @@ cp "$plugin_dir/tsconfig.build.json" "$compat_root/"
 cp "$plugin_dir/vitest.config.ts" "$compat_root/"
 cp "$plugin_dir/index.ts" "$compat_root/"
 cp "$plugin_dir/setup-entry.ts" "$compat_root/"
+cp "$plugin_dir/openclaw.plugin.json" "$compat_root/"
 cp -R "$plugin_dir/src" "$compat_root/"
 cp -R "$plugin_dir/test" "$compat_root/"
 

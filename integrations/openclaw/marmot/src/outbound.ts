@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -25,6 +25,7 @@ import {
 // `latest` and `beta` OpenClaw channels. The `plugin-sdk/media-runtime` barrel
 // dropped `assertLocalMediaAllowed`/`getDefaultLocalRoots` in 2026.7.2-beta.
 import { readLocalFileFromRoots } from "openclaw/plugin-sdk/infra-runtime";
+import { extractOriginalFilename, getMediaDir } from "openclaw/plugin-sdk/media-runtime";
 import { getDefaultLocalRoots, LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 
 import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
@@ -50,6 +51,8 @@ export interface MarmotMessageAdapterDeps {
   writeTempMedia?: (fileName: string, bytes: Buffer) => Promise<string>;
   /** Override the connector-shared outbound staging directory (tests/deployments). */
   outboundMediaDir?: string;
+  /** Override the staged-file permission adjustment (tests). */
+  chmodTempMedia?: (path: string, mode: number) => Promise<void>;
 }
 
 /** Build an OpenClaw `MessageReceipt` from wn-agent's durable message ids. */
@@ -169,6 +172,18 @@ function isLocalMediaUrl(mediaUrl: string): boolean {
   return !/^[a-z][a-z0-9+.-]*:\/\//i.test(mediaUrl);
 }
 
+/** Restore a caller-facing name when OpenClaw has staged a buffer in its media store. */
+function localMediaFileName(localPath: string): string {
+  const storedName = basename(localPath) || "attachment";
+  const mediaRelativePath = relative(resolve(getMediaDir()), resolve(localPath));
+  const isManagedMedia =
+    mediaRelativePath === "" ||
+    (mediaRelativePath !== ".." &&
+      !mediaRelativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(mediaRelativePath));
+  return isManagedMedia ? extractOriginalFilename(storedName) : storedName;
+}
+
 /**
  * A resolved outbound media upload plus cleanup for the private copy staged in
  * the connector-shared outbound directory.
@@ -234,7 +249,7 @@ async function resolveOutboundMediaUpload(
   if (mediaReadFile) {
     const bytes = await mediaReadFile(mediaUrl);
     const fileName = localPath
-      ? basename(localPath) || "attachment"
+      ? localMediaFileName(localPath)
       : basename(new URL(mediaUrl).pathname) || "attachment";
     const path = await writeTempMedia(fileName, bytes);
     return {
@@ -263,7 +278,7 @@ async function resolveOutboundMediaUpload(
         "marmot: outbound media is not readable from the allowed local media roots",
       );
     }
-    const fileName = basename(localPath) || "attachment";
+    const fileName = localMediaFileName(localPath);
     const path = await writeTempMedia(fileName, read.buffer);
     return {
       upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
@@ -285,12 +300,20 @@ async function defaultWriteTempMedia(
   fileName: string,
   bytes: Buffer,
   outboundMediaDir = defaultOutboundMediaDir(),
+  chmodTempMedia: (path: string, mode: number) => Promise<void> = chmod,
 ): Promise<string> {
   await mkdir(outboundMediaDir, { recursive: true, mode: 0o700 });
   const safeName = basename(fileName || "attachment") || "attachment";
   const path = join(outboundMediaDir, `${randomUUID()}-${safeName}`);
   await writeFile(path, bytes, { flag: "wx", mode: 0o640 });
-  await chmod(path, 0o640);
+  try {
+    await chmodTempMedia(path, 0o640);
+  } catch (error) {
+    // Do not strand plaintext if the split-user permission adjustment fails
+    // before resolution can return its normal cleanup callback.
+    await rm(path, { force: true }).catch(() => undefined);
+    throw error;
+  }
   return path;
 }
 
@@ -306,7 +329,7 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
   const writeTempMedia =
     deps.writeTempMedia ??
     ((fileName: string, bytes: Buffer) =>
-      defaultWriteTempMedia(fileName, bytes, deps.outboundMediaDir));
+      defaultWriteTempMedia(fileName, bytes, deps.outboundMediaDir, deps.chmodTempMedia));
   // Lives in the adapter closure: maps each durable message id we return back to
   // the account+group it was sent to, so an agent delete can be routed by id.
   const sentTargets = new SentMessageTargetCache();
