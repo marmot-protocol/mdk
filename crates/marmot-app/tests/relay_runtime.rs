@@ -5121,7 +5121,10 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
         loop {
             let health = runtime.shared_services().relay_plane().relay_health().await;
             if health.directory_active_subscriptions == 1
-                && health.directory_completed_subscription_syncs == 1
+                // A relay recovery can legitimately complete another rebuild
+                // before this poll observes the initial one. This counter is
+                // monotonic, so waiting for exact equality races that recovery.
+                && health.directory_completed_subscription_syncs >= 1
             {
                 break health;
             }
@@ -5131,7 +5134,7 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
     .await
     .expect("directory subscriptions should complete asynchronously");
     assert_eq!(health.directory_active_subscriptions, 1);
-    assert_eq!(health.directory_completed_subscription_syncs, 1);
+    assert!(health.directory_completed_subscription_syncs >= 1);
     runtime.shutdown().await;
 }
 
