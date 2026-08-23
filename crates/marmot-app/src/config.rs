@@ -50,6 +50,14 @@ pub enum CursorPersistence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
     pub directory_max_future_skew: Duration,
+    /// Host-configured WebSocket relays used for Nostr directory reads such as
+    /// relay-list and KeyPackage discovery.
+    ///
+    /// These are deliberately separate from the app's operational relay URLs,
+    /// allowing a host to use different relay sets for discovery and message
+    /// delivery. Empty preserves the historical behavior of falling back to
+    /// the operational relay set.
+    pub directory_relay_urls: Vec<String>,
     pub service_endpoints: MarmotServiceEndpoints,
     /// Durable transport-cursor persistence policy. Defaults to
     /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
@@ -170,6 +178,7 @@ impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
+            directory_relay_urls: Vec::new(),
             service_endpoints: MarmotServiceEndpoints::compiled(),
             cursor_persistence: CursorPersistence::Advance,
             allow_loopback_blob_endpoints: false,
@@ -192,6 +201,12 @@ impl Default for MarmotAppConfig {
 impl MarmotAppConfig {
     pub fn with_directory_max_future_skew(mut self, skew: Duration) -> Self {
         self.directory_max_future_skew = skew;
+        self
+    }
+
+    /// Configure relays used only for Nostr directory and KeyPackage reads.
+    pub fn with_directory_relay_urls(mut self, relay_urls: Vec<String>) -> Self {
+        self.directory_relay_urls = relay_urls;
         self
     }
 

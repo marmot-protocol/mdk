@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-16
+updated: 2026-08-21
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -335,7 +335,7 @@ future inventory revision should encode machine-checked expected values where th
 | A6 | `epoch_stall.rs`; threshold/debounce/reset tests; next-event and audit backfill tests | M3.1 retained-relay threshold sweep; additional production cohorts |
 | A7 | `marmot-app/lib.rs`; `cold_restart_since_floor_permanently_drops_backlog_below_it`; `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed` | M2.3 long-offline retained-relay matrix |
 | A8 | `marmot-app/lib.rs`; since-floor malicious/future timestamp coverage | M3.1 explicit skew/cursor-reset Scenario IR family |
-| A9 | `epoch_stall.rs`; `escalates_when_arms_repeat_without_passing_cleanly_through_an_epoch`; `an_epoch_the_device_passes_through_cleanly_ends_the_arm_run`; `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`; `an_escalated_run_reports_once_however_long_it_keeps_arming`; `storm_collapse_suppression_is_not_an_arm`; `repeated_arming_without_recovery_escalates_exactly_once`; `an_epoch_passed_cleanly_between_arms_never_escalates`; `a_clean_recovery_the_runtime_never_reports_still_escalates`; `an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sync`; `an_escalation_recorded_during_a_received_delivery_rides_that_seam` | M3.1 retained-relay arm-run sweep; production cohorts confirming the run length that warrants the stronger repair |
+| A9 | `epoch_stall.rs`; `escalates_when_arms_repeat_without_passing_cleanly_through_an_epoch`; `an_epoch_the_device_passes_through_cleanly_ends_the_arm_run`; `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`; `an_escalated_run_reports_once_however_long_it_keeps_arming`; `storm_collapse_suppression_is_not_an_arm`; `repeated_arming_without_recovery_escalates_exactly_once`; `an_epoch_passed_cleanly_between_arms_never_escalates`; `a_clean_recovery_reported_as_a_passage_ends_the_arm_run`; `a_spanning_passage_off_the_armed_epoch_ends_the_arm_run`; `a_device_limping_one_epoch_per_arm_still_escalates`; `the_movement_after_an_adjacent_passage_ends_the_arm_run`; `a_passage_for_a_group_with_no_stall_history_leaves_it_untracked`; `a_backward_passage_is_not_progress_and_leaves_the_run_open`; `re_climbing_the_epochs_a_rollback_dropped_does_not_end_the_arm_run`; `a_passage_ending_at_or_behind_the_observed_epoch_changes_nothing`; `a_stale_passage_does_not_reopen_storm_collapse_suppression`; `an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sync`; `an_escalation_recorded_during_a_received_delivery_rides_that_seam` | M3.1 retained-relay arm-run sweep; production cohorts confirming the run length that warrants the stronger repair |
 
 Ledger work:
 

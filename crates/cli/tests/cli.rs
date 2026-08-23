@@ -5564,6 +5564,64 @@ fn daemon_executes_cli_commands_over_socket() {
 }
 
 #[test]
+fn daemon_uses_discovery_relays_independently_from_operational_relays() {
+    let discovery_relay = TestRelay::new();
+    let operational_relay = TestRelay::new();
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
+    let bob = create_account_with_real_relay(bob_home.path(), discovery_relay.url());
+    run_json_with_relay(
+        bob_home.path(),
+        discovery_relay.url(),
+        &["--account", &bob, "keys", "rotate"],
+    );
+
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let alice = create_account_with_real_relay(alice_home.path(), discovery_relay.url());
+    let socket = alice_home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(alice_home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--relay")
+        .arg(operational_relay.url())
+        .arg("--discovery-relays")
+        .arg(discovery_relay.url())
+        .arg("--default-account-relays")
+        .arg(operational_relay.url())
+        .arg("--secret-store")
+        .arg("file")
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--account")
+        .arg(&alice)
+        .arg("--json")
+        .args(["keys", "fetch", &bob])
+        .output()
+        .expect("wn keys fetch should run through daemon");
+
+    stop_daemon(&socket, &mut child);
+    assert!(
+        output.status.success(),
+        "daemon-hosted discovery failed\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["result"]["account_id"], bob);
+    assert_eq!(
+        value["result"]["source_relays"],
+        serde_json::json!([discovery_relay.url()]),
+        "KeyPackage discovery must not fall back to the operational relay"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn daemon_socket_path_is_private() {
     let home = tempfile::tempdir().expect("tempdir");

@@ -20,8 +20,9 @@
 //! `MarmotAppEvent::EpochStallEscalated`) plus one durable
 //! `epoch_stall_backfill_escalated` row. The escalation tests below pin that
 //! decision, its once-per-run latch, its reset when bob passes cleanly through
-//! an epoch, and the runtime reporting gap that costs him that reset when a
-//! convergence fold is what carried him through.
+//! an epoch, and that the reset also lands when a convergence fold is what
+//! carried him through — an epoch no delivery is ever read at, so only the
+//! engine's own epoch passage can report it.
 //!
 //! The arm is driven through `AppClient::next_event` exactly as
 //! `next_event_backfill.rs` does — the deterministic seam that avoids the full
@@ -93,12 +94,12 @@ const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// through `wn-cli`. That difference is not cosmetic here. At 1 s a convergence
 /// pass stays open across a drain, so a device reads a burst of commits at the
 /// epoch it was already sitting at and folds afterwards; at 0 ms every commit
-/// folds inside its own ingest, so the runtime reports an epoch per delivery and
-/// no device can be carried *through* an epoch at all. The whole reporting gap
-/// that [`a_clean_recovery_the_runtime_never_reports_still_escalates`] exists to
-/// pin lives in the first regime, which is also the one real devices run in, so this
-/// file states the window it means instead of taking whichever one the feature
-/// resolution hands it.
+/// folds inside its own ingest, so the runtime lands on an epoch per delivery and
+/// no device can be carried *through* an epoch at all. The carry that
+/// [`a_clean_recovery_reported_as_a_passage_ends_the_arm_run`] needs — an epoch
+/// no landing report can cover — exists only in the first regime, which is also
+/// the one real devices run in, so this file states the window it means instead
+/// of taking whichever one the feature resolution hands it.
 const SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 
 async fn mock_relay() -> (MockRelay, String) {
@@ -391,27 +392,26 @@ impl StalledGroup {
     /// Carry bob *through* an epoch instead of stopping at it: alice commits
     /// twice, bob retains *both* commits before he folds either, and the folds
     /// then take him past the middle epoch without a single delivery ever being
-    /// read while he is there. That is the whole shape of the reporting gap: the
-    /// only epoch the runtime reports to the detector is the one it read a
-    /// delivery at, and the folds that moved bob two epochs on report nothing.
+    /// read while he is there. That isolates the epoch *passage* as the only
+    /// report that can decide the run: a landing position always arrives at the
+    /// epoch bob sits on, and he never sits on the middle one.
     ///
     /// Ingesting and folding are two phases here, not one loop, and the split is
-    /// what makes the carry deterministic rather than a race. The epoch a
-    /// delivery is *read* at is the only epoch the runtime ever reports, so both
-    /// commits have to be read before either is folded. Neither half of that is
-    /// left to timing: [`SETTLEMENT_QUIESCENCE_MS`] keeps the convergence pass
-    /// open across the drain that reads them (bob retains the first commit as
+    /// what makes the carry deterministic rather than a race. Both commits have
+    /// to be read before either is folded. Neither half of that is left to
+    /// timing: [`SETTLEMENT_QUIESCENCE_MS`] keeps the convergence pass open
+    /// across the drain that reads them (bob retains the first commit as
     /// convergence input and cannot even peel the second from below its epoch),
     /// and the fold is driven explicitly, by `retry_group_convergence`, only
     /// once the ingest phase has both. Interleaving the two — drain, fold, drain
     /// — would instead let a slow relay hand bob the second commit after the
     /// first had already been folded: that delivery is then read at the middle
-    /// epoch, the runtime does report it, the arm run legitimately ends, and the
-    /// test's premise is deleted rather than failed. The ingest phase therefore
-    /// waits on the engine's own ingest outcomes for exactly alice's two commit
-    /// ids — the group's undecryptable probe traffic shares its `group_ref`, so
-    /// a count would not do — and the epoch assertion between the phases pins
-    /// that nothing folded early.
+    /// epoch, a landing report ends the run all by itself, and a test about
+    /// passages passes without one. The ingest phase therefore waits on the
+    /// engine's own ingest outcomes for exactly alice's two commit ids — the
+    /// group's undecryptable probe traffic shares its `group_ref`, so a count
+    /// would not do — and the epoch assertion between the phases pins that
+    /// nothing folded early.
     async fn carry_bob_through_an_epoch(&mut self, name: &str) {
         let before = self.bobs_epoch();
         let mut audit_rows = AuditRowTracker::default();
@@ -750,29 +750,29 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
     );
 }
 
-/// A device that recovered cleanly is escalated anyway, because the runtime
-/// never tells the detector about the epochs a convergence fold carried it
-/// through.
+/// A device that recovers cleanly is not escalated, because the convergence fold
+/// that carried it reports the epochs it passed through.
 ///
-/// Bob arms, then one real fold takes him past an epoch he never stalled at.
-/// Under the detector's own rule that clean pass ends his unrecovered run — but
-/// no `observe_*` call on the fold path reports it, so the run stays open and his
-/// next two stalls are counted as its second and third arms. He is reported as a
-/// group full-history replay cannot repair on the strength of an epoch he sailed
-/// through.
+/// Bob arms, then one real fold takes him past an epoch he never stalled at. No
+/// delivery is ever read while he is there — the epoch a delivery is read at is
+/// a landing position, and he never lands on that one — so the only report that
+/// can end his unrecovered run is the engine's `EpochChanged` passage. The
+/// runtime feeds it to the detector, the run ends, and his next two stalls are a
+/// fresh run's first and second arms rather than the old run's second and third.
 ///
-/// This is today's behavior, not the intended behavior, and it is the "before"
-/// side of closing the reporting gap: once the convergence fold reports its
-/// epochs, the middle epoch ends the run, the last stall is only its second arm,
-/// and this test flips to asserting no escalation at all. The detector unit test
-/// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`
-/// cannot pin this — it omits the observation by hand, so it keeps passing
-/// whether or not the runtime makes the call.
+/// This is the runtime half of the passage report, and the half the detector unit
+/// tests cannot pin: they hand the detector a passage directly, so they keep
+/// passing whether or not a real fold produces one. The rule the passage feeds is
+/// `GroupStall::observe_epoch`; the arithmetic that turns one passage into two
+/// reports is pinned by
+/// `a_spanning_passage_off_the_armed_epoch_ends_the_arm_run`.
 #[tokio::test]
-async fn a_clean_recovery_the_runtime_never_reports_still_escalates() {
+async fn a_clean_recovery_reported_as_a_passage_ends_the_arm_run() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
     let mut live = stalled_bob_in_a_live_group(&dir_bob, &dir_alice).await;
+    let mut audit_rows = AuditRowTracker::default();
+    let _setup_rows = audit_rows.new_rows(&live.app_bob, "bob");
 
     // Arm one: bob stalls at the epoch he starts on.
     assert!(
@@ -780,8 +780,8 @@ async fn a_clean_recovery_the_runtime_never_reports_still_escalates() {
         "the first arm of a run must not escalate",
     );
 
-    // He then recovers cleanly through an epoch — the one thing that should end
-    // the run — carried by a fold nobody reports.
+    // He then recovers cleanly through an epoch — the one thing that ends the
+    // run — carried by a fold that reports its passage and nothing else.
     let armed_epoch = live.bobs_epoch();
     live.carry_bob_through_an_epoch("recovered").await;
     assert!(
@@ -789,31 +789,30 @@ async fn a_clean_recovery_the_runtime_never_reports_still_escalates() {
         "the carry must take bob past an epoch, not stop at the next one",
     );
 
-    // The two stalls that follow are unrelated to the armed run, but the detector
-    // has heard nothing since the arm, so it counts them as its second and third.
+    // The two stalls that follow are unrelated to the armed run, and the detector
+    // now knows it: they open a new run instead of completing the old one.
     assert!(
         live.stall_bob_for_one_run(1).await.is_empty(),
         "a stall after a clean recovery must not escalate on its own",
     );
-    let stalled_epoch = live.bobs_epoch();
     live.advance_bobs_epoch("advanced").await;
     let escalations = live.stall_bob_for_one_run(2).await;
 
-    assert_eq!(
-        escalations.len(),
-        1,
-        "today's runtime escalates a recovered device: {escalations:?}",
+    assert!(
+        escalations.is_empty(),
+        "a recovery the runtime reported must not be counted as an arm: {escalations:?}",
     );
+    // Three arms did happen — the absence above is a decision, not a run that
+    // never armed — and none of them was reported.
+    let rows = audit_rows.new_rows(&live.app_bob, "bob");
     assert_eq!(
-        escalations[0].arms, ESCALATION_ARM_THRESHOLD as u32,
-        "the escalation counts the clean recovery as an arm of the same run: {:?}",
-        escalations[0],
+        rows_of_kind(&rows, "epoch_stall_backfill_armed").len(),
+        ESCALATION_ARM_THRESHOLD,
+        "each stalled epoch must still record its own arm row: {rows:?}"
     );
-    assert_eq!(
-        escalations[0].stalled_epoch,
-        stalled_epoch + 1,
-        "the escalating arm fired at the epoch the last commit left bob on: {:?}",
-        escalations[0],
+    assert!(
+        rows_of_kind(&rows, "epoch_stall_backfill_escalated").is_empty(),
+        "no escalation row may be recorded: {rows:?}"
     );
 }
 

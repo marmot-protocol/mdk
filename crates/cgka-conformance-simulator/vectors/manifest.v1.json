@@ -103,7 +103,7 @@
       "artifact": "admin-policy-update.v1.json",
       "coverage": [
         "non-admin admin-policy update rejection",
-        "invalid empty admin-policy rejection",
+        "sole-admin empty admin-policy refused as admin depletion",
         "admin promotion through app-component update",
         "promoted member group-data update",
         "admin self-demotion through app-component update",

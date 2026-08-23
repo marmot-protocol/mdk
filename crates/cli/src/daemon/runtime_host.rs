@@ -169,6 +169,7 @@ async fn dispatch_hosted_runtime_command(
     let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
+        defaults.discovery_relays.clone(),
         account_home.clone(),
     ) {
         Ok(app) => app,
@@ -563,7 +564,12 @@ pub(crate) fn open_app_runtime(
     let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
     let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
     let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-    let app = crate::app_for(defaults.home.clone(), defaults.relay.clone(), account_home)?;
+    let app = crate::app_for(
+        defaults.home.clone(),
+        defaults.relay.clone(),
+        defaults.discovery_relays.clone(),
+        account_home,
+    )?;
     Ok(app.runtime())
 }
 
@@ -721,6 +727,7 @@ pub(crate) async fn auto_watch_agent_stream_starts(
     let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
+        defaults.discovery_relays.clone(),
         account_home.clone(),
     ) {
         Ok(app) => app,

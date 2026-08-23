@@ -83,7 +83,8 @@ These are the scenarios another implementation should be able to load from JSON 
 - Setup: Alice creates a group with Bob as a non-admin, rejects Bob's first admin-policy edit, promotes Bob, lets Bob
   make an admin-gated group-data update, and then Bob removes himself from the admin set.
 - Pressure: admin-policy app-component validation, admin authorization, role convergence, and post-demotion denial.
-- Expected: empty admin policies fail, non-admin updates fail, both clients observe Bob's promotion and later
+- Expected: an empty admin policy is refused as admin depletion, non-admin updates fail, both clients observe
+  Bob's promotion and later
   self-demotion, and both clients converge at epoch 4 with Alice as the sole admin.
 
 ### `group-data-fork-recovery/v1`

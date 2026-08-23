@@ -19,12 +19,18 @@
 //!
 //! What the detector counts is bounded by what it is told. Its only view of a
 //! group's local epoch is the epoch handed to its own `observe_*` calls, so an
-//! advance nobody reports leaves it believing the group never moved. Two known
-//! blind spots follow, both tracked for a follow-up rather than defended here: a
-//! run can outlive the condition that opened it, because an unreported advance
-//! cannot end one (see [`GroupStall::observe_epoch`]); and a group whose
-//! reported epoch never moves at all arms once and never escalates, because
-//! every arm after the first needs that epoch to change.
+//! advance nobody reports leaves it believing the group never moved. Movement
+//! reaches it as an epoch *passage*
+//! ([`EpochStallDetector::observe_epoch_passage`]) — the engine's own
+//! `EpochChanged` — so a device that recovers can end its own run even across
+//! epochs no delivery was ever read at. Only a convergence reorg spans more than
+//! one epoch in a single passage; a confirmed local publish and a folded peer
+//! commit each advance exactly one, which is why the adjacency rule in
+//! [`EpochStallDetector::observe_epoch_passage`] must stay a *delayed* reset and
+//! not no reset at all. One blind spot remains, tracked for a follow-up rather
+//! than defended here: a group whose reported epoch never moves at all arms once
+//! and never escalates, because every arm after the first needs that epoch to
+//! change.
 //!
 //! All detector state is process-local, like the stall counts it extends.
 //! `sync_with_partial_progress` moves a one-shot escalation into either its
@@ -167,23 +173,45 @@ impl GroupStall {
     /// group that stalls again much later is reported again.
     ///
     /// "Passed through" means *reported to this method*, which is narrower than
-    /// "the device advanced". `self.epoch` only moves when a caller reports an
-    /// epoch, and neither convergence-fold seam — `AppClient::retry_group_convergence`
-    /// nor `AppClient::advance_convergence_after_runtime_sync`, the mechanism by
-    /// which a trailing device usually catches up — reaches an `observe_*` call at
-    /// all. So a device armed at 10 and then folded cleanly through 11, 12 and 13
-    /// arrives at its next stall with `self.epoch` still 10, the epoch it armed
-    /// at, and the run continues: a healthy recovery is counted as arm two. That
-    /// makes the unreported advance a false-positive amplifier, not merely a
-    /// delayed reset, and closing the reporting gap on both seams is the tracked
-    /// follow-up. The rule is pinned by
-    /// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`;
-    /// the escalation it costs a recovered device is pinned at the runtime by
-    /// `a_clean_recovery_the_runtime_never_reports_still_escalates`.
+    /// "the device advanced": `self.epoch` only moves when a caller reports an
+    /// epoch. A landing position — the epoch a delivery was read at — cannot be
+    /// the *first* such report after an arm, because it arrives at the epoch the
+    /// device already sits on, which leaves the armed epoch as the one being
+    /// left. A *second* landing, at a further epoch, does end the run
+    /// (`an_epoch_the_device_passes_through_cleanly_ends_the_arm_run` pins
+    /// exactly that), but only if traffic happens to be read at both — which is
+    /// accident, not design. The engine's `EpochChanged` passage makes the report
+    /// unconditional: fed here as `from + 1` and then `to` by
+    /// [`EpochStallDetector::observe_epoch_passage`], one passage supplies both
+    /// reports on its own.
+    ///
+    /// The app routes that passage from every effects batch whose events it
+    /// gates or projects (`AppClient::observe_recovery_evidence`) — the
+    /// convergence folds a trailing device usually catches up by, and the
+    /// maintenance tick's own confirmed evolution, included. Two publishing
+    /// seams stay outside that routing. `AppClient::redeliver_welcome` is an
+    /// empty exception: it re-publishes a stored envelope without re-committing
+    /// and never drains the engine, so its batch carries no events to observe.
+    /// `AppClient::disband_group` is a real one — the engine does emit an
+    /// `EpochChanged` when it confirms a disband — and it is accepted rather
+    /// than pre-existing: passage reporting is a new contract, and this is a new
+    /// hole in it, taken because a run whose group is being destroyed has
+    /// nothing left to recover. Arming from an observed batch is conditional on
+    /// it carrying a `TransportObjectResourceRefused`; observing a passage is
+    /// not.
+    ///
+    /// A batch that reports neither leaves the run exactly as it was: an advance
+    /// nobody reports is invisible here, as
+    /// `an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run`
+    /// pins, and the runtime side of the passage report is pinned by
+    /// `a_clean_recovery_reported_as_a_passage_ends_the_arm_run` in
+    /// `tests/epoch_stall_backfill_audit.rs`.
     ///
     /// How far the epoch jumped does not enter into it: the rule compares only
     /// the armed epoch against the epoch being left, so a reported advance of
-    /// five epochs decides exactly as one of a single epoch does.
+    /// five epochs decides exactly as one of a single epoch does. Span decides
+    /// one level up, in [`EpochStallDetector::observe_epoch_passage`], where a
+    /// passage becomes the two reports this rule then reads.
     ///
     /// Deliberately *not* "the device decrypted something": a replay that
     /// recovers old backlog the device can read has not caught it up, and
@@ -274,6 +302,92 @@ impl EpochStallDetector {
         if let Some(stall) = self.groups.get_mut(group) {
             stall.observe_epoch(epoch);
         }
+    }
+
+    /// Note that an already-tracked `group` moved *through* the epochs between
+    /// `from` and `to`: the engine's own `EpochChanged` passage, as reported by a
+    /// convergence reorg, a folded peer commit, or a confirmed local publish.
+    ///
+    /// A passage carries strictly more than a landing position: it names an epoch
+    /// the device is no longer at. Every other `observe_*` call reports the epoch
+    /// a delivery was *read* at, which is where the device already sits, while
+    /// [`GroupStall::observe_epoch`] decides on the epoch being *left*. A device
+    /// armed at 10 and recovered to 13 that reports only 13 is therefore still
+    /// judged on leaving 10 — the epoch it armed at — and its run never ends.
+    /// Feeding `from + 1` first moves the detector off the armed epoch, and
+    /// feeding `to` then leaves an epoch nothing armed at, which is what ends the
+    /// run.
+    ///
+    /// An adjacent passage (`to == from + 1`) deliberately does not end a run by
+    /// itself: the second feed is the epoch the first already recorded, so it
+    /// returns early, and the run ends only on the device's next movement off
+    /// that epoch. One epoch of progress per arm is a device limping, not a
+    /// device recovered — exactly the field shape escalation exists to report —
+    /// while sustained movement resets. Adjacency is the common case, not the
+    /// exception: a confirmed local publish (`from` synthesized as
+    /// `new_epoch - 1`) and a folded peer commit (`before` -> `after`) always
+    /// advance exactly one epoch, and only a convergence reorg can span several.
+    /// So the rule has to be a *delayed* reset rather than none — a single-commit
+    /// catch-up resets on the movement after it, which is the next passage the
+    /// device reports. Pinned by
+    /// `a_device_limping_one_epoch_per_arm_still_escalates` and
+    /// `the_movement_after_an_adjacent_passage_ends_the_arm_run`.
+    ///
+    /// The observed epoch is monotone, and two guards keep it that way: a
+    /// passage the engine reports as backward (`to <= from`) is dropped, and so
+    /// is one ending at or behind the epoch already observed. Together they make
+    /// a rollback and the re-climb after it silent — the device must pass its own
+    /// previous high-water mark before anything is reported again, and then only
+    /// the part of the passage beyond that mark is. Without the second guard the
+    /// re-climb would walk `self.epoch` backwards, which resets the run and
+    /// clears `fired_at_epoch`, so a device that merely retraced ground would end
+    /// an unrecovered run *and* re-arm at an epoch it had already armed at. The
+    /// same guard is what makes observing one `EpochChanged` twice decide as
+    /// observing it once does. Pinned by
+    /// `re_climbing_the_epochs_a_rollback_dropped_does_not_end_the_arm_run`,
+    /// `a_passage_ending_at_or_behind_the_observed_epoch_changes_nothing`, and
+    /// `a_stale_passage_does_not_reopen_storm_collapse_suppression`.
+    ///
+    /// What a span of two or more proves is worth stating plainly, because the
+    /// reset turns on it. It is not proof the device reached the tip — this layer
+    /// can never learn a group's live epoch, for the reason
+    /// [`GroupStall::observe_epoch`] gives. It is proof that more than one commit
+    /// applied in one go, which is the signature of an ingest pipe that started
+    /// flowing again rather than one delivering a commit at a time. So the reset
+    /// means "stop counting this run", not "this device recovered", and it is
+    /// deliberately cheap to earn. A device still behind stalls again at its new
+    /// epoch, re-arms, and escalates off the fresh run: being wrong here delays
+    /// the report, it does not lose it, whereas the opposite default keeps
+    /// escalating devices that did heal.
+    ///
+    /// `get_mut` like [`Self::observe_group_epoch`]: a passage is evidence about
+    /// a stall run, never the start of one, so a group with no stall history
+    /// stays untracked.
+    pub(crate) fn observe_epoch_passage(&mut self, group: &GroupId, from: EpochId, to: EpochId) {
+        // Only forward movement is evidence of progress. A reorg that rolls the
+        // tip back reports a passage too, and synthesizing its intermediate
+        // epoch would end an unrecovered run on a rollback.
+        if to <= from {
+            return;
+        }
+        let Some(stall) = self.groups.get_mut(group) else {
+            return;
+        };
+        // The observed epoch only ever moves forward. A passage ending at or
+        // behind it is ground already covered — a re-observed event, or the
+        // re-climb after a dropped rollback — and feeding it would walk
+        // `self.epoch` backwards, taking the fired-at suppression with it.
+        if to <= stall.epoch {
+            return;
+        }
+        // Synthesize the intermediate epoch only when it is itself forward.
+        // Below the observed epoch it is not a step the device is taking now,
+        // and reporting it would make the next feed misread which epoch is
+        // being left.
+        if from.next() > stall.epoch {
+            stall.observe_epoch(from.next());
+        }
+        stall.observe_epoch(to);
     }
 
     /// Record one undecryptable message for `group` observed while the group is
@@ -485,19 +599,17 @@ mod tests {
         );
     }
 
-    /// Pins the known blind spot named in [`GroupStall::observe_epoch`]: a run
-    /// ends on an *observation* at an epoch the device did not arm at, and an
-    /// epoch the detector is never told about cannot be that observation. This is
-    /// today's behavior, not the intended behavior — a device that recovers
-    /// cleanly through several epochs still has its next unrelated stall counted
-    /// as arm two, so a healthy device can be escalated.
+    /// Pins the reporting rule in [`GroupStall::observe_epoch`]: a run ends on an
+    /// *observation* at an epoch the device did not arm at, and an epoch the
+    /// detector is never told about cannot be that observation.
     ///
-    /// What it pins is the rule, not the field bug: the observation is omitted
-    /// here by hand, so this test keeps passing whether or not the runtime ever
-    /// learns to report a fold. The "before" side of closing the gap is
-    /// `a_clean_recovery_the_runtime_never_reports_still_escalates` in
-    /// `tests/epoch_stall_backfill_audit.rs`, which drives a real fold and flips
-    /// to asserting no escalation once the report lands.
+    /// The runtime now reports the epochs a fold carries a device through, as a
+    /// passage — so the field shape this rule used to punish is handled by
+    /// [`EpochStallDetector::observe_epoch_passage`] and pinned by
+    /// `a_spanning_passage_off_the_armed_epoch_ends_the_arm_run`. The rule below
+    /// is still the one the detector runs on, and it still decides any batch that
+    /// reports nothing: the observation is omitted here by hand, so this test
+    /// states what silence costs rather than what the runtime does.
     #[test]
     fn an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run() {
         let mut detector = EpochStallDetector::new(1, 3);
@@ -521,6 +633,227 @@ mod tests {
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(14)),
             BackfillDecision::ArmAndEscalate { arms: 3 },
+        );
+    }
+
+    /// A passage that leaves the armed epoch behind ends the run, and clears the
+    /// escalation latch with it, so a group that stalls again much later is
+    /// reported again.
+    #[test]
+    fn a_spanning_passage_off_the_armed_epoch_ends_the_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // A full unrecovered run, reported.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            BackfillDecision::ArmAndEscalate { arms: 3 }
+        );
+
+        // One convergence fold then carries the device from 12 to 15. It passed
+        // through 13 and 14 without arming at either, which is as close to
+        // "reached the tip" as this layer can observe.
+        detector.observe_epoch_passage(&g, EpochId(12), EpochId(15));
+
+        // So the stalls that follow are a new run, counted from one, and able to
+        // report again on their own third arm rather than staying latched shut.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(15)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(16)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m6".into(), EpochId(17)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "the passage must have cleared the escalation latch too"
+        );
+    }
+
+    /// One epoch of progress per arm is not recovery, so an adjacent passage
+    /// does not end the run by itself — the run keeps counting to escalation.
+    #[test]
+    fn a_device_limping_one_epoch_per_arm_still_escalates() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // Arm, limp forward exactly one epoch, stall again at it: the field
+        // shape, now with the advance actually reported.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11)),
+            BackfillDecision::Arm
+        );
+        detector.observe_epoch_passage(&g, EpochId(11), EpochId(12));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "a device that arms at every epoch it reaches is still failing to catch up"
+        );
+    }
+
+    /// The movement *after* an adjacent passage is what ends the run: it leaves
+    /// an epoch nothing armed at.
+    #[test]
+    fn the_movement_after_an_adjacent_passage_ends_the_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // Two arms into a run, one epoch apart.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+
+        // The device then keeps moving: it reaches 12, arms nothing there, and
+        // moves on to 13. Leaving 12 is the clean pass that ends the run.
+        detector.observe_epoch_passage(&g, EpochId(11), EpochId(12));
+        detector.observe_epoch_passage(&g, EpochId(12), EpochId(13));
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13)),
+            BackfillDecision::Arm,
+            "sustained movement must restart the run, so this is its first arm"
+        );
+    }
+
+    #[test]
+    fn a_passage_for_a_group_with_no_stall_history_leaves_it_untracked() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // A passage is evidence *about* a stall run, never the start of one.
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(14));
+
+        // Storm-collapse suppression covers tracked groups only, so a first arm
+        // surviving it proves the passage created no entry to suppress.
+        detector.mark_replayed();
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14)),
+            BackfillDecision::Arm,
+            "a passage must not enroll a group with no stall history"
+        );
+    }
+
+    #[test]
+    fn a_backward_passage_is_not_progress_and_leaves_the_run_open() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+
+        // A reorg that rolls the tip back moves the device away from the group's
+        // history, not toward it. Synthesizing an intermediate epoch here would
+        // end an unrecovered run on a rollback.
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(9));
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "the rollback must not have ended the run"
+        );
+    }
+
+    /// A dropped backward passage leaves the detector above the engine's tip.
+    /// The forward passages that re-climb that same ground are not new progress,
+    /// so they must not end the run, reopen the fired-at suppression, or let the
+    /// device re-arm at an epoch it already armed at.
+    #[test]
+    fn re_climbing_the_epochs_a_rollback_dropped_does_not_end_the_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // Two arms into a run, one epoch apart, so the detector sits at 15.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14));
+        detector.observe_epoch_passage(&g, EpochId(14), EpochId(15));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(15));
+
+        // A reorg rolls the tip back to 12. The passage is dropped, so the
+        // detector keeps believing 15 while the engine restarts from 12.
+        detector.observe_epoch_passage(&g, EpochId(15), EpochId(12));
+        detector.observe_epoch_passage(&g, EpochId(12), EpochId(13));
+        detector.observe_epoch_passage(&g, EpochId(13), EpochId(14));
+        detector.observe_epoch_passage(&g, EpochId(14), EpochId(15));
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(15)),
+            BackfillDecision::Skip,
+            "re-climbing to 15 must not reopen the backfill already fired there"
+        );
+
+        // And the run is intact: the next genuine advance is still arm three.
+        detector.observe_epoch_passage(&g, EpochId(15), EpochId(16));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(16)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "the re-climb must not have reset the run"
+        );
+    }
+
+    /// The detector's epoch only ever moves forward, so a passage that ends
+    /// at-or-behind where it already sits is not evidence of anything. Pins
+    /// idempotency: observing one `EpochChanged` twice decides as observing it
+    /// once does.
+    #[test]
+    fn a_passage_ending_at_or_behind_the_observed_epoch_changes_nothing() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // A spanning passage ends the first run, then two arms open a new one.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(12));
+        detector.observe_epoch_passage(&g, EpochId(12), EpochId(15));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(15));
+        detector.observe_epoch_passage(&g, EpochId(15), EpochId(16));
+        let _ = detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(16));
+
+        // The very same passage observed a second time, now far behind the tip.
+        detector.observe_epoch_passage(&g, EpochId(12), EpochId(15));
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(16)),
+            BackfillDecision::Skip,
+            "a re-observed passage must not reopen the backfill fired at 16"
+        );
+
+        detector.observe_epoch_passage(&g, EpochId(16), EpochId(17));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(17)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "a re-observed passage must not reset the run either"
+        );
+    }
+
+    /// The same rule guarding the run also guards storm-collapse suppression: a
+    /// stale passage that lands back on the epoch a replay already covered must
+    /// not hand the group a second account-wide replay for free.
+    #[test]
+    fn a_stale_passage_does_not_reopen_storm_collapse_suppression() {
+        let mut detector = EpochStallDetector::new(2, 3);
+        let g = group(0x01);
+
+        // Tracked but never armed, then suppressed by someone else's replay.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10)),
+            BackfillDecision::Skip
+        );
+        detector.mark_replayed();
+
+        // A passage the device already made, re-reported: no movement at all.
+        detector.observe_epoch_passage(&g, EpochId(8), EpochId(10));
+
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(10)),
+            BackfillDecision::Skip,
+            "the replay suppression at 10 must survive a stale passage"
         );
     }
 

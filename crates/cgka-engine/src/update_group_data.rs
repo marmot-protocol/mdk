@@ -91,6 +91,16 @@ impl<S: StorageProvider> Engine<S> {
                     "UpdateAppComponents contains duplicate component ids".into(),
                 ));
             }
+            // MIP-03 §150, ordered ahead of the component validator: that
+            // validator refuses the same payload as a malformed encoding, which
+            // would hide the policy refusal behind a wire fault.
+            if update.component_id == GROUP_ADMIN_POLICY_COMPONENT_ID
+                && crate::app_components::admin_policy_is_empty(&update.data)
+            {
+                return Err(EngineError::AdminDepletion {
+                    group_id: group_id.clone(),
+                });
+            }
             crate::app_components::validate_app_component_update(update)?;
         }
 
