@@ -21,6 +21,17 @@ Repeating a removal is idempotent. Reaction content follows the
 agent-control v2 bound: non-blank, control-free, and at most 64 Unicode scalar
 values.
 
+Agents send outbound media through OpenClaw's normal
+`message(action="send", channel="marmot", media=..., attachments=...)` interface.
+Generated files must be placed under the active agent workspace or an
+OpenClaw-managed media store; data URLs are not supported. OpenClaw's
+host-provided media reader is the source authorization boundary. The plugin
+stages the authorized bytes as a private, short-lived copy under
+`MARMOT_OUTBOUND_MEDIA_DIR`, while `wn-agent --media-allowed-root` independently
+authorizes that staging path before encrypting and uploading it. Direct
+`MarmotAgentControlClient.sendMedia()` calls are reserved for connector tests
+and smoketests, not runtime agents.
+
 For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
 materialized chat window and supplies it to OpenClaw with durable message ids,
 senders, timestamps, reply links, current reaction summaries, and
@@ -309,14 +320,15 @@ for any plugin or tenant that is not in the same trust boundary.
   a host-local decrypted path and passes it to the turn as an OpenClaw
   `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
   base64-encodes for a vision model. Outbound — the message adapter declares
-  `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
-  `mediaReadFile` when needed) onto `send_media`. The adapter retains OpenClaw's
-  local-root check, stages a short-lived copy under `MARMOT_OUTBOUND_MEDIA_DIR`,
-  and cleans it up after the response; `wn-agent` independently requires that
-  path beneath a startup `--media-allowed-root` and rejects symlinks and
-  non-regular files. `wn-agent` encrypts + uploads to Blossom; the content key
-  never leaves it. The vision model actually
-  receiving the image is confirmed on the docker harness.
+  `media` and maps an agent reply's `mediaUrl` onto `send_media`. It prefers the
+  running host's authorized `mediaReadFile` capability for every source,
+  including local paths, and uses connector-side local-root validation only as
+  a fallback when the host provides no reader. The adapter stages a short-lived
+  copy under `MARMOT_OUTBOUND_MEDIA_DIR` and cleans it up after success or
+  failure; `wn-agent` independently requires that path beneath a startup
+  `--media-allowed-root` and rejects symlinks and non-regular files. `wn-agent`
+  encrypts + uploads to Blossom; the content key never leaves it. The vision
+  model actually receiving the image is confirmed on the docker harness.
 - **Live QUIC previews** (`src/live.ts`) are temporarily not wired into inbound
   agent turns. Those turns are final-only so durable delivery has one owner: the
   registered OpenClaw message adapter. The transcript and preview primitives

@@ -1,8 +1,8 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deriveDurableFinalDeliveryRequirements,
   type ChannelMessageSendMediaContext,
@@ -206,6 +206,7 @@ describe("createMarmotMessageAdapter", () => {
       });
       expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
       expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
+      await expect(access(calls.sendMedia[0]!.attachments[0]!.path)).rejects.toThrow();
       expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
       expect(result.receipt.sentAt).toBe(5678);
       expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(5678);
@@ -273,6 +274,130 @@ describe("createMarmotMessageAdapter", () => {
       media_type: "image/jpeg",
       file_name: "photo.jpg",
     });
+  });
+
+  it("uses the host-authorized media reader for a local path", async () => {
+    const calls = emptyClientCalls();
+    const writes: { fileName: string; bytes: Buffer }[] = [];
+    const mediaReadFile = vi.fn(async () => Buffer.from("host-authorized-bytes"));
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+      writeTempMedia: async (fileName, bytes) => {
+        writes.push({ fileName, bytes });
+        return `/tmp/marmot-media/${fileName}`;
+      },
+    });
+    const ctx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "generated image",
+      mediaUrl: "/workspace/generated/photo.png",
+      // The running host has already authorized the source through
+      // mediaReadFile. Its roots may differ from this pinned SDK's roots.
+      mediaAccess: {
+        readFile: mediaReadFile,
+        localRoots: ["/different-sdk-media-root"],
+      },
+    } as unknown as ChannelMessageSendMediaContext;
+
+    await adapter.send!.media!(ctx);
+
+    expect(mediaReadFile).toHaveBeenCalledWith("/workspace/generated/photo.png");
+    expect(writes).toEqual([
+      { fileName: "photo.png", bytes: Buffer.from("host-authorized-bytes") },
+    ]);
+    expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
+      path: "/tmp/marmot-media/photo.png",
+      media_type: "image/png",
+      file_name: "photo.png",
+    });
+  });
+
+  it("does not stage or send media rejected by the host-authorized reader", async () => {
+    const calls = emptyClientCalls();
+    const writeTempMedia = vi.fn(async () => "/tmp/marmot-media/secret.png");
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+      writeTempMedia,
+    });
+    const ctx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "denied",
+      mediaUrl: "/outside/authorized/roots/secret.png",
+      mediaReadFile: vi.fn(async () => {
+        throw new Error("host media authorization denied");
+      }),
+    } as unknown as ChannelMessageSendMediaContext;
+
+    await expect(adapter.send!.media!(ctx)).rejects.toThrow(/host media authorization denied/);
+
+    expect(writeTempMedia).not.toHaveBeenCalled();
+    expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("removes host-authorized staged media when send_media fails", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const calls = emptyClientCalls();
+      const client = stubClient(calls);
+      client.sendMedia = async (_accountIdHex, _groupIdHex, attachments) => {
+        calls.sendMedia.push({
+          accountIdHex: HEX32("aa"),
+          groupIdHex: HEX32("cc"),
+          attachments,
+        });
+        throw new Error("wn-agent send failed");
+      };
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client, marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "generated image",
+        mediaUrl: "/workspace/generated/photo.png",
+        mediaReadFile: async () => Buffer.from("host-authorized-bytes"),
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await expect(adapter.send!.media!(ctx)).rejects.toThrow(/wn-agent send failed/);
+
+      const stagedPath = calls.sendMedia[0]!.attachments[0]!.path;
+      expect(stagedPath).toContain(join(tmpRoot, "staging"));
+      await expect(access(stagedPath)).rejects.toThrow();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("removes staged plaintext when the permission adjustment fails", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    const stagingDir = join(tmpRoot, "staging");
+    try {
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: stagingDir,
+        chmodTempMedia: async () => {
+          throw new Error("chmod failed");
+        },
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "generated image",
+        mediaUrl: "/workspace/generated/photo.png",
+        mediaReadFile: async () => Buffer.from("host-authorized-bytes"),
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await expect(adapter.send!.media!(ctx)).rejects.toThrow(/chmod failed/);
+
+      expect(calls.sendMedia).toHaveLength(0);
+      expect(await readdir(stagingDir)).toEqual([]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   it("rejects a remote media url with no local-path accessor", async () => {

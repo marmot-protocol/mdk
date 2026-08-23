@@ -26,6 +26,7 @@ const RUNTIME_IMPORTS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ],
   ["openclaw/plugin-sdk/core", ["createChatChannelPlugin", "jsonResult", "KeyedAsyncQueue"]],
   ["openclaw/plugin-sdk/infra-runtime", ["readLocalFileFromRoots"]],
+  ["openclaw/plugin-sdk/media-runtime", ["extractOriginalFilename", "getMediaDir"]],
   ["openclaw/plugin-sdk/media-store", ["saveMediaBuffer"]],
   [
     "openclaw/plugin-sdk/status-helpers",
