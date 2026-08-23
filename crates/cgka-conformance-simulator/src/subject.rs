@@ -2382,6 +2382,35 @@ mod tests {
         assert_eq!(code, "unknown_member");
     }
 
+    #[tokio::test]
+    async fn admin_policy_naming_a_non_member_surfaces_unknown_member() {
+        // The classification-table pin above cannot see the harness funnel,
+        // and no vector can: `ScenarioErrorObservation` carries no category
+        // field, so `ExpectedRefusal` is only assertable here. On master this
+        // refusal surfaced as `Protocol`/`other`.
+        let labels = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        // carol stays out of the group.
+        create_current_group_and_join(&mut subject, "alice", &labels[1..2]).await;
+
+        let error = subject
+            .update_admin_policy(SubjectUpdateAdminPolicy {
+                action_id: None,
+                client: "alice",
+                admins: &[labels[0].clone(), labels[2].clone()],
+                pending: None,
+            })
+            .await
+            .expect_err("an admin policy naming a non-member must be refused");
+        assert_eq!(error.category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(error.code, "unknown_member");
+    }
+
     #[test]
     fn implicit_topology_preserves_legacy_client_identity_seeds() {
         let labels = vec!["alice".to_owned(), "bob".to_owned()];
