@@ -2209,7 +2209,9 @@ fn observe_engine_error(error: &EngineError) -> String {
             "admin_policy"
         }
         EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
-        EngineError::Serialize(_) => "invalid_admin_policy",
+        // Every decode failure the engine can reach, not an admin-policy
+        // verdict: `audit_helpers::engine_error_kind` names it the same way.
+        EngineError::Serialize(_) => "serialize",
         EngineError::InvalidWelcome => "invalid_welcome",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::InvalidTransition(_) => "invalid_transition",
@@ -2352,11 +2354,18 @@ mod tests {
     }
 
     #[test]
-    fn serialization_failures_are_not_classified_as_expected_refusals() {
+    fn serialization_failures_report_an_encoding_fault_not_an_admin_policy_refusal() {
+        // `EngineError::Serialize` covers every decode failure the engine can
+        // reach — MLS payloads, trailing bytes, oversize lengths — and only a
+        // fraction of them ever touch an admin policy. Labelling all of them
+        // `invalid_admin_policy` reported a policy refusal for a wire fault,
+        // the inverse of the mislabelling #1523 fixed one layer down.
+        // `serialize` is the name `audit_helpers::engine_error_kind` already
+        // gives this verdict, so the two classifiers stay greppable together.
         let (category, code) =
             classify_engine_error(&EngineError::Serialize("malformed internal state".into()));
         assert_eq!(category, SubjectFailureCategory::Protocol);
-        assert_eq!(code, "invalid_admin_policy");
+        assert_eq!(code, "serialize");
     }
 
     #[test]
