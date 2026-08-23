@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-08-19
+updated: 2026-08-23
 tags: [marmot, architecture, index]
 ---
 
@@ -48,6 +48,11 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`overview/nostr-account-transport.md`](./overview/nostr-account-transport.md)
   - **What it covers:** Working note on Nostr user directory, account bootstrap, relay plane, group routing, and relay
     safety policy.
+
+- **Doc:** [`overview/transport-agnosticism.md`](./overview/transport-agnosticism.md)
+  - **What it covers:** Working note on where transport pluggability stops today: leak inventory from the FIPS spike and
+    PRs #1513/#1521/#1514, the five seams (directory, peeler injection, endpoint type, blob store, composition-root
+    bundle), and the sequencing to real carrier swaps.
 
 - **Doc:** [`overview/app-core-boundary.md`](./overview/app-core-boundary.md)
   - **What it covers:** The boundary between `wn`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
