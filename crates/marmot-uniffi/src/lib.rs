@@ -232,8 +232,9 @@ impl Marmot {
         self.runtime.shutdown().await;
     }
 
-    /// [`Marmot::shutdown`], then close every SQLite database and release the
-    /// Marmot root's runtime lease.
+    /// Stop admitting runtime work, close every SQLite database and release the
+    /// Marmot root's runtime lease, then make a bounded attempt at graceful
+    /// worker cleanup.
     ///
     /// Await this before letting the process be suspended. When it returns,
     /// nothing this process owns holds a file lock inside the Marmot root —
@@ -250,9 +251,12 @@ impl Marmot {
     /// this method just cleared. Construct a new `Marmot` on resume — which is
     /// what a foregrounding app does anyway.
     ///
-    /// Safe to call twice, and safe to call with or without a preceding
-    /// [`Marmot::shutdown`]. Bounded: worker drain has a fixed budget and the
-    /// close itself waits only for the SQLite statement currently executing.
+    /// Storage closure runs in a runtime-owned task, so cancelling the host
+    /// future cannot cancel it. Safe to call twice or concurrently, and safe to
+    /// call with or without a preceding [`Marmot::shutdown`]. Graceful cleanup
+    /// has a fixed budget; the close itself waits only for an already-admitted
+    /// database open or SQLite statement. Begin this call early enough to cover
+    /// that close before the host's suspension assertion expires.
     /// An error means at least one database reported a problem while closing;
     /// every database is still attempted and left closed, so a failure is not
     /// a reason to retry or to keep the process alive.

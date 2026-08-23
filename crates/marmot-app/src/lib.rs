@@ -510,10 +510,14 @@ pub struct MarmotApp {
     /// it counts against the same App Group suspension rule as the databases
     /// (see [`Self::close_storage`]).
     root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
-    /// Latched by [`Self::close_storage`]. Every database accessor checks it so
-    /// a late call cannot silently reopen a database — and re-lock a container
-    /// the host has just been told is lock-free.
+    /// Latched as soon as [`Self::close_storage`] starts. Every database
+    /// accessor checks it so a late call cannot silently reopen a database
+    /// while terminal close is in progress or after it completes.
     storage_closed: Arc<AtomicBool>,
+    /// Published only after every database close has been attempted and the
+    /// root lease has been released. This is the host-facing completion fact;
+    /// `storage_closed` above is the earlier admission latch.
+    storage_close_completed: Arc<AtomicBool>,
     /// Admission control that makes the close *atomic* rather than merely
     /// latched: database opens hold the read side across create-and-publish,
     /// [`Self::close_storage`] holds the write side across its whole teardown.
@@ -1349,6 +1353,7 @@ impl MarmotApp {
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
+            storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             relay_plane,
@@ -1421,6 +1426,7 @@ impl MarmotApp {
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
+            storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             account_home,
@@ -4896,6 +4902,7 @@ impl MarmotApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take(),
         );
+        self.storage_close_completed.store(true, Ordering::Release);
 
         tracing::debug!(
             target: "marmot_app::storage",
@@ -4911,16 +4918,17 @@ impl MarmotApp {
         }
     }
 
-    /// Whether [`Self::close_storage`] has run. Databases are unreachable from
-    /// this handle once it returns true.
+    /// Whether [`Self::close_storage`] has finished closing every database and
+    /// releasing the root lease. Databases are unreachable from this handle
+    /// once it returns true.
     #[must_use]
     pub fn storage_is_closed(&self) -> bool {
-        self.storage_closed.load(Ordering::Acquire)
+        self.storage_close_completed.load(Ordering::Acquire)
     }
 
     /// Fail rather than reopen a database after [`Self::close_storage`].
     fn ensure_storage_open(&self, database: &'static str) -> Result<(), AppError> {
-        if self.storage_is_closed() {
+        if self.storage_closed.load(Ordering::Acquire) {
             return Err(AppError::from(cgka_traits::StorageError::Closed(format!(
                 "{database} unavailable: app storage is closed"
             ))));

@@ -10289,6 +10289,237 @@ async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown
     runtime.shutdown_and_close().await.unwrap();
 }
 
+fn open_suspension_shutdown_fixture(
+    root: &std::path::Path,
+) -> (
+    MarmotApp,
+    MarmotAppRuntime,
+    SqliteAccountStorage,
+    SqliteSharedStorage,
+    DirectoryCache,
+    PathBuf,
+    PathBuf,
+) {
+    let home = AccountHome::open(root);
+    let account = home.create_account("suspension-close").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+    let session = app.account_storage(&account.label).unwrap();
+    session.app_message_count().unwrap();
+    let shared = app.shared_storage().unwrap();
+    shared
+        .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 30,
+        })
+        .unwrap();
+    let directory = app.directory_cache_for_account(&account).unwrap();
+    directory.entries().unwrap();
+    let session_path = app.account_storage_path(&account.label);
+    let shared_path = app.shared_storage_path();
+    let runtime = app.runtime();
+    (
+        app,
+        runtime,
+        session,
+        shared,
+        directory,
+        session_path,
+        shared_path,
+    )
+}
+
+fn assert_suspension_storage_closed(
+    root: &std::path::Path,
+    app: &MarmotApp,
+    session: &SqliteAccountStorage,
+    shared: &SqliteSharedStorage,
+    directory: &DirectoryCache,
+    session_path: &std::path::Path,
+    shared_path: &std::path::Path,
+) {
+    assert!(app.storage_is_closed());
+    assert!(session.is_closed());
+    assert!(shared.is_closed());
+    assert!(matches!(
+        directory.entries(),
+        Err(AppError::Storage(error)) if error.is_closed()
+    ));
+    for database in [session_path, shared_path] {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", database.display()));
+            assert!(
+                !sidecar.exists(),
+                "{} must be released by terminal shutdown",
+                sidecar.display()
+            );
+        }
+    }
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+    assert!(matches!(
+        app.shared_storage(),
+        Err(AppError::Storage(error)) if error.is_closed()
+    ));
+}
+
+/// Every graceful subsystem can stop making progress. Terminal suspension
+/// close must already have released SQLite and the root lease, and the outer
+/// graceful budget must still bound the call.
+#[tokio::test]
+async fn runtime_shutdown_and_close_bounds_every_graceful_shutdown_phase() {
+    use crate::runtime::ShutdownTestPhase;
+
+    for phase in [
+        ShutdownTestPhase::DirectorySync,
+        ShutdownTestPhase::InitialDirectorySync,
+        ShutdownTestPhase::AccountWorkers,
+        ShutdownTestPhase::RelayPlane,
+        ShutdownTestPhase::AuditTracker,
+        ShutdownTestPhase::AccountOpens,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, runtime, session, shared, directory, session_path, shared_path) =
+            open_suspension_shutdown_fixture(temp.path());
+        runtime.set_shutdown_grace_wait_for_test(Duration::from_millis(50));
+        let stall = runtime.stall_shutdown_for_test(phase);
+
+        let started = Instant::now();
+        runtime.shutdown_and_close().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{phase:?} stall exceeded the terminal shutdown bound"
+        );
+        assert!(stall.was_entered(), "{phase:?} stall was not exercised");
+        assert_suspension_storage_closed(
+            temp.path(),
+            &app,
+            &session,
+            &shared,
+            &directory,
+            &session_path,
+            &shared_path,
+        );
+
+        // A fresh runtime can acquire and use the same root immediately. The
+        // spent runtime remains alive, proving release is explicit rather than
+        // an incidental last-Arc drop.
+        let reopened = MarmotApp::try_with_relays_and_account_home_and_config(
+            temp.path(),
+            Vec::new(),
+            AccountHome::open(temp.path()),
+            MarmotAppConfig::default(),
+        )
+        .expect("fresh runtime should acquire the closed root");
+        reopened.shared_storage().unwrap();
+        reopened.close_storage().unwrap();
+    }
+}
+
+/// Dropping the awaiting future models a host/UniFFI owner being cancelled.
+/// The runtime-owned terminal task must continue and close storage anyway.
+#[tokio::test]
+async fn cancelling_shutdown_and_close_cannot_strand_storage_open() {
+    use crate::runtime::ShutdownTestPhase;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (app, runtime, session, shared, directory, session_path, shared_path) =
+        open_suspension_shutdown_fixture(temp.path());
+    let stall = runtime.stall_shutdown_for_test(ShutdownTestPhase::StorageClose);
+    let closing_runtime = runtime.clone();
+    let host_future = tokio::spawn(async move { closing_runtime.shutdown_and_close().await });
+    stall.wait_until_entered().await;
+
+    host_future.abort();
+    assert!(host_future.await.unwrap_err().is_cancelled());
+    assert!(!runtime.storage_is_closed());
+    stall.release();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !runtime.storage_is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime-owned terminal close must survive caller cancellation");
+    assert_suspension_storage_closed(
+        temp.path(),
+        &app,
+        &session,
+        &shared,
+        &directory,
+        &session_path,
+        &shared_path,
+    );
+}
+
+#[tokio::test]
+async fn concurrent_runtime_shutdown_and_close_calls_are_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, runtime, session, shared, directory, session_path, shared_path) =
+        open_suspension_shutdown_fixture(temp.path());
+    let callers = (0..4)
+        .map(|_| {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.shutdown_and_close().await })
+        })
+        .collect::<Vec<_>>();
+    for caller in callers {
+        caller.await.unwrap().unwrap();
+    }
+    assert_suspension_storage_closed(
+        temp.path(),
+        &app,
+        &session,
+        &shared,
+        &directory,
+        &session_path,
+        &shared_path,
+    );
+}
+
+const SUSPENSION_REOPEN_CHILD_ROOT: &str = "MARMOT_SUSPENSION_REOPEN_CHILD_ROOT";
+
+#[test]
+fn shutdown_and_close_allows_another_process_to_open_root_child() {
+    let Some(root) = std::env::var_os(SUSPENSION_REOPEN_CHILD_ROOT) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        &root,
+        Vec::new(),
+        AccountHome::open(&root),
+        MarmotAppConfig::default(),
+    )
+    .expect("child process must acquire the released root");
+    app.shared_storage().unwrap();
+    app.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_and_close_allows_another_process_to_open_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, runtime, ..) = open_suspension_shutdown_fixture(temp.path());
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(app.storage_is_closed());
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::shutdown_and_close_allows_another_process_to_open_root_child",
+            "--nocapture",
+        ])
+        .env(SUSPENSION_REOPEN_CHILD_ROOT, temp.path())
+        .status()
+        .expect("run fresh-runtime child process");
+    assert!(status.success(), "fresh-runtime child process failed");
+}
+
 /// #1177: an accepted send whose intent the engine retained in the group's
 /// durable queue must say so. Reporting `published: 0` with no message ids
 /// forces the host to infer acceptance from an empty list, which is exactly
