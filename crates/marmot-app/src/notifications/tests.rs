@@ -1751,3 +1751,464 @@ fn recovery_skips_rows_before_the_subscription_watermark() {
     record.received_at = 1;
     assert!(notification_recovery_is_fresh(&record, None));
 }
+
+fn member_id_from_hex(value: &str) -> cgka_traits::MemberId {
+    cgka_traits::MemberId::new(hex::decode(value).expect("member hex"))
+}
+
+fn group_state_event(
+    group_id: cgka_traits::GroupId,
+    actor: Option<&str>,
+    change: cgka_traits::engine::GroupStateChange,
+) -> cgka_traits::engine::GroupEvent {
+    cgka_traits::engine::GroupEvent::GroupStateChanged {
+        group_id,
+        epoch: cgka_traits::EpochId(3),
+        actor: actor.map(member_id_from_hex),
+        change,
+        origin_commit_id: Some(cgka_traits::MessageId::new(vec![0xAB; 32])),
+    }
+}
+
+fn seed_group_state_resolver(
+    resolver: &mut NotificationResolver,
+    account_label: &str,
+    account_id_hex: &str,
+    group_id_hex: &str,
+    actor_id_hex: Option<&str>,
+    local_enabled: bool,
+    muted: bool,
+) {
+    resolver.settings.insert(
+        account_label.to_owned(),
+        NotificationSettings {
+            account_ref: account_label.to_owned(),
+            account_id_hex: account_id_hex.to_owned(),
+            local_notifications_enabled: local_enabled,
+            native_push_enabled: true,
+        },
+    );
+    let conversation = (account_label.to_owned(), group_id_hex.to_owned());
+    resolver.groups.insert(conversation.clone(), None);
+    resolver.chat_muted.insert(conversation, muted);
+    let mut users = vec![account_id_hex];
+    if let Some(actor_id_hex) = actor_id_hex {
+        users.push(actor_id_hex);
+    }
+    for account_id in users {
+        resolver.users.insert(
+            account_id.to_owned(),
+            NotificationUser {
+                account_id_hex: account_id.to_owned(),
+                display_name: None,
+                picture_url: None,
+            },
+        );
+    }
+}
+
+#[test]
+fn group_state_classifier_notifies_only_local_self_affecting_changes() {
+    let local = "aa".repeat(32);
+    let actor = "bb".repeat(32);
+    let other = "cc".repeat(32);
+
+    assert!(matches!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&actor),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+            Some(&local),
+        ),
+        Some(NotificationTrigger::RemovedFromGroup)
+    ));
+    assert!(matches!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&actor),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            Some(&local),
+        ),
+        Some(NotificationTrigger::MadeAdmin)
+    ));
+    assert!(matches!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&actor),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+            Some(&local),
+        ),
+        Some(NotificationTrigger::RemovedAsAdmin)
+    ));
+
+    assert_eq!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&actor),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+            Some(&local),
+        ),
+        None,
+        "voluntary leave must not notify"
+    );
+    assert_eq!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&local),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+            Some(&local),
+        ),
+        None,
+        "self-demotion must not notify"
+    );
+    assert_eq!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&actor),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+            Some(&other),
+        ),
+        None,
+        "unrelated subjects must not notify"
+    );
+    assert!(matches!(
+        classify_local_group_state_notification(
+            &local,
+            None,
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+            Some(&local),
+        ),
+        Some(NotificationTrigger::RemovedAsAdmin),
+    ));
+    assert_eq!(
+        classify_local_group_state_notification(
+            &local,
+            Some(&actor),
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+            None,
+        ),
+        None
+    );
+}
+
+#[test]
+fn group_state_live_classification_respects_settings_and_mute() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_label = "alice";
+    let local = "aa".repeat(32);
+    let actor = "bb".repeat(32);
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let event = MarmotAppEvent::GroupEvent(crate::RuntimeGroupEvent {
+        account_id_hex: local.clone(),
+        account_label: account_label.to_owned(),
+        event: group_state_event(
+            group_id.clone(),
+            Some(&actor),
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: member_id_from_hex(&local),
+            },
+        ),
+    });
+
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(
+        &mut resolver,
+        account_label,
+        &local,
+        &group_id_hex,
+        Some(&actor),
+        true,
+        false,
+    );
+    let update = notification_update_from_event_cached(&app, &mut resolver, &event)
+        .unwrap()
+        .expect("unmuted eviction of the local account should notify");
+    assert!(matches!(
+        update.trigger,
+        NotificationTrigger::RemovedFromGroup
+    ));
+    assert!(!update.is_mention);
+    assert!(!update.is_from_self);
+    assert!(update.notification_key.starts_with("group-state:"));
+
+    resolver
+        .chat_muted
+        .insert((account_label.to_owned(), group_id_hex.clone()), true);
+    assert_eq!(
+        notification_update_from_event_cached(&app, &mut resolver, &event).unwrap(),
+        None,
+        "muted groups must suppress membership notifications"
+    );
+
+    seed_group_state_resolver(
+        &mut resolver,
+        account_label,
+        &local,
+        &group_id_hex,
+        Some(&actor),
+        false,
+        false,
+    );
+    assert!(
+        matches!(
+            notification_update_from_event_cached(&app, &mut resolver, &event),
+            Err(crate::AppError::NotificationsDisabled)
+        ),
+        "disabled local notifications must suppress membership notifications"
+    );
+}
+
+#[test]
+fn group_state_live_and_recovery_share_a_deterministic_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_label = "alice";
+    let local = "aa".repeat(32);
+    let actor = "bb".repeat(32);
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let change = cgka_traits::engine::GroupStateChange::AdminAdded {
+        member: member_id_from_hex(&local),
+    };
+    let actor_id = member_id_from_hex(&actor);
+    let material =
+        cgka_traits::app_event::group_system_event_material(&group_id, 3, Some(&actor_id), &change)
+            .unwrap();
+
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(
+        &mut resolver,
+        account_label,
+        &local,
+        &group_id_hex,
+        Some(&actor),
+        true,
+        false,
+    );
+    let live = notification_update_from_event_cached(
+        &app,
+        &mut resolver,
+        &MarmotAppEvent::GroupEvent(crate::RuntimeGroupEvent {
+            account_id_hex: local.clone(),
+            account_label: account_label.to_owned(),
+            event: group_state_event(group_id, Some(&actor), change),
+        }),
+    )
+    .unwrap()
+    .expect("live admin grant should notify");
+
+    let recovered = notification_update_from_group_system_record(
+        &app,
+        &mut resolver,
+        account_label,
+        &local,
+        &AppMessageRecord {
+            message_id_hex: material.message_id_hex.clone(),
+            direction: "system".to_owned(),
+            group_id_hex,
+            sender: actor.clone(),
+            plaintext: material.content,
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: material.tags,
+            source_epoch: Some(3),
+            retention: None,
+            recorded_at: 30,
+            received_at: 30,
+            insert_order: 1,
+            invalidated: false,
+            moderation_grant: false,
+        },
+    )
+    .unwrap()
+    .expect("fresh kind-1210 recovery should notify");
+
+    assert_eq!(live.notification_key, recovered.notification_key);
+    assert!(matches!(live.trigger, NotificationTrigger::MadeAdmin));
+    assert!(matches!(recovered.trigger, NotificationTrigger::MadeAdmin));
+}
+
+#[test]
+fn recovery_skips_invalidated_group_system_rows() {
+    let mut record = AppMessageRecord {
+        message_id_hex: "11".repeat(32),
+        direction: "system".to_owned(),
+        group_id_hex: "22".repeat(16),
+        sender: "33".repeat(32),
+        plaintext: "system".to_owned(),
+        kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        tags: Vec::new(),
+        source_epoch: Some(1),
+        retention: None,
+        recorded_at: 20,
+        received_at: 20,
+        insert_order: 1,
+        invalidated: true,
+        moderation_grant: false,
+    };
+    assert!(!notification_recovery_should_project(&record, Some(10)));
+    record.invalidated = false;
+    assert!(notification_recovery_should_project(&record, Some(10)));
+    record.received_at = 9;
+    assert!(!notification_recovery_should_project(&record, Some(10)));
+}
+
+#[test]
+fn group_state_wake_targets_only_matching_non_self_effects() {
+    let local = "aa".repeat(32);
+    let bob = "bb".repeat(32);
+    let carol = "cc".repeat(32);
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
+    let events = vec![
+        group_state_event(
+            group_id.clone(),
+            Some(&local),
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: member_id_from_hex(&bob),
+            },
+        ),
+        group_state_event(
+            group_id.clone(),
+            Some(&local),
+            cgka_traits::engine::GroupStateChange::MemberLeft {
+                member: member_id_from_hex(&local),
+            },
+        ),
+        group_state_event(
+            group_id.clone(),
+            Some(&local),
+            cgka_traits::engine::GroupStateChange::AdminRemoved {
+                member: member_id_from_hex(&local),
+            },
+        ),
+        group_state_event(
+            group_id,
+            Some(&local),
+            cgka_traits::engine::GroupStateChange::AdminAdded {
+                member: member_id_from_hex(&carol),
+            },
+        ),
+    ];
+    let targets = wake_member_ids_from_group_events(&local, &events);
+    assert!(targets.contains(&bob));
+    assert!(targets.contains(&carol));
+    assert!(!targets.contains(&local));
+}
+
+#[test]
+fn group_state_wake_uses_only_snapshotted_target_tokens() {
+    let bob = "bb".repeat(32);
+    let carol = "cc".repeat(32);
+    let group_id_hex = "ee".repeat(16);
+    let tokens = vec![
+        GroupPushTokenRecord {
+            group_id_hex: group_id_hex.clone(),
+            member_id_hex: bob.clone(),
+            leaf_index: 1,
+            platform: PushPlatform::Fcm,
+            token_fingerprint: "fp-bob".to_owned(),
+            server_pubkey_hex: "aa".repeat(32),
+            relay_hint: Some("wss://hint.example".to_owned()),
+            encrypted_token: vec![1; PUSH_ENCRYPTED_TOKEN_LEN],
+            owner_ts: 0,
+            owner_sig: String::new(),
+            updated_at_ms: 0,
+        },
+        GroupPushTokenRecord {
+            group_id_hex,
+            member_id_hex: carol,
+            leaf_index: 2,
+            platform: PushPlatform::Fcm,
+            token_fingerprint: "fp-carol".to_owned(),
+            server_pubkey_hex: "aa".repeat(32),
+            relay_hint: Some("wss://hint.example".to_owned()),
+            encrypted_token: vec![2; PUSH_ENCRYPTED_TOKEN_LEN],
+            owner_ts: 0,
+            owner_sig: String::new(),
+            updated_at_ms: 0,
+        },
+    ];
+    let filtered = tokens_for_member_ids(tokens, [bob.as_str()]);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].member_id_hex, bob);
+}
+
+#[tokio::test]
+async fn group_state_wake_keeps_kind_446_context_free() {
+    use nostr::nips::nip59::UnwrappedGift;
+
+    let secret = server_secret();
+    let server_pubkey_hex = server_pubkey_hex(&secret);
+    let token = vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN];
+    let wrap = build_notification_gift_wrap(&server_pubkey_hex, &[token])
+        .await
+        .unwrap();
+    let event = wrap.to_verified_nostr_event().unwrap();
+    let server_keys = Keys::new(nostr::SecretKey::from(secret));
+    let UnwrappedGift { rumor, .. } = UnwrappedGift::from_gift_wrap(&server_keys, &event)
+        .await
+        .unwrap();
+    let tag_slices: Vec<&[String]> = rumor.tags.iter().map(|tag| tag.as_slice()).collect();
+    assert_eq!(
+        tag_slices,
+        vec![[NOTIFICATION_VERSION_TAG.to_owned(), PUSH_VERSION.to_owned()].as_slice()],
+        "group-state wakes must reuse the context-free kind-446 rumor"
+    );
+}
+
+#[test]
+fn recover_notification_updates_rebuilds_fresh_kind_1210_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.notification_settings("alice").unwrap();
+    let local = account.account_id_hex.clone();
+    let actor = "bb".repeat(32);
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
+    let change = cgka_traits::engine::GroupStateChange::MemberRemoved {
+        member: member_id_from_hex(&local),
+    };
+    let actor_id = member_id_from_hex(&actor);
+    let material =
+        cgka_traits::app_event::group_system_event_material(&group_id, 4, Some(&actor_id), &change)
+            .unwrap();
+    app.record_account_app_event_at(
+        "alice",
+        &crate::AppMessageProjection {
+            message_id_hex: material.message_id_hex.clone(),
+            source_message_id_hex: None,
+            direction: "system".to_owned(),
+            group_id_hex: material.group_id_hex,
+            sender: actor,
+            plaintext: material.content,
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: material.tags,
+            source_epoch: Some(4),
+            retention: None,
+            recorded_at: Some(40),
+            origin_commit_id: Some("ab".repeat(32)),
+            moderation_grant: false,
+        },
+        40,
+    )
+    .unwrap();
+
+    let recovered = recover_notification_updates(&app, Some(40)).unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert!(matches!(
+        recovered[0].trigger,
+        NotificationTrigger::RemovedFromGroup
+    ));
+    assert_eq!(
+        recovered[0].notification_key,
+        format!("group-state:{local}:{}", material.message_id_hex)
+    );
+
+    let stale = recover_notification_updates(&app, Some(41)).unwrap();
+    assert!(
+        stale.is_empty(),
+        "pre-watermark kind-1210 rows must stay history"
+    );
+}

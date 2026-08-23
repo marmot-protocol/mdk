@@ -25,15 +25,21 @@ use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+    EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    group_system_event_material,
 };
+use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::{GroupId, MemberId};
 
 use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
 use crate::{
     AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
-    ReceivedMessage, RuntimeMessageReceived, tag_value,
+    ReceivedMessage, RuntimeGroupEvent, RuntimeMessageReceived, group_system_event_from_message,
+    tag_value,
 };
 use storage_sqlite::TimelineMessageTarget;
 
@@ -155,6 +161,9 @@ pub enum NotificationCollectionStatus {
 pub enum NotificationTrigger {
     NewMessage,
     GroupInvite,
+    RemovedFromGroup,
+    MadeAdmin,
+    RemovedAsAdmin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1488,35 +1497,46 @@ pub(crate) fn recover_notification_updates(
             },
         )?;
         for record in records {
-            if !notification_recovery_is_fresh(&record, min_observed_at) {
+            if !notification_recovery_should_project(&record, min_observed_at) {
                 continue;
             }
-            let Ok(group_id) = hex::decode(&record.group_id_hex) else {
-                continue;
+            let result = if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+                notification_update_from_group_system_record(
+                    app,
+                    &mut resolver,
+                    &account.label,
+                    &account.account_id_hex,
+                    &record,
+                )
+            } else {
+                let Ok(group_id) = hex::decode(&record.group_id_hex) else {
+                    continue;
+                };
+                let sender_display_name = app
+                    .display_name_for_account_id(&record.sender)
+                    .ok()
+                    .flatten();
+                let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+                    account_id_hex: account.account_id_hex.clone(),
+                    account_label: account.label.clone(),
+                    message: ReceivedMessage {
+                        message_id_hex: record.message_id_hex,
+                        source_message_id_hex: String::new(),
+                        sender: record.sender,
+                        sender_display_name,
+                        group_id: GroupId::new(group_id),
+                        source_epoch: record.source_epoch.unwrap_or(0),
+                        retention: record.retention,
+                        plaintext: record.plaintext,
+                        kind: record.kind,
+                        tags: record.tags,
+                        recorded_at: record.recorded_at,
+                        received_at: record.received_at,
+                    },
+                });
+                notification_update_from_event_cached(app, &mut resolver, &event)
             };
-            let sender_display_name = app
-                .display_name_for_account_id(&record.sender)
-                .ok()
-                .flatten();
-            let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-                account_id_hex: account.account_id_hex.clone(),
-                account_label: account.label.clone(),
-                message: ReceivedMessage {
-                    message_id_hex: record.message_id_hex,
-                    source_message_id_hex: String::new(),
-                    sender: record.sender,
-                    sender_display_name,
-                    group_id: cgka_traits::GroupId::new(group_id),
-                    source_epoch: record.source_epoch.unwrap_or(0),
-                    retention: record.retention,
-                    plaintext: record.plaintext,
-                    kind: record.kind,
-                    tags: record.tags,
-                    recorded_at: record.recorded_at,
-                    received_at: record.received_at,
-                },
-            });
-            match notification_update_from_event_cached(app, &mut resolver, &event) {
+            match result {
                 Ok(Some(update)) => updates.push(update),
                 Ok(None) | Err(AppError::NotificationsDisabled) => {}
                 Err(_) => {
@@ -1543,6 +1563,13 @@ pub(crate) fn notification_recovery_is_fresh(
     min_observed_at.is_none_or(|min| record.received_at >= min)
 }
 
+pub(crate) fn notification_recovery_should_project(
+    record: &AppMessageRecord,
+    min_observed_at: Option<u64>,
+) -> bool {
+    !record.invalidated && notification_recovery_is_fresh(record, min_observed_at)
+}
+
 /// Build a notification for one event, reusing `resolver`'s memoized
 /// settings/group/user lookups across a batch of events (#639).
 pub(crate) fn notification_update_from_event_cached(
@@ -1566,14 +1593,250 @@ pub(crate) fn notification_update_from_event_cached(
             group_id,
         )
         .map(Some),
+        MarmotAppEvent::GroupEvent(group_event) => {
+            notification_update_from_runtime_group_event(app, resolver, group_event)
+        }
         MarmotAppEvent::GroupStateUpdated { .. }
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::AgentStreamStarted(_)
-        | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
+}
+
+/// Classify an authenticated group-state change for the receiving local
+/// account. Only self-affecting `MemberRemoved`, `AdminAdded`, and non-self
+/// `AdminRemoved` notify. Voluntary leave, self-demotion, unrelated subjects,
+/// and changes without a local subject are suppressed. Inbound admin-policy
+/// diffs are commonly unattributed; self-demotion is the case whose actor is
+/// the local account.
+pub(crate) fn classify_local_group_state_notification(
+    local_account_id_hex: &str,
+    actor_account_id_hex: Option<&str>,
+    system_type: &str,
+    subject_account_id_hex: Option<&str>,
+) -> Option<NotificationTrigger> {
+    let subject = subject_account_id_hex.filter(|value| !value.is_empty())?;
+    if !subject.eq_ignore_ascii_case(local_account_id_hex) {
+        return None;
+    }
+    match system_type {
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED => Some(NotificationTrigger::RemovedFromGroup),
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED => Some(NotificationTrigger::MadeAdmin),
+        GROUP_SYSTEM_TYPE_ADMIN_REMOVED => {
+            let is_self_demotion = actor_account_id_hex
+                .filter(|value| !value.is_empty())
+                .is_some_and(|actor| actor.eq_ignore_ascii_case(local_account_id_hex));
+            if is_self_demotion {
+                None
+            } else {
+                Some(NotificationTrigger::RemovedAsAdmin)
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn classify_group_state_change(
+    local_account_id_hex: &str,
+    actor: Option<&MemberId>,
+    change: &GroupStateChange,
+) -> Option<NotificationTrigger> {
+    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
+    let (system_type, subject) = match change {
+        GroupStateChange::MemberRemoved { member } => (GROUP_SYSTEM_TYPE_MEMBER_REMOVED, member),
+        GroupStateChange::AdminAdded { member } => (GROUP_SYSTEM_TYPE_ADMIN_ADDED, member),
+        GroupStateChange::AdminRemoved { member } => (GROUP_SYSTEM_TYPE_ADMIN_REMOVED, member),
+        _ => return None,
+    };
+    classify_local_group_state_notification(
+        local_account_id_hex,
+        actor_hex.as_deref(),
+        system_type,
+        Some(&hex::encode(subject.as_slice())),
+    )
+}
+
+/// Subjects of successful non-self membership/admin effects that should receive
+/// a context-free kind-446 wake from the mutating device.
+pub(crate) fn wake_member_id_hex_from_group_event(
+    local_account_id_hex: &str,
+    event: &GroupEvent,
+) -> Option<String> {
+    let GroupEvent::GroupStateChanged { change, .. } = event else {
+        return None;
+    };
+    let member = match change {
+        GroupStateChange::MemberRemoved { member }
+        | GroupStateChange::AdminAdded { member }
+        | GroupStateChange::AdminRemoved { member } => member,
+        _ => return None,
+    };
+    let member_hex = hex::encode(member.as_slice());
+    (!member_hex.eq_ignore_ascii_case(local_account_id_hex)).then_some(member_hex)
+}
+
+pub(crate) fn wake_member_ids_from_group_events(
+    local_account_id_hex: &str,
+    events: &[GroupEvent],
+) -> HashSet<String> {
+    events
+        .iter()
+        .filter_map(|event| wake_member_id_hex_from_group_event(local_account_id_hex, event))
+        .collect()
+}
+
+pub(crate) fn tokens_for_member_ids(
+    tokens: Vec<GroupPushTokenRecord>,
+    member_id_hexes: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<GroupPushTokenRecord> {
+    let wanted = member_id_hexes
+        .into_iter()
+        .map(|id| id.as_ref().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    tokens
+        .into_iter()
+        .filter(|token| wanted.contains(&token.member_id_hex.to_ascii_lowercase()))
+        .collect()
+}
+
+fn notification_update_from_runtime_group_event(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    event: &RuntimeGroupEvent,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let GroupEvent::GroupStateChanged {
+        group_id,
+        epoch,
+        actor,
+        change,
+        ..
+    } = &event.event
+    else {
+        return Ok(None);
+    };
+    let Some(trigger) = classify_group_state_change(&event.account_id_hex, actor.as_ref(), change)
+    else {
+        return Ok(None);
+    };
+    let material = match group_system_event_material(group_id, epoch.0, actor.as_ref(), change) {
+        Ok(material) => material,
+        Err(_) => return Ok(None),
+    };
+    let actor_hex = actor.as_ref().map(|id| hex::encode(id.as_slice()));
+    notification_update_from_classified_group_state(
+        app,
+        resolver,
+        &event.account_label,
+        &event.account_id_hex,
+        ClassifiedGroupStateNotice {
+            group_id_hex: &material.group_id_hex,
+            trigger,
+            message_id_hex: &material.message_id_hex,
+            actor_account_id_hex: actor_hex.as_deref(),
+        },
+    )
+}
+
+fn notification_update_from_group_system_record(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    account_label: &str,
+    account_id_hex: &str,
+    record: &AppMessageRecord,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let Some(event) = group_system_event_from_message(record.kind, &record.plaintext) else {
+        return Ok(None);
+    };
+    let Some(trigger) = classify_local_group_state_notification(
+        account_id_hex,
+        event.actor_account_id_hex.as_deref(),
+        &event.system_type,
+        event.subject_account_id_hex.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    notification_update_from_classified_group_state(
+        app,
+        resolver,
+        account_label,
+        account_id_hex,
+        ClassifiedGroupStateNotice {
+            group_id_hex: &record.group_id_hex,
+            trigger,
+            message_id_hex: &record.message_id_hex,
+            actor_account_id_hex: event.actor_account_id_hex.as_deref(),
+        },
+    )
+}
+
+struct ClassifiedGroupStateNotice<'a> {
+    group_id_hex: &'a str,
+    trigger: NotificationTrigger,
+    message_id_hex: &'a str,
+    actor_account_id_hex: Option<&'a str>,
+}
+
+fn notification_update_from_classified_group_state(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    account_label: &str,
+    account_id_hex: &str,
+    notice: ClassifiedGroupStateNotice<'_>,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let settings = resolver.settings(app, account_label)?;
+    if !settings.local_notifications_enabled {
+        return Err(AppError::NotificationsDisabled);
+    }
+    let group = match resolver.group(app, account_label, notice.group_id_hex) {
+        Ok(group) => group,
+        Err(AppError::UnknownGroup(_)) => None,
+        Err(err) => return Err(err),
+    };
+    let muted = match resolver.chat_muted(app, account_label, notice.group_id_hex) {
+        Ok(muted) => muted,
+        Err(AppError::UnknownGroup(_)) => false,
+        Err(err) => return Err(err),
+    };
+    if muted {
+        return Ok(None);
+    }
+    let receiver = resolver.user(app, account_id_hex)?;
+    let sender = match notice
+        .actor_account_id_hex
+        .filter(|value| !value.is_empty())
+    {
+        Some(actor_id) => resolver.user(app, actor_id)?,
+        None => NotificationUser {
+            account_id_hex: String::new(),
+            display_name: None,
+            picture_url: None,
+        },
+    };
+    let is_from_self = notice
+        .actor_account_id_hex
+        .is_some_and(|actor| !actor.is_empty() && actor.eq_ignore_ascii_case(account_id_hex));
+    Ok(Some(NotificationUpdate {
+        notification_key: format!("group-state:{account_id_hex}:{}", notice.message_id_hex),
+        conversation_key: conversation_key(account_id_hex, notice.group_id_hex),
+        trigger: notice.trigger,
+        traffic_class: NotificationTrafficClass::Standard,
+        account_ref: account_label.to_owned(),
+        account_id_hex: account_id_hex.to_owned(),
+        group_id_hex: notice.group_id_hex.to_owned(),
+        group_name: group_name(group.as_ref()),
+        is_dm: false,
+        is_mention: false,
+        message_id_hex: Some(notice.message_id_hex.to_owned()),
+        sender,
+        receiver,
+        preview_text: None,
+        reaction_emoji: None,
+        reacted_to_preview: None,
+        timestamp_ms: unix_now_ms(),
+        is_from_self,
+    }))
 }
 
 /// Classify every notification-eligible wire kind. Returning `None` for
