@@ -101,6 +101,7 @@ pub(crate) async fn media_command_with_runtime(
                 &account.account_id_hex,
                 AppMessageQuery {
                     group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
                     limit: None,
                 },
             )?;
@@ -135,6 +136,7 @@ pub(crate) async fn media_command_with_runtime(
                 &account.account_id_hex,
                 AppMessageQuery {
                     group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
                     limit: None,
                 },
             )?;

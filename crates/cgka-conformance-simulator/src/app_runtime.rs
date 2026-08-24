@@ -643,6 +643,7 @@ impl AppRuntimeHarness {
                 &participant.account_id,
                 AppMessageQuery {
                     group_id_hex: Some(group_id_hex),
+                    kinds: None,
                     limit: None,
                 },
             )

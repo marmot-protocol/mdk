@@ -1659,6 +1659,7 @@ fn messages_recovery_query_drops_initial_replay_limit() {
     let group_id_hex = "cd".repeat(32);
     let query = AppMessageQuery {
         group_id_hex: Some(group_id_hex.clone()),
+        kinds: None,
         limit: Some(1),
     };
     let recovery = messages_recovery_query(&query);
@@ -1679,6 +1680,7 @@ fn messages_recovery_query_preserves_absent_group_filter() {
     // all groups, still without a limit.
     let query = AppMessageQuery {
         group_id_hex: None,
+        kinds: None,
         limit: Some(10),
     };
     let recovery = messages_recovery_query(&query);

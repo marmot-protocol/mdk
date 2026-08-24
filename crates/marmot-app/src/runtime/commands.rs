@@ -1474,6 +1474,26 @@ impl AccountManager {
         .await
     }
 
+    pub(crate) async fn send_custom_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Result<SendSummary, AppError> {
+        self.send_app_event(
+            account_ref,
+            group_id,
+            AppMessageIntent::Custom {
+                kind,
+                tags,
+                content,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn upload_media(
         &self,
         account_ref: &str,

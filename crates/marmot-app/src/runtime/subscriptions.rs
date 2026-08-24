@@ -1709,6 +1709,7 @@ impl MarmotAppRuntime {
 pub(crate) fn messages_recovery_query(query: &AppMessageQuery) -> AppMessageQuery {
     AppMessageQuery {
         group_id_hex: query.group_id_hex.clone(),
+        kinds: query.kinds.clone(),
         limit: None,
     }
 }

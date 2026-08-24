@@ -1493,6 +1493,7 @@ pub(crate) fn recover_notification_updates(
             &account.label,
             AppMessageQuery {
                 group_id_hex: None,
+                kinds: None,
                 limit: Some(NOTIFICATION_LAG_RECOVERY_LIMIT),
             },
         )?;

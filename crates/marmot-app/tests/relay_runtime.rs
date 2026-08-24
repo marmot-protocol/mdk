@@ -2635,6 +2635,136 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
 }
 
 #[tokio::test]
+async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "custom events",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+    accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // A kind MDK owns must be rejected before anything is committed.
+    let rejected = runtime
+        .send_custom_event(
+            &alice_id,
+            &group_id,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            Vec::new(),
+            "forged".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected, AppError::InvalidAppMessagePayload(_)));
+
+    let summary = runtime
+        .send_custom_event(
+            &alice_id,
+            &group_id,
+            30078,
+            vec![vec!["d".to_owned(), "game-1".to_owned()]],
+            "{\"move\":\"e4\"}".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert!(summary.published >= 1);
+
+    // Bob receives the custom event live.
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.kind == 30078
+        )
+    })
+    .await;
+
+    // It materializes in bob's timeline as a standalone row with its tags and
+    // content intact...
+    let bob_timeline = app
+        .timeline_messages_with_query(
+            &bob_label,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let custom = bob_timeline
+        .iter()
+        .find(|message| message.kind == 30078)
+        .expect("custom event projected to the timeline");
+    assert_eq!(custom.plaintext, "{\"move\":\"e4\"}");
+    assert_eq!(tag_value(&custom.tags, "d"), Some("game-1"));
+
+    // ...and the kinds filter fetches it from the raw app-event store.
+    let filtered = app
+        .messages_with_query(
+            &bob_label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                kinds: Some(vec![30078]),
+                limit: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].plaintext, "{\"move\":\"e4\"}");
+
+    // A kind filter that excludes it returns no custom rows.
+    let chat_only = app
+        .messages_with_query(
+            &bob_label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                kinds: Some(vec![MARMOT_APP_EVENT_KIND_CHAT]),
+                limit: None,
+            },
+        )
+        .unwrap();
+    assert!(
+        chat_only
+            .iter()
+            .all(|message| message.kind == MARMOT_APP_EVENT_KIND_CHAT)
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_delete_group_local_removes_projection_without_publishing_leave() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -2733,6 +2863,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             &bob_label,
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
                 limit: None,
             },
         )
@@ -2794,6 +2925,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             &bob_label,
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
                 limit: None,
             },
         )
@@ -5304,6 +5436,7 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
             &bob.account.account_id_hex,
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex),
+                kinds: None,
                 limit: Some(10),
             },
         )

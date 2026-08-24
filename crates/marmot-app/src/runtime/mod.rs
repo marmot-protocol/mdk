@@ -1981,6 +1981,25 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
+    /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
+    /// edit, delete, agent, group system, push token) are rejected so an app
+    /// cannot forge protocol events. Custom events project into the timeline
+    /// as standalone rows with the `custom_event` trigger but do not bump the
+    /// chat-list preview or raise push notifications.
+    pub async fn send_custom_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_custom_event(account_ref, group_id, kind, tags, content)
+            .await
+    }
+
     pub async fn share_push_registration(
         &self,
         account_ref: &str,
