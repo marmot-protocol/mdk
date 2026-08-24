@@ -362,6 +362,7 @@ fn sync_drain_round_trips_through_serde() {
     let kind = AuditEventKind::SyncDrain {
         duration_ms: 250,
         deliveries: 3,
+        skipped: Some(17),
         cursor_before_secs: Some(1_699_999_880),
         cursor_after_secs: Some(1_700_000_000),
     };
@@ -384,15 +385,35 @@ fn sync_drain_round_trips_through_serde() {
     let empty = AuditEventKind::SyncDrain {
         duration_ms: 8,
         deliveries: 0,
+        skipped: None,
         cursor_before_secs: None,
         cursor_after_secs: None,
     };
     let empty_json = serde_json::to_string(&empty).unwrap();
     assert!(!empty_json.contains("cursor_before_secs"));
     assert!(!empty_json.contains("cursor_after_secs"));
+    // An unrecorded skip count is omitted rather than written as zero: absent
+    // means "this build did not count", which is not the same claim as "no
+    // receive was skipped".
+    assert!(!empty_json.contains("skipped"));
     assert_eq!(
         serde_json::from_str::<AuditEventKind>(&empty_json).unwrap(),
         empty
+    );
+    // A row written before `skipped` existed still parses, and reads as
+    // unrecorded.
+    let legacy: AuditEventKind =
+        serde_json::from_str(r#"{"type":"sync_drain","duration_ms":250,"deliveries":3}"#)
+            .expect("a v2 sync_drain row predating `skipped` must still parse");
+    assert_eq!(
+        legacy,
+        AuditEventKind::SyncDrain {
+            duration_ms: 250,
+            deliveries: 3,
+            skipped: None,
+            cursor_before_secs: None,
+            cursor_after_secs: None,
+        }
     );
 }
 
@@ -879,6 +900,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::SyncDrain {
             duration_ms: 250,
             deliveries: 3,
+            skipped: Some(17),
             cursor_before_secs: Some(1_699_999_880),
             cursor_after_secs: Some(1_700_000_000),
         },
@@ -898,6 +920,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             activation_outcome: EpochBackfillActivationOutcome::Succeeded,
             completion_kind: Some(EpochBackfillCompletionKind::EndOfStoredEvents),
             deliveries: 4,
+            skipped: Some(21),
             local_epoch_before: 19,
             local_epoch_after: 20,
             group_advanced: true,
@@ -908,6 +931,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             activation_outcome: EpochBackfillActivationOutcome::Failed,
             error_kind: Some("account_transport".into()),
             deliveries: 0,
+            skipped: Some(0),
             local_epoch_before: 19,
             local_epoch_after: 19,
             group_advanced: false,
