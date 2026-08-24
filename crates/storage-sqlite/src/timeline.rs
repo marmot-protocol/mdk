@@ -1508,7 +1508,7 @@ fn project_single_message_timeline_tx(
         // their target and deletes tombstone it. Every other kind — including
         // app-defined custom kinds — projects a generic row.
         MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE => return Ok(None),
-        _ => timeline_row_from_app_event(&event),
+        _ => timeline_row_from_custom_event(&event),
     };
 
     if event.invalidated {
@@ -2870,7 +2870,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             // including app-defined custom kinds — projects a generic row.
             MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE => {}
             _ => {
-                let mut row = timeline_row_from_app_event(event);
+                let mut row = timeline_row_from_custom_event(event);
                 if event.invalidated {
                     row.invalidation_status = Some(invalidation_status(event));
                 }
@@ -3009,6 +3009,17 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         deleted: false,
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+    }
+}
+
+/// App-defined custom kinds own their tag semantics: an `e` tag may mean
+/// anything to the app, so it is never interpreted as MDK reply metadata.
+/// Ordinary chat replies can still target a custom row — reply linkage is
+/// derived from the replying event's own tags, not the target's.
+fn timeline_row_from_custom_event(event: &RawAppEvent) -> TimelineRow {
+    TimelineRow {
+        reply_to_message_id_hex: None,
+        ..timeline_row_from_app_event(event)
     }
 }
 

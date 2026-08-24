@@ -1163,13 +1163,19 @@ fn custom_kind_event_with_e_tag_still_projects_as_standalone_row() {
             message,
         }] if message.message_id_hex == "custom"
     ));
+    let messages = list(&store);
     assert_eq!(
-        list(&store)
+        messages
             .iter()
             .map(|message| message.message_id_hex.as_str())
             .collect::<Vec<_>>(),
         vec!["target", "custom"]
     );
+    // The `e` tag is app-owned semantics, not an MDK reply: no reply linkage,
+    // no hydrated preview.
+    let custom = &messages[1];
+    assert_eq!(custom.reply_to_message_id_hex, None);
+    assert!(custom.reply_preview.is_none());
 }
 
 #[test]
