@@ -31,6 +31,12 @@ App runtime bridge for the first real Marmot app surfaces.
   skips authoritative (`MlsGroup::load`) component re-checks at an unchanged group epoch
   (`encrypted_media_not_required_epochs`, mdk#1380), and the sync checkpoint skips its second
   `refresh_group_routes` when the drained prefix carried zero deliveries and clean routes.
+- Keep app-defined custom events on the `AppMessageIntent::Custom` path in `src/messages/intents.rs`: kind, tags, and
+  content pass through verbatim, and kinds MDK owns (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
+  agent, group system, push token) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
+  protocol-owned events. Custom kinds project as standalone timeline rows under
+  `TimelineUpdateTrigger::CustomEvent` (never folding onto a target message like reactions/deletes) and are queryable
+  by kind through `AppMessageQuery::kinds`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).
