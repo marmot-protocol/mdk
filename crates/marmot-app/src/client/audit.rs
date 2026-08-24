@@ -24,6 +24,7 @@ pub(crate) struct EpochBackfillTerminalAudit {
     pub completion_kind: Option<EpochBackfillCompletionKind>,
     pub error_kind: Option<String>,
     pub deliveries: u64,
+    pub skipped: u64,
     pub local_epoch_before: u64,
     pub local_epoch_after: u64,
     pub group_advanced: bool,
@@ -191,14 +192,19 @@ impl AppClient {
 
     /// Record a `sync_drain` forensic audit row at every drain-loop exit: how
     /// long the drain ran (`duration_ms`, wall-clock), how many deliveries it
-    /// ingested
-    /// (`deliveries`), and the durable transport cursor immediately before and
-    /// after the drain (Nostr second-granular). Account-scoped, so `group_ref`
-    /// is `None`.
+    /// ingested (`deliveries`), how many receives it dropped as an echo or an
+    /// already-seen duplicate (`skipped`), and the durable transport cursor
+    /// immediately before and after the drain (Nostr second-granular).
+    /// Account-scoped, so `group_ref` is `None`.
+    ///
+    /// The two counts are recorded apart because `duration_ms` alone cannot
+    /// tell a long drain that was making progress from one a relay held open
+    /// with traffic carrying no new history.
     pub(crate) fn record_sync_drain(
         &self,
         duration_ms: u64,
         deliveries: u64,
+        skipped: u64,
         cursor_before_secs: Option<u64>,
         cursor_after_secs: Option<u64>,
     ) {
@@ -208,6 +214,7 @@ impl AppClient {
             AuditEventKind::SyncDrain {
                 duration_ms,
                 deliveries,
+                skipped: Some(skipped),
                 cursor_before_secs,
                 cursor_after_secs,
             },
@@ -269,6 +276,7 @@ impl AppClient {
                 activation_outcome: terminal.activation_outcome,
                 completion_kind: terminal.completion_kind,
                 deliveries: terminal.deliveries,
+                skipped: Some(terminal.skipped),
                 local_epoch_before: terminal.local_epoch_before,
                 local_epoch_after: terminal.local_epoch_after,
                 group_advanced: terminal.group_advanced,
@@ -280,6 +288,7 @@ impl AppClient {
                 activation_outcome: terminal.activation_outcome,
                 error_kind: terminal.error_kind,
                 deliveries: terminal.deliveries,
+                skipped: Some(terminal.skipped),
                 local_epoch_before: terminal.local_epoch_before,
                 local_epoch_after: terminal.local_epoch_after,
                 group_advanced: terminal.group_advanced,

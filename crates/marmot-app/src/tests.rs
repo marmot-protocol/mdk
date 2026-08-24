@@ -1346,6 +1346,264 @@ fn epoch_backfill_drain_ends_when_relays_report_end_of_stored_events() {
     });
 }
 
+/// One already-seen event redelivered every `interval` until the returned flag
+/// is set or `deadline` passes, modelling a relay that keeps a drain's socket
+/// warm with traffic carrying no new history.
+///
+/// The first injection is novel, so a caller expecting `n` skips must run the
+/// pump for `n + 1` injections.
+fn redelivery_pump(
+    app: &MarmotApp,
+    event: NostrTransportEvent,
+    interval: Duration,
+    deadline: Duration,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<u64>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let app = app.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let expires_at = std::time::Instant::now() + deadline;
+            let mut sent = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < expires_at
+            {
+                inject_epoch_gap_probe(&app, event.clone()).await;
+                sent += 1;
+                tokio::time::sleep(interval).await;
+            }
+            sent
+        })
+    };
+    (stop, handle)
+}
+
+/// The end-of-stored-events gate must be reachable from the delivery path.
+///
+/// A relay redelivering faster than [`SDK_DRAIN_WAIT`] never lets the receive
+/// timeout fire, and the timeout is where the drain consults its gate. Before
+/// the delivery-path poll, a drain in this shape ran until the redelivery
+/// stopped even though every subscription had reported end-of-stored-events
+/// from the first moment — the drain had already won and could not say so.
+#[test]
+fn epoch_backfill_drain_ends_on_end_of_stored_events_while_duplicates_stream() {
+    run_composed_app_runtime_test("backfill-drain-eose-under-duplicates", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(30_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // Every subscription is served from the start: the gate's Complete
+        // verdict is available for the whole drain.
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        // Redelivery at 100 ms, well inside SDK_DRAIN_WAIT, for far longer than
+        // the drain should need.
+        let (stop, pump) = redelivery_pump(
+            &app,
+            epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "eose-under-duplicates",
+            ),
+            Duration::from_millis(100),
+            Duration::from_secs(20),
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        let drained_in = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a served history must complete even while duplicates arrive"
+        );
+        assert!(
+            drained_in < Duration::from_secs(3),
+            "the delivery-path gate poll must end the drain promptly, not when \
+             the redelivery stops; took {drained_in:?}"
+        );
+    });
+}
+
+/// `skipped` counts the receives a drain dropped as echo or duplicate, and
+/// `deliveries` keeps its ingested-only meaning.
+///
+/// Without the split, a long drain that was doing work and one held open by
+/// traffic carrying no new history are indistinguishable in a field export.
+#[test]
+fn epoch_backfill_drain_records_skipped_receives_beside_ingested_deliveries() {
+    run_composed_app_runtime_test("backfill-drain-skipped-counter", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(400),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // No relay reports end-of-stored-events, so the silence budget is what
+        // ends this drain. Six injections of one event: the first is novel, the
+        // other five are already-seen skips.
+        let (stop, pump) = redelivery_pump(
+            &app,
+            epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "skipped-counter",
+            ),
+            Duration::from_millis(100),
+            Duration::from_millis(550),
+        );
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let injected = pump.await.expect("redelivery pump must not panic");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "no relay reported end-of-stored-events, so the replay is unconfirmed"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let drains = recorded_rows_of_kind(&rows, "sync_drain");
+        let backfill_drain = drains
+            .iter()
+            .find(|row| {
+                row["kind"]["skipped"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            })
+            .expect("the backfill drain must record its skipped receives");
+        assert_eq!(
+            backfill_drain["kind"]["deliveries"], 1,
+            "only the first injection carried new history"
+        );
+        assert_eq!(
+            backfill_drain["kind"]["skipped"].as_u64().unwrap(),
+            injected - 1,
+            "every later redelivery of the same event must count as skipped"
+        );
+
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the unconfirmed replay must have one terminal row"
+        );
+        assert_eq!(failed[0]["kind"]["deliveries"], 1);
+        assert_eq!(
+            failed[0]["kind"]["skipped"].as_u64().unwrap(),
+            injected - 1,
+            "the terminal row must carry the same split as the drain row"
+        );
+    });
+}
+
+/// Regression guard for the deliberate choice not to gate the silence reset on
+/// progress.
+///
+/// The 2026-08 field export's working replays trickled novel events further
+/// apart than any budget worth setting, with non-novel traffic in between. If
+/// a later change stops redeliveries from resetting `silence_started` — the
+/// obvious way to bound a duplicate storm that never reports
+/// end-of-stored-events — this drain collects its first event and gives up.
+#[test]
+fn epoch_backfill_drain_collects_novel_history_that_trickles_slower_than_its_budget() {
+    run_composed_app_runtime_test("backfill-drain-stuttering-history", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(400),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        let nostr_group_id_hex = group.nostr_routing.nostr_group_id_hex.clone();
+
+        // Filler keeps the socket warm; it is bounded so the drain can still
+        // end once the novel history is exhausted.
+        let (stop, pump) = redelivery_pump(
+            &app,
+            epoch_gap_probe(
+                &nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "stuttering-filler",
+            ),
+            Duration::from_millis(100),
+            Duration::from_millis(3_300),
+        );
+        // Five novel events, 600 ms apart — every gap wider than the 400 ms
+        // silence budget.
+        let novel = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                for index in 0..5_u32 {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    inject_epoch_gap_probe(
+                        &app,
+                        epoch_gap_probe(
+                            &nostr_group_id_hex,
+                            crate::unix_now_seconds(),
+                            &format!("stuttering-novel-{index}"),
+                        ),
+                    )
+                    .await;
+                }
+            })
+        };
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+        novel.abort();
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "no relay reported end-of-stored-events, so the replay is unconfirmed"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["deliveries"], 6,
+            "the drain must collect the filler's first event and all five novel \
+             ones, not stop at the first budget-wide gap"
+        );
+    });
+}
+
 #[test]
 fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
     run_composed_app_runtime_test("backfill-drain-no-eose", || async {

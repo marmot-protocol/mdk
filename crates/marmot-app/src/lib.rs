@@ -326,6 +326,18 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 /// is making progress; what needs bounding is a drain that has stopped, and
 /// this bounds that.
 ///
+/// Because this budget is only consulted when the receive wait times out, a
+/// relay delivering faster than [`SDK_DRAIN_WAIT`] never reaches it; skipped
+/// deliveries therefore poll the end-of-stored-events gate directly, so a
+/// replay the relays have finished serving ends as soon as they say so rather
+/// than when their traffic stops. That closes the case where the drain had
+/// already won. It does not bound the case where a relay streams events this
+/// account already has and never reports end-of-stored-events: nothing here
+/// ends that drain before its traffic stops or the account worker is aborted
+/// at shutdown. Distinguishing it from a working replay needs the
+/// ingested-versus-skipped split now recorded on the `sync_drain` and
+/// `epoch_stall_backfill_*` audit rows; that residual is filed, not fixed.
+///
 /// 30 s is chosen to be far longer than any silence a working relay leaves
 /// mid-replay while still short enough that a wedged relay costs one worker
 /// stall rather than an unbounded one, and it is paced against repetition by
