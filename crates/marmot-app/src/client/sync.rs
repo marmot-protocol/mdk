@@ -989,9 +989,7 @@ impl AppClient {
         } else {
             EPOCH_BACKFILL_RETRY_BACKOFF
         };
-        let doubling = 1_u32 << retry_ordinal.min(8);
-        base.saturating_mul(doubling)
-            .min(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.max(base))
+        retry_backoff_for_ordinal(base, retry_ordinal)
     }
 
     /// Whether this seam must leave a pending intent alone for now.
@@ -3059,10 +3057,46 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
     }
 }
 
+/// Doubling backoff from `base`, capped at [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`]
+/// (or `base` itself when a test override exceeds the cap). Pure so the
+/// schedule is table-testable without a client.
+fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
+    let doubling = 1_u32 << retry_ordinal.min(8);
+    base.saturating_mul(doubling)
+        .min(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.max(base))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DrainVerdict, backfill_drain_verdict};
+    use super::{DrainVerdict, backfill_drain_verdict, retry_backoff_for_ordinal};
+    use crate::{EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP};
+    use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+
+    #[test]
+    fn the_retry_backoff_doubles_from_its_base_and_caps() {
+        // The production schedule the reviewer probed by hand: 15s, 30s, 60s,
+        // 120s, 240s, then pinned at the 5-minute cap — and the shift is
+        // clamped so absurd ordinals cannot overflow.
+        let base = EPOCH_BACKFILL_RETRY_BACKOFF;
+        let expect_secs = [15, 30, 60, 120, 240, 300, 300, 300];
+        for (ordinal, secs) in expect_secs.iter().enumerate() {
+            assert_eq!(
+                retry_backoff_for_ordinal(base, ordinal as u64),
+                Duration::from_secs(*secs),
+                "ordinal {ordinal}"
+            );
+        }
+        assert_eq!(
+            retry_backoff_for_ordinal(base, u64::MAX),
+            EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
+            "the shift clamp must hold for absurd ordinals"
+        );
+        // A test override larger than the cap stays at its own base rather
+        // than being shrunk by the cap.
+        let oversized = EPOCH_BACKFILL_RETRY_BACKOFF_CAP * 2;
+        assert_eq!(retry_backoff_for_ordinal(oversized, 0), oversized);
+    }
 
     #[test]
     fn drain_verdict_reads_end_of_stored_events_progress() {
