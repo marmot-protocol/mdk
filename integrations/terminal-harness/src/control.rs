@@ -311,6 +311,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
+        AgentControlResponse::InvitePolicy { .. } => "invite_policy",
         AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {

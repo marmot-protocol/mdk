@@ -206,6 +206,13 @@ impl AgentConnector {
                 account_id_hex,
                 welcomer_account_id_hex,
             } => self.allowlist_remove_response(&account_id_hex, &welcomer_account_id_hex),
+            AgentControlRequest::InvitePolicyGet { account_id_hex } => {
+                self.invite_policy_response(&account_id_hex)
+            }
+            AgentControlRequest::InvitePolicySet {
+                account_id_hex,
+                policy,
+            } => self.invite_policy_set_response(&account_id_hex, policy),
             AgentControlRequest::GroupInfo {
                 account_id_hex,
                 group_id_hex,

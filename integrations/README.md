@@ -255,6 +255,14 @@ the default installer topology that means each connector has its own allowlist.
 It matters most when several integrations are intentionally configured to manage
 the same account.
 
+Invite admission defaults to `allowlist`. Public direct-message bots can opt in
+without enabling debug controls by rerunning bootstrap with
+`--invite-policy any-authenticated-direct`; this accepts an authenticated
+welcomer only when the resulting MLS group has exactly two members. The other
+explicit policies are `deny`, `allowlist`, and `any-authenticated` (which also
+admits multi-party groups). These account-scoped invite policies remain
+independent from each integration's sender and activation policy.
+
 Hermes and OpenClaw can mirror configured `allowFrom`/welcomer entries into
 `wn-agent`. Their sync path is config-driven and may reconcile the connector
 allowlist to the configured set. All terminal harnesses require at least one

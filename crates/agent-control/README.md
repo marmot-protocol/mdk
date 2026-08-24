@@ -22,10 +22,14 @@ begin inputs is an error, and trying to begin another active stream with an occu
 
 ## What this crate does
 
-- Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, stream compose,
+- Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, invite policy, stream compose,
   allowlists, etc.).
 - Provides newline-delimited JSON framing with a 1 MiB per-frame cap.
 - Stays dependency-light: `serde` and Tokio IO only.
+
+Invite-policy values serialize on the wire as `deny`, `allowlist`, `any_authenticated_direct`, and
+`any_authenticated`. Deserialization also accepts the CLI spellings `any-authenticated-direct` and
+`any-authenticated`.
 
 `send_reaction` adds arbitrary non-blank, control-free reaction content of at
 most 64 Unicode scalar values to a durable message. Repeating the same content

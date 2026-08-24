@@ -15,6 +15,56 @@ pub const AGENT_CONTROL_TIMELINE_MAX_LIMIT: u32 = 50;
 pub const AGENT_CONTROL_TIMELINE_TEXT_MAX_CHARS: usize = 8_192;
 pub const AGENT_CONTROL_TIMELINE_REACTIONS_MAX: usize = 64;
 
+/// Account-scoped policy for confirming inbound Marmot group invites.
+///
+/// A policy never makes an unauthenticated Welcome acceptable. The
+/// `any_authenticated_direct` variant additionally requires the joined MLS
+/// group to contain exactly the local agent and one peer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlInvitePolicy {
+    Deny,
+    #[default]
+    Allowlist,
+    #[serde(alias = "any-authenticated-direct")]
+    AnyAuthenticatedDirect,
+    #[serde(alias = "any-authenticated")]
+    AnyAuthenticated,
+}
+
+impl AgentControlInvitePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allowlist => "allowlist",
+            Self::AnyAuthenticatedDirect => "any-authenticated-direct",
+            Self::AnyAuthenticated => "any-authenticated",
+        }
+    }
+}
+
+impl std::fmt::Display for AgentControlInvitePolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AgentControlInvitePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "deny" => Ok(Self::Deny),
+            "allowlist" => Ok(Self::Allowlist),
+            "any-authenticated-direct" => Ok(Self::AnyAuthenticatedDirect),
+            "any-authenticated" => Ok(Self::AnyAuthenticated),
+            _ => Err(format!(
+                "invalid invite policy {value:?}; expected deny, allowlist, any-authenticated-direct, or any-authenticated"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentControlError {
     #[error("agent control frame is empty")]
@@ -272,6 +322,13 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         welcomer_account_id_hex: String,
     },
+    InvitePolicyGet {
+        account_id_hex: String,
+    },
+    InvitePolicySet {
+        account_id_hex: String,
+        policy: AgentControlInvitePolicy,
+    },
     DebugInjectInbound {
         account_id_hex: String,
         group_id_hex: String,
@@ -397,6 +454,10 @@ pub enum AgentControlResponse {
     Allowlist {
         account_id_hex: String,
         welcomer_account_ids_hex: Vec<String>,
+    },
+    InvitePolicy {
+        account_id_hex: String,
+        policy: AgentControlInvitePolicy,
     },
     GroupInfo {
         account_id_hex: String,
@@ -846,12 +907,29 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlMediaUpload,
-        AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
-        AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlInvitePolicy,
+        AgentControlMediaUpload, AgentControlProfileLookupStatus, AgentControlRequest,
+        AgentControlResponse, AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
         MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
         write_frame,
     };
+
+    #[test]
+    fn invite_policy_accepts_cli_aliases_without_changing_canonical_wire_values() {
+        assert_eq!(
+            serde_json::from_str::<AgentControlInvitePolicy>("\"any-authenticated-direct\"")
+                .unwrap(),
+            AgentControlInvitePolicy::AnyAuthenticatedDirect
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentControlInvitePolicy>("\"any-authenticated\"").unwrap(),
+            AgentControlInvitePolicy::AnyAuthenticated
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentControlInvitePolicy::AnyAuthenticatedDirect).unwrap(),
+            "\"any_authenticated_direct\""
+        );
+    }
 
     #[test]
     fn rich_context_golden_events_decode_and_deleted_targets_are_redacted() {
@@ -1543,6 +1621,19 @@ mod tests {
                     welcomer_account_id_hex: welcomer(),
                 },
                 "allowlist_remove",
+            ),
+            (
+                AgentControlRequest::InvitePolicyGet {
+                    account_id_hex: account(),
+                },
+                "invite_policy_get",
+            ),
+            (
+                AgentControlRequest::InvitePolicySet {
+                    account_id_hex: account(),
+                    policy: crate::AgentControlInvitePolicy::AnyAuthenticatedDirect,
+                },
+                "invite_policy_set",
             ),
             (
                 AgentControlRequest::DebugInjectInbound {

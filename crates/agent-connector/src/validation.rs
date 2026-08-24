@@ -174,6 +174,8 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::AllowlistList { .. } => "allowlist_list",
         AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
         AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",
+        AgentControlRequest::InvitePolicyGet { .. } => "invite_policy_get",
+        AgentControlRequest::InvitePolicySet { .. } => "invite_policy_set",
         AgentControlRequest::DebugInjectInbound { .. } => "debug_inject_inbound",
         AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
         AgentControlRequest::SendMedia { .. } => "send_media",
