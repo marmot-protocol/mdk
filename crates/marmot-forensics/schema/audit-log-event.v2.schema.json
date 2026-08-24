@@ -715,6 +715,9 @@
     "epochBackfillActivationOutcome": {
       "enum": ["succeeded", "failed"]
     },
+    "epochBackfillCompletionKind": {
+      "enum": ["end_of_stored_events", "quiescence_fallback"]
+    },
     "epochBackfillDeferredReason": {
       "enum": ["group_epoch_unavailable"]
     },
@@ -1726,6 +1729,9 @@
             },
             "activation_outcome": {
               "$ref": "#/$defs/epochBackfillActivationOutcome"
+            },
+            "completion_kind": {
+              "$ref": "#/$defs/epochBackfillCompletionKind"
             },
             "deliveries": {
               "$ref": "#/$defs/u64"

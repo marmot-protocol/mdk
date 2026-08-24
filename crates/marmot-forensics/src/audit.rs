@@ -247,6 +247,23 @@ pub enum EpochBackfillActivationOutcome {
     Failed,
 }
 
+/// What ended the drain of an epoch-gap replay that completed.
+///
+/// Absent on rows written before this field existed; those predate the
+/// end-of-stored-events gate and were all quiescence drains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillCompletionKind {
+    /// Every subscription the replay issued was reported end-of-stored-events
+    /// by a relay: the account's stored history was served in full.
+    EndOfStoredEvents,
+    /// The end-of-stored-events gate never cleared within its attempt budget,
+    /// so this attempt fell back to draining until the relays went quiet. The
+    /// replay recovered whatever the relays sent, but nothing confirms that was
+    /// all of it — the weaker guarantee that shipped before the gate existed.
+    QuiescenceFallback,
+}
+
 /// Why a pending epoch-gap replay was not executed on this pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1086,6 +1103,11 @@ pub enum AuditEventKind {
         retry_ordinal: u64,
         duration_ms: u64,
         activation_outcome: EpochBackfillActivationOutcome,
+        /// What ended the drain. A `quiescence_fallback` completion is a
+        /// weaker claim than an `end_of_stored_events` one and must not be read
+        /// as proof the account's stored history was served in full.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_kind: Option<EpochBackfillCompletionKind>,
         deliveries: u64,
         local_epoch_before: u64,
         local_epoch_after: u64,

@@ -2874,54 +2874,59 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
     assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 0);
 }
 
-/// The account-wide end-of-stored-events gate an unfloored history drain reads:
-/// it must count every live subscription, and a re-activation must reset it so
-/// the next replay has to earn its own confirmation rather than inherit the
-/// previous one's.
+/// The account-wide end-of-stored-events gate an unfloored history drain reads.
+///
+/// It must follow the *live* subscription set across route churn: count every
+/// subscription the current activation issued, stop counting one whose route is
+/// gone, and require a re-issued subscription to be confirmed again rather than
+/// inheriting the previous generation's confirmation. The tracked-subscription
+/// assertions pin the eviction that keeps churned-away ids from accumulating.
 #[tokio::test]
-async fn account_subscription_eose_covers_every_live_subscription_and_resets_on_reactivation() {
+async fn account_subscription_eose_follows_the_live_subscription_set() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
     let account_id = MemberId::new(vec![0xB2; 32]);
     let inbox = TransportEndpoint("wss://inbox.example".to_owned());
-    let group_endpoint = TransportEndpoint("wss://group.example".to_owned());
-    let group = TransportGroupSubscription {
-        group_id: cgka_traits::GroupId::new(vec![9; 32]),
-        transport_group_id: vec![9; 32],
-        endpoints: vec![group_endpoint.clone()],
+    let group_for = |index: u8| TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![index; 32]),
+        transport_group_id: vec![index; 32],
+        endpoints: vec![TransportEndpoint(format!("wss://group-{index}.example"))],
     };
-
-    let activate = || {
-        adapter.activate_account(TransportAccountActivation {
-            account_id: account_id.clone(),
-            inbox_endpoints: vec![inbox.clone()],
-            group_subscriptions: vec![group.clone()],
-            since: None,
-        })
-    };
-    activate().await.expect("activation succeeds");
-
+    let group_endpoint = |index: u8| TransportEndpoint(format!("wss://group-{index}.example"));
     let inbox_id = NostrSubscription::AccountInbox {
         account_id: account_id.clone(),
         endpoints: vec![inbox.clone()],
         since: None,
     }
     .subscription_id();
-    let group_id = NostrSubscription::Group {
-        account_id: account_id.clone(),
-        group_id: group.group_id.clone(),
-        transport_group_id: group.transport_group_id.clone(),
-        endpoints: vec![group_endpoint.clone()],
-        since: None,
-    }
-    .subscription_id();
+    let group_id_for = |index: u8| {
+        NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: cgka_traits::GroupId::new(vec![index; 32]),
+            transport_group_id: vec![index; 32],
+            endpoints: vec![group_endpoint(index)],
+            since: None,
+        }
+        .subscription_id()
+    };
+    let activate = |group: TransportGroupSubscription| {
+        adapter.activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![inbox.clone()],
+            group_subscriptions: vec![group],
+            since: None,
+        })
+    };
 
+    activate(group_for(1)).await.expect("activation succeeds");
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert_eq!(progress.subscriptions, 2);
     assert!(!progress.any(), "no relay has reported yet");
     assert!(!progress.complete());
 
-    adapter.handle_relay_eose(inbox.clone(), inbox_id).await;
+    adapter
+        .handle_relay_eose(inbox.clone(), inbox_id.clone())
+        .await;
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert!(progress.any());
     assert!(
@@ -2930,17 +2935,25 @@ async fn account_subscription_eose_covers_every_live_subscription_and_resets_on_
     );
 
     adapter
-        .handle_relay_eose(group_endpoint.clone(), group_id)
+        .handle_relay_eose(group_endpoint(1), group_id_for(1))
         .await;
     assert!(
         adapter
             .account_subscription_eose(&account_id)
             .await
             .complete(),
-        "every live subscription has been served"
+        "every issued subscription has been served"
     );
 
-    activate().await.expect("reactivation succeeds");
+    // Reactivate with group 1 replaced by group 2. The retired subscription
+    // must be evicted rather than left tracked, and both re-issued ids must be
+    // confirmed again.
+    activate(group_for(2)).await.expect("reactivation succeeds");
+    assert_eq!(
+        adapter.relay_sync().await.tracked_subscriptions,
+        2,
+        "the retired group subscription must not stay tracked"
+    );
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert_eq!(progress.subscriptions, 2);
     assert!(
@@ -2948,15 +2961,37 @@ async fn account_subscription_eose_covers_every_live_subscription_and_resets_on_
         "a re-issued subscription must be confirmed again"
     );
 
+    // A report for the retired route cannot stand in for the live one.
+    adapter
+        .handle_relay_eose(group_endpoint(1), group_id_for(1))
+        .await;
+    adapter
+        .handle_relay_eose(inbox.clone(), inbox_id.clone())
+        .await;
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(progress.with_eose, 1, "the retired route must not count");
+    assert!(!progress.complete());
+
+    adapter
+        .handle_relay_eose(group_endpoint(2), group_id_for(2))
+        .await;
+    assert!(
+        adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete()
+    );
+
     adapter
         .deactivate_account(&account_id)
         .await
         .expect("deactivation succeeds");
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 0);
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert_eq!(progress.subscriptions, 0);
     assert!(
-        progress.complete(),
-        "an account with no live subscriptions has nothing to wait for"
+        !progress.complete(),
+        "an account with nothing subscribed cannot have been served"
     );
 }
 

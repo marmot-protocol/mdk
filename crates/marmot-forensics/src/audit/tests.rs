@@ -896,6 +896,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             retry_ordinal: 0,
             duration_ms: 120,
             activation_outcome: EpochBackfillActivationOutcome::Succeeded,
+            completion_kind: Some(EpochBackfillCompletionKind::EndOfStoredEvents),
             deliveries: 4,
             local_epoch_before: 19,
             local_epoch_after: 20,

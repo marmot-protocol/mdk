@@ -340,7 +340,9 @@ pub struct NostrRelayEvent {
 /// replay that never finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccountSubscriptionEose {
-    /// Live subscriptions the account currently holds.
+    /// Subscriptions this account's activation issued: its inbox plus one per
+    /// group route. Temporary post-join maintenance subscriptions are not
+    /// among them — they are installed and removed on their own gate.
     pub subscriptions: usize,
     /// Of those, how many at least one relay has reported end-of-stored-events
     /// for.
@@ -348,10 +350,12 @@ pub struct AccountSubscriptionEose {
 }
 
 impl AccountSubscriptionEose {
-    /// Whether every live subscription has been reported end-of-stored-events.
-    /// An account holding no subscriptions has no stored history to wait for.
+    /// Whether every issued subscription has been reported end-of-stored-events.
+    ///
+    /// An account holding no subscriptions is not complete: nothing was
+    /// subscribed, so nothing can have served its stored history.
     pub fn complete(&self) -> bool {
-        self.with_eose == self.subscriptions
+        self.subscriptions > 0 && self.with_eose == self.subscriptions
     }
 
     /// Whether any relay reported end-of-stored-events at all. `false` after a
