@@ -536,7 +536,9 @@ impl AppClient {
         // (`restore_disband_tombstone`), and that replay is the only reconciler
         // left for a disband whose live-session projection never completed — a
         // crash, or a batch that failed after the engine had already drained the
-        // event. So this seam owes the same terminal sweep as the inbound one.
+        // event. So this seam owes the same terminal sweep as the inbound one,
+        // which it discharges by running the shared
+        // `observe_event_projection_effects` below rather than a copy of it.
         let local_account_id_hex = self
             .app
             .account_home()
@@ -621,7 +623,8 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
-            self.invalidate_terminal_pending_sends(event, &local_account_id_hex, &mut summary)?;
+            routes_dirty |=
+                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary)?;
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
@@ -2132,6 +2135,114 @@ impl AppClient {
         Ok(())
     }
 
+    /// The durable app-projection effects one observed [`GroupEvent`] implies,
+    /// beyond the in-memory state [`observe_event`] maintains.
+    ///
+    /// Every seam that observes engine events runs this: live delivery and
+    /// send-applied effects through [`Self::observe_account_device_effects`],
+    /// and session-history replay through
+    /// [`Self::observe_drained_session_events`]. Those seams legitimately differ
+    /// in how they build a group projection and in what recovery evidence they
+    /// arm, but not in what an event means for the timeline, for membership, or
+    /// for a terminal group's notification destinations — so that part lives
+    /// here once. It used to be copied into the live seam only, which is how a
+    /// crash-replayed departure kept a departed member's push records and left
+    /// the account unread aggregate stale.
+    ///
+    /// Replay-safe by construction, which is what lets the drained seam call it:
+    /// hydration re-emits a stored group's `GroupDisbanded` on every open, and a
+    /// crash replays pending application events the live seam may already have
+    /// projected. Token removal is a `DELETE` of rows that may be gone;
+    /// `set_group_self_membership` writes an absolute value and no-ops when the
+    /// group has no projection row; the queued registration removal is an upsert
+    /// keyed on the group; and both invalidation sweeps skip rows they already
+    /// withdrew.
+    ///
+    /// Returns whether the event forces a transport-route refresh.
+    fn observe_event_projection_effects(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+        local_account_id_hex: &str,
+        summary: &mut SyncSummary,
+    ) -> Result<bool, AppError> {
+        let mut routes_dirty = false;
+        // Timeline invalidation dispatch: `AppMessageInvalidated` withdraws
+        // the delivered source row; `GroupStateInvalidated` withdraws every
+        // kind-1210 system row stamped with the superseded commit's
+        // `origin_commit_id`. The engine pairs `GroupStateInvalidated`
+        // with the commit-rollback seam (`CommitRolledBack` on the
+        // stored-convergence path), so that event no longer triggers
+        // tombstoning here — the explicit withdrawal event is the single
+        // authoritative signal and one rollback produces exactly one
+        // projection update.
+        if let Some(projection_update) = self
+            .app
+            .projection_update_for_invalidation_event(&self.state.label, event)?
+        {
+            summary.projection_updates.push(projection_update);
+        }
+        if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id, change, ..
+        } = event
+            && let Some((member, membership)) = member_departure(change)
+        {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let member_id_hex = hex::encode(member.as_slice());
+            let _ = self.app.remove_group_push_tokens_for_member(
+                &self.state.label,
+                &group_id_hex,
+                &member_id_hex,
+            );
+            // Only the local account leaving / being removed suppresses our
+            // own unread aggregate for the group; a peer departure must not.
+            // The recorded membership distinguishes a voluntary `Left` from
+            // an involuntary `Removed` so the chat list can tell them apart.
+            // This projection write is the source of truth for the account
+            // unread aggregate, so propagate its error (matching the nearby
+            // timeline/message projection writes) instead of swallowing it:
+            // silently leaving the flag stale would keep
+            // `account_unread_total()` returning an inflated badge after a
+            // self-removal that sync otherwise reports as successful.
+            if member_id_hex.eq_ignore_ascii_case(local_account_id_hex) {
+                self.app
+                    .set_group_self_membership(&self.state.label, &group_id_hex, membership)?;
+            }
+        }
+        if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id,
+            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+            ..
+        } = event
+        {
+            routes_dirty = true;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            // Terminal groups never advertise notification destinations
+            // again. Queue the current registration's removal and discard
+            // every cached peer token immediately; publishing the removal
+            // rumor remains restart-safe in the normal outbox.
+            let _ = self.queue_current_push_registration_removal_for_group(group_id);
+            let _ = self
+                .app
+                .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
+        }
+        self.invalidate_terminal_pending_sends(event, local_account_id_hex, summary)?;
+        // A (re-)join or create restores the local account's membership so a
+        // re-add after removal un-suppresses the group's unread count. Same
+        // source-of-truth write as the departure path above: propagate the
+        // error rather than swallow it.
+        if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. }
+        | cgka_traits::engine::GroupEvent::GroupCreated { group_id } = event
+        {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            self.app.set_group_self_membership(
+                &self.state.label,
+                &group_id_hex,
+                SelfMembership::Member,
+            )?;
+        }
+        Ok(routes_dirty)
+    }
+
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -2231,85 +2342,10 @@ impl AppClient {
                 updated_group.as_ref(),
                 source_message_id_hex,
             );
-            // Timeline invalidation dispatch: `AppMessageInvalidated` withdraws
-            // the delivered source row; `GroupStateInvalidated` withdraws every
-            // kind-1210 system row stamped with the superseded commit's
-            // `origin_commit_id`. The engine pairs `GroupStateInvalidated`
-            // with the commit-rollback seam (`CommitRolledBack` on the
-            // stored-convergence path), so that event no longer triggers
-            // tombstoning here — the explicit withdrawal event is the single
-            // authoritative signal and one rollback produces exactly one
-            // projection update.
-            if let Some(projection_update) = self
-                .app
-                .projection_update_for_invalidation_event(&self.state.label, event)?
-            {
-                summary.projection_updates.push(projection_update);
-            }
+            routes_dirty |=
+                self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
             if self.state.groups.len() != before {
                 routes_dirty = true;
-            }
-            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
-                group_id, change, ..
-            } = event
-                && let Some((member, membership)) = member_departure(change)
-            {
-                let group_id_hex = hex::encode(group_id.as_slice());
-                let member_id_hex = hex::encode(member.as_slice());
-                let _ = self.app.remove_group_push_tokens_for_member(
-                    &self.state.label,
-                    &group_id_hex,
-                    &member_id_hex,
-                );
-                // Only the local account leaving / being removed suppresses our
-                // own unread aggregate for the group; a peer departure must not.
-                // The recorded membership distinguishes a voluntary `Left` from
-                // an involuntary `Removed` so the chat list can tell them apart.
-                // This projection write is the source of truth for the account
-                // unread aggregate, so propagate its error (matching the nearby
-                // timeline/message projection writes) instead of swallowing it:
-                // silently leaving the flag stale would keep
-                // `account_unread_total()` returning an inflated badge after a
-                // self-removal that sync otherwise reports as successful.
-                if member_id_hex.eq_ignore_ascii_case(&local_account_id_hex) {
-                    self.app.set_group_self_membership(
-                        &self.state.label,
-                        &group_id_hex,
-                        membership,
-                    )?;
-                }
-            }
-            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
-                group_id,
-                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
-                ..
-            } = event
-            {
-                routes_dirty = true;
-                let group_id_hex = hex::encode(group_id.as_slice());
-                // Terminal groups never advertise notification destinations
-                // again. Queue the current registration's removal and discard
-                // every cached peer token immediately; publishing the removal
-                // rumor remains restart-safe in the normal outbox.
-                let _ = self.queue_current_push_registration_removal_for_group(group_id);
-                let _ =
-                    self.app
-                        .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
-            }
-            self.invalidate_terminal_pending_sends(event, &local_account_id_hex, summary)?;
-            // A (re-)join or create restores the local account's membership so a
-            // re-add after removal un-suppresses the group's unread count. Same
-            // source-of-truth write as the departure path above: propagate the
-            // error rather than swallow it.
-            if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. }
-            | cgka_traits::engine::GroupEvent::GroupCreated { group_id } = event
-            {
-                let group_id_hex = hex::encode(group_id.as_slice());
-                self.app.set_group_self_membership(
-                    &self.state.label,
-                    &group_id_hex,
-                    SelfMembership::Member,
-                )?;
             }
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
