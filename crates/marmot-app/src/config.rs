@@ -118,6 +118,12 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
     pub dev_fail_invite_local_refresh: bool,
+    /// Dev/test-only override for how long the epoch-gap backfill drain waits
+    /// in silence for end-of-stored-events before reporting an incomplete
+    /// replay ([`crate::EPOCH_BACKFILL_EOSE_WAIT`]). Honored only with
+    /// `test-policy-overrides`; this keeps the give-up path testable without
+    /// spending the production budget in wall-clock.
+    pub dev_epoch_backfill_eose_wait_ms: Option<u64>,
     /// Dev/test-only fault injected before the next delivery after this many
     /// completed catch-up deliveries. Honored only with
     /// `test-policy-overrides`; this exercises truthful partial-progress
@@ -190,6 +196,7 @@ impl Default for MarmotAppConfig {
             dev_fail_invite_welcome_intent: false,
             dev_fail_create_local_projection: false,
             dev_fail_invite_local_refresh: false,
+            dev_epoch_backfill_eose_wait_ms: None,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
             dev_fail_ingest_after_application_event_ack: false,
@@ -309,6 +316,14 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_fail_invite_local_refresh(mut self, enabled: bool) -> Self {
         self.dev_fail_invite_local_refresh = enabled;
+        self
+    }
+
+    /// Give the epoch-gap backfill drain `ms` of silence to reach
+    /// end-of-stored-events in test-policy builds. Normal builds ignore this
+    /// field.
+    pub fn with_dev_epoch_backfill_eose_wait_ms(mut self, ms: u64) -> Self {
+        self.dev_epoch_backfill_eose_wait_ms = Some(ms);
         self
     }
 

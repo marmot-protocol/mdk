@@ -307,6 +307,24 @@ const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
+/// How long the epoch-gap backfill drain keeps waiting in *silence* for
+/// end-of-stored-events before it gives up and reports an incomplete replay.
+///
+/// Ordinary sync treats a quiet relay as a finished drain, which is right for a
+/// floored subscription that asks for a little and gets it. The backfill's
+/// subscription is unfloored, so silence there is ambiguous: it is equally the
+/// relay having nothing more to send and the relay still resolving a
+/// whole-account history query. Only EOSE separates them, and this is the
+/// budget for waiting on it.
+///
+/// The budget is spent on silence alone — every delivery, novel or not, resets
+/// it — so a long but progressing replay is never cut short; it only has to
+/// cover the longest gap a working relay leaves mid-replay. The 2026-08 field
+/// export put whole-account fetches at 0.8-1.4 s to first completion, and the
+/// adapter's own regression coverage already treats 30 s as the outer bound on
+/// waiting for one relay's EOSE, so 30 s is generous by two orders of magnitude
+/// while still bounding how long one wedged relay can hold the account worker.
+pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 /// Local worker operations include SQLite's bounded busy retry but no relay or
 /// blob transfer. A missing response beyond this point indicates a wedged

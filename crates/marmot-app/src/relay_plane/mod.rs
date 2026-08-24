@@ -21,9 +21,9 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
-    RelayRegistrationOutcome,
+    AccountSubscriptionEose, NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient,
+    NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter, RelayExportConsent,
+    RelayLabelResolution, RelayRegistrationOutcome,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -748,6 +748,23 @@ impl MarmotRelayPlane {
             .await
     }
 
+    /// Report end-of-stored-events for one subscription on one endpoint, the
+    /// way [`handle_relay_notification`] does for an SDK-backed plane. An
+    /// injected relay client produces no relay messages of its own, so tests
+    /// that need an EOSE-gated drain to complete drive this seam instead.
+    #[cfg(test)]
+    pub(crate) async fn handle_relay_eose_for_test(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+    ) {
+        self.inner
+            .transport
+            .adapter
+            .handle_relay_eose(endpoint, subscription_id)
+            .await;
+    }
+
     /// Drive the managed account worker through its receive-error reconnect path
     /// by closing inbound delivery, matching relay-notification recovery.
     #[cfg(test)]
@@ -1221,6 +1238,19 @@ impl MarmotRelayPlaneAccountAdapter {
             .transport
             .adapter
             .subscription_any_eose(subscription_id)
+            .await
+    }
+
+    /// End-of-stored-events progress across this account's live subscriptions.
+    ///
+    /// The epoch-gap backfill drain reads this to tell a relay that has
+    /// finished replaying stored history from one that has simply gone quiet.
+    pub(crate) async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_eose(&self.account_id)
             .await
     }
 

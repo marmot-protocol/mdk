@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
@@ -17,8 +17,9 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
-    AppPerformanceTelemetry, ClassifiedSyncFailure, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT,
-    SelfMembership, SyncFailure, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
+    AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_WAIT, SDK_DRAIN_WAIT,
+    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillDeferredReason,
@@ -62,6 +63,57 @@ pub(crate) enum EpochBackfillRunOutcome {
     NotPending,
     Deferred,
     Completed(SyncSummary),
+    /// The replay ran, ingested whatever it did reach, and stopped without the
+    /// relays confirming they had served the account's stored history. The
+    /// summary is real and must still be published; the intent stays pending.
+    Incomplete(SyncSummary),
+}
+
+/// What ends a transport drain.
+///
+/// The two contracts differ only in what silence means, so they share one loop
+/// body: see [`AppClient::sync_sdk_relay`] and
+/// [`AppClient::backfill_sdk_relay`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainCompletion {
+    /// Ordinary sync: a quiet relay is a finished drain. Latency-bound, because
+    /// a foreground sync must return in human time.
+    Quiescence,
+    /// Epoch-gap backfill: the subscription is unfloored, so only
+    /// end-of-stored-events proves the history query finished. Silence polls
+    /// that gate and spends the passed budget; it never ends the drain by
+    /// itself.
+    EndOfStoredEvents(Duration),
+}
+
+/// How a drain ended.
+///
+/// Only [`DrainCompletion::EndOfStoredEvents`] can reach the two incomplete
+/// verdicts; a quiescence drain is complete by its own contract as soon as the
+/// relays go quiet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainVerdict {
+    /// Every live subscription reached end-of-stored-events and the relays then
+    /// went quiet: the account's stored history was served in full.
+    Complete,
+    /// The silence budget ran out with stored history still unconfirmed, though
+    /// some relay did reach end-of-stored-events.
+    EoseTimeout,
+    /// The silence budget ran out without one relay reaching
+    /// end-of-stored-events: the subscriptions were registered but never
+    /// served.
+    NoRelayEose,
+}
+
+impl DrainVerdict {
+    /// The audit row's `error_kind` for a drain that did not complete.
+    fn error_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::EoseTimeout => Some("backfill_drain_eose_timeout"),
+            Self::NoRelayEose => Some("backfill_drain_no_relay_eose"),
+        }
+    }
 }
 
 /// What the convergence scheduler should do next for a group, derived from
@@ -876,10 +928,60 @@ impl AppClient {
         }
     }
 
+    /// Drain the transport for an ordinary floored sync: ingest what is waiting
+    /// and return as soon as the relays go quiet.
     async fn sync_sdk_relay(
         &mut self,
         deliveries: &mut u64,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let (summary, _) = self
+            .drain_sdk_relay(deliveries, DrainCompletion::Quiescence)
+            .await?;
+        Ok(summary)
+    }
+
+    /// Drain the transport for an epoch-gap backfill: the same ingest, ended by
+    /// the relays reporting end-of-stored-events instead of by silence, so a
+    /// whole-account history query that is merely slow is not read as one that
+    /// had nothing to send.
+    async fn backfill_sdk_relay(
+        &mut self,
+        deliveries: &mut u64,
+    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
+        let budget = self.epoch_backfill_eose_wait();
+        self.drain_sdk_relay(deliveries, DrainCompletion::EndOfStoredEvents(budget))
+            .await
+    }
+
+    /// The silence budget the backfill drain spends waiting on
+    /// end-of-stored-events.
+    fn epoch_backfill_eose_wait(&self) -> Duration {
+        if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.app.config.dev_epoch_backfill_eose_wait_ms
+        {
+            return Duration::from_millis(ms);
+        }
+        EPOCH_BACKFILL_EOSE_WAIT
+    }
+
+    /// How an epoch-gap backfill drain that stops now should be read, from the
+    /// account's current end-of-stored-events progress.
+    async fn backfill_drain_verdict(&self) -> DrainVerdict {
+        let eose = self.adapter.account_subscription_eose().await;
+        if eose.complete() {
+            DrainVerdict::Complete
+        } else if eose.any() {
+            DrainVerdict::EoseTimeout
+        } else {
+            DrainVerdict::NoRelayEose
+        }
+    }
+
+    async fn drain_sdk_relay(
+        &mut self,
+        deliveries: &mut u64,
+        completion: DrainCompletion,
+    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
         // These are local app-state reads before the relay receive loop. They
         // are not failures of the account-worker command boundary.
         let display_names = self.app.display_names_by_id().map_err(|error| {
@@ -911,8 +1013,12 @@ impl AppClient {
         let cursor_before_secs = self.state.last_transport_timestamp;
         *deliveries = 0;
         let mut routes_dirty = false;
+        // Silence, not total drain time, is what the backfill's budget bounds:
+        // every delivery below resets this, so a long replay that keeps making
+        // progress is never cut short.
+        let mut silence_started = std::time::Instant::now();
 
-        loop {
+        let verdict = loop {
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
             } else {
@@ -921,7 +1027,14 @@ impl AppClient {
             first_wait = false;
             let delivery = match timeout(wait, self.adapter.receive()).await {
                 Ok(Ok(Some(delivery))) => delivery,
-                Ok(Ok(None)) => break,
+                Ok(Ok(None)) => {
+                    break match completion {
+                        DrainCompletion::Quiescence => DrainVerdict::Complete,
+                        DrainCompletion::EndOfStoredEvents(_) => {
+                            self.backfill_drain_verdict().await
+                        }
+                    };
+                }
                 Ok(Err(error)) => {
                     return Err(self
                         .finish_failed_sync_drain(
@@ -934,8 +1047,21 @@ impl AppClient {
                         )
                         .await);
                 }
-                Err(_) => break,
+                Err(_) => match completion {
+                    DrainCompletion::Quiescence => break DrainVerdict::Complete,
+                    DrainCompletion::EndOfStoredEvents(budget) => {
+                        let verdict = self.backfill_drain_verdict().await;
+                        if verdict == DrainVerdict::Complete || silence_started.elapsed() >= budget
+                        {
+                            break verdict;
+                        }
+                        continue;
+                    }
+                },
             };
+            // Any delivery proves the stream is alive, including one this drain
+            // goes on to skip as an echo or a duplicate.
+            silence_started = std::time::Instant::now();
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 continue;
@@ -987,7 +1113,7 @@ impl AppClient {
             *deliveries = (*deliveries).saturating_add(1);
             summary.merge(delivery_summary);
             routes_dirty |= delivery_routes_dirty;
-        }
+        };
 
         if let Err(error) = self
             .checkpoint_sync_prefix(&mut summary, routes_dirty, *deliveries)
@@ -1010,7 +1136,7 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        Ok(summary)
+        Ok((summary, verdict))
     }
 
     async fn finish_failed_sync_drain(
@@ -1607,8 +1733,8 @@ impl AppClient {
                 }
                 self.record_subscription_rebuild(None).await;
                 let mut deliveries = 0;
-                let mut summary = match self.sync_sdk_relay(&mut deliveries).await {
-                    Ok(summary) => summary,
+                let (mut summary, verdict) = match self.backfill_sdk_relay(&mut deliveries).await {
+                    Ok(drained) => drained,
                     Err(err) => {
                         let terminal_error = err.source.privacy_safe_kind().to_string();
                         self.finish_epoch_backfill_execution(
@@ -1637,13 +1763,22 @@ impl AppClient {
                     }
                 };
                 summary.merge(drained);
+                // Activation itself succeeded either way; what the verdict
+                // decides is whether the replay it opened actually served this
+                // account's stored history. An unconfirmed drain must not
+                // disarm the detector, so it is recorded as a failed attempt
+                // and its intent stays queued for the next seam.
+                let error_kind = verdict.error_kind();
                 self.finish_epoch_backfill_execution(
                     execution,
                     EpochBackfillActivationOutcome::Succeeded,
-                    None,
+                    error_kind.map(str::to_owned),
                     deliveries,
-                    true,
+                    error_kind.is_none(),
                 );
+                if error_kind.is_some() {
+                    return Ok(EpochBackfillRunOutcome::Incomplete(summary));
+                }
                 Ok(EpochBackfillRunOutcome::Completed(summary))
             }
             Err(err) => {
@@ -1717,6 +1852,14 @@ impl AppClient {
                         )
                     })? {
                     EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
+                    // The intent's own replay could not confirm it served this
+                    // account's history. Retain what it did ingest and fall
+                    // through to the caller-directed unfloored repair below
+                    // rather than re-running the same intent in a tight loop.
+                    EpochBackfillRunOutcome::Incomplete(summary) => {
+                        self.pending_failed_sync_summary.merge(summary);
+                        break;
+                    }
                     EpochBackfillRunOutcome::Deferred => continue,
                     EpochBackfillRunOutcome::NotPending => break,
                 }
