@@ -8602,6 +8602,382 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     );
 }
 
+fn drained_seam_push_token(
+    group_id_hex: &str,
+    member_id_hex: &str,
+    leaf_index: u32,
+) -> GroupPushTokenRecord {
+    GroupPushTokenRecord {
+        group_id_hex: group_id_hex.to_owned(),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index,
+        platform: PushPlatform::Apns,
+        token_fingerprint: format!("fingerprint-{member_id_hex}"),
+        server_pubkey_hex: "bb".repeat(32),
+        relay_hint: None,
+        encrypted_token: vec![1, 2, 3],
+        owner_ts: 1,
+        owner_sig: String::new(),
+        updated_at_ms: 1,
+    }
+}
+
+/// A departed member's cached push records can never verify against current
+/// membership again, so the inbound seam drops them the moment it observes the
+/// departure. A departure that only ever reaches the drained seam — the live
+/// projection crashed before it ran — owes the same cleanup, or the records
+/// survive the restart with nothing left to sweep them.
+#[tokio::test]
+async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-departure.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("drained departure", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let departing = nostr::Keys::generate().public_key().to_hex();
+    let staying = nostr::Keys::generate().public_key().to_hex();
+    app.upsert_group_push_token(
+        "alice",
+        &drained_seam_push_token(&group_id_hex, &departing, 1),
+    )
+    .unwrap();
+    app.upsert_group_push_token(
+        "alice",
+        &drained_seam_push_token(&group_id_hex, &staying, 2),
+    )
+    .unwrap();
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change: cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: MemberId::new(hex::decode(&departing).unwrap()),
+            },
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        app.group_push_tokens("alice", &group_id_hex)
+            .unwrap()
+            .into_iter()
+            .map(|token| token.member_id_hex)
+            .collect::<HashSet<_>>(),
+        HashSet::from([staying]),
+        "a drained departure must drop the departed member's push records and keep the rest"
+    );
+}
+
+/// `account_groups.self_membership` is the source of truth for the account
+/// unread aggregate. A self-departure observed only on the drained seam must
+/// move it, and a drained re-join must move it back — otherwise a crash during
+/// a leave leaves the badge inflated forever, and a crash during a re-add
+/// leaves a live group's unread permanently suppressed.
+#[tokio::test]
+async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-membership.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("drained membership", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+    );
+
+    let departure = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change: cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            },
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&departure)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+        "a drained self-eviction must record how the account left"
+    );
+
+    let rejoin = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
+            group_id: group_id.clone(),
+            via_welcome: MessageId::new(vec![0x7a; 32]),
+            welcomer: None,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&rejoin)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+        "a drained re-join must un-suppress the group's unread aggregate again"
+    );
+}
+
+/// A terminal group never advertises notification destinations again. The
+/// inbound seam queues the current registration's removal and discards every
+/// cached peer token; hydration re-emits a stored group's `GroupDisbanded`
+/// behind no delivery at all, and that replay is the only reconciler left when
+/// the live projection never ran.
+///
+/// The arm also sets `routes_dirty`, which is deliberately not asserted here: a
+/// disband leaves the group's transport route in place, so the forced
+/// `sync_runtime_groups` reconciles an unchanged subscription set and reaches
+/// the relay as nothing observable.
+#[tokio::test]
+async fn a_drained_disband_performs_the_terminal_push_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-sweep.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("drained sweep", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    app.upsert_push_registration(
+        "alice",
+        PushPlatform::Fcm,
+        "device-token",
+        &nostr::Keys::generate().public_key().to_hex(),
+        None,
+    )
+    .unwrap();
+    let peer = nostr::Keys::generate().public_key().to_hex();
+    app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
+        .unwrap();
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .into_iter()
+            .map(|(group, _)| group)
+            .collect::<Vec<_>>(),
+        vec![group_id_hex.clone()],
+        "a drained disband must queue the current registration's removal"
+    );
+    assert!(
+        app.group_push_tokens("alice", &group_id_hex)
+            .unwrap()
+            .is_empty(),
+        "a drained disband must discard every cached peer token"
+    );
+}
+
+/// `AppMessageInvalidated` is the engine's explicit timeline withdrawal. The
+/// drained seam is where it lands after a crash, so skipping the dispatch
+/// leaves a message the canonical branch never carried rendered as live
+/// history.
+#[tokio::test]
+async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-invalidation.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("drained invalidation", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let source_message_id = MessageId::new(vec![0x5c; 32]);
+    let source_message_id_hex = hex::encode(source_message_id.as_slice());
+
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: "losing-branch-row".to_owned(),
+            source_message_id_hex: Some(source_message_id_hex),
+            direction: "received".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "from the losing branch".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(11),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+            group_id: group_id.clone(),
+            message_id: source_message_id,
+            epoch: cgka_traits::EpochId(1),
+            reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+            decrypted_payload_ref: None,
+        }],
+        ..Default::default()
+    };
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    assert!(
+        !summary.projection_updates.is_empty(),
+        "a drained withdrawal must reach live timeline subscribers"
+    );
+    assert_eq!(
+        app.timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|row| row.message_id_hex == "losing-branch-row")
+        .expect("the withdrawn row must still be on the timeline as a tombstone")
+        .invalidation_status,
+        Some("LosingBranch".to_owned()),
+        "a drained withdrawal must tombstone the delivered row"
+    );
+}
+
+/// Drained replay is not exclusive with live delivery: a crash can leave the
+/// engine's durable outbox holding events the inbound seam already projected,
+/// and hydration re-emits a disband on every open. Every write both seams share
+/// must therefore be safe to apply twice — an absent push token, a membership
+/// already at its target value, and an already-queued registration removal all
+/// converge rather than accumulate.
+#[tokio::test]
+async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-replay.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("drained replay", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    app.upsert_push_registration(
+        "alice",
+        PushPlatform::Fcm,
+        "device-token",
+        &nostr::Keys::generate().public_key().to_hex(),
+        None,
+    )
+    .unwrap();
+    let peer = nostr::Keys::generate().public_key().to_hex();
+    app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
+        .unwrap();
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(1),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::MemberRemoved {
+                    member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                },
+                origin_commit_id: None,
+            },
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(2),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                origin_commit_id: None,
+            },
+        ],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .expect("re-observing a replayed batch must not error");
+
+    assert_eq!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .len(),
+        1,
+        "a replayed disband must converge on one queued removal, not accumulate them"
+    );
+    assert!(
+        app.group_push_tokens("alice", &group_id_hex)
+            .unwrap()
+            .is_empty(),
+    );
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+        "a replayed self-departure must leave membership where the first pass put it"
+    );
+}
+
 #[test]
 fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {
