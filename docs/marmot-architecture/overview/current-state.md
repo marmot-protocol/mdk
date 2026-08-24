@@ -69,7 +69,7 @@ uploaded founding metadata and performs no media transfer; the older all-in-one 
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
 
-Hosts can also send app-defined custom events: any non-reserved `MarmotAppEvent` kind with verbatim tags and content,
+Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
 every message surface, and custom kinds materialize as standalone timeline rows under a dedicated `CustomEvent`
 update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token) are rejected on
