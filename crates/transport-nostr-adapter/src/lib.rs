@@ -330,6 +330,38 @@ pub struct NostrRelayEvent {
     pub event: NostrTransportEvent,
 }
 
+/// End-of-stored-events progress across one account's live subscriptions,
+/// from [`NostrTransportAdapter::account_subscription_eose`].
+///
+/// "At least one relay" rather than "every relay" is deliberate: a subscription
+/// is issued to every configured endpoint, including ones that are registered
+/// but never connect, and those never report EOSE. Requiring all of them would
+/// make one permanently unreachable relay indistinguishable from a history
+/// replay that never finished.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountSubscriptionEose {
+    /// Live subscriptions the account currently holds.
+    pub subscriptions: usize,
+    /// Of those, how many at least one relay has reported end-of-stored-events
+    /// for.
+    pub with_eose: usize,
+}
+
+impl AccountSubscriptionEose {
+    /// Whether every live subscription has been reported end-of-stored-events.
+    /// An account holding no subscriptions has no stored history to wait for.
+    pub fn complete(&self) -> bool {
+        self.with_eose == self.subscriptions
+    }
+
+    /// Whether any relay reported end-of-stored-events at all. `false` after a
+    /// wait is the shape of an account whose relays accepted the subscription
+    /// registration but never served it.
+    pub fn any(&self) -> bool {
+        self.with_eose > 0
+    }
+}
+
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
@@ -544,6 +576,24 @@ impl NostrTransportAdapter {
             .await
             .sync
             .subscription_any_eose(subscription_id)
+    }
+
+    /// End-of-stored-events progress across every subscription an account
+    /// currently holds — its inbox plus one per group route.
+    ///
+    /// This is the account-wide counterpart of
+    /// [`Self::subscription_any_eose`], for a caller draining an unfloored
+    /// re-activation that must not mistake a quiet relay for a finished
+    /// history replay. It reports counts only: no ids, endpoints, or routes
+    /// cross the boundary.
+    pub async fn account_subscription_eose(
+        &self,
+        account_id: &MemberId,
+    ) -> AccountSubscriptionEose {
+        self.state
+            .read()
+            .await
+            .account_subscription_eose(account_id)
     }
 
     /// Install the temporary, full-history subscription used by the post-join
@@ -1356,14 +1406,13 @@ impl AdapterState {
         }
     }
 
-    /// Evict sync-telemetry progress for every subscription implied by an
-    /// account's stored routes (its inbox plus each group). Called before the
-    /// routes are replaced (reactivate) or removed (deactivate); subscription
-    /// ids are derived from account/group/endpoint state, never `since`, so
-    /// the reconstructed ids match the ones recorded at subscribe time.
-    fn forget_account_subscription_starts(&mut self, account_id: &MemberId) {
+    /// Subscription ids implied by an account's stored routes: its inbox plus
+    /// one per group. Ids are derived from account/group/endpoint state, never
+    /// `since`, so the reconstructed ids match the ones recorded at subscribe
+    /// time. Empty for an account with no stored routes.
+    fn account_subscription_ids(&self, account_id: &MemberId) -> Vec<String> {
         let Some(routes) = self.accounts.get(account_id) else {
-            return;
+            return Vec::new();
         };
         let mut ids = Vec::with_capacity(1 + routes.groups.len());
         ids.push(
@@ -1381,8 +1430,27 @@ impl AdapterState {
         for group in &routes.groups {
             ids.push(group_subscription(account_id, group, None).subscription_id());
         }
-        for id in ids {
+        ids
+    }
+
+    /// Evict sync-telemetry progress for every subscription implied by an
+    /// account's stored routes. Called before the routes are replaced
+    /// (reactivate) or removed (deactivate).
+    fn forget_account_subscription_starts(&mut self, account_id: &MemberId) {
+        for id in self.account_subscription_ids(account_id) {
             self.sync.forget_subscription(&id);
+        }
+    }
+
+    /// End-of-stored-events progress across an account's live subscriptions.
+    fn account_subscription_eose(&self, account_id: &MemberId) -> AccountSubscriptionEose {
+        let ids = self.account_subscription_ids(account_id);
+        AccountSubscriptionEose {
+            subscriptions: ids.len(),
+            with_eose: ids
+                .iter()
+                .filter(|id| self.sync.subscription_any_eose(id).unwrap_or(false))
+                .count(),
         }
     }
 

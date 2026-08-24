@@ -2874,6 +2874,92 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
     assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 0);
 }
 
+/// The account-wide end-of-stored-events gate an unfloored history drain reads:
+/// it must count every live subscription, and a re-activation must reset it so
+/// the next replay has to earn its own confirmation rather than inherit the
+/// previous one's.
+#[tokio::test]
+async fn account_subscription_eose_covers_every_live_subscription_and_resets_on_reactivation() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let account_id = MemberId::new(vec![0xB2; 32]);
+    let inbox = TransportEndpoint("wss://inbox.example".to_owned());
+    let group_endpoint = TransportEndpoint("wss://group.example".to_owned());
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![9; 32]),
+        transport_group_id: vec![9; 32],
+        endpoints: vec![group_endpoint.clone()],
+    };
+
+    let activate = || {
+        adapter.activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![inbox.clone()],
+            group_subscriptions: vec![group.clone()],
+            since: None,
+        })
+    };
+    activate().await.expect("activation succeeds");
+
+    let inbox_id = NostrSubscription::AccountInbox {
+        account_id: account_id.clone(),
+        endpoints: vec![inbox.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let group_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: vec![group_endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(progress.subscriptions, 2);
+    assert!(!progress.any(), "no relay has reported yet");
+    assert!(!progress.complete());
+
+    adapter.handle_relay_eose(inbox.clone(), inbox_id).await;
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert!(progress.any());
+    assert!(
+        !progress.complete(),
+        "the group subscription has not been served"
+    );
+
+    adapter
+        .handle_relay_eose(group_endpoint.clone(), group_id)
+        .await;
+    assert!(
+        adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete(),
+        "every live subscription has been served"
+    );
+
+    activate().await.expect("reactivation succeeds");
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(progress.subscriptions, 2);
+    assert!(
+        !progress.any(),
+        "a re-issued subscription must be confirmed again"
+    );
+
+    adapter
+        .deactivate_account(&account_id)
+        .await
+        .expect("deactivation succeeds");
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(progress.subscriptions, 0);
+    assert!(
+        progress.complete(),
+        "an account with no live subscriptions has nothing to wait for"
+    );
+}
+
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
     // `to_transport_message` verifies the id against the event hash (#351), so
     // the distinguishing byte lives in the content and the id is computed from
