@@ -839,6 +839,7 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let account_id_hex = account.account_id_hex.clone();
         let group_id_hex = query.group_id_hex.clone();
+        let kinds = query.kinds.clone();
         let account_label = account.label.clone();
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
@@ -961,6 +962,13 @@ impl MarmotAppRuntime {
                     != Some(hex::encode(message.group_id.as_slice()).as_str())
                     && group_id_hex.is_some()
                 {
+                    continue;
+                }
+                // The live broadcast path applies the caller's kind filter
+                // itself; the lag-recovery path applies it through the
+                // recovery query's SQL. Both must agree, or a kind-filtered
+                // subscriber would receive every live kind.
+                if !message_kind_filter_allows(kinds.as_deref(), message.kind) {
                     continue;
                 }
                 let message_id = message.message_id_hex.clone();
@@ -1697,6 +1705,14 @@ impl MarmotAppRuntime {
             stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
     }
+}
+
+/// True when a subscription's kind filter admits `kind`. `None` and an empty
+/// list both mean unrestricted: the UniFFI surface normalizes an empty list to
+/// `None`, but every `subscribe_messages` caller gets identical behavior
+/// either way.
+pub(crate) fn message_kind_filter_allows(kinds: Option<&[u64]>, kind: u64) -> bool {
+    kinds.is_none_or(|kinds| kinds.is_empty() || kinds.contains(&kind))
 }
 
 /// Build the lag-recovery query for `subscribe_messages` from the caller's

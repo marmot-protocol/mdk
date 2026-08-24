@@ -5468,6 +5468,108 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn app_runtime_message_subscription_kinds_filter_applies_to_live_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "kind-filtered subscription",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    const CUSTOM_KIND: u64 = 30100;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut subscription = runtime
+        .subscribe_messages(
+            &bob.account.account_id_hex,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                kinds: Some(vec![CUSTOM_KIND]),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(subscription.snapshot.is_empty());
+
+    // A chat message (kind 9) does not match the filter and must not reach
+    // the subscriber.
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"filtered out chat".to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "filtered out chat"
+        )
+    })
+    .await;
+
+    runtime
+        .send_custom_event(
+            &alice.account.account_id_hex,
+            &group_id,
+            CUSTOM_KIND,
+            Vec::new(),
+            "matching custom event".to_owned(),
+        )
+        .await
+        .unwrap();
+
+    // The chat event was published before the custom one over the same
+    // pipeline, so a broken filter would deliver it first: the first live
+    // update must be the kind-matching custom event.
+    let update = timeout(Duration::from_secs(5), subscription.recv())
+        .await
+        .expect("live update")
+        .expect("subscription update");
+    assert!(
+        matches!(
+            &update,
+            RuntimeMessageUpdate::Message(message)
+                if message.account_id_hex == bob_id
+                    && message.message.kind == CUSTOM_KIND
+                    && message.message.plaintext == "matching custom event"
+        ),
+        "first live update must be the kind-matching custom event, got {update:?}",
+    );
+
+    runtime.shutdown().await;
+}
+
 async fn wait_for_event<F>(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     mut matches_event: F,
