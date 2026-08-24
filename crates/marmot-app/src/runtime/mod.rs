@@ -18,6 +18,8 @@ use marmot_account::{
     NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -120,6 +122,55 @@ pub struct MarmotAppRuntime {
     follow_list_updates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(test)]
+    shutdown_test_hook: Arc<StdMutex<Option<ShutdownTestHook>>>,
+    #[cfg(test)]
+    shutdown_grace_wait_for_test: Arc<StdMutex<Duration>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShutdownTestPhase {
+    StorageClose,
+    DirectorySync,
+    InitialDirectorySync,
+    AccountWorkers,
+    RelayPlane,
+    AuditTracker,
+    AccountOpens,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ShutdownTestHook {
+    phase: ShutdownTestPhase,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+pub(crate) struct ShutdownTestStall {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl ShutdownTestStall {
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("shutdown test hook semaphore must stay open")
+            .forget();
+    }
+
+    pub(crate) fn was_entered(&self) -> bool {
+        self.entered.available_permits() > 0
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 #[derive(Clone)]
@@ -1067,6 +1118,12 @@ impl MarmotAppRuntime {
             follow_list_updates: Arc::new(Mutex::new(HashMap::new())),
             directory_sync: Arc::new(Mutex::new(None)),
             initial_directory_sync: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            shutdown_test_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            shutdown_grace_wait_for_test: Arc::new(StdMutex::new(
+                APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+            )),
         }
     }
 
@@ -4302,21 +4359,98 @@ impl MarmotAppRuntime {
         self.accounts.drain_in_flight_work().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn stall_shutdown_for_test(&self, phase: ShutdownTestPhase) -> ShutdownTestStall {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        *self
+            .shutdown_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ShutdownTestHook {
+            phase,
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        ShutdownTestStall { entered, release }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_shutdown_grace_wait_for_test(&self, wait: Duration) {
+        *self
+            .shutdown_grace_wait_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = wait;
+    }
+
+    fn shutdown_grace_wait(&self) -> Duration {
+        #[cfg(test)]
+        {
+            return *self
+                .shutdown_grace_wait_for_test
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        #[cfg(not(test))]
+        {
+            APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT
+        }
+    }
+
+    #[cfg(test)]
+    async fn stall_shutdown_phase_for_test(&self, phase: ShutdownTestPhase) {
+        let hook = self
+            .shutdown_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(hook) = hook.filter(|hook| hook.phase == phase) else {
+            return;
+        };
+        hook.entered.add_permits(1);
+        hook.release
+            .acquire()
+            .await
+            .expect("shutdown test hook semaphore must stay open")
+            .forget();
+    }
+
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
         self.shared.stop_relay_telemetry_exporter();
+        #[cfg(test)]
+        self.stall_shutdown_phase_for_test(ShutdownTestPhase::DirectorySync)
+            .await;
         if let Some(directory_sync) = self.directory_sync.lock().await.take() {
             directory_sync.shutdown().await;
         }
+        #[cfg(test)]
+        self.stall_shutdown_phase_for_test(ShutdownTestPhase::InitialDirectorySync)
+            .await;
         if let Some(initial_directory_sync) = self.initial_directory_sync.lock().await.take() {
             let _ = initial_directory_sync.await;
         }
         self.accounts.app.set_directory_sync_handle(None);
-        let accounts = self.accounts.shutdown();
-        let relay_plane = self.shared.relay_plane.shutdown();
+        let accounts = async {
+            #[cfg(test)]
+            self.stall_shutdown_phase_for_test(ShutdownTestPhase::AccountWorkers)
+                .await;
+            self.accounts.shutdown().await;
+        };
+        let relay_plane = async {
+            #[cfg(test)]
+            self.stall_shutdown_phase_for_test(ShutdownTestPhase::RelayPlane)
+                .await;
+            self.shared.relay_plane.shutdown().await;
+        };
         tokio::join!(accounts, relay_plane);
+        #[cfg(test)]
+        self.stall_shutdown_phase_for_test(ShutdownTestPhase::AuditTracker)
+            .await;
         self.shared.shutdown_audit_log_tracker_uploader().await;
+        #[cfg(test)]
+        self.stall_shutdown_phase_for_test(ShutdownTestPhase::AccountOpens)
+            .await;
         self.shared
             .lifecycle()
             .wait_for_account_opens_to_drain(
@@ -4331,9 +4465,10 @@ impl MarmotAppRuntime {
         );
     }
 
-    /// [`Self::shutdown`], then close every SQLite database and release the
-    /// root runtime lease — so when this returns, nothing this process owns
-    /// holds a file lock inside the Marmot root.
+    /// Stop admitting runtime work, close every SQLite database and release the
+    /// root runtime lease, then make a bounded attempt to drain graceful
+    /// shutdown work. When this returns, nothing this process owns holds a file
+    /// lock inside the Marmot root.
     ///
     /// This is the operation a host needs before its process can be suspended.
     /// [`Self::shutdown`] alone is not enough: it stops workers but takes
@@ -4345,9 +4480,14 @@ impl MarmotAppRuntime {
     /// suspension (`0xdead10cc`, raised for holding a lock in a shared App
     /// Group container).
     ///
-    /// Ordering is the point of this method: workers drain first, so the
-    /// databases close under quiesced state rather than out from under live
-    /// engine work.
+    /// Ordering is the point of this method: the lifecycle stop latch closes
+    /// admission first, then storage closure takes priority over graceful
+    /// draining. This is deliberately different from [`Self::shutdown`]. A
+    /// host suspension deadline cannot safely sit behind directory, worker,
+    /// relay, or audit cleanup that may be awaiting network or task progress.
+    /// SQLite completes the statement holding a connection guard and rolls an
+    /// uncommitted transaction back on close; later work sees `Closed` and
+    /// cannot reopen storage.
     ///
     /// **Terminal.** This runtime and the [`MarmotApp`] it came from are done:
     /// every later database access fails with
@@ -4356,14 +4496,43 @@ impl MarmotAppRuntime {
     /// host has just been told is clear. Build a fresh `MarmotApp` and runtime
     /// to use the root again — which is what a foregrounding app does anyway.
     ///
-    /// Safe to call twice, and safe to call with or without a preceding
-    /// [`Self::shutdown`]. Worker drain is bounded by
-    /// `APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT`; the close itself waits only for
-    /// whatever SQLite statement is executing.
+    /// Safe to call twice, safe to call concurrently, and safe to call with or
+    /// without a preceding [`Self::shutdown`]. The terminal operation runs in a
+    /// runtime-owned task, so cancelling the caller (including a host-side FFI
+    /// future) cannot cancel storage closure. Graceful draining is bounded by
+    /// `APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT`; the close itself waits only for an
+    /// already-admitted database open or SQLite statement.
     pub async fn shutdown_and_close(&self) -> Result<(), AppError> {
-        self.shutdown().await;
+        let runtime = self.clone();
+        tokio::spawn(async move { runtime.run_terminal_shutdown_and_close().await })
+            .await
+            .map_err(|err| {
+                AppError::BlockingTask(format!("terminal shutdown task failed: {err}"))
+            })?
+    }
+
+    async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
+        self.shared.lifecycle().begin_shutdown();
+        #[cfg(test)]
+        self.stall_shutdown_phase_for_test(ShutdownTestPhase::StorageClose)
+            .await;
+
+        // Close first. Every graceful subsystem is allowed to retain `MarmotApp`
+        // clones after its deadline, but terminal storage closure makes those
+        // clones inert and releases the suspension-sensitive root lease.
         let app = self.accounts.app.clone();
-        blocking_app_task(move || app.close_storage()).await
+        let close_result = blocking_app_task(move || app.close_storage()).await;
+
+        let graceful_wait = self.shutdown_grace_wait();
+        if timeout(graceful_wait, self.shutdown()).await.is_err() {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "shutdown_and_close",
+                graceful_wait_ms = graceful_wait.as_millis() as u64,
+                "graceful runtime shutdown exceeded its budget after storage was closed",
+            );
+        }
+        close_result
     }
 
     /// Whether this runtime's storage has been closed by
