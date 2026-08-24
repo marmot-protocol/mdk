@@ -3941,6 +3941,31 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         .unwrap();
     assert_eq!(alice_view.active_token_count, 0);
 
+    // Push-token gossip (kinds 447 update / 448 list / 449 removal) is protocol
+    // plumbing, not conversation content: the sender skips local projection and
+    // the receiver diverts it to push-token ingestion, so after a full
+    // update/replace/remove lifecycle neither side's timeline may contain a
+    // push-token row — the generic custom-kind projection must never see one.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    for label in [alice.account.label.as_str(), bob.account.label.as_str()] {
+        let timeline = app
+            .timeline_messages_with_query(
+                label,
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    ..TimelineMessageQuery::default()
+                },
+            )
+            .unwrap()
+            .messages;
+        assert!(
+            timeline
+                .iter()
+                .all(|message| !(447..=449).contains(&message.kind)),
+            "push-token gossip must not materialize as timeline rows"
+        );
+    }
+
     runtime.shutdown().await;
 }
 
