@@ -18,6 +18,8 @@ Current tracks:
   harness install assets, including Hermes, OpenClaw, and OpenCode.
 - MarmotKit binding releases use tags like `marmotkit-v0.9.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
+- Marmot C binding releases use tags like `marmotc-v0.9.0`. These build the C ABI bundle (shared/static library,
+  `marmot.h`, pkg-config file) from `crates/marmot-c` and attach it to a GitHub Release.
 
 Future binary or package tracks should follow the same shape, for example `quic-broker-v0.9.0` or `wn-cli-v0.9.0`, only
 when those artifacts become independently consumed release surfaces.
