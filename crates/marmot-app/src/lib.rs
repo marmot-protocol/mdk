@@ -307,7 +307,7 @@ const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-/// How long the epoch-gap backfill drain keeps waiting in *silence* for
+/// How long the epoch-gap backfill drain waits through *silence* for
 /// end-of-stored-events before it gives up and reports an incomplete replay.
 ///
 /// Ordinary sync treats a quiet relay as a finished drain, which is right for a
@@ -317,14 +317,48 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 /// whole-account history query. Only EOSE separates them, and this is the
 /// budget for waiting on it.
 ///
-/// The budget is spent on silence alone — every delivery, novel or not, resets
-/// it — so a long but progressing replay is never cut short; it only has to
-/// cover the longest gap a working relay leaves mid-replay. The 2026-08 field
-/// export put whole-account fetches at 0.8-1.4 s to first completion, and the
-/// adapter's own regression coverage already treats 30 s as the outer bound on
-/// waiting for one relay's EOSE, so 30 s is generous by two orders of magnitude
-/// while still bounding how long one wedged relay can hold the account worker.
+/// This bounds *consecutive silence*, not the drain. Every delivery resets it,
+/// so there is no cap on total drain time and a relay that trickles one event
+/// inside every window holds the drain open indefinitely. That is deliberate:
+/// the alternative — an overall cap — cuts off exactly the long, working
+/// replays this recovery exists to complete (the 2026-08 field export has one
+/// that ran 59 minutes and delivered 63 events). A drain that keeps delivering
+/// is making progress; what needs bounding is a drain that has stopped, and
+/// this bounds that.
+///
+/// 30 s is chosen to be far longer than any silence a working relay leaves
+/// mid-replay while still short enough that a wedged relay costs one worker
+/// stall rather than an unbounded one, and it is paced against repetition by
+/// [`EPOCH_BACKFILL_RETRY_BACKOFF`].
 pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
+/// How long an epoch-gap backfill whose replay went unconfirmed waits before
+/// the automatic seams may try it again, doubling per attempt up to
+/// [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
+///
+/// Without pacing, the receive seam runs a pending intent after *every* inbound
+/// ingest, so a permanently unconfirmable replay would spend
+/// [`EPOCH_BACKFILL_EOSE_WAIT`] of the serial account worker per delivery,
+/// blocking user commands behind it. The floor matches the maintenance tick
+/// cadence: the slowest automatic seam is the right baseline for how often an
+/// unproductive account-wide replay may repeat.
+pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
+/// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
+/// that outlasts this is not going to be resolved by trying harder, and the
+/// intent is durable, so a five-minute floor between attempts costs nothing but
+/// leaves recovery responsive when the relay returns.
+pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+/// Attempts an intent spends on the end-of-stored-events gate before its drain
+/// falls back to the quiescence contract.
+///
+/// The gate requires every subscription the replay issued to be served, and a
+/// group route may carry a single relay (group routing requires only a
+/// non-empty endpoint set). One unreachable relay would otherwise leave the
+/// gate permanently unclearable and the account permanently unhealed — a worse
+/// failure than the one the gate fixes. After this many unconfirmed attempts
+/// the replay drains on the pre-gate contract instead, which still recovers
+/// whatever the reachable relays send; the audit row records that weaker claim
+/// as `quiescence_fallback` rather than passing it off as a served history.
+pub(crate) const EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT: u64 = 3;
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 /// Local worker operations include SQLite's bounded busy retry but no relay or
 /// blob transfer. A missing response beyond this point indicates a wedged
@@ -1650,6 +1684,7 @@ impl MarmotApp {
             pending_welcome_delivery_events: Vec::new(),
             unpublished_welcome_delivery: None,
             epoch_stall: Default::default(),
+            epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),

@@ -1434,10 +1434,13 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = maintenance_tick.tick() => {
-                // Periodic maintenance is never urgent, and its catch-up leg is
-                // capped at 15s — three times the whole shutdown budget. Skip
-                // the tick outright once shutdown is requested rather than
-                // starting work the drain would then have to wait out.
+                // Periodic maintenance is never urgent, and its longest legs
+                // run well past the whole shutdown budget: the key-package
+                // catch-up below is capped at 15s, and an armed epoch-gap
+                // backfill can hold the worker for EPOCH_BACKFILL_EOSE_WAIT
+                // waiting on end-of-stored-events. Skip the tick outright once
+                // shutdown is requested rather than starting work the drain
+                // would then have to wait out.
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
@@ -4571,7 +4574,8 @@ mod tests {
 
     use crate::client::epoch_stall::BackfillDecision;
     use crate::tests::{
-        ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription, scripted_eose_pump,
+        ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+        every_subscription, scripted_eose_pump,
     };
     use crate::{AuditLogSettings, MarmotApp};
     use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
@@ -4892,8 +4896,12 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings {
             enabled: true,
             ..Default::default()
@@ -4980,8 +4988,12 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings {
             enabled: true,
             ..Default::default()
@@ -5077,8 +5089,12 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -5199,8 +5215,12 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -5311,8 +5331,12 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client.create_group("queued repair a", &[]).await.unwrap();

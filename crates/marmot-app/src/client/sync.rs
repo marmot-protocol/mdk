@@ -6,6 +6,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::{GroupId, TransportAdapter};
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
+use transport_nostr_adapter::AccountSubscriptionEose;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
@@ -17,13 +18,14 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
-    AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_WAIT, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
+    AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT,
+    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
     TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
-    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillDeferredReason,
-    EpochBackfillExecutionSeam, EpochStallBackfillTrigger,
+    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillCompletionKind,
+    EpochBackfillDeferredReason, EpochBackfillExecutionSeam, EpochStallBackfillTrigger,
 };
 
 use super::AppClient;
@@ -46,6 +48,7 @@ struct EpochBackfillReplayOutcome {
     duration_ms: u64,
     activation_outcome: EpochBackfillActivationOutcome,
     error_kind: Option<String>,
+    completion_kind: Option<EpochBackfillCompletionKind>,
     deliveries: u64,
     succeeded: bool,
 }
@@ -84,6 +87,11 @@ enum DrainCompletion {
     /// that gate and spends the passed budget; it never ends the drain by
     /// itself.
     EndOfStoredEvents(Duration),
+    /// Epoch-gap backfill that has spent its end-of-stored-events attempt
+    /// budget ([`EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT`]). Drains exactly like
+    /// [`Self::Quiescence`] so an account whose group route has one unreachable
+    /// relay can still heal, and reports itself as the weaker claim it is.
+    QuiescenceFallback,
 }
 
 /// How a drain ended.
@@ -96,6 +104,10 @@ enum DrainVerdict {
     /// Every live subscription reached end-of-stored-events and the relays then
     /// went quiet: the account's stored history was served in full.
     Complete,
+    /// The relays went quiet under the fallback contract, after the gate had
+    /// spent its attempt budget. Recovery ran and is not a failure, but nothing
+    /// confirms the history was served in full.
+    QuiescenceFallback,
     /// The silence budget ran out with stored history still unconfirmed, though
     /// some relay did reach end-of-stored-events.
     EoseTimeout,
@@ -109,9 +121,19 @@ impl DrainVerdict {
     /// The audit row's `error_kind` for a drain that did not complete.
     fn error_kind(self) -> Option<&'static str> {
         match self {
-            Self::Complete => None,
+            Self::Complete | Self::QuiescenceFallback => None,
             Self::EoseTimeout => Some("backfill_drain_eose_timeout"),
             Self::NoRelayEose => Some("backfill_drain_no_relay_eose"),
+        }
+    }
+
+    /// What the completed audit row should claim about this drain, so a
+    /// fallback is never read as an end-of-stored-events confirmation.
+    fn completion_kind(self) -> Option<EpochBackfillCompletionKind> {
+        match self {
+            Self::Complete => Some(EpochBackfillCompletionKind::EndOfStoredEvents),
+            Self::QuiescenceFallback => Some(EpochBackfillCompletionKind::QuiescenceFallback),
+            Self::EoseTimeout | Self::NoRelayEose => None,
         }
     }
 }
@@ -947,10 +969,46 @@ impl AppClient {
     async fn backfill_sdk_relay(
         &mut self,
         deliveries: &mut u64,
+        retry_ordinal: u64,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
-        let budget = self.epoch_backfill_eose_wait();
-        self.drain_sdk_relay(deliveries, DrainCompletion::EndOfStoredEvents(budget))
-            .await
+        let completion = if retry_ordinal >= EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+            DrainCompletion::QuiescenceFallback
+        } else {
+            DrainCompletion::EndOfStoredEvents(self.epoch_backfill_eose_wait())
+        };
+        self.drain_sdk_relay(deliveries, completion).await
+    }
+
+    /// How long an unconfirmed replay must wait before an automatic seam may
+    /// try it again, doubling per attempt to a cap.
+    fn epoch_backfill_retry_backoff(&self, retry_ordinal: u64) -> Duration {
+        let base = if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.app.config.dev_epoch_backfill_retry_backoff_ms
+        {
+            Duration::from_millis(ms)
+        } else {
+            EPOCH_BACKFILL_RETRY_BACKOFF
+        };
+        let doubling = 1_u32 << retry_ordinal.min(8);
+        base.saturating_mul(doubling)
+            .min(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.max(base))
+    }
+
+    /// Whether this seam must leave a pending intent alone for now.
+    ///
+    /// The receive seam runs pending recovery after every inbound ingest, so an
+    /// intent that keeps failing to confirm its replay would spend the drain's
+    /// whole silence budget per delivery on the serial account worker, with
+    /// user commands queued behind it. Pacing skips those attempts outright
+    /// rather than queueing them: the intent is already durable and the next
+    /// seam past the cooldown runs it. Caller-directed catch-up is exempt — a
+    /// person asking for a repair is not a loop.
+    fn epoch_backfill_retry_is_paced(&self, seam: EpochBackfillExecutionSeam) -> bool {
+        if matches!(seam, EpochBackfillExecutionSeam::ExplicitCatchUp) {
+            return false;
+        }
+        self.epoch_backfill_retry_not_before
+            .is_some_and(|not_before| Instant::now() < not_before)
     }
 
     /// The silence budget the backfill drain spends waiting on
@@ -967,14 +1025,7 @@ impl AppClient {
     /// How an epoch-gap backfill drain that stops now should be read, from the
     /// account's current end-of-stored-events progress.
     async fn backfill_drain_verdict(&self) -> DrainVerdict {
-        let eose = self.adapter.account_subscription_eose().await;
-        if eose.complete() {
-            DrainVerdict::Complete
-        } else if eose.any() {
-            DrainVerdict::EoseTimeout
-        } else {
-            DrainVerdict::NoRelayEose
-        }
+        backfill_drain_verdict(self.adapter.account_subscription_eose().await)
     }
 
     async fn drain_sdk_relay(
@@ -1030,6 +1081,7 @@ impl AppClient {
                 Ok(Ok(None)) => {
                     break match completion {
                         DrainCompletion::Quiescence => DrainVerdict::Complete,
+                        DrainCompletion::QuiescenceFallback => DrainVerdict::QuiescenceFallback,
                         DrainCompletion::EndOfStoredEvents(_) => {
                             self.backfill_drain_verdict().await
                         }
@@ -1049,6 +1101,7 @@ impl AppClient {
                 }
                 Err(_) => match completion {
                     DrainCompletion::Quiescence => break DrainVerdict::Complete,
+                    DrainCompletion::QuiescenceFallback => break DrainVerdict::QuiescenceFallback,
                     DrainCompletion::EndOfStoredEvents(budget) => {
                         let verdict = self.backfill_drain_verdict().await;
                         if verdict == DrainVerdict::Complete || silence_started.elapsed() >= budget
@@ -1559,6 +1612,7 @@ impl AppClient {
             } else {
                 Some("account_transport".to_string())
             },
+            succeeded.then_some(EpochBackfillCompletionKind::EndOfStoredEvents),
             0,
             succeeded,
         );
@@ -1634,6 +1688,7 @@ impl AppClient {
         execution: EpochBackfillExecution,
         activation_outcome: EpochBackfillActivationOutcome,
         error_kind: Option<String>,
+        completion_kind: Option<EpochBackfillCompletionKind>,
         deliveries: u64,
         succeeded: bool,
     ) {
@@ -1655,6 +1710,7 @@ impl AppClient {
                 duration_ms,
                 activation_outcome,
                 error_kind,
+                completion_kind,
                 deliveries,
                 succeeded,
             },
@@ -1693,6 +1749,7 @@ impl AppClient {
                     duration_ms: outcome.duration_ms,
                     activation_outcome: outcome.activation_outcome,
                     error_kind: outcome.error_kind.clone(),
+                    completion_kind: outcome.completion_kind,
                     deliveries: outcome.deliveries,
                     local_epoch_before,
                     local_epoch_after,
@@ -1714,6 +1771,9 @@ impl AppClient {
         if !self.has_pending_epoch_backfill() {
             return Ok(EpochBackfillRunOutcome::NotPending);
         }
+        if self.epoch_backfill_retry_is_paced(seam) {
+            return Ok(EpochBackfillRunOutcome::Deferred);
+        }
         let Some(execution) = self.begin_epoch_backfill_execution(seam) else {
             return Ok(EpochBackfillRunOutcome::Deferred);
         };
@@ -1726,6 +1786,7 @@ impl AppClient {
                         execution,
                         EpochBackfillActivationOutcome::Succeeded,
                         Some(terminal_error),
+                        None,
                         0,
                         false,
                     );
@@ -1733,7 +1794,11 @@ impl AppClient {
                 }
                 self.record_subscription_rebuild(None).await;
                 let mut deliveries = 0;
-                let (mut summary, verdict) = match self.backfill_sdk_relay(&mut deliveries).await {
+                let retry_ordinal = execution.retry_ordinal;
+                let (mut summary, verdict) = match self
+                    .backfill_sdk_relay(&mut deliveries, retry_ordinal)
+                    .await
+                {
                     Ok(drained) => drained,
                     Err(err) => {
                         let terminal_error = err.source.privacy_safe_kind().to_string();
@@ -1741,6 +1806,7 @@ impl AppClient {
                             execution,
                             EpochBackfillActivationOutcome::Succeeded,
                             Some(terminal_error),
+                            None,
                             deliveries,
                             false,
                         );
@@ -1756,6 +1822,7 @@ impl AppClient {
                             execution,
                             EpochBackfillActivationOutcome::Succeeded,
                             Some(terminal_error),
+                            None,
                             deliveries,
                             false,
                         );
@@ -1773,12 +1840,25 @@ impl AppClient {
                     execution,
                     EpochBackfillActivationOutcome::Succeeded,
                     error_kind.map(str::to_owned),
+                    verdict.completion_kind(),
                     deliveries,
                     error_kind.is_none(),
                 );
-                if error_kind.is_some() {
+                if let Some(error_kind) = error_kind {
+                    tracing::warn!(
+                        target: "marmot_app::epoch_stall",
+                        method = "run_pending_epoch_backfill",
+                        error_kind,
+                        retry_ordinal,
+                        deliveries,
+                        eose_attempt_limit = EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT,
+                        "epoch-gap backfill drain ended without the relays confirming stored history; retrying later"
+                    );
+                    self.epoch_backfill_retry_not_before =
+                        Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
                     return Ok(EpochBackfillRunOutcome::Incomplete(summary));
                 }
+                self.epoch_backfill_retry_not_before = None;
                 Ok(EpochBackfillRunOutcome::Completed(summary))
             }
             Err(err) => {
@@ -1788,6 +1868,7 @@ impl AppClient {
                     execution,
                     EpochBackfillActivationOutcome::Failed,
                     Some(terminal_error),
+                    None,
                     0,
                     false,
                 );
@@ -2959,6 +3040,52 @@ mod transport_cursor_tests {
             clamped_transport_cursor(Some(healed), later, later, SKEW),
             later,
             "after healing, the cursor tracks present-dated messages again"
+        );
+    }
+}
+
+/// How an epoch-gap backfill drain that stops now should be read.
+///
+/// An account holding no subscriptions is deliberately not complete: nothing
+/// was subscribed, so nothing can have served its stored history, and a replay
+/// that reaches that state recovered nothing.
+fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
+    if eose.subscriptions == 0 || !eose.any() {
+        DrainVerdict::NoRelayEose
+    } else if eose.complete() {
+        DrainVerdict::Complete
+    } else {
+        DrainVerdict::EoseTimeout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DrainVerdict, backfill_drain_verdict};
+    use transport_nostr_adapter::AccountSubscriptionEose;
+
+    #[test]
+    fn drain_verdict_reads_end_of_stored_events_progress() {
+        let progress = |subscriptions, with_eose| AccountSubscriptionEose {
+            subscriptions,
+            with_eose,
+        };
+        assert_eq!(
+            backfill_drain_verdict(progress(2, 2)),
+            DrainVerdict::Complete
+        );
+        assert_eq!(
+            backfill_drain_verdict(progress(2, 1)),
+            DrainVerdict::EoseTimeout
+        );
+        assert_eq!(
+            backfill_drain_verdict(progress(2, 0)),
+            DrainVerdict::NoRelayEose
+        );
+        assert_eq!(
+            backfill_drain_verdict(progress(0, 0)),
+            DrainVerdict::NoRelayEose,
+            "an account with nothing subscribed cannot have been served"
         );
     }
 }

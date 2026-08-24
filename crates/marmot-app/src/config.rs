@@ -124,6 +124,12 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides`; this keeps the give-up path testable without
     /// spending the production budget in wall-clock.
     pub dev_epoch_backfill_eose_wait_ms: Option<u64>,
+    /// Dev/test-only override for the base interval an unconfirmed epoch-gap
+    /// backfill waits before an automatic seam may retry it
+    /// ([`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]). Honored only with
+    /// `test-policy-overrides`; this lets a test exercise both sides of the
+    /// cooldown without spending it in wall-clock.
+    pub dev_epoch_backfill_retry_backoff_ms: Option<u64>,
     /// Dev/test-only fault injected before the next delivery after this many
     /// completed catch-up deliveries. Honored only with
     /// `test-policy-overrides`; this exercises truthful partial-progress
@@ -197,6 +203,7 @@ impl Default for MarmotAppConfig {
             dev_fail_create_local_projection: false,
             dev_fail_invite_local_refresh: false,
             dev_epoch_backfill_eose_wait_ms: None,
+            dev_epoch_backfill_retry_backoff_ms: None,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
             dev_fail_ingest_after_application_event_ack: false,
@@ -324,6 +331,13 @@ impl MarmotAppConfig {
     /// field.
     pub fn with_dev_epoch_backfill_eose_wait_ms(mut self, ms: u64) -> Self {
         self.dev_epoch_backfill_eose_wait_ms = Some(ms);
+        self
+    }
+
+    /// Pace unconfirmed epoch-gap backfill retries `ms` apart in test-policy
+    /// builds. Normal builds ignore this field.
+    pub fn with_dev_epoch_backfill_retry_backoff_ms(mut self, ms: u64) -> Self {
+        self.dev_epoch_backfill_retry_backoff_ms = Some(ms);
         self
     }
 

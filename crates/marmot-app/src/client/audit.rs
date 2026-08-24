@@ -6,8 +6,8 @@ use cgka_traits::app_components::{
 };
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditHumanActionContext, EpochBackfillActivationOutcome,
-    EpochBackfillDeferredReason, EpochBackfillExecutionSeam, EpochBackfillReplayScope,
-    EpochStallBackfillTrigger, RelayRegistration,
+    EpochBackfillCompletionKind, EpochBackfillDeferredReason, EpochBackfillExecutionSeam,
+    EpochBackfillReplayScope, EpochStallBackfillTrigger, RelayRegistration,
 };
 
 use crate::messages::AppMessageIntent;
@@ -21,6 +21,7 @@ pub(crate) struct EpochBackfillTerminalAudit {
     pub retry_ordinal: u64,
     pub duration_ms: u64,
     pub activation_outcome: EpochBackfillActivationOutcome,
+    pub completion_kind: Option<EpochBackfillCompletionKind>,
     pub error_kind: Option<String>,
     pub deliveries: u64,
     pub local_epoch_before: u64,
@@ -266,6 +267,7 @@ impl AppClient {
                 retry_ordinal: terminal.retry_ordinal,
                 duration_ms: terminal.duration_ms,
                 activation_outcome: terminal.activation_outcome,
+                completion_kind: terminal.completion_kind,
                 deliveries: terminal.deliveries,
                 local_epoch_before: terminal.local_epoch_before,
                 local_epoch_after: terminal.local_epoch_after,
