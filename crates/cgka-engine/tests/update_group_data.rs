@@ -1242,16 +1242,26 @@ async fn admin_policy_update_listing_non_member_is_rejected() {
 
     let err = alice
         .send(SendIntent::UpdateAppComponents {
-            group_id: gid,
+            group_id: gid.clone(),
             updates: vec![AppComponentData {
                 component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
-                data: encode_admin_policy_for_test(&[alice_id, carol_non_member]),
+                data: encode_admin_policy_for_test(&[alice_id, carol_non_member.clone()]),
             }],
         })
         .await
         .expect_err("admin-policy listing a non-member must be rejected");
 
-    assert!(matches!(err, EngineError::Other(_)), "got {err:?}");
+    // The refusal names the orphaned admin key. `EngineError::Other` — the old
+    // verdict — is the unclassified bucket, so hosts, the CLI, the audit log
+    // and the conformance simulator all saw this policy refusal as a generic
+    // fault and could not say which key was at fault.
+    match err {
+        EngineError::UnknownMember { group_id, member } => {
+            assert_eq!(group_id, gid);
+            assert_eq!(member.as_slice(), carol_non_member.as_slice());
+        }
+        other => panic!("expected UnknownMember naming carol, got {other:?}"),
+    }
 }
 
 // ── Partial update ──────────────────────────────────────────────────────────
