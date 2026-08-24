@@ -13,7 +13,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
-TARGET_DIR="$WORKSPACE_DIR/target"
+TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
 OUT_DIR="$CRATE_DIR/output"
 
 CRATE_NAME="marmot-c"

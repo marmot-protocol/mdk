@@ -37,6 +37,12 @@ jobs:
             echo "error: C binding releases must use a version tag like marmotc-v0.1.0" >&2
             exit 1
           fi
+          tag_version="${GITHUB_REF_NAME#marmotc-v}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$tag_version" != "$workspace_version" ]]; then
+            echo "error: tag version $tag_version does not match workspace version $workspace_version" >&2
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         shell: bash

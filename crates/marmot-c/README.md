@@ -21,20 +21,33 @@ contents.
 ## Using the ABI
 
 ```c
+#include <stdio.h>
+
 #include <marmot.h>
 
-MarmotClient *client = NULL;
-const char *relays[] = {"wss://relay.example.org"};
-if (marmot_client_new("/path/to/home", relays, 1, &client) != MARMOT_STATUS_OK) {
+static void report(const char *what) {
     char *msg = marmot_last_error_message();
-    fprintf(stderr, "marmot: %s\n", msg ? msg : "(no detail)");
+    fprintf(stderr, "marmot: %s: %s\n", what, msg ? msg : "(no detail)");
     marmot_string_free(msg);
-    return 1;
 }
-marmot_client_start(client);
-/* ... */
-marmot_client_shutdown(client);
-marmot_client_free(client);
+
+int main(void) {
+    MarmotClient *client = NULL;
+    const char *relays[] = {"wss://relay.example.org"};
+    if (marmot_client_new("/path/to/home", relays, 1, &client) != MARMOT_STATUS_OK) {
+        report("client_new");
+        return 1;
+    }
+    if (marmot_client_start(client) != MARMOT_STATUS_OK) {
+        report("client_start");
+        marmot_client_free(client);
+        return 1;
+    }
+    /* ... */
+    marmot_client_shutdown(client);
+    marmot_client_free(client);
+    return 0;
+}
 ```
 
 `examples/smoke.c` is a worked example covering lifecycle, Markdown

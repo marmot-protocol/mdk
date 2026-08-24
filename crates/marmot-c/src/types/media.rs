@@ -55,11 +55,11 @@ impl MarmotMediaAttachmentReference {
     /// Strings must be valid; `locators` must point to `locators_len`
     /// valid structs (or be NULL with len 0).
     pub(crate) unsafe fn to_ffi(&self) -> Result<MediaAttachmentReferenceFfi, MarmotStatus> {
-        let mut locators = Vec::with_capacity(self.locators_len);
         if self.locators.is_null() && self.locators_len != 0 {
             set_last_error("locators was NULL with nonzero length");
             return Err(MarmotStatus::NullPointer);
         }
+        let mut locators = Vec::with_capacity(self.locators_len);
         for i in 0..self.locators_len {
             locators.push(unsafe { (*self.locators.add(i)).to_ffi() }?);
         }

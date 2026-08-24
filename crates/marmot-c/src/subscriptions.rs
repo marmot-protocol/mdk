@@ -26,6 +26,12 @@
 //!   synchronization: e.g. observe the terminal NULL-item call (or a
 //!   quiescent flag) before freeing, or only free at process teardown.
 //!
+//!   The terminal NULL item arrives only when the stream closes on its
+//!   own. `clear_callback` and `*_subscription_free` abort the pump, so
+//!   after either call the terminal NULL item is never delivered. Do
+//!   not wait for it on that path; use a quiescent flag or free at
+//!   process teardown instead.
+//!
 //! Do not mix blocking reads and an installed callback on the same
 //! handle: both compete for the same inner receiver.
 //!

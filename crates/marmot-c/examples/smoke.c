@@ -113,11 +113,17 @@ int main(int argc, char **argv) {
     /* ---- construct + lifecycle ---------------------------------------- */
     const char *relays[] = {"wss://relay.example.org"};
     st = marmot_client_new(home, relays, 1, &client);
-    if (st != MARMOT_STATUS_OK) {
+    if (st == MARMOT_STATUS_KEYSTORE_UNAVAILABLE) {
         /* No platform keychain (headless): a documented limitation. */
         print_last_error("client_new");
-        printf("smoke: SKIP: no client\n");
+        printf("smoke: SKIP: no keystore on this host\n");
         return 0;
+    }
+    if (st != MARMOT_STATUS_OK) {
+        /* Any other construction failure is a regression, not a skip. */
+        print_last_error("client_new");
+        fprintf(stderr, "smoke: FAILED: client_new status %d\n", (int)st);
+        return 1;
     }
     ok("client constructed");
 

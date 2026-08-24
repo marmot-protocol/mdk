@@ -27,7 +27,7 @@ CFLAGS=(-std=c11 -Wall -Wextra -Werror -I"$CRATE_DIR/include")
 run() {
     local bin="$1"; shift
     local home
-    home="$(mktemp -d)"
+    home="$(mktemp -d "$WORK/home.XXXXXX")"
     LD_LIBRARY_PATH="$TARGET_DIR/release" "$@" "$bin" "$home"
     rm -rf "$home"
 }
