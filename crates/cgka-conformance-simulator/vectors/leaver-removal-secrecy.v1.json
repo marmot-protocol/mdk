@@ -1,7 +1,7 @@
 {
   "scenario_name": "leaver-removal-secrecy/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.14",
+  "conformance_version": "0.9.15",
   "seed": null,
   "scenario": {
     "name": "leaver-removal-secrecy/v1",

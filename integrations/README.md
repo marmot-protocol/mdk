@@ -23,7 +23,7 @@ Choose the runtime you already use:
 | Pi | Terminal harness | Repository and coding tasks through Pi |
 
 The guided installers prompt on the terminal for the White Noise account that
-may invite and message the agent. They install release `wn-agent-v0.9.14`, create
+may invite and message the agent. They install release `wn-agent-v0.9.15`, create
 an isolated White Noise identity for the selected connector, and start same-user
 services where supported. Download each installer with its adjacent checksum,
 verify it, and only then execute the local file:
@@ -50,7 +50,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.15"
 ```
 
 ### Hermes
@@ -110,7 +110,7 @@ install_verified "$base_url/install-pi-marmot.sh" \
 
 ### Finish In White Noise
 
-Release 0.9.14 records the new agent's `npub` and `nprofile` in the
+Release 0.9.15 records the new agent's `npub` and `nprofile` in the
 `bootstrap.json` path printed at completion. Display them with:
 
 ```sh
@@ -119,9 +119,8 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["npub"]); p
 ```
 
 Use `hermes`, `openclaw`, `codex`, `harnesses` (OpenCode), or `pi` in that path.
-The updated source installers also show these values directly and render a
-terminal QR when `qrencode` is installed; that improvement will apply to the
-next immutable release.
+The installers also show these values directly and render a terminal QR when
+`qrencode` is installed.
 
 1. Add the displayed agent identity in White Noise.
 2. Invite it to a direct message or group from the account you authorized.

@@ -252,9 +252,9 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
-bash scripts/install-hermes-marmot.sh --dry-run --yes
-bash scripts/install-openclaw-marmot.sh --dry-run --yes
 sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
+bash scripts/install-hermes-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --allow-user "$sender_hex"
+bash scripts/install-openclaw-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex"
 bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
@@ -348,7 +348,7 @@ workspace release looks like:
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.15"
 
 install_verified() (
   set -eu

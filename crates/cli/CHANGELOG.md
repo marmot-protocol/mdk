@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-08-25
+
 ### Added
 
 - Local notification projection and UniFFI `NotificationTrigger` now include
@@ -16,9 +18,85 @@ versioning through the workspace version in the root `Cargo.toml`.
   self-affecting membership and admin-role changes. Kind 446 wake delivery
   stays context-free.
   ([#1240](https://github.com/marmot-protocol/mdk/issues/1240))
+
+- Membership and administrator activity now advances group chat previews,
+  ordering, unread state, and read markers without treating synthesized system
+  actors as Nostr profile identities.
+  ([#1551](https://github.com/marmot-protocol/mdk/pull/1551))
+
+- WN Agent adds persistent account-scoped invite policies for denying all
+  invites, allowing configured senders, allowing authenticated direct invites,
+  or allowing any authenticated invite. The policy is available through agent
+  control and `wn-agent bootstrap --invite-policy`.
+  ([#1542](https://github.com/marmot-protocol/mdk/pull/1542))
+
+- The conformance simulator adds a deterministic 54-case large-group pressure
+  catalog spanning 10–200 members, with versioned workload metadata and strict
+  convergence, pending-work, policy, profile, and decryptability oracles.
+  ([#1511](https://github.com/marmot-protocol/mdk/pull/1511))
+
+### Changed
+
 - Daemon-hosted directory and KeyPackage reads now honor configured discovery
   relays independently from the operational relay set used for message
   delivery.
+  ([#1537](https://github.com/marmot-protocol/mdk/pull/1537))
+
+- WN Agent installation guidance now downloads installers and their adjacent
+  SHA-256 files, verifies them before execution, and distinguishes the rolling
+  convenience alias from immutable versioned releases. Connector onboarding
+  also reports the bootstrapped agent identity and service status more clearly.
+  ([#1512](https://github.com/marmot-protocol/mdk/pull/1512),
+  [#1533](https://github.com/marmot-protocol/mdk/pull/1533))
+
+- `shutdown_and_close` now closes runtime admission, SQLite connections, and
+  the root lease before bounded graceful cleanup, and terminal closure remains
+  runtime-owned if the awaiting host call is cancelled.
+  ([#1541](https://github.com/marmot-protocol/mdk/pull/1541))
+
+### Fixed
+
+- Epoch-gap recovery now arms before every publish-failure gate, observes real
+  epoch passages, and drains full-history backfill to relay end-of-stored-events
+  with paced retries and an explicit quiescence fallback. Failed or incomplete
+  drains no longer claim a successful replay.
+  ([#1519](https://github.com/marmot-protocol/mdk/pull/1519),
+  [#1524](https://github.com/marmot-protocol/mdk/pull/1524),
+  [#1532](https://github.com/marmot-protocol/mdk/pull/1532),
+  [#1548](https://github.com/marmot-protocol/mdk/pull/1548))
+
+- Restart-time session-history replay now applies the same idempotent
+  membership, push-token, unread, disband, and timeline-invalidation projection
+  effects as live delivery.
+  ([#1543](https://github.com/marmot-protocol/mdk/pull/1543))
+
+- Group invites select the newest usable current-profile KeyPackage while
+  skipping malformed publications, so an older incompatible record cannot mask
+  a newer valid one.
+  ([#1550](https://github.com/marmot-protocol/mdk/pull/1550))
+
+- External-signer accounts can sign out or wipe without a local secret key;
+  wiping also removes the in-memory signer registration while reversible
+  sign-out preserves it.
+  ([#1528](https://github.com/marmot-protocol/mdk/pull/1528))
+
+- OpenClaw durable text retries now reuse deterministic connector idempotency
+  keys, profile onboarding persists ambiguous send and publication intent, and
+  outbound media uses the host-authorized reader with staged-file cleanup.
+  Allowlist reconciliation revokes first and verifies the effective set.
+  ([#1516](https://github.com/marmot-protocol/mdk/pull/1516),
+  [#1534](https://github.com/marmot-protocol/mdk/pull/1534),
+  [#1540](https://github.com/marmot-protocol/mdk/pull/1540))
+
+- Valid empty administrator policies now report the typed last-admin refusal,
+  orphaned administrators report `unknown_member`, and serialization failures
+  are no longer mislabeled as administrator-policy refusals.
+  ([#1523](https://github.com/marmot-protocol/mdk/pull/1523),
+  [#1536](https://github.com/marmot-protocol/mdk/pull/1536))
+
+- Incident replay rejects empty, non-object, or unrelated JSON documents
+  instead of classifying them as healthy agent-state exports.
+  ([#1530](https://github.com/marmot-protocol/mdk/pull/1530))
 
 ## [0.9.14] - 2026-08-19
 
@@ -1773,7 +1851,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.14...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.15...HEAD
+[0.9.15]: https://github.com/marmot-protocol/mdk/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/marmot-protocol/mdk/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/marmot-protocol/mdk/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...v0.9.12
