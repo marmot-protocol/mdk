@@ -1719,6 +1719,268 @@ fn epoch_backfill_drain_needs_every_subscription_to_report() {
     });
 }
 
+/// The two relays every group route below is published to: `FAST_RELAY` answers
+/// the unfloored history query at once, `SLOW_RELAY` is still holding the commit
+/// the stalled group is missing.
+const FAST_RELAY: &str = "wss://fast.example";
+const SLOW_RELAY: &str = "wss://slow.example";
+
+/// [`armed_epoch_backfill`] with both relays on every route, and armed through
+/// the detector's own observations rather than injected: only a tracked group
+/// gives `mark_replayed` something to latch, which is what the drain's effect on
+/// a later arm depends on.
+async fn armed_epoch_backfill_across_two_relays(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+) -> (MarmotApp, crate::AppClient, cgka_traits::GroupId) {
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let mut app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![FAST_RELAY.to_owned(), SLOW_RELAY.to_owned()],
+        config,
+    )
+    .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(crate::AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    app.relay_plane =
+        MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
+
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client
+        .create_group("epoch backfill across two relays", &[])
+        .await
+        .unwrap();
+    let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    let mut decision = BackfillDecision::Skip;
+    for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
+        decision = client.epoch_stall.observe_undecryptable(
+            group_id.clone(),
+            format!("two-relay-stall-{probe}"),
+            cgka_traits::EpochId(stalled_epoch),
+        );
+    }
+    assert_eq!(decision, BackfillDecision::Arm);
+    client.apply_backfill_decision(
+        &group_id,
+        stalled_epoch,
+        decision,
+        marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+    );
+    (app, client, group_id)
+}
+
+/// [`scripted_eose_pump`] narrowed to [`FAST_RELAY`]: the account-wide gate asks
+/// for one relay per subscription, and this satisfies it from one of the two
+/// each route is published to while [`SLOW_RELAY`] answers nothing.
+fn fast_relay_eose_pump(
+    plane: MarmotRelayPlane,
+    relay: Arc<ScriptedPushRelayClient>,
+) -> ScriptedEosePump {
+    let fast = TransportEndpoint(FAST_RELAY.to_owned());
+    ScriptedEosePump(tokio::spawn(async move {
+        loop {
+            for subscription in relay.accepted_subscriptions() {
+                plane
+                    .handle_relay_eose_for_test(fast.clone(), subscription.subscription_id())
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }))
+}
+
+/// Wait until a running replay has stopped issuing subscriptions, having issued
+/// some. Its activation, group sync, and subscription rebuild each issue their
+/// own, and a re-issued subscription must be confirmed again — so only past the
+/// last of them is the pump above holding a gate that is actually satisfied.
+async fn epoch_backfill_subscriptions_settled(relay: &ScriptedPushRelayClient, before: usize) {
+    let mut last = before;
+    let mut settled = 0;
+    while settled < 3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let count = relay.subscription_count();
+        settled = if count == last && count > before {
+            settled + 1
+        } else {
+            0
+        };
+        last = count;
+    }
+}
+
+/// One event delivered by [`SLOW_RELAY`] into the account's live routes.
+async fn deliver_from_slow_relay(app: &MarmotApp, event: NostrTransportEvent) {
+    let delivered = app
+        .relay_plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: TransportEndpoint(SLOW_RELAY.to_owned()),
+            subscription_id: Some("slow-relay-test".to_owned()),
+            event,
+        })
+        .await
+        .expect("route the slow relay's commit");
+    assert_eq!(delivered, 1, "the active group route must receive it");
+}
+
+#[test]
+fn epoch_backfill_drain_collects_a_slow_relay_commit_inside_its_silence_window() {
+    run_composed_app_runtime_test("backfill-drain-slow-relay-inside", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        // A silence budget far larger than this drain can spend, so completing
+        // is the gate's doing and not the budget's.
+        let (app, mut client, group_id) = armed_epoch_backfill_across_two_relays(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(10_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // The fast relay satisfies the account-wide gate on its own, and only
+        // then does the slow relay answer — the drain is still inside its
+        // silence window when that commit lands.
+        let _eose = fast_relay_eose_pump(app.relay_plane.clone(), relay.clone());
+        let commit = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            crate::unix_now_seconds(),
+            "slow-relay-inside-window",
+        );
+        let slow_relay = {
+            let app = app.clone();
+            let relay = relay.clone();
+            let subscriptions_before = relay.subscription_count();
+            tokio::spawn(async move {
+                epoch_backfill_subscriptions_settled(&relay, subscriptions_before).await;
+                deliver_from_slow_relay(&app, commit).await;
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        slow_relay.await.expect("scripted relay must not panic");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a satisfied gate plus quiet relays is a completed replay"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the gate must end the drain, not the silence budget"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["kind"]["deliveries"], 1,
+            "a satisfied gate must not cut the drain off mid-silence-window"
+        );
+    });
+}
+
+#[test]
+fn epoch_backfill_drain_leaves_a_late_slow_relay_commit_to_the_next_drain() {
+    run_composed_app_runtime_test("backfill-drain-slow-relay-late", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill_across_two_relays(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(10_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let _eose = fast_relay_eose_pump(app.relay_plane.clone(), relay.clone());
+
+        // The accepted trade-off, in the words of the gate's own contract:
+        // requiring *every* relay "would make one permanently unreachable relay
+        // indistinguishable from a history replay that never finished". One
+        // relay per subscription therefore ends this drain while a reachable but
+        // slower relay still owes a commit, and the drain claims
+        // `end_of_stored_events` for a history it has not seen in full.
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Completed(_)
+        ));
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "the fast relay's report consumes the intent"
+        );
+        // And no second replay is coming: a confirmed drain latches the group's
+        // stalled epoch, so the same epoch cannot arm again however much
+        // undecryptable traffic it goes on to accumulate.
+        let mut rearm = BackfillDecision::Skip;
+        for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
+            rearm = client.epoch_stall.observe_undecryptable(
+                group_id.clone(),
+                format!("after-replay-{probe}"),
+                cgka_traits::EpochId(stalled_epoch),
+            );
+        }
+        assert_eq!(
+            rearm,
+            BackfillDecision::Skip,
+            "a confirmed replay disarms the epoch it was armed at"
+        );
+
+        // What recovers the group is not another replay but the delivery
+        // itself: the subscriptions the backfill opened stay live, so the slow
+        // relay's answer reaches the next drain on the ordinary path.
+        deliver_from_slow_relay(
+            &app,
+            epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "slow-relay-after-window",
+            ),
+        )
+        .await;
+        client.sync().await.expect("ordinary sync must run");
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["kind"]["deliveries"], 0,
+            "the drain ended before the slow relay answered"
+        );
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events")
+        );
+        let drains = recorded_rows_of_kind(&rows, "sync_drain");
+        assert_eq!(
+            drains
+                .last()
+                .expect("the follow-up sync must record a drain")["kind"]["deliveries"],
+            1,
+            "the late commit is left to the next drain, not dropped"
+        );
+    });
+}
+
 #[test]
 fn unconfirmed_epoch_backfill_paces_its_automatic_retries() {
     run_composed_app_runtime_test("backfill-retry-cooldown", || async {
