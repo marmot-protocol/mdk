@@ -106,19 +106,25 @@ variable-length.
 
 ### Session flow
 
-```
-A                                   B
-|-- HELLO (digests) --------------->|
-|<-- HELLO (digests) ---------------|
-        digests equal? -> DONE, session over (common case)
-|-- SUMMARY (categories that differ)|
-|<-- SUMMARY -----------------------|
-|-- WANT (ids B has, A lacks) ----->|
-|<-- WANT --------------------------|
-|-- DATA* ------------------------->|
-|<-- DATA* -------------------------|
-|-- DONE -------------------------->|
-|<-- DONE --------------------------|
+```mermaid
+sequenceDiagram
+    participant A as Device A
+    participant B as Device B
+    A->>B: HELLO (digests)
+    B->>A: HELLO (digests)
+    alt digests equal (common case)
+        A->>B: DONE
+        B->>A: DONE
+    else digests differ
+        A->>B: SUMMARY (categories that differ)
+        B->>A: SUMMARY
+        A->>B: WANT (ids B has, A lacks)
+        B->>A: WANT
+        A->>B: DATA (chunked, repeated)
+        B->>A: DATA (chunked, repeated)
+        A->>B: DONE
+        B->>A: DONE
+    end
 ```
 
 Category digest = hash of sorted item hashes, so equal digests skip the
