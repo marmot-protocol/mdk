@@ -38,7 +38,7 @@ use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
 };
 pub use cgka_traits::app_event::AppMessageRetentionDecision;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
 use cgka_traits::storage::{DisbandTombstoneStorage, KeyPackageBundleStorage, MaintenanceStorage};
@@ -4459,13 +4459,23 @@ impl MarmotApp {
             .map(|account| account.label))
     }
 
+    /// Kind-1210 rows are locally synthesized state projections, not authored
+    /// Nostr events. Their sender is the authenticated MLS actor when one is
+    /// available and is intentionally empty otherwise, so it is not a stable
+    /// Nostr identity input. The chat-list preview renders the structured
+    /// group-system payload and never consumes a sender display name.
+    fn chat_list_sender_for_profile_hydration(message: &ChatListMessagePreview) -> Option<&str> {
+        (message.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).then_some(message.sender.as_str())
+    }
+
     fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
         let senders = rows
             .iter()
             .filter_map(|row| {
                 row.last_message
                     .as_ref()
-                    .map(|message| message.sender.clone())
+                    .and_then(Self::chat_list_sender_for_profile_hydration)
+                    .map(ToOwned::to_owned)
             })
             .collect::<HashSet<_>>();
         let senders = senders.into_iter().collect::<Vec<_>>();
@@ -4492,7 +4502,10 @@ impl MarmotApp {
         };
         (message.attachment_kind, message.attachment_count) =
             media::classify_chat_list_attachments(message.media_json.as_deref());
-        if let Some(name) = self.display_name_for_account_id(&message.sender)? {
+        let Some(sender) = Self::chat_list_sender_for_profile_hydration(message) else {
+            return Ok(());
+        };
+        if let Some(name) = self.display_name_for_account_id(sender)? {
             message.sender_display_name = Some(name);
         }
         Ok(())
@@ -5190,8 +5203,13 @@ impl MarmotApp {
         storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
         let chat_list_row = self.refresh_chat_list_row(label, &storage_update.group_id_hex)?;
-        let chat_list_trigger =
-            ChatListUpdateTrigger::from_timeline_changes(&storage_update.changes);
+        let projects_group_system_activity = chat_list_row
+            .as_ref()
+            .is_some_and(|row| row.conversation_kind == ChatConversationKind::Group);
+        let chat_list_trigger = ChatListUpdateTrigger::from_timeline_changes(
+            &storage_update.changes,
+            projects_group_system_activity,
+        );
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,

@@ -5951,10 +5951,10 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
 }
 
 #[tokio::test]
-async fn self_removal_suppresses_account_unread_while_peer_removal_preserves_it() {
-    // mdk#573: the projection-only account unread aggregate must exclude
-    // groups the local account left / was removed from, but a peer removal must
-    // leave the observer's own unread untouched.
+async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it() {
+    // mdk#573: the projection-only account unread aggregate must exclude groups
+    // the local account left / was removed from. Issue #822 additionally makes
+    // a peer removal visible chat-list activity for observers who remain.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice_account = home.create_account("alice").unwrap();
@@ -6030,16 +6030,16 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_preserves_it(
     loop {
         bob.sync().await.unwrap();
         carol.sync().await.unwrap();
-        // carol's self-removal must zero her summary; bob's peer-removal view must
-        // leave his own unread untouched.
+        // Carol's self-removal must zero her summary. Bob remains a member, so
+        // the peer-removal system row advances his existing unread count.
         if unread_for(&carol_account.account_id_hex) == 0
-            && unread_for(&bob_account.account_id_hex) == 1
+            && unread_for(&bob_account.account_id_hex) == 2
         {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for carol's self-removal to suppress while bob's count is preserved"
+            "timed out waiting for carol's self-removal to suppress while bob sees peer-removal activity"
         );
         sleep(Duration::from_millis(50)).await;
     }
@@ -6051,8 +6051,8 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_preserves_it(
     );
     assert_eq!(
         unread_for(&bob_account.account_id_hex),
-        1,
-        "a peer removal must not suppress bob's own account unread total"
+        2,
+        "a peer removal must advance bob's unread total while he remains a member"
     );
 }
 

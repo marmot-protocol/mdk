@@ -540,6 +540,81 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
     }
 }
 
+#[test]
+fn group_system_projection_advances_the_chat_list_like_a_new_message() {
+    let mut record = timeline_test_record("role-change", 10);
+    record.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    record.tags = vec![vec![
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_ADMIN_ADDED.to_owned(),
+    ]];
+    let change = TimelineMessageChange::Upsert {
+        trigger: crate::TimelineUpdateTrigger::GroupSystem,
+        message: Box::new(record),
+    };
+
+    assert_eq!(
+        ChatListUpdateTrigger::from_timeline_changes(&[change], true),
+        ChatListUpdateTrigger::NewLastMessage,
+    );
+}
+
+#[test]
+fn direct_conversation_group_system_projection_does_not_claim_new_chat_list_activity() {
+    let mut record = timeline_test_record("role-change", 10);
+    record.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    record.tags = vec![vec![
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_ADMIN_ADDED.to_owned(),
+    ]];
+    let change = TimelineMessageChange::Upsert {
+        trigger: crate::TimelineUpdateTrigger::GroupSystem,
+        message: Box::new(record),
+    };
+
+    assert_eq!(
+        ChatListUpdateTrigger::from_timeline_changes(&[change], false),
+        ChatListUpdateTrigger::SnapshotRefresh,
+    );
+}
+
+#[test]
+fn agent_stream_updates_still_advance_the_chat_list_like_new_messages() {
+    for trigger in [
+        crate::TimelineUpdateTrigger::AgentStreamStarted,
+        crate::TimelineUpdateTrigger::AgentStreamFinished,
+    ] {
+        let change = TimelineMessageChange::Upsert {
+            trigger,
+            message: Box::new(timeline_test_record("agent-stream", 10)),
+        };
+
+        assert_eq!(
+            ChatListUpdateTrigger::from_timeline_changes(&[change], false),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+    }
+}
+
+#[test]
+fn unrelated_group_system_projection_does_not_claim_new_chat_list_activity() {
+    let mut record = timeline_test_record("rename", 10);
+    record.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    record.tags = vec![vec![
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED.to_owned(),
+    ]];
+    let change = TimelineMessageChange::Upsert {
+        trigger: crate::TimelineUpdateTrigger::GroupSystem,
+        message: Box::new(record),
+    };
+
+    assert_eq!(
+        ChatListUpdateTrigger::from_timeline_changes(&[change], true),
+        ChatListUpdateTrigger::SnapshotRefresh,
+    );
+}
+
 fn timeline_test_page(
     records: &[(&str, u64)],
     has_more_before: bool,
