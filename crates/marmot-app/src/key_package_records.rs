@@ -96,17 +96,22 @@ fn latest_key_package_from_records(
     mut records: Vec<RelayEventRecord>,
 ) -> Result<FetchedKeyPackage, AppError> {
     sort_directory_records(&mut records);
-    let mut latest = None;
-    for record in records {
+    let mut newest_error = None;
+    for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
         }
-        let fetched = key_package_from_record(record)?;
-        if fetched.key_package.protocol_profile == ProtocolProfile::Current {
-            latest = Some(fetched);
+        match key_package_from_record(record) {
+            Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
+                return Ok(fetched);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                newest_error.get_or_insert(error);
+            }
         }
     }
-    latest.ok_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned()))
+    Err(newest_error.unwrap_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned())))
 }
 
 pub(crate) fn latest_fresh_key_package_from_records(

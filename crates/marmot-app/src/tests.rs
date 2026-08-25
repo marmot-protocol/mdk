@@ -5055,6 +5055,60 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
 }
 
 #[tokio::test]
+async fn member_key_package_resolution_ignores_older_malformed_publication() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        let current = events
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .expect("current KeyPackage event")
+            .clone();
+        let mut older_malformed = current.clone();
+        older_malformed.created_at = current.created_at.saturating_sub(1);
+        older_malformed.id = "00".repeat(32);
+        older_malformed.content = "not-base64".to_owned();
+        events.push(older_malformed);
+    }
+
+    let summary = app
+        .prewarm_group_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect("the newest valid KeyPackage must win over an older malformed publication");
+
+    assert_eq!(summary.unique_members, 1);
+    assert_eq!(summary.network_resolved_members, 1);
+}
+
+#[tokio::test]
+async fn member_key_package_resolution_falls_back_from_newest_malformed_publication() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        let current = events
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .expect("current KeyPackage event")
+            .clone();
+        let mut newer_malformed = current.clone();
+        newer_malformed.created_at = current.created_at.saturating_add(1);
+        newer_malformed.id = "ff".repeat(32);
+        newer_malformed.content = "not-base64".to_owned();
+        events.push(newer_malformed);
+    }
+
+    let summary = app
+        .prewarm_group_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect("an invalid newest publication must not hide an older valid KeyPackage");
+
+    assert_eq!(summary.unique_members, 1);
+    assert_eq!(summary.network_resolved_members, 1);
+}
+
+#[tokio::test]
 async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     *fetcher.stalled_endpoint.lock().unwrap() = Some("wss://directory.example".to_owned());
