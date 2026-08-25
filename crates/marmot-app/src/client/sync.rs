@@ -1836,6 +1836,14 @@ impl AppClient {
         if !self.has_pending_epoch_backfill() {
             return Ok(EpochBackfillRunOutcome::NotPending);
         }
+        // Pacing is account-wide and is checked *before* rotation, so a queued
+        // sibling intent waits out the cooldown the primary intent earned
+        // instead of rotating forward through `begin_epoch_backfill_execution`.
+        // Deliberate: the contended resource is the one account-wide replay
+        // budget, not the intent that last spent it, and one full-history replay
+        // serves every armed group — rotating here would buy a different
+        // group-id on the audit rows and pay a second whole-account drain for
+        // it. The wait is bounded by `EPOCH_BACKFILL_RETRY_BACKOFF_CAP`.
         if self.epoch_backfill_retry_is_paced(seam) {
             return Ok(EpochBackfillRunOutcome::Deferred);
         }
