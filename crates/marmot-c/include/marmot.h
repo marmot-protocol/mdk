@@ -2860,6 +2860,23 @@ MarmotStatus marmot_republish_key_package(const struct MarmotClient *client,
                                           uint64_t *out);
 
 /**
+ * Rotate the account's KeyPackage: mint and publish a fresh one,
+ * superseding the current slot (the sanctioned repair for an
+ * epoch-stalled group; see `MARMOT_EVENT_EPOCH_STALL_ESCALATED`).
+ * Writes the accepting-relay count. `marmot_publish_new_key_package`
+ * is the same operation under its legacy name.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_rotate_key_package(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       uint64_t *out);
+
+/**
  * Publish a NIP-09 deletion for a KeyPackage event. Writes the
  * accepting-relay count.
  *

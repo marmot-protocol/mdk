@@ -176,6 +176,11 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
           "unknown account -> MARMOT_STATUS_UNKNOWN_ACCOUNT");
 
+    uint64_t accepted = 0;
+    st = marmot_rotate_key_package(client, "no-such-account", &accepted);
+    check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
+          "rotate_key_package on unknown account -> UNKNOWN_ACCOUNT");
+
     char *nsec = NULL;
     st = marmot_reveal_nsec(client, "no-such-account", &nsec);
     check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,

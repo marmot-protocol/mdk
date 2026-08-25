@@ -442,6 +442,13 @@ c_cmd! {
     /// publish a fresh one. Writes the accepting-relay count.
     async fn marmot_republish_key_package(account_ref: str) -> scalar(u64) = republish_key_package;
 
+    /// Rotate the account's KeyPackage: mint and publish a fresh one,
+    /// superseding the current slot (the sanctioned repair for an
+    /// epoch-stalled group; see `MARMOT_EVENT_EPOCH_STALL_ESCALATED`).
+    /// Writes the accepting-relay count. `marmot_publish_new_key_package`
+    /// is the same operation under its legacy name.
+    async fn marmot_rotate_key_package(account_ref: str) -> scalar(u64) = rotate_key_package;
+
     /// Publish a NIP-09 deletion for a KeyPackage event. Writes the
     /// accepting-relay count.
     async fn marmot_delete_account_key_package(account_ref: str, event_id_hex: str, relays/relays_len: str_arr) -> scalar(u64) = delete_account_key_package;
