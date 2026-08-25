@@ -341,9 +341,12 @@ Each binary/plugin tarball carries a `manifest.json` recording the release tag, 
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
 The installer assets are generated during the release and default to their own immutable `wn-agent-v<version>` release
-tag and `<version>` asset suffix. A verified install for the current workspace release looks like:
+tag and `<version>` asset suffix. The mutable `wn-agent-latest` release is a rolling convenience alias, not an
+authoritative pin; repeatable installs use immutable `wn-agent-v<version>` tags. A verified install for the current
+workspace release looks like:
 
 ```sh
+(
 set -eu
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
 
@@ -378,6 +381,7 @@ install_verified "$base_url/install-codex-marmot.sh" "$base_url/install-codex-ma
 install_verified "$base_url/install-opencode-marmot.sh" "$base_url/install-opencode-marmot.sh.sha256"
 # Pi terminal harness
 install_verified "$base_url/install-pi-marmot.sh" "$base_url/install-pi-marmot.sh.sha256"
+)
 ```
 
 Change the immutable `wn-agent-v<version>` release URL when you need to pin a different release for repeatable testing or

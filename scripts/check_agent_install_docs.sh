@@ -46,17 +46,22 @@ if release_guide.count(f'base_url="{base_url}"') != 1:
         file=sys.stderr,
     )
     raise SystemExit(1)
-for connector in ("hermes", "openclaw", "codex", "opencode", "pi"):
+quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "codex": 2, "opencode": 1, "pi": 1}
+for connector, quickstart_expected in quickstart_expected_calls.items():
     installer = f"install-{connector}-marmot.sh"
     call = f'install_verified "$base_url/{installer}"'
     checksum = f'"$base_url/{installer}.sha256"'
-    if quickstart.count(call) < 1 or quickstart.count(checksum) < 1:
-        print(
-            "error: integrations/README.md must verify the current "
-            f"{connector} installer against its companion checksum before execution",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+    for label, text, expected in (
+        ("integrations/README.md", quickstart, quickstart_expected),
+        ("release.md", release_guide, 1),
+    ):
+        if text.count(call) != expected or text.count(checksum) != expected:
+            print(
+                f"error: {label} must contain exactly {expected} current {connector} installer call(s) "
+                "paired with companion checksums",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 PY
 
 if rg -n 'releases/download/wn-agent-latest/install-' "${active_paths[@]}"; then

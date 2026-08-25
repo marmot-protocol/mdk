@@ -74,6 +74,25 @@ install_verified "$base_url/install.sh"
             gate.documented_surface_errors(mutated, installers),
         )
 
+    def test_release_guide_rejects_download_to_shell_mutation(self) -> None:
+        release = (Path(__file__).resolve().parents[1] / "release.md").read_text(encoding="utf-8")
+        installers = {installer: 1 for installer in gate.INSTALLERS}
+        self.assertEqual(gate.documented_surface_errors(release, installers), [])
+        verified = (
+            'install_verified "$base_url/install-hermes-marmot.sh" '
+            '"$base_url/install-hermes-marmot.sh.sha256"'
+        )
+        mutated = release.replace(
+            verified,
+            "curl -fsSL https://example.test/install-hermes-marmot.sh | bash",
+            1,
+        )
+        self.assertTrue(gate.find_download_to_shell_pipelines(mutated))
+        self.assertIn(
+            "expected at least 1 verified calls for install-hermes-marmot.sh",
+            gate.documented_surface_errors(mutated, installers),
+        )
+
     def test_repository_scan_rejects_new_unverified_example(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
