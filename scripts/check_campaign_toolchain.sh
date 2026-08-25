@@ -9,16 +9,55 @@ if [[ -z "$toolchain" ]]; then
     exit 1
 fi
 
-builder_line="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.convergence-campaign)"
-if [[ ! "$builder_line" =~ ^FROM\ rust:([^@]+)@sha256:[0-9a-f]{64}\ AS\ builder$ ]]; then
-    echo 'error: campaign builder must use a digest-pinned rust image' >&2
+expected_tag="${toolchain}-bookworm"
+
+check_builder_image() {
+    local label="$1"
+    local dockerfile="$2"
+    local builder_line actual_tag
+
+    builder_line="$(sed -n '/^FROM rust:.* AS builder$/p' "$dockerfile")"
+    if [[ ! "$builder_line" =~ ^FROM\ rust:([^@]+)@sha256:[0-9a-f]{64}\ AS\ builder$ ]]; then
+        echo "error: ${label} builder must use a digest-pinned rust image" >&2
+        exit 1
+    fi
+
+    actual_tag="${BASH_REMATCH[1]}"
+    if [[ "$actual_tag" != "$expected_tag" ]]; then
+        echo "error: ${label} builder uses rust:${actual_tag}; expected rust:${expected_tag}" >&2
+        exit 1
+    fi
+}
+
+check_base_image_digests() {
+    local label="$1"
+    local dockerfile="$2"
+    local from_line
+
+    while IFS= read -r from_line; do
+        if [[ ! "$from_line" =~ ^FROM\ [^[:space:]@]+@sha256:[0-9a-f]{64}(\ AS\ [A-Za-z0-9_-]+)?$ ]]; then
+            echo "error: ${label} base images must be digest-pinned: ${from_line}" >&2
+            exit 1
+        fi
+    done < <(sed -n '/^FROM /p' "$dockerfile")
+}
+
+check_builder_image 'campaign' Dockerfile.convergence-campaign
+check_builder_image 'quic broker' Dockerfile.quic-broker
+check_base_image_digests 'campaign' Dockerfile.convergence-campaign
+check_base_image_digests 'quic broker' Dockerfile.quic-broker
+
+campaign_builder="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.convergence-campaign)"
+quic_builder="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.quic-broker)"
+if [[ "$quic_builder" != "$campaign_builder" ]]; then
+    echo 'error: quic broker builder pin must match the campaign builder pin' >&2
     exit 1
 fi
 
-expected_tag="${toolchain}-bookworm"
-actual_tag="${BASH_REMATCH[1]}"
-if [[ "$actual_tag" != "$expected_tag" ]]; then
-    echo "error: campaign builder uses rust:${actual_tag}; expected rust:${expected_tag}" >&2
+campaign_runtime="$(sed -n '/^FROM /p' Dockerfile.convergence-campaign | sed -n '2p')"
+quic_runtime="$(sed -n '/^FROM /p' Dockerfile.quic-broker | sed -n '2p')"
+if [[ "$quic_runtime" != "$campaign_runtime" ]]; then
+    echo 'error: quic broker runtime pin must match the campaign runtime pin' >&2
     exit 1
 fi
 
@@ -27,4 +66,4 @@ if ! grep -Fqx 'COPY Cargo.toml Cargo.lock rust-toolchain.toml ./' Dockerfile.co
     exit 1
 fi
 
-echo "campaign toolchain gate: rust ${toolchain}"
+echo "campaign and quic broker toolchain gate: rust ${toolchain}"

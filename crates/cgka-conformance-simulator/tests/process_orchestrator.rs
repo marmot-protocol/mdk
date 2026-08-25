@@ -293,7 +293,9 @@ async fn run_app_runtime_adapter(
     cgka_conformance_simulator::ScenarioReport,
     BTreeMap<String, AppRuntimeObservationV1>,
 ) {
-    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
+    let mut app = AppRuntimeHarness::new_with_pinned_settlement(&spec.clients)
+        .await
+        .unwrap();
     let app_report = run_scenario_report_with_subject(spec, None, Vec::new(), &mut app)
         .await
         .unwrap();

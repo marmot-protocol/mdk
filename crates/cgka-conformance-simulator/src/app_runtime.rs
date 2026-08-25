@@ -127,10 +127,24 @@ pub struct AppRuntimeHarness {
     active_scenario_group: Option<String>,
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
     relay_action_events: RelayActionEvents,
+    settlement_quiescence_ms: Option<u64>,
 }
 
 impl AppRuntimeHarness {
     pub async fn new(clients: &[String]) -> Result<Self, SubjectError> {
+        Self::new_with_settlement_quiescence(clients, None).await
+    }
+
+    /// Build the retained-history regression harness with the protocol-pinned
+    /// settlement window even when the workspace enables test-policy overrides.
+    pub async fn new_with_pinned_settlement(clients: &[String]) -> Result<Self, SubjectError> {
+        Self::new_with_settlement_quiescence(clients, Some(1_000)).await
+    }
+
+    async fn new_with_settlement_quiescence(
+        clients: &[String],
+        settlement_quiescence_ms: Option<u64>,
+    ) -> Result<Self, SubjectError> {
         let relay_control = RelayControl::new();
         let relay = LocalRelay::new(relay_control.relay_builder());
         relay.run().await.map_err(environment_error)?;
@@ -143,7 +157,7 @@ impl AppRuntimeHarness {
                 .tempdir()
                 .map_err(environment_error)?;
             fs_private::create_dir_all_private(root.path()).map_err(environment_error)?;
-            let app = app_for_root(root.path(), &relay_url);
+            let app = app_for_root(root.path(), &relay_url, settlement_quiescence_ms);
             let runtime = MarmotAppRuntime::new(app.clone());
             runtime.start().await.map_err(app_error)?;
             let setup = runtime
@@ -187,6 +201,7 @@ impl AppRuntimeHarness {
             active_scenario_group: None,
             accepted_publications: BTreeMap::new(),
             relay_action_events: BTreeMap::new(),
+            settlement_quiescence_ms,
         })
     }
 
@@ -379,13 +394,14 @@ impl AppRuntimeHarness {
 
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
         let relay_url = self.relay_url.clone();
+        let settlement_quiescence_ms = self.settlement_quiescence_ms;
         let participant = self.participant_mut(client)?;
         if participant.online
             && let Some(runtime) = participant.runtime.take()
         {
             runtime.shutdown_and_close().await.map_err(app_error)?;
         }
-        participant.app = app_for_root(participant.root(), &relay_url);
+        participant.app = app_for_root(participant.root(), &relay_url, settlement_quiescence_ms);
         let runtime = MarmotAppRuntime::new(participant.app.clone());
         runtime.start().await.map_err(app_error)?;
         participant.events = Some(runtime.subscribe());
@@ -1291,12 +1307,12 @@ async fn compensate_admin_changes(
     app_error(original)
 }
 
-fn app_for_root(root: &Path, relay_url: &str) -> MarmotApp {
-    MarmotApp::with_relay_and_config(
-        root,
-        relay_url.to_owned(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
-    )
+fn app_for_root(root: &Path, relay_url: &str, settlement_quiescence_ms: Option<u64>) -> MarmotApp {
+    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    if let Some(ms) = settlement_quiescence_ms {
+        config = config.with_dev_settlement_quiescence_ms(ms);
+    }
+    MarmotApp::with_relay_and_config(root, relay_url.to_owned(), config)
 }
 
 pub(crate) fn public_protocol_projection(
