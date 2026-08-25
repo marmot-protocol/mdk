@@ -65,12 +65,15 @@ same logic; there is no client/server distinction inside a session.
 
 ### Data categories
 
-| Category | Item id | Merge rule |
-| --- | --- | --- |
-| `MSG` (application/group messages) | message id | set union (immutable items) |
-| `GRP` (group/community membership + metadata) | group id | last-write-wins by (epoch, timestamp) |
-| `KP` (published keypackages) | keypackage ref | set union + tombstones for consumed ones |
-| `DEV` (mesh member list) | device pubkey | master-signed, highest version wins |
+| Tag | Category | Item id | Merge rule |
+| --- | --- | --- | --- |
+| 0x01 | `MSG` (application/group messages) | message id | set union (immutable items) |
+| 0x02 | `GRP` (group/community membership + metadata) | group id | last-write-wins by (epoch, timestamp) |
+| 0x03 | `KP` (published keypackages) | keypackage ref | set union + tombstones for consumed ones |
+| 0x04 | `DEV` (mesh member list) | device pubkey | master-signed, highest version wins |
+
+Tag values are fixed for `ver = 1`. A frame carrying an unassigned tag
+is a protocol error.
 
 Item ids here are sync-internal handles. Note `GroupId` is opaque MLS
 bytes; do not conflate with 32-byte `nostr_group_id` routing handles.
@@ -103,6 +106,43 @@ the session); a higher `ver` than supported closes with `ERR`.
 
 Item ids are length-prefixed (`u16 len` + bytes) since `GroupId` is
 variable-length.
+
+### Hashing and canonicalization
+
+All hashes are SHA-256; every 32-byte digest and item hash in the frame
+tables is a SHA-256 output. Domain separation keeps item hashes and
+category digests from colliding across contexts:
+
+```
+item_hash       = SHA-256("mdk-sync-v1:item:"   || tag || item_id || payload)
+category_digest = SHA-256("mdk-sync-v1:digest:" || tag || h_1 || h_2 || ... || h_n)
+```
+
+where `tag` is the category's u8 value, `item_id` is the length-prefixed
+id exactly as framed, `payload` is the item's canonical bytes, and
+`h_1..h_n` are the category's item hashes sorted ascending bytewise. An
+empty category's digest is the hash of the prefix and tag alone (n = 0).
+
+Canonical bytes rule: the payload transmitted in `DATA` frames IS the
+canonical serialization; item hashes are computed over those exact
+bytes, so there is no separate re-serialization step to disagree on.
+Each category's payload encoding is deterministic:
+
+- Fields appear in a fixed order defined per category, with no optional
+  omission; fixed-width integers are little-endian, variable-length
+  fields are `u16 len` prefixed, timestamps are u64 unix seconds.
+- An optional field is a u8 presence flag followed by the value when
+  the flag is 1. A `KP` tombstone is a u8 consumed flag.
+- Any set-valued field (for example the `DEV` member list) is sorted
+  ascending bytewise before encoding.
+
+`DEV` signatures are BIP-340 Schnorr (as in Nostr) by the master key,
+computed over the canonical payload bytes excluding the signature field
+itself.
+
+Convergence check: two devices holding the same items MUST produce
+identical category digests. Conformance vectors pin this: fixed item
+sets with expected payload bytes, item hashes, and digests.
 
 ### Session flow
 
