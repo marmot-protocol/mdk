@@ -9,7 +9,8 @@ server infrastructure; devices talk directly over a private mesh.
 ## Roles
 
 - **Master**: the first device the account is created on. It creates the
-  mesh network and issues join credentials. Master is an *administrative*
+  mesh network and is its nostr-vpn admin: it approves join requests and
+  signs the roster. Master is an *administrative*
   role (invites, revocation), not a data authority: sync itself is
   peer-to-peer and symmetric.
 - **Member**: any other device that joined the mesh. Full sync peer.
@@ -35,20 +36,29 @@ own.
 
 ### Joining
 
-1. Master displays a QR code containing: mesh network id, a one-time
-   join secret, and relay hints for signaling.
-2. New device scans it, connects to the master over the mesh, proves
-   possession of the join secret, and sends its device pubkey.
-3. Master adds the pubkey to the member list and gossips the updated
-   list to all members.
+Joining follows the upstream nostr-vpn flow; this spec adds nothing to
+it:
 
-Join secrets are single-use and expire (suggested: 10 minutes).
+1. The joining device generates its device keypair and displays a QR
+   code encoding its signed `nvpn://join-request`.
+2. The master scans it and approves. nostr-vpn returns an admin-signed
+   roster to the joining device over relay signaling.
+3. The roster is the sole source of network membership, `network_id`,
+   admin identities, and relay configuration. A device connects to the
+   mesh only once it holds a roster that includes it; non-members never
+   touch the mesh.
+
+Trust contract: the in-person QR scan is the enrollment root. The
+joining device pins the admin pubkey from the approval response and
+from then on accepts only rosters signed by that key. Members accept a
+roster only if admin-signed and higher-versioned than the one they
+hold.
 
 ### Leaving
 
 - Voluntary: device sends `BYE` and stops connecting.
-- Revocation: master removes the pubkey from the member list and gossips
-  the update. Members drop connections from removed pubkeys.
+- Revocation: master publishes a new roster without the device. Members
+  drop connections from any pubkey absent in the latest roster.
 
 A removed device keeps the data it already synced; that is inherent to
 any sync design and is handled at the MLS layer (key rotation on device
@@ -70,7 +80,7 @@ same logic; there is no client/server distinction inside a session.
 | 0x01 | `MSG` (application/group messages) | message id | set union (immutable items) |
 | 0x02 | `GRP` (group/community membership + metadata) | group id | last-write-wins by (epoch, timestamp) |
 | 0x03 | `KP` (published keypackages) | keypackage ref | set union + tombstones for consumed ones |
-| 0x04 | `DEV` (mesh member list) | device pubkey | master-signed, highest version wins |
+| 0x04 | `DEV` (nostr-vpn roster) | `network_id` (single item) | admin-signed, highest version wins |
 
 Tag values are fixed for `ver = 1`. A frame carrying an unassigned tag
 is a protocol error.
@@ -133,12 +143,12 @@ Each category's payload encoding is deterministic:
   fields are `u16 len` prefixed, timestamps are u64 unix seconds.
 - An optional field is a u8 presence flag followed by the value when
   the flag is 1. A `KP` tombstone is a u8 consumed flag.
-- Any set-valued field (for example the `DEV` member list) is sorted
-  ascending bytewise before encoding.
+- Any set-valued field (for example the roster's member pubkeys) is
+  sorted ascending bytewise before encoding.
 
-`DEV` signatures are BIP-340 Schnorr (as in Nostr) by the master key,
-computed over the canonical payload bytes excluding the signature field
-itself.
+The `DEV` payload is the admin-signed roster exactly as produced by
+nostr-vpn; its signature scheme and byte layout are upstream's, not
+redefined here.
 
 Convergence check: two devices holding the same items MUST produce
 identical category digests. Conformance vectors pin this: fixed item
@@ -178,7 +188,9 @@ Applied per category rule (table above), after validation:
 - `GRP`: accept if (epoch, timestamp) newer than local; MLS validity is
   checked by the engine before commit; sync never bypasses it.
 - `KP`: union; a tombstone (consumed marker) beats presence.
-- `DEV`: verify master signature, accept if version higher.
+- `DEV`: the roster travels as one item; verify the pinned admin
+  signature, accept if its version is higher. Syncing `DEV` lets a
+  device that missed a roster update catch up from any peer.
 
 Merges are torn-write-free per the multi-step-state-changes invariant:
 validate the full incoming batch, apply transactionally per category.
@@ -188,8 +200,9 @@ validate the full incoming batch, apply transactionally per category.
 - Trust boundary is mesh membership: any member can send any frame, so
   every payload is validated before merge (signature checks, MLS epoch
   checks, size limits). Malformed input gets `ERR` + close, never a crash.
-- Join secret over QR is the enrollment root of trust; it never
-  transits a relay in cleartext (it rides the QR, then a mesh tunnel).
+- Enrollment root of trust is the in-person scan of the joining
+  device's signed `nvpn://join-request` plus the pinned admin key;
+  membership authority lives entirely in the admin-signed roster.
 - Sync tracing follows the observability rules: aggregate counts only,
   no ids, pubkeys, or payloads.
 - Relay dialing inherits the dial-safety discipline
