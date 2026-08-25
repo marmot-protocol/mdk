@@ -229,6 +229,14 @@ pi-dev-e2e-connector:
 agent-install-docs-gate:
     scripts/check_agent_install_docs.sh
 
+install-example-sha256-gate:
+    python3 scripts/check_install_example_sha256.py
+    python3 scripts/test_install_example_sha256_gate.py
+
+cargo-audit-policy-gate:
+    python3 scripts/check_cargo_audit_ci.py
+    python3 scripts/test_check_cargo_audit_ci.py
+
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -559,6 +567,6 @@ test-convergence-policy-pin:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin test
