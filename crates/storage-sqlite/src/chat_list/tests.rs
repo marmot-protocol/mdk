@@ -9,7 +9,10 @@ use cgka_traits::app_components::{
     encode_group_avatar_url_v1,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+    EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    GROUP_SYSTEM_TYPE_GROUP_RENAMED, GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
 };
 use cgka_traits::storage::{GroupStorage, LeaveRequest, LeaveRequestStorage};
 use cgka_traits::types::{EpochId, GroupId};
@@ -68,6 +71,33 @@ fn chat_with_tags(
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
+    }
+}
+
+fn group_system(
+    id: &str,
+    sender: &str,
+    at: u64,
+    system_type: &str,
+    plaintext: &str,
+) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: GROUP.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: None,
+        source_epoch: Some(at),
+        direction: "system".to_owned(),
+        sender: sender.to_owned(),
+        plaintext: plaintext.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        tags: vec![vec![
+            GROUP_SYSTEM_TYPE_TAG.to_owned(),
+            system_type.to_owned(),
+        ]],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: Some(format!("commit-{id}")),
         moderation_grant: false,
     }
 }
@@ -2067,6 +2097,257 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
 }
 
 #[test]
+fn remote_group_system_event_advances_preview_unread_and_read_marker() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "before role change"))
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let system_at = unix_now_seconds() + 1;
+    let payload = r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#;
+    store
+        .record_app_event(&group_system(
+            "made-admin",
+            REMOTE,
+            system_at,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            payload,
+        ))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+
+    let preview = row.last_message.expect("group-system preview");
+    assert_eq!(preview.message_id_hex, "made-admin");
+    assert_eq!(preview.kind, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM);
+    assert_eq!(preview.plaintext, payload);
+    assert_eq!(row.activity_sort_at, system_at);
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(
+        row.first_unread_message_id_hex.as_deref(),
+        Some("made-admin")
+    );
+
+    let read = store
+        .mark_timeline_message_read(LOCAL, GROUP, "made-admin", &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(read.unread_count, 0);
+    assert_eq!(read.last_read_message_id_hex.as_deref(), Some("made-admin"));
+}
+
+#[test]
+fn every_membership_and_admin_system_type_signals_activity() {
+    for system_type in [
+        GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+        GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+        GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    ] {
+        let store = setup_store();
+        store
+            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+            .unwrap();
+        store
+            .record_app_event(&group_system(
+                system_type,
+                REMOTE,
+                unix_now_seconds() + 1,
+                system_type,
+                &format!(r#"{{"v":1,"system_type":"{system_type}","text":"Changed"}}"#),
+            ))
+            .unwrap();
+
+        let row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row");
+        assert_eq!(
+            row.last_message
+                .expect("group activity preview")
+                .message_id_hex,
+            system_type,
+        );
+        assert_eq!(row.unread_count, 1, "system type {system_type}");
+    }
+}
+
+#[test]
+fn own_group_system_event_advances_preview_without_becoming_unread() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "before role change"))
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let system_at = unix_now_seconds() + 1;
+    store
+        .record_app_event(&group_system(
+            "own-role-change",
+            LOCAL,
+            system_at,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(
+        row.last_message
+            .expect("group-system preview")
+            .message_id_hex,
+        "own-role-change"
+    );
+    assert_eq!(row.activity_sort_at, system_at);
+    assert_eq!(row.unread_count, 0);
+}
+
+#[test]
+fn group_system_payload_does_not_increment_mentions() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
+        .unwrap();
+    store
+        .record_app_event(&group_system(
+            "role-change",
+            REMOTE,
+            20,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added","data":{"subject":"aa"}}"#,
+        ))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.unread_mention_count, 0);
+}
+
+#[test]
+fn unrelated_group_system_event_does_not_signal_chat_list_activity() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "existing preview"))
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+
+    store
+        .record_app_event(&group_system(
+            "renamed",
+            REMOTE,
+            unix_now_seconds() + 1,
+            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+            r#"{"v":1,"system_type":"group_renamed","text":"Group renamed"}"#,
+        ))
+        .unwrap();
+    let after = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(
+        after.last_message.expect("existing preview").message_id_hex,
+        "old"
+    );
+    assert_eq!(after.activity_sort_at, before.activity_sort_at);
+    assert_eq!(after.unread_count, 0);
+}
+
+#[test]
+fn invalidated_group_activity_is_removed_from_preview_and_unread() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "existing preview"))
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&group_system(
+            "rolled-back-role",
+            REMOTE,
+            unix_now_seconds() + 1,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+    let signaled = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(signaled.unread_count, 1);
+    assert_eq!(
+        signaled.last_message.expect("role preview").message_id_hex,
+        "rolled-back-role"
+    );
+
+    store
+        .invalidate_app_event_by_message_id(GROUP, "rolled-back-role", "LosingBranch")
+        .unwrap();
+    let reconciled = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(reconciled.unread_count, 0);
+    assert_eq!(
+        reconciled
+            .last_message
+            .expect("restored preview")
+            .message_id_hex,
+        "old"
+    );
+}
+
+#[test]
+fn direct_conversation_does_not_project_admin_activity() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    let store = setup_store_with_group(direct);
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    store
+        .record_app_event(&group_system(
+            "direct-role-change",
+            REMOTE,
+            unix_now_seconds() + 1,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.conversation_kind, ChatConversationKind::Direct);
+    assert!(row.last_message.is_none());
+    assert_eq!(row.unread_count, 0);
+}
+
+#[test]
 fn secure_prune_refreshes_unread_count_mentions_and_first_message_atomically() {
     let store = setup_store();
     let mentions = |plaintext: &str, _tags: &[Vec<String>]| plaintext.contains("@local");
@@ -2478,6 +2759,76 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
 
     assert_eq!(row.unread_mention_count, 1);
     assert!(row.has_unread_mention);
+}
+
+#[test]
+fn ensure_chat_list_rows_reconciles_pre_group_system_projection() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let system_at = unix_now_seconds() + 1;
+    store
+        .record_app_event(&group_system(
+            "role-change",
+            REMOTE,
+            system_at,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+    let mut newest_chat = chat(
+        "newest-chat",
+        REMOTE,
+        system_at + 1,
+        "newer visible preview",
+    );
+    newest_chat.source_epoch = Some(system_at + 1);
+    store.record_app_event(&newest_chat).unwrap();
+    let current = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(current.unread_count, 2);
+    assert_eq!(
+        current.last_message.expect("latest preview").message_id_hex,
+        "newest-chat"
+    );
+
+    // Simulate a version-1 row: its latest preview is structurally correct,
+    // but it counted only the kind-9 message and silently omitted the older
+    // kind-1210 role event.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET unread_count = 1 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let reconciled = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(reconciled.unread_count, 2);
+    let projection_version: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT mention_counts_version FROM chat_list_projection_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(projection_version, CHAT_LIST_PROJECTION_VERSION);
 }
 
 #[test]

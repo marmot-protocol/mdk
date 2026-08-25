@@ -9,7 +9,11 @@ use crate::{
     i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{
+    GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+    GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
@@ -936,10 +940,9 @@ fn rebuild_all_chat_list_rows_tx(
         [],
     )
     .storage()?;
-    // #750: a full rebuild recomputes every mention count, so the projection is
-    // current — advance the marker so warm-up completeness checks skip the
-    // per-group recompute.
-    set_chat_list_mention_counts_version_tx(tx, CHAT_LIST_MENTION_COUNTS_VERSION)?;
+    // A full rebuild reconciles every derived field covered by the current
+    // projection contract, including mentions and kind-1210 activity.
+    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)?;
     Ok(())
 }
 
@@ -961,12 +964,42 @@ fn refresh_chat_list_row_tx(
     chat_list_row_tx(tx, group_id_hex)
 }
 
-/// Current chat-list projection reconciliation version (#750). Once the stored
-/// marker reaches this value, the warm-up completeness check trusts the stored
-/// `unread_mention_count`s (kept current by incremental refresh) and skips the
-/// O(groups × unread) per-group recompute. Bump this if a future migration can
-/// again leave the counts stale.
-const CHAT_LIST_MENTION_COUNTS_VERSION: i64 = 1;
+/// Current chat-list projection reconciliation version.
+///
+/// Version 1 covered unread-mention counts (#750). Version 2 additionally
+/// projects kind-1210 group-system rows into preview, activity, and unread state
+/// (#822). The persisted column keeps its legacy `mention_counts_version` name
+/// for schema compatibility, but now gates the complete derived-row contract.
+const CHAT_LIST_PROJECTION_VERSION: i64 = 2;
+
+const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
+    GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+    GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+    GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+    GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+];
+
+/// SQL predicate for activity that should behave like a chat message in the
+/// chat list. Kind-1210 also carries metadata changes; #822 intentionally
+/// promotes only membership/admin rows, leaving unrelated system events alone.
+fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
+    let group_activity_tags = CHAT_LIST_GROUP_ACTIVITY_TYPES
+        .iter()
+        .map(|system_type| format!(r#"'[["{GROUP_SYSTEM_TYPE_TAG}","{system_type}"]]'"#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "({column_prefix}kind = {MARMOT_APP_EVENT_KIND_CHAT} OR \
+         ({column_prefix}kind = {MARMOT_APP_EVENT_KIND_GROUP_SYSTEM} AND \
+          {column_prefix}tags_json IN ({group_activity_tags}) AND \
+          EXISTS (SELECT 1 FROM account_groups AS activity_group \
+                  WHERE activity_group.group_id_hex = {column_prefix}group_id_hex \
+                    AND (trim(activity_group.profile_name) != '' OR \
+                         (activity_group.member_count IS NOT NULL AND \
+                          activity_group.member_count != 2)))))"
+    )
+}
 
 /// One authoritative latest-preview order for rebuild, completeness, and
 /// secure-prune repair. Failed local sends remain visible in the timeline but
@@ -987,7 +1020,7 @@ struct LatestChatListMessage {
     canonical_order_prefix: (u8, u64, u8, u64),
 }
 
-fn chat_list_mention_counts_version_tx(tx: &Connection) -> StorageResult<i64> {
+fn chat_list_projection_version_tx(tx: &Connection) -> StorageResult<i64> {
     Ok(tx
         .query_row(
             "SELECT mention_counts_version FROM chat_list_projection_meta WHERE id = 1",
@@ -999,7 +1032,7 @@ fn chat_list_mention_counts_version_tx(tx: &Connection) -> StorageResult<i64> {
         .unwrap_or(0))
 }
 
-fn set_chat_list_mention_counts_version_tx(tx: &Connection, version: i64) -> StorageResult<()> {
+fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> StorageResult<()> {
     tx.execute(
         "UPDATE chat_list_projection_meta SET mention_counts_version = ?1 WHERE id = 1",
         params![version],
@@ -1017,6 +1050,7 @@ fn chat_list_projection_complete_tx(
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<bool> {
+    let activity_filter = chat_list_activity_filter_sql("mt.");
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(
@@ -1115,7 +1149,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.message_id_hex
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1130,7 +1164,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.sender
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1145,7 +1179,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.plaintext
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1160,7 +1194,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.kind
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1175,7 +1209,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.timeline_at
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1190,7 +1224,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.deleted
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1205,7 +1239,7 @@ fn chat_list_projection_complete_tx(
                         SELECT mt.media_json
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1225,7 +1259,7 @@ fn chat_list_projection_complete_tx(
                         END
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
+                          AND {activity_filter}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1242,7 +1276,7 @@ fn chat_list_projection_complete_tx(
                             SELECT mt.timeline_at
                             FROM message_timeline AS mt
                             WHERE mt.group_id_hex = ag.group_id_hex
-                              AND mt.kind = ?1
+                              AND {activity_filter}
                               AND (
                                   mt.invalidation_status IS NULL
                                   OR (
@@ -1262,53 +1296,66 @@ fn chat_list_projection_complete_tx(
                      )
              )"
         ),
-        params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
+        [],
     )? {
         return Ok(false);
     }
-    // #750: once the mention counts have been reconciled to the current
-    // projection version, the per-group recompute below is redundant —
-    // incremental refresh keeps `unread_mention_count` current — so skip the
-    // O(groups × unread-per-group) scan (which materializes every unread
-    // plaintext). The cheap structural checks above still run every warm-up.
-    if chat_list_mention_counts_version_tx(tx)? >= CHAT_LIST_MENTION_COUNTS_VERSION {
+    if chat_list_projection_version_tx(tx)? >= CHAT_LIST_PROJECTION_VERSION {
         return Ok(true);
     }
-    // Mention classification needs the injected closure (not expressible in pure
-    // SQL), so the remaining checks recompute the unread-mention count per group
-    // and compare it to the stored value. This corrects rows upgraded via
-    // migration 0019 (which defaults the new column to 0) for groups that
-    // actually have unread mentions.
-    for (group_id_hex, stored_mention_count) in chat_list_stored_mention_counts_tx(tx)? {
+    // The version marker can lag behind rows that a targeted refresh already
+    // brought current. Re-derive the unread summary once and rebuild only when
+    // a row is actually stale; this preserves the cheap warm path after the
+    // marker advances without turning a metadata-only open into needless SQL.
+    for (group_id_hex, stored) in chat_list_stored_unread_summaries_tx(tx)? {
         let read_state = read_state_tx(tx, &group_id_hex)?;
-        let unread = unread_summary_tx(
+        let derived = unread_summary_tx(
             tx,
             local_account_id_hex,
             &group_id_hex,
             read_state.as_ref(),
             mention_classifier,
         )?;
-        if unread.mention_count != stored_mention_count {
+        if derived.count != stored.count
+            || derived.mention_count != stored.mention_count
+            || derived.first_message_id != stored.first_message_id
+        {
             return Ok(false);
         }
     }
-    // Counts verified current — record the version so future warm-ups skip the
-    // per-group recompute above.
-    set_chat_list_mention_counts_version_tx(tx, CHAT_LIST_MENTION_COUNTS_VERSION)?;
+    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)?;
     Ok(true)
 }
 
-fn chat_list_stored_mention_counts_tx(tx: &Connection) -> StorageResult<Vec<(String, u64)>> {
+fn chat_list_stored_unread_summaries_tx(
+    tx: &Connection,
+) -> StorageResult<Vec<(String, UnreadSummary)>> {
     let mut stmt = tx
-        .prepare("SELECT group_id_hex, unread_mention_count FROM chat_list_rows")
+        .prepare(
+            "SELECT group_id_hex, unread_count, unread_mention_count,
+                    first_unread_message_id_hex
+             FROM chat_list_rows",
+        )
         .storage()?;
     stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
     })
     .storage()?
     .map(|entry| {
-        let (group_id_hex, count) = entry.storage()?;
-        Ok((group_id_hex, i64_to_u64(count)?))
+        let (group_id_hex, count, mention_count, first_message_id) = entry.storage()?;
+        Ok((
+            group_id_hex,
+            UnreadSummary {
+                count: i64_to_u64(count)?,
+                mention_count: i64_to_u64(mention_count)?,
+                first_message_id,
+            },
+        ))
     })
     .collect()
 }
@@ -1328,7 +1375,7 @@ fn rebuild_chat_list_row_for_group_tx(
     group: AccountGroupRow,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
-    let latest = latest_kind9_message_tx(tx, &group.group_id_hex)?;
+    let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
     let latest_message = latest.as_ref().map(|latest| &latest.preview);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
     let unread = unread_summary_tx(
@@ -1498,7 +1545,7 @@ fn unread_summary_tx(
               timeline_order_primary,
               timeline_order_phase,
               timeline_order_at,
-              message_id_hex) > (?4, ?5, ?6, ?7, ?8)",
+              message_id_hex) > (?3, ?4, ?5, ?6, ?7)",
                 vec![
                     rusqlite::types::Value::Integer(i64::from(class)),
                     rusqlite::types::Value::Integer(u64_to_i64(primary)?),
@@ -1515,7 +1562,7 @@ fn unread_summary_tx(
         } else if let Some(last_read_at) = read_state.last_read_timeline_at {
             let marker_id = read_state.last_read_message_id_hex.as_deref().unwrap_or("");
             (
-                "(timeline_at > ?4 OR (timeline_at = ?4 AND message_id_hex > ?5))",
+                "(timeline_at > ?3 OR (timeline_at = ?3 AND message_id_hex > ?4))",
                 vec![
                     rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
                     rusqlite::types::Value::Text(marker_id.to_owned()),
@@ -1524,7 +1571,7 @@ fn unread_summary_tx(
             )
         } else {
             (
-                "timeline_at > ?4 AND (?5 = ?5)",
+                "timeline_at > ?3 AND (?4 = ?4)",
                 vec![
                     rusqlite::types::Value::Integer(u64_to_i64(read_state.initialized_at)?),
                     rusqlite::types::Value::Text(String::new()),
@@ -1536,20 +1583,20 @@ fn unread_summary_tx(
     // the unread window. Persisted canonical anchors use the same accepted-history
     // key as timeline pagination even after retention prunes the marker row.
     // Legacy states without a canonical anchor use wall-clock predicate + order.
+    let activity_filter = chat_list_activity_filter_sql("");
     let scan_sql = format!(
-        "SELECT message_id_hex, plaintext, tags_json
+        "SELECT message_id_hex, plaintext, tags_json, kind
          FROM message_timeline
          WHERE group_id_hex = ?1
-           AND kind = ?2
+           AND {activity_filter}
            AND deleted = 0
            AND invalidation_status IS NULL
-           AND sender != ?3
+           AND sender != ?2
            AND {where_sql}
          ORDER BY {order_sql}"
     );
     let mut query_params = vec![
         rusqlite::types::Value::Text(group_id_hex.to_owned()),
-        rusqlite::types::Value::Integer(u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?),
         rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
     ];
     query_params.extend(marker_params);
@@ -1564,12 +1611,13 @@ fn unread_summary_tx(
         let message_id_hex: String = row.get(0).storage()?;
         let plaintext: String = row.get(1).storage()?;
         let tags_json: String = row.get(2).storage()?;
+        let kind = i64_to_u64(row.get(3).storage()?)?;
         if first_message_id.is_none() {
             first_message_id = Some(message_id_hex);
         }
         count += 1;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
-        if mention_classifier(&plaintext, &tags) {
+        if kind == MARMOT_APP_EVENT_KIND_CHAT && mention_classifier(&plaintext, &tags) {
             mention_count += 1;
         }
     }
@@ -1683,17 +1731,18 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
     })
 }
 
-fn latest_kind9_message_tx(
+fn latest_chat_list_activity_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<LatestChatListMessage>> {
+    let activity_filter = chat_list_activity_filter_sql("");
     let sql = format!(
         "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
                 media_json, direction, source_message_id_hex, invalidation_status,
                 timeline_order_class, timeline_order_primary,
                 timeline_order_phase, timeline_order_at
          FROM message_timeline
-         WHERE group_id_hex = ?1 AND kind = ?2
+         WHERE group_id_hex = ?1 AND {activity_filter}
            AND (
                invalidation_status IS NULL
                OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
@@ -1701,21 +1750,17 @@ fn latest_kind9_message_tx(
          ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
          LIMIT 1"
     );
-    tx.query_row(
-        &sql,
-        params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
-        |row| {
-            Ok(LatestChatListMessage {
-                preview: chat_list_message_from_row(row)?,
-                canonical_order_prefix: (
-                    row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
-                    row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
-                    row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
-                    row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
-                ),
-            })
-        },
-    )
+    tx.query_row(&sql, params![group_id_hex], |row| {
+        Ok(LatestChatListMessage {
+            preview: chat_list_message_from_row(row)?,
+            canonical_order_prefix: (
+                row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+                row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+                row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
+                row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
+            ),
+        })
+    })
     .optional()
     .storage()
 }
@@ -1725,16 +1770,17 @@ fn timeline_message_for_read_marker_tx(
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<TimelineReadMarker>> {
+    let activity_filter = chat_list_activity_filter_sql("");
     tx.query_row(
-        "SELECT message_id_hex, source_message_id_hex, source_epoch,
+        &format!(
+            "SELECT message_id_hex, source_message_id_hex, source_epoch,
                 invalidation_status, timeline_at
          FROM message_timeline
-         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind = ?3",
-        params![
-            group_id_hex,
-            message_id_hex,
-            u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?
-        ],
+         WHERE group_id_hex = ?1
+           AND message_id_hex = ?2
+           AND {activity_filter}"
+        ),
+        params![group_id_hex, message_id_hex],
         |row| {
             Ok(TimelineReadMarker {
                 message_id_hex: row.get(0)?,
@@ -1784,7 +1830,7 @@ fn insert_initial_read_state_tx(
     group_id_hex: &str,
     manually_marked_unread: bool,
 ) -> StorageResult<()> {
-    let latest = latest_kind9_message_tx(tx, group_id_hex)?;
+    let latest = latest_chat_list_activity_tx(tx, group_id_hex)?;
     let (message_id, timeline_at, order_class, order_primary, order_phase, order_at) = match latest
     {
         Some(latest) => (
@@ -1797,9 +1843,9 @@ fn insert_initial_read_state_tx(
         ),
         None => (None, None, None, None, None, None),
     };
-    // Match first-open semantics: with no retained kind-9 history there is no
-    // read anchor yet, so a subsequently recorded message counts even when its
-    // sender timestamp predates this local interaction.
+    // Match first-open semantics: with no retained chat or group-system
+    // activity there is no read anchor yet, so a subsequently recorded row
+    // counts even when its sender timestamp predates this local interaction.
     let initialized_at = timeline_at.unwrap_or(0);
     tx.execute(
         "INSERT INTO conversation_read_state (

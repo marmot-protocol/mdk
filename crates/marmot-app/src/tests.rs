@@ -5984,6 +5984,38 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
 }
 
 #[test]
+fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_sender() {
+    let preview = ChatListMessagePreview {
+        message_id_hex: "11".repeat(32),
+        sender: String::new(),
+        sender_display_name: None,
+        plaintext: r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        timeline_at: 1,
+        deleted: false,
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state: ChatListMessageDeliveryState::NotApplicable,
+        media_json: None,
+    };
+
+    assert_eq!(
+        MarmotApp::chat_list_sender_for_profile_hydration(&preview),
+        None,
+    );
+
+    let ordinary = ChatListMessagePreview {
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        sender: "22".repeat(32),
+        ..preview
+    };
+    assert_eq!(
+        MarmotApp::chat_list_sender_for_profile_hydration(&ordinary),
+        Some(ordinary.sender.as_str()),
+    );
+}
+
+#[test]
 fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

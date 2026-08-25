@@ -6,7 +6,11 @@ use std::future::pending;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
+use cgka_traits::app_event::{
+    GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+    GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+};
 use cgka_traits::{GroupId, MessageId, storage::StorageError};
 use serde::{Deserialize, Serialize};
 use storage_sqlite::AppEventReplayCursor;
@@ -661,20 +665,40 @@ impl ChatListUpdateTrigger {
         }) {
             return Self::LastMessageDeleted;
         }
-        if changes.iter().any(|change| {
-            matches!(
-                change,
-                TimelineMessageChange::Upsert {
-                    trigger: TimelineUpdateTrigger::NewMessage
-                        | TimelineUpdateTrigger::AgentStreamStarted
-                        | TimelineUpdateTrigger::AgentStreamFinished,
-                    ..
-                }
-            )
-        }) {
+        if changes.iter().any(change_advances_chat_list) {
             return Self::NewLastMessage;
         }
         Self::SnapshotRefresh
+    }
+}
+
+fn change_advances_chat_list(change: &TimelineMessageChange) -> bool {
+    match change {
+        TimelineMessageChange::Upsert {
+            trigger:
+                TimelineUpdateTrigger::NewMessage
+                | TimelineUpdateTrigger::AgentStreamStarted
+                | TimelineUpdateTrigger::AgentStreamFinished,
+            ..
+        } => true,
+        TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::GroupSystem,
+            message,
+        } => message.tags.iter().any(|tag| {
+            tag.first()
+                .is_some_and(|name| name == GROUP_SYSTEM_TYPE_TAG)
+                && tag.get(1).is_some_and(|system_type| {
+                    matches!(
+                        system_type.as_str(),
+                        GROUP_SYSTEM_TYPE_MEMBER_ADDED
+                            | GROUP_SYSTEM_TYPE_MEMBER_REMOVED
+                            | GROUP_SYSTEM_TYPE_MEMBER_LEFT
+                            | GROUP_SYSTEM_TYPE_ADMIN_ADDED
+                            | GROUP_SYSTEM_TYPE_ADMIN_REMOVED
+                    )
+                })
+        }),
+        _ => false,
     }
 }
 
