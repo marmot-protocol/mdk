@@ -58,6 +58,8 @@ install_verified "$base_url/install-opencode-marmot.sh" \
 For repeatable noninteractive setup, pass the allowed inviter and prompt sender
 as either an `npub` or raw hex public key:
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
 install_verified "$base_url/install-opencode-marmot.sh" \

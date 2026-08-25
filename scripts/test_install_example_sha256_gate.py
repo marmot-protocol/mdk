@@ -57,6 +57,23 @@ install_verified "$base_url/install.sh"
         errors = gate.documented_surface_errors(text, {"install.sh": 1})
         self.assertIn("expected at least 1 companion checksums for install.sh", errors)
 
+    def test_codex_readme_is_a_documented_install_surface(self) -> None:
+        installers = gate.DOCUMENTED_INSTALL_CALLS["integrations/codex/marmot/README.md"]
+        self.assertEqual(installers, {"install-codex-marmot.sh": 1})
+        readme = (Path(__file__).resolve().parents[1] / "integrations/codex/marmot/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(gate.documented_surface_errors(readme, installers), [])
+        mutated = readme.replace(
+            '"$base_url/install-codex-marmot.sh.sha256"',
+            '"$base_url/install-codex-marmot.sh.sig"',
+            1,
+        )
+        self.assertIn(
+            "expected at least 1 companion checksums for install-codex-marmot.sh",
+            gate.documented_surface_errors(mutated, installers),
+        )
+
     def test_repository_scan_rejects_new_unverified_example(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

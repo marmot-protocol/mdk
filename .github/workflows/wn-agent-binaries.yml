@@ -684,7 +684,7 @@ jobs:
           fi
 
           cat > "$latest_notes" <<EOF
-          Latest WN Agent installers. These scripts install WN Agent \`$version\` from immutable release \`$tag\`.
+          Latest WN Agent installers. These scripts install whichever version the mutable \`$latest_tag\` alias currently references; use immutable release \`$tag\` for WN Agent \`$version\`.
 
           \`\`\`sh
           set -eu

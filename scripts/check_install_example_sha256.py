@@ -32,6 +32,7 @@ DOCUMENTED_INSTALL_CALLS = {
     # connector guide intentionally links there rather than duplicating them.
     "integrations/hermes/marmot/README.md": {"install-hermes-marmot.sh": 4},
     "integrations/openclaw/marmot/README.md": {"install-openclaw-marmot.sh": 3},
+    "integrations/codex/marmot/README.md": {"install-codex-marmot.sh": 1},
     "integrations/opencode/marmot/README.md": {"install-opencode-marmot.sh": 2},
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
 }

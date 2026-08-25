@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
 class PolicyError(ValueError):
     """The workflow no longer satisfies the cargo-audit policy."""
+
+
+APPROVED_ADVISORY_IGNORES = ["RUSTSEC-2024-0384"]
 
 
 def _job_block(workflow: str, job_name: str) -> str:
@@ -32,12 +36,22 @@ def validate(workflow_path: Path, audit_config_path: Path) -> None:
     if not audit_config_path.is_file():
         raise PolicyError(f"missing repository audit.toml: {audit_config_path}")
 
-    audit_config = audit_config_path.read_text(encoding="utf-8")
-    if not re.search(r"(?m)^\[advisories\]\s*$", audit_config):
-        raise PolicyError("audit.toml must contain an [advisories] policy section")
+    try:
+        audit_config = tomllib.loads(audit_config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise PolicyError(f"invalid repository audit.toml: {error}") from error
+    advisory_ignores = audit_config.get("advisories", {}).get("ignore")
+    if advisory_ignores != APPROVED_ADVISORY_IGNORES:
+        raise PolicyError(
+            "audit.toml advisory ignore list must exactly match the approved policy: "
+            f"{APPROVED_ADVISORY_IGNORES}"
+        )
 
     workflow = workflow_path.read_text(encoding="utf-8")
     job = _job_block(workflow, "rust-audit")
+
+    if re.search(r"(?m)^    if:", job):
+        raise PolicyError("rust-audit job must not use a job-level if condition")
 
     if "uses: actions/checkout@" not in job:
         raise PolicyError("rust-audit job must check out the repository")

@@ -88,6 +88,8 @@ the Hermes installer.
 For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
 an `npub` or raw hex public key:
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
 install_verified "$base_url/install-openclaw-marmot.sh" \
@@ -99,6 +101,8 @@ Generated-identity onboarding is the default (and can be selected explicitly
 with `--generate-identity`). To preserve an existing Nostr identity, place its
 `nsec` or raw secret hex in a regular file owned by the current user with mode
 `0600`, then use a pinned release URL:
+
+Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"

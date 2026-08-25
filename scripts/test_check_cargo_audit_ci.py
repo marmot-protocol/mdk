@@ -28,6 +28,17 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(PolicyError, message):
                 validate(mutated, AUDIT_CONFIG)
 
+    def assert_audit_config_mutation_rejected(
+        self, old: str, new: str, message: str
+    ) -> None:
+        audit_config = AUDIT_CONFIG.read_text(encoding="utf-8")
+        self.assertIn(old, audit_config)
+        with tempfile.TemporaryDirectory() as directory:
+            mutated = Path(directory) / "audit.toml"
+            mutated.write_text(audit_config.replace(old, new, 1), encoding="utf-8")
+            with self.assertRaisesRegex(PolicyError, message):
+                validate(WORKFLOW, mutated)
+
     def test_rejects_missing_rust_toolchain_setup(self) -> None:
         self.assert_mutation_rejected(
             '          rustup toolchain install "$toolchain" --profile minimal\n',
@@ -63,6 +74,13 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             "continue-on-error",
         )
 
+    def test_rejects_job_level_condition(self) -> None:
+        self.assert_mutation_rejected(
+            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n\n    steps:",
+            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    if: ${{ false }}\n\n    steps:",
+            "job-level if condition",
+        )
+
     def test_rejects_non_root_working_directory(self) -> None:
         self.assert_mutation_rejected(
             "      - name: Audit Rust dependencies\n",
@@ -75,6 +93,22 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             missing = Path(directory) / "audit.toml"
             with self.assertRaisesRegex(PolicyError, "audit.toml"):
                 validate(WORKFLOW, missing)
+
+    def test_rejects_changed_missing_or_invalid_advisory_policy(self) -> None:
+        approved = 'ignore = ["RUSTSEC-2024-0384"]'
+        mutations = (
+            'ignore = ["RUSTSEC-2024-0384", "RUSTSEC-2099-0001"]',
+            'ignore = ["RUSTSEC-2099-0001"]',
+            'ignore = []',
+            'ignore = [',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assert_audit_config_mutation_rejected(
+                    approved,
+                    mutation,
+                    "audit.toml|exactly match the approved policy",
+                )
 
 
 if __name__ == "__main__":

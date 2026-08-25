@@ -49,6 +49,8 @@ install_verified "$base_url/install-pi-marmot.sh" \
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
 install_verified "$base_url/install-pi-marmot.sh" \
