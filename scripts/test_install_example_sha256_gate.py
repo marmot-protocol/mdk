@@ -97,32 +97,42 @@ install_verified "$base_url/install.sh"
         readme = (Path(__file__).resolve().parents[1] / "integrations/hermes/marmot/README.md").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(gate.same_shell_notice_errors(readme, 3), [])
-        mutated = readme.replace(gate.SAME_SHELL_NOTICE, "", 1)
-        self.assertIn(
-            "expected exactly 3 same-shell notices, found 2",
-            gate.same_shell_notice_errors(mutated, 3),
+        self.assertEqual(gate.same_shell_notice_errors(readme), [])
+        mutated = readme.replace(
+            "Run this example in the same shell where `install_verified` above was defined.",
+            "Prerequisite omitted.",
+            1,
         )
+        self.assertTrue(gate.same_shell_notice_errors(mutated))
 
     def test_quickstart_same_shell_notice_regression_is_rejected(self) -> None:
         quickstart = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(gate.same_shell_notice_errors(quickstart, 7), [])
-        mutated = quickstart.replace(gate.SAME_SHELL_NOTICE, "", 1)
-        self.assertIn(
-            "expected exactly 7 same-shell notices, found 6",
-            gate.same_shell_notice_errors(mutated, 7),
+        self.assertEqual(gate.same_shell_notice_errors(quickstart), [])
+        mutated = quickstart.replace(
+            "Run this example in the same shell where `install_verified` above was defined.",
+            "Prerequisite omitted.",
+            1,
         )
+        self.assertTrue(gate.same_shell_notice_errors(mutated))
 
     def test_generated_note_claim_mutations_are_rejected(self) -> None:
         workflow = (
             Path(__file__).resolve().parents[1] / ".github/workflows/wn-agent-binaries.yml"
         ).read_text(encoding="utf-8")
         self.assertEqual(gate.workflow_release_note_claim_errors(workflow), [])
-        for claim in gate.LATEST_ALIAS_CLAIMS:
-            with self.subTest(claim=claim):
-                mutated = workflow.replace(claim, "regressed wording", 1)
+        mutations = (
+            workflow.replace("mutable \\`wn-agent-latest\\`", "rolling \\`wn-agent-latest\\`", 1),
+            workflow.replace("mutable \\`$latest_tag\\`", "rolling \\`$latest_tag\\`", 1),
+            workflow.replace(
+                'base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest"',
+                'base_url="https://github.com/$GITHUB_REPOSITORY/releases/latest"',
+                1,
+            ),
+        )
+        for index, mutated in enumerate(mutations):
+            with self.subTest(index=index):
                 self.assertTrue(gate.workflow_release_note_claim_errors(mutated))
 
     def test_repository_scan_rejects_new_unverified_example(self) -> None:

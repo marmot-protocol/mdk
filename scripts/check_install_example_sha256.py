@@ -43,17 +43,12 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/opencode/marmot/README.md": {"install-opencode-marmot.sh": 2},
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
 }
-SAME_SHELL_NOTICE_COUNTS = {
-    "integrations/README.md": 7,
-    "integrations/hermes/marmot/README.md": 3,
-    "integrations/openclaw/marmot/README.md": 2,
-    "integrations/opencode/marmot/README.md": 1,
-    "integrations/pi/marmot/README.md": 1,
-}
-SAME_SHELL_NOTICE = "Run this example in the same shell where `install_verified` above was defined."
-LATEST_ALIAS_CLAIMS = (
-    "Install whichever version the mutable \\`wn-agent-latest\\` alias currently references with:",
-    "Latest WN Agent installers. These scripts install whichever version the mutable \\`$latest_tag\\` alias currently references; use immutable release \\`$tag\\` for WN Agent \\`$version\\`.",
+SAME_SHELL_SURFACES = (
+    "integrations/README.md",
+    "integrations/hermes/marmot/README.md",
+    "integrations/openclaw/marmot/README.md",
+    "integrations/opencode/marmot/README.md",
+    "integrations/pi/marmot/README.md",
 )
 
 
@@ -126,19 +121,46 @@ def documented_surface_errors(
     return errors
 
 
-def same_shell_notice_errors(text: str, expected: int) -> list[str]:
-    count = text.count(SAME_SHELL_NOTICE)
-    if count == expected:
-        return []
-    return [f"expected exactly {expected} same-shell notices, found {count}"]
+def same_shell_notice_errors(text: str) -> list[str]:
+    errors: list[str] = []
+    for index, match in enumerate(re.finditer(r"```sh\n(.*?)\n```", text, re.DOTALL), start=1):
+        block = match.group(1)
+        if "install_verified " not in block or "install_verified() (" in block:
+            continue
+        prelude = text[max(0, match.start() - 240):match.start()].lower()
+        if "same shell" not in prelude or "install_verified" not in prelude:
+            errors.append(f"dependent install fence {index} must state its same-shell prerequisite")
+    return errors
+
+
+def _heredoc(text: str, variable: str) -> str:
+    match = re.search(
+        rf'cat > "\${re.escape(variable)}" <<EOF\n(?P<body>.*?)\n\s*EOF',
+        text,
+        re.DOTALL,
+    )
+    return match.group("body") if match else ""
 
 
 def workflow_release_note_claim_errors(text: str) -> list[str]:
-    return [
-        "generated notes must distinguish the mutable latest alias from immutable release tags"
-        for claim in LATEST_ALIAS_CLAIMS
-        if text.count(claim) != 1
-    ]
+    versioned = _heredoc(text, "notes")
+    rolling = _heredoc(text, "latest_notes")
+    errors: list[str] = []
+    if not (
+        "releases/download/wn-agent-latest" in versioned
+        and re.search(r"\bmutable\b", versioned, re.IGNORECASE)
+        and "releases/download/$tag" in versioned
+        and "exact" in versioned.lower()
+    ):
+        errors.append("versioned notes must distinguish the mutable latest alias from the exact release tag")
+    if not (
+        "releases/download/$latest_tag" in rolling
+        and re.search(r"\bmutable\b", rolling, re.IGNORECASE)
+        and "$tag" in rolling
+        and re.search(r"\bimmutable\b", rolling, re.IGNORECASE)
+    ):
+        errors.append("rolling notes must distinguish the mutable latest alias from the immutable release tag")
+    return errors
 
 
 def scan_paths(root: Path, paths: Iterable[Path]) -> list[str]:
@@ -198,9 +220,9 @@ def repository_errors(root: Path) -> list[str]:
         for error in documented_surface_errors(text, installers):
             errors.append(f"{relative}: {error}")
 
-    for relative, expected in SAME_SHELL_NOTICE_COUNTS.items():
+    for relative in SAME_SHELL_SURFACES:
         text = (root / relative).read_text(encoding="utf-8")
-        for error in same_shell_notice_errors(text, expected):
+        for error in same_shell_notice_errors(text):
             errors.append(f"{relative}: {error}")
 
     for installer in INSTALLERS:
