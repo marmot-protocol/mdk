@@ -378,6 +378,27 @@ describe("maybeSendProfilePromptOnJoin", () => {
     expect(calls.sendFinalKeys[0]).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
     expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
   });
+
+  it("retries a legacy prompt claim with an equivalent canonical group id", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "prompt_pending",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    };
+
+    expect(
+      await maybeSendProfilePromptOnJoin({
+        store,
+        client: stubClient(calls),
+        accountIdHex: ACCOUNT,
+        groupIdHex: `0X${GROUP.toUpperCase()}`,
+        configuredName: "Changed Name",
+      }),
+    ).toBe(true);
+    expect(calls.sendFinal).toEqual([buildProfilePrompt("Marmot Bot")]);
+  });
 });
 
 describe("maybeHandleProfileOnboardingInbound", () => {
@@ -652,7 +673,11 @@ describe("maybeHandleProfileOnboardingInbound", () => {
   it("rejects invalid onboarding hex before sending", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
-    store.rec = { status: "prompted", group_id_hex: GROUP };
+    store.rec = {
+      status: "prompted",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    };
 
     await expect(
       maybeHandleProfileOnboardingInbound({
@@ -779,7 +804,9 @@ describe("ProfileNameOnboardingStore", () => {
     const store = new ProfileNameOnboardingStore(path);
     expect(await store.get(ACCOUNT)).toEqual({});
 
-    expect(await store.tryClaimPrompt(ACCOUNT, GROUP, "Marmot Bot")).toBe(true);
+    expect(
+      await store.tryClaimPrompt(ACCOUNT, `0X${GROUP.toUpperCase()}`, "Marmot Bot"),
+    ).toBe(true);
     // a racing second claim is rejected
     expect(await store.tryClaimPrompt(ACCOUNT, GROUP, "Other")).toBe(false);
     expect(await store.get(ACCOUNT)).toEqual({
@@ -788,9 +815,14 @@ describe("ProfileNameOnboardingStore", () => {
       suggested_name: "Marmot Bot",
     });
 
-    await store.markPrompted(ACCOUNT, GROUP, "Marmot Bot");
+    await store.markPrompted(ACCOUNT, `0x${GROUP.toUpperCase()}`, "Marmot Bot");
     expect(await store.get(ACCOUNT)).toMatchObject({ status: "prompted" });
-    await store.markPublishing(ACCOUNT, GROUP, MSG, "Ada");
+    await store.markPublishing(
+      ACCOUNT,
+      `0x${GROUP.toUpperCase()}`,
+      `0X${MSG.toUpperCase()}`,
+      "Ada",
+    );
     expect(await store.get(ACCOUNT)).toEqual({
       status: "publishing",
       group_id_hex: GROUP,

@@ -167,12 +167,16 @@ describe("createMarmotMessageAdapter", () => {
       enqueuedAt: 1,
       retryCount: 1,
       payloads: [{ text: "normal path" }],
+      // OpenClaw persists the actual adapter route separately from the
+      // pre-hook queue input. Reconciliation must reuse that effective anchor.
+      replyToId: HEX32("ee"),
       effectiveReplyToId: HEX32("dd"),
     });
 
     expect(order).toEqual(["dispatch", "connector", "connector"]);
     expect(reconciled.status).toBe("sent");
     expect(calls.sendFinal).toHaveLength(2);
+    expect(calls.sendFinal[1]?.replyToMessageIdHex).toBe(HEX32("dd"));
     expect(calls.sendFinal[1]?.idempotencyKey).toBe(calls.sendFinal[0]?.idempotencyKey);
   });
 

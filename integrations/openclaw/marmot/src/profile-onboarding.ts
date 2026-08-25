@@ -124,6 +124,14 @@ export interface OnboardingRecord {
   reply_to_message_id_hex?: string;
 }
 
+function sameOnboardingHex(
+  stored: string | undefined,
+  current: string,
+  field: string,
+): boolean {
+  return stored !== undefined && normalizeHex(stored, field) === normalizeHex(current, field);
+}
+
 /** State store interface (the runtime uses the file-backed impl; tests stub it). */
 export interface ProfileOnboardingStateStore {
   get(accountIdHex: string): Promise<Partial<OnboardingRecord>>;
@@ -214,7 +222,7 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
       }
       data.accounts[accountIdHex] = {
         status: "prompt_pending",
-        group_id_hex: groupIdHex,
+        group_id_hex: normalizeHex(groupIdHex, "groupIdHex"),
         ...(suggestedName ? { suggested_name: suggestedName } : {}),
       };
       await this.persist(data);
@@ -237,7 +245,7 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
   ): Promise<void> {
     return this.set(accountIdHex, {
       status: "prompted",
-      group_id_hex: groupIdHex,
+      group_id_hex: normalizeHex(groupIdHex, "groupIdHex"),
       ...(suggestedName ? { suggested_name: suggestedName } : {}),
     });
   }
@@ -250,8 +258,8 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
   ): Promise<void> {
     return this.set(accountIdHex, {
       status: "publishing",
-      group_id_hex: groupIdHex,
-      reply_to_message_id_hex: replyToMessageIdHex,
+      group_id_hex: normalizeHex(groupIdHex, "groupIdHex"),
+      reply_to_message_id_hex: normalizeHex(replyToMessageIdHex, "replyToMessageIdHex"),
       name,
     });
   }
@@ -458,7 +466,7 @@ async function sendProfilePrompt(deps: {
 
   let suggested: string | undefined;
   if (current.status === "prompt_pending") {
-    if (current.group_id_hex !== deps.groupIdHex) {
+    if (!sameOnboardingHex(current.group_id_hex, deps.groupIdHex, "groupIdHex")) {
       return false;
     }
     suggested = validProfileName(current.suggested_name);
@@ -628,7 +636,7 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
       logger?.warn?.("marmot: invalid pending profile publication state");
       return false;
     }
-    if (groupIdHex !== message.groupIdHex) {
+    if (!sameOnboardingHex(groupIdHex, message.groupIdHex, "groupIdHex")) {
       return false;
     }
     const lookupStatus = await (deps.lookupGate ?? profileLookupGateFor(store)).lookup(
@@ -667,7 +675,7 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
   }
 
   if (record.status === "prompted") {
-    if (record.group_id_hex !== message.groupIdHex) {
+    if (!sameOnboardingHex(record.group_id_hex, message.groupIdHex, "groupIdHex")) {
       return false; // the prompt is awaiting a reply in a different conversation
     }
     const parsed = parseProfileNameReply(message.text);
