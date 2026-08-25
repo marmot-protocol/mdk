@@ -8,6 +8,7 @@ import {
   type ChannelMessageSendMediaContext,
   type ChannelMessageSendTextContext,
 } from "openclaw/plugin-sdk/channel-outbound";
+import { getMediaDir } from "openclaw/plugin-sdk/media-runtime";
 
 import type {
   AgentControlMediaUpload,
@@ -189,6 +190,7 @@ describe("createMarmotMessageAdapter", () => {
       to: HEX32("cc"),
     } as unknown as ChannelMessageSendTextContext);
 
+    expect(calls.sendFinal[0]?.idempotencyKey).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
     expect(calls.sendFinal[1]?.idempotencyKey).toBe(calls.sendFinal[0]?.idempotencyKey);
   });
 
@@ -350,6 +352,10 @@ describe("createMarmotMessageAdapter", () => {
     const calls = emptyClientCalls();
     const writes: { fileName: string; bytes: Buffer }[] = [];
     const mediaReadFile = vi.fn(async () => Buffer.from("host-authorized-bytes"));
+    const managedMediaPath = join(
+      getMediaDir(),
+      "photo---12345678-1234-1234-1234-123456789abc.png",
+    );
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
       writeTempMedia: async (fileName, bytes) => {
@@ -361,7 +367,7 @@ describe("createMarmotMessageAdapter", () => {
       cfg: {},
       to: HEX32("cc"),
       text: "generated image",
-      mediaUrl: "/workspace/generated/photo.png",
+      mediaUrl: managedMediaPath,
       // The running host has already authorized the source through
       // mediaReadFile. Its roots may differ from this pinned SDK's roots.
       mediaAccess: {
@@ -372,7 +378,7 @@ describe("createMarmotMessageAdapter", () => {
 
     await adapter.send!.media!(ctx);
 
-    expect(mediaReadFile).toHaveBeenCalledWith("/workspace/generated/photo.png");
+    expect(mediaReadFile).toHaveBeenCalledWith(managedMediaPath);
     expect(writes).toEqual([
       { fileName: "photo.png", bytes: Buffer.from("host-authorized-bytes") },
     ]);

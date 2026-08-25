@@ -529,9 +529,10 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(store.rec.status).toBe("prompted");
   });
 
-  it("reuses the response key for an identical inbound replay and changes it for a new message", async () => {
+  it("reuses the name-empty response key for an identical inbound replay and changes it for a new message", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
+    // No suggested name intentionally exercises the PROFILE_NAME_EMPTY response path.
     store.rec = { status: "prompted", group_id_hex: GROUP };
     const client = stubClient(calls);
 
