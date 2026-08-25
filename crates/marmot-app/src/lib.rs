@@ -5203,8 +5203,13 @@ impl MarmotApp {
         storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
         let chat_list_row = self.refresh_chat_list_row(label, &storage_update.group_id_hex)?;
-        let chat_list_trigger =
-            ChatListUpdateTrigger::from_timeline_changes(&storage_update.changes);
+        let projects_group_system_activity = chat_list_row
+            .as_ref()
+            .is_some_and(|row| row.conversation_kind == ChatConversationKind::Group);
+        let chat_list_trigger = ChatListUpdateTrigger::from_timeline_changes(
+            &storage_update.changes,
+            projects_group_system_activity,
+        );
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,

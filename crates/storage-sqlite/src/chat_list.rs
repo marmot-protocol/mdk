@@ -400,6 +400,7 @@ struct TimelineReadMarker {
     source_message_id_hex: Option<String>,
     source_epoch: Option<u64>,
     invalidation_status: Option<String>,
+    kind: u64,
     timeline_at: u64,
 }
 
@@ -409,7 +410,7 @@ impl TimelineReadMarker {
             self.source_message_id_hex.as_deref(),
             self.source_epoch,
             self.invalidation_status.as_deref(),
-            MARMOT_APP_EVENT_KIND_CHAT,
+            self.kind,
             self.timeline_at,
             &self.message_id_hex,
         )
@@ -1774,7 +1775,7 @@ fn timeline_message_for_read_marker_tx(
     tx.query_row(
         &format!(
             "SELECT message_id_hex, source_message_id_hex, source_epoch,
-                invalidation_status, timeline_at
+                invalidation_status, kind, timeline_at
          FROM message_timeline
          WHERE group_id_hex = ?1
            AND message_id_hex = ?2
@@ -1789,7 +1790,8 @@ fn timeline_message_for_read_marker_tx(
                     .get::<_, Option<i64>>(2)?
                     .and_then(|value| value.try_into().ok()),
                 invalidation_status: row.get(3)?,
-                timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+                kind: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+                timeline_at: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
             })
         },
     )

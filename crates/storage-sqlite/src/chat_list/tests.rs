@@ -1851,6 +1851,45 @@ fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
 }
 
 #[test]
+fn group_system_read_marker_preserves_same_epoch_canonical_phase() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let mut marker = group_system(
+        "system-marker",
+        REMOTE,
+        200,
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+        "role changed",
+    );
+    marker.source_epoch = Some(7);
+    store.record_app_event(&marker).unwrap();
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "system-marker", &no_mentions)
+        .unwrap();
+
+    let mut later_chat = chat("same-epoch-chat", REMOTE, 100, "later canonical phase");
+    later_chat.source_epoch = Some(7);
+    store.record_app_event(&later_chat).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        row.last_read_message_id_hex.as_deref(),
+        Some("system-marker")
+    );
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(
+        row.first_unread_message_id_hex.as_deref(),
+        Some("same-epoch-chat")
+    );
+}
+
+#[test]
 fn read_marker_follows_pending_send_into_authenticated_history() {
     let store = setup_store();
     let mut pending = chat("pending", LOCAL, 500, "optimistic send");
