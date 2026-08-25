@@ -118,7 +118,7 @@ Hermes accepts after gateway restart via $HERMES_HOME/.env.
 
 Verified download (then choose one invocation below):
   set -eu
-  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14
+  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.15
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
   installer_script=install-hermes-marmot.sh

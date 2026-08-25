@@ -52,7 +52,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.15"
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
