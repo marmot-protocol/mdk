@@ -27,6 +27,7 @@ import sys
 
 version = sys.argv[1]
 quickstart = Path("integrations/README.md").read_text(encoding="utf-8")
+release_guide = Path("release.md").read_text(encoding="utf-8")
 base_url = (
     "https://github.com/marmot-protocol/mdk/releases/download/"
     f"wn-agent-v{version}"
@@ -34,6 +35,13 @@ base_url = (
 if quickstart.count(f'base_url="{base_url}"') != 1:
     print(
         "error: integrations/README.md must define exactly one immutable current-release base_url "
+        f"({base_url})",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if release_guide.count(f'base_url="{base_url}"') != 1:
+    print(
+        "error: release.md must define exactly one immutable current-release base_url "
         f"({base_url})",
         file=sys.stderr,
     )
