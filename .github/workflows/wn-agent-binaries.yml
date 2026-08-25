@@ -478,7 +478,7 @@ jobs:
           cat > "$notes" <<EOF
           WN Agent \`$version\` from MDK commit \`$GITHUB_SHA\`.
 
-          Install the latest WN Agent release with:
+          Install whichever version the mutable \`wn-agent-latest\` alias currently references with:
 
           \`\`\`sh
           set -eu

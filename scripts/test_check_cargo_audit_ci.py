@@ -28,6 +28,13 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(PolicyError, message):
                 validate(mutated, AUDIT_CONFIG)
 
+    def assert_workflow_rejected(self, workflow: str, message: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mutated = Path(directory) / "ci.yml"
+            mutated.write_text(workflow, encoding="utf-8")
+            with self.assertRaisesRegex(PolicyError, message):
+                validate(mutated, AUDIT_CONFIG)
+
     def assert_audit_config_mutation_rejected(
         self, old: str, new: str, message: str
     ) -> None:
@@ -78,8 +85,40 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
         self.assert_mutation_rejected(
             "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n\n    steps:",
             "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    if: ${{ false }}\n\n    steps:",
-            "job-level if condition",
+            "must not have an if condition",
         )
+
+    def test_rejects_step_level_condition(self) -> None:
+        self.assert_mutation_rejected(
+            "      - name: Audit Rust dependencies\n",
+            "      - name: Audit Rust dependencies\n        if: ${{ false }}\n",
+            "must not have an if condition",
+        )
+
+    def test_rejects_quoted_condition_key(self) -> None:
+        self.assert_mutation_rejected(
+            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n",
+            '  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    "if": ${{ false }}\n',
+            "must not have an if condition",
+        )
+
+    def test_commented_next_job_boundary_does_not_supply_audit_command(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "  terminal-harness-installers:\n",
+            "  terminal-harness-installers: # annotated boundary\n",
+            1,
+        ).replace("run: cargo --locked audit", "run: echo audit-disabled", 1)
+        marker = "      - name: Test Codex, Pi, and OpenCode installers\n"
+        self.assertIn(marker, workflow)
+        workflow = workflow.replace(
+            marker,
+            "      - name: Synthetic unrelated audit command\n"
+            "        run: cargo --locked audit\n\n"
+            + marker,
+            1,
+        )
+        self.assert_workflow_rejected(workflow, "exactly 'cargo --locked audit'")
 
     def test_rejects_non_root_working_directory(self) -> None:
         self.assert_mutation_rejected(
@@ -101,6 +140,7 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             'ignore = ["RUSTSEC-2099-0001"]',
             'ignore = []',
             'ignore = [',
+            'ignore = ["RUSTSEC-2024-0384"]\nseverity_threshold = "critical"',
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):

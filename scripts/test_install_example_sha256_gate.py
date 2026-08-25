@@ -93,6 +93,17 @@ install_verified "$base_url/install.sh"
             gate.documented_surface_errors(mutated, installers),
         )
 
+    def test_same_shell_notice_regression_is_rejected(self) -> None:
+        readme = (Path(__file__).resolve().parents[1] / "integrations/hermes/marmot/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(gate.same_shell_notice_errors(readme, 3), [])
+        mutated = readme.replace(gate.SAME_SHELL_NOTICE, "", 1)
+        self.assertIn(
+            "expected exactly 3 same-shell notices, found 2",
+            gate.same_shell_notice_errors(mutated, 3),
+        )
+
     def test_repository_scan_rejects_new_unverified_example(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -28,6 +28,13 @@ LEGACY_PIPELINE_BASELINE = {
     "scripts/hermes_marmot_dev_setup.sh": 1,
 }
 DOCUMENTED_INSTALL_CALLS = {
+    "integrations/README.md": {
+        "install-hermes-marmot.sh": 2,
+        "install-openclaw-marmot.sh": 1,
+        "install-codex-marmot.sh": 2,
+        "install-opencode-marmot.sh": 1,
+        "install-pi-marmot.sh": 1,
+    },
     # The repository-level quickstart owns release commands. The crate-level
     # connector guide intentionally links there rather than duplicating them.
     "integrations/hermes/marmot/README.md": {"install-hermes-marmot.sh": 4},
@@ -36,6 +43,13 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/opencode/marmot/README.md": {"install-opencode-marmot.sh": 2},
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
 }
+SAME_SHELL_NOTICE_COUNTS = {
+    "integrations/hermes/marmot/README.md": 3,
+    "integrations/openclaw/marmot/README.md": 2,
+    "integrations/opencode/marmot/README.md": 1,
+    "integrations/pi/marmot/README.md": 1,
+}
+SAME_SHELL_NOTICE = "Run this example in the same shell where `install_verified` above was defined."
 
 
 def find_download_to_shell_pipelines(text: str) -> list[str]:
@@ -107,6 +121,13 @@ def documented_surface_errors(
     return errors
 
 
+def same_shell_notice_errors(text: str, expected: int) -> list[str]:
+    count = text.count(SAME_SHELL_NOTICE)
+    if count == expected:
+        return []
+    return [f"expected exactly {expected} same-shell notices, found {count}"]
+
+
 def scan_paths(root: Path, paths: Iterable[Path]) -> list[str]:
     errors: list[str] = []
     for relative in paths:
@@ -164,6 +185,11 @@ def repository_errors(root: Path) -> list[str]:
         for error in documented_surface_errors(text, installers):
             errors.append(f"{relative}: {error}")
 
+    for relative, expected in SAME_SHELL_NOTICE_COUNTS.items():
+        text = (root / relative).read_text(encoding="utf-8")
+        for error in same_shell_notice_errors(text, expected):
+            errors.append(f"{relative}: {error}")
+
     for installer in INSTALLERS:
         try:
             help_text = render_installer_help(root, installer)
@@ -181,6 +207,15 @@ def repository_errors(root: Path) -> list[str]:
     workflow_text = (root / ".github/workflows/wn-agent-binaries.yml").read_text(
         encoding="utf-8"
     )
+    latest_alias_claims = (
+        "Install whichever version the mutable \\`wn-agent-latest\\` alias currently references with:",
+        "Latest WN Agent installers. These scripts install whichever version the mutable \\`$latest_tag\\` alias currently references; use immutable release \\`$tag\\` for WN Agent \\`$version\\`.",
+    )
+    for claim in latest_alias_claims:
+        if workflow_text.count(claim) != 1:
+            errors.append(
+                ".github/workflows/wn-agent-binaries.yml: generated notes must distinguish the mutable latest alias from immutable release tags"
+            )
     for installer in INSTALLERS:
         verified_call = re.compile(
             rf"install_verified[^\n]*{re.escape(installer)}[^\n]*"

@@ -14,19 +14,28 @@ class PolicyError(ValueError):
 
 
 APPROVED_ADVISORY_IGNORES = ["RUSTSEC-2024-0384"]
+APPROVED_AUDIT_CONFIG = {"advisories": {"ignore": APPROVED_ADVISORY_IGNORES}}
+
+
+def _mapping_key(line: str, indent: int) -> str | None:
+    pattern = rf"^ {{{indent}}}(?P<key>[A-Za-z0-9_-]+|'[^']+'|\"[^\"]+\")\s*:\s*(?:#.*)?$"
+    match = re.match(pattern, line)
+    if match is None:
+        return None
+    return match.group("key").strip("'\"")
 
 
 def _job_block(workflow: str, job_name: str) -> str:
-    marker = f"  {job_name}:"
     lines = workflow.splitlines()
-    try:
-        start = lines.index(marker)
-    except ValueError as error:
-        raise PolicyError(f"missing required {job_name} job") from error
-
+    start = next(
+        (index for index, line in enumerate(lines) if _mapping_key(line, 2) == job_name),
+        None,
+    )
+    if start is None:
+        raise PolicyError(f"missing required {job_name} job")
     end = len(lines)
     for index in range(start + 1, len(lines)):
-        if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[index]):
+        if _mapping_key(lines[index], 2) is not None:
             end = index
             break
     return "\n".join(lines[start:end])
@@ -40,18 +49,17 @@ def validate(workflow_path: Path, audit_config_path: Path) -> None:
         audit_config = tomllib.loads(audit_config_path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as error:
         raise PolicyError(f"invalid repository audit.toml: {error}") from error
-    advisory_ignores = audit_config.get("advisories", {}).get("ignore")
-    if advisory_ignores != APPROVED_ADVISORY_IGNORES:
+    if audit_config != APPROVED_AUDIT_CONFIG:
         raise PolicyError(
-            "audit.toml advisory ignore list must exactly match the approved policy: "
-            f"{APPROVED_ADVISORY_IGNORES}"
+            "audit.toml must exactly match the approved policy: "
+            f"{APPROVED_AUDIT_CONFIG}"
         )
 
     workflow = workflow_path.read_text(encoding="utf-8")
     job = _job_block(workflow, "rust-audit")
 
-    if re.search(r"(?m)^    if:", job):
-        raise PolicyError("rust-audit job must not use a job-level if condition")
+    if re.search(r"(?m)^\s+(?:if|'if'|\"if\")\s*:", job):
+        raise PolicyError("rust-audit job and steps must not have an if condition")
 
     if "uses: actions/checkout@" not in job:
         raise PolicyError("rust-audit job must check out the repository")
