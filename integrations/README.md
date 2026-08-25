@@ -57,6 +57,8 @@ base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9
 
 Hermes 0.19.0 or newer must already be installed and working.
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
@@ -65,6 +67,8 @@ install_verified "$base_url/install-hermes-marmot.sh" \
 ### OpenClaw
 
 OpenClaw 2026.7.1 or newer and Node 22.19 or newer must already be installed.
+
+Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
 install_verified "$base_url/install-openclaw-marmot.sh" \
@@ -75,6 +79,8 @@ install_verified "$base_url/install-openclaw-marmot.sh" \
 
 Codex must already be installed, authenticated, and runnable as `codex`.
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256"
@@ -84,6 +90,8 @@ install_verified "$base_url/install-codex-marmot.sh" \
 
 OpenCode 1.18.18 or newer must already be installed and runnable as `opencode`.
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 install_verified "$base_url/install-opencode-marmot.sh" \
   "$base_url/install-opencode-marmot.sh.sha256"
@@ -92,6 +100,8 @@ install_verified "$base_url/install-opencode-marmot.sh" \
 ### Pi
 
 Pi must already be installed, authenticated, and runnable as `pi`.
+
+Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
 install_verified "$base_url/install-pi-marmot.sh" \
@@ -128,6 +138,8 @@ Use the immutable release URL and provide the authorized White Noise account
 explicitly. Terminal harnesses and OpenClaw use the welcomer entry for both
 invitation and prompt authorization.
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
 OWNER_NPUB=npub1...
 install_verified "$base_url/install-codex-marmot.sh" \
@@ -137,6 +149,8 @@ install_verified "$base_url/install-codex-marmot.sh" \
 
 Replace `codex` in the URL with `openclaw`, `opencode`, or `pi`. Hermes keeps
 invite acceptance and message-sender authorization explicit:
+
+Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
 install_verified "$base_url/install-hermes-marmot.sh" \

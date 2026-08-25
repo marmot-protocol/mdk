@@ -44,12 +44,17 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
 }
 SAME_SHELL_NOTICE_COUNTS = {
+    "integrations/README.md": 7,
     "integrations/hermes/marmot/README.md": 3,
     "integrations/openclaw/marmot/README.md": 2,
     "integrations/opencode/marmot/README.md": 1,
     "integrations/pi/marmot/README.md": 1,
 }
 SAME_SHELL_NOTICE = "Run this example in the same shell where `install_verified` above was defined."
+LATEST_ALIAS_CLAIMS = (
+    "Install whichever version the mutable \\`wn-agent-latest\\` alias currently references with:",
+    "Latest WN Agent installers. These scripts install whichever version the mutable \\`$latest_tag\\` alias currently references; use immutable release \\`$tag\\` for WN Agent \\`$version\\`.",
+)
 
 
 def find_download_to_shell_pipelines(text: str) -> list[str]:
@@ -126,6 +131,14 @@ def same_shell_notice_errors(text: str, expected: int) -> list[str]:
     if count == expected:
         return []
     return [f"expected exactly {expected} same-shell notices, found {count}"]
+
+
+def workflow_release_note_claim_errors(text: str) -> list[str]:
+    return [
+        "generated notes must distinguish the mutable latest alias from immutable release tags"
+        for claim in LATEST_ALIAS_CLAIMS
+        if text.count(claim) != 1
+    ]
 
 
 def scan_paths(root: Path, paths: Iterable[Path]) -> list[str]:
@@ -207,15 +220,8 @@ def repository_errors(root: Path) -> list[str]:
     workflow_text = (root / ".github/workflows/wn-agent-binaries.yml").read_text(
         encoding="utf-8"
     )
-    latest_alias_claims = (
-        "Install whichever version the mutable \\`wn-agent-latest\\` alias currently references with:",
-        "Latest WN Agent installers. These scripts install whichever version the mutable \\`$latest_tag\\` alias currently references; use immutable release \\`$tag\\` for WN Agent \\`$version\\`.",
-    )
-    for claim in latest_alias_claims:
-        if workflow_text.count(claim) != 1:
-            errors.append(
-                ".github/workflows/wn-agent-binaries.yml: generated notes must distinguish the mutable latest alias from immutable release tags"
-            )
+    for error in workflow_release_note_claim_errors(workflow_text):
+        errors.append(f".github/workflows/wn-agent-binaries.yml: {error}")
     for installer in INSTALLERS:
         verified_call = re.compile(
             rf"install_verified[^\n]*{re.escape(installer)}[^\n]*"

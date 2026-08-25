@@ -104,6 +104,27 @@ install_verified "$base_url/install.sh"
             gate.same_shell_notice_errors(mutated, 3),
         )
 
+    def test_quickstart_same_shell_notice_regression_is_rejected(self) -> None:
+        quickstart = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(gate.same_shell_notice_errors(quickstart, 7), [])
+        mutated = quickstart.replace(gate.SAME_SHELL_NOTICE, "", 1)
+        self.assertIn(
+            "expected exactly 7 same-shell notices, found 6",
+            gate.same_shell_notice_errors(mutated, 7),
+        )
+
+    def test_generated_note_claim_mutations_are_rejected(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github/workflows/wn-agent-binaries.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(gate.workflow_release_note_claim_errors(workflow), [])
+        for claim in gate.LATEST_ALIAS_CLAIMS:
+            with self.subTest(claim=claim):
+                mutated = workflow.replace(claim, "regressed wording", 1)
+                self.assertTrue(gate.workflow_release_note_claim_errors(mutated))
+
     def test_repository_scan_rejects_new_unverified_example(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
