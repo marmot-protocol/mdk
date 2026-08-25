@@ -366,6 +366,13 @@ pub struct AppClient {
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
     pub(crate) epoch_stall: EpochStallDetector,
+    /// Earliest instant an automatic seam may retry a pending epoch-gap
+    /// backfill whose last attempt could not confirm its replay.
+    ///
+    /// Process-local on purpose: the intent it paces is durable, so a restart
+    /// costs at most one unpaced attempt, while persisting a monotonic deadline
+    /// would mean durable schema for a scheduling hint.
+    pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
     /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]

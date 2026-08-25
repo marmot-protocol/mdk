@@ -247,6 +247,23 @@ pub enum EpochBackfillActivationOutcome {
     Failed,
 }
 
+/// What ended the drain of an epoch-gap replay that completed.
+///
+/// Absent on rows written before this field existed; those predate the
+/// end-of-stored-events gate and were all quiescence drains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochBackfillCompletionKind {
+    /// Every subscription the replay issued was reported end-of-stored-events
+    /// by a relay: the account's stored history was served in full.
+    EndOfStoredEvents,
+    /// The end-of-stored-events gate never cleared within its attempt budget,
+    /// so this attempt fell back to draining until the relays went quiet. The
+    /// replay recovered whatever the relays sent, but nothing confirms that was
+    /// all of it — the weaker guarantee that shipped before the gate existed.
+    QuiescenceFallback,
+}
+
 /// Why a pending epoch-gap replay was not executed on this pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1026,10 +1043,15 @@ pub enum AuditEventKind {
     },
     /// The transport drain loop (`sync_sdk_relay`) reached a success or failure
     /// exit. Records how long the drain ran (`duration_ms`, true wall-clock),
-    /// how many deliveries it ingested
-    /// (`deliveries`), and the durable transport cursor immediately before and
-    /// after the drain (`cursor_before_secs` / `cursor_after_secs`; `None`
-    /// before any delivery has ever advanced the cursor).
+    /// how many deliveries it ingested (`deliveries`), how many receives it
+    /// dropped as an echo or an already-seen duplicate (`skipped`), and the
+    /// durable transport cursor immediately before and after the drain
+    /// (`cursor_before_secs` / `cursor_after_secs`; `None` before any delivery
+    /// has ever advanced the cursor).
+    ///
+    /// `deliveries` and `skipped` together are what separate a long drain that
+    /// was making progress from one a relay held open with traffic carrying no
+    /// new history — the two are indistinguishable from `duration_ms` alone.
     ///
     /// Units: the cursor is a Nostr second-granular timestamp, so those fields
     /// are `_secs`; `duration_ms` is a genuine millisecond wall-clock duration.
@@ -1039,6 +1061,15 @@ pub enum AuditEventKind {
     SyncDrain {
         duration_ms: u64,
         deliveries: u64,
+        /// Receives this drain dropped without ingesting: a relay echo of this
+        /// device's own publish, or an event already in the seen index. Split
+        /// out from `deliveries` because the two answer different questions —
+        /// a long drain with a high `deliveries` count was doing work, while
+        /// one with a high `skipped` count was being held open by traffic
+        /// carrying no new history. Optional only so rows written before this
+        /// field existed stay readable; absent means "not recorded", not zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor_before_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1086,7 +1117,21 @@ pub enum AuditEventKind {
         retry_ordinal: u64,
         duration_ms: u64,
         activation_outcome: EpochBackfillActivationOutcome,
+        /// What ended the drain. A `quiescence_fallback` completion is a
+        /// weaker claim than an `end_of_stored_events` one and must not be read
+        /// as proof the account's stored history was served in full.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_kind: Option<EpochBackfillCompletionKind>,
         deliveries: u64,
+        /// Receives this drain dropped without ingesting: a relay echo of this
+        /// device's own publish, or an event already in the seen index. Split
+        /// out from `deliveries` because the two answer different questions —
+        /// a long drain with a high `deliveries` count was doing work, while
+        /// one with a high `skipped` count was being held open by traffic
+        /// carrying no new history. Optional only so rows written before this
+        /// field existed stay readable; absent means "not recorded", not zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped: Option<u64>,
         local_epoch_before: u64,
         local_epoch_after: u64,
         group_advanced: bool,
@@ -1101,6 +1146,15 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_kind: Option<String>,
         deliveries: u64,
+        /// Receives this drain dropped without ingesting: a relay echo of this
+        /// device's own publish, or an event already in the seen index. Split
+        /// out from `deliveries` because the two answer different questions —
+        /// a long drain with a high `deliveries` count was doing work, while
+        /// one with a high `skipped` count was being held open by traffic
+        /// carrying no new history. Optional only so rows written before this
+        /// field existed stay readable; absent means "not recorded", not zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped: Option<u64>,
         local_epoch_before: u64,
         local_epoch_after: u64,
         group_advanced: bool,

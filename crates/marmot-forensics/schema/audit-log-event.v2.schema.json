@@ -715,6 +715,9 @@
     "epochBackfillActivationOutcome": {
       "enum": ["succeeded", "failed"]
     },
+    "epochBackfillCompletionKind": {
+      "enum": ["end_of_stored_events", "quiescence_fallback"]
+    },
     "epochBackfillDeferredReason": {
       "enum": ["group_epoch_unavailable"]
     },
@@ -1655,6 +1658,9 @@
             "deliveries": {
               "$ref": "#/$defs/u64"
             },
+            "skipped": {
+              "$ref": "#/$defs/u64"
+            },
             "cursor_before_secs": {
               "$ref": "#/$defs/u64"
             },
@@ -1727,7 +1733,13 @@
             "activation_outcome": {
               "$ref": "#/$defs/epochBackfillActivationOutcome"
             },
+            "completion_kind": {
+              "$ref": "#/$defs/epochBackfillCompletionKind"
+            },
             "deliveries": {
+              "$ref": "#/$defs/u64"
+            },
+            "skipped": {
               "$ref": "#/$defs/u64"
             },
             "local_epoch_before": {
@@ -1771,6 +1783,9 @@
               "type": "string"
             },
             "deliveries": {
+              "$ref": "#/$defs/u64"
+            },
+            "skipped": {
               "$ref": "#/$defs/u64"
             },
             "local_epoch_before": {

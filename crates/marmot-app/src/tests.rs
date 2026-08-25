@@ -414,6 +414,11 @@ impl ScriptedPushRelayClient {
         self.subscriptions.lock().unwrap().len()
     }
 
+    /// Every subscription this relay has accepted so far.
+    pub(crate) fn accepted_subscriptions(&self) -> Vec<NostrSubscription> {
+        self.subscriptions.lock().unwrap().clone()
+    }
+
     pub(crate) fn unfloored_account_subscription_count(&self) -> usize {
         self.subscriptions
             .lock()
@@ -727,6 +732,81 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     }
 }
 
+/// Cut both epoch-gap backfill timers to test scale for a test that drives its
+/// relay through [`scripted_eose_pump`]: a pump that stops reporting is then a
+/// fast failure rather than a 30 s stall per attempt.
+pub(crate) fn bounded_epoch_backfill_config() -> MarmotAppConfig {
+    MarmotAppConfig::default()
+        .with_dev_epoch_backfill_eose_wait_ms(2_000)
+        .with_dev_epoch_backfill_retry_backoff_ms(0)
+}
+
+/// Open a client on the app's *own* relay plane.
+///
+/// [`MarmotApp::client`] mints a fresh plane per client, so a test that drives
+/// stored events or end-of-stored-events into `app.relay_plane` would otherwise
+/// be talking to a different transport than the client reads.
+pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> crate::AppClient {
+    let relay_plane = app.relay_plane.clone();
+    app.client_with_relay_plane(label, &relay_plane, None)
+        .await
+        .expect("client on the app relay plane")
+}
+
+/// Stand-in for the relay pool's end-of-stored-events frames, which an injected
+/// relay client never produces.
+///
+/// The epoch-gap backfill drain ends on EOSE rather than on silence, so a test
+/// whose transport is a [`ScriptedPushRelayClient`] has to supply that signal
+/// itself. The pump reports EOSE for every subscription the relay has accepted
+/// and `accept` selects, on every endpoint it was issued to, and keeps doing so
+/// as later subscriptions are registered. Repeat reports are ignored by the
+/// adapter, so this is safe to run for the whole test.
+pub(crate) struct ScriptedEosePump(tokio::task::JoinHandle<()>);
+
+impl Drop for ScriptedEosePump {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub(crate) fn scripted_eose_pump(
+    plane: MarmotRelayPlane,
+    relay: Arc<ScriptedPushRelayClient>,
+    accept: fn(&NostrSubscription) -> bool,
+) -> ScriptedEosePump {
+    ScriptedEosePump(tokio::spawn(async move {
+        loop {
+            report_scripted_eose(&plane, &relay, accept).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }))
+}
+
+/// One pass of [`scripted_eose_pump`], for a test that needs the EOSE to land
+/// at a moment of its own choosing.
+async fn report_scripted_eose(
+    plane: &MarmotRelayPlane,
+    relay: &ScriptedPushRelayClient,
+    accept: fn(&NostrSubscription) -> bool,
+) {
+    for subscription in relay.accepted_subscriptions() {
+        if !accept(&subscription) {
+            continue;
+        }
+        for endpoint in subscription.endpoints() {
+            plane
+                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                .await;
+        }
+    }
+}
+
+/// Every subscription reaches end-of-stored-events.
+pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
+    true
+}
+
 const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
 
 fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> NostrTransportEvent {
@@ -768,8 +848,12 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let mut app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings {
             enabled: true,
             ..Default::default()
@@ -797,6 +881,7 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             .unwrap()
             .expect("local group projection");
 
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.start().await.unwrap();
         // This command is deferred behind startup catch-up, so its response is
@@ -985,8 +1070,12 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let mut app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings {
             enabled: true,
             ..Default::default()
@@ -997,8 +1086,9 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             relay.clone(),
             true,
         );
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
-        let mut client = app.client("alice").await.unwrap();
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("failed epoch backfill retry", &[])
             .await
@@ -1090,6 +1180,692 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
     });
 }
 
+/// Config every drain-completion test starts from: both epoch-gap backfill
+/// timers cut to test scale, so a give-up path costs milliseconds rather than
+/// the production 30 s drain budget and 15 s retry cooldown.
+fn backfill_drain_test_config() -> MarmotAppConfig {
+    MarmotAppConfig::default()
+        .with_dev_epoch_backfill_eose_wait_ms(300)
+        .with_dev_epoch_backfill_retry_backoff_ms(0)
+}
+
+/// A single-account app with one armed epoch-gap backfill intent on an injected
+/// relay client: the shape every drain-completion test below starts from.
+///
+/// Callers shorten the drain's silence budget and the unconfirmed-retry
+/// cooldown from their production values ([`crate::EPOCH_BACKFILL_EOSE_WAIT`],
+/// [`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]) so both give-up paths are testable
+/// in wall-clock a test can afford.
+async fn armed_epoch_backfill(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+) -> (MarmotApp, crate::AppClient, cgka_traits::GroupId) {
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let mut app =
+        MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
+            .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(crate::AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    app.relay_plane =
+        MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
+
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client
+        .create_group("epoch backfill drain completion", &[])
+        .await
+        .unwrap();
+    let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    client.apply_backfill_decision(
+        &group_id,
+        stalled_epoch,
+        BackfillDecision::Arm,
+        marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+    );
+    (app, client, group_id)
+}
+
+/// Every audit row this app has recorded so far.
+fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
+    app.audit_log_files()
+        .unwrap()
+        .into_iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn recorded_rows_of_kind<'rows>(
+    rows: &'rows [serde_json::Value],
+    kind: &str,
+) -> Vec<&'rows serde_json::Value> {
+    rows.iter()
+        .filter(|row| row["kind"]["type"] == kind)
+        .collect()
+}
+
+#[test]
+fn epoch_backfill_drain_collects_history_that_lands_after_the_first_sync_wait() {
+    run_composed_app_runtime_test("backfill-drain-late-history", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(10_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // Model the relay the 2026-08 field export caught: it answers the
+        // unfloored whole-account REQ only after the drain's first-event wait
+        // has already elapsed, then reports end-of-stored-events.
+        let stored_history = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            crate::unix_now_seconds(),
+            "late-stored-history",
+        );
+        let slow_relay = {
+            let app = app.clone();
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(SDK_FIRST_SYNC_WAIT + Duration::from_millis(400)).await;
+                inject_epoch_gap_probe(&app, stored_history).await;
+                report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+            })
+        };
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        slow_relay
+            .await
+            .expect("scripted relay task must not panic");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a replay the relays confirmed they served must complete"
+        );
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "a confirmed replay must consume its pending recovery"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1, "the replay must have one terminal row");
+        assert_eq!(
+            completed[0]["kind"]["deliveries"], 1,
+            "the drain must still be listening when the relay answers"
+        );
+    });
+}
+
+#[test]
+fn epoch_backfill_drain_ends_when_relays_report_end_of_stored_events() {
+    run_composed_app_runtime_test("backfill-drain-prompt-eose", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        // A production-sized silence budget: reaching it would take 30s, so
+        // completing promptly is what this asserts.
+        let (app, mut client, _group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(30_000),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+
+        let started = std::time::Instant::now();
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "prompt end-of-stored-events must complete the replay"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "end-of-stored-events must end the drain, not the silence budget"
+        );
+    });
+}
+
+/// One already-seen event redelivered every `interval` until the returned flag
+/// is set or `deadline` passes, modelling a relay that keeps a drain's socket
+/// warm with traffic carrying no new history.
+///
+/// The first injection is novel, so a caller expecting `n` skips must run the
+/// pump for `n + 1` injections.
+fn redelivery_pump(
+    app: &MarmotApp,
+    event: NostrTransportEvent,
+    interval: Duration,
+    deadline: Duration,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<u64>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let app = app.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let expires_at = std::time::Instant::now() + deadline;
+            let mut sent = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < expires_at
+            {
+                inject_epoch_gap_probe(&app, event.clone()).await;
+                sent += 1;
+                tokio::time::sleep(interval).await;
+            }
+            sent
+        })
+    };
+    (stop, handle)
+}
+
+/// The end-of-stored-events gate must be reachable from the delivery path.
+///
+/// A relay redelivering faster than [`SDK_DRAIN_WAIT`] never lets the receive
+/// timeout fire, and the timeout is where the drain consults its gate. Before
+/// the delivery-path poll, a drain in this shape ran until the redelivery
+/// stopped even though every subscription had reported end-of-stored-events
+/// from the first moment — the drain had already won and could not say so.
+#[test]
+fn epoch_backfill_drain_ends_on_end_of_stored_events_while_duplicates_stream() {
+    run_composed_app_runtime_test("backfill-drain-eose-under-duplicates", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(30_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // Every subscription is served from the start: the gate's Complete
+        // verdict is available for the whole drain.
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        // Redelivery at 100 ms, well inside SDK_DRAIN_WAIT, for far longer than
+        // the drain should need.
+        let (stop, pump) = redelivery_pump(
+            &app,
+            epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "eose-under-duplicates",
+            ),
+            Duration::from_millis(100),
+            Duration::from_secs(20),
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        let drained_in = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a served history must complete even while duplicates arrive"
+        );
+        assert!(
+            drained_in < Duration::from_secs(3),
+            "the delivery-path gate poll must end the drain promptly, not when \
+             the redelivery stops; took {drained_in:?}"
+        );
+    });
+}
+
+/// `skipped` counts the receives a drain dropped as echo or duplicate, and
+/// `deliveries` keeps its ingested-only meaning.
+///
+/// Without the split, a long drain that was doing work and one held open by
+/// traffic carrying no new history are indistinguishable in a field export.
+#[test]
+fn epoch_backfill_drain_records_skipped_receives_beside_ingested_deliveries() {
+    run_composed_app_runtime_test("backfill-drain-skipped-counter", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(400),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // No relay reports end-of-stored-events, so the silence budget is what
+        // ends this drain. Six injections of one event: the first is novel, the
+        // other five are already-seen skips.
+        let (stop, pump) = redelivery_pump(
+            &app,
+            epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "skipped-counter",
+            ),
+            Duration::from_millis(100),
+            Duration::from_millis(550),
+        );
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let injected = pump.await.expect("redelivery pump must not panic");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "no relay reported end-of-stored-events, so the replay is unconfirmed"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let drains = recorded_rows_of_kind(&rows, "sync_drain");
+        let backfill_drain = drains
+            .iter()
+            .find(|row| {
+                row["kind"]["skipped"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            })
+            .expect("the backfill drain must record its skipped receives");
+        assert_eq!(
+            backfill_drain["kind"]["deliveries"], 1,
+            "only the first injection carried new history"
+        );
+        assert_eq!(
+            backfill_drain["kind"]["skipped"].as_u64().unwrap(),
+            injected - 1,
+            "every later redelivery of the same event must count as skipped"
+        );
+
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the unconfirmed replay must have one terminal row"
+        );
+        assert_eq!(failed[0]["kind"]["deliveries"], 1);
+        assert_eq!(
+            failed[0]["kind"]["skipped"].as_u64().unwrap(),
+            injected - 1,
+            "the terminal row must carry the same split as the drain row"
+        );
+    });
+}
+
+/// Regression guard for the deliberate choice not to gate the silence reset on
+/// progress.
+///
+/// The 2026-08 field export's working replays trickled novel events further
+/// apart than any budget worth setting, with non-novel traffic in between. If
+/// a later change stops redeliveries from resetting `silence_started` — the
+/// obvious way to bound a duplicate storm that never reports
+/// end-of-stored-events — this drain collects its first event and gives up.
+#[test]
+fn epoch_backfill_drain_collects_novel_history_that_trickles_slower_than_its_budget() {
+    run_composed_app_runtime_test("backfill-drain-stuttering-history", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_eose_wait_ms(400),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        let nostr_group_id_hex = group.nostr_routing.nostr_group_id_hex.clone();
+
+        // Filler keeps the socket warm; it is bounded so the drain can still
+        // end once the novel history is exhausted.
+        let (stop, pump) = redelivery_pump(
+            &app,
+            epoch_gap_probe(
+                &nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "stuttering-filler",
+            ),
+            Duration::from_millis(100),
+            Duration::from_millis(3_300),
+        );
+        // Five novel events, 600 ms apart — every gap wider than the 400 ms
+        // silence budget.
+        let novel = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                for index in 0..5_u32 {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    inject_epoch_gap_probe(
+                        &app,
+                        epoch_gap_probe(
+                            &nostr_group_id_hex,
+                            crate::unix_now_seconds(),
+                            &format!("stuttering-novel-{index}"),
+                        ),
+                    )
+                    .await;
+                }
+            })
+        };
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("armed replay must run");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+        novel.abort();
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "no relay reported end-of-stored-events, so the replay is unconfirmed"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["deliveries"], 6,
+            "the drain must collect the filler's first event and all five novel \
+             ones, not stop at the first budget-wide gap"
+        );
+    });
+}
+
+#[test]
+fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
+    run_composed_app_runtime_test("backfill-drain-no-eose", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+
+        // A second group stalled at the same time but has not armed. Only
+        // `mark_replayed` suppresses its own arm, and only a replay that
+        // actually served this account's history has earned that.
+        let bystander = cgka_traits::GroupId::new(vec![7_u8; 32]);
+        for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD - 1 {
+            assert_eq!(
+                client.epoch_stall.observe_undecryptable(
+                    bystander.clone(),
+                    format!("bystander-{probe}"),
+                    cgka_traits::EpochId(stalled_epoch),
+                ),
+                BackfillDecision::Skip,
+            );
+        }
+
+        // No relay reports end-of-stored-events: the subscriptions registered
+        // but were never served.
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("an unconfirmed replay is not a transport error");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "silence alone must not be read as a served history replay"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "an unconfirmed replay must retain its pending recovery"
+        );
+        assert_eq!(
+            client.epoch_stall.observe_undecryptable(
+                bystander,
+                "bystander-threshold".to_owned(),
+                cgka_traits::EpochId(stalled_epoch),
+            ),
+            BackfillDecision::Arm,
+            "an unconfirmed replay must not disarm a group it never recovered"
+        );
+
+        // The retained intent runs again, under the next retry ordinal.
+        let retry = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("retained recovery must retry");
+        assert!(matches!(
+            retry,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        assert!(
+            recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed").is_empty(),
+            "no attempt served this account's history"
+        );
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 2, "both attempts must record a terminal row");
+        assert_eq!(
+            failed[0]["kind"]["activation_outcome"].as_str(),
+            Some("succeeded"),
+            "activation did succeed; the drain after it is what did not"
+        );
+        assert_eq!(
+            failed[0]["kind"]["error_kind"].as_str(),
+            Some("backfill_drain_no_relay_eose")
+        );
+        assert_eq!(failed[0]["kind"]["deliveries"], 0);
+        assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
+        assert_eq!(failed[1]["kind"]["retry_ordinal"], 1);
+    });
+}
+
+#[test]
+fn epoch_backfill_drain_needs_every_subscription_to_report() {
+    run_composed_app_runtime_test("backfill-drain-partial-eose", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, _group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        // Only the account inbox is served. The group subscriptions carrying the
+        // commits a stalled group is missing never report.
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), |subscription| {
+            matches!(subscription, NostrSubscription::AccountInbox { .. })
+        });
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("an unconfirmed replay is not a transport error");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "one served subscription is not a served account history"
+        );
+        assert!(client.has_pending_epoch_backfill());
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["error_kind"].as_str(),
+            Some("backfill_drain_eose_timeout")
+        );
+    });
+}
+
+#[test]
+fn unconfirmed_epoch_backfill_paces_its_automatic_retries() {
+    run_composed_app_runtime_test("backfill-retry-cooldown", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        // No EOSE pump: every attempt spends its silence budget and gives up.
+        // The cooldown is what must stop the receive seam from paying that on
+        // every inbound delivery.
+        let (app, mut client, _group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_epoch_backfill_retry_backoff_ms(1_500),
+        )
+        .await;
+
+        let first = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .await
+            .expect("an unconfirmed replay is not a transport error");
+        assert!(matches!(
+            first,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(
+                matches!(
+                    client
+                        .run_pending_epoch_backfill(
+                            marmot_forensics::EpochBackfillExecutionSeam::Receive
+                        )
+                        .await
+                        .expect("a paced seam is not a failure"),
+                    crate::EpochBackfillRunOutcome::Deferred
+                ),
+                "the receive seam must skip an intent inside its cooldown"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "skipped attempts must not spend the drain's silence budget"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "a paced attempt must leave the intent pending"
+        );
+
+        // Caller-directed repair is not a loop, so it is never paced.
+        assert!(
+            matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
+                    )
+                    .await
+                    .expect("explicit catch-up runs"),
+                crate::EpochBackfillRunOutcome::Incomplete(_)
+            ),
+            "caller-directed catch-up must bypass the cooldown"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        assert_eq!(
+            recorded_rows_of_kind(&rows, "epoch_stall_backfill_started").len(),
+            2,
+            "only the unpaced attempts may start a replay"
+        );
+    });
+}
+
+#[test]
+fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
+    run_composed_app_runtime_test("backfill-eose-fallback", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        // Stands in for the field shape this exit exists for: a group route
+        // whose only relay never answers, so the account-wide gate can never
+        // clear however long it waits.
+        for attempt in 0..crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+            let outcome = client
+                .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+                .await
+                .expect("an unconfirmed replay is not a transport error");
+            assert!(
+                matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+                "attempt {attempt} must still hold the honest gate"
+            );
+        }
+
+        // History the reachable relays do serve must still reach the account.
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                crate::unix_now_seconds(),
+                "fallback-history",
+            ),
+        )
+        .await;
+        let fallback = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .await
+            .expect("the fallback attempt runs");
+        assert!(
+            matches!(fallback, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a spent gate must not wedge recovery forever"
+        );
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "the fallback attempt consumes the intent"
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(
+            failed.len(),
+            crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT as usize,
+            "every gated attempt must record its own honest failure"
+        );
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("quiescence_fallback"),
+            "a fallback completion must never read as a served history replay"
+        );
+        assert_eq!(
+            completed[0]["kind"]["retry_ordinal"].as_u64(),
+            Some(crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT)
+        );
+        assert_eq!(
+            completed[0]["kind"]["deliveries"], 1,
+            "the fallback drain must still recover reachable history"
+        );
+    });
+}
+
 #[test]
 fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
     run_composed_app_runtime_test("in-flight-backfill-arm", || async {
@@ -1098,15 +1874,21 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings {
             enabled: true,
             ..Default::default()
         })
         .unwrap();
 
-        let mut client = app.client("alice").await.unwrap();
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client
             .create_group("in-flight backfill group a", &[])
             .await
@@ -1399,15 +2181,21 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings {
             enabled: true,
             ..Default::default()
         })
         .unwrap();
 
-        let mut client = app.client("alice").await.unwrap();
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client
             .create_group("queued older backfill group a", &[])
             .await
