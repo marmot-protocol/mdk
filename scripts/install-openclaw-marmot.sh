@@ -108,12 +108,44 @@ Environment:
   MARMOT_RELAYS            Relay CSV used by wn-agent and bootstrap
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
 
-Example:
-  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh | bash
+Verified download (then choose one invocation below):
+  set -eu
+  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+  installer_script=install-openclaw-marmot.sh
+  installer_url="$base_url/$installer_script"
+  checksum_url="$installer_url.sha256"
+  if ! curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"; then
+    echo "error: failed to download installer $installer_url to $tmpdir/$installer_script" >&2
+    exit 1
+  fi
+  if ! curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"; then
+    echo "error: failed to download checksum $checksum_url for $installer_url" >&2
+    exit 1
+  fi
+  if ! expected="$(awk 'NR == 1 && length($1) == 64 && $1 !~ /[^[:xdigit:]]/ { print tolower($1); found = 1 } END { if (!found) exit 1 }' "$tmpdir/$installer_script.sha256")"; then
+    echo "error: could not parse SHA-256 checksum from $tmpdir/$installer_script.sha256 ($checksum_url) for $installer_url" >&2
+    exit 1
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmpdir/$installer_script" | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmpdir/$installer_script" | awk '{print $1}')"
+  else
+    echo "error: need shasum or sha256sum to verify the installer" >&2
+    exit 1
+  fi
+  if [ "$expected" != "$actual" ]; then
+    echo "error: checksum mismatch for $tmpdir/$installer_script ($installer_url): expected $expected, actual $actual" >&2
+    exit 1
+  fi
 
-  curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
+  bash "$tmpdir/$installer_script"
 
-  curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes \
+  bash "$tmpdir/$installer_script" --yes --allow-welcomer npub1...
+
+  bash "$tmpdir/$installer_script" --yes \
     --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
     --expected-npub npub1... --allow-welcomer npub1...
 USAGE

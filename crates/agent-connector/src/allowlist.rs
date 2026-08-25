@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use std::fs::{File, OpenOptions};
 
+use agent_control::AgentControlInvitePolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::ALLOWLIST_DIR;
@@ -21,6 +22,8 @@ pub(crate) struct AllowlistStore {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct AllowlistRecord {
     pub(crate) account_id_hex: String,
+    #[serde(default)]
+    pub(crate) invite_policy: AgentControlInvitePolicy,
     pub(crate) welcomer_account_ids_hex: Vec<String>,
 }
 
@@ -76,6 +79,26 @@ impl AllowlistStore {
             .list(account_id_hex)?
             .iter()
             .any(|existing| existing == welcomer_account_id_hex))
+    }
+
+    pub(crate) fn policy(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<AgentControlInvitePolicy, ConnectorError> {
+        let _guard = crate::lock_recover(&self.lock);
+        Ok(self.read_record(account_id_hex)?.invite_policy)
+    }
+
+    pub(crate) fn set_policy(
+        &self,
+        account_id_hex: &str,
+        invite_policy: AgentControlInvitePolicy,
+    ) -> Result<AgentControlInvitePolicy, ConnectorError> {
+        let _guard = crate::lock_recover(&self.lock);
+        let mut record = self.read_record(account_id_hex)?;
+        record.invite_policy = invite_policy;
+        self.write_record(&record)?;
+        Ok(record.invite_policy)
     }
 
     pub(crate) fn read_record(
@@ -154,6 +177,7 @@ impl AllowlistStore {
     fn empty_record(account_id_hex: &str) -> AllowlistRecord {
         AllowlistRecord {
             account_id_hex: account_id_hex.to_owned(),
+            invite_policy: AgentControlInvitePolicy::default(),
             welcomer_account_ids_hex: Vec::new(),
         }
     }

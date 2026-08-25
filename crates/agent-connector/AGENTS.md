@@ -46,7 +46,7 @@ several files in the same crate); methods shared across those files are `pub(cra
   `ReconcileSource` label used on per-pass tracing events (mdk#1380).
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
-- `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account welcomer allowlist persistence.
+- `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.
 - `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the persisted
   `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
   versioned SHA-256 request fingerprints, `stream_finalize_v2:` keys for durable finalized sends,

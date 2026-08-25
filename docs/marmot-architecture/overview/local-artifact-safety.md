@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-08-08
+updated: 2026-08-23
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -65,9 +65,19 @@ drop anything.
 - **Closing is terminal, and nothing reopens.** `MarmotApp::close_storage` latches, and every database accessor
   refuses afterwards. A late background read that transparently reopened would re-lock the container the host was just
   told is clear — the exact failure the close exists to prevent. Hosts construct a fresh runtime on resume.
-- **Drain, then close.** `MarmotAppRuntime::shutdown_and_close` is the sequenced entry point: workers stop first, so
-  databases close under quiesced state. Closing under live work stays *safe* — SQLite rolls back any open transaction
-  as part of closing, so a write is all-or-nothing across the cut — but it is not the intended path.
+- **Terminal close precedes best-effort drain.** `MarmotAppRuntime::shutdown_and_close` closes runtime admission, every
+  database, and the root lease before it gives graceful directory, account, relay, audit, and account-open cleanup a
+  bounded budget. Those subsystems can await network or task progress and therefore cannot sit ahead of the lock-release
+  boundary on a host suspension deadline. The terminal operation is runtime-owned and continues if its caller is
+  cancelled.
+- **The cut is transaction-safe, but not operation-transparent.** A statement that already owns a connection guard is
+  allowed to finish; closing rolls an uncommitted SQLite transaction back, and later work receives
+  `StorageError::Closed`. A higher-level operation composed of multiple transactions or an external side effect can be
+  cut between its steps and must rely on durable intent/reconciliation. This is the deliberate suspension tradeoff: a
+  forced process kill is at least as abrupt and also leaves the container lock held until RunningBoard terminates it.
+- **Completion means completion.** The early close latch rejects new work, but `storage_is_closed` becomes true only
+  after all database closes have been attempted and the root lease has been released. Repeated and concurrent terminal
+  closes are safe.
 - **Bail out at engine-step boundaries, not inside them.** Shutdown checks belong between whole engine operations
   (`RuntimeLifecycle::is_stopping()` in the account worker's per-group loops), where no snapshot guard is live.
   Interrupting *inside* a step can leave a `SnapshotRollbackGuard`'s window half-applied, which is worse than the kill.

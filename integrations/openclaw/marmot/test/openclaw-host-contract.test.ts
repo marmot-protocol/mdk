@@ -1,4 +1,15 @@
+import { createServer, type Server, type Socket } from "node:net";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Deliberate test-only internal import: OpenClaw exposes neither its plugin
+// loader nor generic message-action runner through a supported SDK subpath.
+// Re-verify this stable loader entry whenever the pinned SDK is bumped.
+import * as openClawPluginLoader from "../node_modules/openclaw/dist/plugins/loader.js";
 
 import type { AgentControlEvent, MarmotAgentControlClient } from "../src/client.js";
 import { createMarmotChannelPlugin } from "../src/channel.js";
@@ -15,10 +26,189 @@ import type { MarmotInboundMessage } from "../src/inbound.js";
 import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
 
 const HEX32 = (byte: string): string => byte.repeat(32);
+const PROTOCOL = "marmot.agent-control.v2";
+
+interface RecordedMediaSend {
+  request: Record<string, unknown>;
+  stagedPath: string;
+  stagedBytes: Buffer;
+}
+
+type RunMessageAction = (input: {
+  cfg: unknown;
+  action: "send";
+  params: Record<string, unknown>;
+  agentId: string;
+  senderIsOwner: boolean;
+}) => Promise<unknown>;
+
+/** Load the installed host's private action runner without pinning its hashed chunk name. */
+async function loadInstalledRunMessageAction(): Promise<RunMessageAction> {
+  const distDir = join(import.meta.dirname, "..", "node_modules", "openclaw", "dist");
+  const runnerFile = (await readdir(distDir)).find(
+    (entry) => entry.startsWith("message-action-runner-") && entry.endsWith(".js"),
+  );
+  if (!runnerFile) {
+    throw new Error("installed OpenClaw has no message-action runner chunk");
+  }
+  const module = (await import(pathToFileURL(join(distDir, runnerFile)).href)) as Record<
+    string,
+    unknown
+  >;
+  const runner = Object.values(module).find(
+    (value) => typeof value === "function" && value.name === "runMessageAction",
+  );
+  if (!runner) {
+    throw new Error("installed OpenClaw message-action runner export was not found");
+  }
+  return runner as RunMessageAction;
+}
+
+function sendControlResponse(
+  socket: Socket,
+  id: unknown,
+  payload: Record<string, unknown>,
+): void {
+  socket.write(`${JSON.stringify({ marmot_agent_control: PROTOCOL, id, ...payload })}\n`);
+}
+
+/** Minimal wn-agent socket that records the staged media while it still exists. */
+function startMediaControlServer(
+  socketPath: string,
+  recorded: RecordedMediaSend[],
+): Promise<Server> {
+  const server = createServer((socket) => {
+    let pending = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      let newline = pending.indexOf(0x0a);
+      while (newline !== -1) {
+        const line = pending.subarray(0, newline);
+        pending = pending.subarray(newline + 1);
+        if (line.length > 0) {
+          const request = JSON.parse(line.toString("utf8")) as Record<string, unknown>;
+          void (async () => {
+            if (request.type !== "send_media") {
+              sendControlResponse(socket, request.id, {
+                type: "error",
+                code: "unexpected_request",
+                message: `unexpected request: ${String(request.type)}`,
+              });
+              return;
+            }
+            const attachment = (request.attachments as Array<Record<string, unknown>>)[0]!;
+            const stagedPath = String(attachment.path);
+            recorded.push({
+              request,
+              stagedPath,
+              stagedBytes: await readFile(stagedPath),
+            });
+            sendControlResponse(socket, request.id, {
+              type: "final_sent",
+              message_ids_hex: [HEX32("11")],
+            });
+          })().catch((error: unknown) => socket.destroy(error as Error));
+        }
+        newline = pending.indexOf(0x0a);
+      }
+    });
+    socket.on("error", () => undefined);
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => resolve(server));
+  });
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+/** Run the installed generic message action through the loaded Marmot plugin. */
+async function runPublicMediaSend(
+  buildParams: (workspaceDir: string) => Promise<Record<string, unknown>>,
+): Promise<RecordedMediaSend> {
+  const root = await mkdtemp(join(tmpdir(), "marmot-host-media-contract-"));
+  const workspaceDir = join(root, "workspace");
+  const outboundMediaDir = join(root, "outbound-media");
+  const socketPath = join(root, "wn-agent.sock");
+  const recorded: RecordedMediaSend[] = [];
+  const previousOutboundMediaDir = process.env.MARMOT_OUTBOUND_MEDIA_DIR;
+  let server: Server | undefined;
+  try {
+    await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
+    process.env.MARMOT_OUTBOUND_MEDIA_DIR = outboundMediaDir;
+    server = await startMediaControlServer(socketPath, recorded);
+    const pluginRoot = join(import.meta.dirname, "..");
+    const cfg = {
+      plugins: {
+        allow: ["marmot"],
+        load: { paths: [pluginRoot] },
+        entries: { marmot: { enabled: true } },
+      },
+      agents: { list: [{ id: "main", workspace: workspaceDir }] },
+      tools: { fs: { workspaceOnly: false } },
+      channels: {
+        marmot: {
+          socketPath,
+          accountIdHex: HEX32("aa"),
+        },
+      },
+    };
+    // Import the runner before activation: older hosts initialize additional
+    // runtime projections while evaluating this private chunk.
+    const runMessageAction = await loadInstalledRunMessageAction();
+    const registry = openClawPluginLoader.loadOpenClawPlugins({
+      config: cfg as never,
+      activationSourceConfig: cfg as never,
+      workspaceDir,
+      onlyPluginIds: ["marmot"],
+      activate: true,
+      loadModules: true,
+      cache: false,
+      mode: "full",
+      throwOnLoadError: true,
+    });
+    expect(
+      registry.channels.map((entry) => entry.plugin.id),
+      JSON.stringify(registry.diagnostics),
+    ).toContain("marmot");
+    await runMessageAction({
+      cfg,
+      action: "send",
+      params: await buildParams(workspaceDir),
+      agentId: "main",
+      senderIsOwner: true,
+    });
+    expect(recorded).toHaveLength(1);
+    await expect(access(recorded[0]!.stagedPath)).rejects.toThrow();
+    return recorded[0]!;
+  } finally {
+    if (server) {
+      await closeServer(server);
+    }
+    if (previousOutboundMediaDir === undefined) {
+      delete process.env.MARMOT_OUTBOUND_MEDIA_DIR;
+    } else {
+      process.env.MARMOT_OUTBOUND_MEDIA_DIR = previousOutboundMediaDir;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 afterEach(() => {
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
+  openClawPluginLoader.clearActivatedPluginRuntimeState();
+  openClawPluginLoader.clearPluginRegistryLoadCache();
+  const clearPluginLoaderCache = (
+    openClawPluginLoader as typeof openClawPluginLoader & {
+      clearPluginLoaderCache?: () => void;
+    }
+  ).clearPluginLoaderCache;
+  clearPluginLoaderCache?.();
 });
 
 /**
@@ -26,6 +216,50 @@ afterEach(() => {
  * This file is also run by openclaw-host-compat.sh against the supported beta.
  */
 describe("installed OpenClaw inbound host contract", () => {
+  it("sends an authorized workspace image through the public message action", async () => {
+    const imageBytes = Buffer.from("workspace-image-bytes");
+    const sent = await runPublicMediaSend(async (workspaceDir) => {
+      const imagePath = join(workspaceDir, "generated.png");
+      await writeFile(imagePath, imageBytes);
+      return {
+        channel: "marmot",
+        target: HEX32("cc"),
+        message: "workspace image",
+        media: imagePath,
+      };
+    });
+
+    expect(sent.stagedBytes).toEqual(imageBytes);
+    expect(sent.request).toMatchObject({
+      type: "send_media",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      caption: "workspace image",
+      attachments: [{ media_type: "image/png", file_name: "generated.png" }],
+    });
+  });
+
+  it("sends a buffer and filename through the public message action", async () => {
+    const imageBytes = Buffer.from("buffer-image-bytes");
+    const sent = await runPublicMediaSend(async () => ({
+      channel: "marmot",
+      target: HEX32("cc"),
+      message: "buffer image",
+      buffer: imageBytes.toString("base64"),
+      filename: "from-buffer.png",
+      contentType: "image/png",
+    }));
+
+    expect(sent.stagedBytes).toEqual(imageBytes);
+    expect(sent.request).toMatchObject({
+      type: "send_media",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      caption: "buffer image",
+      attachments: [{ media_type: "image/png", file_name: "from-buffer.png" }],
+    });
+  });
+
   it("runs Marmot's real dispatcher through the installed turn kernel", async () => {
     const deliverInboundReply = vi.fn(async () => ({
       status: "handled_visible" as const,

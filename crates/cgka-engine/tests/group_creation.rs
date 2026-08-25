@@ -793,10 +793,15 @@ async fn create_group_rejects_uninvited_initial_admin() {
         })
         .await
         .expect_err("an uninvited initial admin must be rejected");
-    assert!(
-        matches!(err, EngineError::Other(ref msg) if msg.contains("no member leaf")),
-        "expected admin-leaf-coupling rejection, got {err:?}"
-    );
+    // The refusal names the phantom admin rather than landing in
+    // `EngineError::Other`, the unclassified bucket that gave this policy
+    // refusal a generic fault's shape at every surface downstream.
+    match err {
+        EngineError::UnknownMember { member, .. } => {
+            assert_eq!(member, mallory.self_id());
+        }
+        other => panic!("expected UnknownMember naming mallory, got {other:?}"),
+    }
 }
 
 /// mdk#737 review: an `initial_admins` entry that is 32 bytes but not a valid

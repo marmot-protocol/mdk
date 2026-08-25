@@ -860,6 +860,15 @@ impl MarmotApp {
         if !source_relays.is_empty() {
             return source_relays.to_vec();
         }
+        if !self.config.directory_relay_urls.is_empty() {
+            return self
+                .config
+                .directory_relay_urls
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect();
+        }
         self.relay_endpoints()
     }
 

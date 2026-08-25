@@ -5,6 +5,9 @@ local `wn-agent` connector. OpenClaw runs the agent, model, tools, and channel
 routing. `wn-agent` owns the Marmot account, MLS group state, Nostr transport,
 durable encrypted sends, and QUIC live-preview stream records.
 
+For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
+[White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
+
 The plugin is intentionally thin and **control-plane only**: it speaks the
 `marmot.agent-control.v2` newline-delimited JSON protocol to `wn-agent` over a
 local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
@@ -20,6 +23,17 @@ Missing, empty, or non-string emoji values never implicitly remove reactions.
 Repeating a removal is idempotent. Reaction content follows the
 agent-control v2 bound: non-blank, control-free, and at most 64 Unicode scalar
 values.
+
+Agents send outbound media through OpenClaw's normal
+`message(action="send", channel="marmot", media=..., attachments=...)` interface.
+Generated files must be placed under the active agent workspace or an
+OpenClaw-managed media store; data URLs are not supported. OpenClaw's
+host-provided media reader is the source authorization boundary. The plugin
+stages the authorized bytes as a private, short-lived copy under
+`MARMOT_OUTBOUND_MEDIA_DIR`, while `wn-agent --media-allowed-root` independently
+authorizes that staging path before encrypting and uploading it. Direct
+`MarmotAgentControlClient.sendMedia()` calls are reserved for connector tests
+and smoketests, not runtime agents.
 
 For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
 materialized chat window and supplies it to OpenClaw with durable message ids,
@@ -46,8 +60,32 @@ Prerequisites:
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-Use the canonical [White Noise + Agents quickstart](../../README.md#openclaw)
-for the current guided install command and the steps to finish in White Noise.
+```sh
+install_verified() (
+  set -eu
+  installer_url="$1"
+  checksum_url="$2"
+  shift 2
+  installer_script="${installer_url##*/}"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
+  elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
+  else
+    echo "error: need shasum or sha256sum to verify the installer" >&2
+    exit 1
+  fi
+  bash "$tmpdir/$installer_script" "$@"
+)
+
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+install_verified "$base_url/install-openclaw-marmot.sh" \
+  "$base_url/install-openclaw-marmot.sh.sha256"
+```
 
 The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
 tarball, runs `openclaw plugins install`, enables the `marmot` channel, starts a
@@ -58,12 +96,16 @@ Set `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`, and `WN_AGENT_VERSION` (or the
 legacy `WN_AGENT_SHA` alias) to install a non-default release asset, matching
 the Hermes installer.
 
-For repeatable noninteractive setup, pass the White Noise owner as either an
-`npub` or raw hex public key:
+For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
+an `npub` or raw hex public key:
+
+Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+install_verified "$base_url/install-openclaw-marmot.sh" \
+  "$base_url/install-openclaw-marmot.sh.sha256" \
+  --yes --allow-welcomer npub1...
 ```
 
 Generated-identity onboarding is the default (and can be selected explicitly
@@ -71,13 +113,16 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 `nsec` or raw secret hex in a regular file owned by the current user with mode
 `0600`, then use a pinned release URL:
 
+Run this example in the same shell where `install_verified` above was defined.
+
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14/install-openclaw-marmot.sh" | \
-  bash -s -- \
-    --yes \
-    --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
-    --expected-npub npub1... \
-    --allow-welcomer npub1...
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.14"
+install_verified "$base_url/install-openclaw-marmot.sh" \
+  "$base_url/install-openclaw-marmot.sh.sha256" \
+  --yes \
+  --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+  --expected-npub npub1... \
+  --allow-welcomer npub1...
 ```
 
 The installer passes only the file path, never the secret, in process arguments.
@@ -309,14 +354,15 @@ for any plugin or tenant that is not in the same trust boundary.
   a host-local decrypted path and passes it to the turn as an OpenClaw
   `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
   base64-encodes for a vision model. Outbound — the message adapter declares
-  `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
-  `mediaReadFile` when needed) onto `send_media`. The adapter retains OpenClaw's
-  local-root check, stages a short-lived copy under `MARMOT_OUTBOUND_MEDIA_DIR`,
-  and cleans it up after the response; `wn-agent` independently requires that
-  path beneath a startup `--media-allowed-root` and rejects symlinks and
-  non-regular files. `wn-agent` encrypts + uploads to Blossom; the content key
-  never leaves it. The vision model actually
-  receiving the image is confirmed on the docker harness.
+  `media` and maps an agent reply's `mediaUrl` onto `send_media`. It prefers the
+  running host's authorized `mediaReadFile` capability for every source,
+  including local paths, and uses connector-side local-root validation only as
+  a fallback when the host provides no reader. The adapter stages a short-lived
+  copy under `MARMOT_OUTBOUND_MEDIA_DIR` and cleans it up after success or
+  failure; `wn-agent` independently requires that path beneath a startup
+  `--media-allowed-root` and rejects symlinks and non-regular files. `wn-agent`
+  encrypts + uploads to Blossom; the content key never leaves it. The vision
+  model actually receiving the image is confirmed on the docker harness.
 - **Live QUIC previews** (`src/live.ts`) are temporarily not wired into inbound
   agent turns. Those turns are final-only so durable delivery has one owner: the
   registered OpenClaw message adapter. The transcript and preview primitives
@@ -335,7 +381,14 @@ for any plugin or tenant that is not in the same trust boundary.
   `channels.marmot.dm.allowFrom` (hex account ids) into `wn-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist
   managed directly on `wn-agent`). `wn-agent` still performs welcomer-based
-  post-join accept/decline.
+  post-join accept/decline. With `allowFrom` set the mirror is *exact
+  reconciliation* of an account-scoped list: entries another integration added
+  to the same `wn-agent` account are removed. It runs fail-closed — revocations
+  before additions, every step attempted even when an earlier one fails, and the
+  effective list read back afterwards. `wn-agent` has no atomic replace, so a
+  partial control-plane failure is reported, not repaired: the connector logs
+  `welcomer allowlist revocation failed …` (entries still authorized) or
+  `welcomer allowlist not reconciled …`, and startup continues.
 - **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
   disable with `profileNameOnboarding: false`): when the agent joins a group it
   asks, on its own, whether to publish a public Nostr profile (`kind:0`) name —

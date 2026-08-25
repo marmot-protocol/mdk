@@ -11,6 +11,7 @@ use agent_connector::{
     resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
     resolve_bootstrap_socket, run_bootstrap, serve_socket,
 };
+use agent_control::AgentControlInvitePolicy;
 use clap::{Args, Parser, Subcommand};
 use zeroize::Zeroizing;
 
@@ -169,6 +170,12 @@ struct BootstrapArgs {
         help = "Add this welcomer/inviter public key to the agent allowlist; may be repeated"
     )]
     allow_welcomer: Vec<String>,
+    #[arg(
+        long,
+        value_name = "POLICY",
+        help = "Set invite policy: deny, allowlist, any-authenticated-direct, or any-authenticated"
+    )]
+    invite_policy: Option<AgentControlInvitePolicy>,
     #[arg(long, help = "Render invite URI as a terminal QR code using qrencode")]
     qr: bool,
     #[arg(long, help = "Print machine-readable JSON only")]
@@ -545,6 +552,7 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
         relays,
         quic_candidates,
         allow_welcomers: args.allow_welcomer,
+        invite_policy: args.invite_policy,
         create_if_missing: !args.no_create,
         publish_key_package: !args.no_publish_key_package,
         wait_for_socket: Duration::from_secs_f64(args.wait_for_socket.max(0.0)),
@@ -600,6 +608,9 @@ fn write_bootstrap_output(
             "ies"
         }
     );
+    if let Some(invite_policy) = result.invite_policy {
+        println!("Invite policy: {invite_policy}");
+    }
     if result.key_package_published {
         println!("KeyPackage: published or repaired");
     } else {

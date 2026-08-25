@@ -13,6 +13,12 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - No QUIC, crypto, relay, or MLS logic here.
 - Privacy-safe logging only: no account ids, group ids, message ids, pubkeys,
   relay URLs, payloads, ciphertext, plaintext, or key material.
+- Runtime agents send media through OpenClaw's normal `message` tool with
+  `media`/`attachments`, using files beneath the active workspace or an
+  OpenClaw-managed media store; data URLs are unsupported. Treat the host's
+  media reader as source authorization and `wn-agent --media-allowed-root` as
+  independent staging authorization. Direct control-client `sendMedia()` calls
+  are for connector tests and smoketests only.
 
 ## Key files
 

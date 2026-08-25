@@ -593,7 +593,7 @@ fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 
 /// storage provider now wraps `merge_staged_commit` in a backend transaction.
 pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     mls_group: &MlsGroup,
-    _group_id: &GroupId,
+    group_id: &GroupId,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
     // Resulting admins come from the staged (provisional) app_data_dictionary, so
@@ -661,14 +661,14 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
         }
     }
 
-    if resulting_admins
+    if let Some(orphaned) = resulting_admins
         .iter()
-        .any(|admin| !accounts.contains(admin))
+        .find(|admin| !accounts.contains(*admin))
     {
-        return Err(EngineError::Other(
-            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch"
-                .into(),
-        ));
+        return Err(EngineError::UnknownMember {
+            group_id: group_id.clone(),
+            member: MemberId::new(orphaned.to_vec()),
+        });
     }
     Ok(())
 }
@@ -1335,16 +1335,32 @@ pub(crate) fn member_account_pubkeys(mls_group: &MlsGroup) -> BTreeSet<[u8; 32]>
 /// add/commit ingest), so the tree cannot carry an unvalidated member leaf here.
 /// The admin set (`decode_admin_policy`) is likewise length-only, so both sides
 /// of the coupling comparison share a basis.
+///
+/// The refusal is [`EngineError::UnknownMember`], naming the orphaned admin key:
+/// the account it names has no leaf in this group, which is exactly what that
+/// variant says, and it is already wired through the FFI
+/// (`MemberNotInGroup`), the CLI, the audit classifier and the conformance
+/// simulator. It used to be [`EngineError::Other`] — the unclassified bucket —
+/// which reported a policy refusal as a generic fault and threw away which key
+/// was at fault. [`validate_admin_leaf_coupling_for_staged_commit`] answers the
+/// same way, so the rule reads identically whether it fires on the authoring
+/// side or on ingest.
 pub(crate) fn reject_admins_without_member_accounts(
     admins: &[[u8; 32]],
     member_accounts: &BTreeSet<[u8; 32]>,
-    _group_id: &GroupId,
+    group_id: &GroupId,
 ) -> Result<(), EngineError> {
     if admins.is_empty() {
         return Ok(());
     }
-    if admins.iter().any(|admin| !member_accounts.contains(admin)) {
-        return Err(EngineError::Other("admin key has no member leaf".into()));
+    if let Some(orphaned) = admins
+        .iter()
+        .find(|admin| !member_accounts.contains(*admin))
+    {
+        return Err(EngineError::UnknownMember {
+            group_id: group_id.clone(),
+            member: MemberId::new(orphaned.to_vec()),
+        });
     }
     Ok(())
 }
@@ -1485,6 +1501,18 @@ pub(crate) fn encode_group_profile(name: &str, description: &str) -> Result<Vec<
     .map_err(EngineError::Other)
 }
 
+/// Encode an admin set as admin-policy-v1 component bytes.
+///
+/// The empty-set guard below is an encoder invariant, not a live policy
+/// refusal: no call site can reach it. Creation seeds the set with the creator
+/// (`group_lifecycle::do_create_group`), invite only encodes inside the
+/// non-empty-grants branch, disband passes the committer, and remove is guarded
+/// by an explicit [`EngineError::AdminDepletion`] check before it gets here
+/// (`message_processor::send`). MIP-03 §150 depletion arriving through an
+/// author-supplied payload is likewise refused upstream as `AdminDepletion` by
+/// [`admin_policy_is_empty`] (#1523). So this stays [`EngineError::Other`]:
+/// reaching it would be an engine bug, and dressing it as a policy verdict
+/// would claim a refusal no caller can actually provoke.
 pub(crate) fn encode_admin_policy(admins: &[[u8; 32]]) -> Result<Vec<u8>, EngineError> {
     let mut admins = admins.to_vec();
     admins.sort();
@@ -2018,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_policy_validation_error_does_not_display_group_id() {
+    fn admin_policy_validation_error_names_the_orphaned_admin_without_displaying_ids() {
         let secret_group_id = GroupId::new(vec![0xA5; 32]);
         let error = reject_admins_without_member_accounts(
             &[[0x11; 32]],
@@ -2027,7 +2055,18 @@ mod tests {
         )
         .unwrap_err();
 
+        // The typed refusal carries both ids for callers that need them...
+        match &error {
+            EngineError::UnknownMember { group_id, member } => {
+                assert_eq!(group_id, &secret_group_id);
+                assert_eq!(member.as_slice(), [0x11; 32]);
+            }
+            other => panic!("expected UnknownMember, got {other:?}"),
+        }
+        // ...while the display string, which the audit log records verbatim,
+        // stays free of them.
         assert!(!error.to_string().contains(&hex::encode([0xA5; 32])));
+        assert!(!error.to_string().contains(&hex::encode([0x11; 32])));
     }
 
     #[test]

@@ -18,9 +18,10 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
     AuditDataMode, AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp,
     MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
-    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationWakeSource,
-    PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate, SelfMembership, SignOutOptions,
-    TimelineMessageQuery, TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
+    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
+    NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
+    RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
+    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -364,6 +365,53 @@ impl WritePolicy for RejectGiftWrapsWhileArmed {
             }
         })
     }
+}
+
+#[derive(Clone, Debug)]
+struct CountGiftWraps {
+    count: Arc<AtomicUsize>,
+}
+
+impl CountGiftWraps {
+    fn new() -> Self {
+        Self {
+            count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+impl WritePolicy for CountGiftWraps {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind == Kind::GiftWrap {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
+async fn gift_wrap_counting_app(
+    dir: &tempfile::TempDir,
+    gate: CountGiftWraps,
+) -> (LocalRelay, MarmotApp, String) {
+    let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    (relay, app, url)
 }
 
 #[derive(Clone, Debug)]
@@ -3848,6 +3896,372 @@ async fn removed_member_triggers_local_push_token_cleanup() {
 }
 
 #[tokio::test]
+async fn eviction_projects_removed_from_group_notification() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "eviction notify",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let mut subscription = runtime.subscribe_notifications().unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    runtime
+        .remove_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&bob_id),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let update = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id
+            && matches!(update.trigger, NotificationTrigger::RemovedFromGroup)
+    })
+    .await;
+    assert!(
+        update.notification_key.starts_with("group-state:"),
+        "live eviction keys must be deterministic group-state ids"
+    );
+    assert!(!update.is_from_self);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_grant_projects_made_admin_notification() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "admin notify",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let mut subscription = runtime.subscribe_notifications().unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    runtime
+        .promote_admin(&alice.account.account_id_hex, &group_id, &bob_id)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let update = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id && matches!(update.trigger, NotificationTrigger::MadeAdmin)
+    })
+    .await;
+    assert!(matches!(update.trigger, NotificationTrigger::MadeAdmin));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_revoke_projects_removed_as_admin_notification() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "admin revoke notify",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let mut subscription = runtime.subscribe_notifications().unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    runtime
+        .promote_admin(&alice.account.account_id_hex, &group_id, &bob_id)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id && matches!(update.trigger, NotificationTrigger::MadeAdmin)
+    })
+    .await;
+
+    runtime
+        .demote_admin(&alice.account.account_id_hex, &group_id, &bob_id)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let update = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id
+            && matches!(update.trigger, NotificationTrigger::RemovedAsAdmin)
+    })
+    .await;
+    assert!(
+        update.notification_key.starts_with("group-state:"),
+        "live admin-revoke keys must be deterministic group-state ids"
+    );
+    assert!(!update.is_from_self);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_members_sends_context_free_wake_from_snapshotted_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = CountGiftWraps::new();
+    let (_relay, app, url) = gift_wrap_counting_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "eviction wake",
+            &[
+                bob.account.account_id_hex.clone(),
+                carol.account.account_id_hex.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    app.upsert_push_registration(
+        &bob.account.account_id_hex,
+        PushPlatform::Fcm,
+        "bob-wake-token",
+        &server_pubkey,
+        Some(url.clone()),
+    )
+    .unwrap();
+    runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    sleep(Duration::from_millis(300)).await;
+
+    let wraps_before = gate.count();
+    runtime
+        .remove_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&bob.account.account_id_hex),
+        )
+        .await
+        .unwrap();
+    assert!(
+        gate.count() > wraps_before,
+        "successful eviction must publish a context-free kind-446 gift wrap from the snapshot"
+    );
+
+    let wraps_after_remove = gate.count();
+    runtime
+        .leave_group(&carol.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        gate.count(),
+        wraps_after_remove,
+        "voluntary leave must not publish a membership wake"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_members_succeeds_when_wake_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "wake failure",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    app.upsert_push_registration(
+        &bob.account.account_id_hex,
+        PushPlatform::Fcm,
+        "failing-wake-token",
+        &server_pubkey,
+        Some("not-a-relay-url".to_owned()),
+    )
+    .unwrap();
+    runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    runtime
+        .remove_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&bob.account.account_id_hex),
+        )
+        .await
+        .expect("successful eviction must ignore best-effort wake failure");
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn unauthorized_remove_and_self_demotion_send_no_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = CountGiftWraps::new();
+    let (_relay, app, url) = gift_wrap_counting_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "no wake",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    sleep(Duration::from_millis(300)).await;
+    let wraps_before = gate.count();
+    let unauthorized = runtime
+        .remove_members(
+            &bob.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&alice.account.account_id_hex),
+        )
+        .await;
+    assert!(
+        unauthorized.is_err(),
+        "non-admin removal must fail before any wake"
+    );
+    assert_eq!(
+        gate.count(),
+        wraps_before,
+        "unauthorized removal must not publish a wake"
+    );
+
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    app.upsert_push_registration(
+        &bob.account.account_id_hex,
+        PushPlatform::Fcm,
+        "bob-admin-token",
+        &server_pubkey,
+        Some(url.clone()),
+    )
+    .unwrap();
+    runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    runtime
+        .promote_admin(
+            &alice.account.account_id_hex,
+            &group_id,
+            &bob.account.account_id_hex,
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    sleep(Duration::from_millis(300)).await;
+    let wraps_after_promote = gate.count();
+    assert!(
+        wraps_after_promote > wraps_before,
+        "promoting another member must publish a context-free wake"
+    );
+
+    runtime
+        .self_demote_admin(&bob.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        gate.count(),
+        wraps_after_promote,
+        "self-demotion must not publish a wake"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn concurrent_wake_collection_and_foreground_subscription_share_notification_key() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -4707,7 +5121,10 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
         loop {
             let health = runtime.shared_services().relay_plane().relay_health().await;
             if health.directory_active_subscriptions == 1
-                && health.directory_completed_subscription_syncs == 1
+                // A relay recovery can legitimately complete another rebuild
+                // before this poll observes the initial one. This counter is
+                // monotonic, so waiting for exact equality races that recovery.
+                && health.directory_completed_subscription_syncs >= 1
             {
                 break health;
             }
@@ -4717,7 +5134,7 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
     .await
     .expect("directory subscriptions should complete asynchronously");
     assert_eq!(health.directory_active_subscriptions, 1);
-    assert_eq!(health.directory_completed_subscription_syncs, 1);
+    assert!(health.directory_completed_subscription_syncs >= 1);
     runtime.shutdown().await;
 }
 
@@ -4935,6 +5352,25 @@ where
     })
     .await
     .expect("runtime event")
+}
+
+async fn wait_for_notification<F>(
+    subscription: &mut RuntimeNotificationsSubscription,
+    mut matches_update: F,
+) -> marmot_app::NotificationUpdate
+where
+    F: FnMut(&marmot_app::NotificationUpdate) -> bool,
+{
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let update = subscription.recv().await.expect("notification update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("notification update")
 }
 
 async fn wait_for_message_update<F>(

@@ -47,11 +47,19 @@ jobs:
       - name: Naming gate (retired legacy tokens)
         run: ./scripts/check_legacy_naming.sh
 
+      - name: Install example SHA-256 gate
+        run: |
+          python3 scripts/check_install_example_sha256.py
+          python3 scripts/test_install_example_sha256_gate.py
+
       - name: Campaign image toolchain gate
         run: ./scripts/check_campaign_toolchain.sh
 
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh
+
+      - name: Cargo audit workflow policy gate
+        run: python3 scripts/test_check_cargo_audit_ci.py
 
   rust-audit:
     name: Rust audit
@@ -64,13 +72,24 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
       - name: Install cargo-audit
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
         with:
           tool: cargo-audit@0.22.1
 
       - name: Audit Rust dependencies
-        run: cargo audit
+        # Cargo consumes --locked before dispatching to cargo-audit; cargo-audit
+        # itself does not accept --locked after the subcommand.
+        run: cargo --locked audit
 
   terminal-harness-installers:
     name: Terminal harness installer tests

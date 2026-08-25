@@ -705,4 +705,39 @@ describe("syncMarmotAllowlist", () => {
     });
     expect(used).toBe(false);
   });
+
+  it("warns when a welcomer revocation cannot be applied", async () => {
+    const stale = HEX32("99");
+    const warnings: string[] = [];
+    const client = {
+      async accountList() {
+        return {
+          type: "account_list",
+          accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+        };
+      },
+      async allowlistList() {
+        return {
+          type: "allowlist",
+          account_id_hex: HEX32("aa"),
+          welcomer_account_ids_hex: [stale],
+        };
+      },
+      async allowlistAdd() {
+        return { type: "ack" };
+      },
+      async allowlistRemove() {
+        throw new Error("allowlist_remove failed");
+      },
+    } as unknown as MarmotAgentControlClient;
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { dm: { allowFrom: [HEX32("11")] } } } },
+      logger: { info: () => {}, warn: (message: string) => warnings.push(message) },
+    };
+
+    await syncMarmotAllowlist(api, { clientFactory: () => client });
+
+    expect(warnings.some((message) => message.includes("revocation failed"))).toBe(true);
+    expect(warnings.join(" ")).not.toContain(stale);
+  });
 });

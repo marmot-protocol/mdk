@@ -9,6 +9,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Local notification projection and UniFFI `NotificationTrigger` now include
+  `RemovedFromGroup`, `MadeAdmin`, and `RemovedAsAdmin` for authenticated
+  self-affecting membership and admin-role changes. Kind 446 wake delivery
+  stays context-free.
+  ([#1240](https://github.com/marmot-protocol/mdk/issues/1240))
+- Daemon-hosted directory and KeyPackage reads now honor configured discovery
+  relays independently from the operational relay set used for message
+  delivery.
+
 ## [0.9.14] - 2026-08-19
 
 ### Added

@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_control::{
-    AgentControlAccount, AgentControlEnvelope, AgentControlError, AgentControlRequest,
-    AgentControlResponse, encode_frame, read_envelope,
+    AgentControlAccount, AgentControlEnvelope, AgentControlError, AgentControlInvitePolicy,
+    AgentControlRequest, AgentControlResponse, encode_frame, read_envelope,
 };
 use marmot_app::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -34,6 +34,7 @@ pub struct BootstrapOptions {
     pub relays: Vec<String>,
     pub quic_candidates: Vec<String>,
     pub allow_welcomers: Vec<String>,
+    pub invite_policy: Option<AgentControlInvitePolicy>,
     pub create_if_missing: bool,
     pub publish_key_package: bool,
     pub wait_for_socket: Duration,
@@ -53,6 +54,8 @@ pub struct BootstrapResult {
     pub relays: Vec<String>,
     pub quic_candidates: Vec<String>,
     pub welcomer_account_ids_hex: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_policy: Option<AgentControlInvitePolicy>,
     pub npub: String,
     pub nprofile: String,
     pub qr_payload: String,
@@ -89,6 +92,8 @@ pub enum BootstrapError {
     KeyPackageAccountMismatch { expected: String, actual: String },
     #[error("allowlist updated for unexpected account: expected {expected}, got {actual}")]
     AllowlistAccountMismatch { expected: String, actual: String },
+    #[error("invite policy updated for unexpected account: expected {expected}, got {actual}")]
+    InvitePolicyAccountMismatch { expected: String, actual: String },
     #[error("{code}: {message}")]
     ControlRejected { code: String, message: String },
     #[error(transparent)]
@@ -125,6 +130,12 @@ pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult,
         options.allow_welcomers.clone(),
     )
     .await?;
+    let invite_policy = match options.invite_policy {
+        Some(policy) => {
+            Some(bootstrap_invite_policy(&client, &account_state.account_id_hex, policy).await?)
+        }
+        None => None,
+    };
 
     let npub = npub_for_account_id(&account_state.account_id_hex)?;
     let nprofile = nprofile_for_account_id(&account_state.account_id_hex, &options.relays)?;
@@ -139,12 +150,41 @@ pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult,
         relays: options.relays.clone(),
         quic_candidates: options.quic_candidates.clone(),
         welcomer_account_ids_hex,
+        invite_policy,
         npub,
         nprofile: nprofile.clone(),
         qr_payload: nprofile,
     };
 
     Ok(result)
+}
+
+async fn bootstrap_invite_policy(
+    client: &ControlClient,
+    account_id_hex: &str,
+    policy: AgentControlInvitePolicy,
+) -> Result<AgentControlInvitePolicy, BootstrapError> {
+    let request = AgentControlRequest::InvitePolicySet {
+        account_id_hex: account_id_hex.to_owned(),
+        policy,
+    };
+    let response = client.request(request).await?;
+    ensure_response_type(&response, "invite_policy")?;
+    let (echoed_account_id_hex, policy) = match response.payload {
+        AgentControlResponse::InvitePolicy {
+            account_id_hex,
+            policy,
+        } => (account_id_hex, policy),
+        other => return Err(unexpected_response("invite_policy", &other)),
+    };
+    let echoed_account_id_hex = normalize_account_id_hex(&echoed_account_id_hex)?;
+    if echoed_account_id_hex != account_id_hex {
+        return Err(BootstrapError::InvitePolicyAccountMismatch {
+            expected: account_id_hex.to_owned(),
+            actual: echoed_account_id_hex,
+        });
+    }
+    Ok(policy)
 }
 
 #[derive(Clone, Debug)]
@@ -472,6 +512,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
+        AgentControlResponse::InvitePolicy { .. } => "invite_policy",
         AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {
@@ -998,6 +1039,7 @@ mod tests {
                 .collect(),
             quic_candidates: vec![DEFAULT_QUIC_CANDIDATE.to_owned()],
             allow_welcomers: Vec::new(),
+            invite_policy: None,
             create_if_missing: true,
             publish_key_package: true,
             wait_for_socket: Duration::from_millis(100),
