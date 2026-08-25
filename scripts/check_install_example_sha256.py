@@ -43,6 +43,8 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/opencode/marmot/README.md": {"install-opencode-marmot.sh": 2},
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
 }
+# Codex is intentionally absent: its helper definition and only invocation
+# share one fence, so it has no dependent copy-paste fence.
 SAME_SHELL_SURFACES = (
     "integrations/README.md",
     "integrations/hermes/marmot/README.md",

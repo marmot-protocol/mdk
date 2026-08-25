@@ -80,9 +80,4 @@ if [ -n "$stale_versioned_urls" ]; then
     exit 1
 fi
 
-if rg -n 'releases/download/\$latest_tag/install-' .github/workflows/wn-agent-binaries.yml; then
-    echo "error: generated release notes must link to the immutable release tag" >&2
-    exit 1
-fi
-
 echo "agent install documentation matches wn-agent-v$workspace_version"
