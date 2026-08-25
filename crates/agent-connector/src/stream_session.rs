@@ -43,7 +43,11 @@ impl DebugFinalSendStore {
 /// Maximum number of recent idempotency keys retained for durable-send dedup.
 /// Oldest keys are evicted FIFO once the cap is reached; this bounds memory while
 /// comfortably covering any plausible in-flight retry window.
-const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
+pub(crate) const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
+/// Preview mutations are process-local and high-frequency. Keep their receipts
+/// in a separate, larger FIFO so they cannot evict durable send/finalize
+/// receipts or cause pointless disk snapshots.
+const PREVIEW_IDEMPOTENCY_CAPACITY: usize = 4096;
 
 /// Relative path under the connector home for persisted `send_final` idempotency
 /// records (`$MARMOT_HOME/dev/send-idempotency.json`).
@@ -79,6 +83,8 @@ struct SendIdempotencyGate {
 #[derive(Clone)]
 pub(crate) struct SendIdempotencyStore {
     path: PathBuf,
+    persist: bool,
+    capacity: usize,
     lock: Arc<Mutex<()>>,
     inner: Arc<Mutex<SendIdempotencyInner>>,
     in_flight: SendIdempotencyGates,
@@ -87,6 +93,12 @@ pub(crate) struct SendIdempotencyStore {
 pub(crate) enum SendIdempotencyAcquisition {
     Completed(SendIdempotencyResult),
     Leader(SendIdempotencyLeader),
+}
+
+pub(crate) enum StrictIdempotencyAcquisition {
+    Completed,
+    Leader(SendIdempotencyLeader),
+    Conflict,
 }
 
 pub(crate) struct SendIdempotencyLeader {
@@ -135,12 +147,28 @@ impl SendIdempotencyStore {
     pub(crate) fn new(home: &Path) -> Self {
         let store = Self {
             path: home.join(SEND_IDEMPOTENCY_FILE),
+            persist: true,
+            capacity: SEND_IDEMPOTENCY_CAPACITY,
             lock: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
         };
         store.load_from_disk();
         store
+    }
+
+    /// A separate process-local store for strict live-preview mutation
+    /// idempotency. Active streams cannot survive restart, so persisting these
+    /// receipts is both useless and harmful to durable receipt retention.
+    pub(crate) fn process_local_preview() -> Self {
+        Self {
+            path: PathBuf::new(),
+            persist: false,
+            capacity: PREVIEW_IDEMPOTENCY_CAPACITY,
+            lock: Arc::new(Mutex::new(())),
+            inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The message ids recorded for `key` by an earlier successful send, but only
@@ -227,6 +255,79 @@ impl SendIdempotencyStore {
         }))
     }
 
+    /// Acquire an idempotency reservation whose key is permanently bound to
+    /// its first fingerprint. This is used by preview mutations; legacy durable
+    /// send/finalize callers retain the historical cache-miss semantics of
+    /// [`Self::acquire`].
+    pub(crate) async fn acquire_strict(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<StrictIdempotencyAcquisition, ConnectorError> {
+        {
+            let inner = crate::lock_recover(&self.inner);
+            if let Some((recorded, _, _)) = inner.seen.get(key) {
+                return if constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()) {
+                    Ok(StrictIdempotencyAcquisition::Completed)
+                } else {
+                    Ok(StrictIdempotencyAcquisition::Conflict)
+                };
+            }
+        }
+
+        let gate_key = (key.to_owned(), fingerprint.to_owned());
+        let gate = {
+            let mut in_flight = crate::lock_recover(&self.in_flight);
+            in_flight.retain(|_, gate| gate.strong_count() > 0);
+            if in_flight
+                .iter()
+                .any(|((reserved_key, reserved_fingerprint), gate)| {
+                    reserved_key == key
+                        && reserved_fingerprint != fingerprint
+                        && gate.strong_count() > 0
+                })
+            {
+                return Ok(StrictIdempotencyAcquisition::Conflict);
+            }
+            if let Some(gate) = in_flight.get(&gate_key).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(SendIdempotencyGate {
+                    lock: Arc::new(tokio::sync::Mutex::new(())),
+                    completed: Mutex::new(None),
+                });
+                in_flight.insert(gate_key, Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let guard = crate::with_control_operation_timeout(
+            "stream_preview_idempotency_wait",
+            Arc::clone(&gate.lock).lock_owned(),
+        )
+        .await
+        .map_err(|_| ConnectorError::SendInProgress)?;
+
+        {
+            let inner = crate::lock_recover(&self.inner);
+            if let Some((recorded, _, _)) = inner.seen.get(key) {
+                return if constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()) {
+                    Ok(StrictIdempotencyAcquisition::Completed)
+                } else {
+                    Ok(StrictIdempotencyAcquisition::Conflict)
+                };
+            }
+        }
+        if crate::lock_recover(&gate.completed).is_some() {
+            return Ok(StrictIdempotencyAcquisition::Completed);
+        }
+        Ok(StrictIdempotencyAcquisition::Leader(
+            SendIdempotencyLeader {
+                _guard: guard,
+                gate,
+            },
+        ))
+    }
+
     /// Record the request `fingerprint` and durable message ids produced for
     /// `key`. A repeat record for an existing key keeps the original entry (the
     /// first successful send wins); otherwise the key is appended and the oldest
@@ -252,7 +353,7 @@ impl SendIdempotencyStore {
             if inner.seen.contains_key(&key) {
                 return;
             }
-            if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
+            if inner.order.len() >= self.capacity
                 && let Some(evicted) = inner.order.pop_front()
             {
                 inner.seen.remove(&evicted);
@@ -267,6 +368,9 @@ impl SendIdempotencyStore {
             true
         };
         if !should_persist {
+            return;
+        }
+        if !self.persist {
             return;
         }
         // #691: persist OFF the async send hot path. The in-memory entry recorded

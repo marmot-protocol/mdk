@@ -195,16 +195,22 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         stream_capability: String,
         append_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     StreamStatus {
         stream_id_hex: String,
         stream_capability: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     StreamProgress {
         stream_id_hex: String,
         stream_capability: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     /// Finalize an active preview stream into the durable final message.
     ///
@@ -964,6 +970,7 @@ mod tests {
                     .to_owned(),
                 stream_capability: "11".repeat(32),
                 append_text: "lo".to_owned(),
+                idempotency_key: None,
             },
         );
 
@@ -977,9 +984,24 @@ mod tests {
         assert_eq!(json["stream_capability"], "11".repeat(32));
         assert!(json.get("text").is_none());
         assert!(json.get("replace_text").is_none());
+        assert!(json.get("idempotency_key").is_none());
 
         let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn stream_preview_idempotency_key_is_optional_and_round_trips() {
+        let request: AgentControlRequest = serde_json::from_value(serde_json::json!({
+            "type": "stream_progress",
+            "stream_id_hex": "aa",
+            "stream_capability": "bb",
+            "text": "working",
+            "idempotency_key": "operation-1"
+        }))
+        .unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["idempotency_key"], "operation-1");
     }
 
     #[test]
@@ -1319,6 +1341,7 @@ mod tests {
                             .to_owned(),
                     stream_capability: capability(),
                     append_text,
+                    idempotency_key: None,
                 },
             )
         };
@@ -1437,6 +1460,7 @@ mod tests {
                     stream_id_hex: stream(),
                     stream_capability: capability(),
                     append_text: "hel".to_owned(),
+                    idempotency_key: None,
                 },
                 "stream_append",
             ),
@@ -1445,6 +1469,7 @@ mod tests {
                     stream_id_hex: stream(),
                     stream_capability: capability(),
                     status: "thinking".to_owned(),
+                    idempotency_key: None,
                 },
                 "stream_status",
             ),
@@ -1453,6 +1478,7 @@ mod tests {
                     stream_id_hex: stream(),
                     stream_capability: capability(),
                     text: "{\"v\":1,\"status\":\"started\"}".to_owned(),
+                    idempotency_key: None,
                 },
                 "stream_progress",
             ),

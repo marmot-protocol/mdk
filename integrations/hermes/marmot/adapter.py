@@ -40,6 +40,7 @@ DEFAULT_SOCKET_HOME = "~/.marmot"
 DEFAULT_STREAM_CHUNK_BYTES = 1024
 AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN = 65519
 TEXT_DELTA_RECORD = 0x01
+PROGRESS_DELTA_RECORD = 0x02
 STATUS_RECORD = 0x03
 TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
@@ -60,6 +61,7 @@ SEND_MEDIA_RETRY_BACKOFF_S = (0.1, 0.3)
 SEND_MEDIA_COMPLETION_TIMEOUT_S = 15 * 60.0
 STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
+STREAM_PREVIEW_RETRY_BACKOFF_S = (0.1, 0.3)
 # Hermes albums and the native Telegram/Discord/Slack batch APIs share a
 # ten-item ceiling. Keeping one Marmot album within that bound also limits the
 # encrypted blobs an all-or-error upload can orphan before publication fails.
@@ -1038,6 +1040,9 @@ class AgentTextStreamTranscript:
     def append_status(self, status: str) -> None:
         self._append_record(STATUS_RECORD, status)
 
+    def append_progress(self, text: str) -> None:
+        self._append_record(PROGRESS_DELTA_RECORD, text)
+
     def _append_record(self, record_type: int, text: str) -> None:
         for chunk in split_text_deltas(text, self.chunk_bytes):
             hasher = hashlib.sha256()
@@ -1443,13 +1448,16 @@ class MarmotAgentControlClient:
         stream_id_hex: str,
         stream_capability: str,
         append_text: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_append",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "stream_capability": _normalize_stream_capability(stream_capability),
                 "append_text": str(append_text or ""),
+                **({"idempotency_key": key} if key else {}),
             },
             timeout=self.preview_request_timeout,
         )
@@ -1459,13 +1467,16 @@ class MarmotAgentControlClient:
         stream_id_hex: str,
         stream_capability: str,
         status: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_status",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "stream_capability": _normalize_stream_capability(stream_capability),
                 "status": str(status or ""),
+                **({"idempotency_key": key} if key else {}),
             },
             timeout=self.preview_request_timeout,
         )
@@ -1475,13 +1486,16 @@ class MarmotAgentControlClient:
         stream_id_hex: str,
         stream_capability: str,
         text: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_progress",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "stream_capability": _normalize_stream_capability(stream_capability),
                 "text": str(text or ""),
+                **({"idempotency_key": key} if key else {}),
             },
             timeout=self.preview_request_timeout,
         )
@@ -1737,6 +1751,36 @@ class MarmotLiveStream:
         )
         self.finalize_idempotency_key = uuid.uuid4().hex
         self.finalized = False
+        self._mutation_lock = asyncio.Lock()
+        self._pending_preview_mutation: Optional[Tuple[str, str, str]] = None
+
+    async def _retry_preview_mutation(
+        self,
+        operation: str,
+        payload: str,
+        mutation: Callable[[str], Awaitable[Dict[str, Any]]],
+    ) -> None:
+        pending = self._pending_preview_mutation
+        if pending is not None and pending[:2] != (operation, payload):
+            raise AgentControlError(
+                "an ambiguous preview mutation must be reconciled first",
+                code="preview_mutation_pending",
+                retryable=True,
+            )
+        key = pending[2] if pending is not None else uuid.uuid4().hex
+        self._pending_preview_mutation = (operation, payload, key)
+        for attempt in range(len(STREAM_PREVIEW_RETRY_BACKOFF_S) + 1):
+            try:
+                await mutation(key)
+                self._pending_preview_mutation = None
+                return
+            except Exception as exc:
+                if not is_retryable(exc):
+                    self._pending_preview_mutation = None
+                    raise
+                if attempt >= len(STREAM_PREVIEW_RETRY_BACKOFF_S):
+                    raise
+                await asyncio.sleep(STREAM_PREVIEW_RETRY_BACKOFF_S[attempt])
 
     @classmethod
     async def begin(
@@ -1793,6 +1837,10 @@ class MarmotLiveStream:
         )
 
     async def append_replacement(self, next_text: str) -> None:
+        async with self._mutation_lock:
+            await self._append_replacement_locked(next_text)
+
+    async def _append_replacement_locked(self, next_text: str) -> None:
         next_text = str(next_text or "")
         suffix = self.text.pending_suffix_for(next_text)
         if not suffix:
@@ -1800,16 +1848,44 @@ class MarmotLiveStream:
         # Commit local transcript/append-only state only AFTER the remote append
         # succeeds, so a failed append leaves the stream consistent and the same
         # text re-appendable (mirrors live.ts update() lines 99-116).
-        await self.client.stream_append(self.stream_id_hex, self.stream_capability, suffix)
+        await self._retry_preview_mutation(
+            "append",
+            suffix,
+            lambda key: self.client.stream_append(
+                self.stream_id_hex, self.stream_capability, suffix, idempotency_key=key
+            )
+        )
         self.transcript.append_text(suffix)
         self.text.commit(next_text)
 
     async def status(self, status: str) -> None:
-        await self.client.stream_status(self.stream_id_hex, self.stream_capability, status)
-        self.transcript.append_status(status)
+        async with self._mutation_lock:
+            await self._retry_preview_mutation(
+                "status",
+                status,
+                lambda key: self.client.stream_status(
+                    self.stream_id_hex, self.stream_capability, status, idempotency_key=key
+                )
+            )
+            self.transcript.append_status(status)
+
+    async def progress(self, text: str) -> None:
+        async with self._mutation_lock:
+            await self._retry_preview_mutation(
+                "progress",
+                text,
+                lambda key: self.client.stream_progress(
+                    self.stream_id_hex, self.stream_capability, text, idempotency_key=key
+                ),
+            )
+            self.transcript.append_progress(text)
 
     async def finalize(self, final_text: str) -> Dict[str, Any]:
-        await self.append_replacement(final_text)
+        async with self._mutation_lock:
+            return await self._finalize_locked(final_text)
+
+    async def _finalize_locked(self, final_text: str) -> Dict[str, Any]:
+        await self._append_replacement_locked(final_text)
         response: Optional[Dict[str, Any]] = None
         for attempt in range(len(STREAM_FINALIZE_RETRY_BACKOFF_S) + 1):
             try:

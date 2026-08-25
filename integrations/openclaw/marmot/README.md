@@ -322,6 +322,13 @@ for any plugin or tenant that is not in the same trust boundary.
   never merges or rewrites text across sends. A bounded retry reuses one
   per-send idempotency key so a transient control-socket failure does not create
   a second Marmot message.
+- **Live-preview retry contract**: `stream_append`, `stream_status`, and
+  `stream_progress` use the preview request's 8-second timeout and bounded
+  retries. Every retry of one logical mutation reuses its original idempotency
+  key and payload. `wn-agent` therefore applies a mutation at most once even
+  when it committed the record but its Ack was lost, while the plugin advances
+  its local transcript only after an Ack; the client and server transcript
+  hashes remain aligned for `stream_finalize`.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call
