@@ -2468,6 +2468,72 @@ fn secure_prune_preserves_a_newer_group_system_preview() {
 }
 
 #[test]
+fn secure_prune_retains_pruned_group_system_activity_as_the_sort_anchor() {
+    let store = setup_store();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups SET conversation_created_at = 5 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("older-chat", REMOTE, 100, "older activity"))
+        .unwrap();
+    store
+        .record_app_event(&group_system(
+            "pruned-role-change",
+            REMOTE,
+            200,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(before.activity_sort_at, 200);
+    assert_eq!(
+        before.last_message.expect("system preview").message_id_hex,
+        "pruned-role-change"
+    );
+
+    store
+        .secure_prune_app_events_before(GROUP, 201, LOCAL, &no_mentions)
+        .unwrap();
+
+    let after = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(after.last_message.is_none());
+    assert_eq!(after.activity_sort_at, 200);
+    let retained_activity_sort_at = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT retained_activity_sort_at FROM chat_list_rows WHERE group_id_hex = ?1",
+            params![GROUP],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(retained_activity_sort_at, 200);
+
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("rebuilt chat row")
+            .activity_sort_at,
+        200
+    );
+}
+
+#[test]
 fn invalidated_kind9_tombstones_do_not_count_as_unread() {
     // Repro for #418: a group exchanges chat plus a group-system commit; fork
     // recovery later invalidates some received kind:9 rows (losing branch). The

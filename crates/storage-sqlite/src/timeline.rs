@@ -1244,30 +1244,25 @@ fn retain_pruned_chat_activity_tx(
     group_id_hex: &str,
     pruned_message_ids: &BTreeSet<String>,
 ) -> StorageResult<()> {
-    let mut statement = tx
-        .prepare(
-            "SELECT timeline_at
-             FROM message_timeline
-             WHERE group_id_hex = ?1
-               AND message_id_hex = ?2
-               AND kind = ?3
-               AND (
-                   invalidation_status IS NULL
-                   OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
-               )",
-        )
-        .storage()?;
+    let activity_filter = crate::chat_list::chat_list_activity_filter_sql("");
+    let sql = format!(
+        "SELECT timeline_at
+         FROM message_timeline
+         WHERE group_id_hex = ?1
+           AND message_id_hex = ?2
+           AND {activity_filter}
+           AND (
+               invalidation_status IS NULL
+               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+           )"
+    );
+    let mut statement = tx.prepare(&sql).storage()?;
     let mut latest_pruned_activity = None;
     for message_id_hex in pruned_message_ids {
         let timeline_at = statement
-            .query_row(
-                params![
-                    group_id_hex,
-                    message_id_hex,
-                    u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?
-                ],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row(params![group_id_hex, message_id_hex], |row| {
+                row.get::<_, i64>(0)
+            })
             .optional()
             .storage()?;
         latest_pruned_activity = latest_pruned_activity.max(timeline_at);
