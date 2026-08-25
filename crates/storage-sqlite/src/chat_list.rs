@@ -983,7 +983,7 @@ const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
 /// SQL predicate for activity that should behave like a chat message in the
 /// chat list. Kind-1210 also carries metadata changes; #822 intentionally
 /// promotes only membership/admin rows, leaving unrelated system events alone.
-fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
+pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
     let group_activity_tags = CHAT_LIST_GROUP_ACTIVITY_TYPES
         .iter()
         .map(|system_type| format!(r#"'[["{GROUP_SYSTEM_TYPE_TAG}","{system_type}"]]'"#))

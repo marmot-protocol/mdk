@@ -2385,6 +2385,50 @@ fn secure_prune_refreshes_unread_count_mentions_and_first_message_atomically() {
 }
 
 #[test]
+fn secure_prune_preserves_a_newer_group_system_preview() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("expiring-chat", REMOTE, 10, "old chat"))
+        .unwrap();
+    store
+        .record_app_event(&group_system(
+            "retained-role-change",
+            REMOTE,
+            20,
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+        ))
+        .unwrap();
+
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        before.last_message.expect("system preview").message_id_hex,
+        "retained-role-change"
+    );
+    assert_eq!(before.unread_count, 2);
+
+    store
+        .secure_prune_app_events_before(GROUP, 15, LOCAL, &no_mentions)
+        .unwrap();
+
+    let after = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    let preview = after.last_message.expect("retained system preview");
+    assert_eq!(preview.message_id_hex, "retained-role-change");
+    assert_eq!(preview.kind, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM);
+    assert_eq!(after.unread_count, 1);
+    assert_eq!(
+        after.first_unread_message_id_hex.as_deref(),
+        Some("retained-role-change")
+    );
+}
+
+#[test]
 fn invalidated_kind9_tombstones_do_not_count_as_unread() {
     // Repro for #418: a group exchanges chat plus a group-system commit; fork
     // recovery later invalidates some received kind:9 rows (losing branch). The

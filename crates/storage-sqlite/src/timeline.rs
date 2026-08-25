@@ -1289,6 +1289,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
+    let activity_filter = crate::chat_list::chat_list_activity_filter_sql("");
     let sql = format!(
         "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
                 media_json,
@@ -1300,32 +1301,28 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                 END
          FROM message_timeline
          WHERE group_id_hex = ?1
-           AND kind = ?2
+           AND {activity_filter}
            AND (
                invalidation_status IS NULL
                OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
            )
          ORDER BY {}
          LIMIT 1",
-        crate::chat_list::CHAT_LIST_PREVIEW_ORDER_DESC
+        crate::chat_list::CHAT_LIST_PREVIEW_ORDER_DESC,
     );
     let latest = tx
-        .query_row(
-            &sql,
-            params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            },
-        )
+        .query_row(&sql, params![group_id_hex], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
         .optional()
         .storage()?;
     let updated_at = u64_to_i64(unix_now_seconds())?;
