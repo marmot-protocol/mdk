@@ -32,11 +32,37 @@ class MemoryOnboardingStore implements ProfileOnboardingStateStore {
   ): Promise<boolean> {
     if (this.record.status) return false;
     this.record = {
-      status: "prompted",
+      status: "prompt_pending",
       group_id_hex: groupIdHex,
       ...(suggestedName ? { suggested_name: suggestedName } : {}),
     };
     return true;
+  }
+
+  async markPrompted(
+    _accountIdHex: string,
+    groupIdHex: string,
+    suggestedName: string | undefined,
+  ): Promise<void> {
+    this.record = {
+      status: "prompted",
+      group_id_hex: groupIdHex,
+      ...(suggestedName ? { suggested_name: suggestedName } : {}),
+    };
+  }
+
+  async markPublishing(
+    _accountIdHex: string,
+    groupIdHex: string,
+    replyToMessageIdHex: string,
+    name: string,
+  ): Promise<void> {
+    this.record = {
+      status: "publishing",
+      group_id_hex: groupIdHex,
+      reply_to_message_id_hex: replyToMessageIdHex,
+      name,
+    };
   }
 
   async markPublished(_accountIdHex: string, name: string): Promise<void> {

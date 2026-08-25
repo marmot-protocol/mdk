@@ -134,7 +134,49 @@ describe("createMarmotMessageAdapter", () => {
     expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
   });
 
-  it("reuses the key for the same durable intent and degrades to a non-keyed send without one", async () => {
+  it("marks platform dispatch before connector I/O and reconciles unknown sends with the same key", async () => {
+    const calls = emptyClientCalls();
+    const order: string[] = [];
+    const client = stubClient(calls);
+    const originalSendFinal = client.sendFinal.bind(client);
+    client.sendFinal = async (...args) => {
+      order.push("connector");
+      return originalSendFinal(...args);
+    };
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client, marmotAccountIdHex: HEX32("aa") }),
+      nowMs: () => 1234,
+    });
+
+    await adapter.send!.text!({
+      cfg: {},
+      to: HEX32("cc"),
+      text: "normal path",
+      replyToId: HEX32("dd"),
+      deliveryQueueId: "queue-normal",
+      onPlatformSendDispatch: async () => {
+        order.push("dispatch");
+      },
+    } as unknown as ChannelMessageSendTextContext);
+
+    const reconciled = await adapter.durableFinal!.reconcileUnknownSend!({
+      cfg: {},
+      queueId: "queue-normal",
+      channel: "marmot",
+      to: HEX32("cc"),
+      enqueuedAt: 1,
+      retryCount: 1,
+      payloads: [{ text: "normal path" }],
+      effectiveReplyToId: HEX32("dd"),
+    });
+
+    expect(order).toEqual(["dispatch", "connector", "connector"]);
+    expect(reconciled.status).toBe("sent");
+    expect(calls.sendFinal).toHaveLength(2);
+    expect(calls.sendFinal[1]?.idempotencyKey).toBe(calls.sendFinal[0]?.idempotencyKey);
+  });
+
+  it("reuses the key for the same durable intent and fails closed without one", async () => {
     const calls = emptyClientCalls();
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
@@ -154,13 +196,14 @@ describe("createMarmotMessageAdapter", () => {
     expect(firstKey).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
     expect(calls.sendFinal.map((call) => call.idempotencyKey)).toEqual([firstKey, firstKey]);
 
-    await adapter.send!.text!({
-      cfg: {},
-      to: HEX32("cc"),
-      text: "missing durable identity",
-    } as unknown as ChannelMessageSendTextContext);
-    expect(calls.sendFinal).toHaveLength(3);
-    expect(calls.sendFinal[2]?.idempotencyKey).toBeUndefined();
+    await expect(
+      adapter.send!.text!({
+        cfg: {},
+        to: HEX32("cc"),
+        text: "missing durable identity",
+      } as unknown as ChannelMessageSendTextContext),
+    ).rejects.toThrow("requires OpenClaw delivery queue identity");
+    expect(calls.sendFinal).toHaveLength(2);
   });
 
   it("reuses the key for prefixed and unprefixed session ids", async () => {
@@ -203,15 +246,20 @@ describe("createMarmotMessageAdapter", () => {
       media: true,
       replyTo: true,
       messageSendingHooks: true,
+      reconcileUnknownSend: true,
     });
+    expect(adapter.durableFinal?.reconcileUnknownSendKinds).toEqual({ text: true });
+    expect(adapter.durableFinal?.reconcileUnknownSend).toBeTypeOf("function");
     const required = deriveDurableFinalDeliveryRequirements({
       payload: { text: "done" },
       replyToId: HEX32("dd"),
+      reconcileUnknownSend: true,
     });
     expect(required).toEqual({
       text: true,
       replyTo: true,
       messageSendingHooks: true,
+      reconcileUnknownSend: true,
     });
     expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);

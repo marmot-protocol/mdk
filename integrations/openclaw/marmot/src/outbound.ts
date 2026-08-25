@@ -17,6 +17,7 @@ import {
   defineChannelMessageAdapter,
   type ChannelMessageSendMediaContext,
   type ChannelMessageSendTextContext,
+  type ChannelMessageUnknownSendContext,
   type MessageReceipt,
   type MessageReceiptPart,
 } from "openclaw/plugin-sdk/channel-outbound";
@@ -358,6 +359,73 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
     return true;
   };
 
+  const sendDurableText = async (params: {
+    cfg: unknown;
+    accountId?: string | null;
+    to: string;
+    text: string;
+    replyToId?: string | null;
+    durableIntentId: string;
+    onPlatformSendDispatch?: () => Promise<void>;
+  }) => {
+    const { client, marmotAccountIdHex } = await deps.resolveTarget(
+      params.cfg,
+      params.accountId,
+    );
+    const idempotencyKey = deriveDurableFinalIdempotency({
+      sessionBinding: `openclaw:marmot:${normalizeHex(marmotAccountIdHex, "accountIdHex")}:${normalizeHex(params.to, "groupIdHex")}`,
+      turnBinding: params.durableIntentId,
+      accountIdHex: marmotAccountIdHex,
+      groupIdHex: params.to,
+      replyToMessageIdHex: params.replyToId ?? null,
+      text: params.text,
+    }).idempotencyKey;
+    await params.onPlatformSendDispatch?.();
+    const response = await client.sendFinal(
+      marmotAccountIdHex,
+      params.to,
+      params.text,
+      params.replyToId ?? null,
+      idempotencyKey,
+    );
+    sentTargets.recordAll(response.message_ids_hex, {
+      marmotAccountIdHex,
+      groupIdHex: params.to,
+    });
+    const receipt = receiptFromMessageIds(response.message_ids_hex, now());
+    markMarmotOutboundSent(params.accountId, receipt.sentAt);
+    return { receipt };
+  };
+
+  const reconcileUnknownTextSend = async (ctx: ChannelMessageUnknownSendContext) => {
+    const payload = ctx.payloads.length === 1 ? ctx.payloads[0] : undefined;
+    if (
+      !payload ||
+      typeof payload.text !== "string" ||
+      payload.mediaUrl ||
+      (payload.mediaUrls?.length ?? 0) > 0
+    ) {
+      return {
+        status: "unresolved" as const,
+        error: "marmot durable reconciliation supports one text-only payload",
+        retryable: false,
+      };
+    }
+    const result = await sendDurableText({
+      cfg: ctx.cfg,
+      accountId: ctx.accountId,
+      to: ctx.to,
+      text: payload.text,
+      replyToId: ctx.effectiveReplyToId ?? ctx.replyToId ?? payload.replyToId ?? null,
+      durableIntentId: ctx.queueId,
+    });
+    return {
+      status: "sent" as const,
+      receipt: result.receipt,
+      messageId: result.receipt.primaryPlatformMessageId,
+    };
+  };
+
   const adapter = defineChannelMessageAdapter({
     id: "marmot",
     durableFinal: {
@@ -368,39 +436,27 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
         media: true,
         replyTo: true,
         messageSendingHooks: true,
+        reconcileUnknownSend: true,
       },
+      reconcileUnknownSendKinds: { text: true },
+      reconcileUnknownSend: reconcileUnknownTextSend,
     },
     send: {
       text: async (ctx: ChannelMessageSendTextContext) => {
-        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
-        const durableIntentId = ctx.deliveryQueueId;
-        // Older OpenClaw hosts omit this optional field. Preserve their legacy
-        // non-keyed send path; only retries carrying one stable host intent may
-        // opt into connector deduplication.
-        const idempotencyKey = durableIntentId
-          ? deriveDurableFinalIdempotency({
-              sessionBinding: `openclaw:marmot:${normalizeHex(marmotAccountIdHex, "accountIdHex")}:${normalizeHex(ctx.to, "groupIdHex")}`,
-              turnBinding: durableIntentId,
-              accountIdHex: marmotAccountIdHex,
-              groupIdHex: ctx.to,
-              replyToMessageIdHex: ctx.replyToId ?? null,
-              text: ctx.text,
-            }).idempotencyKey
-          : undefined;
-        const response = await client.sendFinal(
-          marmotAccountIdHex,
-          ctx.to,
-          ctx.text,
-          ctx.replyToId ?? null,
-          idempotencyKey,
-        );
-        sentTargets.recordAll(response.message_ids_hex, {
-          marmotAccountIdHex,
-          groupIdHex: ctx.to,
+        if (!ctx.deliveryQueueId) {
+          throw new Error(
+            "marmot: durable text send requires OpenClaw delivery queue identity",
+          );
+        }
+        return sendDurableText({
+          cfg: ctx.cfg,
+          accountId: ctx.accountId,
+          to: ctx.to,
+          text: ctx.text,
+          replyToId: ctx.replyToId ?? null,
+          durableIntentId: ctx.deliveryQueueId,
+          onPlatformSendDispatch: ctx.onPlatformSendDispatch,
         });
-        const receipt = receiptFromMessageIds(response.message_ids_hex, now());
-        markMarmotOutboundSent(ctx.accountId, receipt.sentAt);
-        return { receipt };
       },
       media: async (ctx: ChannelMessageSendMediaContext) => {
         const resolved = await resolveOutboundMediaUpload(ctx, writeTempMedia);

@@ -108,13 +108,20 @@ export function parseProfileNameReply(text: string): ProfileNameReply {
 
 // --- persisted per-account status ------------------------------------------
 
-export type OnboardingStatus = "profile_exists" | "prompted" | "published" | "skipped";
+export type OnboardingStatus =
+  | "profile_exists"
+  | "prompt_pending"
+  | "prompted"
+  | "publishing"
+  | "published"
+  | "skipped";
 
 export interface OnboardingRecord {
   status: OnboardingStatus;
   group_id_hex?: string;
   name?: string;
   suggested_name?: string;
+  reply_to_message_id_hex?: string;
 }
 
 /** State store interface (the runtime uses the file-backed impl; tests stub it). */
@@ -126,6 +133,17 @@ export interface ProfileOnboardingStateStore {
     groupIdHex: string,
     suggestedName: string | undefined,
   ): Promise<boolean>;
+  markPrompted(
+    accountIdHex: string,
+    groupIdHex: string,
+    suggestedName: string | undefined,
+  ): Promise<void>;
+  markPublishing(
+    accountIdHex: string,
+    groupIdHex: string,
+    replyToMessageIdHex: string,
+    name: string,
+  ): Promise<void>;
   markPublished(accountIdHex: string, name: string): Promise<void>;
   markSkipped(accountIdHex: string): Promise<void>;
   markProfileExists(accountIdHex: string): Promise<void>;
@@ -195,7 +213,7 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
         return false;
       }
       data.accounts[accountIdHex] = {
-        status: "prompted",
+        status: "prompt_pending",
         group_id_hex: groupIdHex,
         ...(suggestedName ? { suggested_name: suggestedName } : {}),
       };
@@ -209,6 +227,32 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
       const data = await this.load();
       data.accounts[accountIdHex] = record;
       await this.persist(data);
+    });
+  }
+
+  markPrompted(
+    accountIdHex: string,
+    groupIdHex: string,
+    suggestedName: string | undefined,
+  ): Promise<void> {
+    return this.set(accountIdHex, {
+      status: "prompted",
+      group_id_hex: groupIdHex,
+      ...(suggestedName ? { suggested_name: suggestedName } : {}),
+    });
+  }
+
+  markPublishing(
+    accountIdHex: string,
+    groupIdHex: string,
+    replyToMessageIdHex: string,
+    name: string,
+  ): Promise<void> {
+    return this.set(accountIdHex, {
+      status: "publishing",
+      group_id_hex: groupIdHex,
+      reply_to_message_id_hex: replyToMessageIdHex,
+      name,
     });
   }
 
@@ -408,12 +452,12 @@ async function sendProfilePrompt(deps: {
   logger?: OnboardingLogger;
 }): Promise<boolean> {
   const current = await deps.store.get(deps.accountIdHex);
-  if (current.status && current.status !== "prompted") {
+  if (current.status && current.status !== "prompt_pending") {
     return false;
   }
 
   let suggested: string | undefined;
-  if (current.status === "prompted") {
+  if (current.status === "prompt_pending") {
     if (current.group_id_hex !== deps.groupIdHex) {
       return false;
     }
@@ -443,6 +487,7 @@ async function sendProfilePrompt(deps: {
       groupIdHex: deps.groupIdHex,
       text: buildProfilePrompt(suggested),
     });
+    await deps.store.markPrompted(deps.accountIdHex, deps.groupIdHex, suggested);
     deps.logger?.info?.("marmot: profile onboarding prompt sent");
     return true;
   } catch {
@@ -485,16 +530,22 @@ async function publishAndConfirm(
   onboardingSessionBinding(message.accountIdHex, message.groupIdHex);
   normalizeHex(message.messageIdHex, "replyToMessageIdHex");
 
+  // Persist the exact publication intent before the external kind:0 side
+  // effect. If connector success is followed by a local write failure, later
+  // inbound messages recover this intent instead of publishing twice.
+  await store.markPublishing(
+    message.accountIdHex,
+    message.groupIdHex,
+    message.messageIdHex,
+    name,
+  );
+
   try {
     await client.accountPublishProfile(message.accountIdHex, name, name);
   } catch {
-    await sendOnboardingFinal(client, {
-      accountIdHex: message.accountIdHex,
-      groupIdHex: message.groupIdHex,
-      text: PROFILE_NAME_PUBLISH_FAILED,
-      replyToMessageIdHex: message.messageIdHex,
-      responseKind: "profile-publish-failed",
-    });
+    // The connector outcome may be ambiguous. Keep the durable publishing
+    // intent and reconcile by live-profile lookup on a later inbound message;
+    // never reopen consent handling based on an uncertain external result.
     logger?.warn?.("marmot: profile name publish failed");
     return;
   }
@@ -502,14 +553,8 @@ async function publishAndConfirm(
   try {
     await store.markPublished(message.accountIdHex, name);
   } catch {
-    // Publication has already succeeded. Retry only the local bookkeeping; a
-    // storage failure must never turn a live profile into a contradictory
-    // profile-publish-failed response.
-    try {
-      await store.markPublished(message.accountIdHex, name);
-    } catch {
-      logger?.warn?.("marmot: profile published but local state not recorded");
-    }
+    logger?.warn?.("marmot: profile published but local state not recorded");
+    return;
   }
 
   const confirmation = {
@@ -559,6 +604,66 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
     record.status === "skipped"
   ) {
     return false;
+  }
+
+  if (record.status === "prompt_pending") {
+    // This message cannot be consent because no prompt has been durably
+    // acknowledged. Retry the exact persisted prompt snapshot first.
+    return sendProfilePrompt({
+      store,
+      client,
+      lookupGate: deps.lookupGate,
+      accountIdHex: message.accountIdHex,
+      groupIdHex: message.groupIdHex,
+      configuredName: deps.configuredName,
+      logger,
+    });
+  }
+
+  if (record.status === "publishing") {
+    const groupIdHex = record.group_id_hex;
+    const replyToMessageIdHex = record.reply_to_message_id_hex;
+    const name = validProfileName(record.name);
+    if (!groupIdHex || !replyToMessageIdHex || !name) {
+      logger?.warn?.("marmot: invalid pending profile publication state");
+      return false;
+    }
+    if (groupIdHex !== message.groupIdHex) {
+      return false;
+    }
+    const lookupStatus = await (deps.lookupGate ?? profileLookupGateFor(store)).lookup(
+      message.accountIdHex,
+      () => client.accountLookupProfile(message.accountIdHex),
+    );
+    if (lookupStatus === "indeterminate") {
+      return false;
+    }
+    if (lookupStatus === "profile_not_found") {
+      try {
+        await client.accountPublishProfile(message.accountIdHex, name, name);
+      } catch {
+        logger?.warn?.("marmot: pending profile publication retry failed");
+        return true;
+      }
+    }
+    try {
+      await store.markPublished(message.accountIdHex, name);
+    } catch {
+      logger?.warn?.("marmot: published profile recovery state not recorded");
+      return true;
+    }
+    try {
+      await sendOnboardingFinal(client, {
+        accountIdHex: message.accountIdHex,
+        groupIdHex,
+        text: PROFILE_NAME_PUBLISHED.replace("{name}", name),
+        replyToMessageIdHex,
+        responseKind: "profile-published",
+      });
+    } catch {
+      logger?.warn?.("marmot: recovered profile confirmation not delivered");
+    }
+    return true;
   }
 
   if (record.status === "prompted") {

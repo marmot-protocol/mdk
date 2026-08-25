@@ -88,11 +88,35 @@ class MemStore implements ProfileOnboardingStateStore {
       return false;
     }
     this.rec = {
-      status: "prompted",
+      status: "prompt_pending",
       group_id_hex: groupIdHex,
       ...(suggestedName ? { suggested_name: suggestedName } : {}),
     };
     return true;
+  }
+  async markPrompted(
+    _account: string,
+    groupIdHex: string,
+    suggestedName: string | undefined,
+  ): Promise<void> {
+    this.rec = {
+      status: "prompted",
+      group_id_hex: groupIdHex,
+      ...(suggestedName ? { suggested_name: suggestedName } : {}),
+    };
+  }
+  async markPublishing(
+    _account: string,
+    groupIdHex: string,
+    replyToMessageIdHex: string,
+    name: string,
+  ): Promise<void> {
+    this.rec = {
+      status: "publishing",
+      group_id_hex: groupIdHex,
+      reply_to_message_id_hex: replyToMessageIdHex,
+      name,
+    };
   }
   async markPublished(_account: string, name: string): Promise<void> {
     this.rec = { status: "published", name };
@@ -326,7 +350,7 @@ describe("maybeSendProfilePromptOnJoin", () => {
       configuredName: "Marmot Bot",
     });
     expect(store.rec).toEqual({
-      status: "prompted",
+      status: "prompt_pending",
       group_id_hex: GROUP,
       suggested_name: "Marmot Bot",
     });
@@ -428,7 +452,7 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
   });
 
-  it("retries local published-state persistence without sending publish-failed", async () => {
+  it("recovers a successful publication from the live profile before handling more input", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
     store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
@@ -446,18 +470,89 @@ describe("maybeHandleProfileOnboardingInbound", () => {
       message: msg("yes"),
     });
 
+    expect(calls.publish).toHaveLength(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toMatchObject({ status: "publishing", name: "Marmot Bot" });
+
+    const recoveredClient = stubClient(calls, { profileStatus: "profile_found" });
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client: recoveredClient,
+      message: { ...msg("skip"), messageIdHex: HEX("22") },
+    });
+
+    expect(calls.publish).toHaveLength(1);
     expect(persistenceAttempts).toBe(2);
     expect(calls.sendFinal).toEqual([
       PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot"),
     ]);
-    expect(calls.sendFinal).not.toContain(PROFILE_NAME_PUBLISH_FAILED);
+    expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
   });
 
-  it("still confirms publication after published-state persistence fails twice", async () => {
+  it("retries the persisted publication after an authoritative profile-not-found lookup", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    };
+
+    const intercepted = await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls, { profileStatus: "profile_not_found" }),
+      message: { ...msg("ordinary text"), messageIdHex: HEX("22") },
+    });
+
+    expect(intercepted).toBe(true);
+    expect(calls.publish).toEqual([{ name: "Marmot Bot", displayName: "Marmot Bot" }]);
+    expect(calls.sendFinal).toEqual([
+      PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot"),
+    ]);
+    expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
+  });
+
+  it("does not consume unrelated or indeterminate inbound messages while publishing", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    };
+
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client: stubClient(calls, { profileStatus: "profile_found" }),
+        message: msg("unrelated", HEX("dd")),
+      }),
+    ).toBe(false);
+    expect(calls.lookup).toBe(0);
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client: stubClient(calls, { profileStatus: "indeterminate" }),
+        lookupGate: new ProfileLookupGate({ backoffMs: [0] }),
+        message: msg("same group"),
+      }),
+    ).toBe(false);
+    expect(calls.publish).toEqual([]);
+    expect(store.rec.status).toBe("publishing");
+  });
+
+  it("keeps the publishing guard when recovery state cannot be persisted", async () => {
     const calls = emptyCalls();
     const warnings: string[] = [];
     const store = new MemStore();
-    store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
+    store.rec = {
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    };
     store.markPublished = async () => {
       throw new Error("storage unavailable");
     };
@@ -465,16 +560,16 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(
       await maybeHandleProfileOnboardingInbound({
         store,
-        client: stubClient(calls),
-        message: msg("yes"),
+        client: stubClient(calls, { profileStatus: "profile_found" }),
+        message: { ...msg("skip"), messageIdHex: HEX("22") },
         logger: { warn: (message) => warnings.push(message) },
       }),
     ).toBe(true);
 
-    expect(calls.sendFinal).toEqual([
-      PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot"),
-    ]);
-    expect(warnings).toEqual(["marmot: profile published but local state not recorded"]);
+    expect(calls.publish).toEqual([]);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec.status).toBe("publishing");
+    expect(warnings).toEqual(["marmot: published profile recovery state not recorded"]);
   });
 
   it("returns normally after two published-confirmation failures", async () => {
@@ -580,7 +675,7 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(calls.publish).toEqual([]);
   });
 
-  it("stays prompted and reports failure when publish throws", async () => {
+  it("keeps a durable publishing guard when the connector result is ambiguous", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
     store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
@@ -589,8 +684,13 @@ describe("maybeHandleProfileOnboardingInbound", () => {
       client: stubClient(calls, { failPublish: true }),
       message: msg("yes"),
     });
-    expect(calls.sendFinal).toEqual([PROFILE_NAME_PUBLISH_FAILED]);
-    expect(store.rec.status).toBe("prompted");
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toMatchObject({
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    });
   });
 
   it("falls back to prompting on a first message when no status exists", async () => {
@@ -606,6 +706,32 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(calls.publish).toEqual([]);
     expect(calls.sendFinal).toEqual([buildProfilePrompt("Marmot Bot")]);
     expect(store.rec).toMatchObject({ status: "prompted", suggested_name: "Marmot Bot" });
+  });
+
+  it("retries a pending prompt before treating inbound text as consent", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "prompt_pending",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    };
+
+    const intercepted = await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls),
+      message: msg("yes"),
+      configuredName: "Changed Name",
+    });
+
+    expect(intercepted).toBe(true);
+    expect(calls.publish).toEqual([]);
+    expect(calls.sendFinal).toEqual([buildProfilePrompt("Marmot Bot")]);
+    expect(store.rec).toEqual({
+      status: "prompted",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    });
   });
 
   it("does not intercept a reply that arrives in a different conversation", async () => {
@@ -657,11 +783,20 @@ describe("ProfileNameOnboardingStore", () => {
     // a racing second claim is rejected
     expect(await store.tryClaimPrompt(ACCOUNT, GROUP, "Other")).toBe(false);
     expect(await store.get(ACCOUNT)).toEqual({
-      status: "prompted",
+      status: "prompt_pending",
       group_id_hex: GROUP,
       suggested_name: "Marmot Bot",
     });
 
+    await store.markPrompted(ACCOUNT, GROUP, "Marmot Bot");
+    expect(await store.get(ACCOUNT)).toMatchObject({ status: "prompted" });
+    await store.markPublishing(ACCOUNT, GROUP, MSG, "Ada");
+    expect(await store.get(ACCOUNT)).toEqual({
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Ada",
+    });
     await store.markPublished(ACCOUNT, "Ada");
     const reopened = new ProfileNameOnboardingStore(path);
     expect(await reopened.get(ACCOUNT)).toEqual({ status: "published", name: "Ada" });
