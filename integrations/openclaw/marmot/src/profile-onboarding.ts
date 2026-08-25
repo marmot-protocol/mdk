@@ -12,6 +12,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { normalizeHex } from "./client.js";
 import { deriveDurableFinalIdempotency } from "./durable-final-idempotency.js";
 
 export const MAX_PROFILE_NAME_CHARS = 80;
@@ -128,7 +129,7 @@ export interface ProfileOnboardingStateStore {
   markPublished(accountIdHex: string, name: string): Promise<void>;
   markSkipped(accountIdHex: string): Promise<void>;
   markProfileExists(accountIdHex: string): Promise<void>;
-  /** Reset an account's record (used to retry after a prompt send fails). */
+  /** Reset an account's record for explicit recovery/testing. */
   clear(accountIdHex: string): Promise<void>;
 }
 
@@ -353,12 +354,8 @@ type OnboardingResponseKind =
   | "profile-name-required"
   | "profile-invalid";
 
-function canonicalOnboardingHex(value: string): string {
-  return value.trim().replace(/^0x/i, "").toLowerCase();
-}
-
 function onboardingSessionBinding(accountIdHex: string, groupIdHex: string): string {
-  return `openclaw:marmot:onboarding:${canonicalOnboardingHex(accountIdHex)}:${canonicalOnboardingHex(groupIdHex)}`;
+  return `openclaw:marmot:onboarding:${normalizeHex(accountIdHex, "accountIdHex")}:${normalizeHex(groupIdHex, "groupIdHex")}`;
 }
 
 async function sendOnboardingFinal(
@@ -374,7 +371,7 @@ async function sendOnboardingFinal(
   const replyToMessageIdHex = input.replyToMessageIdHex ?? null;
   const replyTurnBinding = replyToMessageIdHex == null
     ? null
-    : canonicalOnboardingHex(replyToMessageIdHex);
+    : normalizeHex(replyToMessageIdHex, "replyToMessageIdHex");
   const turnBinding = input.responseKind
     ? `profile-response:v1:${replyTurnBinding}:${input.responseKind}`
     : "profile-prompt:v1";
@@ -398,7 +395,8 @@ async function sendOnboardingFinal(
 /**
  * Send the one-time profile prompt for an account, claiming the prompt slot
  * atomically first so a join event and a racing first message can't double-ask.
- * No-op once any status (prompted/published/skipped) exists.
+ * A previously claimed prompt retries its persisted snapshot, so configuration
+ * changes cannot alter the durable key after an ambiguous send result.
  */
 async function sendProfilePrompt(deps: {
   store: ProfileOnboardingStateStore;
@@ -410,26 +408,34 @@ async function sendProfilePrompt(deps: {
   logger?: OnboardingLogger;
 }): Promise<boolean> {
   const current = await deps.store.get(deps.accountIdHex);
-  if (current.status) {
+  if (current.status && current.status !== "prompted") {
     return false;
   }
 
-  const lookupStatus = await (deps.lookupGate ?? profileLookupGateFor(deps.store)).lookup(
-    deps.accountIdHex,
-    () => deps.client.accountLookupProfile(deps.accountIdHex),
-  );
-  if (lookupStatus === "profile_found") {
-    await deps.store.markProfileExists(deps.accountIdHex);
-    return false;
-  }
-  if (lookupStatus === "indeterminate") {
-    return false;
-  }
+  let suggested: string | undefined;
+  if (current.status === "prompted") {
+    if (current.group_id_hex !== deps.groupIdHex) {
+      return false;
+    }
+    suggested = validProfileName(current.suggested_name);
+  } else {
+    const lookupStatus = await (deps.lookupGate ?? profileLookupGateFor(deps.store)).lookup(
+      deps.accountIdHex,
+      () => deps.client.accountLookupProfile(deps.accountIdHex),
+    );
+    if (lookupStatus === "profile_found") {
+      await deps.store.markProfileExists(deps.accountIdHex);
+      return false;
+    }
+    if (lookupStatus === "indeterminate") {
+      return false;
+    }
 
-  const suggested = validProfileName(deps.configuredName);
-  const claimed = await deps.store.tryClaimPrompt(deps.accountIdHex, deps.groupIdHex, suggested);
-  if (!claimed) {
-    return false;
+    suggested = validProfileName(deps.configuredName);
+    const claimed = await deps.store.tryClaimPrompt(deps.accountIdHex, deps.groupIdHex, suggested);
+    if (!claimed) {
+      return false;
+    }
   }
   try {
     await sendOnboardingFinal(deps.client, {
@@ -440,8 +446,8 @@ async function sendProfilePrompt(deps: {
     deps.logger?.info?.("marmot: profile onboarding prompt sent");
     return true;
   } catch {
-    // Could not deliver the prompt; release the slot so a later trigger retries.
-    await deps.store.clear(deps.accountIdHex).catch(() => undefined);
+    // Preserve the claimed prompt snapshot so a later trigger retries the same
+    // text and idempotency key after an ambiguous connector result.
     deps.logger?.warn?.("marmot: failed to send profile onboarding prompt");
     return false;
   }
@@ -474,17 +480,13 @@ async function publishAndConfirm(
   name: string,
   logger?: OnboardingLogger,
 ): Promise<void> {
+  // Validate every identifier that will bind the durable confirmation before
+  // publishing the external kind:0 side effect.
+  onboardingSessionBinding(message.accountIdHex, message.groupIdHex);
+  normalizeHex(message.messageIdHex, "replyToMessageIdHex");
+
   try {
     await client.accountPublishProfile(message.accountIdHex, name, name);
-    await store.markPublished(message.accountIdHex, name);
-    await sendOnboardingFinal(client, {
-      accountIdHex: message.accountIdHex,
-      groupIdHex: message.groupIdHex,
-      text: PROFILE_NAME_PUBLISHED.replace("{name}", name),
-      replyToMessageIdHex: message.messageIdHex,
-      responseKind: "profile-published",
-    });
-    logger?.info?.("marmot: profile name published");
   } catch {
     await sendOnboardingFinal(client, {
       accountIdHex: message.accountIdHex,
@@ -494,7 +496,44 @@ async function publishAndConfirm(
       responseKind: "profile-publish-failed",
     });
     logger?.warn?.("marmot: profile name publish failed");
+    return;
   }
+
+  try {
+    await store.markPublished(message.accountIdHex, name);
+  } catch {
+    // Publication has already succeeded. Retry only the local bookkeeping; a
+    // storage failure must never turn a live profile into a contradictory
+    // profile-publish-failed response.
+    try {
+      await store.markPublished(message.accountIdHex, name);
+    } catch {
+      logger?.warn?.("marmot: profile published but local state not recorded");
+    }
+  }
+
+  const confirmation = {
+    accountIdHex: message.accountIdHex,
+    groupIdHex: message.groupIdHex,
+    text: PROFILE_NAME_PUBLISHED.replace("{name}", name),
+    replyToMessageIdHex: message.messageIdHex,
+    responseKind: "profile-published" as const,
+  };
+  try {
+    await sendOnboardingFinal(client, confirmation);
+  } catch {
+    // A response can be lost after the connector commits the durable send. The
+    // derived key is stable, so retry only this confirmation and let wn-agent
+    // return the first committed result instead of sending a contradictory
+    // profile-publish-failed response.
+    try {
+      await sendOnboardingFinal(client, confirmation);
+    } catch {
+      logger?.warn?.("marmot: profile published but confirmation not delivered");
+      return;
+    }
+  }
+  logger?.info?.("marmot: profile name published");
 }
 
 /**

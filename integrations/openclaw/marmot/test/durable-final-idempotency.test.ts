@@ -33,4 +33,40 @@ describe("deriveDurableFinalIdempotency", () => {
       }),
     ).toThrow("turnBinding must not be empty");
   });
+
+  it("derives the same key for equivalent prefixed and unprefixed hex ids", () => {
+    const lower = deriveDurableFinalIdempotency({
+      accountIdHex: "aa",
+      groupIdHex: "bb",
+      text: "pong",
+      replyToMessageIdHex: "cc",
+      sessionBinding: "agent:marmot",
+      turnBinding: "turn",
+    });
+    const prefixedUpper = deriveDurableFinalIdempotency({
+      accountIdHex: "0xAA",
+      groupIdHex: "0XBB",
+      text: "pong",
+      replyToMessageIdHex: "0xCC",
+      sessionBinding: "agent:marmot",
+      turnBinding: "turn",
+    });
+
+    expect(prefixedUpper).toEqual(lower);
+  });
+
+  it("rejects non-string text without coercion while allowing an empty string", () => {
+    const base = {
+      accountIdHex: "aa",
+      groupIdHex: "bb",
+      replyToMessageIdHex: null,
+      sessionBinding: "agent:marmot",
+      turnBinding: "turn",
+    };
+
+    expect(() => deriveDurableFinalIdempotency({ ...base, text: undefined as unknown as string }))
+      .toThrow("text must be a string");
+    expect(deriveDurableFinalIdempotency({ ...base, text: "" }).contentFingerprint)
+      .toMatch(/^[0-9a-f]{64}$/);
+  });
 });

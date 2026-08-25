@@ -38,5 +38,8 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      openclaw:
+        patterns: ["openclaw"]
       openclaw-plugin:
         patterns: ["*"]
+        exclude-patterns: ["openclaw"]

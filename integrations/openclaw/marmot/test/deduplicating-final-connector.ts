@@ -1,4 +1,4 @@
-import { AgentControlError } from "../src/client.js";
+import { AgentControlError, normalizeHex } from "../src/client.js";
 
 export interface RecordedEncryptedKind9Post {
   accountIdHex: string;
@@ -37,10 +37,10 @@ export class DeduplicatingFinalConnector {
   ): Promise<{ type: "final_sent"; message_ids_hex: string[] }> {
     const replyTo = replyToMessageIdHex ?? null;
     const fingerprint = JSON.stringify([
-      accountIdHex.toLowerCase(),
-      groupIdHex.toLowerCase(),
+      normalizeHex(accountIdHex, "accountIdHex"),
+      normalizeHex(groupIdHex, "groupIdHex"),
       text,
-      replyTo?.toLowerCase() ?? null,
+      replyTo == null ? null : normalizeHex(replyTo, "replyToMessageIdHex"),
     ]);
     const completed = idempotencyKey ? this.completed.get(idempotencyKey) : undefined;
     if (completed?.fingerprint === fingerprint) {

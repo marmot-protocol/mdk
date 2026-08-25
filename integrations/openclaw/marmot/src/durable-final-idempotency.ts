@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { normalizeHex } from "./client.js";
+
 const IDEMPOTENCY_KEY_PREFIX = "marmot-final-v1:";
 
 export interface DurableFinalIdempotencyInput {
@@ -22,18 +24,6 @@ function requireNonEmpty(value: string, field: string): string {
     throw new TypeError(`${field} must not be empty`);
   }
   return value;
-}
-
-function normalizeHex(value: string, field: string): string {
-  let normalized = requireNonEmpty(value, field).trim();
-  if (/^0x/i.test(normalized)) {
-    normalized = normalized.slice(2);
-  }
-  normalized = normalized.toLowerCase();
-  if (normalized.length === 0 || normalized.length % 2 !== 0 || !/^[0-9a-f]+$/.test(normalized)) {
-    throw new TypeError(`${field} must be non-empty even-length hexadecimal`);
-  }
-  return normalized;
 }
 
 function normalizeReplyAnchor(value?: string | null): string | null {
@@ -75,7 +65,10 @@ export function deriveDurableFinalIdempotency(
   const accountIdHex = normalizeHex(input.accountIdHex, "accountIdHex");
   const groupIdHex = normalizeHex(input.groupIdHex, "groupIdHex");
   const replyAnchor = normalizeReplyAnchor(input.replyToMessageIdHex);
-  const text = String(input.text ?? "");
+  if (typeof input.text !== "string") {
+    throw new TypeError("text must be a string");
+  }
+  const text = input.text;
   rejectUnpairedSurrogates(text);
 
   const contentFingerprint = sha256Hex(

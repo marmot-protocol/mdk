@@ -27,7 +27,7 @@ import {
 import { readLocalFileFromRoots } from "openclaw/plugin-sdk/infra-runtime";
 import { getDefaultLocalRoots, LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 
-import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
+import { normalizeHex, type AgentControlMediaUpload, type MarmotAgentControlClient } from "./client.js";
 import { deriveDurableFinalIdempotency } from "./durable-final-idempotency.js";
 import { markMarmotOutboundSent } from "./runtime-state.js";
 
@@ -340,19 +340,19 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
       text: async (ctx: ChannelMessageSendTextContext) => {
         const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
         const durableIntentId = ctx.deliveryQueueId;
-        if (!durableIntentId) {
-          throw new Error(
-            "marmot: durable final send requires OpenClaw deliveryQueueId for idempotency",
-          );
-        }
-        const { idempotencyKey } = deriveDurableFinalIdempotency({
-          sessionBinding: `openclaw:marmot:${marmotAccountIdHex.toLowerCase()}:${ctx.to.toLowerCase()}`,
-          turnBinding: durableIntentId,
-          accountIdHex: marmotAccountIdHex,
-          groupIdHex: ctx.to,
-          replyToMessageIdHex: ctx.replyToId ?? null,
-          text: ctx.text,
-        });
+        // Older OpenClaw hosts omit this optional field. Preserve their legacy
+        // non-keyed send path; only retries carrying one stable host intent may
+        // opt into connector deduplication.
+        const idempotencyKey = durableIntentId
+          ? deriveDurableFinalIdempotency({
+              sessionBinding: `openclaw:marmot:${normalizeHex(marmotAccountIdHex, "accountIdHex")}:${normalizeHex(ctx.to, "groupIdHex")}`,
+              turnBinding: durableIntentId,
+              accountIdHex: marmotAccountIdHex,
+              groupIdHex: ctx.to,
+              replyToMessageIdHex: ctx.replyToId ?? null,
+              text: ctx.text,
+            }).idempotencyKey
+          : undefined;
         const response = await client.sendFinal(
           marmotAccountIdHex,
           ctx.to,

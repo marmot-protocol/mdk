@@ -133,7 +133,7 @@ describe("createMarmotMessageAdapter", () => {
     expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
   });
 
-  it("reuses the key for the same durable intent and fails closed without one", async () => {
+  it("reuses the key for the same durable intent and degrades to a non-keyed send without one", async () => {
     const calls = emptyClientCalls();
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
@@ -153,14 +153,43 @@ describe("createMarmotMessageAdapter", () => {
     expect(firstKey).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
     expect(calls.sendFinal.map((call) => call.idempotencyKey)).toEqual([firstKey, firstKey]);
 
-    await expect(
-      adapter.send!.text!({
-        cfg: {},
-        to: HEX32("cc"),
-        text: "missing durable identity",
-      } as unknown as ChannelMessageSendTextContext),
-    ).rejects.toThrow("requires OpenClaw deliveryQueueId");
-    expect(calls.sendFinal).toHaveLength(2);
+    await adapter.send!.text!({
+      cfg: {},
+      to: HEX32("cc"),
+      text: "missing durable identity",
+    } as unknown as ChannelMessageSendTextContext);
+    expect(calls.sendFinal).toHaveLength(3);
+    expect(calls.sendFinal[2]?.idempotencyKey).toBeUndefined();
+  });
+
+  it("reuses the key for prefixed and unprefixed session ids", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: (cfg) => ({
+        client: stubClient(calls),
+        marmotAccountIdHex: (cfg as { prefixed?: boolean }).prefixed
+          ? `0x${HEX32("aa").toUpperCase()}`
+          : HEX32("aa"),
+      }),
+    });
+    const base = {
+      text: "retry-safe",
+      replyToId: HEX32("dd"),
+      deliveryQueueId: "turn-canonical:0",
+    };
+
+    await adapter.send!.text!({
+      ...base,
+      cfg: { prefixed: true },
+      to: `0X${HEX32("cc").toUpperCase()}`,
+    } as unknown as ChannelMessageSendTextContext);
+    await adapter.send!.text!({
+      ...base,
+      cfg: {},
+      to: HEX32("cc"),
+    } as unknown as ChannelMessageSendTextContext);
+
+    expect(calls.sendFinal[1]?.idempotencyKey).toBe(calls.sendFinal[0]?.idempotencyKey);
   });
 
   it("declares the capabilities required by OpenClaw durable inbound delivery", () => {

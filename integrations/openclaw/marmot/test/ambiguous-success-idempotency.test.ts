@@ -57,6 +57,29 @@ class MemoryOnboardingStore implements ProfileOnboardingStateStore {
 }
 
 describe("retry after ambiguous send_final success", () => {
+  it("deduplicates equivalent prefixed and unprefixed hexadecimal ids", async () => {
+    const connector = new DeduplicatingFinalConnector();
+    const idempotencyKey = "stable-key";
+
+    const first = await connector.sendFinal(
+      `0x${ACCOUNT.toUpperCase()}`,
+      `0x${GROUP.toUpperCase()}`,
+      "same durable result",
+      `0x${FIRST_REPLY.toUpperCase()}`,
+      idempotencyKey,
+    );
+    const second = await connector.sendFinal(
+      ACCOUNT,
+      GROUP,
+      "same durable result",
+      FIRST_REPLY,
+      idempotencyKey,
+    );
+
+    expect(second).toEqual(first);
+    expect(connector.encryptedKind9Posts).toHaveLength(1);
+  });
+
   it("reuses the outbound key so connector dedup publishes one encrypted kind-9", async () => {
     const connector = new DeduplicatingFinalConnector();
     const adapter = createMarmotMessageAdapter({
@@ -109,19 +132,21 @@ describe("retry after ambiguous send_final success", () => {
       sendFinal: connector.sendFinal.bind(connector),
       accountPublishProfile: async () => ({ type: "profile_published" }),
     };
-    const triggerPrompt = () =>
+    const triggerPrompt = (configuredName: string | null = null) =>
       maybeSendProfilePromptOnJoin({
         store,
         client,
         accountIdHex: ACCOUNT,
         groupIdHex: GROUP,
-        configuredName: null,
+        configuredName,
       });
 
     connector.armPostSuccessDisconnect();
-    expect(await triggerPrompt()).toBe(false);
-    expect(await triggerPrompt()).toBe(true);
+    expect(await triggerPrompt("Original Name")).toBe(false);
+    expect(await triggerPrompt("Changed Name")).toBe(true);
     expect(connector.encryptedKind9Posts).toHaveLength(1);
+    expect(connector.encryptedKind9Posts[0]?.text).toContain('"Original Name"');
+    expect(connector.encryptedKind9Posts[0]?.text).not.toContain('"Changed Name"');
 
     const firstReply = {
       accountIdHex: ACCOUNT,
@@ -130,24 +155,19 @@ describe("retry after ambiguous send_final success", () => {
       text: "yes",
     };
     connector.armPostSuccessDisconnect();
-    await expect(
-      maybeHandleProfileOnboardingInbound({ store, client, message: firstReply }),
-    ).rejects.toMatchObject({ code: "connection_closed", retryable: true });
-    await maybeHandleProfileOnboardingInbound({ store, client, message: firstReply });
+    expect(
+      await maybeHandleProfileOnboardingInbound({ store, client, message: firstReply }),
+    ).toBe(true);
     expect(connector.encryptedKind9Posts).toHaveLength(2);
+    expect(connector.encryptedKind9Posts[1]?.replyToMessageIdHex).toBe(FIRST_REPLY);
 
-    await maybeHandleProfileOnboardingInbound({
-      store,
-      client,
-      message: { ...firstReply, messageIdHex: SECOND_REPLY },
-    });
-    expect(connector.encryptedKind9Posts).toHaveLength(3);
-    expect(connector.encryptedKind9Posts.slice(1).map((post) => post.replyToMessageIdHex)).toEqual([
-      FIRST_REPLY,
-      SECOND_REPLY,
-    ]);
-    expect(connector.encryptedKind9Posts[2]?.idempotencyKey).not.toBe(
-      connector.encryptedKind9Posts[1]?.idempotencyKey,
-    );
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client,
+        message: { ...firstReply, messageIdHex: SECOND_REPLY },
+      }),
+    ).toBe(false);
+    expect(connector.encryptedKind9Posts).toHaveLength(2);
   });
 });
