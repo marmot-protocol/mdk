@@ -8,6 +8,7 @@ import {
   type ChannelMessageSendMediaContext,
   type ChannelMessageSendTextContext,
 } from "openclaw/plugin-sdk/channel-outbound";
+import { getMediaDir } from "openclaw/plugin-sdk/media-runtime";
 
 import type {
   AgentControlMediaUpload,
@@ -36,6 +37,7 @@ interface SendFinalCall {
   groupIdHex: string;
   text: string;
   replyToMessageIdHex?: string | null;
+  idempotencyKey?: string;
 }
 
 interface SendMediaCall {
@@ -69,8 +71,15 @@ function stubClient(calls: ClientCalls, messageIdsHex: string[] = [HEX32("ab")])
       groupIdHex: string,
       text: string,
       replyToMessageIdHex?: string | null,
+      idempotencyKey?: string,
     ) {
-      calls.sendFinal.push({ accountIdHex, groupIdHex, text, replyToMessageIdHex });
+      calls.sendFinal.push({
+        accountIdHex,
+        groupIdHex,
+        text,
+        replyToMessageIdHex,
+        idempotencyKey,
+      });
       return { type: "final_sent", message_ids_hex: messageIdsHex };
     },
     async sendMedia(
@@ -105,6 +114,7 @@ describe("createMarmotMessageAdapter", () => {
       to: HEX32("cc"),
       text: "done",
       replyToId: HEX32("dd"),
+      deliveryQueueId: "turn-123:0",
     } as unknown as ChannelMessageSendTextContext;
 
     const result = await adapter.send!.text!(ctx);
@@ -115,12 +125,120 @@ describe("createMarmotMessageAdapter", () => {
       groupIdHex: HEX32("cc"),
       text: "done",
       replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: expect.stringMatching(/^marmot-final-v1:[0-9a-f]{64}$/),
     });
     expect(result.receipt.primaryPlatformMessageId).toBe(HEX32("ab"));
     expect(result.receipt.platformMessageIds).toEqual([HEX32("ab")]);
     expect(result.receipt.parts[0]).toMatchObject({ kind: "text", index: 0 });
     expect(result.receipt.sentAt).toBe(1234);
     expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
+  });
+
+  it("marks platform dispatch before connector I/O and reconciles unknown sends with the same key", async () => {
+    const calls = emptyClientCalls();
+    const order: string[] = [];
+    const client = stubClient(calls);
+    const originalSendFinal = client.sendFinal.bind(client);
+    client.sendFinal = async (...args) => {
+      order.push("connector");
+      return originalSendFinal(...args);
+    };
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client, marmotAccountIdHex: HEX32("aa") }),
+      nowMs: () => 1234,
+    });
+
+    await adapter.send!.text!({
+      cfg: {},
+      to: HEX32("cc"),
+      text: "normal path",
+      replyToId: HEX32("dd"),
+      deliveryQueueId: "queue-normal",
+      onPlatformSendDispatch: async () => {
+        order.push("dispatch");
+      },
+    } as unknown as ChannelMessageSendTextContext);
+
+    const reconciled = await adapter.durableFinal!.reconcileUnknownSend!({
+      cfg: {},
+      queueId: "queue-normal",
+      channel: "marmot",
+      to: HEX32("cc"),
+      enqueuedAt: 1,
+      retryCount: 1,
+      payloads: [{ text: "normal path" }],
+      // OpenClaw persists the actual adapter route separately from the
+      // pre-hook queue input. Reconciliation must reuse that effective anchor.
+      replyToId: HEX32("ee"),
+      effectiveReplyToId: HEX32("dd"),
+    });
+
+    expect(order).toEqual(["dispatch", "connector", "connector"]);
+    expect(reconciled.status).toBe("sent");
+    expect(calls.sendFinal).toHaveLength(2);
+    expect(calls.sendFinal[1]?.replyToMessageIdHex).toBe(HEX32("dd"));
+    expect(calls.sendFinal[1]?.idempotencyKey).toBe(calls.sendFinal[0]?.idempotencyKey);
+  });
+
+  it("reuses the key for the same durable intent and fails closed without one", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+    });
+    const durableCtx = {
+      cfg: {},
+      to: HEX32("cc"),
+      text: "retry-safe",
+      replyToId: HEX32("dd"),
+      deliveryQueueId: "turn-retry:0",
+    } as unknown as ChannelMessageSendTextContext;
+
+    await adapter.send!.text!(durableCtx);
+    await adapter.send!.text!(durableCtx);
+
+    const firstKey = calls.sendFinal[0]?.idempotencyKey;
+    expect(firstKey).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinal.map((call) => call.idempotencyKey)).toEqual([firstKey, firstKey]);
+
+    await expect(
+      adapter.send!.text!({
+        cfg: {},
+        to: HEX32("cc"),
+        text: "missing durable identity",
+      } as unknown as ChannelMessageSendTextContext),
+    ).rejects.toThrow("requires OpenClaw delivery queue identity");
+    expect(calls.sendFinal).toHaveLength(2);
+  });
+
+  it("reuses the key for prefixed and unprefixed session ids", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: (cfg) => ({
+        client: stubClient(calls),
+        marmotAccountIdHex: (cfg as { prefixed?: boolean }).prefixed
+          ? `0x${HEX32("aa").toUpperCase()}`
+          : HEX32("aa"),
+      }),
+    });
+    const base = {
+      text: "retry-safe",
+      replyToId: HEX32("dd"),
+      deliveryQueueId: "turn-canonical:0",
+    };
+
+    await adapter.send!.text!({
+      ...base,
+      cfg: { prefixed: true },
+      to: `0X${HEX32("cc").toUpperCase()}`,
+    } as unknown as ChannelMessageSendTextContext);
+    await adapter.send!.text!({
+      ...base,
+      cfg: {},
+      to: HEX32("cc"),
+    } as unknown as ChannelMessageSendTextContext);
+
+    expect(calls.sendFinal[0]?.idempotencyKey).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinal[1]?.idempotencyKey).toBe(calls.sendFinal[0]?.idempotencyKey);
   });
 
   it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
@@ -132,15 +250,20 @@ describe("createMarmotMessageAdapter", () => {
       media: true,
       replyTo: true,
       messageSendingHooks: true,
+      reconcileUnknownSend: true,
     });
+    expect(adapter.durableFinal?.reconcileUnknownSendKinds).toEqual({ text: true });
+    expect(adapter.durableFinal?.reconcileUnknownSend).toBeTypeOf("function");
     const required = deriveDurableFinalDeliveryRequirements({
       payload: { text: "done" },
       replyToId: HEX32("dd"),
+      reconcileUnknownSend: true,
     });
     expect(required).toEqual({
       text: true,
       replyTo: true,
       messageSendingHooks: true,
+      reconcileUnknownSend: true,
     });
     expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
@@ -162,6 +285,7 @@ describe("createMarmotMessageAdapter", () => {
       accountId: "personal",
       to: HEX32("cc"),
       text: "cross-account send",
+      deliveryQueueId: "cross-account-turn:0",
     } as unknown as ChannelMessageSendTextContext);
 
     expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
@@ -280,6 +404,10 @@ describe("createMarmotMessageAdapter", () => {
     const calls = emptyClientCalls();
     const writes: { fileName: string; bytes: Buffer }[] = [];
     const mediaReadFile = vi.fn(async () => Buffer.from("host-authorized-bytes"));
+    const managedMediaPath = join(
+      getMediaDir(),
+      "photo---12345678-1234-1234-1234-123456789abc.png",
+    );
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
       writeTempMedia: async (fileName, bytes) => {
@@ -291,7 +419,7 @@ describe("createMarmotMessageAdapter", () => {
       cfg: {},
       to: HEX32("cc"),
       text: "generated image",
-      mediaUrl: "/workspace/generated/photo.png",
+      mediaUrl: managedMediaPath,
       // The running host has already authorized the source through
       // mediaReadFile. Its roots may differ from this pinned SDK's roots.
       mediaAccess: {
@@ -302,7 +430,7 @@ describe("createMarmotMessageAdapter", () => {
 
     await adapter.send!.media!(ctx);
 
-    expect(mediaReadFile).toHaveBeenCalledWith("/workspace/generated/photo.png");
+    expect(mediaReadFile).toHaveBeenCalledWith(managedMediaPath);
     expect(writes).toEqual([
       { fileName: "photo.png", bytes: Buffer.from("host-authorized-bytes") },
     ]);
@@ -579,6 +707,7 @@ describe("createMarmotMessageAdapter", () => {
       cfg: {},
       to: HEX32("cc"),
       text: "deletable",
+      deliveryQueueId: "delete-test-turn:0",
     } as unknown as ChannelMessageSendTextContext;
     await adapter.send!.text!(ctx);
 

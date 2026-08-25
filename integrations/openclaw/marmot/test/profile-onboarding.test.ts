@@ -31,11 +31,12 @@ const MSG = HEX("11");
 interface Calls {
   lookup: number;
   sendFinal: string[];
+  sendFinalKeys: (string | undefined)[];
   publish: { name: string; displayName: string | null }[];
 }
 
 function emptyCalls(): Calls {
-  return { lookup: 0, sendFinal: [], publish: [] };
+  return { lookup: 0, sendFinal: [], sendFinalKeys: [], publish: [] };
 }
 
 function stubClient(
@@ -55,11 +56,12 @@ function stubClient(
         retryable: opts.profileStatus === "indeterminate",
       };
     },
-    async sendFinal(_account, _group, text) {
+    async sendFinal(_account, _group, text, _replyTo, idempotencyKey) {
+      calls.sendFinal.push(text);
+      calls.sendFinalKeys.push(idempotencyKey);
       if (opts.failSend) {
         throw new Error("send failed");
       }
-      calls.sendFinal.push(text);
       return { type: "final_sent" };
     },
     async accountPublishProfile(_account, name, displayName) {
@@ -86,11 +88,35 @@ class MemStore implements ProfileOnboardingStateStore {
       return false;
     }
     this.rec = {
-      status: "prompted",
+      status: "prompt_pending",
       group_id_hex: groupIdHex,
       ...(suggestedName ? { suggested_name: suggestedName } : {}),
     };
     return true;
+  }
+  async markPrompted(
+    _account: string,
+    groupIdHex: string,
+    suggestedName: string | undefined,
+  ): Promise<void> {
+    this.rec = {
+      status: "prompted",
+      group_id_hex: groupIdHex,
+      ...(suggestedName ? { suggested_name: suggestedName } : {}),
+    };
+  }
+  async markPublishing(
+    _account: string,
+    groupIdHex: string,
+    replyToMessageIdHex: string,
+    name: string,
+  ): Promise<void> {
+    this.rec = {
+      status: "publishing",
+      group_id_hex: groupIdHex,
+      reply_to_message_id_hex: replyToMessageIdHex,
+      name,
+    };
   }
   async markPublished(_account: string, name: string): Promise<void> {
     this.rec = { status: "published", name };
@@ -288,7 +314,33 @@ describe("maybeSendProfilePromptOnJoin", () => {
     expect(calls.sendFinal).toEqual([]);
   });
 
-  it("releases the prompt slot if the prompt fails to send", async () => {
+  it("keeps an ambiguous prompt claim bound to its original group", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "prompted",
+      group_id_hex: GROUP,
+      suggested_name: "Original Name",
+    };
+
+    expect(
+      await maybeSendProfilePromptOnJoin({
+        store,
+        client: stubClient(calls),
+        accountIdHex: ACCOUNT,
+        groupIdHex: HEX("dd"),
+        configuredName: "Changed Name",
+      }),
+    ).toBe(false);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toEqual({
+      status: "prompted",
+      group_id_hex: GROUP,
+      suggested_name: "Original Name",
+    });
+  });
+
+  it("preserves the claimed prompt snapshot if the send result is ambiguous", async () => {
     const store = new MemStore();
     await maybeSendProfilePromptOnJoin({
       store,
@@ -297,7 +349,55 @@ describe("maybeSendProfilePromptOnJoin", () => {
       groupIdHex: GROUP,
       configuredName: "Marmot Bot",
     });
-    expect(store.rec).toEqual({}); // cleared so a later trigger retries
+    expect(store.rec).toEqual({
+      status: "prompt_pending",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    });
+  });
+
+  it("reuses the proactive prompt key after a failed send is retried", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    const trigger = () =>
+      maybeSendProfilePromptOnJoin({
+        store,
+        client: stubClient(calls, { failSend: true }),
+        accountIdHex: ACCOUNT,
+        groupIdHex: GROUP,
+        configuredName: "Marmot Bot",
+      });
+
+    await trigger();
+    await trigger();
+
+    expect(calls.sendFinal).toEqual([
+      buildProfilePrompt("Marmot Bot"),
+      buildProfilePrompt("Marmot Bot"),
+    ]);
+    expect(calls.sendFinalKeys[0]).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
+  });
+
+  it("retries a legacy prompt claim with an equivalent canonical group id", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "prompt_pending",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    };
+
+    expect(
+      await maybeSendProfilePromptOnJoin({
+        store,
+        client: stubClient(calls),
+        accountIdHex: ACCOUNT,
+        groupIdHex: `0X${GROUP.toUpperCase()}`,
+        configuredName: "Changed Name",
+      }),
+    ).toBe(true);
+    expect(calls.sendFinal).toEqual([buildProfilePrompt("Marmot Bot")]);
   });
 });
 
@@ -347,6 +447,180 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(store.rec.status).toBe("published");
   });
 
+  it("retries only the published confirmation after an ambiguous send success", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
+    const client = stubClient(calls);
+    let confirmationAttempts = 0;
+    client.sendFinal = async (_account, _group, text, _replyTo, idempotencyKey) => {
+      calls.sendFinal.push(text);
+      calls.sendFinalKeys.push(idempotencyKey);
+      confirmationAttempts += 1;
+      if (confirmationAttempts === 1) {
+        throw new Error("connection closed after durable send");
+      }
+      return { type: "final_sent" };
+    };
+
+    await maybeHandleProfileOnboardingInbound({ store, client, message: msg("yes") });
+
+    const published = PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot");
+    expect(calls.publish).toEqual([{ name: "Marmot Bot", displayName: "Marmot Bot" }]);
+    expect(calls.sendFinal).toEqual([published, published]);
+    expect(calls.sendFinal).not.toContain(PROFILE_NAME_PUBLISH_FAILED);
+    expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
+    expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
+  });
+
+  it("recovers a successful publication from the live profile before handling more input", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
+    const originalMarkPublished = store.markPublished.bind(store);
+    let persistenceAttempts = 0;
+    store.markPublished = async (accountIdHex, name) => {
+      persistenceAttempts += 1;
+      if (persistenceAttempts === 1) throw new Error("temporary storage failure");
+      await originalMarkPublished(accountIdHex, name);
+    };
+
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls),
+      message: msg("yes"),
+    });
+
+    expect(calls.publish).toHaveLength(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toMatchObject({ status: "publishing", name: "Marmot Bot" });
+
+    const recoveredClient = stubClient(calls, { profileStatus: "profile_found" });
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client: recoveredClient,
+      message: { ...msg("skip"), messageIdHex: HEX("22") },
+    });
+
+    expect(calls.publish).toHaveLength(1);
+    expect(persistenceAttempts).toBe(2);
+    expect(calls.sendFinal).toEqual([
+      PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot"),
+    ]);
+    expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
+  });
+
+  it("retries the persisted publication after an authoritative profile-not-found lookup", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    };
+
+    const intercepted = await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls, { profileStatus: "profile_not_found" }),
+      message: { ...msg("ordinary text"), messageIdHex: HEX("22") },
+    });
+
+    expect(intercepted).toBe(true);
+    expect(calls.publish).toEqual([{ name: "Marmot Bot", displayName: "Marmot Bot" }]);
+    expect(calls.sendFinal).toEqual([
+      PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot"),
+    ]);
+    expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
+  });
+
+  it("does not consume unrelated or indeterminate inbound messages while publishing", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    };
+
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client: stubClient(calls, { profileStatus: "profile_found" }),
+        message: msg("unrelated", HEX("dd")),
+      }),
+    ).toBe(false);
+    expect(calls.lookup).toBe(0);
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client: stubClient(calls, { profileStatus: "indeterminate" }),
+        lookupGate: new ProfileLookupGate({ backoffMs: [0] }),
+        message: msg("same group"),
+      }),
+    ).toBe(false);
+    expect(calls.publish).toEqual([]);
+    expect(store.rec.status).toBe("publishing");
+  });
+
+  it("keeps the publishing guard when recovery state cannot be persisted", async () => {
+    const calls = emptyCalls();
+    const warnings: string[] = [];
+    const store = new MemStore();
+    store.rec = {
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    };
+    store.markPublished = async () => {
+      throw new Error("storage unavailable");
+    };
+
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client: stubClient(calls, { profileStatus: "profile_found" }),
+        message: { ...msg("skip"), messageIdHex: HEX("22") },
+        logger: { warn: (message) => warnings.push(message) },
+      }),
+    ).toBe(true);
+
+    expect(calls.publish).toEqual([]);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec.status).toBe("publishing");
+    expect(warnings).toEqual(["marmot: published profile recovery state not recorded"]);
+  });
+
+  it("returns normally after two published-confirmation failures", async () => {
+    const calls = emptyCalls();
+    const warnings: string[] = [];
+    const store = new MemStore();
+    store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
+    const client = stubClient(calls);
+    client.sendFinal = async (_account, _group, text, _replyTo, idempotencyKey) => {
+      calls.sendFinal.push(text);
+      calls.sendFinalKeys.push(idempotencyKey);
+      throw new Error("connector unavailable");
+    };
+
+    expect(
+      await maybeHandleProfileOnboardingInbound({
+        store,
+        client,
+        message: msg("yes"),
+        logger: { warn: (message) => warnings.push(message) },
+      }),
+    ).toBe(true);
+
+    const published = PROFILE_NAME_PUBLISHED.replace("{name}", "Marmot Bot");
+    expect(calls.sendFinal).toEqual([published, published]);
+    expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
+    expect(warnings).toEqual(["marmot: profile published but confirmation not delivered"]);
+    expect(store.rec).toEqual({ status: "published", name: "Marmot Bot" });
+  });
+
   it("publishes a different name supplied in the reply", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
@@ -371,6 +645,51 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(store.rec.status).toBe("prompted");
   });
 
+  it("reuses the name-empty response key for an identical inbound replay and changes it for a new message", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    // No suggested name intentionally exercises the PROFILE_NAME_EMPTY response path.
+    store.rec = { status: "prompted", group_id_hex: GROUP };
+    const client = stubClient(calls);
+
+    await maybeHandleProfileOnboardingInbound({ store, client, message: msg("yes") });
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client,
+      message: { ...msg("yes"), messageIdHex: `0x${MSG.toUpperCase()}` },
+    });
+    await maybeHandleProfileOnboardingInbound({
+      store,
+      client,
+      message: { ...msg("yes"), messageIdHex: HEX("22") },
+    });
+
+    expect(calls.sendFinal).toEqual([PROFILE_NAME_EMPTY, PROFILE_NAME_EMPTY, PROFILE_NAME_EMPTY]);
+    expect(calls.sendFinalKeys[0]).toMatch(/^marmot-final-v1:[0-9a-f]{64}$/);
+    expect(calls.sendFinalKeys[1]).toBe(calls.sendFinalKeys[0]);
+    expect(calls.sendFinalKeys[2]).not.toBe(calls.sendFinalKeys[0]);
+  });
+
+  it("rejects invalid onboarding hex before sending", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "prompted",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    };
+
+    await expect(
+      maybeHandleProfileOnboardingInbound({
+        store,
+        client: stubClient(calls),
+        message: { ...msg("yes"), messageIdHex: "not-hex" },
+      }),
+    ).rejects.toThrow("replyToMessageIdHex must be hexadecimal");
+    expect(calls.publish).toEqual([]);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
   it("skips on a skip reply", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
@@ -381,7 +700,7 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(calls.publish).toEqual([]);
   });
 
-  it("stays prompted and reports failure when publish throws", async () => {
+  it("keeps a durable publishing guard when the connector result is ambiguous", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
     store.rec = { status: "prompted", group_id_hex: GROUP, suggested_name: "Marmot Bot" };
@@ -390,8 +709,13 @@ describe("maybeHandleProfileOnboardingInbound", () => {
       client: stubClient(calls, { failPublish: true }),
       message: msg("yes"),
     });
-    expect(calls.sendFinal).toEqual([PROFILE_NAME_PUBLISH_FAILED]);
-    expect(store.rec.status).toBe("prompted");
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toMatchObject({
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Marmot Bot",
+    });
   });
 
   it("falls back to prompting on a first message when no status exists", async () => {
@@ -407,6 +731,32 @@ describe("maybeHandleProfileOnboardingInbound", () => {
     expect(calls.publish).toEqual([]);
     expect(calls.sendFinal).toEqual([buildProfilePrompt("Marmot Bot")]);
     expect(store.rec).toMatchObject({ status: "prompted", suggested_name: "Marmot Bot" });
+  });
+
+  it("retries a pending prompt before treating inbound text as consent", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    store.rec = {
+      status: "prompt_pending",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    };
+
+    const intercepted = await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls),
+      message: msg("yes"),
+      configuredName: "Changed Name",
+    });
+
+    expect(intercepted).toBe(true);
+    expect(calls.publish).toEqual([]);
+    expect(calls.sendFinal).toEqual([buildProfilePrompt("Marmot Bot")]);
+    expect(store.rec).toEqual({
+      status: "prompted",
+      group_id_hex: GROUP,
+      suggested_name: "Marmot Bot",
+    });
   });
 
   it("does not intercept a reply that arrives in a different conversation", async () => {
@@ -454,15 +804,31 @@ describe("ProfileNameOnboardingStore", () => {
     const store = new ProfileNameOnboardingStore(path);
     expect(await store.get(ACCOUNT)).toEqual({});
 
-    expect(await store.tryClaimPrompt(ACCOUNT, GROUP, "Marmot Bot")).toBe(true);
+    expect(
+      await store.tryClaimPrompt(ACCOUNT, `0X${GROUP.toUpperCase()}`, "Marmot Bot"),
+    ).toBe(true);
     // a racing second claim is rejected
     expect(await store.tryClaimPrompt(ACCOUNT, GROUP, "Other")).toBe(false);
     expect(await store.get(ACCOUNT)).toEqual({
-      status: "prompted",
+      status: "prompt_pending",
       group_id_hex: GROUP,
       suggested_name: "Marmot Bot",
     });
 
+    await store.markPrompted(ACCOUNT, `0x${GROUP.toUpperCase()}`, "Marmot Bot");
+    expect(await store.get(ACCOUNT)).toMatchObject({ status: "prompted" });
+    await store.markPublishing(
+      ACCOUNT,
+      `0x${GROUP.toUpperCase()}`,
+      `0X${MSG.toUpperCase()}`,
+      "Ada",
+    );
+    expect(await store.get(ACCOUNT)).toEqual({
+      status: "publishing",
+      group_id_hex: GROUP,
+      reply_to_message_id_hex: MSG,
+      name: "Ada",
+    });
     await store.markPublished(ACCOUNT, "Ada");
     const reopened = new ProfileNameOnboardingStore(path);
     expect(await reopened.get(ACCOUNT)).toEqual({ status: "published", name: "Ada" });

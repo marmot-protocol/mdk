@@ -28,10 +28,10 @@ import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
 const HEX32 = (byte: string): string => byte.repeat(32);
 const PROTOCOL = "marmot.agent-control.v2";
 
-interface RecordedMediaSend {
+interface RecordedControlSend {
   request: Record<string, unknown>;
-  stagedPath: string;
-  stagedBytes: Buffer;
+  stagedPath?: string;
+  stagedBytes?: Buffer;
 }
 
 type RunMessageAction = (input: {
@@ -72,10 +72,10 @@ function sendControlResponse(
   socket.write(`${JSON.stringify({ marmot_agent_control: PROTOCOL, id, ...payload })}\n`);
 }
 
-/** Minimal wn-agent socket that records the staged media while it still exists. */
-function startMediaControlServer(
+/** Minimal wn-agent socket that records durable text or staged media sends. */
+function startControlServer(
   socketPath: string,
-  recorded: RecordedMediaSend[],
+  recorded: RecordedControlSend[],
 ): Promise<Server> {
   const server = createServer((socket) => {
     let pending = Buffer.alloc(0);
@@ -88,6 +88,14 @@ function startMediaControlServer(
         if (line.length > 0) {
           const request = JSON.parse(line.toString("utf8")) as Record<string, unknown>;
           void (async () => {
+            if (request.type === "send_final") {
+              recorded.push({ request });
+              sendControlResponse(socket, request.id, {
+                type: "final_sent",
+                message_ids_hex: [HEX32("11")],
+              });
+              return;
+            }
             if (request.type !== "send_media") {
               sendControlResponse(socket, request.id, {
                 type: "error",
@@ -127,20 +135,20 @@ async function closeServer(server: Server): Promise<void> {
 }
 
 /** Run the installed generic message action through the loaded Marmot plugin. */
-async function runPublicMediaSend(
+async function runPublicSend(
   buildParams: (workspaceDir: string) => Promise<Record<string, unknown>>,
-): Promise<RecordedMediaSend> {
+): Promise<RecordedControlSend> {
   const root = await mkdtemp(join(tmpdir(), "marmot-host-media-contract-"));
   const workspaceDir = join(root, "workspace");
   const outboundMediaDir = join(root, "outbound-media");
   const socketPath = join(root, "wn-agent.sock");
-  const recorded: RecordedMediaSend[] = [];
+  const recorded: RecordedControlSend[] = [];
   const previousOutboundMediaDir = process.env.MARMOT_OUTBOUND_MEDIA_DIR;
   let server: Server | undefined;
   try {
     await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
     process.env.MARMOT_OUTBOUND_MEDIA_DIR = outboundMediaDir;
-    server = await startMediaControlServer(socketPath, recorded);
+    server = await startControlServer(socketPath, recorded);
     const pluginRoot = join(import.meta.dirname, "..");
     const cfg = {
       plugins: {
@@ -183,8 +191,11 @@ async function runPublicMediaSend(
       senderIsOwner: true,
     });
     expect(recorded).toHaveLength(1);
-    await expect(access(recorded[0]!.stagedPath)).rejects.toThrow();
-    return recorded[0]!;
+    const sent = recorded[0]!;
+    if (sent.stagedPath) {
+      await expect(access(sent.stagedPath)).rejects.toThrow();
+    }
+    return sent;
   } finally {
     if (server) {
       await closeServer(server);
@@ -218,7 +229,7 @@ afterEach(() => {
 describe("installed OpenClaw inbound host contract", () => {
   it("sends an authorized workspace image through the public message action", async () => {
     const imageBytes = Buffer.from("workspace-image-bytes");
-    const sent = await runPublicMediaSend(async (workspaceDir) => {
+    const sent = await runPublicSend(async (workspaceDir) => {
       const imagePath = join(workspaceDir, "generated.png");
       await writeFile(imagePath, imageBytes);
       return {
@@ -241,7 +252,7 @@ describe("installed OpenClaw inbound host contract", () => {
 
   it("sends a buffer and filename through the public message action", async () => {
     const imageBytes = Buffer.from("buffer-image-bytes");
-    const sent = await runPublicMediaSend(async () => ({
+    const sent = await runPublicSend(async () => ({
       channel: "marmot",
       target: HEX32("cc"),
       message: "buffer image",
@@ -257,6 +268,23 @@ describe("installed OpenClaw inbound host contract", () => {
       group_id_hex: HEX32("cc"),
       caption: "buffer image",
       attachments: [{ media_type: "image/png", file_name: "from-buffer.png" }],
+    });
+  });
+
+  it("passes the host durable queue identity into send_final", async () => {
+    const sent = await runPublicSend(async () => ({
+      channel: "marmot",
+      target: HEX32("cc"),
+      message: "durable text",
+      bestEffort: false,
+    }));
+
+    expect(sent.request).toMatchObject({
+      type: "send_final",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      text: "durable text",
+      idempotency_key: expect.stringMatching(/^marmot-final-v1:[0-9a-f]{64}$/),
     });
   });
 
