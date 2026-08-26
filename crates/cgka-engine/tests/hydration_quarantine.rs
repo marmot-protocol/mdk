@@ -192,6 +192,54 @@ fn insert_marmot_group_without_openmls_state(
         .expect("insert marmot group record without openmls state");
 }
 
+fn seed_probe_work_rows(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    suffix: u8,
+) -> (MessageRecord, QueuedOutboundIntent) {
+    let message = MessageRecord {
+        id: MessageId::new(vec![0x70, suffix]),
+        group_id: group_id.clone(),
+        epoch: storage.get_group(group_id).expect("group").epoch,
+        state: MessageState::Processed,
+        payload: vec![0x71, suffix],
+        deferred_peel: None,
+    };
+    storage.put_message(&message).expect("put probe message");
+    let queued = QueuedOutboundIntent {
+        id: MessageId::new(vec![0x72, suffix]),
+        group_id: group_id.clone(),
+        intent: SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: vec![0x73, suffix],
+        },
+        created_at_ms: u64::from(suffix),
+    };
+    storage
+        .put_queued_outbound_intent(&queued)
+        .expect("put probe queued intent");
+    (message, queued)
+}
+
+fn assert_probe_work_rows(
+    storage: &SqliteAccountStorage,
+    message: &MessageRecord,
+    queued: &QueuedOutboundIntent,
+) {
+    assert_eq!(
+        storage.get_message(&message.id).expect("probe message"),
+        *message,
+        "interrupted canonical-state probe recovery must preserve the live message ledger"
+    );
+    assert!(
+        storage
+            .list_queued_outbound_intents(&queued.group_id)
+            .expect("queued intents")
+            .contains(queued),
+        "interrupted canonical-state probe recovery must preserve the live outbound queue"
+    );
+}
+
 #[tokio::test]
 async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
     let storage = SqliteAccountStorage::in_memory().expect("storage");
@@ -1631,6 +1679,7 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
+    let (live_message, live_queued) = seed_probe_work_rows(&storage, &group_id, 1);
 
     let mut historical_group = live_group.clone();
     historical_group.name = "historical anchor".into();
@@ -1639,15 +1688,15 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
         .put_group(&historical_group)
         .expect("plant historical group record");
     storage
-        .create_group_snapshot(&group_id, "test-historical-anchor")
+        .create_group_state_snapshot(&group_id, "test-historical-anchor")
         .expect("capture historical anchor");
 
     storage.put_group(&live_group).expect("restore live record");
     storage
-        .create_group_snapshot(&group_id, "openmls-retained-probe-test-crash")
+        .create_group_state_snapshot(&group_id, "openmls-retained-probe-test-crash")
         .expect("capture pre-probe live state");
     storage
-        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .rollback_group_state_to_snapshot(&group_id, "test-historical-anchor")
         .expect("simulate committed probe rewind");
     drop(initial);
 
@@ -1671,6 +1720,7 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
         reopened.epoch(&group_id).expect("hydrated epoch"),
         live_group.epoch
     );
+    assert_probe_work_rows(&storage, &live_message, &live_queued);
     assert!(
         !storage
             .list_group_snapshots(&group_id)
@@ -1690,6 +1740,7 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
+    let (live_message, live_queued) = seed_probe_work_rows(&storage, &group_id, 2);
 
     let mut historical_group = live_group.clone();
     historical_group.name = "historical anchor".into();
@@ -1699,14 +1750,14 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
         .expect("plant historical group record");
     storage
         .create_group_snapshot(&group_id, "test-historical-anchor")
-        .expect("capture historical anchor");
+        .expect("capture legacy full historical anchor");
 
     storage.put_group(&live_group).expect("restore live record");
     storage
-        .create_group_snapshot(&group_id, "openmls-branch-probe-test-crash")
+        .create_group_state_snapshot(&group_id, "openmls-branch-probe-test-crash")
         .expect("capture pre-probe live state");
     storage
-        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .rollback_group_state_to_snapshot(&group_id, "test-historical-anchor")
         .expect("simulate committed probe rewind");
     drop(initial);
 
@@ -1720,6 +1771,7 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
         live_group,
         "hydrate must restore the pre-probe live state"
     );
+    assert_probe_work_rows(&storage, &live_message, &live_queued);
     assert!(
         !storage
             .list_group_snapshots(&group_id)

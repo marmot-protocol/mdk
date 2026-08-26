@@ -2188,7 +2188,7 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update(record.id.as_slice());
             let digest = hasher.finalize();
             let probe_snapshot = format!("hydrate-selfremove-probe-{}", hex::encode(&digest[..8]));
-            let guard = crate::snapshot_guard::SnapshotRollbackGuard::create(
+            let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
                 &self.storage,
                 group_id.clone(),
                 probe_snapshot,

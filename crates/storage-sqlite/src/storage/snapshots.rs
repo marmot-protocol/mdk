@@ -37,6 +37,14 @@ pub(super) fn rollback(
     restore::rollback(store, group_id, name)
 }
 
+pub(super) fn rollback_group_state(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
+    restore::rollback_group_state(store, group_id, name)
+}
+
 pub(super) fn release(
     store: &SqliteAccountStorage,
     group_id: &GroupId,
@@ -281,6 +289,44 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, vec![mid(1), mid(2)]);
+        assert_eq!(
+            store.list_queued_outbound_intents(&g0.id).unwrap(),
+            vec![live_queued]
+        );
+    }
+
+    #[test]
+    fn group_state_rollback_ignores_work_rows_captured_by_a_full_snapshot() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let g0 = sample_group(gid(1), 0, 1);
+        let original_message = sample_message(mid(1), g0.id.clone(), 0);
+        let original_queued = sample_queued_intent(mid(10), g0.id.clone());
+        store.put_group(&g0).unwrap();
+        store.put_message(&original_message).unwrap();
+        store.put_queued_outbound_intent(&original_queued).unwrap();
+        store
+            .create_group_snapshot(&g0.id, "legacy-full-anchor")
+            .unwrap();
+
+        let g1 = sample_group(gid(1), 1, 2);
+        let live_message = sample_message(mid(2), g0.id.clone(), 1);
+        let live_queued = sample_queued_intent(mid(11), g0.id.clone());
+        store.put_group(&g1).unwrap();
+        store.put_message(&live_message).unwrap();
+        store
+            .delete_queued_outbound_intent(&original_queued.id)
+            .unwrap();
+        store.put_queued_outbound_intent(&live_queued).unwrap();
+
+        store
+            .rollback_group_state_to_snapshot(&g0.id, "legacy-full-anchor")
+            .unwrap();
+
+        assert_eq!(store.get_group(&g0.id).unwrap(), g0);
+        assert_eq!(
+            store.list_messages(&g0.id, EpochId(0)).unwrap(),
+            vec![original_message, live_message]
+        );
         assert_eq!(
             store.list_queued_outbound_intents(&g0.id).unwrap(),
             vec![live_queued]

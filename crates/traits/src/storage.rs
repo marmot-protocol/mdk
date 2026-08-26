@@ -296,6 +296,26 @@ pub trait MessageStorage {
 
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
+
+    /// Restore only canonical group state from a named snapshot, ignoring any
+    /// message-ledger or outbound-queue image the snapshot may contain. This is
+    /// the restore counterpart to [`Self::create_group_state_snapshot`] and is
+    /// required when a temporary probe reads a legacy full snapshot: the probe
+    /// must not rewrite live input/work rows merely because the persisted
+    /// anchor predates state-scoped capture.
+    ///
+    /// Backends that cannot distinguish snapshot fields may restore the full
+    /// image. Callers pair this with a live group-state guard; the default
+    /// state-snapshot implementation is also full, so the fallback remains
+    /// correct even though it forfeits the narrower write bound.
+    fn rollback_group_state_to_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> StorageResult<()> {
+        self.rollback_group_to_snapshot(group_id, name)
+    }
+
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
 
     /// Capture only canonical group state: the Marmot group projection,

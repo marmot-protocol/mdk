@@ -835,7 +835,7 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     // commit at the end. Pre-validated own-commit rollforwards inside the
     // replay land within this guard, so they are unwound with everything
     // else.
-    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
+    let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let result =
@@ -1349,11 +1349,11 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     use crate::snapshot_guard::SnapshotRollbackGuard;
 
     let live_snapshot = retained_anchor_probe_snapshot_name(group_id, work.replay_start_epoch);
-    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), live_snapshot)
+    let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), live_snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
-    let result = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
+    let result = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
         Ok(()) => {
             crate::test_crash_hooks::pause_if_requested("retained-anchor-after-rewind");
             canonicalize_stored_openmls_messages_from_current(storage, group_id, work)
@@ -1689,18 +1689,22 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     // `recover_interrupted_rewind_probe` exactly as the pass's is — under this
     // sweep's own probe name, so two interrupted probes stay distinguishable.
     let probe_snapshot = candidate_branch_probe_snapshot_name(group_id, inputs.replay_start_epoch);
-    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), probe_snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let guard =
+        SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), probe_snapshot)
+            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
-    let contexts = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
-        Ok(()) => candidate_branch_peel_contexts_from_current(
-            storage,
-            group_id,
-            inputs,
-            max_rewind_commits,
-            profile_policy,
-            max_contexts,
-        ),
+    let contexts = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
+        Ok(()) => {
+            crate::test_crash_hooks::pause_if_requested("candidate-branch-after-rewind");
+            candidate_branch_peel_contexts_from_current(
+                storage,
+                group_id,
+                inputs,
+                max_rewind_commits,
+                profile_policy,
+                max_contexts,
+            )
+        }
         Err(StorageError::SnapshotMissing(_)) => Ok(Vec::new()),
         Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
     };
@@ -1878,7 +1882,7 @@ fn candidate_path_peel_context<S: StorageProvider>(
     budget.consume()?;
 
     let snapshot = replay_snapshot_name(group_id, &replay_path.messages);
-    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
+    let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     let captured = capture_candidate_tip_context(
         storage,
@@ -2268,6 +2272,9 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             (Vec::new(), Vec::new())
         };
     let snapshot = apply_snapshot_name(group_id, result);
+    // Deliberately full. Unlike temporary replay/probe guards, canonical apply
+    // changes message dispositions and outbound work; error recovery needs the
+    // complete pre-apply image, not only canonical group/OpenMLS state.
     storage
         .create_group_snapshot(group_id, &snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;

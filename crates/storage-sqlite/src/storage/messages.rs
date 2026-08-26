@@ -480,6 +480,14 @@ impl MessageStorage for SqliteAccountStorage {
         snapshots::rollback(self, group_id, name)
     }
 
+    fn rollback_group_state_to_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> StorageResult<()> {
+        snapshots::rollback_group_state(self, group_id, name)
+    }
+
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::release(self, group_id, name)
     }
