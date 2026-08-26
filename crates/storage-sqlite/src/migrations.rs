@@ -2241,6 +2241,11 @@ mod tests {
             None,
             "durable removal intent must survive projection group deletion"
         );
+        assert_eq!(
+            foreign_key(&conn, "app_epoch_backfill_intents", "group_id"),
+            Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
+            "durable recovery intent must survive projection deletion but cascade with its protocol group"
+        );
     }
 
     #[test]

@@ -448,18 +448,21 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for intent in intents {
+                let group_id = hex::decode(&intent.group_id_hex).map_err(|error| {
+                    StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
+                })?;
                 let stalled_epoch = u64_to_i64(intent.stalled_epoch)?;
                 conn.execute(
                     "INSERT INTO app_epoch_backfill_intents
-                        (group_id_hex, stalled_epoch, updated_at)
+                        (group_id, stalled_epoch, updated_at)
                      VALUES (?1, ?2, ?3)
-                     ON CONFLICT(group_id_hex) DO UPDATE SET
+                     ON CONFLICT(group_id) DO UPDATE SET
                         stalled_epoch = MAX(
                             app_epoch_backfill_intents.stalled_epoch,
                             excluded.stalled_epoch
                         ),
                         updated_at = excluded.updated_at",
-                    params![&intent.group_id_hex, stalled_epoch, now],
+                    params![group_id, stalled_epoch, now],
                 )
                 .storage()?;
             }
@@ -472,22 +475,22 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT group_id_hex, stalled_epoch
+                "SELECT group_id, stalled_epoch
                  FROM app_epoch_backfill_intents
-                 ORDER BY updated_at, group_id_hex",
+                 ORDER BY updated_at, group_id",
             )
             .storage()?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
             })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         rows.into_iter()
-            .map(|(group_id_hex, stalled_epoch)| {
+            .map(|(group_id, stalled_epoch)| {
                 Ok(StoredEpochBackfillIntent {
-                    group_id_hex,
+                    group_id_hex: hex::encode(group_id),
                     stalled_epoch: i64_to_u64(stalled_epoch)?,
                 })
             })
@@ -506,11 +509,14 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for intent in intents {
+                let group_id = hex::decode(&intent.group_id_hex).map_err(|error| {
+                    StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
+                })?;
                 let stalled_epoch = u64_to_i64(intent.stalled_epoch)?;
                 conn.execute(
                     "DELETE FROM app_epoch_backfill_intents
-                     WHERE group_id_hex = ?1 AND stalled_epoch = ?2",
-                    params![&intent.group_id_hex, stalled_epoch],
+                     WHERE group_id = ?1 AND stalled_epoch = ?2",
+                    params![group_id, stalled_epoch],
                 )
                 .storage()?;
             }

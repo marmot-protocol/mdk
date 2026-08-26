@@ -2027,6 +2027,9 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
             Some("succeeded"),
             "activation did succeed; the drain after it is what did not"
         );
+        // The accelerated policy spends its 300 ms EOSE budget before the
+        // unchanged 5 s quantum. Production instead yields at 5 s before its
+        // 30 s EOSE ceiling.
         let expected_error_kind = if cfg!(feature = "test-policy-overrides") {
             "backfill_drain_no_relay_eose"
         } else {
@@ -2331,6 +2334,8 @@ fn epoch_backfill_drain_needs_every_subscription_to_report() {
         let rows = recorded_audit_rows(&app);
         let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
         assert_eq!(failed.len(), 1);
+        // As above, the accelerated EOSE budget wins only in the
+        // test-policy build; the production quantum wins in the default build.
         assert_eq!(
             failed[0]["kind"]["error_kind"].as_str(),
             Some(if cfg!(feature = "test-policy-overrides") {

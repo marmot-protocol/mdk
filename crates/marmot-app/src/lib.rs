@@ -339,9 +339,13 @@ pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_sec
 /// execution quantum independently ends duplicate-only traffic when that gate
 /// never arrives.
 ///
-/// 30 s remains the conservative consecutive-silence ceiling. The shorter
-/// production execution quantum normally yields first; keeping the budgets
-/// distinct makes long-replay slicing independent from the EOSE ambiguity
+/// 30 s remains the conservative consecutive-silence ceiling, but an open
+/// production stream never spends it in one attempt: the 5 s execution quantum
+/// yields first and a later seam resubscribes. Production EOSE completion
+/// therefore requires the gate to report within that quantum (or before an
+/// adapter-closed result); a consistently slower EOSE degrades through paced
+/// resubscriptions to the explicitly weaker quiescence fallback. Keeping the
+/// budgets distinct makes long-replay slicing independent from that fallback
 /// policy, and test-policy builds can exercise either boundary directly.
 pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
 /// How long an epoch-gap backfill whose replay went unconfirmed waits before
