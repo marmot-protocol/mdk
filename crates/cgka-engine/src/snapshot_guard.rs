@@ -62,7 +62,7 @@ impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
     /// consumed.
     pub(crate) fn commit(mut self) -> StorageResult<()> {
         self.storage
-            .rollback_group_to_snapshot(&self.group_id, &self.name)?;
+            .rollback_group_state_to_snapshot(&self.group_id, &self.name)?;
         match self
             .storage
             .release_group_snapshot(&self.group_id, &self.name)
@@ -87,7 +87,7 @@ impl<'a, S: StorageProvider> Drop for SnapshotRollbackGuard<'a, S> {
         // privacy-safe trace so the failure is visible.
         if let Err(_e) = self
             .storage
-            .rollback_group_to_snapshot(&self.group_id, &self.name)
+            .rollback_group_state_to_snapshot(&self.group_id, &self.name)
         {
             tracing::warn!(
                 target: TRACE_TARGET,

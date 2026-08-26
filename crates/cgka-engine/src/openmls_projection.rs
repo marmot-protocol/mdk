@@ -1406,6 +1406,12 @@ pub(crate) fn recover_interrupted_rewind_probe<S: StorageProvider>(
         ));
     }
 
+    // Deliberately recover the complete pre-probe image. A surviving probe
+    // snapshot may have been created by an older binary before guards became
+    // state-scoped. If that binary also rewound through a legacy full retained
+    // anchor, the probe snapshot is the only durable copy of the newer live
+    // message ledger and outbound queue. State-only recovery would leave the
+    // historical work rows stranded after upgrade.
     rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 

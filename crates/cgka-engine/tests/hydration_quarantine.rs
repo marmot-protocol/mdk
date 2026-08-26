@@ -1740,7 +1740,6 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
-    let (live_message, live_queued) = seed_probe_work_rows(&storage, &group_id, 2);
 
     let mut historical_group = live_group.clone();
     historical_group.name = "historical anchor".into();
@@ -1753,13 +1752,29 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
         .expect("capture legacy full historical anchor");
 
     storage.put_group(&live_group).expect("restore live record");
+    let (live_message, live_queued) = seed_probe_work_rows(&storage, &group_id, 2);
     storage
-        .create_group_state_snapshot(&group_id, "openmls-branch-probe-test-crash")
-        .expect("capture pre-probe live state");
+        .create_group_snapshot(&group_id, "openmls-branch-probe-test-crash")
+        .expect("capture legacy full pre-probe live state");
     storage
-        .rollback_group_state_to_snapshot(&group_id, "test-historical-anchor")
-        .expect("simulate committed probe rewind");
+        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate legacy full probe rewind");
     drop(initial);
+
+    assert!(
+        matches!(
+            storage.get_message(&live_message.id),
+            Err(StorageError::NotFound)
+        ),
+        "legacy full rewind must strand the historical message image before recovery"
+    );
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .expect("stranded queued intents")
+            .is_empty(),
+        "legacy full rewind must strand the historical queue image before recovery"
+    );
 
     let mut reopened = build_engine(storage.clone());
     reopened
