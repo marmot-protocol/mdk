@@ -3461,6 +3461,95 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(dispatched), 1)
 
+    async def test_shed_inbound_id_remains_replayable_after_queue_capacity_recovers(self):
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "retry me",
+            "mentions_self": True,
+        }
+        adapter = self._adapter(client=object())
+        adapter._inbound_queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=1)
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def blocking_turn():
+            blocker_started.set()
+            await release_blocker.wait()
+
+        adapter._inbound_queue.enqueue(event["group_id_hex"], blocking_turn)
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+
+        await adapter._handle_control_event(wire_event(event))
+        self.assertNotIn(event["message_id_hex"], adapter._recent_inbound_ids)
+
+        release_blocker.set()
+        await adapter._inbound_queue.join()
+        await adapter._handle_control_event(wire_event(event))
+        await adapter._inbound_queue.join()
+
+        self.assertEqual([message.text for message in adapter.events], ["retry me"])
+
+    async def test_debounced_shed_releases_every_source_id_for_replay(self):
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "retry batch",
+            "mentions_self": True,
+        }
+        sibling = dict(
+            event,
+            message_id_hex="55" * 32,
+            text="second source",
+        )
+        adapter = self._adapter(client=object(), extra={"debounce_ms": 60_000})
+        adapter._inbound_queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=1)
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def blocking_turn():
+            blocker_started.set()
+            await release_blocker.wait()
+
+        adapter._inbound_queue.enqueue(event["group_id_hex"], blocking_turn)
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+
+        await adapter._handle_control_event(wire_event(event))
+        await adapter._handle_control_event(wire_event(sibling))
+        await adapter._handle_control_event(wire_event(event))
+        key = adapter._debounce_key(event)
+        self.assertEqual(len(adapter._debounce_pending[key]), 2)
+        timer = adapter._debounce_tasks[key]
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        await adapter._flush_debounced(key)
+
+        for source in (event, sibling):
+            self.assertNotIn(source["message_id_hex"], adapter._recent_inbound_ids)
+            self.assertNotIn(source["message_id_hex"], adapter._pending_inbound_ids)
+
+        release_blocker.set()
+        await adapter._inbound_queue.join()
+        await adapter._handle_control_event(wire_event(event))
+        await adapter._handle_control_event(wire_event(sibling))
+        timer = adapter._debounce_tasks[key]
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        await adapter._flush_debounced(key)
+        await adapter._inbound_queue.join()
+
+        self.assertEqual(len(adapter.events), 1)
+        self.assertIn("retry batch", adapter.events[0].text)
+        self.assertIn("second source", adapter.events[0].text)
+        for source in (event, sibling):
+            self.assertIn(source["message_id_hex"], adapter._recent_inbound_ids)
+
     # --- Behavior 3: stream_progress wire type --------------------------------
     async def test_stream_progress_sends_progress_wire_type(self):
         requests = []
