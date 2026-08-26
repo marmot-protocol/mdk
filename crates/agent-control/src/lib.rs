@@ -195,6 +195,10 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         stream_capability: String,
         append_text: String,
+        /// Optional client-supplied preview dedup key. A matching retry is
+        /// acknowledged without re-applying the mutation. Reuse with different
+        /// inputs fails with `stream_preview_idempotency_conflict`. Preview
+        /// receipts are process-local and do not survive a restart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
@@ -202,6 +206,10 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         stream_capability: String,
         status: String,
+        /// Optional client-supplied preview dedup key. A matching retry is
+        /// acknowledged without re-applying the mutation. Reuse with different
+        /// inputs fails with `stream_preview_idempotency_conflict`. Preview
+        /// receipts are process-local and do not survive a restart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
@@ -209,6 +217,10 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         stream_capability: String,
         text: String,
+        /// Optional client-supplied preview dedup key. A matching retry is
+        /// acknowledged without re-applying the mutation. Reuse with different
+        /// inputs fails with `stream_preview_idempotency_conflict`. Preview
+        /// receipts are process-local and do not survive a restart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },

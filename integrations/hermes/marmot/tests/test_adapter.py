@@ -4313,6 +4313,63 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_client.finalize_calls), 1)
         self.assertTrue(fake_client.finalize_calls[0][2])
 
+    async def test_exhausted_preview_retry_blocks_a_different_pending_mutation(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.append_calls = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(
+                self,
+                stream_id_hex,
+                stream_capability,
+                append_text,
+                idempotency_key=None,
+            ):
+                self.append_calls.append((append_text, idempotency_key))
+                raise adapter_module.AgentControlError(
+                    "timed out waiting for append",
+                    code="timeout",
+                    retryable=True,
+                )
+
+        fake_client = FakeClient()
+        stream = await adapter_module.MarmotLiveStream.begin(
+            client=fake_client,
+            account_id_hex="11" * 32,
+            group_id_hex="22" * 32,
+            quic_candidates=(),
+            chunk_bytes=1024,
+        )
+
+        with unittest.mock.patch.object(adapter_module, "STREAM_PREVIEW_RETRY_BACKOFF_S", ()):
+            with self.assertRaises(adapter_module.AgentControlError):
+                await stream.append_replacement("first")
+            with self.assertRaises(adapter_module.AgentControlError) as raised:
+                await stream.append_replacement("different")
+
+        self.assertEqual(raised.exception.code, "preview_mutation_pending")
+        self.assertEqual(len(fake_client.append_calls), 1)
+        self.assertTrue(fake_client.append_calls[0][1])
+
     async def test_stream_finalize_retries_retryable_failure_with_same_idempotency_key(self):
         adapter_module = self.adapter_module
 

@@ -291,6 +291,73 @@ describe("MarmotLivePreview", () => {
     expect(live.isActive).toBe(false);
   });
 
+  it("does not commit an append whose response arrives after cancellation", async () => {
+    const calls = emptyCalls();
+    let releaseAppend: () => void = () => undefined;
+    let appendStarted: () => void = () => undefined;
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      appendStarted = resolve;
+    });
+    const client = {
+      ...stubStreamClient(calls),
+      async streamAppend(streamId: string, capability: string, text: string) {
+        calls.append.push({ streamId, capability, text });
+        appendStarted();
+        await appendGate;
+        return { type: "ack" };
+      },
+    } as unknown as StreamControlClient;
+    const live = previewWithClient(client);
+    await live.begin();
+
+    const updateCall = live.update("hello");
+    await started;
+    await live.cancel("superseded");
+    releaseAppend();
+
+    await expect(updateCall).rejects.toThrow(/finalized or cancelled/);
+    expect(calls.append).toHaveLength(1);
+    expect(live.currentText).toBe("");
+  });
+
+  it("does not retry stream_finalize after cancellation wins the backoff race", async () => {
+    const calls = emptyCalls();
+    let firstFinalizeFailed: () => void = () => undefined;
+    const failed = new Promise<void>((resolve) => {
+      firstFinalizeFailed = resolve;
+    });
+    const client = {
+      ...stubStreamClient(calls),
+      async streamFinalize(
+        streamId: string,
+        capability: string,
+        finalText: string,
+        hash: string,
+        count: number,
+        idempotencyKey?: string,
+      ) {
+        calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
+        firstFinalizeFailed();
+        throw new AgentControlError("timed out waiting for stream finalize", {
+          code: "timeout",
+          retryable: true,
+        });
+      },
+    } as unknown as StreamControlClient;
+    const live = previewWithClient(client);
+    await live.update("hello");
+
+    const finalizeCall = live.finalize("hello");
+    await failed;
+    await live.cancel("superseded");
+
+    await expect(finalizeCall).rejects.toThrow(/finalized or cancelled/);
+    expect(calls.finalize).toHaveLength(1);
+  });
+
   it.each([
     ["appendDelta", (live: MarmotLivePreview) => live.appendDelta("hi"), (calls: Calls) => calls.append],
     ["status", (live: MarmotLivePreview) => live.status("thinking"), (calls: Calls) => calls.status],

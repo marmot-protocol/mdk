@@ -102,10 +102,9 @@ export class MarmotLivePreview {
     const key = pending?.key ?? randomUUID();
     this.pendingPreviewMutation = { operation, payload, key };
     for (let attempt = 0; ; attempt += 1) {
+      this.ensureOpen();
       try {
         await mutation(key);
-        this.pendingPreviewMutation = null;
-        return;
       } catch (error) {
         const backoff = STREAM_PREVIEW_RETRY_BACKOFF_MS[attempt];
         if (!isRetryable(error)) {
@@ -116,7 +115,11 @@ export class MarmotLivePreview {
           throw error;
         }
         await new Promise((resolve) => setTimeout(resolve, backoff));
+        continue;
       }
+      this.ensureOpen();
+      this.pendingPreviewMutation = null;
+      return;
     }
   }
 
@@ -281,6 +284,7 @@ export class MarmotLivePreview {
     }
     let response: Awaited<ReturnType<StreamControlClient["streamFinalize"]>> | null = null;
     for (let attempt = 0; attempt <= STREAM_FINALIZE_RETRY_BACKOFF_MS.length; attempt += 1) {
+      this.ensureOpen();
       try {
         response = await this.client.streamFinalize(
           this.streamIdHex!,
@@ -290,14 +294,16 @@ export class MarmotLivePreview {
           this.transcript!.chunkCount,
           this.finalizeIdempotencyKey,
         );
-        break;
       } catch (error) {
         const backoff = STREAM_FINALIZE_RETRY_BACKOFF_MS[attempt];
         if (backoff === undefined || !isRetryable(error)) {
           throw error;
         }
         await new Promise((resolve) => setTimeout(resolve, backoff));
+        continue;
       }
+      this.ensureOpen();
+      break;
     }
     if (!response) {
       throw new Error("stream finalize failed without a response");
