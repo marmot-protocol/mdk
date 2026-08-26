@@ -241,16 +241,26 @@ Precedence, highest first:
    the measured lag, reading the current epoch can add a finding but never mask
    one — including engines the high-water reading kept under the ≥ 2 threshold
    entirely (`quarantine-rolled-back-engine.json` is that case: `Healthy`
-   before, quarantined after). An engine whose epoch evidence carries no
-   timestamp cannot be ordered, so it keeps the high-water reading and
+   before, quarantined after). **One untimed epoch row forfeits the current
+   reading for that whole engine**, the same way one untimed halt row makes
+   rule 5's halt side unorderable: an untimed row may be the engine's newest,
+   so preferring the newest *timed* row would invent a rollback out of forward
+   movement nobody stamped. Such an engine keeps the high-water reading and
    classifies exactly as before.
 
    `rolled_back` outranks the other two modes, which a rolled-back engine also
    satisfies by construction (it is necessarily either dark or active). Nothing
    in the protocol walks an epoch backwards, so the rollback is a local-storage
-   event — a device restored from an older backup, a rolled-back database — and
-   it names a different remedy: no redelivery repairs it, because the device is
-   asking for commits the group has already retired. Re-invite, not re-pull.
+   event: a device restored from an older backup, a rolled-back database.
+
+   The mode reports where the device is, not that it is beyond repair. A
+   restored device still holds valid state at the epoch it fell back to, so a
+   full-history replay reaching every commit from there forward can carry it up
+   again — mdk#1548 healed a device from epoch 13 to 16 that way. The rollback
+   changes the size of the ask rather than its possibility: the gap spans every
+   epoch since the restore, so it needs that replay rather than ordinary
+   redelivery, and re-invite only once relay retention no longer covers the
+   span. Whether it still does is not a question the export can answer.
 7. **`Healthy`** — none of the above.
 
 Rules 5 and 6 rank *below* the incident routes on purpose: a reproducible contest is

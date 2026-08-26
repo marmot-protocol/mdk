@@ -203,11 +203,19 @@ pub enum BehindMode {
     /// The engine's newest timed epoch is *below* one it already reported: its
     /// local state moved backwards. Nothing in the protocol walks an epoch
     /// back, so this is a local-storage event — a device restored from an
-    /// older backup, a rolled-back database — and no amount of redelivery
-    /// repairs it, because the device is asking for commits the group has
-    /// already retired. It outranks the other two modes: an engine that rolled
-    /// back is also, necessarily, active or dark, and the rollback is the
-    /// diagnosis an operator acts on (re-invite, not re-pull).
+    /// older backup, a rolled-back database. It outranks the other two modes:
+    /// an engine that rolled back is also, necessarily, active or dark, and
+    /// the rollback is the sharper of the two readings.
+    ///
+    /// The mode says where the device is, not that it is beyond repair. A
+    /// restored device still holds valid state at the epoch it fell back to,
+    /// so a full-history replay that reaches every commit from there forward
+    /// can carry it up again — mdk#1548 healed a device from epoch 13 to 16
+    /// exactly that way. What the rollback changes is the size of the ask: the
+    /// gap spans every epoch since the restore rather than a commit or two, so
+    /// it needs that replay rather than ordinary redelivery, and re-invite
+    /// only once relay retention no longer covers the span. Whether it still
+    /// does is not a question this export can answer.
     RolledBack,
 }
 
@@ -466,6 +474,13 @@ struct EngineActivity {
     /// behind [`BehindMode::RolledBack`] — a max alone reports a restored
     /// device at the epoch it used to hold and understates its lag.
     current: Option<(u64, u64)>,
+    /// Whether any epoch observation arrived without a timestamp. One such row
+    /// makes the engine's whole epoch sequence unorderable, exactly as one
+    /// untimed halt row does in [`unrecoverable_halt`]: an untimed epoch may
+    /// be the newest one, so a "newest timed" reading could sit behind the
+    /// engine's real position and invent a rollback. The fail-closed answer is
+    /// to keep the high-water reading, which claims no ordering at all.
+    has_untimed_epoch: bool,
 }
 
 /// The weaker of the two gates between "no contested branch" and "healthy":
@@ -508,6 +523,8 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
                 .entry(epoch)
                 .and_modify(|first| *first = (*first).min(ms))
                 .or_insert(ms);
+        } else if observed.is_some() {
+            activity.has_untimed_epoch = true;
         }
     }
 
@@ -522,9 +539,14 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
             // Lag is measured from where the engine is now, not from the best
             // it ever managed. The two differ only on a rollback, and only
             // ever widen the lag, so this can add a finding but never mask
-            // one. An engine whose epoch evidence is untimed keeps the
-            // high-water reading, exactly as before.
-            let epoch = activity.current.map_or(high_water, |(_, epoch)| epoch);
+            // one. Any untimed epoch row forfeits that reading for the whole
+            // engine: the untimed row may be its newest, and preferring the
+            // newest *timed* one would then invent a rollback out of ordinary
+            // forward movement nobody stamped.
+            let epoch = match activity.current {
+                Some((_, epoch)) if !activity.has_untimed_epoch => epoch,
+                _ => high_water,
+            };
             let rolled_back = epoch < high_water;
             if group_epoch - epoch < EPOCH_DIVERGENCE_MIN_LAG {
                 return None;
