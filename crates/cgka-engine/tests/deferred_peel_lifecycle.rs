@@ -641,8 +641,7 @@ where
     let (mut eve, _eve_storage) = build_epoch_sealed_client(b"candidate-cache-eve");
 
     let rival_kp = rival.fresh_key_package().await.unwrap();
-    let routing =
-        NostrRoutingV1::new([0x43; 32], vec!["wss://candidate-cache.example".into()]).unwrap();
+    let routing = NostrRoutingV1::new([0x43; 32], vec!["wss://relay.example".into()]).unwrap();
     let (group_id, create) = incumbent
         .create_group(CreateGroupRequest {
             name: "candidate-cache".into(),
