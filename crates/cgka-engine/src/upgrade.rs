@@ -264,6 +264,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             pre_commit_epoch,

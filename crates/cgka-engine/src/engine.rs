@@ -1483,6 +1483,10 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
+        // Hydration and repair replace the live OpenMLS projection. Any
+        // exporter-bearing candidate contexts from the prior projection are
+        // stale even when the durable fingerprint later compares equal.
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         // A convergence rewind probe — the pass's, or the deferred-peel sweep's
         // candidate-branch enumeration — durably rewinds the group while it
         // explores historical candidates. Process termination cannot run the
@@ -2214,6 +2218,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         reason: GroupHydrationQuarantineReason,
     ) {
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         let reason_tag = hydration_quarantine_reason_tag(reason);
         let group_digest = hydration_quarantine_group_digest(group_id);
         tracing::warn!(

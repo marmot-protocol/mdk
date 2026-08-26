@@ -257,6 +257,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         let mut context = self
             .audit_group_context_snapshot(group_id)
             .unwrap_or_default();
@@ -1462,6 +1463,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let terminalized = if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
+            self.invalidate_deferred_peel_candidate_cache(group_id);
             self.epoch_manager
                 .set_stable(group_id.clone(), selected_tip);
             // Diagnostic only: classify this applied selection as a forward

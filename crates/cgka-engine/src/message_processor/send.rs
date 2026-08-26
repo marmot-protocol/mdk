@@ -360,6 +360,7 @@ impl<S: StorageProvider> Engine<S> {
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             prior_epoch,
@@ -613,6 +614,7 @@ impl<S: StorageProvider> Engine<S> {
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             prior_epoch,
