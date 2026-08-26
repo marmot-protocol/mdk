@@ -168,18 +168,25 @@ for the next prompt. Symlinks that resolve outside `$HOME` are rejected after
 canonicalization. Picker-looking messages with invalid segments are rejected
 and are not forwarded to OpenCode as prompts.
 
-## Session Reset
+## Chat Commands
 
-Send exactly `/reset-session` to clear the current Marmot group's OpenCode
-session id. The harness intercepts the command, preserves the group's validated
-workdir, does not delete OpenCode-owned transcripts, and confirms the result.
-The next normal prompt creates and records a new OpenCode session in that
-workdir. A failed resumed prompt is never retried automatically because the
-original invocation may already have produced side effects.
+`opencode run` does not expand OpenCode's interactive slash commands. The shared
+harness answers its own reserved commands before OpenCode is invoked; send
+`/help` in a chat to list them. The full table and the `//` literal escape are
+documented in the
+[shared chat-command reference](../../terminal-harness/README.md#chat-commands).
 
-The command name is reserved. Send `//reset-session` when the literal
-`/reset-session` text should reach OpenCode; messages such as
-`/reset-session please` are ordinary prompts.
+`/new` and `/reset-session` clear the current Marmot group's OpenCode session
+id. The harness intercepts the command, preserves the group's validated workdir,
+does not delete OpenCode-owned transcripts, and confirms the result. The next
+normal prompt creates and records a new OpenCode session in that workdir. A
+failed resumed prompt is never retried automatically because the original
+invocation may already have produced side effects.
+
+Reserved names are not forwarded to OpenCode. Send `//reset-session` when the
+literal `/reset-session` text should reach OpenCode; a reserved name with
+arguments it does not accept, such as `/reset-session please`, returns a usage
+reply.
 
 ## OpenCode Transport Contract
 
