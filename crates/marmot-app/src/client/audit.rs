@@ -14,6 +14,7 @@ use crate::messages::AppMessageIntent;
 use crate::{AppError, AppGroupRecord};
 
 use super::ObservedHumanActionAudit;
+use super::sync::DrainCounts;
 
 use super::AppClient;
 
@@ -25,6 +26,7 @@ pub(crate) struct EpochBackfillTerminalAudit {
     pub error_kind: Option<String>,
     pub deliveries: u64,
     pub skipped: u64,
+    pub refused: u64,
     pub local_epoch_before: u64,
     pub local_epoch_after: u64,
     pub group_advanced: bool,
@@ -192,19 +194,20 @@ impl AppClient {
 
     /// Record a `sync_drain` forensic audit row at every drain-loop exit: how
     /// long the drain ran (`duration_ms`, wall-clock), how many deliveries it
-    /// ingested (`deliveries`), how many receives it dropped as an echo or an
-    /// already-seen duplicate (`skipped`), and the durable transport cursor
-    /// immediately before and after the drain (Nostr second-granular).
-    /// Account-scoped, so `group_ref` is `None`.
+    /// ingested (`deliveries`), how many of those the engine refused unpersisted
+    /// (`refused`), how many receives it dropped as an echo or an already-seen
+    /// duplicate (`skipped`), and the durable transport cursor immediately
+    /// before and after the drain (Nostr second-granular). Account-scoped, so
+    /// `group_ref` is `None`.
     ///
-    /// The two counts are recorded apart because `duration_ms` alone cannot
-    /// tell a long drain that was making progress from one a relay held open
-    /// with traffic carrying no new history.
+    /// The counts are recorded apart because `duration_ms` alone cannot tell a
+    /// long drain that was making progress from one a relay held open with
+    /// traffic carrying no new history — nor either of those from a drain that
+    /// fetched real history into a full retention cap and had to drop it.
     pub(crate) fn record_sync_drain(
         &self,
         duration_ms: u64,
-        deliveries: u64,
-        skipped: u64,
+        counts: DrainCounts,
         cursor_before_secs: Option<u64>,
         cursor_after_secs: Option<u64>,
     ) {
@@ -213,8 +216,9 @@ impl AppClient {
             None,
             AuditEventKind::SyncDrain {
                 duration_ms,
-                deliveries,
-                skipped: Some(skipped),
+                deliveries: counts.deliveries,
+                skipped: Some(counts.skipped),
+                refused: Some(counts.refused),
                 cursor_before_secs,
                 cursor_after_secs,
             },
@@ -277,6 +281,7 @@ impl AppClient {
                 completion_kind: terminal.completion_kind,
                 deliveries: terminal.deliveries,
                 skipped: Some(terminal.skipped),
+                refused: Some(terminal.refused),
                 local_epoch_before: terminal.local_epoch_before,
                 local_epoch_after: terminal.local_epoch_after,
                 group_advanced: terminal.group_advanced,
@@ -289,6 +294,7 @@ impl AppClient {
                 error_kind: terminal.error_kind,
                 deliveries: terminal.deliveries,
                 skipped: Some(terminal.skipped),
+                refused: Some(terminal.refused),
                 local_epoch_before: terminal.local_epoch_before,
                 local_epoch_after: terminal.local_epoch_after,
                 group_advanced: terminal.group_advanced,

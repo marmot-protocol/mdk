@@ -138,6 +138,40 @@ impl DrainVerdict {
     }
 }
 
+/// What one delivery's ingest settled, for the two seams that decide whether the
+/// delivery may be dropped from the fetch path.
+struct DeliveryIngest {
+    /// Membership-changing effects landed, so the app projection and the route
+    /// table owe a save before anything else can fail.
+    routes_dirty: bool,
+    /// The engine kept no durable trace of this object, so transport
+    /// redelivery is the only path back to it. See
+    /// [`ingest_left_object_unpersisted`].
+    must_stay_fetchable: bool,
+}
+
+/// Whether the engine left this outcome's transport object unpersisted, so only
+/// relay redelivery can present it again.
+///
+/// This is the app-side half of the engine's `retryable_unpersisted_ingest_id`
+/// contract. `ResourceRefused` is the one `Ok` outcome the engine drops without
+/// a durable record *and* deliberately keeps out of its own seen cache, and the
+/// trait states the consequence directly: a resource refusal "must not make
+/// same-id redelivery a duplicate". Recording it in `seen_events` (which has no
+/// removal site short of ring overflow) or letting it carry the relay `since`
+/// floor past itself makes the object permanently unfetchable — across restarts
+/// and across `repair_full_history` alike.
+///
+/// Every other `Ok` outcome leaves the engine holding durable evidence of the
+/// object: `TransportDeferred` retains the raw transport row for later peel,
+/// `Buffered` retains it for convergence replay, and the terminal
+/// classifications (`Processed`, `Ignored`, `LocalState`, `Stale`, `Rejected`)
+/// are decisions the engine can reach again from storage. Forgetting those is
+/// correct dedupe, so they stay.
+fn ingest_left_object_unpersisted(outcome: &IngestOutcome) -> bool {
+    matches!(outcome, IngestOutcome::ResourceRefused { .. })
+}
+
 /// What one drain loop saw on the wire.
 ///
 /// `deliveries` counts receives the drain ingested; `skipped` counts those it
@@ -149,6 +183,22 @@ impl DrainVerdict {
 pub(crate) struct DrainCounts {
     pub(crate) deliveries: u64,
     pub(crate) skipped: u64,
+    /// The subset of `deliveries` the engine refused unpersisted. Nested inside
+    /// `deliveries` rather than beside it: the receive really was ingested, and
+    /// `deliveries` keeps the audit meaning the field exports already depend
+    /// on. [`DrainCounts::durable_deliveries`] is the count that answers "did
+    /// this drain recover anything".
+    pub(crate) refused: u64,
+}
+
+impl DrainCounts {
+    /// Deliveries this drain ingested *and* the engine kept. A drain whose
+    /// every delivery was refused fetched history it could not retain, which is
+    /// no recovery at all — the objects stay fetchable (they are neither marked
+    /// seen nor allowed past the cursor) but nothing durably landed.
+    fn durable_deliveries(self) -> u64 {
+        self.deliveries.saturating_sub(self.refused)
+    }
 }
 
 /// What the convergence scheduler should do next for a group, derived from
@@ -919,14 +969,18 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let routes_dirty = self
+        let ingested = self
             .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
         // Mark the delivery seen only after durable ingest succeeds, matching
         // the catch-up drain below. Marking at receive time would let a failed
         // ingest poison the index, so a reused client would silently skip the
-        // redelivered event.
-        self.remember_seen_event(event_id);
+        // redelivered event — and an `Ok` the engine refused unpersisted is
+        // just as much a not-durable ingest as an `Err` is.
+        if !ingested.must_stay_fetchable {
+            self.remember_seen_event(event_id);
+        }
+        let routes_dirty = ingested.routes_dirty;
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
@@ -1205,11 +1259,11 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
-            let delivery_routes_dirty = match self
+            let ingested = match self
                 .ingest_delivery(delivery, &display_names, &mut delivery_summary)
                 .await
             {
-                Ok(routes_dirty) => routes_dirty,
+                Ok(ingested) => ingested,
                 Err(error) => {
                     return Err(self
                         .finish_failed_sync_drain(
@@ -1223,10 +1277,18 @@ impl AppClient {
                         .await);
                 }
             };
-            self.remember_seen_event(event_id);
+            // Same rule as the receive seam above: an object the engine refused
+            // unpersisted must stay fetchable, so the relay re-serves it on a
+            // later drain instead of this one skipping it as already seen. The
+            // same flag is the refusal count, so one rule decides both.
+            if ingested.must_stay_fetchable {
+                counts.refused = counts.refused.saturating_add(1);
+            } else {
+                self.remember_seen_event(event_id);
+            }
             counts.deliveries = counts.deliveries.saturating_add(1);
             summary.merge(delivery_summary);
-            routes_dirty |= delivery_routes_dirty;
+            routes_dirty |= ingested.routes_dirty;
         };
 
         if let Err(error) = self
@@ -1238,8 +1300,7 @@ impl AppClient {
             let (summary, source) = self.checkpoint_failure_summary(summary, error);
             self.record_sync_drain(
                 drain_started.elapsed().as_millis() as u64,
-                counts.deliveries,
-                counts.skipped,
+                *counts,
                 cursor_before_secs,
                 cursor_after_secs,
             );
@@ -1247,8 +1308,7 @@ impl AppClient {
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            counts.deliveries,
-            counts.skipped,
+            *counts,
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
@@ -1284,8 +1344,7 @@ impl AppClient {
         };
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            counts.deliveries,
-            counts.skipped,
+            counts,
             cursor_before_secs,
             cursor_after_secs,
         );
@@ -1373,17 +1432,24 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
-    ) -> Result<bool, AppError> {
+    ) -> Result<DeliveryIngest, AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
+        let must_stay_fetchable = ingest_left_object_unpersisted(&effects.outcome);
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_groups(&effects.effects);
         self.observe_recovery_evidence(&effects.effects);
-        self.remember_transport_cursor(outer_transport_at);
+        if !must_stay_fetchable {
+            // Scope fence: a `TransportDeferred` object *is* durably retained,
+            // so it advances the floor here. Whether a retained-but-unapplied
+            // object should instead hold the floor back until it converges is
+            // the separate since-floor design item, not this seam's call.
+            self.remember_transport_cursor(outer_transport_at);
+        }
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         // A delivery can contain several application events. If projection
         // fails after an earlier event staged its acknowledgement, keep that
@@ -1440,7 +1506,10 @@ impl AppClient {
                 "incidental auto-publish failed after inbound effects were projected"
             );
         }
-        Ok(routes_dirty)
+        Ok(DeliveryIngest {
+            routes_dirty,
+            must_stay_fetchable,
+        })
     }
 
     /// Feed an unavailable group delivery to the epoch-stall detector.
@@ -1682,6 +1751,29 @@ impl AppClient {
         );
     }
 
+    /// Complete an execution the way a served end-of-stored-events drain does,
+    /// with the delivery counts whose effect on the disarm rule is under test.
+    #[cfg(test)]
+    pub(crate) fn test_complete_epoch_backfill_execution(
+        &mut self,
+        execution: EpochBackfillExecution,
+        deliveries: u64,
+        refused: u64,
+    ) {
+        self.finish_epoch_backfill_execution(
+            execution,
+            EpochBackfillActivationOutcome::Succeeded,
+            None,
+            Some(EpochBackfillCompletionKind::EndOfStoredEvents),
+            DrainCounts {
+                deliveries,
+                skipped: 0,
+                refused,
+            },
+            true,
+        );
+    }
+
     fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
         self.runtime
             .group_record(group_id)
@@ -1780,10 +1872,54 @@ impl AppClient {
             },
         );
         if succeeded {
-            self.epoch_stall.mark_replayed();
+            if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, counts) {
+                self.epoch_stall.mark_replayed();
+            }
         } else {
             self.requeue_failed_epoch_backfill_intent(execution.pending);
         }
+    }
+
+    /// Whether a completed replay recovered anything, and has therefore earned
+    /// the account-wide disarm.
+    ///
+    /// [`mark_replayed`](super::epoch_stall::EpochStallDetector::mark_replayed)
+    /// latches `fired_at_epoch` for every
+    /// *tracked* group, not just the armed one — the right trade when one
+    /// full-history replay really did serve every group's history, and a silent
+    /// end to all automatic recovery when it served nothing. Two independent
+    /// proofs, either of which is enough:
+    ///
+    /// - the drain ingested at least one delivery the engine *kept*
+    ///   ([`DrainCounts::durable_deliveries`]). A delivery can convert into an
+    ///   epoch long after this call returns — one field run drained 376
+    ///   deliveries and moved its epoch a second *after* the terminal row was
+    ///   written — so `epochs_after`, read the moment the drain ends, must never
+    ///   second-guess a delivery count. Deliveries parked awaiting convergence
+    ///   are recovery in flight. Refused ones are not: the engine dropped them
+    ///   unpersisted, so a drain that refused everything it fetched recovered
+    ///   nothing and must not disarm anything. A mixed drain still counts —
+    ///   one kept delivery is progress.
+    /// - a tracked group's local epoch advanced across the run, which is what a
+    ///   zero-delivery replay whose value was letting already-deferred rows
+    ///   converge looks like.
+    ///
+    /// A run that proves neither is fruitless. It is still recorded as the
+    /// completed end-of-stored-events attempt it was and still consumes its
+    /// intent — the pacing and intent-consumption rules are untouched. What it
+    /// must not do is stop the next refusal or undecryptable from arming a fresh
+    /// replay.
+    fn replay_recovered_something(
+        epochs_before: &HashMap<cgka_traits::GroupId, u64>,
+        epochs_after: &HashMap<cgka_traits::GroupId, u64>,
+        counts: DrainCounts,
+    ) -> bool {
+        counts.durable_deliveries() > 0
+            || epochs_after.iter().any(|(group_id, after)| {
+                epochs_before
+                    .get(group_id)
+                    .is_some_and(|before| after > before)
+            })
     }
 
     fn record_epoch_backfill_terminal_rows(
@@ -1816,6 +1952,7 @@ impl AppClient {
                     completion_kind: outcome.completion_kind,
                     deliveries: outcome.counts.deliveries,
                     skipped: outcome.counts.skipped,
+                    refused: outcome.counts.refused,
                     local_epoch_before,
                     local_epoch_after,
                     group_advanced,
