@@ -1745,7 +1745,7 @@ fn a_completed_backfill_that_recovered_nothing_does_not_disarm_the_detector() {
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
             .expect("the armed intent must begin execution");
-        client.test_complete_epoch_backfill_execution(execution, 0);
+        client.test_complete_epoch_backfill_execution(execution, 0, 0);
 
         assert_eq!(
             bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
@@ -1769,6 +1769,106 @@ fn a_completed_backfill_that_recovered_nothing_does_not_disarm_the_detector() {
         assert_eq!(
             completed[0]["kind"]["completion_kind"].as_str(),
             Some("end_of_stored_events"),
+        );
+    });
+}
+
+/// A replay whose every delivery was refused recovered nothing, and must not
+/// disarm the detector — the end-to-end shape of the review finding.
+///
+/// This is the drain that hurts most in the field: the relays serve the exact
+/// history the device is missing, the engine's retention cap is full, and every
+/// object is dropped unpersisted. `deliveries` counts them (a receive really was
+/// ingested, and #1553 pinned that meaning for the field exports), so keying the
+/// disarm on `deliveries` alone read a total loss as a productive replay.
+/// `deliveries - refused` is the count that answers "did anything land".
+#[test]
+fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
+    run_composed_app_runtime_test("backfill-all-refusals", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            backfill_drain_test_config(),
+            filled_through,
+        )
+        .await;
+        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        client.apply_backfill_decision(
+            &route.group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::ResourceRefusal,
+        );
+        let attempt_id = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("the refusal must arm one recovery intent")
+            .attempt_id
+            .clone();
+
+        // The relays have the history and serve it; the engine's retention cap
+        // is full, so the replay fetches it and cannot keep any of it.
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 500,
+                "refused-during-the-replay",
+            ),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the armed replay must run");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a served end-of-stored-events drain is a completed replay, fruitless or not",
+        );
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Arm,
+            "a replay that kept none of what it fetched must not disarm a bystander group",
+        );
+        assert!(
+            !client
+                .queued_epoch_backfills
+                .iter()
+                .chain(client.pending_epoch_backfill.iter())
+                .any(|pending| pending.attempt_id == attempt_id),
+            "the completed run still consumes its own intent; only the disarm is withheld",
+        );
+
+        drop(client);
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1, "the run records one terminal row");
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events"),
+            "the row stays honest about how the drain ended",
+        );
+        let deliveries = completed[0]["kind"]["deliveries"].as_u64();
+        assert_eq!(
+            (deliveries, completed[0]["kind"]["refused"].as_u64()),
+            (Some(1), Some(1)),
+            "the row must self-report cap saturation: every delivery refused",
+        );
+        // And the ordinary drain rows carry the same evidence, so a field export
+        // can read per-drain saturation without reconstructing it from raw
+        // `ingest_outcome` rows.
+        assert!(
+            recorded_rows_of_kind(&rows, "sync_drain")
+                .iter()
+                .any(|row| row["kind"]["refused"].as_u64() == Some(1)),
+            "the drain row must carry the refusal count too",
         );
     });
 }
@@ -1799,7 +1899,7 @@ fn a_backfill_whose_epoch_moved_still_disarms_the_detector() {
             client.group_mls_state(&group_id).unwrap().epoch > stalled_epoch,
             "the armed group's epoch must have moved across the run",
         );
-        client.test_complete_epoch_backfill_execution(execution, 0);
+        client.test_complete_epoch_backfill_execution(execution, 0, 0);
 
         assert_eq!(
             bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
@@ -1832,12 +1932,13 @@ fn a_backfill_that_ingested_deliveries_still_disarms_the_detector() {
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
             .expect("the armed intent must begin execution");
-        client.test_complete_epoch_backfill_execution(execution, 1);
+        // One delivery, none of it refused: a delivery the engine kept.
+        client.test_complete_epoch_backfill_execution(execution, 1, 0);
 
         assert_eq!(
             bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
             BackfillDecision::Skip,
-            "an ingested delivery is recovery in flight, not a fruitless run",
+            "a delivery the engine kept is recovery in flight, not a fruitless run",
         );
     });
 }
@@ -11673,13 +11774,29 @@ async fn group_at_the_undecryptable_retention_cap(
     dir: &tempfile::TempDir,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    group_at_the_undecryptable_retention_cap_with_config(
+        dir,
+        &relay,
+        MarmotAppConfig::default(),
+        filled_through,
+    )
+    .await
+}
+
+async fn group_at_the_undecryptable_retention_cap_with_config(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+    filled_through: u64,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
     let account_id_hex = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap()
         .account_id_hex;
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
+    let mut app =
+        MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
+            .with_test_relay_client(relay.clone());
     app.set_audit_log_settings(crate::AuditLogSettings {
         enabled: true,
         ..Default::default()

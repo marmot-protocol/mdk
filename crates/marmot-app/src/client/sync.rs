@@ -183,6 +183,22 @@ fn ingest_left_object_unpersisted(outcome: &IngestOutcome) -> bool {
 pub(crate) struct DrainCounts {
     pub(crate) deliveries: u64,
     pub(crate) skipped: u64,
+    /// The subset of `deliveries` the engine refused unpersisted. Nested inside
+    /// `deliveries` rather than beside it: the receive really was ingested, and
+    /// `deliveries` keeps the audit meaning the field exports already depend
+    /// on. [`DrainCounts::durable_deliveries`] is the count that answers "did
+    /// this drain recover anything".
+    pub(crate) refused: u64,
+}
+
+impl DrainCounts {
+    /// Deliveries this drain ingested *and* the engine kept. A drain whose
+    /// every delivery was refused fetched history it could not retain, which is
+    /// no recovery at all — the objects stay fetchable (they are neither marked
+    /// seen nor allowed past the cursor) but nothing durably landed.
+    fn durable_deliveries(self) -> u64 {
+        self.deliveries.saturating_sub(self.refused)
+    }
 }
 
 /// What the convergence scheduler should do next for a group, derived from
@@ -1263,8 +1279,11 @@ impl AppClient {
             };
             // Same rule as the receive seam above: an object the engine refused
             // unpersisted must stay fetchable, so the relay re-serves it on a
-            // later drain instead of this one skipping it as already seen.
-            if !ingested.must_stay_fetchable {
+            // later drain instead of this one skipping it as already seen. The
+            // same flag is the refusal count, so one rule decides both.
+            if ingested.must_stay_fetchable {
+                counts.refused = counts.refused.saturating_add(1);
+            } else {
                 self.remember_seen_event(event_id);
             }
             counts.deliveries = counts.deliveries.saturating_add(1);
@@ -1281,8 +1300,7 @@ impl AppClient {
             let (summary, source) = self.checkpoint_failure_summary(summary, error);
             self.record_sync_drain(
                 drain_started.elapsed().as_millis() as u64,
-                counts.deliveries,
-                counts.skipped,
+                *counts,
                 cursor_before_secs,
                 cursor_after_secs,
             );
@@ -1290,8 +1308,7 @@ impl AppClient {
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            counts.deliveries,
-            counts.skipped,
+            *counts,
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
@@ -1327,8 +1344,7 @@ impl AppClient {
         };
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            counts.deliveries,
-            counts.skipped,
+            counts,
             cursor_before_secs,
             cursor_after_secs,
         );
@@ -1736,12 +1752,13 @@ impl AppClient {
     }
 
     /// Complete an execution the way a served end-of-stored-events drain does,
-    /// with the delivery count whose effect on the disarm rule is under test.
+    /// with the delivery counts whose effect on the disarm rule is under test.
     #[cfg(test)]
     pub(crate) fn test_complete_epoch_backfill_execution(
         &mut self,
         execution: EpochBackfillExecution,
         deliveries: u64,
+        refused: u64,
     ) {
         self.finish_epoch_backfill_execution(
             execution,
@@ -1751,6 +1768,7 @@ impl AppClient {
             DrainCounts {
                 deliveries,
                 skipped: 0,
+                refused,
             },
             true,
         );
@@ -1872,12 +1890,16 @@ impl AppClient {
     /// end to all automatic recovery when it served nothing. Two independent
     /// proofs, either of which is enough:
     ///
-    /// - the drain ingested at least one delivery. A delivery can convert into
-    ///   an epoch long after this call returns — one field run drained 376
+    /// - the drain ingested at least one delivery the engine *kept*
+    ///   ([`DrainCounts::durable_deliveries`]). A delivery can convert into an
+    ///   epoch long after this call returns — one field run drained 376
     ///   deliveries and moved its epoch a second *after* the terminal row was
     ///   written — so `epochs_after`, read the moment the drain ends, must never
     ///   second-guess a delivery count. Deliveries parked awaiting convergence
-    ///   are recovery in flight.
+    ///   are recovery in flight. Refused ones are not: the engine dropped them
+    ///   unpersisted, so a drain that refused everything it fetched recovered
+    ///   nothing and must not disarm anything. A mixed drain still counts —
+    ///   one kept delivery is progress.
     /// - a tracked group's local epoch advanced across the run, which is what a
     ///   zero-delivery replay whose value was letting already-deferred rows
     ///   converge looks like.
@@ -1892,7 +1914,7 @@ impl AppClient {
         epochs_after: &HashMap<cgka_traits::GroupId, u64>,
         counts: DrainCounts,
     ) -> bool {
-        counts.deliveries > 0
+        counts.durable_deliveries() > 0
             || epochs_after.iter().any(|(group_id, after)| {
                 epochs_before
                     .get(group_id)
@@ -1930,6 +1952,7 @@ impl AppClient {
                     completion_kind: outcome.completion_kind,
                     deliveries: outcome.counts.deliveries,
                     skipped: outcome.counts.skipped,
+                    refused: outcome.counts.refused,
                     local_epoch_before,
                     local_epoch_after,
                     group_advanced,
