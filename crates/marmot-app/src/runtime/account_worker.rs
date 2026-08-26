@@ -1232,7 +1232,20 @@ async fn run_app_runtime_account_worker(
                 // publish + projection as one uncancelled worker operation;
                 // commands remain queued until that durable sequence lands.
                 let result = match received {
-                    Ok(delivery) => client.ingest_received_delivery(delivery).await,
+                    Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
+                        client.ingest_received_delivery(*delivery).await
+                    }
+                    Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
+                        match client.recover_delivery_overflow().await {
+                            Ok(summary) => Ok(summary),
+                            Err(failure) => {
+                                client
+                                    .pending_failed_sync_summary
+                                    .merge(failure.partial_summary);
+                                Err(failure.source)
+                            }
+                        }
+                    }
                     Err(err) => Err(err),
                 };
                 match result {
@@ -4310,7 +4323,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     seam: EpochBackfillExecutionSeam,
 ) -> Result<(), AccountCatchUpFailure> {
     let backfill_armed = client.has_pending_epoch_backfill();
-    let result = match client.run_pending_epoch_backfill(seam).await {
+    let mut result = match client.run_pending_epoch_backfill(seam).await {
         // An incomplete replay published the same real summary: it ingested
         // whatever it reached before the relays failed to confirm they had
         // served the account's stored history. Its intent stays pending, so the
@@ -4342,6 +4355,40 @@ async fn run_pending_epoch_backfill_reporting_arm(
     };
     if backfill_armed {
         shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
+    }
+    // An epoch replay is itself a large relay burst and can discover the
+    // bounded account queue's overflow record. Resolve that distinct durable
+    // gap immediately instead of waiting for unrelated later traffic to wake
+    // another sync seam.
+    if result.is_ok() && client.delivery_overflow_recovery_pending {
+        result = match client.recover_delivery_overflow().await {
+            Ok(summary) => {
+                publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                Ok(())
+            }
+            Err(failure) => {
+                publish_app_runtime_summary(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &failure.partial_summary,
+                );
+                let message = account_error_message(
+                    "account delivery overflow recovery failed",
+                    &failure.source,
+                );
+                publish_app_runtime_account_error(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    message.clone(),
+                );
+                Err(AccountCatchUpFailure::new(
+                    message,
+                    failure.classification(),
+                ))
+            }
+        };
     }
     result
 }

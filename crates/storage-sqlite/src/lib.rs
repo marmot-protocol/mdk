@@ -21,11 +21,12 @@ mod storage;
 mod timeline;
 
 pub use account_projection::{
-    AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
-    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountStoredPushRegistration,
-    AppEventReplayCursor, DeleteLocalGroupDataResult, SelfMembership, StoredAccountGroup,
-    StoredAccountGroupComponent, StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
-    StoredEpochBackfillIntent, StoredNostrRoute, clamp_to_max_future_skew,
+    AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushToken,
+    AccountNotificationSettings, AccountPendingPushRegistrationRemoval, AccountPushRegistration,
+    AccountStoredPushRegistration, AppEventReplayCursor, DeleteLocalGroupDataResult,
+    SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
+    StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent, StoredNostrRoute,
+    clamp_to_max_future_skew,
 };
 pub use chat_list::{
     AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,

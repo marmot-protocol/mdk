@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use cgka_traits::GroupId;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
-use cgka_traits::{GroupId, TransportAdapter};
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_adapter::AccountSubscriptionEose;
@@ -130,6 +130,10 @@ enum DrainVerdict {
     /// The account-worker quantum ended without durable novel progress. This
     /// includes duplicate/echo-only and all-refused streams.
     NoProgressQuantumYield,
+    /// The per-account queue omitted at least one delivery. The durable marker
+    /// is armed, but this drain's (possibly floored) subscription cannot close
+    /// the gap; the caller must issue a fresh unfloored replay.
+    Overflow,
 }
 
 impl DrainVerdict {
@@ -141,6 +145,7 @@ impl DrainVerdict {
             Self::NoRelayEose => Some("backfill_drain_no_relay_eose"),
             Self::NovelProgressQuantumYield => Some("backfill_drain_novel_progress_quantum_yield"),
             Self::NoProgressQuantumYield => Some("backfill_drain_no_progress_quantum_yield"),
+            Self::Overflow => Some("account_delivery_queue_overflow"),
         }
     }
 
@@ -150,6 +155,7 @@ impl DrainVerdict {
             Self::Complete => Some(EpochBackfillCompletionKind::EndOfStoredEvents),
             Self::EoseTimeout
             | Self::NoRelayEose
+            | Self::Overflow
             | Self::NovelProgressQuantumYield
             | Self::NoProgressQuantumYield => None,
         }
@@ -435,13 +441,71 @@ impl AppClient {
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
-        let rebuild_since = self
-            .relay_plane
-            .subscription_rebuild_since(self.state.last_transport_timestamp);
+        let rebuild_since = self.subscription_rebuild_since();
+        self.sync_runtime_groups_since(rebuild_since).await
+    }
+
+    async fn sync_runtime_groups_since(
+        &mut self,
+        rebuild_since: Option<cgka_traits::transport::Timestamp>,
+    ) -> Result<(), AppError> {
         self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
         self.runtime.sync_transport_groups(rebuild_since).await?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
+    }
+
+    pub(crate) fn subscription_rebuild_since(&self) -> Option<cgka_traits::transport::Timestamp> {
+        if self.delivery_overflow_recovery_pending {
+            None
+        } else {
+            self.relay_plane
+                .subscription_rebuild_since(self.state.last_transport_timestamp)
+        }
+    }
+
+    fn observe_delivery_overflow(
+        &mut self,
+        overflow: crate::relay_plane::AccountDeliveryOverflow,
+    ) -> Result<(), AppError> {
+        // This write precedes any checkpoint of the already-drained prefix.
+        // A crash can therefore leave a conservative recovery marker with an
+        // older cursor, but never a newer cursor without the marker.
+        self.app
+            .account_storage(&self.state.label)?
+            .mark_account_delivery_recovery(
+                &self.state.label,
+                overflow.marker_token,
+                overflow.dropped,
+            )?;
+        self.delivery_overflow_recovery_pending = true;
+        self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
+        tracing::warn!(
+            target: "marmot_app::relay_plane",
+            method = "observe_delivery_overflow",
+            queue_depth = overflow.queue_depth,
+            dropped = overflow.dropped,
+            elapsed_ms = overflow.elapsed_ms,
+            "account delivery queue overflow requires unfloored recovery",
+        );
+        Ok(())
+    }
+
+    fn clear_delivery_overflow_recovery(&mut self, marker_token: u64) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let cleared = storage.clear_account_delivery_recovery(&self.state.label, marker_token)?;
+        if cleared {
+            self.delivery_overflow_recovery_pending = false;
+            self.delivery_overflow_recovery_marker_token = None;
+            return Ok(true);
+        }
+        // A newer process-local generation won the storage race. Keep its
+        // marker authoritative; this replay must not clear or report it.
+        let current = storage.account_delivery_recovery(&self.state.label)?;
+        self.delivery_overflow_recovery_pending = current.is_some();
+        self.delivery_overflow_recovery_marker_token =
+            current.map(|recovery| recovery.marker_token);
+        Ok(false)
     }
 
     /// Warm the encrypted-media epoch-secret cache around a subscription sync,
@@ -515,9 +579,7 @@ impl AppClient {
         self.relay_plane
             .set_transport_signer(self.transport_signer.clone())
             .await;
-        let rebuild_since = self
-            .relay_plane
-            .subscription_rebuild_since(self.state.last_transport_timestamp);
+        let rebuild_since = self.subscription_rebuild_since();
         let activation = self.runtime.activate_transport(rebuild_since).await;
         if let Some(telemetry) = telemetry {
             telemetry.record(
@@ -621,8 +683,7 @@ impl AppClient {
                 })?;
         }
         let rebuild_since_secs = self
-            .relay_plane
-            .subscription_rebuild_since(self.state.last_transport_timestamp)
+            .subscription_rebuild_since()
             .map(|timestamp| timestamp.0);
         self.prepare_transport_for_sync(telemetry)
             .await
@@ -637,7 +698,16 @@ impl AppClient {
         // drained registration log before draining inbound deliveries.
         self.record_subscription_rebuild(rebuild_since_secs).await;
         let mut counts = DrainCounts::default();
-        let mut summary = self.sync_sdk_relay(&mut counts).await?;
+        let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
+        if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
+            match self.recover_delivery_overflow().await {
+                Ok(recovered) => summary.merge(recovered),
+                Err(mut failure) => {
+                    failure.partial_summary.merge(summary);
+                    return Err(failure);
+                }
+            }
+        }
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
         // `open()` hydration (mdk#426). If no relay delivery arrived
@@ -944,8 +1014,21 @@ impl AppClient {
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
-            let delivery = self.receive_next_delivery().await?;
-            let summary = self.ingest_received_delivery(delivery).await?;
+            let summary = match self.receive_next_delivery().await? {
+                crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => {
+                    self.ingest_received_delivery(*delivery).await?
+                }
+                crate::relay_plane::AccountDeliveryReceive::Overflow(_) => {
+                    match self.recover_delivery_overflow().await {
+                        Ok(summary) => summary,
+                        Err(failure) => {
+                            self.pending_failed_sync_summary
+                                .merge(failure.partial_summary);
+                            return Err(failure.source);
+                        }
+                    }
+                }
+            };
             // A directly-owned AppClient has no account-worker scheduler to
             // perform the post-visibility retry. Preserve its historical
             // contract by completing the pending rebuild before handing the
@@ -975,7 +1058,7 @@ impl AppClient {
     /// halfway through when a command arrives.
     pub(crate) async fn receive_next_delivery(
         &mut self,
-    ) -> Result<cgka_traits::TransportDelivery, AppError> {
+    ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
         let local_account_id_hex = self
             .app
             .account_home()
@@ -983,11 +1066,20 @@ impl AppClient {
             .account_id_hex;
 
         loop {
-            let delivery = self
+            let received = self
                 .adapter
-                .receive()
+                .receive_account_delivery()
                 .await?
                 .ok_or(AppError::TransportClosed)?;
+            let delivery = match received {
+                crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => delivery,
+                crate::relay_plane::AccountDeliveryReceive::Overflow(overflow) => {
+                    self.observe_delivery_overflow(overflow)?;
+                    return Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(
+                        overflow,
+                    ));
+                }
+            };
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 continue;
@@ -995,7 +1087,9 @@ impl AppClient {
             if self.seen_events_index.contains(&event_id) {
                 continue;
             }
-            return Ok(delivery);
+            return Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(
+                delivery,
+            ));
         }
     }
 
@@ -1059,11 +1153,9 @@ impl AppClient {
     async fn sync_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        let (summary, _) = self
-            .drain_sdk_relay(counts, DrainCompletion::Quiescence)
-            .await?;
-        Ok(summary)
+    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
+        self.drain_sdk_relay(counts, DrainCompletion::Quiescence)
+            .await
     }
 
     /// Drain the transport for an epoch-gap backfill: the same ingest, ended by
@@ -1080,6 +1172,131 @@ impl AppClient {
             execution_quantum,
         };
         self.drain_sdk_relay(counts, completion).await
+    }
+
+    /// Resolve a durable per-account delivery gap with a fresh, unfloored
+    /// account-wide replay. Only EOSE for subscriptions issued by this attempt
+    /// can clear the marker, and a second queue overflow during the replay
+    /// makes the compare-and-clear fail so another attempt remains required.
+    pub(crate) async fn recover_delivery_overflow(
+        &mut self,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        if !self.delivery_overflow_recovery_pending {
+            return Ok(SyncSummary::default());
+        }
+        let marker_token = self
+            .delivery_overflow_recovery_marker_token
+            .ok_or_else(|| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    AppError::Transport(cgka_traits::TransportAdapterError::Other(
+                        "account delivery overflow marker unavailable".to_owned(),
+                    )),
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
+        let attempt = self.adapter.start_delivery_overflow_recovery(marker_token);
+        let started = Instant::now();
+        self.relay_plane
+            .set_transport_signer(self.transport_signer.clone())
+            .await;
+        if let Err(source) = self.runtime.activate_transport(None).await {
+            self.adapter.fail_delivery_overflow_recovery();
+            return Err(ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                AppError::from(source),
+                SyncFailureStage::TransportActivation,
+            ));
+        }
+        if let Err(source) = self.sync_runtime_groups_since(None).await {
+            self.adapter.fail_delivery_overflow_recovery();
+            return Err(ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                source,
+                SyncFailureStage::GroupSubscriptionSync,
+            ));
+        }
+        self.pending_runtime_group_subscription_refresh = false;
+        self.record_subscription_rebuild(None).await;
+        let mut counts = DrainCounts::default();
+        let (summary, verdict) = match self
+            .drain_sdk_relay(
+                &mut counts,
+                DrainCompletion::EndOfStoredEvents {
+                    silence_budget: self.epoch_backfill_eose_wait(),
+                    execution_quantum: self.epoch_backfill_execution_quantum(),
+                },
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.adapter.fail_delivery_overflow_recovery();
+                return Err(error);
+            }
+        };
+        if verdict == DrainVerdict::Complete
+            && let Some(recovery_elapsed_ms) =
+                self.adapter.finish_delivery_overflow_recovery(attempt)
+        {
+            match self.clear_delivery_overflow_recovery(attempt.marker_token) {
+                Ok(true) => self
+                    .adapter
+                    .record_delivery_overflow_recovery_success(recovery_elapsed_ms),
+                Ok(false) => {
+                    self.adapter.fail_delivery_overflow_recovery();
+                    return Err(ClassifiedSyncFailure::at_stage(
+                        summary,
+                        AppError::Transport(cgka_traits::TransportAdapterError::Other(
+                            "account delivery overflow generation advanced".to_owned(),
+                        )),
+                        SyncFailureStage::RelayReceive,
+                    ));
+                }
+                Err(source) => {
+                    self.adapter.fail_delivery_overflow_recovery();
+                    return Err(ClassifiedSyncFailure::at_stage(
+                        summary,
+                        source,
+                        SyncFailureStage::StatePersist,
+                    ));
+                }
+            }
+            tracing::info!(
+                target: "marmot_app::relay_plane",
+                method = "recover_delivery_overflow",
+                queue_depth = attempt.queue_depth,
+                dropped = attempt.dropped,
+                deliveries = counts.deliveries,
+                skipped = counts.skipped,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "account delivery overflow recovery completed",
+            );
+            return Ok(summary);
+        }
+
+        self.adapter.fail_delivery_overflow_recovery();
+        let error_kind = verdict
+            .error_kind()
+            .unwrap_or("overflow_generation_advanced");
+        tracing::warn!(
+            target: "marmot_app::relay_plane",
+            method = "recover_delivery_overflow",
+            error_kind,
+            queue_depth = attempt.queue_depth,
+            dropped = attempt.dropped,
+            deliveries = counts.deliveries,
+            skipped = counts.skipped,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "account delivery overflow recovery remains incomplete",
+        );
+        Err(ClassifiedSyncFailure::at_stage(
+            summary,
+            AppError::Transport(cgka_traits::TransportAdapterError::Other(
+                "account delivery overflow recovery incomplete".to_owned(),
+            )),
+            SyncFailureStage::RelayReceive,
+        ))
     }
 
     /// How long an unconfirmed replay must wait before an automatic seam may
@@ -1239,8 +1456,30 @@ impl AppClient {
                 wait = wait.min(quantum.saturating_sub(drain_started.elapsed()));
             }
             first_wait = false;
-            let delivery = match timeout(wait, self.adapter.receive()).await {
-                Ok(Ok(Some(delivery))) => delivery,
+            let delivery = match timeout(wait, self.adapter.receive_account_delivery()).await {
+                Ok(Ok(Some(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)))) => {
+                    delivery
+                }
+                Ok(Ok(Some(crate::relay_plane::AccountDeliveryReceive::Overflow(overflow)))) => {
+                    if let Err(error) = self.observe_delivery_overflow(overflow) {
+                        // Never checkpoint a cursor learned from the incomplete
+                        // prefix unless the durable recovery marker landed
+                        // first. Engine/app projection work remains retryable;
+                        // the older floor is the safe subscription authority.
+                        self.state.last_transport_timestamp = cursor_before_secs;
+                        return Err(self
+                            .finish_failed_sync_drain(
+                                summary,
+                                routes_dirty,
+                                *counts,
+                                StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                                drain_started,
+                                cursor_before_secs,
+                            )
+                            .await);
+                    }
+                    break DrainVerdict::Overflow;
+                }
                 Ok(Ok(None)) => {
                     break match completion {
                         DrainCompletion::Quiescence => DrainVerdict::Complete,
@@ -1322,7 +1561,7 @@ impl AppClient {
             }
             let mut delivery_summary = SyncSummary::default();
             let ingested = match self
-                .ingest_delivery(delivery, &display_names, &mut delivery_summary)
+                .ingest_delivery(*delivery, &display_names, &mut delivery_summary)
                 .await
             {
                 Ok(ingested) => ingested,
@@ -2432,7 +2671,16 @@ impl AppClient {
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut counts = DrainCounts::default();
-        let mut summary = self.sync_sdk_relay(&mut counts).await?;
+        let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
+        if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
+            match self.recover_delivery_overflow().await {
+                Ok(recovered) => summary.merge(recovered),
+                Err(mut failure) => {
+                    failure.partial_summary.merge(summary);
+                    return Err(failure);
+                }
+            }
+        }
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
             Err(error) => {

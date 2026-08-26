@@ -9243,6 +9243,80 @@ fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
 }
 
 #[test]
+fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
+    run_composed_app_runtime_test("delivery-overflow-reopen", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let cursor = crate::unix_now_seconds() - 3_600;
+
+        {
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+            app.ensure_account_state("alice").unwrap();
+            let mut state = app.load_state("alice").unwrap();
+            state.last_transport_timestamp = Some(cursor);
+            app.save_state(&state).unwrap();
+            app.account_storage("alice")
+                .unwrap()
+                .mark_account_delivery_recovery("alice", 17, 1)
+                .unwrap();
+        }
+
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        reopened.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+        let mut client = client_on_app_relay_plane(&reopened, "alice").await;
+
+        assert!(client.delivery_overflow_recovery_pending);
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(cursor),
+            "the newer durable cursor remains diagnostic state"
+        );
+        assert!(
+            client.subscription_rebuild_since().is_none(),
+            "the pending gap must override the cursor with a full-history request"
+        );
+        let subscriptions = relay.accepted_subscriptions();
+        assert!(!subscriptions.is_empty());
+        assert!(
+            subscriptions.iter().all(|subscription| match subscription {
+                NostrSubscription::AccountInbox { since, .. }
+                | NostrSubscription::Group { since, .. } => since.is_none(),
+                NostrSubscription::GroupMaintenance { .. } => true,
+            }),
+            "account reopen must issue no cursor floor while overflow recovery is pending"
+        );
+
+        let _eose = scripted_eose_pump(reopened.relay_plane.clone(), relay, every_subscription);
+        client
+            .sync()
+            .await
+            .expect("an EOSE-confirmed unfloored replay resolves the durable gap");
+        assert!(!client.delivery_overflow_recovery_pending);
+        assert!(
+            reopened
+                .account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none(),
+            "the durable marker clears only after the recovery replay reaches EOSE"
+        );
+        let health = reopened.relay_plane.relay_health().await;
+        assert_eq!(health.account_delivery_recovery_attempts, 1);
+        assert_eq!(health.account_delivery_recovery_successes, 1);
+        assert_eq!(health.account_delivery_recovery_failures, 0);
+    });
+}
+
+#[test]
 fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     use nostr::base64::Engine as _;
     use nostr::base64::engine::general_purpose::STANDARD as B64;
@@ -12557,6 +12631,10 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         .await
         .expect("locally fanned-out application message")
         .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = delivery else {
+        panic!("the test did not overflow its account delivery queue");
+    };
+    let delivery = *delivery;
     let event_id = hex::encode(delivery.message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
     bob_client
@@ -12583,6 +12661,10 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
             .await
             .expect("redelivered application message")
             .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
+        panic!("the test did not overflow its account delivery queue");
+    };
+    let redelivery = *redelivery;
     assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
     let summary = bob_client
         .ingest_received_delivery(redelivery)

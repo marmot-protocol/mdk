@@ -349,6 +349,11 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// Durable account-wide marker set when the bounded relay-plane queue
+    /// omits a delivery. While true, every subscription rebuild is unfloored
+    /// and EOSE-gated recovery must complete before the cursor is trusted.
+    pub(crate) delivery_overflow_recovery_pending: bool,
+    pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
     /// Unit-test fault injection for the account-open replay path. This keeps
     /// the live protocol group intact while exercising a missing best-effort
     /// app projection.

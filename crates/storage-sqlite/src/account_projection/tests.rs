@@ -30,6 +30,57 @@ fn secure_delete_restore_failure_preserves_committed_outcome() {
 }
 
 #[test]
+fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delivery-recovery.sqlite");
+    let key = SqlCipherKey::new("delivery recovery marker test key").unwrap();
+
+    {
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        assert_eq!(store.account_delivery_recovery("alice").unwrap(), None);
+        store
+            .mark_account_delivery_recovery("alice", 11, 3)
+            .unwrap();
+        let first = store
+            .account_delivery_recovery("alice")
+            .unwrap()
+            .expect("overflow must create a durable marker");
+        assert_eq!(first.marker_token, 11);
+        assert_eq!(first.dropped_count, 3);
+
+        store
+            .mark_account_delivery_recovery("alice", 11, 7)
+            .unwrap();
+        let updated = store.account_delivery_recovery("alice").unwrap().unwrap();
+        assert_eq!(updated.pending_since, first.pending_since);
+        assert_eq!(updated.dropped_count, 7);
+    }
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(
+        reopened
+            .account_delivery_recovery("alice")
+            .unwrap()
+            .unwrap()
+            .dropped_count,
+        7,
+        "restart must retain incomplete recovery"
+    );
+    assert!(
+        !reopened
+            .clear_account_delivery_recovery("alice", 10)
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .clear_account_delivery_recovery("alice", 11)
+            .unwrap()
+    );
+    assert_eq!(reopened.account_delivery_recovery("alice").unwrap(), None);
+}
+
+#[test]
 fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retention.sqlite");
