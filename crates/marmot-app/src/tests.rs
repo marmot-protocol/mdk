@@ -11470,6 +11470,282 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         "the failed delivery's message must be durably projected exactly once",
     );
 }
+/// A group whose per-group retained-undecryptable backlog is exactly full, plus
+/// everything a test needs to mint one more undecryptable delivery for it.
+///
+/// `cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP` is the
+/// only way to reach `IngestOutcome::ResourceRefused`: the engine offers no
+/// knob for the cap, so the backlog is filled for real. Below the cap an
+/// unpeelable object is *retained* (`TransportDeferred`); at it the engine drops
+/// the object unpersisted and keeps its id out of its own seen cache, so
+/// transport redelivery is the only path back to it.
+struct UndecryptableProbeRoute {
+    account_id_hex: String,
+    group_id: cgka_traits::GroupId,
+    nostr_group_id_hex: String,
+}
+
+impl UndecryptableProbeRoute {
+    /// One kind-445 delivery for this group's route whose body cannot peel.
+    fn probe(&self, created_at: u64, marker: &str) -> cgka_traits::TransportDelivery {
+        cgka_traits::TransportDelivery {
+            account_id: MemberId::new(hex::decode(&self.account_id_hex).unwrap()),
+            group_id_hint: Some(self.group_id.clone()),
+            message: epoch_gap_probe(&self.nostr_group_id_hex, created_at, marker)
+                .to_transport_message()
+                .expect("probe converts to a transport message"),
+            received_at: cgka_traits::transport::Timestamp(created_at),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+                plane: cgka_traits::TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        }
+    }
+}
+
+/// Build [`UndecryptableProbeRoute`]'s group and fill its retained-undecryptable
+/// backlog to the cap, on an app whose relay plane accepts injected events.
+///
+/// Every filling probe is dated `filled_through` so a later probe's effect on
+/// the transport cursor is unambiguous, and each is ingested through the receive
+/// seam because that is the cheapest way to reach the engine 256 times.
+async fn group_at_the_undecryptable_retention_cap(
+    dir: &tempfile::TempDir,
+    filled_through: u64,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    let account_id_hex = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(crate::AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    app.relay_plane =
+        MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
+
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client
+        .create_group("undecryptable retention cap", &[])
+        .await
+        .unwrap();
+    let nostr_group_id_hex = app
+        .group("alice", &hex::encode(group_id.as_slice()))
+        .unwrap()
+        .expect("local group projection")
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route = UndecryptableProbeRoute {
+        account_id_hex,
+        group_id,
+        nostr_group_id_hex,
+    };
+
+    for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+        client
+            .ingest_received_delivery(route.probe(filled_through, &format!("cap-fill-{row}")))
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert_eq!(
+        client.state.last_transport_timestamp,
+        Some(filled_through),
+        "the retained probes must have advanced the cursor to their own timestamp",
+    );
+    (app, client, route)
+}
+
+/// Every `ingest_outcome` audit row the engine recorded for `msg_id`.
+fn recorded_ingest_outcomes(app: &MarmotApp, msg_id: &str) -> Vec<String> {
+    recorded_audit_rows(app)
+        .iter()
+        .filter(|row| row["kind"]["type"] == "ingest_outcome")
+        .filter(|row| row["kind"]["msg_id"].as_str() == Some(msg_id))
+        .filter_map(|row| row["kind"]["outcome_kind"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+/// A refused object must stay fetchable: the receive seam may neither mark it
+/// seen nor let it advance the relay `since` cursor.
+///
+/// `IngestOutcome::ResourceRefused` is an `Ok` the engine deliberately leaves
+/// unpersisted — it suppresses its own seen-cache insertion so "same-id
+/// redelivery is not a duplicate". Marking it seen here defeats that: the id is
+/// persisted in `seen_events` with no removal site short of ring overflow, and
+/// the advanced cursor puts the object below the next subscription's `since`
+/// floor, so the message becomes permanently unfetchable across restarts and
+/// even across `repair_full_history`.
+#[test]
+fn a_refused_delivery_is_neither_marked_seen_nor_allowed_to_advance_the_cursor() {
+    run_composed_app_runtime_test("refused-ingest-receive-seam", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        // Minted once and cloned, so the redelivery below is byte-identical:
+        // a re-minted probe would carry a fresh ephemeral key and a fresh id.
+        let refused = route.probe(filled_through + 500, "refused-at-the-cap");
+        let refused_id = hex::encode(refused.message.id.as_slice());
+        client
+            .ingest_received_delivery(refused.clone())
+            .await
+            .expect("a refused object still completes its ingest pass");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned()],
+            "the backlog must be full, so this object is refused rather than retained",
+        );
+        assert!(
+            !client.seen_events_index.contains(&refused_id),
+            "a refused object is not durably ingested, so it must not be marked seen",
+        );
+        assert!(
+            !client.state.seen_events.contains(&refused_id),
+            "nor persisted into the durable seen-events ring",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(filled_through),
+            "a refused object must not carry the relay `since` floor past itself",
+        );
+
+        // The unstick proof: the relay redelivers, and the reused client hands
+        // the object to the engine again instead of skipping it as seen. It is
+        // still refused — the backlog is still full — which is itself the
+        // evidence that the engine reclassified it rather than deduplicating it.
+        client
+            .ingest_received_delivery(refused)
+            .await
+            .expect("the redelivered object must reach the engine again");
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned(), "resource_refused".to_owned()],
+            "the redelivery must be reclassified, never deduplicated away",
+        );
+        assert!(
+            !client.seen_events_index.contains(&refused_id),
+            "and it stays fetchable for as long as the engine keeps refusing it",
+        );
+    });
+}
+
+/// The fence: a `TransportDeferred` object *is* durably retained by the engine,
+/// so marking it seen is correct dedupe and stays. Only the unpersisted refusal
+/// is exempt.
+#[test]
+fn a_transport_deferred_delivery_is_still_marked_seen() {
+    run_composed_app_runtime_test("transport-deferred-marks-seen", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let account_id_hex = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap()
+            .account_id_hex;
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client.create_group("deferred fence", &[]).await.unwrap();
+        let route = UndecryptableProbeRoute {
+            account_id_hex,
+            nostr_group_id_hex: app
+                .group("alice", &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .expect("local group projection")
+                .nostr_routing
+                .nostr_group_id_hex,
+            group_id,
+        };
+
+        let created_at = crate::unix_now_seconds() - 1_000;
+        let deferred = route.probe(created_at, "retained-below-the-cap");
+        let deferred_id = hex::encode(deferred.message.id.as_slice());
+        client
+            .ingest_received_delivery(deferred)
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &deferred_id),
+            vec!["transport_deferred".to_owned()],
+            "below the cap the engine retains the object durably",
+        );
+        assert!(
+            client.seen_events_index.contains(&deferred_id),
+            "a durably retained object must still be deduplicated by the seen index",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(created_at),
+            "and it still carries the relay `since` floor forward",
+        );
+    });
+}
+
+/// The same rule at the catch-up drain seam: a refused delivery must leave both
+/// the seen index and the transport cursor untouched there too, so the relay
+/// re-serves it on the next drain instead of the app skipping it.
+#[test]
+fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
+    run_composed_app_runtime_test("refused-ingest-drain-seam", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        let refused = epoch_gap_probe(
+            &route.nostr_group_id_hex,
+            filled_through + 500,
+            "refused-in-the-drain",
+        );
+        let refused_id = refused.id.clone();
+        inject_epoch_gap_probe(&app, refused.clone()).await;
+        client.sync().await.expect("the drain must complete");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned()],
+            "the backlog must be full, so the drain's object is refused",
+        );
+        assert!(
+            !client.seen_events_index.contains(&refused_id),
+            "the drain must not mark a refused object seen",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(filled_through),
+            "nor carry the relay `since` floor past it",
+        );
+
+        // The relay re-serves it on the next drain, and the drain ingests it
+        // again rather than counting it as an already-seen skip.
+        inject_epoch_gap_probe(&app, refused).await;
+        client.sync().await.expect("the second drain must complete");
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned(), "resource_refused".to_owned()],
+            "the re-served object must reach the engine again",
+        );
+    });
+}
 
 /// Every SQLite database this app can open, plus the root runtime lease, must
 /// be released by one `close_storage` call — that is the whole contract iOS

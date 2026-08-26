@@ -138,6 +138,40 @@ impl DrainVerdict {
     }
 }
 
+/// What one delivery's ingest settled, for the two seams that decide whether the
+/// delivery may be dropped from the fetch path.
+struct DeliveryIngest {
+    /// Membership-changing effects landed, so the app projection and the route
+    /// table owe a save before anything else can fail.
+    routes_dirty: bool,
+    /// The engine kept no durable trace of this object, so transport
+    /// redelivery is the only path back to it. See
+    /// [`ingest_left_object_unpersisted`].
+    must_stay_fetchable: bool,
+}
+
+/// Whether the engine left this outcome's transport object unpersisted, so only
+/// relay redelivery can present it again.
+///
+/// This is the app-side half of the engine's `retryable_unpersisted_ingest_id`
+/// contract. `ResourceRefused` is the one `Ok` outcome the engine drops without
+/// a durable record *and* deliberately keeps out of its own seen cache, and the
+/// trait states the consequence directly: a resource refusal "must not make
+/// same-id redelivery a duplicate". Recording it in `seen_events` (which has no
+/// removal site short of ring overflow) or letting it carry the relay `since`
+/// floor past itself makes the object permanently unfetchable — across restarts
+/// and across `repair_full_history` alike.
+///
+/// Every other `Ok` outcome leaves the engine holding durable evidence of the
+/// object: `TransportDeferred` retains the raw transport row for later peel,
+/// `Buffered` retains it for convergence replay, and the terminal
+/// classifications (`Processed`, `Ignored`, `LocalState`, `Stale`, `Rejected`)
+/// are decisions the engine can reach again from storage. Forgetting those is
+/// correct dedupe, so they stay.
+fn ingest_left_object_unpersisted(outcome: &IngestOutcome) -> bool {
+    matches!(outcome, IngestOutcome::ResourceRefused { .. })
+}
+
 /// What one drain loop saw on the wire.
 ///
 /// `deliveries` counts receives the drain ingested; `skipped` counts those it
@@ -919,14 +953,18 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let routes_dirty = self
+        let ingested = self
             .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
         // Mark the delivery seen only after durable ingest succeeds, matching
         // the catch-up drain below. Marking at receive time would let a failed
         // ingest poison the index, so a reused client would silently skip the
-        // redelivered event.
-        self.remember_seen_event(event_id);
+        // redelivered event — and an `Ok` the engine refused unpersisted is
+        // just as much a not-durable ingest as an `Err` is.
+        if !ingested.must_stay_fetchable {
+            self.remember_seen_event(event_id);
+        }
+        let routes_dirty = ingested.routes_dirty;
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
@@ -1205,11 +1243,11 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
-            let delivery_routes_dirty = match self
+            let ingested = match self
                 .ingest_delivery(delivery, &display_names, &mut delivery_summary)
                 .await
             {
-                Ok(routes_dirty) => routes_dirty,
+                Ok(ingested) => ingested,
                 Err(error) => {
                     return Err(self
                         .finish_failed_sync_drain(
@@ -1223,10 +1261,15 @@ impl AppClient {
                         .await);
                 }
             };
-            self.remember_seen_event(event_id);
+            // Same rule as the receive seam above: an object the engine refused
+            // unpersisted must stay fetchable, so the relay re-serves it on a
+            // later drain instead of this one skipping it as already seen.
+            if !ingested.must_stay_fetchable {
+                self.remember_seen_event(event_id);
+            }
             counts.deliveries = counts.deliveries.saturating_add(1);
             summary.merge(delivery_summary);
-            routes_dirty |= delivery_routes_dirty;
+            routes_dirty |= ingested.routes_dirty;
         };
 
         if let Err(error) = self
@@ -1373,17 +1416,24 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
-    ) -> Result<bool, AppError> {
+    ) -> Result<DeliveryIngest, AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
+        let must_stay_fetchable = ingest_left_object_unpersisted(&effects.outcome);
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_groups(&effects.effects);
         self.observe_recovery_evidence(&effects.effects);
-        self.remember_transport_cursor(outer_transport_at);
+        if !must_stay_fetchable {
+            // Scope fence: a `TransportDeferred` object *is* durably retained,
+            // so it advances the floor here. Whether a retained-but-unapplied
+            // object should instead hold the floor back until it converges is
+            // the separate since-floor design item, not this seam's call.
+            self.remember_transport_cursor(outer_transport_at);
+        }
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         // A delivery can contain several application events. If projection
         // fails after an earlier event staged its acknowledgement, keep that
@@ -1440,7 +1490,10 @@ impl AppClient {
                 "incidental auto-publish failed after inbound effects were projected"
             );
         }
-        Ok(routes_dirty)
+        Ok(DeliveryIngest {
+            routes_dirty,
+            must_stay_fetchable,
+        })
     }
 
     /// Feed an unavailable group delivery to the epoch-stall detector.
