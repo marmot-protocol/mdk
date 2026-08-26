@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
+use support::epoch_sealed_peeler::EpochSealedPeeler;
 use support::proof_signer;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -199,6 +200,72 @@ struct NotifyEpochGatePeeler {
     block_on_attempt: Arc<AtomicU64>,
 }
 
+/// Epoch-faithful peeler that can suspend before any supplied context is
+/// attempted. Used to cancel a sweep after candidate enumeration but before a
+/// deferred row receives a definitive result.
+#[derive(Clone)]
+struct CancellableEpochSealedPeeler {
+    blocked: Arc<AtomicBool>,
+    blocked_attempts: Arc<AtomicU64>,
+}
+
+impl CancellableEpochSealedPeeler {
+    fn new() -> Self {
+        Self {
+            blocked: Arc::new(AtomicBool::new(false)),
+            blocked_attempts: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn block(&self) {
+        self.blocked_attempts.store(0, Ordering::SeqCst);
+        self.blocked.store(true, Ordering::SeqCst);
+    }
+
+    fn unblock(&self) {
+        self.blocked.store(false, Ordering::SeqCst);
+    }
+
+    fn blocked_attempts(&self) -> u64 {
+        self.blocked_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for CancellableEpochSealedPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if self.blocked.load(Ordering::SeqCst) {
+            self.blocked_attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        EpochSealedPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        EpochSealedPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        EpochSealedPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        EpochSealedPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 impl NotifyEpochGatePeeler {
     fn new() -> Self {
         Self {
@@ -339,6 +406,43 @@ fn build_notify_client(
 ) {
     let peeler = NotifyEpochGatePeeler::new();
     build_gated_client(name, peeler)
+}
+
+fn build_epoch_sealed_client_with_storage(
+    name: &[u8],
+    storage: SqliteAccountStorage,
+) -> Engine<SqliteAccountStorage> {
+    build_epoch_sealed_client_with_storage_and_peeler(name, storage, EpochSealedPeeler)
+}
+
+fn build_epoch_sealed_client_with_storage_and_peeler<P>(
+    name: &[u8],
+    storage: SqliteAccountStorage,
+    peeler: P,
+) -> Engine<SqliteAccountStorage>
+where
+    P: TransportPeeler + 'static,
+{
+    let mut engine = EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .peeler(Box::new(peeler))
+        .build()
+        .unwrap();
+    engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    engine
+}
+
+fn build_epoch_sealed_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let engine = build_epoch_sealed_client_with_storage(name, storage.clone());
+    (engine, storage)
 }
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
@@ -491,6 +595,320 @@ async fn carol_behind_two_epochs_with<P>(
         commit_to_epoch2,
         commit_to_epoch3,
     )
+}
+
+/// Build a deterministic two-branch graph and retain `backlog` wrappers of one
+/// rival-branch application message. Peeling any wrapper adds no commit digest,
+/// so every background slice observes the exact same context fingerprint.
+async fn contested_rival_app_backlog(
+    backlog: usize,
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Engine<SqliteAccountStorage>,
+) {
+    contested_rival_app_backlog_with_peeler(backlog, EpochSealedPeeler).await
+}
+
+async fn contested_rival_app_backlog_with_peeler<P>(
+    backlog: usize,
+    incumbent_peeler: P,
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Engine<SqliteAccountStorage>,
+)
+where
+    P: TransportPeeler + 'static,
+{
+    let incumbent_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut incumbent = build_epoch_sealed_client_with_storage_and_peeler(
+        b"candidate-cache-incumbent",
+        incumbent_storage.clone(),
+        incumbent_peeler,
+    );
+    let (mut rival, _rival_storage) = build_epoch_sealed_client(b"candidate-cache-rival");
+    let (mut david, _david_storage) = build_epoch_sealed_client(b"candidate-cache-david");
+    let (mut eve, _eve_storage) = build_epoch_sealed_client(b"candidate-cache-eve");
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let (group_id, create) = incumbent
+        .create_group(CreateGroupRequest {
+            name: "candidate-cache".into(),
+            description: String::new(),
+            members: vec![rival_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![rival.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    incumbent.confirm_published(pending).await.unwrap();
+    rival
+        .join_welcome(welcome_for(&welcomes, b"candidate-cache-rival"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let (incumbent_commit, incumbent_pending, incumbent_welcomes) = match incumbent
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+            ..
+        } => (msg, pending, welcomes),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    incumbent
+        .confirm_published(incumbent_pending)
+        .await
+        .unwrap();
+    david
+        .join_welcome(welcome_for(&incumbent_welcomes, b"candidate-cache-david"))
+        .await
+        .unwrap();
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let (rival_root, rival_pending) = evolution(
+        rival
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![eve_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    rival.confirm_published(rival_pending).await.unwrap();
+
+    // The own commit is already durably stamped by confirm. Retain its wire
+    // value too so the setup is explicit about both sides of the contested
+    // graph and cannot be optimized into an unused local evolution.
+    let _ = incumbent_commit;
+    assert!(matches!(
+        incumbent
+            .ingest(route(rival_root, &group_id))
+            .await
+            .unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    let rival_app = send_app(&mut rival, &group_id, "rival branch witness").await;
+    for index in 0..backlog {
+        let wrapper = TransportMessage {
+            id: MessageId::new(format!("candidate-cache-wrapper-{index}").into_bytes()),
+            ..rival_app.clone()
+        };
+        assert!(matches!(
+            incumbent.ingest(wrapper).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    assert_eq!(
+        incumbent_storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0),)
+            .unwrap()
+            .len(),
+        backlog
+    );
+
+    (incumbent, incumbent_storage, group_id, david)
+}
+
+#[tokio::test]
+async fn unchanged_192_row_contested_backlog_enumerates_candidates_once() {
+    let (mut incumbent, storage, group_id, _same_branch_peer) =
+        contested_rival_app_backlog(192).await;
+
+    let mut handled = 0usize;
+    for _ in 0..3 {
+        let progressed = incumbent.retry_deferred_peels(&group_id).await.unwrap();
+        assert_eq!(progressed, 64, "background work must stay slice-bounded");
+        handled += progressed;
+    }
+
+    assert_eq!(handled, 192);
+    assert!(
+        storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0),)
+            .unwrap()
+            .is_empty(),
+        "every raw wrapper must leave the deferred lifecycle"
+    );
+    let metrics = incumbent.engine_metrics();
+    assert_eq!(metrics.deferred_peel_candidate_enumerations, 1);
+    assert_eq!(metrics.deferred_peel_candidate_cache_misses, 1);
+    assert_eq!(metrics.deferred_peel_candidate_cache_hits, 2);
+    assert_eq!(metrics.deferred_peel_candidate_cache_invalidations, 1);
+    assert_eq!(metrics.deferred_peel_candidate_contexts, 2);
+    assert_eq!(
+        metrics.deferred_peel_candidate_context_depth.sample_count(),
+        2
+    );
+    assert_eq!(
+        metrics
+            .deferred_peel_candidate_context_depth
+            .approx_percentile(1.0),
+        Some(1)
+    );
+    assert_eq!(
+        metrics.deferred_peel_candidate_replay_probes, 4,
+        "candidate replay work must be independent of the number of slices"
+    );
+    assert_eq!(
+        metrics
+            .deferred_peel_candidate_enumeration_ms
+            .sample_count(),
+        1
+    );
+    assert_eq!(
+        metrics.deferred_peel_sweeps, 4,
+        "three work slices plus the generation-completion empty sweep"
+    );
+}
+
+#[tokio::test]
+async fn changed_fingerprint_enumerates_exactly_one_new_candidate_generation() {
+    let (mut incumbent, storage, group_id, mut same_branch_peer) =
+        contested_rival_app_backlog(256).await;
+
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    let before_change = incumbent.engine_metrics();
+    assert_eq!(before_change.deferred_peel_candidate_enumerations, 1);
+    assert_eq!(before_change.deferred_peel_candidate_cache_hits, 1);
+
+    // A valid commit on the incumbent lineage adds one stored convergence
+    // input without adopting the rival branch. The commit digest is part of
+    // the existing fingerprint semantics, so the remaining rows form one new
+    // exact generation.
+    let (new_input, pending) = evolution(
+        same_branch_peer
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    same_branch_peer.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        incumbent.ingest(route(new_input, &group_id)).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    assert!(
+        storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0),)
+            .unwrap()
+            .is_empty()
+    );
+    let after_change = incumbent.engine_metrics();
+    assert_eq!(
+        after_change.deferred_peel_candidate_enumerations,
+        before_change.deferred_peel_candidate_enumerations + 1,
+        "one changed fingerprint must cause exactly one new enumeration"
+    );
+    assert_eq!(after_change.deferred_peel_candidate_cache_misses, 2);
+    assert_eq!(after_change.deferred_peel_candidate_cache_hits, 2);
+    assert!(after_change.deferred_peel_candidate_cache_invalidations >= 2);
+}
+
+#[tokio::test]
+async fn restart_discards_candidate_context_cache_and_recomputes_once() {
+    let (mut incumbent, storage, group_id, _same_branch_peer) =
+        contested_rival_app_backlog(192).await;
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    assert_eq!(
+        incumbent
+            .engine_metrics()
+            .deferred_peel_candidate_enumerations,
+        1
+    );
+    drop(incumbent);
+
+    let mut restarted =
+        build_epoch_sealed_client_with_storage(b"candidate-cache-incumbent", storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    let mut progressed = 0usize;
+    for _ in 0..3 {
+        progressed += restarted.retry_deferred_peels(&group_id).await.unwrap();
+        if restarted
+            .engine_metrics()
+            .deferred_peel_candidate_enumerations
+            > 0
+        {
+            break;
+        }
+    }
+    assert_eq!(progressed, 64);
+    let metrics = restarted.engine_metrics();
+    assert_eq!(
+        metrics.deferred_peel_candidate_enumerations, 1,
+        "a restarted engine must enumerate instead of loading secret contexts"
+    );
+    assert_eq!(metrics.deferred_peel_candidate_cache_misses, 1);
+    assert_eq!(metrics.deferred_peel_candidate_cache_hits, 0);
+}
+
+#[tokio::test]
+async fn cancelled_sweep_keeps_untried_rows_eligible_and_reuses_enumeration() {
+    let peeler = CancellableEpochSealedPeeler::new();
+    let (mut incumbent, storage, group_id, _same_branch_peer) =
+        contested_rival_app_backlog_with_peeler(192, peeler.clone()).await;
+
+    peeler.block();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(25),
+        incumbent.retry_deferred_peels(&group_id),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the blocked peel must exhaust the caller budget"
+    );
+    assert_eq!(peeler.blocked_attempts(), 1);
+    let deferred = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap();
+    assert_eq!(deferred.len(), 192);
+    assert!(deferred.iter().all(|record| {
+        record
+            .deferred_peel
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.last_context_fingerprint)
+            .is_none()
+    }));
+    assert_eq!(
+        incumbent
+            .engine_metrics()
+            .deferred_peel_candidate_enumerations,
+        1
+    );
+
+    peeler.unblock();
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    let metrics = incumbent.engine_metrics();
+    assert_eq!(
+        metrics.deferred_peel_candidate_enumerations, 1,
+        "cancellation retains the safe memory-only enumeration"
+    );
+    assert_eq!(metrics.deferred_peel_candidate_cache_hits, 1);
 }
 
 #[tokio::test]

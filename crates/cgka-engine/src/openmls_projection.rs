@@ -172,7 +172,6 @@ struct StoredOpenMlsCandidatePathResult {
 /// The pass fails closed (`ReplayBudgetExceeded`) rather than returning a partial result.
 struct ReplayBudget {
     remaining: u64,
-    #[cfg(feature = "test-conformance-snapshot")]
     consumed: u64,
 }
 
@@ -187,7 +186,6 @@ impl ReplayBudget {
     fn new(limit: u64) -> Self {
         Self {
             remaining: limit,
-            #[cfg(feature = "test-conformance-snapshot")]
             consumed: 0,
         }
     }
@@ -197,7 +195,6 @@ impl ReplayBudget {
     fn unlimited() -> Self {
         Self {
             remaining: u64::MAX,
-            #[cfg(feature = "test-conformance-snapshot")]
             consumed: 0,
         }
     }
@@ -217,10 +214,7 @@ impl ReplayBudget {
             return Err(OpenMlsProjectionError::ReplayBudgetExceeded);
         }
         self.remaining -= 1;
-        #[cfg(feature = "test-conformance-snapshot")]
-        {
-            self.consumed = self.consumed.saturating_add(1);
-        }
+        self.consumed = self.consumed.saturating_add(1);
         Ok(())
     }
 }
@@ -1612,6 +1606,10 @@ pub(crate) struct CandidateBranchPeelContext {
     /// admits only its frozen batch, the two need not enumerate the same set.
     pub(crate) branch_id: String,
     pub(crate) tip_epoch: u64,
+    /// Number of commit edges replayed from the retained base to capture this
+    /// tip. Exposed only through aggregate metrics; never logged alongside a
+    /// branch or group identifier.
+    pub(crate) depth: u64,
     pub(crate) context: cgka_traits::group_context::GroupContextSnapshot,
 }
 
@@ -1629,6 +1627,9 @@ pub(crate) struct CandidateBranchPeel {
     /// Tip contexts enumeration captured, at most `max_contexts` of them.
     /// Empty on every halt, and empty for an uncontested graph.
     pub(crate) contexts: Vec<CandidateBranchPeelContext>,
+    /// OpenMLS replay probes consumed while enumerating and capturing the
+    /// candidate contexts. Aggregate work accounting only.
+    pub(crate) replay_probe_count: u64,
 }
 
 impl CandidateBranchPeel {
@@ -1637,15 +1638,22 @@ impl CandidateBranchPeel {
     const UNCONTESTED: Self = Self {
         contested: false,
         contexts: Vec::new(),
+        replay_probe_count: 0,
     };
 
     /// Whatever enumeration captured from a graph already known to be split.
-    fn contested_over(contexts: Vec<CandidateBranchPeelContext>) -> Self {
+    fn contested_over(enumeration: CandidateBranchPeelEnumeration) -> Self {
         Self {
             contested: true,
-            contexts,
+            contexts: enumeration.contexts,
+            replay_probe_count: enumeration.replay_probe_count,
         }
     }
+}
+
+struct CandidateBranchPeelEnumeration {
+    contexts: Vec<CandidateBranchPeelContext>,
+    replay_probe_count: u64,
 }
 
 /// Survey the branches a convergence graph offers: whether it is contested, and
@@ -1711,7 +1719,10 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
                 max_contexts,
             )
         }
-        Err(StorageError::SnapshotMissing(_)) => Ok(Vec::new()),
+        Err(StorageError::SnapshotMissing(_)) => Ok(CandidateBranchPeelEnumeration {
+            contexts: Vec::new(),
+            replay_probe_count: 0,
+        }),
         Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
     };
     guard
@@ -1749,7 +1760,7 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     max_rewind_commits: u64,
     profile_policy: ReplayProfilePolicy,
     max_contexts: usize,
-) -> Result<Vec<CandidateBranchPeelContext>, OpenMlsProjectionError> {
+) -> Result<CandidateBranchPeelEnumeration, OpenMlsProjectionError> {
     let mut budget = ReplayBudget::for_pass(inputs.commit_messages.len(), max_rewind_commits);
     let path_result = match build_stored_openmls_candidate_paths(
         storage,
@@ -1777,12 +1788,18 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
                 reason = candidate_branch_enumeration_halt_reason(&err),
                 "no candidate branch peel contexts: branch enumeration halted"
             );
-            return Ok(Vec::new());
+            return Ok(CandidateBranchPeelEnumeration {
+                contexts: Vec::new(),
+                replay_probe_count: budget.consumed,
+            });
         }
         Err(err) => return Err(err),
     };
     if path_result.candidate_paths.len() < 2 {
-        return Ok(Vec::new());
+        return Ok(CandidateBranchPeelEnumeration {
+            contexts: Vec::new(),
+            replay_probe_count: budget.consumed,
+        });
     }
 
     let pending_proposals = pending_proposal_messages(&inputs.pending_messages)?;
@@ -1819,7 +1836,10 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
             Err(err) => return Err(err),
         }
     }
-    Ok(contexts)
+    Ok(CandidateBranchPeelEnumeration {
+        contexts,
+        replay_probe_count: budget.consumed,
+    })
 }
 
 /// Order candidate paths by how much a peel context on each is worth, so the
@@ -1904,6 +1924,7 @@ fn candidate_path_peel_context<S: StorageProvider>(
     Ok(captured?.map(|tip| CandidateBranchPeelContext {
         branch_id: path.branch_id.clone(),
         tip_epoch: tip.epoch,
+        depth: path.messages.len().try_into().unwrap_or(u64::MAX),
         context: tip.context,
     }))
 }

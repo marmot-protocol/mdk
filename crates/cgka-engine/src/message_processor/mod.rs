@@ -35,6 +35,7 @@ use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
@@ -166,6 +167,21 @@ pub(crate) struct DeferredPeelGroupState {
     /// per rejected message; this suppresses the repeats until the backlog
     /// drops back below the cap and re-arms.
     cap_rejection_audited: bool,
+    /// Candidate branch contexts for one exact process-local generation.
+    ///
+    /// These contexts contain exporter-derived secret material. The cache is
+    /// deliberately nested in engine memory: it is never serialized, audited,
+    /// logged, or copied into durable generation state, and process restart
+    /// drops it naturally.
+    candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
+}
+
+struct DeferredPeelCandidateCacheEntry {
+    context_fingerprint: [u8; 32],
+    /// Exact durable barrier generation observed after enumeration. `None` is
+    /// also meaningful and must match on reuse.
+    durable_generation_fingerprint: Option<[u8; 32]>,
+    peel: Arc<crate::openmls_projection::CandidateBranchPeel>,
 }
 
 impl DeferredPeelGroupState {
@@ -1394,6 +1410,7 @@ impl<S: StorageProvider> Engine<S> {
         execution: &mut DeferredPeelExecution<'_>,
     ) -> Result<DeferredPeelWorkResult, EngineError> {
         let sweep_started = Instant::now();
+        self.engine_metrics.note_deferred_peel_sweep();
         let foreground_budget_ms = match execution {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
             DeferredPeelExecution::Background => None,
@@ -1548,6 +1565,7 @@ impl<S: StorageProvider> Engine<S> {
             state.counted = true;
         }
         if total == 0 {
+            self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
                 self.converge_stored_openmls_messages_with_time(group_id, now)
@@ -1577,6 +1595,7 @@ impl<S: StorageProvider> Engine<S> {
             .cloned()
             .collect::<Vec<_>>();
         if unattempted.is_empty() {
+            self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
                 self.converge_stored_openmls_messages_with_time(group_id, now)
@@ -1631,35 +1650,127 @@ impl<S: StorageProvider> Engine<S> {
         // pays only the seeding scan. Nothing read here is trusted: the bytes
         // re-enter through ordinary ingest and only the next pass's OpenMLS
         // replay authenticates them. A peel that fails is silence.
-        let peel = match self.candidate_branch_peel(group_id) {
-            Ok(peel) => peel,
-            Err(error) => {
-                self.note_foreground_deferred_phase(
-                    sweep_started,
-                    foreground_budget_ms,
-                    0,
-                    total,
-                    crate::engine_metrics::DeferredPeelMetricOutcome::Error,
+        let durable_generation_fingerprint = self
+            .storage
+            .deferred_peel_generation(group_id)?
+            .map(|generation| generation.context_fingerprint);
+        let cached = self
+            .deferred_peel
+            .get(group_id)
+            .and_then(|state| state.candidate_cache.as_ref())
+            .filter(|cached| {
+                cached.context_fingerprint == fingerprint
+                    && cached.durable_generation_fingerprint == durable_generation_fingerprint
+            })
+            .map(|cached| Arc::clone(&cached.peel));
+        let (peel, candidate_cache_hit) = if let Some(cached) = cached {
+            self.engine_metrics.note_deferred_peel_candidate_cache_hit();
+            (cached, true)
+        } else {
+            self.invalidate_deferred_peel_candidate_cache(group_id);
+            self.engine_metrics
+                .note_deferred_peel_candidate_cache_miss();
+            let candidate_enumeration_started = Instant::now();
+            let enumerated = match self.candidate_branch_peel(group_id) {
+                Ok(peel) => peel,
+                Err(error) => {
+                    self.engine_metrics
+                        .note_deferred_peel_candidate_enumeration(
+                            candidate_enumeration_started
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                            std::iter::empty(),
+                            0,
+                        );
+                    self.note_foreground_deferred_phase(
+                        sweep_started,
+                        foreground_budget_ms,
+                        0,
+                        total,
+                        crate::engine_metrics::DeferredPeelMetricOutcome::Error,
+                    );
+                    return Err(error);
+                }
+            };
+            let candidate_enumeration_ms = candidate_enumeration_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            self.engine_metrics
+                .note_deferred_peel_candidate_enumeration(
+                    candidate_enumeration_ms,
+                    enumerated.contexts.iter().map(|context| context.depth),
+                    enumerated.replay_probe_count,
                 );
-                return Err(error);
+            tracing::info!(
+                target: "cgka_engine::message_processor",
+                method = "candidate_branch_peel",
+                candidate_contexts = enumerated.contexts.len() as u64,
+                max_candidate_context_depth = enumerated
+                    .contexts
+                    .iter()
+                    .map(|context| context.depth)
+                    .max()
+                    .unwrap_or(0),
+                replay_probes = enumerated.replay_probe_count,
+                candidate_enumeration_ms,
+                "deferred-peel candidate enumeration"
+            );
+            if enumerated.contested {
+                self.storage
+                    .put_deferred_peel_generation(&DeferredPeelGeneration {
+                        group_id: group_id.clone(),
+                        context_fingerprint: fingerprint,
+                    })?;
             }
+            let cached_generation_fingerprint = if enumerated.contested {
+                Some(fingerprint)
+            } else {
+                durable_generation_fingerprint
+            };
+            let enumerated = Arc::new(enumerated);
+            self.deferred_peel
+                .entry(group_id.clone())
+                .or_default()
+                .candidate_cache = Some(DeferredPeelCandidateCacheEntry {
+                context_fingerprint: fingerprint,
+                durable_generation_fingerprint: cached_generation_fingerprint,
+                peel: Arc::clone(&enumerated),
+            });
+            (enumerated, false)
         };
+        tracing::debug!(
+            target: "cgka_engine::message_processor",
+            method = "candidate_branch_peel_cache",
+            cache_hit = candidate_cache_hit,
+            "deferred-peel candidate cache lookup"
+        );
         let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel);
-        if peel.contested {
-            self.storage
-                .put_deferred_peel_generation(&DeferredPeelGeneration {
-                    group_id: group_id.clone(),
-                    context_fingerprint: fingerprint,
-                })?;
-        }
 
         let mut progressed = 0usize;
         let mut terminal = 0usize;
         let mut attempted = 0usize;
         let mut timed_out = false;
+        let mut contexts_invalidated = false;
         for record in unattempted.into_iter().take(row_limit) {
             if execution.exhausted() {
                 timed_out = true;
+                break;
+            }
+            // A row can itself advance or replace canonical state. Those
+            // transition sites synchronously invalidate the map entry; do not
+            // keep offering the slice's local Arc to later rows after that.
+            // Their lifecycle remains untouched for the next fingerprint.
+            if !self
+                .deferred_peel
+                .get(group_id)
+                .and_then(|state| state.candidate_cache.as_ref())
+                .is_some_and(|cached| Arc::ptr_eq(&cached.peel, &peel))
+            {
+                contexts_invalidated = true;
                 break;
             }
             let lifecycle = record
@@ -1728,6 +1839,9 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let final_fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+        if final_fingerprint != fingerprint {
+            self.invalidate_deferred_peel_candidate_cache(group_id);
+        }
         let remaining = self
             .storage
             .list_messages_in_states(group_id, &[MessageState::PeelDeferred], EpochId(0))?
@@ -1748,6 +1862,7 @@ impl<S: StorageProvider> Engine<S> {
                 // content rows are durable, so a crash in between simply lets
                 // the next normal convergence wake process the complete set.
                 self.storage.delete_deferred_peel_generation(group_id)?;
+                self.invalidate_deferred_peel_candidate_cache(group_id);
                 self.converge_stored_openmls_messages_with_time(group_id, now)
                     .map_err(|error| {
                         EngineError::Backend(format!("converge swept batch: {error}"))
@@ -1797,9 +1912,11 @@ impl<S: StorageProvider> Engine<S> {
             terminal = terminal as u64,
             contested = peel.contested,
             branch_contexts = peel.contexts.len() as u64,
+            candidate_cache_hit,
             queue_depth,
             sweep_duration_ms = duration_ms,
             budget_exhausted = status == DeferredPeelWorkStatus::BudgetExhausted,
+            contexts_invalidated,
             "deferred-peel retry sweep"
         );
         Ok(DeferredPeelWorkResult { status, progressed })
@@ -2078,6 +2195,26 @@ impl<S: StorageProvider> Engine<S> {
             .note_row_persisted();
     }
 
+    /// Drop exporter-bearing candidate contexts for one group. The aggregate
+    /// metric deliberately records only that stale work was discarded; the
+    /// group, fingerprint, generation, and branch identities never leave
+    /// engine memory.
+    pub(crate) fn invalidate_deferred_peel_candidate_cache(&mut self, group_id: &GroupId) {
+        let invalidated = self
+            .deferred_peel
+            .get_mut(group_id)
+            .is_some_and(|state| state.candidate_cache.take().is_some());
+        if invalidated {
+            self.engine_metrics
+                .note_deferred_peel_candidate_cache_invalidation();
+            tracing::debug!(
+                target: "cgka_engine::message_processor",
+                method = "invalidate_deferred_peel_candidate_cache",
+                "invalidated deferred-peel candidate cache"
+            );
+        }
+    }
+
     /// Bookkeeping for a row leaving `PeelDeferred` (applied, reclassified,
     /// invalidated, or terminally failed): release its flood-cap slot and its
     /// attempt-tracking entry. Once the backlog drops back below the cap, the
@@ -2120,6 +2257,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<usize, EngineError> {
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.storage.delete_deferred_peel_generation(group_id)?;
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         if queued.is_empty() {

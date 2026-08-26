@@ -234,6 +234,17 @@ pub struct EngineMetrics {
     foreground_deferred_unchanged: u64,
     foreground_deferred_errors: u64,
     foreground_deferred_budget_overrun_ms: BucketHistogram,
+    /// Deferred-peel work-shape observability. All values are aggregate and
+    /// candidate contexts themselves remain exclusively in engine memory.
+    deferred_peel_sweeps: u64,
+    deferred_peel_candidate_enumerations: u64,
+    deferred_peel_candidate_contexts: u64,
+    deferred_peel_candidate_context_depth: BucketHistogram,
+    deferred_peel_candidate_replay_probes: u64,
+    deferred_peel_candidate_cache_hits: u64,
+    deferred_peel_candidate_cache_misses: u64,
+    deferred_peel_candidate_cache_invalidations: u64,
+    deferred_peel_candidate_enumeration_ms: BucketHistogram,
     queued_outbound_wait_ms: BucketHistogram,
     /// Per-group completion time of the last applied pass, in-memory only
     /// (never snapshotted); feeds `generation_gap_ms`.
@@ -266,6 +277,17 @@ impl Default for EngineMetrics {
             foreground_deferred_unchanged: 0,
             foreground_deferred_errors: 0,
             foreground_deferred_budget_overrun_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            deferred_peel_sweeps: 0,
+            deferred_peel_candidate_enumerations: 0,
+            deferred_peel_candidate_contexts: 0,
+            deferred_peel_candidate_context_depth: BucketHistogram::new(&WORK_COUNT_BUCKET_BOUNDS),
+            deferred_peel_candidate_replay_probes: 0,
+            deferred_peel_candidate_cache_hits: 0,
+            deferred_peel_candidate_cache_misses: 0,
+            deferred_peel_candidate_cache_invalidations: 0,
+            deferred_peel_candidate_enumeration_ms: BucketHistogram::new(
+                &LATENESS_BUCKET_BOUNDS_MS,
+            ),
             queued_outbound_wait_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             last_pass_completed_at_ms: HashMap::new(),
         }
@@ -406,6 +428,46 @@ impl EngineMetrics {
         self.outbound_queue_accept_ms.record(duration_ms);
     }
 
+    pub(crate) fn note_deferred_peel_sweep(&mut self) {
+        self.deferred_peel_sweeps = self.deferred_peel_sweeps.saturating_add(1);
+    }
+
+    pub(crate) fn note_deferred_peel_candidate_enumeration(
+        &mut self,
+        duration_ms: u64,
+        context_depths: impl IntoIterator<Item = u64>,
+        replay_probe_count: u64,
+    ) {
+        self.deferred_peel_candidate_enumerations =
+            self.deferred_peel_candidate_enumerations.saturating_add(1);
+        for depth in context_depths {
+            self.deferred_peel_candidate_contexts =
+                self.deferred_peel_candidate_contexts.saturating_add(1);
+            self.deferred_peel_candidate_context_depth.record(depth);
+        }
+        self.deferred_peel_candidate_replay_probes = self
+            .deferred_peel_candidate_replay_probes
+            .saturating_add(replay_probe_count);
+        self.deferred_peel_candidate_enumeration_ms
+            .record(duration_ms);
+    }
+
+    pub(crate) fn note_deferred_peel_candidate_cache_hit(&mut self) {
+        self.deferred_peel_candidate_cache_hits =
+            self.deferred_peel_candidate_cache_hits.saturating_add(1);
+    }
+
+    pub(crate) fn note_deferred_peel_candidate_cache_miss(&mut self) {
+        self.deferred_peel_candidate_cache_misses =
+            self.deferred_peel_candidate_cache_misses.saturating_add(1);
+    }
+
+    pub(crate) fn note_deferred_peel_candidate_cache_invalidation(&mut self) {
+        self.deferred_peel_candidate_cache_invalidations = self
+            .deferred_peel_candidate_cache_invalidations
+            .saturating_add(1);
+    }
+
     pub(crate) fn note_outbound_wire_prepare_ms(&mut self, duration_ms: u64) {
         self.outbound_wire_prepare_ms.record(duration_ms);
     }
@@ -450,6 +512,20 @@ impl EngineMetrics {
             foreground_deferred_errors: self.foreground_deferred_errors,
             foreground_deferred_budget_overrun_ms: self
                 .foreground_deferred_budget_overrun_ms
+                .snapshot(),
+            deferred_peel_sweeps: self.deferred_peel_sweeps,
+            deferred_peel_candidate_enumerations: self.deferred_peel_candidate_enumerations,
+            deferred_peel_candidate_contexts: self.deferred_peel_candidate_contexts,
+            deferred_peel_candidate_context_depth: self
+                .deferred_peel_candidate_context_depth
+                .snapshot(),
+            deferred_peel_candidate_replay_probes: self.deferred_peel_candidate_replay_probes,
+            deferred_peel_candidate_cache_hits: self.deferred_peel_candidate_cache_hits,
+            deferred_peel_candidate_cache_misses: self.deferred_peel_candidate_cache_misses,
+            deferred_peel_candidate_cache_invalidations: self
+                .deferred_peel_candidate_cache_invalidations,
+            deferred_peel_candidate_enumeration_ms: self
+                .deferred_peel_candidate_enumeration_ms
                 .snapshot(),
             queued_outbound_wait_ms: self.queued_outbound_wait_ms.snapshot(),
         }
@@ -518,6 +594,24 @@ pub struct EngineMetricsSnapshot {
     pub foreground_deferred_errors: u64,
     /// Elapsed foreground deferred time beyond the configured budget.
     pub foreground_deferred_budget_overrun_ms: HistogramSnapshot,
+    /// Deferred-peel retry sweeps invoked, including empty or gated sweeps.
+    pub deferred_peel_sweeps: u64,
+    /// Candidate-branch enumerations actually performed (cache misses).
+    pub deferred_peel_candidate_enumerations: u64,
+    /// Candidate contexts captured across all enumerations.
+    pub deferred_peel_candidate_contexts: u64,
+    /// Commit depth of each captured candidate context.
+    pub deferred_peel_candidate_context_depth: HistogramSnapshot,
+    /// OpenMLS replay probes consumed by candidate enumeration and capture.
+    pub deferred_peel_candidate_replay_probes: u64,
+    /// Exact-fingerprint candidate-context cache hits.
+    pub deferred_peel_candidate_cache_hits: u64,
+    /// Candidate-context cache misses.
+    pub deferred_peel_candidate_cache_misses: u64,
+    /// Cached generations discarded because their work became stale or ended.
+    pub deferred_peel_candidate_cache_invalidations: u64,
+    /// Candidate enumeration elapsed time in local monotonic milliseconds.
+    pub deferred_peel_candidate_enumeration_ms: HistogramSnapshot,
     /// Time from durable queue acceptance to a regeneration attempt.
     pub queued_outbound_wait_ms: HistogramSnapshot,
 }

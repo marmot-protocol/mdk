@@ -766,6 +766,7 @@ impl<S: StorageProvider> Engine<S> {
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             EpochId(0),
@@ -1240,6 +1241,7 @@ impl<S: StorageProvider> Engine<S> {
         // blind `set_stable` overwrite (mdk#971). The group record written
         // above already clears the durable `unrecoverable` marker.
         let joined_epoch = EpochId(mls_group.epoch().as_u64());
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         let join_reason = if repaired_unrecoverable {
             if !self.epoch_manager.is_unrecoverable(&group_id) {
                 // Direct join callers are not required to run session-open

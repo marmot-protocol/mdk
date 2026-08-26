@@ -1462,6 +1462,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let terminalized = if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
+            self.invalidate_deferred_peel_candidate_cache(group_id);
             self.epoch_manager
                 .set_stable(group_id.clone(), selected_tip);
             // Diagnostic only: classify this applied selection as a forward
