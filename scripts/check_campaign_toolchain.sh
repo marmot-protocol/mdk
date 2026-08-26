@@ -47,6 +47,31 @@ check_builder_image 'quic broker' Dockerfile.quic-broker
 check_base_image_digests 'campaign' Dockerfile.convergence-campaign
 check_base_image_digests 'quic broker' Dockerfile.quic-broker
 
+check_copy_coverage() {
+    local label="$1"
+    local dockerfile="$2"
+    local copy_line
+
+    for copy_line in \
+        'COPY Cargo.toml Cargo.lock rust-toolchain.toml ./' \
+        'COPY .cargo ./.cargo' \
+        'COPY crates ./crates' \
+        'COPY integrations ./integrations'; do
+        if ! grep -Fqx "$copy_line" "$dockerfile"; then
+            echo "error: ${label} builder is missing required source coverage: ${copy_line}" >&2
+            exit 1
+        fi
+    done
+}
+
+check_copy_coverage 'campaign' Dockerfile.convergence-campaign
+check_copy_coverage 'quic broker' Dockerfile.quic-broker
+
+if grep -Fq 'RUSTUP_TOOLCHAIN=' Dockerfile.convergence-campaign Dockerfile.quic-broker; then
+    echo 'error: release images must use rust-toolchain.toml instead of a fixed RUSTUP_TOOLCHAIN override' >&2
+    exit 1
+fi
+
 campaign_builder="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.convergence-campaign)"
 quic_builder="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.quic-broker)"
 if [[ "$quic_builder" != "$campaign_builder" ]]; then
@@ -61,8 +86,8 @@ if [[ "$quic_runtime" != "$campaign_runtime" ]]; then
     exit 1
 fi
 
-if ! grep -Fqx 'COPY Cargo.toml Cargo.lock rust-toolchain.toml ./' Dockerfile.convergence-campaign; then
-    echo 'error: campaign builder must copy rust-toolchain.toml with workspace manifests' >&2
+if ! grep -Fq 'snapshot.debian.org/archive/debian/%s bookworm main' Dockerfile.quic-broker; then
+    echo 'error: quic broker runtime packages must use the dated Debian snapshot' >&2
     exit 1
 fi
 
