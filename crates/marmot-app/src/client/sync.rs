@@ -148,6 +148,11 @@ struct DeliveryIngest {
     /// redelivery is the only path back to it. See
     /// [`ingest_left_object_unpersisted`].
     must_stay_fetchable: bool,
+    /// The group a resource refusal was counted against, so a drain can report
+    /// *which* groups it fetched history for and could not retain. Only
+    /// `IngestOutcome::ResourceRefused` names a group, which is exactly the
+    /// outcome the refusal count is keyed on.
+    refused_group: Option<cgka_traits::GroupId>,
 }
 
 /// Whether the engine left this outcome's transport object unpersisted, so only
@@ -179,7 +184,7 @@ fn ingest_left_object_unpersisted(outcome: &IngestOutcome) -> bool {
 /// in the seen index. Keeping the two apart is what lets a field export tell a
 /// long drain that was making progress from one a relay held open with traffic
 /// carrying no new history.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DrainCounts {
     pub(crate) deliveries: u64,
     pub(crate) skipped: u64,
@@ -189,6 +194,12 @@ pub(crate) struct DrainCounts {
     /// on. [`DrainCounts::durable_deliveries`] is the count that answers "did
     /// this drain recover anything".
     pub(crate) refused: u64,
+    /// The groups those refusals were counted against. Recorded at the same
+    /// site that increments `refused`, so the three consequences of a refusal —
+    /// stays fetchable, does not count as recovery, and re-arms its group after
+    /// a fruitless replay — cannot drift apart. Not an audit field: the row
+    /// carries the scalar count, and group ids never enter a forensic row.
+    pub(crate) refused_groups: std::collections::HashSet<cgka_traits::GroupId>,
 }
 
 impl DrainCounts {
@@ -196,7 +207,7 @@ impl DrainCounts {
     /// every delivery was refused fetched history it could not retain, which is
     /// no recovery at all — the objects stay fetchable (they are neither marked
     /// seen nor allowed past the cursor) but nothing durably landed.
-    fn durable_deliveries(self) -> u64 {
+    fn durable_deliveries(&self) -> u64 {
         self.deliveries.saturating_sub(self.refused)
     }
 }
@@ -1068,7 +1079,7 @@ impl AppClient {
     /// rather than queueing them: the intent is already durable and the next
     /// seam past the cooldown runs it. Caller-directed catch-up is exempt — a
     /// person asking for a repair is not a loop.
-    fn epoch_backfill_retry_is_paced(&self, seam: EpochBackfillExecutionSeam) -> bool {
+    pub(crate) fn epoch_backfill_retry_is_paced(&self, seam: EpochBackfillExecutionSeam) -> bool {
         if matches!(seam, EpochBackfillExecutionSeam::ExplicitCatchUp) {
             return false;
         }
@@ -1199,7 +1210,7 @@ impl AppClient {
                         .finish_failed_sync_drain(
                             summary,
                             routes_dirty,
-                            *counts,
+                            counts.clone(),
                             StagedSyncError::new(error.into(), SyncFailureStage::RelayReceive),
                             drain_started,
                             cursor_before_secs,
@@ -1248,7 +1259,7 @@ impl AppClient {
                     .finish_failed_sync_drain(
                         summary,
                         routes_dirty,
-                        *counts,
+                        counts.clone(),
                         StagedSyncError::new(
                             AppError::BlockingTask("injected catch-up delivery failure".to_owned()),
                             SyncFailureStage::Unknown,
@@ -1269,7 +1280,7 @@ impl AppClient {
                         .finish_failed_sync_drain(
                             summary,
                             routes_dirty,
-                            *counts,
+                            counts.clone(),
                             StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
                             drain_started,
                             cursor_before_secs,
@@ -1283,6 +1294,9 @@ impl AppClient {
             // same flag is the refusal count, so one rule decides both.
             if ingested.must_stay_fetchable {
                 counts.refused = counts.refused.saturating_add(1);
+                if let Some(group_id) = ingested.refused_group {
+                    counts.refused_groups.insert(group_id);
+                }
             } else {
                 self.remember_seen_event(event_id);
             }
@@ -1300,7 +1314,7 @@ impl AppClient {
             let (summary, source) = self.checkpoint_failure_summary(summary, error);
             self.record_sync_drain(
                 drain_started.elapsed().as_millis() as u64,
-                *counts,
+                counts.clone(),
                 cursor_before_secs,
                 cursor_after_secs,
             );
@@ -1308,7 +1322,7 @@ impl AppClient {
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
-            *counts,
+            counts.clone(),
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
@@ -1440,6 +1454,10 @@ impl AppClient {
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         let must_stay_fetchable = ingest_left_object_unpersisted(&effects.outcome);
+        let refused_group = match &effects.outcome {
+            IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
+            _ => None,
+        };
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_groups(&effects.effects);
         self.observe_recovery_evidence(&effects.effects);
@@ -1509,6 +1527,7 @@ impl AppClient {
         Ok(DeliveryIngest {
             routes_dirty,
             must_stay_fetchable,
+            refused_group,
         })
     }
 
@@ -1769,6 +1788,7 @@ impl AppClient {
                 deliveries,
                 skipped: 0,
                 refused,
+                ..DrainCounts::default()
             },
             true,
         );
@@ -1847,7 +1867,7 @@ impl AppClient {
         completion_kind: Option<EpochBackfillCompletionKind>,
         counts: DrainCounts,
         succeeded: bool,
-    ) {
+    ) -> bool {
         let duration_ms = execution.started.elapsed().as_millis() as u64;
         let epochs_after = self.capture_pending_group_epochs(&execution.pending);
         let observed_all_groups = epochs_after.len() == execution.pending.groups.len();
@@ -1867,17 +1887,25 @@ impl AppClient {
                 activation_outcome,
                 error_kind,
                 completion_kind,
-                counts,
+                counts: counts.clone(),
                 succeeded,
             },
         );
-        if succeeded {
-            if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, counts) {
-                self.epoch_stall.mark_replayed();
-            }
-        } else {
+        if !succeeded {
             self.requeue_failed_epoch_backfill_intent(execution.pending);
+            return false;
         }
+        if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, &counts) {
+            self.epoch_stall.mark_replayed();
+            return true;
+        }
+        // Fruitless but complete. Withholding `mark_replayed` re-arms bystanders
+        // only; the groups this drain actually refused history for latched
+        // themselves when they armed, so they need an explicit clear or they can
+        // never arm again at this epoch.
+        self.epoch_stall
+            .rearm_refused_groups(&counts.refused_groups);
+        false
     }
 
     /// Whether a completed replay recovered anything, and has therefore earned
@@ -1912,7 +1940,7 @@ impl AppClient {
     fn replay_recovered_something(
         epochs_before: &HashMap<cgka_traits::GroupId, u64>,
         epochs_after: &HashMap<cgka_traits::GroupId, u64>,
-        counts: DrainCounts,
+        counts: &DrainCounts,
     ) -> bool {
         counts.durable_deliveries() > 0
             || epochs_after.iter().any(|(group_id, after)| {
@@ -2044,12 +2072,12 @@ impl AppClient {
                 // disarm the detector, so it is recorded as a failed attempt
                 // and its intent stays queued for the next seam.
                 let error_kind = verdict.error_kind();
-                self.finish_epoch_backfill_execution(
+                let recovered = self.finish_epoch_backfill_execution(
                     execution,
                     EpochBackfillActivationOutcome::Succeeded,
                     error_kind.map(str::to_owned),
                     verdict.completion_kind(),
-                    counts,
+                    counts.clone(),
                     error_kind.is_none(),
                 );
                 if let Some(error_kind) = error_kind {
@@ -2067,7 +2095,23 @@ impl AppClient {
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
                     return Ok(EpochBackfillRunOutcome::Incomplete(summary));
                 }
-                self.epoch_backfill_retry_not_before = None;
+                if recovered {
+                    self.epoch_backfill_retry_not_before = None;
+                } else {
+                    // A completed-but-fruitless replay just re-armed the groups
+                    // whose history it could not retain. Clearing the cooldown
+                    // here would let that re-arm drain the whole account again
+                    // immediately, against a cap that is still full — an
+                    // unpaced arm -> drain -> clear -> re-arm loop, because a
+                    // fresh intent starts at `execution_attempts == 0`. A
+                    // fruitless success pays the same backoff an unconfirmed
+                    // drain does, which bounds the loop to one account-wide
+                    // replay per window. `epoch_backfill_retry_is_paced`
+                    // exempts caller-directed catch-up, so a person asking for
+                    // a repair still never waits on it.
+                    self.epoch_backfill_retry_not_before =
+                        Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
+                }
                 Ok(EpochBackfillRunOutcome::Completed(summary))
             }
             Err(err) => {
