@@ -121,7 +121,7 @@ never retried automatically. Send `//reset-session` to pass the literal
 | `WN_CODEX_ACCOUNT_ID_HEX` | sole local account | Explicit account selection |
 | `WN_CODEX_BIN` | `codex` | Codex executable |
 | `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
-| `WN_CODEX_IDLE_TIMEOUT_SECS` | `120` | Maximum silence per invocation |
+| `WN_CODEX_IDLE_TIMEOUT_SECS` | `120` | Presentation-idle interval before liveness is reported as unknown; does not stop the invocation |
 | `WN_CODEX_TIMEOUT_SECS` | `3600` | Total invocation cap |
 | `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
 | `WN_CODEX_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |

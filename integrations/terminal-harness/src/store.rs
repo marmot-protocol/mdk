@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::error::Result;
 
@@ -10,6 +10,43 @@ use crate::error::Result;
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryKind {
+    FailedResumable,
+    UncertainOutcome,
+    PolicyLimit,
+    NotResponding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryStatus {
+    Pending,
+    Retrying,
+}
+
+/// Private durable replay obligation. Its contents are never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryRecord {
+    pub(crate) prompt: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) kind: RecoveryKind,
+    pub(crate) status: RecoveryStatus,
+}
+
+/// Durable acknowledgement reconciliation for text-only `SendFinal` chunks.
+/// Media and mixed-media terminals are intentionally outside this store.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FinalDeliveryRecord {
+    pub(crate) account_ref: String,
+    pub(crate) group_ref: String,
+    pub(crate) reply_to_ref: String,
+    pub(crate) text: String,
+    pub(crate) chunk_index: usize,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +130,227 @@ impl SessionStore {
         *map = next;
         Ok(true)
     }
+}
+
+pub(crate) struct RecoveryStore {
+    path: PathBuf,
+    map: Mutex<HashMap<String, RecoveryRecord>>,
+}
+
+impl RecoveryStore {
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
+        if path.exists() {
+            fs_private::tighten_existing_private_file(&path)?;
+        }
+        let mut map: HashMap<String, RecoveryRecord> = match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)?,
+            Ok(_) => HashMap::new(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(err) => return Err(err.into()),
+        };
+        for record in map.values_mut() {
+            if record.status == RecoveryStatus::Retrying {
+                record.status = RecoveryStatus::Pending;
+            }
+        }
+        Ok(Self {
+            path,
+            map: Mutex::new(map),
+        })
+    }
+
+    pub(crate) async fn get(&self, group_key: &str) -> Option<RecoveryRecord> {
+        self.map.lock().await.get(group_key).cloned()
+    }
+
+    pub(crate) async fn set(&self, group_key: &str, record: RecoveryRecord) -> Result<()> {
+        let mut map = self.map.lock().await;
+        let mut next = map.clone();
+        next.insert(group_key.to_owned(), record);
+        self.commit(&mut map, next).await
+    }
+
+    /// Atomically consumes retry authority while retaining the restart barrier.
+    pub(crate) async fn begin_retry(&self, group_key: &str) -> Result<Option<RecoveryRecord>> {
+        let mut map = self.map.lock().await;
+        let Some(current) = map.get(group_key) else {
+            return Ok(None);
+        };
+        if current.status != RecoveryStatus::Pending {
+            return Ok(None);
+        }
+        let mut next = map.clone();
+        let record = next.get_mut(group_key).expect("recovery record exists");
+        record.status = RecoveryStatus::Retrying;
+        let result = record.clone();
+        self.commit(&mut map, next).await?;
+        Ok(Some(result))
+    }
+
+    pub(crate) async fn reset_retry(&self, group_key: &str) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        let Some(current) = map.get(group_key) else {
+            return Ok(false);
+        };
+        if current.status != RecoveryStatus::Retrying {
+            return Ok(false);
+        }
+        let mut next = map.clone();
+        next.get_mut(group_key)
+            .expect("recovery record exists")
+            .status = RecoveryStatus::Pending;
+        self.commit(&mut map, next).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn discard(&self, group_key: &str) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        if !map.contains_key(group_key) {
+            return Ok(false);
+        }
+        let mut next = map.clone();
+        next.remove(group_key);
+        self.commit(&mut map, next).await?;
+        Ok(true)
+    }
+
+    async fn commit(
+        &self,
+        map: &mut tokio::sync::MutexGuard<'_, HashMap<String, RecoveryRecord>>,
+        next: HashMap<String, RecoveryRecord>,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let snapshot = next.clone();
+        tokio::task::spawn_blocking(move || write_recovery_snapshot(&path, &snapshot)).await??;
+        **map = next;
+        Ok(())
+    }
+}
+
+pub(crate) struct FinalDeliveryStore {
+    path: PathBuf,
+    map: Mutex<HashMap<String, FinalDeliveryRecord>>,
+    changed: watch::Sender<u64>,
+}
+
+impl FinalDeliveryStore {
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
+        if path.exists() {
+            fs_private::tighten_existing_private_file(&path)?;
+        }
+        let map = match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)?,
+            Ok(_) => HashMap::new(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let (changed, _) = watch::channel(0);
+        Ok(Self {
+            path,
+            map: Mutex::new(map),
+            changed,
+        })
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub(crate) async fn has_group(&self, group_ref: &str) -> bool {
+        self.map
+            .lock()
+            .await
+            .values()
+            .any(|record| record.group_ref == group_ref)
+    }
+
+    pub(crate) async fn list(&self) -> Vec<(String, FinalDeliveryRecord)> {
+        let mut records: Vec<_> = self
+            .map
+            .lock()
+            .await
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        records.sort_by(|(_, left), (_, right)| {
+            (
+                &left.account_ref,
+                &left.group_ref,
+                &left.reply_to_ref,
+                left.chunk_index,
+            )
+                .cmp(&(
+                    &right.account_ref,
+                    &right.group_ref,
+                    &right.reply_to_ref,
+                    right.chunk_index,
+                ))
+        });
+        records
+    }
+
+    pub(crate) async fn set(&self, key: &str, record: FinalDeliveryRecord) -> Result<()> {
+        let mut map = self.map.lock().await;
+        let mut next = map.clone();
+        next.insert(key.to_owned(), record);
+        self.commit(&mut map, next).await?;
+        self.changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(())
+    }
+
+    pub(crate) async fn remove(&self, key: &str) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        if !map.contains_key(key) {
+            return Ok(false);
+        }
+        let mut next = map.clone();
+        next.remove(key);
+        self.commit(&mut map, next).await?;
+        self.changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(true)
+    }
+
+    async fn commit(
+        &self,
+        map: &mut tokio::sync::MutexGuard<'_, HashMap<String, FinalDeliveryRecord>>,
+        next: HashMap<String, FinalDeliveryRecord>,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let snapshot = next.clone();
+        tokio::task::spawn_blocking(move || write_final_delivery_snapshot(&path, &snapshot))
+            .await??;
+        **map = next;
+        Ok(())
+    }
+}
+
+fn write_final_delivery_snapshot(
+    path: &Path,
+    snapshot: &HashMap<String, FinalDeliveryRecord>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_private::create_dir_all_private(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    fs_private::write_private(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    fs_private::tighten_existing_private_file(path)?;
+    Ok(())
+}
+
+fn write_recovery_snapshot(path: &Path, snapshot: &HashMap<String, RecoveryRecord>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_private::create_dir_all_private(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    fs_private::write_private(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    fs_private::tighten_existing_private_file(path)?;
+    Ok(())
 }
 
 fn write_snapshot(path: &Path, snapshot: &HashMap<String, SessionRecord>) -> Result<()> {
@@ -218,6 +476,88 @@ mod tests {
         let record = store.get("group1").await.expect("legacy record");
         assert_eq!(record.session_id, "ses_legacy");
         assert_eq!(record.cwd, home);
+    }
+
+    #[tokio::test]
+    async fn recovery_store_persists_and_consumes_retry_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.json");
+        let record = RecoveryRecord {
+            prompt: "private prompt".to_owned(),
+            cwd: dir.path().join("repo"),
+            session_id: "session".to_owned(),
+            kind: RecoveryKind::UncertainOutcome,
+            status: RecoveryStatus::Pending,
+        };
+        RecoveryStore::load(path.clone())
+            .unwrap()
+            .set("group", record.clone())
+            .await
+            .unwrap();
+
+        let store = RecoveryStore::load(path.clone()).unwrap();
+        assert!(store.get("group").await == Some(record));
+        let first = store.begin_retry("group").await.unwrap().unwrap();
+        assert_eq!(first.status, RecoveryStatus::Retrying);
+        assert!(store.begin_retry("group").await.unwrap().is_none());
+        assert!(store.reset_retry("group").await.unwrap());
+        assert_eq!(
+            store.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(store.begin_retry("group").await.unwrap().is_some());
+        drop(store);
+
+        let store = RecoveryStore::load(path).unwrap();
+        assert_eq!(
+            store.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(store.begin_retry("group").await.unwrap().is_some());
+        assert!(store.discard("group").await.unwrap());
+        assert!(store.get("group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn discard_is_idempotent_and_never_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
+        assert!(!store.discard("missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn final_delivery_store_survives_restart_until_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let first = FinalDeliveryRecord {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_ref: "message".to_owned(),
+            text: "first".to_owned(),
+            chunk_index: 1,
+        };
+        let second = FinalDeliveryRecord {
+            text: "second".to_owned(),
+            chunk_index: 2,
+            ..first.clone()
+        };
+        let initial = FinalDeliveryStore::load(path.clone()).unwrap();
+        initial.set("second", second.clone()).await.unwrap();
+        initial.set("first", first.clone()).await.unwrap();
+        let store = FinalDeliveryStore::load(path).unwrap();
+        let mut changed = store.subscribe();
+        assert!(store.has_group("group").await);
+        assert!(!store.has_group("other-group").await);
+        assert!(
+            store.list().await == vec![("first".to_owned(), first), ("second".to_owned(), second),]
+        );
+        assert!(store.remove("first").await.unwrap());
+        changed.changed().await.unwrap();
+        assert!(store.has_group("group").await);
+        assert!(store.remove("second").await.unwrap());
+        changed.changed().await.unwrap();
+        assert!(!store.has_group("group").await);
+        assert!(store.list().await.is_empty());
     }
 
     #[cfg(unix)]

@@ -9,8 +9,8 @@ case "$scenario" in
         ;;
     idle)
         printf '%s\n' '{"type":"step_start","sessionID":"ses_idle"}'
-        # Stay alive longer than the harness idle timeout so the test observes
-        # BackendIdle instead of racing normal exit at the same deadline.
+        # Stay alive across presentation idle so the harness reports unknown
+        # liveness and waits for the explicit total policy limit.
         exec sleep 3
         ;;
     streaming)

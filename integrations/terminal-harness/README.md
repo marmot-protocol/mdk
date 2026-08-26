@@ -16,8 +16,8 @@ storage, QUIC previews, or backend-specific CLI semantics.
 
 A connector supplies a `Backend` implementation. For each authorized inbound
 prompt, the shared runtime passes an `Invocation` containing the selected
-working directory, optional prior session id, prompt, idle timeout, and total
-timeout. The backend may emit only completed assistant text as `RunnerEvent::Text`
+working directory, optional prior session id, prompt, presentation-idle interval,
+and total policy limit. The backend may emit only completed assistant text as `RunnerEvent::Text`
 and returns privacy-safe `Outcome` metadata.
 
 Connector crates are responsible for:
@@ -98,7 +98,13 @@ All connectors:
   only that group's backend session id, and retain its selected workdir;
 - split durable replies on UTF-8 boundaries with a 30,000-byte default and a
   60,000-byte hard ceiling;
-- enforce bounded per-group queues plus idle and total backend timeouts;
+- report presentation-idle liveness as unknown without killing an invocation and
+  enforce a separate total backend policy limit;
+- persist typed recovery obligations and require an exact `/retry-last` or
+  `/discard-last` command before uncertain or resumable work can leave its FIFO
+  barrier;
+- reconcile text-only final-delivery acknowledgements idempotently before later
+  FIFO work, without replaying the backend invocation;
 - keep diagnostics free of identifiers, paths, prompts, and backend output.
 
 `/reset-session` is reserved as a harness control message. Send
@@ -106,6 +112,12 @@ All connectors:
 Reset never deletes backend-owned transcripts and never retries a failed resumed
 prompt automatically; the next distinct prompt starts a new logical backend
 session in the retained workdir.
+
+`/retry-last` and `/discard-last` are available only while one matching durable
+recovery record blocks that group. Retry consumes that record once and runs ahead
+of queued prompts; discard removes it without replay. An uncertain outcome warns
+that retrying may repeat side effects. Recovery state is stored in private files
+and is never included in logs or diagnostics.
 
 The connector READMEs document their environment variables, installer topology,
 and backend contracts:

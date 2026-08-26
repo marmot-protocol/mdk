@@ -254,22 +254,23 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_idle_timeout_fires_after_silence() {
+    async fn run_presentation_idle_reports_unknown_and_waits_for_total_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         let failure = run(
             Invocation {
-                // The mock child sleeps longer than this idle budget after the
-                // session line so CI load cannot race idle timeout with normal exit.
-                idle_timeout: Duration::from_secs(2),
+                timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_millis(200),
                 ..mock_invocation(&dir, "idle")
             },
             tx,
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::BackendIdle));
+        assert!(matches!(failure.error, HarnessError::BackendTimedOut));
         assert_eq!(failure.observed_session.as_deref(), Some("ses_idle"));
+        assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+        assert!(rx.recv().await.is_none());
     }
 
     #[cfg(unix)]
@@ -295,13 +296,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_idle_timeout_fires_after_stdout_eof_with_live_child() {
+    async fn run_stdout_eof_reports_unknown_and_waits_for_total_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         let started = Instant::now();
         let failure = run(
             Invocation {
-                timeout: Duration::from_secs(10),
+                timeout: Duration::from_secs(1),
                 idle_timeout: Duration::from_millis(200),
                 ..mock_invocation(&dir, "stdout-close-live")
             },
@@ -309,19 +310,21 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::BackendIdle));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(failure.error, HarnessError::BackendTimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(800));
+        assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+        assert!(rx.recv().await.is_none());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_eof_keeps_remaining_idle_budget() {
+    async fn run_eof_keeps_original_presentation_idle_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         let started = Instant::now();
         let failure = run(
             Invocation {
-                timeout: Duration::from_secs(10),
+                timeout: Duration::from_millis(1_200),
                 idle_timeout: Duration::from_secs(1),
                 ..mock_invocation(&dir, "stdout-close-near-idle")
             },
@@ -329,11 +332,13 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::BackendIdle));
+        assert!(matches!(failure.error, HarnessError::BackendTimedOut));
         assert!(
-            started.elapsed() < Duration::from_millis(1_350),
+            started.elapsed() >= Duration::from_secs(1),
             "stdout EOF must not reset the existing idle deadline"
         );
+        assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+        assert!(rx.recv().await.is_none());
     }
 
     #[cfg(unix)]

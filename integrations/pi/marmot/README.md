@@ -111,7 +111,7 @@ resume that group's Pi session.
 | `WN_PI_BIN` | `pi` | Pi executable |
 | `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_PI_SESSION_DIR` | `$MARMOT_HOME/dev/pi-sessions` | Private Pi session directory |
-| `WN_PI_IDLE_TIMEOUT_SECS` | `120` | Maximum silence per invocation |
+| `WN_PI_IDLE_TIMEOUT_SECS` | `120` | Presentation-idle interval before liveness is reported as unknown; does not stop the invocation |
 | `WN_PI_TIMEOUT_SECS` | `3600` | Total invocation cap |
 | `WN_PI_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
 | `WN_PI_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
