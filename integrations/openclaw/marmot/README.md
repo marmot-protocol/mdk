@@ -390,12 +390,14 @@ for any plugin or tenant that is not in the same trust boundary.
   managed directly on `wn-agent`). `wn-agent` still performs welcomer-based
   post-join accept/decline. With `allowFrom` set the mirror is *exact
   reconciliation* of an account-scoped list: entries another integration added
-  to the same `wn-agent` account are removed. It runs fail-closed — revocations
-  before additions, every step attempted even when an earlier one fails, and the
-  effective list read back afterwards. `wn-agent` has no atomic replace, so a
-  partial control-plane failure is reported, not repaired: the connector logs
-  `welcomer allowlist revocation failed …` (entries still authorized) or
-  `welcomer allowlist not reconciled …`, and startup continues.
+  to the same `wn-agent` account are removed. It performs best-effort
+  reconciliation: revocations run before additions, every step is attempted
+  even when an earlier one fails, and the effective list is read back afterward.
+  `wn-agent` has no atomic replace, so a partial control-plane failure is
+  reported, not repaired: the connector logs `welcomer allowlist revocation
+  failed …` (entries still authorized) or `welcomer allowlist not reconciled …`,
+  and startup continues. A failed revocation leaves that entry authorized until
+  a later successful sync.
 - **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
   disable with `profileNameOnboarding: false`): when the agent joins a group it
   asks, on its own, whether to publish a public Nostr profile (`kind:0`) name —
