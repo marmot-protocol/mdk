@@ -1656,6 +1656,21 @@ struct CandidateBranchPeelEnumeration {
     replay_probe_count: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct CandidateBranchPeelFailure {
+    pub(crate) error: OpenMlsProjectionError,
+    pub(crate) replay_probe_count: u64,
+}
+
+impl CandidateBranchPeelFailure {
+    fn new(error: OpenMlsProjectionError, replay_probe_count: u64) -> Self {
+        Self {
+            error,
+            replay_probe_count,
+        }
+    }
+}
+
 /// Survey the branches a convergence graph offers: whether it is contested, and
 /// the peel context of each candidate branch tip that could be materialized.
 ///
@@ -1674,10 +1689,11 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     max_rewind_commits: u64,
     profile_policy: ReplayProfilePolicy,
     max_contexts: usize,
-) -> Result<CandidateBranchPeel, OpenMlsProjectionError> {
+) -> Result<CandidateBranchPeel, CandidateBranchPeelFailure> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
 
-    let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)?;
+    let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)
+        .map_err(|error| CandidateBranchPeelFailure::new(error, 0))?;
     // Cheap contested-graph gate ahead of any replay: competing branches exist
     // only where two commits share a source epoch. An uncontested graph pays
     // the seeding scan and nothing more. This is also the ONLY answer to
@@ -1705,7 +1721,12 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     let probe_snapshot = candidate_branch_probe_snapshot_name(group_id, inputs.replay_start_epoch);
     let guard =
         SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), probe_snapshot)
-            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            .map_err(|error| {
+                CandidateBranchPeelFailure::new(
+                    OpenMlsProjectionError::Snapshot(format!("{error:?}")),
+                    0,
+                )
+            })?;
     let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
     let contexts = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
         Ok(()) => {
@@ -1723,11 +1744,21 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
             contexts: Vec::new(),
             replay_probe_count: 0,
         }),
-        Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+        Err(error) => Err(CandidateBranchPeelFailure::new(
+            OpenMlsProjectionError::Snapshot(format!("{error:?}")),
+            0,
+        )),
     };
-    guard
-        .commit()
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let replay_probe_count = contexts.as_ref().map_or_else(
+        |failure| failure.replay_probe_count,
+        |enumeration| enumeration.replay_probe_count,
+    );
+    guard.commit().map_err(|error| {
+        CandidateBranchPeelFailure::new(
+            OpenMlsProjectionError::Snapshot(format!("{error:?}")),
+            replay_probe_count,
+        )
+    })?;
     contexts.map(CandidateBranchPeel::contested_over)
 }
 
@@ -1760,7 +1791,7 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
     max_rewind_commits: u64,
     profile_policy: ReplayProfilePolicy,
     max_contexts: usize,
-) -> Result<CandidateBranchPeelEnumeration, OpenMlsProjectionError> {
+) -> Result<CandidateBranchPeelEnumeration, CandidateBranchPeelFailure> {
     let mut budget = ReplayBudget::for_pass(inputs.commit_messages.len(), max_rewind_commits);
     let path_result = match build_stored_openmls_candidate_paths(
         storage,
@@ -1793,7 +1824,9 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
                 replay_probe_count: budget.consumed,
             });
         }
-        Err(err) => return Err(err),
+        Err(error) => {
+            return Err(CandidateBranchPeelFailure::new(error, budget.consumed));
+        }
     };
     if path_result.candidate_paths.len() < 2 {
         return Ok(CandidateBranchPeelEnumeration {
@@ -1802,7 +1835,8 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
         });
     }
 
-    let pending_proposals = pending_proposal_messages(&inputs.pending_messages)?;
+    let pending_proposals = pending_proposal_messages(&inputs.pending_messages)
+        .map_err(|error| CandidateBranchPeelFailure::new(error, budget.consumed))?;
     let ranked =
         candidate_paths_ranked_for_peel(&path_result.candidate_paths, &path_result.materialized);
     let mut contexts = Vec::with_capacity(max_contexts.min(ranked.len()));
@@ -1833,7 +1867,9 @@ fn candidate_branch_peel_contexts_from_current<S: StorageProvider>(
                 );
                 break;
             }
-            Err(err) => return Err(err),
+            Err(error) => {
+                return Err(CandidateBranchPeelFailure::new(error, budget.consumed));
+            }
         }
     }
     Ok(CandidateBranchPeelEnumeration {
@@ -3991,8 +4027,8 @@ fn tls_hex<T: TlsSerialize>(value: &T) -> Result<String, OpenMlsProjectionError>
 #[cfg(test)]
 mod replay_budget_tests {
     use super::{
-        CANDIDATE_REPLAY_BUDGET_FLOOR, CANDIDATE_REPLAY_BUDGET_SLACK, OpenMlsProjectionError,
-        ReplayBudget,
+        CANDIDATE_REPLAY_BUDGET_FLOOR, CANDIDATE_REPLAY_BUDGET_SLACK, CandidateBranchPeelFailure,
+        OpenMlsProjectionError, ReplayBudget,
     };
 
     #[test]
@@ -4032,6 +4068,20 @@ mod replay_budget_tests {
             budget.consume(),
             Err(OpenMlsProjectionError::ReplayBudgetExceeded)
         ));
+    }
+
+    #[test]
+    fn candidate_failure_preserves_consumed_replay_count() {
+        let mut budget = ReplayBudget::new(3);
+        budget.consume().expect("first probe");
+        budget.consume().expect("second probe");
+        let failure = CandidateBranchPeelFailure::new(
+            OpenMlsProjectionError::Storage("injected failure".into()),
+            budget.consumed,
+        );
+
+        assert_eq!(failure.replay_probe_count, 2);
+        assert!(matches!(failure.error, OpenMlsProjectionError::Storage(_)));
     }
 
     #[test]

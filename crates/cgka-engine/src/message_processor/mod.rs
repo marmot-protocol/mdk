@@ -181,7 +181,17 @@ struct DeferredPeelCandidateCacheEntry {
     /// Exact durable barrier generation observed after enumeration. `None` is
     /// also meaningful and must match on reuse.
     durable_generation_fingerprint: Option<[u8; 32]>,
+    /// Pending proposals may be folded into candidate replay paths, but merely
+    /// staging a proposal cannot change the epoch, exporter secret, or
+    /// transport route captured by `GroupContextSnapshot`. If that snapshot
+    /// ever gains proposal-dependent state, this cache key must gain the same
+    /// dependency.
     peel: Arc<crate::openmls_projection::CandidateBranchPeel>,
+}
+
+struct DeferredPeelCandidateEnumerationFailure {
+    error: EngineError,
+    replay_probe_count: u64,
 }
 
 impl DeferredPeelGroupState {
@@ -1673,7 +1683,7 @@ impl<S: StorageProvider> Engine<S> {
             let candidate_enumeration_started = Instant::now();
             let enumerated = match self.candidate_branch_peel(group_id) {
                 Ok(peel) => peel,
-                Err(error) => {
+                Err(failure) => {
                     self.engine_metrics
                         .note_deferred_peel_candidate_enumeration(
                             candidate_enumeration_started
@@ -1682,7 +1692,7 @@ impl<S: StorageProvider> Engine<S> {
                                 .try_into()
                                 .unwrap_or(u64::MAX),
                             std::iter::empty(),
-                            0,
+                            failure.replay_probe_count,
                         );
                     self.note_foreground_deferred_phase(
                         sweep_started,
@@ -1691,7 +1701,7 @@ impl<S: StorageProvider> Engine<S> {
                         total,
                         crate::engine_metrics::DeferredPeelMetricOutcome::Error,
                     );
-                    return Err(error);
+                    return Err(failure.error);
                 }
             };
             let candidate_enumeration_ms = candidate_enumeration_started
@@ -1927,11 +1937,22 @@ impl<S: StorageProvider> Engine<S> {
     fn candidate_branch_peel(
         &self,
         group_id: &GroupId,
-    ) -> Result<crate::openmls_projection::CandidateBranchPeel, EngineError> {
-        let group = self.storage.get_group(group_id)?;
+    ) -> Result<
+        crate::openmls_projection::CandidateBranchPeel,
+        DeferredPeelCandidateEnumerationFailure,
+    > {
+        let group = self.storage.get_group(group_id).map_err(|error| {
+            DeferredPeelCandidateEnumerationFailure {
+                error: error.into(),
+                replay_probe_count: 0,
+            }
+        })?;
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
-            .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+            .map_err(|error| DeferredPeelCandidateEnumerationFailure {
+                error: EngineError::Backend(format!("load convergence policy: {error}")),
+                replay_probe_count: 0,
+            })?;
         let max_rewind_commits = policy.convergence.max_rewind_commits;
         crate::openmls_projection::candidate_branch_peel(
             &self.storage,
@@ -1944,7 +1965,10 @@ impl<S: StorageProvider> Engine<S> {
             },
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
         )
-        .map_err(|e| EngineError::Backend(format!("candidate branch peel: {e}")))
+        .map_err(|failure| DeferredPeelCandidateEnumerationFailure {
+            error: EngineError::Backend(format!("candidate branch peel: {}", failure.error)),
+            replay_probe_count: failure.replay_probe_count,
+        })
     }
 
     /// Re-ingest one retained raw-transport row and settle its retry lifecycle

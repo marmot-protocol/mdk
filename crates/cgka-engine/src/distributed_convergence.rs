@@ -257,6 +257,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         let mut context = self
             .audit_group_context_snapshot(group_id)
             .unwrap_or_default();

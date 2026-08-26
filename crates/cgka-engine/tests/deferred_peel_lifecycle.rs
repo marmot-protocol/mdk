@@ -8,6 +8,10 @@ use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
 use cgka_engine::openmls_projection::project_mls_message;
 use cgka_engine::{Engine, EngineBuilder, ManualConvergenceClock};
+use cgka_traits::app_components::{
+    AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components,
+    encode_nostr_routing_v1,
+};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -423,10 +427,13 @@ fn build_epoch_sealed_client_with_storage_and_peeler<P>(
 where
     P: TransportPeeler + 'static,
 {
+    let mut supported_components: Vec<_> = default_group_components().into_iter().collect();
+    supported_components.push(NOSTR_ROUTING_COMPONENT_ID);
     let mut engine = EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
+        .supported_app_components(supported_components)
         .peeler(Box::new(peeler))
         .build()
         .unwrap();
@@ -634,13 +641,18 @@ where
     let (mut eve, _eve_storage) = build_epoch_sealed_client(b"candidate-cache-eve");
 
     let rival_kp = rival.fresh_key_package().await.unwrap();
+    let routing =
+        NostrRoutingV1::new([0x43; 32], vec!["wss://candidate-cache.example".into()]).unwrap();
     let (group_id, create) = incumbent
         .create_group(CreateGroupRequest {
             name: "candidate-cache".into(),
             description: String::new(),
             members: vec![rival_kp],
             required_features: vec![],
-            app_components: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing).unwrap(),
+            }],
             initial_admins: vec![rival.self_id()],
         })
         .await
@@ -699,11 +711,19 @@ where
     // value too so the setup is explicit about both sides of the contested
     // graph and cannot be optimized into an unused local evolution.
     let _ = incumbent_commit;
+    let TransportEnvelope::GroupMessage {
+        transport_group_id: rival_route,
+    } = &rival_root.envelope
+    else {
+        panic!("rival root must be a routed group message");
+    };
+    assert_ne!(
+        rival_route.as_slice(),
+        group_id.as_slice(),
+        "transport routing id must stay distinct from the MLS group id"
+    );
     assert!(matches!(
-        incumbent
-            .ingest(route(rival_root, &group_id))
-            .await
-            .unwrap(),
+        incumbent.ingest(rival_root).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
 
@@ -782,6 +802,36 @@ async fn unchanged_192_row_contested_backlog_enumerates_candidates_once() {
 }
 
 #[tokio::test]
+async fn group_policy_change_invalidates_cached_candidate_enumeration() {
+    let (mut incumbent, _storage, group_id, _same_branch_peer) =
+        contested_rival_app_backlog(192).await;
+
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    let before_change = incumbent.engine_metrics();
+    assert_eq!(before_change.deferred_peel_candidate_enumerations, 1);
+    assert_eq!(before_change.deferred_peel_candidate_cache_misses, 1);
+
+    let mut policy = CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    };
+    policy.convergence.max_rewind_commits = 1;
+    incumbent
+        .set_group_convergence_policy(&group_id, policy)
+        .expect("test policy override accepted");
+
+    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
+    let after_change = incumbent.engine_metrics();
+    assert_eq!(
+        after_change.deferred_peel_candidate_enumerations, 2,
+        "a changed replay horizon must not reuse the prior enumeration"
+    );
+    assert_eq!(after_change.deferred_peel_candidate_cache_misses, 2);
+    assert_eq!(after_change.deferred_peel_candidate_cache_hits, 0);
+    assert_eq!(after_change.deferred_peel_candidate_cache_invalidations, 1);
+}
+
+#[tokio::test]
 async fn changed_fingerprint_enumerates_exactly_one_new_candidate_generation() {
     let (mut incumbent, storage, group_id, mut same_branch_peer) =
         contested_rival_app_backlog(256).await;
@@ -806,7 +856,7 @@ async fn changed_fingerprint_enumerates_exactly_one_new_candidate_generation() {
     );
     same_branch_peer.confirm_published(pending).await.unwrap();
     assert!(matches!(
-        incumbent.ingest(route(new_input, &group_id)).await.unwrap(),
+        incumbent.ingest(new_input).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
 
