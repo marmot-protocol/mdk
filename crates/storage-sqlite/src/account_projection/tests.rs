@@ -408,6 +408,52 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 }
 
 #[test]
+fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        groups: vec![group("aa", "alpha"), group("bb", "beta")],
+        ..StoredAccountState::default()
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+
+    let aa_epoch_7 = StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 7,
+    };
+    let aa_epoch_8 = StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 8,
+    };
+    let bb_epoch_3 = StoredEpochBackfillIntent {
+        group_id_hex: "bb".to_owned(),
+        stalled_epoch: 3,
+    };
+    store
+        .arm_epoch_backfill_intents(&[aa_epoch_8.clone(), bb_epoch_3.clone()])
+        .unwrap();
+    store
+        .arm_epoch_backfill_intents(std::slice::from_ref(&aa_epoch_7))
+        .unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![aa_epoch_8.clone(), bb_epoch_3.clone()],
+        "an older concurrent arm must not regress the durable epoch"
+    );
+
+    store
+        .clear_epoch_backfill_intents(&[aa_epoch_7, bb_epoch_3])
+        .unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![aa_epoch_8],
+        "completion clears exact epochs and preserves newer recovery evidence"
+    );
+}
+
+#[test]
 fn pending_confirmation_group_invites_reads_only_pending_outlines() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     // One applied member group, one pending invite with a welcomer, one

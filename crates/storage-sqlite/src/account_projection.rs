@@ -1,8 +1,9 @@
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt, bool_i64,
     connection::retry_on_busy,
-    encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, i64_to_usize,
-    tags_from_json, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
+    encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, i64_to_u64,
+    i64_to_usize, tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64,
+    usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::MessageId;
@@ -106,6 +107,15 @@ pub struct StoredAccountState {
     pub seen_events: Vec<String>,
     pub last_transport_timestamp: Option<u64>,
     pub groups: Vec<StoredAccountGroup>,
+}
+
+/// Durable per-group evidence that an account-wide epoch-gap replay remains
+/// required. Scheduling ordinals stay process-local; reopening coalesces these
+/// rows into one fresh account-wide attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEpochBackfillIntent {
+    pub group_id_hex: String,
+    pub stalled_epoch: u64,
 }
 
 /// Minimal outline of a group still pending the local device's join
@@ -423,6 +433,89 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         Ok(())
+    }
+
+    /// Record recovery intent before its external full-history subscription.
+    /// A concurrent older arm cannot regress a newer stalled epoch.
+    pub fn arm_epoch_backfill_intents(
+        &self,
+        intents: &[StoredEpochBackfillIntent],
+    ) -> StorageResult<()> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now_seconds_i64();
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for intent in intents {
+                let stalled_epoch = u64_to_i64(intent.stalled_epoch)?;
+                conn.execute(
+                    "INSERT INTO app_epoch_backfill_intents
+                        (group_id_hex, stalled_epoch, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(group_id_hex) DO UPDATE SET
+                        stalled_epoch = MAX(
+                            app_epoch_backfill_intents.stalled_epoch,
+                            excluded.stalled_epoch
+                        ),
+                        updated_at = excluded.updated_at",
+                    params![&intent.group_id_hex, stalled_epoch, now],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Load every pending epoch-gap recovery marker for account-open re-arm.
+    pub fn pending_epoch_backfill_intents(&self) -> StorageResult<Vec<StoredEpochBackfillIntent>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT group_id_hex, stalled_epoch
+                 FROM app_epoch_backfill_intents
+                 ORDER BY updated_at, group_id_hex",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(group_id_hex, stalled_epoch)| {
+                Ok(StoredEpochBackfillIntent {
+                    group_id_hex,
+                    stalled_epoch: i64_to_u64(stalled_epoch)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Consume only the exact epochs one completed replay served. A newer arm
+    /// written concurrently remains pending.
+    pub fn clear_epoch_backfill_intents(
+        &self,
+        intents: &[StoredEpochBackfillIntent],
+    ) -> StorageResult<()> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for intent in intents {
+                let stalled_epoch = u64_to_i64(intent.stalled_epoch)?;
+                conn.execute(
+                    "DELETE FROM app_epoch_backfill_intents
+                     WHERE group_id_hex = ?1 AND stalled_epoch = ?2",
+                    params![&intent.group_id_hex, stalled_epoch],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
     }
 
     /// Read only the pending-confirmation, non-archived group outlines.
