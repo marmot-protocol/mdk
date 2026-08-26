@@ -161,6 +161,7 @@ async fn drain_events(
     let mut reconcile = interval(Duration::from_secs(30));
     reconcile.set_missed_tick_behavior(MissedTickBehavior::Delay);
     reconcile.tick().await;
+    let reconciliation_slot = Arc::new(Semaphore::new(1));
     loop {
         tokio::select! {
             result = &mut shutdown => {
@@ -196,7 +197,13 @@ async fn drain_events(
                 }
             }
             _ = reconcile.tick() => {
-                reconcile_pending_deliveries(&ctx.client, &ctx.deliveries).await;
+                if let Ok(permit) = reconciliation_slot.clone().try_acquire_owned() {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries).await;
+                    });
+                }
             }
         }
     }
@@ -488,7 +495,9 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             return;
         }
         PromptDisposition::RetryLast => {
-            let record = match ctx.recovery.begin_retry(&inbound.group_ref).await {
+            let record = match begin_validated_retry(&ctx.recovery, &inbound.group_ref, &ctx.home)
+                .await
+            {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     let _ = send_reply(
@@ -643,13 +652,14 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             }
             RunnerEvent::LivenessUnknown => {
                 let text = format!("[{}] {LIVENESS_UNKNOWN_TEXT}", ctx.cfg.spec.reply_prefix);
+                chunk_index += 1;
                 if let Err(err) = send_reply(
                     &ctx,
                     &inbound.account_ref,
                     &inbound.group_ref,
                     &inbound.message_ref,
                     &text,
-                    0,
+                    chunk_index,
                 )
                 .await
                 {
@@ -741,6 +751,35 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 chunk_index + 1,
             )
             .await;
+        }
+    }
+}
+
+async fn begin_validated_retry(
+    recovery: &RecoveryStore,
+    group_ref: &str,
+    home: &std::path::Path,
+) -> Result<Option<RecoveryRecord>> {
+    let Some(mut record) = recovery.begin_retry(group_ref).await? else {
+        return Ok(None);
+    };
+    match validate_session_cwd(&record.cwd, home).await {
+        Ok(cwd) => {
+            record.cwd = cwd;
+            Ok(Some(record))
+        }
+        Err(err) => {
+            for attempt in 0..3 {
+                match recovery.reset_retry(group_ref).await {
+                    Ok(_) => return Err(err),
+                    Err(reset_err) if attempt < 2 => {
+                        warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "retrying recovery-state restoration after workdir validation");
+                        sleep(Duration::from_millis(50 * (attempt + 1))).await;
+                    }
+                    Err(reset_err) => return Err(reset_err),
+                }
+            }
+            unreachable!("bounded retry loop always returns")
         }
     }
 }
@@ -1760,6 +1799,49 @@ mod tests {
         let current = store.get("group1").await.unwrap();
         assert_eq!(current.session_id, "ses_new");
         assert_eq!(current.cwd, cwd);
+    }
+
+    #[tokio::test]
+    async fn retry_validation_canonicalizes_inside_home_and_restores_invalid_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("repo")).unwrap();
+        let recovery = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
+        let record = RecoveryRecord {
+            prompt: "private prompt".to_owned(),
+            cwd: home.join("repo").join("..").join("repo"),
+            session_id: "session".to_owned(),
+            kind: RecoveryKind::PolicyLimit,
+            status: RecoveryStatus::Pending,
+        };
+        recovery.set("valid", record.clone()).await.unwrap();
+
+        let validated = begin_validated_retry(&recovery, "valid", &home)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(validated.cwd, home.join("repo"));
+        assert_eq!(validated.status, RecoveryStatus::Retrying);
+
+        recovery
+            .set(
+                "invalid",
+                RecoveryRecord {
+                    cwd: home.join("missing"),
+                    ..record
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            begin_validated_retry(&recovery, "invalid", &home)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            recovery.get("invalid").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
     }
 
     #[tokio::test]

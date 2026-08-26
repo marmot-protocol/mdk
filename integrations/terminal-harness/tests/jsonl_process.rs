@@ -401,6 +401,44 @@ sleep 30
 }
 
 #[tokio::test]
+async fn immediate_child_exit_does_not_wait_for_inherited_stdout_writer() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "inherited-stdout-backend",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"session","id":"immediate-exit"}'
+printf '\033[31minherited-stderr\033[0m\n' >&2
+sleep 30 &
+printf '%s' "$!" > background.pid
+exit 23
+"#,
+    );
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut spec = process_spec(
+        &script,
+        root.path(),
+        PromptTransport::Stdin("x".repeat(1024 * 1024)),
+    );
+    spec.total_timeout = Duration::from_secs(3);
+    spec.idle_timeout = Duration::from_secs(2);
+
+    let started = std::time::Instant::now();
+    let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
+    let background_pid = std::fs::read_to_string(root.path().join("background.pid")).unwrap();
+    let _ = std::process::Command::new("kill")
+        .arg(background_pid.trim())
+        .status();
+
+    assert_eq!(outcome.exit_code, Some(23));
+    assert_eq!(outcome.observed_session.as_deref(), Some("immediate-exit"));
+    assert_eq!(outcome.stderr, "inherited-stderr");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn early_stdin_closure_preserves_exit_and_bounded_sanitized_stderr() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();

@@ -1,11 +1,12 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::debug;
@@ -224,7 +225,8 @@ where
             return Err(spawn_failure());
         }
     };
-    let mut stderr_task = tokio::spawn(capture_stderr(stderr));
+    let stderr_snapshot = Arc::new(Mutex::new(String::new()));
+    let mut stderr_task = tokio::spawn(capture_stderr(stderr, stderr_snapshot.clone()));
     let started = StdInstant::now();
     let mut observed_session = None;
     let mut error_summary = None;
@@ -234,9 +236,12 @@ where
 
     let lifecycle_result = timeout_at(total_deadline, async {
         let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let line = match timeout_at(idle_deadline, lines.next_line()).await {
-                Err(_) => {
+        let child_status = loop {
+            let line = tokio::select! {
+                biased;
+                line = lines.next_line() => Some(line),
+                status = child.wait() => break Some(status.map_err(HarnessError::from)?),
+                _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
                         tx.send(RunnerEvent::LivenessUnknown)
                             .await
@@ -246,9 +251,11 @@ where
                     idle_deadline = Instant::now() + idle_timeout;
                     continue;
                 }
-                Ok(Err(_)) => return Err(HarnessError::BackendStream),
-                Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => break,
+            };
+            let line = match line.expect("line branch returns a value") {
+                Err(_) => return Err(HarnessError::BackendStream),
+                Ok(Some(line)) => line,
+                Ok(None) => break None,
             };
             if !line.is_empty() {
                 match parse_event(&line) {
@@ -304,6 +311,24 @@ where
                 }
             }
             idle_deadline = Instant::now() + idle_timeout;
+        };
+
+        if let Some(status) = child_status {
+            if let Some(task) = writer_task.as_mut() {
+                task.abort();
+                let _ = task.await;
+            }
+            stderr_task.abort();
+            let _ = (&mut stderr_task).await;
+            let stderr = stderr_snapshot.lock().await.clone();
+            return Ok(Outcome {
+                observed_session: observed_session.clone(),
+                exit_code: status.code(),
+                error_summary,
+                no_side_effects_proven,
+                stderr: strip_ansi(stderr.trim()),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
         }
 
         let completion = async {
@@ -403,24 +428,33 @@ fn write_stdin(stdin: ChildStdin, prompt: String) -> JoinHandle<std::io::Result<
 }
 
 /// Captures a bounded prefix of backend stderr.
-async fn capture_stderr(stderr: ChildStderr) -> String {
-    capture_bounded(stderr).await
+async fn capture_stderr(stderr: ChildStderr, captured: Arc<Mutex<String>>) -> String {
+    capture_bounded_shared(stderr, captured).await
 }
 
-async fn capture_bounded(mut reader: impl AsyncRead + Unpin) -> String {
+#[cfg(test)]
+async fn capture_bounded(reader: impl AsyncRead + Unpin) -> String {
+    capture_bounded_shared(reader, Arc::new(Mutex::new(String::new()))).await
+}
+
+async fn capture_bounded_shared(
+    mut reader: impl AsyncRead + Unpin,
+    captured: Arc<Mutex<String>>,
+) -> String {
     let mut buf = [0_u8; 1024];
-    let mut captured = String::new();
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(read) if captured.len() < STDERR_CAPTURE_BYTES => {
-                captured.push_str(&String::from_utf8_lossy(&buf[..read]));
-                truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
+            Ok(read) => {
+                let mut captured = captured.lock().await;
+                if captured.len() < STDERR_CAPTURE_BYTES {
+                    captured.push_str(&String::from_utf8_lossy(&buf[..read]));
+                    truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
+                }
             }
-            Ok(_) => {}
         }
     }
-    captured
+    captured.lock().await.clone()
 }
 
 /// Aborts auxiliary tasks, terminates the child, and reaps it after failure.
