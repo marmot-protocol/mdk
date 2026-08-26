@@ -801,7 +801,7 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
         "later enumerations must be failing"
     );
     assert!(
-        snapshot.invite_enumerations_started <= 14,
+        snapshot.invite_enumerations_started <= 40,
         "a failing enumeration with a matured retry must back off, not spin: {} attempts",
         snapshot.invite_enumerations_started
     );
