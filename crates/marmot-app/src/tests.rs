@@ -1685,6 +1685,163 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
     });
 }
 
+/// A tracked group stalled below the arm threshold, so `mark_replayed` is the
+/// only thing that can stop it from arming when its next undecryptable lands.
+///
+/// Returned by the disarm tests below as the probe they read the detector
+/// through: the armed group's own `arm()` has already latched its epoch, so a
+/// bystander is the only place the disarm rule is observable.
+fn bystander_stalled_below_threshold(
+    client: &mut crate::AppClient,
+    stalled_epoch: u64,
+) -> cgka_traits::GroupId {
+    let bystander = cgka_traits::GroupId::new(vec![7_u8; 32]);
+    for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD - 1 {
+        assert_eq!(
+            client.epoch_stall.observe_undecryptable(
+                bystander.clone(),
+                format!("bystander-{probe}"),
+                cgka_traits::EpochId(stalled_epoch),
+            ),
+            BackfillDecision::Skip,
+        );
+    }
+    bystander
+}
+
+/// The threshold-crossing undecryptable for [`bystander_stalled_below_threshold`].
+fn bystander_crosses_threshold(
+    client: &mut crate::AppClient,
+    bystander: cgka_traits::GroupId,
+    stalled_epoch: u64,
+) -> BackfillDecision {
+    client.epoch_stall.observe_undecryptable(
+        bystander,
+        "bystander-threshold".to_owned(),
+        cgka_traits::EpochId(stalled_epoch),
+    )
+}
+
+/// A replay that completed but recovered nothing must not disarm the detector.
+///
+/// `mark_replayed` latches `fired_at_epoch` for *every* tracked group, which is
+/// the right trade when one account-wide replay really did serve every group's
+/// history. A drain that ended at end-of-stored-events having ingested nothing,
+/// with no tracked group's epoch moving, served nothing — so latching on it ends
+/// all automatic recovery for the process lifetime, silently. The run is still
+/// recorded honestly and still consumes its intent; only the disarm is withheld.
+#[test]
+fn a_completed_backfill_that_recovered_nothing_does_not_disarm_the_detector() {
+    run_composed_app_runtime_test("backfill-fruitless-no-disarm", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the armed intent must begin execution");
+        client.test_complete_epoch_backfill_execution(execution, 0);
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Arm,
+            "a replay that recovered nothing must not disarm a group it never recovered",
+        );
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "the completed run still consumes its intent; only the disarm is withheld",
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(
+            completed.len(),
+            1,
+            "a fruitless run is still recorded as the completed attempt it was",
+        );
+        assert_eq!(completed[0]["kind"]["deliveries"], 0);
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events"),
+        );
+    });
+}
+
+/// A zero-delivery replay after which a tracked group's epoch moved is genuine
+/// success: the value of the replay was letting already-deferred rows converge,
+/// and that is exactly what the epoch delta reports.
+#[test]
+fn a_backfill_whose_epoch_moved_still_disarms_the_detector() {
+    run_composed_app_runtime_test("backfill-epoch-moved-disarms", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (_app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the armed intent must begin execution");
+        client
+            .update_group_profile(&group_id, Some("moved during the replay"), None)
+            .await
+            .expect("a solo group's commit confirms locally");
+        assert!(
+            client.group_mls_state(&group_id).unwrap().epoch > stalled_epoch,
+            "the armed group's epoch must have moved across the run",
+        );
+        client.test_complete_epoch_backfill_execution(execution, 0);
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Skip,
+            "a replay that moved a tracked group's epoch has earned the account-wide disarm",
+        );
+    });
+}
+
+/// A replay that ingested deliveries has earned the disarm even with every
+/// tracked epoch still where it started.
+///
+/// The epoch is read the moment the drain returns, and a delivery it ingested
+/// can convert into an epoch long after that — one field run drained 376
+/// deliveries and moved its epoch a second *after* the terminal row was written.
+/// So a delivery count is never second-guessed by an epoch read taken this
+/// early: the deliveries are parked awaiting convergence, not lost.
+#[test]
+fn a_backfill_that_ingested_deliveries_still_disarms_the_detector() {
+    run_composed_app_runtime_test("backfill-deliveries-disarm", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (_app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the armed intent must begin execution");
+        client.test_complete_epoch_backfill_execution(execution, 1);
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Skip,
+            "an ingested delivery is recovery in flight, not a fruitless run",
+        );
+    });
+}
+
 #[test]
 fn epoch_backfill_drain_needs_every_subscription_to_report() {
     run_composed_app_runtime_test("backfill-drain-partial-eose", || async {

@@ -1735,6 +1735,27 @@ impl AppClient {
         );
     }
 
+    /// Complete an execution the way a served end-of-stored-events drain does,
+    /// with the delivery count whose effect on the disarm rule is under test.
+    #[cfg(test)]
+    pub(crate) fn test_complete_epoch_backfill_execution(
+        &mut self,
+        execution: EpochBackfillExecution,
+        deliveries: u64,
+    ) {
+        self.finish_epoch_backfill_execution(
+            execution,
+            EpochBackfillActivationOutcome::Succeeded,
+            None,
+            Some(EpochBackfillCompletionKind::EndOfStoredEvents),
+            DrainCounts {
+                deliveries,
+                skipped: 0,
+            },
+            true,
+        );
+    }
+
     fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
         self.runtime
             .group_record(group_id)
@@ -1833,10 +1854,50 @@ impl AppClient {
             },
         );
         if succeeded {
-            self.epoch_stall.mark_replayed();
+            if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, counts) {
+                self.epoch_stall.mark_replayed();
+            }
         } else {
             self.requeue_failed_epoch_backfill_intent(execution.pending);
         }
+    }
+
+    /// Whether a completed replay recovered anything, and has therefore earned
+    /// the account-wide disarm.
+    ///
+    /// [`mark_replayed`](super::epoch_stall::EpochStallDetector::mark_replayed)
+    /// latches `fired_at_epoch` for every
+    /// *tracked* group, not just the armed one — the right trade when one
+    /// full-history replay really did serve every group's history, and a silent
+    /// end to all automatic recovery when it served nothing. Two independent
+    /// proofs, either of which is enough:
+    ///
+    /// - the drain ingested at least one delivery. A delivery can convert into
+    ///   an epoch long after this call returns — one field run drained 376
+    ///   deliveries and moved its epoch a second *after* the terminal row was
+    ///   written — so `epochs_after`, read the moment the drain ends, must never
+    ///   second-guess a delivery count. Deliveries parked awaiting convergence
+    ///   are recovery in flight.
+    /// - a tracked group's local epoch advanced across the run, which is what a
+    ///   zero-delivery replay whose value was letting already-deferred rows
+    ///   converge looks like.
+    ///
+    /// A run that proves neither is fruitless. It is still recorded as the
+    /// completed end-of-stored-events attempt it was and still consumes its
+    /// intent — the pacing and intent-consumption rules are untouched. What it
+    /// must not do is stop the next refusal or undecryptable from arming a fresh
+    /// replay.
+    fn replay_recovered_something(
+        epochs_before: &HashMap<cgka_traits::GroupId, u64>,
+        epochs_after: &HashMap<cgka_traits::GroupId, u64>,
+        counts: DrainCounts,
+    ) -> bool {
+        counts.deliveries > 0
+            || epochs_after.iter().any(|(group_id, after)| {
+                epochs_before
+                    .get(group_id)
+                    .is_some_and(|before| after > before)
+            })
     }
 
     fn record_epoch_backfill_terminal_rows(
