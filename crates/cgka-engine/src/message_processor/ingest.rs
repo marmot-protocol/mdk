@@ -2531,8 +2531,11 @@ impl<S: StorageProvider> Engine<S> {
             // (panic, early error, async cancel) so the live group
             // state never leaks past this scope as the past-snapshot
             // state.
-            let guard =
-                SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
+            let guard = SnapshotRollbackGuard::create_group_state(
+                &self.storage,
+                group_id.clone(),
+                restore_snapshot,
+            )?;
             let (ctx, message_retention_seconds) =
                 match self.context_from_group_snapshot(group_id, &snapshot_name) {
                     Ok(Some(context)) => context,
@@ -2613,10 +2616,14 @@ impl<S: StorageProvider> Engine<S> {
             current_epoch.0,
             hex::encode(&hasher.finalize()[..8])
         );
-        let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_name)?;
+        let guard = SnapshotRollbackGuard::create_group_state(
+            &self.storage,
+            group_id.clone(),
+            restore_name,
+        )?;
         let resolved = match self
             .storage
-            .rollback_group_to_snapshot(group_id, &snapshot_name)
+            .rollback_group_state_to_snapshot(group_id, &snapshot_name)
         {
             Ok(()) => {
                 let provider =
@@ -2683,7 +2690,7 @@ impl<S: StorageProvider> Engine<S> {
         EngineError,
     > {
         self.storage
-            .rollback_group_to_snapshot(group_id, snapshot_name)?;
+            .rollback_group_state_to_snapshot(group_id, snapshot_name)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mls_group = MlsGroup::load(
