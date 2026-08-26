@@ -224,11 +224,33 @@ Precedence, highest first:
    mode: **`went_dark`** (its events end before — or within one hour of — the
    group provably advancing past it: a dead device, stopped uploads, or a
    member who left; telling a departure apart needs a member↔engine linkage
-   the export does not carry yet) or **`active_while_behind`** (it kept
+   the export does not carry yet), **`active_while_behind`** (it kept
    recording events for over an hour after the group moved past it without
-   catching up: commits are not reaching it while its other traffic flows).
-   A real liveness incident, but not a branch contest, so there is nothing to
-   replay — the named engines are the triage starting point.
+   catching up: commits are not reaching it while its other traffic flows), or
+   **`rolled_back`** (its newest timed epoch is *below* one it already
+   reported). A real liveness incident, but not a branch contest, so there is
+   nothing to replay — the named engines are the triage starting point.
+
+   The lag is measured from each engine's **current** epoch — its newest timed
+   observation — not from its high-water mark. The two agree on every engine
+   that only ever moves forward, and diverge exactly on a rollback, where the
+   high-water reading reports a restored device at an epoch it no longer holds
+   and understates its lag. On the 2026-08-26 cohort that gap hid five epochs:
+   one device re-hydrated at epoch 8 having reached 13, and read as lag-4
+   against a tip of 17 instead of lag-9. Since a rollback only ever *widens*
+   the measured lag, reading the current epoch can add a finding but never mask
+   one — including engines the high-water reading kept under the ≥ 2 threshold
+   entirely (`quarantine-rolled-back-engine.json` is that case: `Healthy`
+   before, quarantined after). An engine whose epoch evidence carries no
+   timestamp cannot be ordered, so it keeps the high-water reading and
+   classifies exactly as before.
+
+   `rolled_back` outranks the other two modes, which a rolled-back engine also
+   satisfies by construction (it is necessarily either dark or active). Nothing
+   in the protocol walks an epoch backwards, so the rollback is a local-storage
+   event — a device restored from an older backup, a rolled-back database — and
+   it names a different remedy: no redelivery repairs it, because the device is
+   asking for commits the group has already retired. Re-invite, not re-pull.
 7. **`Healthy`** — none of the above.
 
 Rules 5 and 6 rank *below* the incident routes on purpose: a reproducible contest is

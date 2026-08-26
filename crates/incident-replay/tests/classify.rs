@@ -608,3 +608,42 @@ fn a_halt_outranks_the_epoch_divergence_it_explains() {
         Some(QuarantineReason::EpochDivergence { .. })
     ));
 }
+
+#[test]
+fn an_engine_whose_local_state_moved_backwards_quarantines_as_rolled_back() {
+    // engine-b reports epoch 5, then reports epoch 2 nearly three hours later:
+    // local state moved backwards, which no protocol step produces — a device
+    // restored from an older backup. Read from the high-water mark alone it
+    // sits at epoch 5, one behind the tip, *below* the divergence threshold and
+    // therefore invisible; read from where it actually is, it is four behind.
+    // This is the 2026-08-26 cohort's worst device in miniature: nine epochs
+    // behind, reported as four, and unreachable by any redelivery.
+    assert_eq!(
+        classify(&load("quarantine-rolled-back-engine.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 2,
+                    mode: BehindMode::RolledBack,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_rollback_outranks_the_active_while_behind_it_also_satisfies() {
+    // The rolled-back engine keeps recording well past the catch-up grace, so
+    // it qualifies as active-while-behind too. The rollback is the mode
+    // reported: it names a cause and a different remedy (re-invite, not
+    // re-pull) than "commits are not arriving".
+    let Some(QuarantineReason::EpochDivergence { engines, .. }) =
+        liveness_advisory(&load("quarantine-rolled-back-engine.json"))
+    else {
+        panic!("expected an epoch-divergence advisory");
+    };
+    assert_eq!(engines.len(), 1);
+    assert_eq!(engines[0].mode, BehindMode::RolledBack);
+}

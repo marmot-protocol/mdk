@@ -162,7 +162,9 @@ impl fmt::Display for HaltedEngine {
 pub struct BehindEngine {
     /// The engine that fell behind.
     pub engine_id: String,
-    /// The highest epoch the engine's own events place it at.
+    /// The epoch the engine's own events currently place it at — its newest
+    /// timed position, not its high-water mark, so a rolled-back device is
+    /// reported where it actually sits.
     pub epoch: u64,
     /// How the engine was behaving once the group moved past it.
     pub mode: BehindMode,
@@ -198,6 +200,15 @@ pub enum BehindMode {
     /// catching up: commits are not reaching it even though its other traffic
     /// flows.
     ActiveWhileBehind,
+    /// The engine's newest timed epoch is *below* one it already reported: its
+    /// local state moved backwards. Nothing in the protocol walks an epoch
+    /// back, so this is a local-storage event — a device restored from an
+    /// older backup, a rolled-back database — and no amount of redelivery
+    /// repairs it, because the device is asking for commits the group has
+    /// already retired. It outranks the other two modes: an engine that rolled
+    /// back is also, necessarily, active or dark, and the rollback is the
+    /// diagnosis an operator acts on (re-invite, not re-pull).
+    RolledBack,
 }
 
 impl fmt::Display for BehindMode {
@@ -205,6 +216,7 @@ impl fmt::Display for BehindMode {
         f.write_str(match self {
             BehindMode::WentDark => "went dark",
             BehindMode::ActiveWhileBehind => "active while behind",
+            BehindMode::RolledBack => "rolled back",
         })
     }
 }
@@ -448,6 +460,12 @@ struct EngineActivity {
     last_seen_ms: Option<u64>,
     /// The highest epoch the engine reported itself at.
     high_water_epoch: Option<u64>,
+    /// The engine's newest *timed* epoch observation, as `(wall_time_ms,
+    /// epoch)`. Held beside the high-water mark because the two disagree
+    /// exactly when local state moved backwards, which is the whole signal
+    /// behind [`BehindMode::RolledBack`] — a max alone reports a restored
+    /// device at the epoch it used to hold and understates its lag.
+    current: Option<(u64, u64)>,
 }
 
 /// The weaker of the two gates between "no contested branch" and "healthy":
@@ -478,6 +496,14 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
         let observed = event.kind.observed_epoch();
         activity.high_water_epoch = activity.high_water_epoch.max(observed);
         if let (Some(epoch), Some(ms)) = (observed, event.wall_time_ms) {
+            // Newest timed observation wins. A tie orders nothing, so it keeps
+            // the higher epoch rather than assert a regression the timestamps
+            // do not actually establish.
+            let candidate = (ms, epoch);
+            activity.current = Some(match activity.current {
+                Some(current) if current > candidate => current,
+                _ => candidate,
+            });
             epoch_first_seen
                 .entry(epoch)
                 .and_modify(|first| *first = (*first).min(ms))
@@ -492,7 +518,14 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
     let behind: Vec<BehindEngine> = engines
         .iter()
         .filter_map(|(engine_id, activity)| {
-            let epoch = activity.high_water_epoch?;
+            let high_water = activity.high_water_epoch?;
+            // Lag is measured from where the engine is now, not from the best
+            // it ever managed. The two differ only on a rollback, and only
+            // ever widen the lag, so this can add a finding but never mask
+            // one. An engine whose epoch evidence is untimed keeps the
+            // high-water reading, exactly as before.
+            let epoch = activity.current.map_or(high_water, |(_, epoch)| epoch);
+            let rolled_back = epoch < high_water;
             if group_epoch - epoch < EPOCH_DIVERGENCE_MIN_LAG {
                 return None;
             }
@@ -505,7 +538,9 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
                 .map(|(_, first_seen)| *first_seen)
                 .min()?;
             let catch_up_deadline = moved_past.saturating_add(CATCH_UP_GRACE_MS);
-            let mode = if last_seen > catch_up_deadline {
+            let mode = if rolled_back {
+                BehindMode::RolledBack
+            } else if last_seen > catch_up_deadline {
                 BehindMode::ActiveWhileBehind
             } else {
                 BehindMode::WentDark
