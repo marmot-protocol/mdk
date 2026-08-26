@@ -144,37 +144,21 @@ struct DeliveryIngest {
     /// Membership-changing effects landed, so the app projection and the route
     /// table owe a save before anything else can fail.
     routes_dirty: bool,
-    /// The engine kept no durable trace of this object, so transport
-    /// redelivery is the only path back to it. See
-    /// [`ingest_left_object_unpersisted`].
+    /// The engine kept no durable trace of this object, so relay redelivery is
+    /// the only path back to it and this delivery must not enter `seen_events`.
+    ///
+    /// Reported by the engine rather than reconstructed from the outcome:
+    /// `Ignored { UnknownGroup }` covers both an object the engine dropped
+    /// without a trace and one it durably dedup-marked, and only the engine can
+    /// tell them apart. See `Engine::last_ingest_left_object_unpersisted`.
     must_stay_fetchable: bool,
     /// The group a resource refusal was counted against, so a drain can report
-    /// *which* groups it fetched history for and could not retain. Only
-    /// `IngestOutcome::ResourceRefused` names a group, which is exactly the
-    /// outcome the refusal count is keyed on.
+    /// *which* groups it fetched history for and could not retain, and so the
+    /// audit `refused` count keeps meaning exactly "a local resource bound
+    /// rejected this". Only `IngestOutcome::ResourceRefused` names a group, and
+    /// it is deliberately narrower than `must_stay_fetchable`: an unknown-group
+    /// object was not refused for want of a resource.
     refused_group: Option<cgka_traits::GroupId>,
-}
-
-/// Whether the engine left this outcome's transport object unpersisted, so only
-/// relay redelivery can present it again.
-///
-/// This is the app-side half of the engine's `retryable_unpersisted_ingest_id`
-/// contract. `ResourceRefused` is the one `Ok` outcome the engine drops without
-/// a durable record *and* deliberately keeps out of its own seen cache, and the
-/// trait states the consequence directly: a resource refusal "must not make
-/// same-id redelivery a duplicate". Recording it in `seen_events` (which has no
-/// removal site short of ring overflow) or letting it carry the relay `since`
-/// floor past itself makes the object permanently unfetchable — across restarts
-/// and across `repair_full_history` alike.
-///
-/// Every other `Ok` outcome leaves the engine holding durable evidence of the
-/// object: `TransportDeferred` retains the raw transport row for later peel,
-/// `Buffered` retains it for convergence replay, and the terminal
-/// classifications (`Processed`, `Ignored`, `LocalState`, `Stale`, `Rejected`)
-/// are decisions the engine can reach again from storage. Forgetting those is
-/// correct dedupe, so they stay.
-fn ingest_left_object_unpersisted(outcome: &IngestOutcome) -> bool {
-    matches!(outcome, IngestOutcome::ResourceRefused { .. })
 }
 
 /// What one drain loop saw on the wire.
@@ -1288,16 +1272,17 @@ impl AppClient {
                         .await);
                 }
             };
-            // Same rule as the receive seam above: an object the engine refused
-            // unpersisted must stay fetchable, so the relay re-serves it on a
-            // later drain instead of this one skipping it as already seen. The
-            // same flag is the refusal count, so one rule decides both.
-            if ingested.must_stay_fetchable {
+            // The refusal count is keyed on the refusal itself, so the audit
+            // row keeps meaning "a local resource bound rejected this" and not
+            // the wider "left no durable trace".
+            if let Some(group_id) = ingested.refused_group {
                 counts.refused = counts.refused.saturating_add(1);
-                if let Some(group_id) = ingested.refused_group {
-                    counts.refused_groups.insert(group_id);
-                }
-            } else {
+                counts.refused_groups.insert(group_id);
+            }
+            // Same rule as the receive seam above: an object the engine kept no
+            // durable trace of must stay fetchable, so the relay re-serves it on
+            // a later drain instead of this one skipping it as already seen.
+            if !ingested.must_stay_fetchable {
                 self.remember_seen_event(event_id);
             }
             counts.deliveries = counts.deliveries.saturating_add(1);
@@ -1453,7 +1438,7 @@ impl AppClient {
         let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
-        let must_stay_fetchable = ingest_left_object_unpersisted(&effects.outcome);
+        let must_stay_fetchable = effects.left_object_unpersisted;
         let refused_group = match &effects.outcome {
             IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
             _ => None,
@@ -1461,11 +1446,25 @@ impl AppClient {
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_groups(&effects.effects);
         self.observe_recovery_evidence(&effects.effects);
-        if !must_stay_fetchable {
-            // Scope fence: a `TransportDeferred` object *is* durably retained,
-            // so it advances the floor here. Whether a retained-but-unapplied
-            // object should instead hold the floor back until it converges is
-            // the separate since-floor design item, not this seam's call.
+        // The cursor is held back only by a resource refusal, which is
+        // narrower than `must_stay_fetchable` on purpose.
+        //
+        // A refusal is this device failing to keep history it was served, at a
+        // route it owns, so holding its own `since` floor back is holding back
+        // work it must redo. Unknown-route input is not: the engine drops it
+        // untraced precisely because #740 forbids letting unknown-route floods
+        // consume local resources, and the `since` floor is one of those — an
+        // attacker who can mint 445s for routes we do not have could otherwise
+        // pin the whole account's floor in the past. Skipping the seen-mark
+        // costs nothing and is what actually restores the object: the two
+        // permanent drop sites are the seen index, and the unfloored recovery
+        // replay re-serves the object once the route resolves.
+        //
+        // Scope fence: a `TransportDeferred` object *is* durably retained, so it
+        // advances the floor here. Whether a retained-but-unapplied object
+        // should instead hold the floor back until it converges is the separate
+        // since-floor design item, not this seam's call.
+        if refused_group.is_none() {
             self.remember_transport_cursor(outer_transport_at);
         }
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);

@@ -12086,6 +12086,162 @@ fn recorded_ingest_outcomes(app: &MarmotApp, msg_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// One kind-445 delivery for a route this device has no group row for.
+///
+/// The reachable production trigger is *not* a commit racing ahead of its
+/// Welcome — a device that is not in a group has no route for it, every 445
+/// filter is `#h`-scoped to a known `transport_group_id`, and the adapter
+/// re-gates every event against the route table before it becomes a delivery.
+/// It is the engine's route-backfill probe budget: on an index miss
+/// `resolve_or_backfill_group_id_for_transport` probes at most
+/// `ROUTE_BACKFILL_PROBES_PER_MISS` (4) of the groups whose durable route row
+/// was missing or stale at hydration, and otherwise falls back to the raw
+/// transport id, which misses `MlsGroup::load` and takes the unknown-group
+/// branch — for a group this device really does have. The app-side consequence
+/// is the same either way and is what these two tests pin; the engine's
+/// disposition contract is pinned in `cgka-engine`'s
+/// `ingest_unknown_group_message_leaves_the_object_unpersisted`.
+fn unknown_route_delivery(
+    account_id_hex: &str,
+    created_at: u64,
+    marker: &str,
+) -> cgka_traits::TransportDelivery {
+    cgka_traits::TransportDelivery {
+        account_id: MemberId::new(hex::decode(account_id_hex).unwrap()),
+        group_id_hint: None,
+        message: epoch_gap_probe(&"ab".repeat(32), created_at, marker)
+            .to_transport_message()
+            .expect("probe converts to a transport message"),
+        received_at: cgka_traits::transport::Timestamp(created_at),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+            plane: cgka_traits::TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    }
+}
+
+/// An object the engine kept no durable trace of must not enter `seen_events`,
+/// even when its outcome is an ordinary `Ignored`.
+///
+/// The engine sets `retryable_unpersisted_ingest_id` on the unknown-group
+/// branch and suppresses its own seen-cache insertion, precisely so relay
+/// redelivery can process the object once the route resolves. Recording it in
+/// `seen_events` defeats that permanently: the index is persisted, has no
+/// removal site short of ring overflow, and gates both
+/// `receive_next_delivery` and the catch-up drain — so the object becomes
+/// unfetchable across restarts and across `repair_full_history` alike.
+///
+/// The cursor still advances. Unknown-route input is exactly what #740 says
+/// must not consume local resources, and the `since` floor is one of them: an
+/// attacker minting 445s for routes we do not have could otherwise pin the
+/// whole account's floor in the past. Skipping the seen-mark is what actually
+/// restores the object, because the unfloored recovery replay re-serves it.
+#[test]
+fn an_unknown_route_delivery_is_not_marked_seen_but_still_advances_the_cursor() {
+    run_composed_app_runtime_test("unknown-route-receive-seam", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        let unknown = unknown_route_delivery(
+            &route.account_id_hex,
+            filled_through + 500,
+            "unknown-route-commit",
+        );
+        let event_id = hex::encode(unknown.message.id.as_slice());
+        client
+            .ingest_received_delivery(unknown.clone())
+            .await
+            .expect("an unknown-route ingest still completes its pass");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &event_id),
+            vec!["ignored".to_owned()],
+            "the engine classifies it as an ignore, which is why the app could not \
+             tell it apart from a durably dedup-marked one",
+        );
+        assert!(
+            !client.seen_events_index.contains(&event_id),
+            "an object the engine retained nothing for must stay fetchable",
+        );
+        assert!(
+            !client.state.seen_events.contains(&event_id),
+            "and must not be persisted into the seen ring either",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(filled_through + 500),
+            "but the `since` floor still advances: unknown-route input must not \
+             hold the whole account's cursor back (#740)",
+        );
+
+        // The contract the skipped seen-mark buys: redelivery is ingested again
+        // rather than dropped, so a later drain can present the object once the
+        // route resolves.
+        client
+            .ingest_received_delivery(unknown)
+            .await
+            .expect("redelivery still completes its pass");
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &event_id).len(),
+            2,
+            "same-id redelivery must reach the engine a second time",
+        );
+    });
+}
+
+/// Why the drain seam cannot be driven with an unknown route from here, and
+/// what the route-backfill miss actually looks like.
+///
+/// The relay plane route-gates every inbound event before it can become a
+/// `TransportDelivery`: an unknown `#h` routes to nobody. That is the same gate
+/// that makes "a commit racing ahead of its Welcome" unreachable — a device not
+/// in a group has no route for it, so no 445 for that group is ever delivered.
+/// The reachable trigger is narrower and lives one layer down: the *adapter*
+/// has the route (the device really is in the group) while the *engine's*
+/// in-memory route index misses it and the route-backfill probe budget runs out,
+/// so `resolve_or_backfill_group_id_for_transport` falls back to the raw
+/// transport id and takes the unknown-group branch.
+///
+/// The app-side rule that branch needs is `must_stay_fetchable`, which both
+/// seams read off the identical `DeliveryIngest` field — pinned at the receive
+/// seam above, and at the drain seam by
+/// `a_refused_delivery_is_neither_marked_seen_nor_allowed_to_advance_the_cursor`.
+/// What is pinned here is the gate itself, so the unreachability claim is a
+/// test rather than a comment.
+#[test]
+fn an_unknown_route_event_is_never_routed_to_a_delivery() {
+    run_composed_app_runtime_test("unknown-route-transport-gate", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, client, _route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        let delivered = app
+            .relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                subscription_id: Some("unknown-route-test".to_owned()),
+                event: epoch_gap_probe(
+                    &"ab".repeat(32),
+                    filled_through + 500,
+                    "unknown-route-commit",
+                ),
+            })
+            .await
+            .expect("routing an unknown-route event is not an error");
+        assert_eq!(
+            delivered, 0,
+            "a 445 for a route this device does not hold must not become a delivery",
+        );
+        drop(client);
+    });
+}
+
 /// A refused object must stay fetchable: the receive seam may neither mark it
 /// seen nor let it advance the relay `since` cursor.
 ///
