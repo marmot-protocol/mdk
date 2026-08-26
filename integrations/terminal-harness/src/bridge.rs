@@ -976,7 +976,7 @@ enum CompletionRoute {
 }
 
 fn completion_route(outcome: &Outcome, delivery: &DeliveryReport) -> CompletionRoute {
-    if outcome.exit_code.is_some_and(|code| code != 0) {
+    if outcome.exit_code != Some(0) {
         CompletionRoute::NonzeroExit
     } else if delivery.failed {
         CompletionRoute::TextFinalAckUnknown
@@ -1657,6 +1657,19 @@ mod tests {
             recovery_kind_for_outcome(&proven),
             RecoveryKind::FailedResumable
         );
+        let signal_terminated = Outcome {
+            observed_session: Some("session".to_owned()),
+            exit_code: None,
+            error_summary: Some("terminated".to_owned()),
+            no_side_effects_proven: true,
+            stderr: String::new(),
+            elapsed_ms: 1,
+        };
+        assert_eq!(
+            completion_route(&signal_terminated, &failed_delivery),
+            CompletionRoute::NonzeroExit
+        );
+
         let completed = Outcome {
             exit_code: Some(0),
             ..proven
