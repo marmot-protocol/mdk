@@ -457,6 +457,7 @@ impl<S: StorageProvider> Engine<S> {
         // Clear a marker left by cancellation/panic in an earlier ingest; only
         // the current call may suppress its own seen-cache insertion.
         self.retryable_unpersisted_ingest_id = None;
+        self.last_ingest_left_object_unpersisted = false;
         // Durable dedup / own-echo check. Storage is authoritative so a
         // restarted engine can classify replayed transport messages the same
         // way as a hot process.
@@ -498,6 +499,10 @@ impl<S: StorageProvider> Engine<S> {
             .retryable_unpersisted_ingest_id
             .take()
             .is_some_and(|id| id == msg.id);
+        // One fact, one place: the flag that suppresses this engine's own
+        // seen-cache insertion is also what it reports to callers holding a
+        // dedup index of their own.
+        self.last_ingest_left_object_unpersisted = retryable_unpersisted;
         if !retryable_unpersisted
             && !matches!(outcome, IngestOutcome::Buffered { .. })
             && self.should_remember_ingested_message(&msg.id)?

@@ -2055,6 +2055,7 @@ where
         }
         let IngestEffects {
             outcome,
+            left_object_unpersisted,
             effects,
             valid_proposal_groups,
         } = self.session.ingest_delivery(delivery).await?;
@@ -2075,7 +2076,11 @@ where
                 unique_state_bearing_groups.push(group_id);
             }
         }
-        Ok(AccountIngestEffects { outcome, effects })
+        Ok(AccountIngestEffects {
+            outcome,
+            left_object_unpersisted,
+            effects,
+        })
     }
 
     pub async fn publish_session_effects(
@@ -4003,6 +4008,9 @@ impl AccountDeviceEffects {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountIngestEffects {
     pub outcome: IngestOutcome,
+    /// The engine kept no durable trace of this delivery's transport object.
+    /// Carried verbatim from [`IngestEffects::left_object_unpersisted`].
+    pub left_object_unpersisted: bool,
     pub effects: AccountDeviceEffects,
 }
 

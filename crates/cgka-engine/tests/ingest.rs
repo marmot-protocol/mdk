@@ -591,6 +591,61 @@ async fn ingest_unknown_group_message_returns_unknown_group() {
     ));
 }
 
+/// Unknown-group input leaves no durable trace, and the engine says so.
+///
+/// `MlsGroup::load` missing with no group row behind it retains nothing (#740:
+/// unknown-route floods must not consume storage), so the engine deliberately
+/// keeps the id out of its seen cache and relay redelivery must process it
+/// again. That disposition is reported, not left implicit: a caller holding its
+/// own dedup index cannot derive it from the outcome, because the *same*
+/// `Ignored { UnknownGroup }` is also returned for durably dedup-marked input:
+/// the disband-tombstone branch in `ingest_group_message_from_sweep` calls
+/// `put_ingress_dedup_marker` and does *not* set this flag, so its redelivery
+/// short-circuits to `Ignored { Duplicate }` instead.
+#[tokio::test]
+async fn ingest_unknown_group_message_leaves_the_object_unpersisted() {
+    let mut engine = build_client(b"a");
+    let msg = TransportMessage {
+        id: MessageId::new(vec![7; 4]),
+        payload: vec![1, 2, 3],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xBB; 32],
+        },
+    };
+
+    let outcome = engine.ingest(msg.clone()).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::UnknownGroup
+        }
+    ));
+    assert!(
+        engine.last_ingest_left_object_unpersisted(),
+        "an unknown-group ignore that retained nothing must report itself unpersisted",
+    );
+
+    // The contract the report exists to protect: same-id redelivery is not a
+    // duplicate, because there is no durable record for it to duplicate.
+    let redelivered = engine.ingest(msg).await.unwrap();
+    assert!(
+        matches!(
+            redelivered,
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup
+            }
+        ),
+        "redelivery must be classified afresh, not as a duplicate: {redelivered:?}",
+    );
+    assert!(
+        engine.last_ingest_left_object_unpersisted(),
+        "and the redelivery is just as unpersisted as the first pass",
+    );
+}
+
 #[tokio::test]
 async fn ingest_welcome_for_another_client_returns_not_for_this_client() {
     let mut engine = build_client(b"me");
