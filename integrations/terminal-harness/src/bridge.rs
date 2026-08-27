@@ -1081,6 +1081,10 @@ fn failed_artifact_delivery_outcome(
     }
 }
 
+fn invalid_replay_batch_can_be_discarded(batch: &PendingArtifactBatch) -> bool {
+    batch.caption.is_none() && batch.remaining_text.is_empty()
+}
+
 async fn deliver_artifact_outputs(
     ctx: &Arc<BridgeContext>,
     inbound: &InboundPrompt,
@@ -1205,7 +1209,8 @@ async fn retry_pending_artifacts(ctx: &Arc<BridgeContext>) {
         match send_pending_artifact_batch(ctx, &batch).await {
             Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await,
             Err(err) => {
-                if err.artifact_validation_failed() {
+                if err.artifact_validation_failed() && invalid_replay_batch_can_be_discarded(&batch)
+                {
                     let _ =
                         discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
                 }
@@ -2444,6 +2449,23 @@ mod tests {
             failed_artifact_delivery_outcome(&HarnessError::ControlClosed, false),
             ArtifactDeliveryOutcome::Pending
         );
+    }
+
+    #[test]
+    fn invalid_mixed_replay_batch_keeps_its_text_and_fifo_barrier() {
+        let mut batch = PendingArtifactBatch {
+            idempotency_key: "key".to_owned(),
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_message_ref: "message".to_owned(),
+            caption: Some("caption".to_owned()),
+            remaining_text: vec!["text".to_owned()],
+            artifacts: Vec::new(),
+        };
+        assert!(!invalid_replay_batch_can_be_discarded(&batch));
+        batch.caption = None;
+        batch.remaining_text.clear();
+        assert!(invalid_replay_batch_can_be_discarded(&batch));
     }
 
     #[async_trait::async_trait]

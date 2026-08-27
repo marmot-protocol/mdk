@@ -646,6 +646,21 @@ fn remove_stale_key_temps(key_path: &Path) -> Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            let reclaim = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let metadata = std::fs::symlink_metadata(entry.path())?;
+                    // A live installer's temp has one link. Only remove a temp after
+                    // hard_link installed the key and an interruption left both links.
+                    metadata.is_file() && metadata.nlink() >= 2
+                }
+                #[cfg(not(unix))]
+                false
+            };
+            if !reclaim {
+                continue;
+            }
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
